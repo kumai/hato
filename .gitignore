@@ -1,0 +1,29 @@
+# Gradle
+.gradle/
+build/
+.kotlin/
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+out/
+
+# OS
+.DS_Store
+
+# Personal and agent-specific configuration stays local (see CONTRIBUTING.md)
+AGENTS.md
+CLAUDE.md
+.claude/
+.agents/
+.codex/
+
+# Scratch space for drafts that are not part of the repository yet
+tmp/
+output/
+
+/notes
