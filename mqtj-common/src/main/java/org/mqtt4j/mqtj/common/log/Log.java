@@ -2,11 +2,12 @@ package org.mqtt4j.mqtj.common.log;
 
 import java.lang.System.Logger.Level;
 import java.util.Arrays;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.jspecify.annotations.Nullable;
+
+import static java.util.Objects.requireNonNull;
 
 /// Logging facade over `System.Logger` with SLF4J-style `{}` placeholders.
 ///
@@ -34,19 +35,22 @@ public final class Log {
 
     /// Returns the log with the given `System.Logger` name.
     public static Log of(String name) {
-        return of(System.getLogger(Objects.requireNonNull(name, "name must not be null")));
+        return of(System.getLogger(requireNonNull(name, "name must not be null")));
     }
 
     /// Returns the log named after `type`. After embedding, the name carries the distribution's
     /// package, so client and broker diagnostics never share a name.
     public static Log of(Class<?> type) {
-        Objects.requireNonNull(type, "type must not be null");
+        requireNonNull(type, "type must not be null");
         return of(System.getLogger(type.getName()));
     }
 
     static Log of(System.Logger logger) {
-        return new Log(Objects.requireNonNull(logger, "logger must not be null"), "",
-                ConcurrentHashMap.newKeySet());
+        return new Log(
+                requireNonNull(logger, "logger must not be null"),
+                "",
+                ConcurrentHashMap.newKeySet()
+        );
     }
 
     /// Returns a log that puts `[prefix]` in front of every message, typically the client id.

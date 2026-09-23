@@ -86,9 +86,12 @@ Gradle needs some JDK to start; the Java 25 JDK it runs on and compiles with is
 provisioned automatically on the first run, as is the Gradle distribution
 itself. Both need network access once.
 
-Docker is needed only for the integration tests that run against real brokers;
-they are skipped when Docker is not available. A GraalVM JDK is needed only for
-the native-image smoke test, which CI runs on every pull request.
+Docker is needed for the integration tests that run against real brokers. Without
+it, `./gradlew build` fails and explains how to skip those tests: add
+`-Pmqtj.docker.required=false` to the command, or put `mqtj.docker.required=false`
+in `~/.gradle/gradle.properties` to skip them in every build. Skipped tests are
+listed in the build output, and CI always runs them. A GraalVM JDK is needed only
+for the native-image smoke test, which CI runs on every pull request.
 
 CI runs the checks below on every pull request, and all of them must pass
 before merge. Run the ones that match what you changed.

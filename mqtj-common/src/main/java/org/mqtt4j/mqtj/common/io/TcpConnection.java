@@ -1,0 +1,112 @@
+package org.mqtt4j.mqtj.common.io;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.time.Duration;
+
+import static java.util.Objects.requireNonNull;
+
+/// Owns one connected TCP socket and its blocking input and output streams.
+///
+/// One reader and one writer may use the connection concurrently. The owner serializes reads
+/// with other reads and writes with other writes; it may close the connection from any thread.
+/// This class creates no threads and leaves MQTT framing and packet encoding to its callers.
+///
+/// The streams are borrowed from this connection. Close the connection to release both sides;
+/// closing either stream also closes the underlying socket. No additional buffering is added.
+///
+/// See [JDK 25 Socket](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/net/Socket.html).
+public final class TcpConnection implements Closeable {
+
+    private static final Duration MAX_CONNECT_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
+
+    private final Socket socket;
+
+    private final InputStream input;
+
+    private final OutputStream output;
+
+    private TcpConnection(Socket socket) throws IOException {
+        this.socket = socket;
+        input = socket.getInputStream();
+        output = socket.getOutputStream();
+    }
+
+    /// Resolves `host` and establishes a TCP connection to `port`.
+    ///
+    /// The positive timeout applies to TCP connection establishment, after DNS resolution.
+    /// It does not bound DNS resolution or later reads and writes. Fractional milliseconds
+    /// are rounded up, so a positive duration never becomes the JDK's zero (infinite) timeout.
+    /// The maximum is [Integer#MAX_VALUE] milliseconds. Any socket created during a failed
+    /// attempt is closed before the failure is propagated.
+    ///
+    /// @throws IllegalArgumentException if the host is blank, the port is outside 1 to 65535,
+    ///         or the timeout is not positive or exceeds the maximum
+    /// @throws java.net.SocketTimeoutException if the TCP connect timeout expires
+    /// @throws IOException if name resolution, connection, or stream initialization fails
+    public static TcpConnection connect(
+            String host,
+            int port,
+            Duration connectTimeout
+    ) throws IOException {
+        requireNonNull(host, "host must not be null");
+        requireNonNull(connectTimeout, "connectTimeout must not be null");
+        if (host.isBlank()) {
+            throw new IllegalArgumentException("Host must not be blank");
+        }
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("Port must be between 1 and 65535");
+        }
+        if (connectTimeout.isZero() || connectTimeout.isNegative()
+                || connectTimeout.compareTo(MAX_CONNECT_TIMEOUT) > 0) {
+            throw new IllegalArgumentException(
+                    "Connect timeout must be positive and at most 2147483647 milliseconds"
+            );
+        }
+        // The range check above also makes conversion to nanoseconds safe from overflow.
+        int timeoutMillis = (int) Math.ceilDiv(connectTimeout.toNanos(), 1_000_000L);
+        var address = new InetSocketAddress(host, port);
+        var socket = new Socket();
+        try {
+            socket.connect(address, timeoutMillis);
+            return new TcpConnection(socket);
+        } catch (IOException | RuntimeException | Error failure) {
+            // Ownership transfers only after both streams are available. Keep the original
+            // failure if releasing the partially initialized connection also fails.
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
+    }
+
+    /// Returns the borrowed input stream, for one reader at a time.
+    ///
+    /// Reads block until data, EOF, or failure; [#close] can cancel a pending read.
+    public InputStream input() {
+        return input;
+    }
+
+    /// Returns the borrowed output stream, for one writer at a time.
+    public OutputStream output() {
+        return output;
+    }
+
+    /// Closes both directions and releases the socket. Repeated calls are harmless.
+    ///
+    /// May be called from any thread. A thread blocked in socket I/O is released with a
+    /// [java.net.SocketException], including when that thread is virtual. The connection
+    /// cannot be reopened and this operation does not send an MQTT DISCONNECT packet.
+    ///
+    /// @throws IOException if closing the socket fails
+    @Override
+    public void close() throws IOException {
+        socket.close();
+    }
+}

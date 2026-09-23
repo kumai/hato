@@ -22,8 +22,9 @@ nullaway = { module = "com.uber.nullaway:nullaway", version.ref = "nullaway" }
 checkstyle = { module = "com.puppycrawl.tools:checkstyle", version.ref = "checkstyle" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
 assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
-# Wired into the integrationTest suites when the interoperability tests arrive (milestone M7).
-testcontainers-junit-jupiter = { module = "org.testcontainers:testcontainers-junit-jupiter", version.ref = "testcontainers" }
+# Real brokers in Docker for the integrationTest suites. Only the core library is used: each test
+# class decides whether a missing Docker skips it or, in CI, fails the build.
+testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
 
 [plugins]
 graalvm-native = { id = "org.graalvm.buildtools.native", version.ref = "graalvm-native" }

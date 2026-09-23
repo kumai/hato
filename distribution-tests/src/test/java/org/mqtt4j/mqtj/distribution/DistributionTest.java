@@ -33,7 +33,11 @@ class DistributionTest {
     private static final String CLIENT_PROBE = """
             if (org.mqtt4j.mqtj.MqttVersion.of(4) != org.mqtt4j.mqtj.MqttVersion.V3_1_1
                     || org.mqtt4j.mqtj.MqttVersion.V5.protocolLevel() != 5
-                    || org.mqtt4j.mqtj.Qos.of(2) != org.mqtt4j.mqtj.Qos.EXACTLY_ONCE) {
+                    || org.mqtt4j.mqtj.Qos.of(2) != org.mqtt4j.mqtj.Qos.EXACTLY_ONCE
+                    || org.mqtt4j.mqtj.ReasonCode.of(0x80)
+                            != org.mqtt4j.mqtj.ReasonCode.UNSPECIFIED_ERROR
+                    || org.mqtt4j.mqtj.ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED.value()
+                            != 0xA2) {
                 throw new AssertionError("Client wire values are not usable");
             }
             """;
@@ -118,7 +122,7 @@ class DistributionTest {
         Set<String> clientClasses = classEntries(CLIENT);
         Set<String> brokerClasses = classEntries(BROKER);
         Set<String> testkitClasses = classEntries(testkit);
-        for (String type : List.of("MqttVersion", "Qos")) {
+        for (String type : List.of("MqttVersion", "Qos", "ReasonCode")) {
             assertThat(clientClasses).contains("org/mqtt4j/mqtj/" + type + ".class");
             assertThat(clientClasses)
                     .noneMatch(name -> name.endsWith("/value/" + type + ".class"));
@@ -178,7 +182,7 @@ class DistributionTest {
             try (var archive = new ZipFile(path.toFile())) {
                 String valuePackage = owner.equals("client") ? "org.mqtt4j.mqtj"
                         : "org.mqtt4j.mqtj." + owner + ".internal.common.value";
-                for (String type : List.of("MqttVersion", "Qos")) {
+                for (String type : List.of("MqttVersion", "Qos", "ReasonCode")) {
                     String name = valuePackage.replace('.', '/') + "/" + type + ".java";
                     var entry = archive.getEntry(name);
                     assertThat(entry).as("%s in %s", name, path).isNotNull();

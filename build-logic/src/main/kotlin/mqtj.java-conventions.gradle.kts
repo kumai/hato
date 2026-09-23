@@ -71,7 +71,9 @@ testing {
             targets.configureEach {
                 testTask.configure {
                     testLogging {
-                        events("failed")
+                        // Skipped tests are listed as well: a test that did not run must not
+                        // look like one that passed.
+                        events("failed", "skipped")
                         exceptionFormat = TestExceptionFormat.FULL
                     }
                 }
@@ -86,6 +88,15 @@ testing {
             targets.configureEach {
                 testTask.configure {
                     shouldRunAfter(tasks.named("test"))
+                    // Tests that need Docker fail without it, so no build passes without them
+                    // (design doc chapter 13). Without Docker, skip them with
+                    // -Pmqtj.docker.required=false, or put mqtj.docker.required=false in
+                    // ~/.gradle/gradle.properties. The value is a test input, so results of runs
+                    // that skipped them are never reused for runs that require Docker.
+                    systemProperty(
+                        "mqtj.docker.required",
+                        providers.gradleProperty("mqtj.docker.required").orElse("true").get()
+                    )
                 }
             }
         }
