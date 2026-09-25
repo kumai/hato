@@ -40,6 +40,11 @@ class DistributionTest {
                             != 0xA2) {
                 throw new AssertionError("Client wire values are not usable");
             }
+            var filter = new org.mqtt4j.mqtj.TopicFilter("a/#");
+            if (!filter.matches(new org.mqtt4j.mqtj.Topic("a/b"))
+                    || filter.matches(new org.mqtt4j.mqtj.Topic("b/a"))) {
+                throw new AssertionError("Client topic values are not usable");
+            }
             """;
     private static final String BROKER_PROBE = """
             var version = org.mqtt4j.mqtj.broker.internal.common.value.MqttVersion.of(5);
@@ -122,7 +127,7 @@ class DistributionTest {
         Set<String> clientClasses = classEntries(CLIENT);
         Set<String> brokerClasses = classEntries(BROKER);
         Set<String> testkitClasses = classEntries(testkit);
-        for (String type : List.of("MqttVersion", "Qos", "ReasonCode")) {
+        for (String type : List.of("MqttVersion", "Qos", "ReasonCode", "Topic", "TopicFilter")) {
             assertThat(clientClasses).contains("org/mqtt4j/mqtj/" + type + ".class");
             assertThat(clientClasses)
                     .noneMatch(name -> name.endsWith("/value/" + type + ".class"));
@@ -182,7 +187,9 @@ class DistributionTest {
             try (var archive = new ZipFile(path.toFile())) {
                 String valuePackage = owner.equals("client") ? "org.mqtt4j.mqtj"
                         : "org.mqtt4j.mqtj." + owner + ".internal.common.value";
-                for (String type : List.of("MqttVersion", "Qos", "ReasonCode")) {
+                for (String type : List.of(
+                        "MqttVersion", "Qos", "ReasonCode", "Topic", "TopicFilter"
+                )) {
                     String name = valuePackage.replace('.', '/') + "/" + type + ".java";
                     var entry = archive.getEntry(name);
                     assertThat(entry).as("%s in %s", name, path).isNotNull();
