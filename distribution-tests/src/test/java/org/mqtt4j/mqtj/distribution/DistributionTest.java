@@ -80,12 +80,25 @@ class DistributionTest {
             }
             """;
     private static final String BROKER_PROBE = """
-            var version = org.mqtt4j.mqtj.broker.internal.common.value.MqttVersion.of(5);
-            if (version.protocolLevel() != 5) {
-                throw new AssertionError("Broker wire values are not usable");
+            try (var broker = org.mqtt4j.mqtj.broker.MqttBroker.start()) {
+                if (broker.port() <= 0) {
+                    throw new AssertionError("Broker did not bind a port");
+                }
             }
-            org.mqtt4j.mqtj.broker.internal.common.log.Log.of("org.mqtt4j.mqtj.broker.probe")
-                    .info("probe {}", 5);
+            """;
+    private static final String CONNECTION_PROBE = """
+            try (var broker = org.mqtt4j.mqtj.broker.MqttBroker.start();
+                    var connectedClient = org.mqtt4j.mqtj.MqttClient.builder()
+                            .server(java.net.URI.create("mqtt://localhost:" + broker.port()))
+                            .version(org.mqtt4j.mqtj.MqttVersion.V3_1_1)
+                            .build()) {
+                var connAck = connectedClient.connect()
+                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
+                if (connAck.sessionPresent()) {
+                    throw new AssertionError("Clean connection resumed a session");
+                }
+                connectedClient.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
             """;
 
     @TempDir
@@ -98,55 +111,53 @@ class DistributionTest {
 
     @Test
     void broker_runs_with_only_its_distributed_jar() throws Exception {
-        // White-box until there is a public broker API. There is no client or protocol jar here.
         runClasspathProbe("broker", BROKER.toString(), BROKER_PROBE);
     }
 
     @Test
     void client_and_broker_can_share_a_classpath() throws Exception {
-        runClasspathProbe("both", CLIENT + File.pathSeparator + BROKER,
-                CLIENT_PROBE + BROKER_PROBE
+        runClasspathProbe(
+                "both",
+                CLIENT + File.pathSeparator + BROKER,
+                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE
         );
     }
 
     @Test
     void client_runs_as_a_standalone_named_module() throws Exception {
-        runModuleProbe("clientModule", CLIENT.toString(), "org.mqtt4j.mqtj.client", CLIENT_PROBE);
+        runModuleProbe(
+                "clientModule",
+                CLIENT.toString(),
+                List.of("org.mqtt4j.mqtj.client"),
+                CLIENT_PROBE
+        );
     }
 
     @Test
     void broker_runs_as_a_standalone_named_module() throws Exception {
-        // White-box until there is a public broker API: the probe is an ordinary consumer module
-        // that is granted access to the internal packages with --add-exports. Nothing is patched
-        // into the jar, so it is resolved exactly as an application resolves it, and its
-        // `requires static` on the annotation module stays optional.
-        Path root = temporaryDirectory.resolve("brokerModule");
-        Path source = write(root.resolve("src/probe/Probe.java"), probeSource(BROKER_PROBE));
-        Path descriptor = write(root.resolve("src/module-info.java"),
-                "module probe { requires org.mqtt4j.mqtj.broker; }"
+        runModuleProbe(
+                "brokerModule",
+                BROKER.toString(),
+                List.of("org.mqtt4j.mqtj.broker"),
+                BROKER_PROBE
         );
-        Path classes = Files.createDirectories(root.resolve("classes"));
-        List<String> exports = List.of(
-                "--add-exports",
-                "org.mqtt4j.mqtj.broker/org.mqtt4j.mqtj.broker.internal.common.value=probe",
-                "--add-exports",
-                "org.mqtt4j.mqtj.broker/org.mqtt4j.mqtj.broker.internal.common.log=probe"
+    }
+
+    @Test
+    void client_and_broker_connect_as_independent_named_modules() throws Exception {
+        runModuleProbe(
+                "bothModules",
+                CLIENT + File.pathSeparator + BROKER,
+                List.of("org.mqtt4j.mqtj.client", "org.mqtt4j.mqtj.broker"),
+                CONNECTION_PROBE
         );
-        var compile = new ArrayList<>(List.of("-Xlint:all", "-Werror", "--module-path",
-                BROKER.toString(), "-d", classes.toString()));
-        compile.addAll(exports);
-        compile.addAll(List.of(descriptor.toString(), source.toString()));
-        succeed(root, "javac", compile.toArray(String[]::new));
-        var run = new ArrayList<>(exports);
-        run.addAll(List.of("--module-path", classes + File.pathSeparator + BROKER,
-                "-m", "probe/probe.Probe"));
-        succeed(root, "java", run.toArray(String[]::new));
     }
 
     @Test
     void testkit_resolves_both_independent_modules_transitively() throws Exception {
         assertThat(paths(TESTKIT_JARS)).hasSize(3);
-        runModuleProbe("testkitModule", TESTKIT_JARS, "org.mqtt4j.mqtj.testkit", CLIENT_PROBE + """
+        runModuleProbe("testkitModule", TESTKIT_JARS, List.of("org.mqtt4j.mqtj.testkit"),
+                CLIENT_PROBE + CONNECTION_PROBE + """
                 var scheduler = new org.mqtt4j.mqtj.testkit.ManualTimerScheduler();
                 var ran = new java.util.concurrent.atomic.AtomicBoolean();
                 scheduler.schedule(java.time.Duration.ofSeconds(1), () -> ran.set(true));
@@ -195,7 +206,8 @@ class DistributionTest {
                     || isCompileTimeOnlyAnnotations(r));
             assertThat(descriptor.requires())
                     .anyMatch(DistributionTest::isCompileTimeOnlyAnnotations);
-            assertThat(descriptor.exports()).noneMatch(e -> e.source().contains(".internal."));
+            assertThat(descriptor.exports())
+                    .noneMatch(e -> List.of(e.source().split("\\.")).contains("internal"));
             assertThat(descriptor.packages())
                     .noneMatch(p -> p.startsWith("org.mqtt4j.mqtj.common"));
         }
@@ -306,12 +318,17 @@ class DistributionTest {
         succeed(root, "java", "-cp", classes + File.pathSeparator + classpath, "probe.Probe");
     }
 
-    private void runModuleProbe(String name, String modulepath, String requiredModule, String body)
-            throws Exception {
+    private void runModuleProbe(
+            String name,
+            String modulepath,
+            List<String> requiredModules,
+            String body
+    ) throws Exception {
         Path root = temporaryDirectory.resolve(name);
         Path source = write(root.resolve("src/probe/Probe.java"), probeSource(body));
-        Path descriptor = write(root.resolve("src/module-info.java"),
-                "module probe { requires " + requiredModule + "; }"
+        Path descriptor = write(
+                root.resolve("src/module-info.java"),
+                "module probe { requires " + String.join("; requires ", requiredModules) + "; }"
         );
         Path classes = Files.createDirectories(root.resolve("classes"));
         succeed(root, "javac", "-Xlint:all", "-Werror", "--module-path", modulepath, "-d",
@@ -323,7 +340,8 @@ class DistributionTest {
     }
 
     private static String probeSource(String body) {
-        return "package probe; public class Probe { public static void main(String[] args) {"
+        return "package probe; public class Probe { public static void main(String[] args)"
+                + " throws Exception {"
                 + body + " System.out.println(\"OK\"); } }";
     }
 
