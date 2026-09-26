@@ -20,8 +20,7 @@ testing {
     suites {
         named<JvmTestSuite>("integrationTest") {
             dependencies {
-                // Starts Mosquitto in Docker for the raw wire exchange that closes version 0.1.
-                implementation(libs.testcontainers)
+                implementation(project(":test-support"))
             }
         }
     }

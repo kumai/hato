@@ -13,10 +13,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
-import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.utility.DockerImageName;
-import org.testcontainers.utility.MountableFile;
 
 import org.mqtt4j.mqtj.common.protocol.Packet;
 import org.mqtt4j.mqtj.common.protocol.PacketCodec;
@@ -25,17 +22,16 @@ import org.mqtt4j.mqtj.common.value.Qos;
 import org.mqtt4j.mqtj.common.value.ReasonCode;
 import org.mqtt4j.mqtj.common.value.Topic;
 import org.mqtt4j.mqtj.common.value.TopicFilter;
+import org.mqtt4j.mqtj.testsupport.Mosquitto;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.fail;
 import static org.mqtt4j.mqtj.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.mqtj.common.value.ReasonCode.SUCCESS;
 
 /// Exchanges raw MQTT 3.1.1 packets with a real Mosquitto broker using only the protocol and io
 /// layers. There is no session, actor, or retry, so each test drives every packet itself.
-/// Passing these tests is the exit criterion of version 0.1.
 ///
 /// Publishing and receiving use separate connections, so the packets on each connection arrive
 /// in an order the broker cannot interleave.
@@ -52,41 +48,18 @@ class MosquittoRawExchangeTest {
     private static final int MQTT_PORT = 1883;
     private static final int MAX_PACKET_SIZE = 1024 * 1024;
     private static final Duration READ_TIMEOUT = Duration.ofSeconds(10);
-    private static final String DOCKER_MISSING = """
-            Docker is not available, but the tests against real brokers require it.
-            Start Docker, or skip these tests with -Pmqtj.docker.required=false.
-            To skip them in every build, put mqtj.docker.required=false
-            in ~/.gradle/gradle.properties.""";
-
-    // The version is pinned so that a broker upgrade is a deliberate change. The configuration
-    // opens the listener to the host and allows anonymous clients; Mosquitto 2 does neither by
-    // default.
-    private static final GenericContainer<?> mosquitto =
-            new GenericContainer<>(DockerImageName.parse("eclipse-mosquitto:2.1.2-alpine"))
-                    .withCopyFileToContainer(
-                            MountableFile.forClasspathResource("mosquitto.conf"),
-                            "/mosquitto/config/mosquitto.conf"
-                    )
-                    .withExposedPorts(MQTT_PORT);
+    private static final GenericContainer<?> mosquitto = Mosquitto.container();
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
 
     /// Enables the tests when Docker is available, and also when Docker is required, so that
     /// `startBroker` fails with instructions instead of the tests being skipped.
     static boolean dockerIsAvailableOrRequired() {
-        return dockerRequired() || DockerClientFactory.instance().isDockerAvailable();
-    }
-
-    /// Only the exact value `false` opts out, so a misspelled setting cannot skip the tests.
-    private static boolean dockerRequired() {
-        return !"false".equals(System.getProperty("mqtj.docker.required"));
+        return Mosquitto.availableOrRequired();
     }
 
     @BeforeAll
     static void startBroker() {
-        if (!DockerClientFactory.instance().isDockerAvailable()) {
-            fail(DOCKER_MISSING);
-        }
-        mosquitto.start();
+        Mosquitto.start(mosquitto);
     }
 
     @AfterAll
