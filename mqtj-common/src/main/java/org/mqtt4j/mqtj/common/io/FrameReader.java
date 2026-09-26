@@ -22,11 +22,13 @@ import static org.mqtt4j.mqtj.common.value.ReasonCode.PACKET_TOO_LARGE;
 /// The input is borrowed and is never closed here. The owner serializes calls to [#read] and
 /// closes the connection after a read failure; the stream may then be partway through a packet.
 /// With [TcpConnection], closing the connection from another thread cancels a pending read.
-/// No buffering, threads, or logging are added.
+/// No read-ahead, threads, or logging are added.
 ///
 /// See [MQTT 3.1.1 Plus Errata 01, section 2.2: Fixed header](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os-complete.html).
 /// See also [MQTT 5.0, section 3.1.2.11.4: Maximum Packet Size](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html).
 public final class FrameReader {
+
+    private static final int INITIAL_CAPACITY = 16 * 1024;
 
     private final InputStream input;
 
@@ -45,8 +47,8 @@ public final class FrameReader {
 
     /// Blocks until one complete packet is available; returns empty only for EOF before it starts.
     ///
-    /// The size limit is checked after reading the fixed header, before allocating the packet
-    /// array or consuming any body bytes. Bytes belonging to the next packet are not consumed.
+    /// The size limit is checked after reading the fixed header, before consuming any body bytes.
+    /// Storage grows with received data, not the declared length. The next packet is not consumed.
     ///
     /// @throws EOFException if the stream ends partway through the header or body
     /// @throws IOException if the input fails
@@ -81,10 +83,17 @@ public final class FrameReader {
             );
         }
 
-        byte[] packet = Arrays.copyOf(header, packetSize);
-        int received = input.readNBytes(packet, headerSize, remaining);
-        if (received != remaining) {
-            throw new EOFException("Stream ended during the MQTT packet body");
+        byte[] packet = Arrays.copyOf(header, Math.min(packetSize, INITIAL_CAPACITY));
+        int received = headerSize;
+        while (received < packetSize) {
+            if (received == packet.length) {
+                // Grow only after filling the buffer; doubling keeps total copying linear.
+                packet = Arrays.copyOf(packet, Math.min(packetSize, packet.length * 2));
+            }
+            received += input.readNBytes(packet, received, packet.length - received);
+            if (received < packet.length) {
+                throw new EOFException("Stream ended during the MQTT packet body");
+            }
         }
         return Optional.of(packet);
     }

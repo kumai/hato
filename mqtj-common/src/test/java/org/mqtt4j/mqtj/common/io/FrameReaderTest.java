@@ -6,10 +6,12 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.SequenceInputStream;
+import java.lang.management.ManagementFactory;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.Optional;
 
+import com.sun.management.ThreadMXBean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -21,6 +23,7 @@ import org.mqtt4j.mqtj.common.value.ReasonCode;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 class FrameReaderTest {
 
@@ -43,7 +46,10 @@ class FrameReaderTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"127, 7f", "128, 8001", "16384, 808001", "2097152, 80808001"})
+    @CsvSource({
+            "127, 7f", "128, 8001", "16380, fc7f", "16381, fd7f", "16382, fe7f",
+            "16384, 808001", "32764, fcff01", "32765, fdff01", "2097152, 80808001"
+    })
     void remaining_length_of_each_width_delimits_the_body(int size, String lengthHex)
             throws IOException {
         // Arrange
@@ -66,6 +72,42 @@ class FrameReaderTest {
         assertThat(sut.read().orElseThrow()).isEqualTo(HexFormat.of().parseHex("4002000a"));
         assertThat(sut.read().orElseThrow()).isEqualTo(HexFormat.of().parseHex("d000"));
         assertThat(sut.read()).isEmpty();
+    }
+
+    @Test
+    void a_growing_frame_does_not_consume_the_next_packet() throws IOException {
+        byte[] header = HexFormat.of().parseHex("30808004");
+        byte[] packet = Arrays.copyOf(header, header.length + 65536);
+        Arrays.fill(packet, header.length, packet.length, (byte) 0x5A);
+        var input = new SequenceInputStream(new ByteArrayInputStream(packet),
+                new ByteArrayInputStream(HexFormat.of().parseHex("c08000")));
+        var sut = new FrameReader(input, packet.length);
+
+        assertThat(sut.read().orElseThrow()).isEqualTo(packet);
+        assertThat(sut.read().orElseThrow()).isEqualTo(HexFormat.of().parseHex("c08000"));
+        assertThat(sut.read()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1, 16383})
+    void an_incomplete_frame_allocates_for_received_bytes_not_its_declared_length(int received) {
+        // Arrange: the maximum Remaining Length, followed by only part of the body.
+        var input = new SequenceInputStream(
+                new ByteArrayInputStream(HexFormat.of().parseHex("30ffffff7f")),
+                new ByteArrayInputStream(new byte[received])
+        );
+        var sut = new FrameReader(input, 268_435_460);
+
+        // Act
+        long before = allocatedBytes();
+        Throwable failure = catchThrowable(sut::read);
+        long allocated = allocatedBytes() - before;
+
+        // Assert: the declared 256 MiB is not allocated up front. The bound leaves room for
+        // one-time class loading, which this thread's measurement also counts.
+        assertThat(before).as("per-thread allocation measurement").isNotNegative();
+        assertThat(failure).isInstanceOf(EOFException.class);
+        assertThat(allocated).isLessThan(16L * 1024 * 1024);
     }
 
     @Test
@@ -175,5 +217,11 @@ class FrameReaderTest {
     void an_input_stream_is_required() {
         assertThatThrownBy(() -> new FrameReader(null, 1024))
                 .isInstanceOf(NullPointerException.class);
+    }
+
+    // Heap bytes this thread has allocated so far, or -1 where the JVM cannot measure them.
+    private static long allocatedBytes() {
+        return ((ThreadMXBean) ManagementFactory.getThreadMXBean())
+                .getCurrentThreadAllocatedBytes();
     }
 }

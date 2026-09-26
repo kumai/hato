@@ -28,6 +28,8 @@ final class IncomingFrames {
 
     private byte @Nullable [] body;
 
+    private int packetSize;
+
     private int position;
 
     IncomingFrames(int maxPacketSize, PacketCodec codec, BiConsumer<Packet, Integer> receiver) {
@@ -56,17 +58,24 @@ final class IncomingFrames {
                             "Incoming packet exceeds " + maxPacketSize + " bytes"
                     );
                 }
-                packet = Arrays.copyOf(header, size);
+                packetSize = size;
+                packet = Arrays.copyOf(header,
+                        headerSize + Math.min(length, bytes.length - offset));
                 body = packet;
                 position = headerSize;
             }
-            int count = Math.min(bytes.length - offset, packet.length - position);
+            int count = Math.min(bytes.length - offset, packetSize - position);
+            if (count > packet.length - position) {
+                // Grow for bytes already received; doubling avoids copying for every fragment.
+                packet = Arrays.copyOf(packet,
+                        Math.min(packetSize, Math.max(position + count, packet.length * 2)));
+                body = packet;
+            }
             System.arraycopy(bytes, offset, packet, position, count);
             offset += count;
             position += count;
-            if (position == packet.length) {
-                body = null;
-                headerSize = 0;
+            if (position == packetSize) {
+                clear();
                 receiver.accept(codec.decode(packet), packet.length);
             }
         }
@@ -74,6 +83,7 @@ final class IncomingFrames {
 
     void clear() {
         body = null;
+        packetSize = 0;
         headerSize = 0;
         position = 0;
     }
