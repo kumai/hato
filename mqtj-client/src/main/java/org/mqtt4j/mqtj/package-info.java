@@ -1,7 +1,7 @@
 /// The public API of the MQTJ client.
 ///
-/// Types here are values (records and enums) or interfaces implemented by the library. Applications
-/// do not implement them; the extension points live in `org.mqtt4j.mqtj.spi`.
+/// Applications use values and client interfaces, and supply connection listeners.
+/// Transport and timer extension points live in `org.mqtt4j.mqtj.spi`.
 ///
 /// Everything is non-null unless marked `@Nullable`.
 @NullMarked

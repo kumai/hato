@@ -45,6 +45,31 @@ standalone jar. Client and broker do not depend on each other, so use either
 alone or both together. On the module path the modules are
 `org.mqtt4j.mqtj.client`, `org.mqtt4j.mqtj.broker`, and `org.mqtt4j.mqtj.testkit`.
 
+## Connecting
+
+```java
+import java.net.URI;
+
+import org.mqtt4j.mqtj.MqttClient;
+import org.mqtt4j.mqtj.MqttVersion;
+
+try (MqttClient client = MqttClient.builder()
+        .server(URI.create("mqtt://localhost:1883"))
+        .version(MqttVersion.V3_1_1)
+        .build()) {
+    client.connect().join();
+    client.disconnect().join();
+}
+```
+
+`connect()` completes when the broker accepts the connection. `disconnect()` sends
+DISCONNECT and closes the connection; the client can connect again afterward.
+Leaving the block calls `close()`, which requests immediate, permanent shutdown
+without sending DISCONNECT. For a graceful disconnect, wait for `disconnect()` to
+complete before leaving the block, as above. Configure a `connectionListener` on
+the builder to receive disconnection notifications. A null notification cause
+means no failure is reported; it does not confirm that DISCONNECT was sent.
+
 ## Embedded broker
 
 The broker is intended to start and stop with an application, without installing

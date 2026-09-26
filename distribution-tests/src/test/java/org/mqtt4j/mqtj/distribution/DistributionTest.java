@@ -45,6 +45,39 @@ class DistributionTest {
                     || filter.matches(new org.mqtt4j.mqtj.Topic("b/a"))) {
                 throw new AssertionError("Client topic values are not usable");
             }
+            org.mqtt4j.mqtj.MqttClient client = org.mqtt4j.mqtj.MqttClient.builder()
+                    .server(java.net.URI.create("mqtt://localhost"))
+                    .version(org.mqtt4j.mqtj.MqttVersion.V3_1_1)
+                    .connectionListener(end -> {
+                        if (end.cause() != null) {
+                            end.cause().getMessage();
+                        }
+                    })
+                    .build();
+            client.close();
+            if (!client.connect().isCompletedExceptionally()) {
+                throw new AssertionError("Closed client accepted a connection");
+            }
+            var transport = org.mqtt4j.mqtj.spi.Transport.tcp("probe");
+            transport.close();
+            if (transport.send(1, new byte[0])
+                    != org.mqtt4j.mqtj.spi.Transport.SendResult.CLOSED) {
+                throw new AssertionError("Closed transport accepted a write");
+            }
+            var cause = new org.mqtt4j.mqtj.MqttProtocolException(
+                    "Invalid packet field",
+                    org.mqtt4j.mqtj.ReasonCode.MALFORMED_PACKET
+            );
+            var failure = new org.mqtt4j.mqtj.MqttProtocolException(
+                    "Invalid packet",
+                    org.mqtt4j.mqtj.ReasonCode.MALFORMED_PACKET,
+                    cause
+            );
+            if (failure.reasonCode() != org.mqtt4j.mqtj.ReasonCode.MALFORMED_PACKET
+                    || failure.getCause() != cause
+                    || cause.getCause() != null) {
+                throw new AssertionError("Public protocol failure is not usable");
+            }
             """;
     private static final String BROKER_PROBE = """
             var version = org.mqtt4j.mqtj.broker.internal.common.value.MqttVersion.of(5);
@@ -114,6 +147,13 @@ class DistributionTest {
     void testkit_resolves_both_independent_modules_transitively() throws Exception {
         assertThat(paths(TESTKIT_JARS)).hasSize(3);
         runModuleProbe("testkitModule", TESTKIT_JARS, "org.mqtt4j.mqtj.testkit", CLIENT_PROBE + """
+                var scheduler = new org.mqtt4j.mqtj.testkit.ManualTimerScheduler();
+                var ran = new java.util.concurrent.atomic.AtomicBoolean();
+                scheduler.schedule(java.time.Duration.ofSeconds(1), () -> ran.set(true));
+                scheduler.advance(java.time.Duration.ofSeconds(1));
+                if (!ran.get()) {
+                    throw new AssertionError("Public timer SPI is not usable");
+                }
                 if (ModuleLayer.boot().findModule("org.mqtt4j.mqtj.client").isEmpty()
                         || ModuleLayer.boot().findModule("org.mqtt4j.mqtj.broker").isEmpty()) {
                     throw new AssertionError("Testkit did not resolve both libraries");
