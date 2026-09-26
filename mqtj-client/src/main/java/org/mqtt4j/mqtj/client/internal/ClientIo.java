@@ -8,6 +8,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.mqtj.MqttVersion;
+import org.mqtt4j.mqtj.client.internal.common.io.SendQueue;
 import org.mqtt4j.mqtj.client.internal.common.log.Log;
 import org.mqtt4j.mqtj.client.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.client.internal.common.protocol.PacketCodec;

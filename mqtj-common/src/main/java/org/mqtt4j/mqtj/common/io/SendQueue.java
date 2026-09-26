@@ -1,4 +1,4 @@
-package org.mqtt4j.mqtj.client.internal;
+package org.mqtt4j.mqtj.common.io;
 
 import java.util.ArrayDeque;
 import java.util.Optional;
@@ -6,15 +6,15 @@ import java.util.Optional;
 import org.jspecify.annotations.Nullable;
 
 /// A single FIFO with independent regular/reserved quotas. Active writes retain their quota.
-final class SendQueue {
+public final class SendQueue {
 
-    enum OfferResult {
+    public enum OfferResult {
         ACCEPTED,
         FULL,
         CLOSED
     }
 
-    record Send(long ticket, byte[] bytes, boolean reserved) {
+    public record Send(long ticket, byte[] bytes, boolean reserved) {
     }
 
     private final ArrayDeque<Send> pending = new ArrayDeque<>();
@@ -27,12 +27,12 @@ final class SendQueue {
 
     private @Nullable Send active;
 
-    SendQueue(int regularCount, long regularBytes, int reservedCount, long reservedBytes) {
+    public SendQueue(int regularCount, long regularBytes, int reservedCount, long reservedBytes) {
         maxCount = new int[] {regularCount, reservedCount};
         maxBytes = new long[] {regularBytes, reservedBytes};
     }
 
-    synchronized OfferResult offer(long ticket, byte[] value, boolean reserved) {
+    public synchronized OfferResult offer(long ticket, byte[] value, boolean reserved) {
         if (closed) {
             return OfferResult.CLOSED;
         }
@@ -48,7 +48,7 @@ final class SendQueue {
     }
 
     /// Starts the next write only when open and no other write is outstanding. Never waits.
-    synchronized Optional<Send> poll() {
+    public synchronized Optional<Send> poll() {
         if (closed || active != null) {
             return Optional.empty();
         }
@@ -56,7 +56,7 @@ final class SendQueue {
         return Optional.ofNullable(active);
     }
 
-    synchronized void completed(long ticket) {
+    public synchronized void completed(long ticket) {
         Send send = active;
         if (send == null || send.ticket() != ticket) {
             if (!closed) {
@@ -68,15 +68,15 @@ final class SendQueue {
         release(send);
     }
 
-    /// Stops admission and discards waiting sends. The transport still owns the active write.
-    synchronized void close() {
+    /// Stops admission and discards waiting sends. The active write stays with its writer.
+    public synchronized void close() {
         closed = true;
         pending.forEach(this::release);
         pending.clear();
     }
 
-    /// Releases the active write only after the transport has stopped using its buffer.
-    synchronized void ended() {
+    /// Releases the active write only after its writer has stopped using the buffer.
+    public synchronized void ended() {
         close();
         Send send = active;
         if (send != null) {

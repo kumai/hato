@@ -1,11 +1,11 @@
-package org.mqtt4j.mqtj.client.internal;
+package org.mqtt4j.mqtj.common.io;
 
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mqtt4j.mqtj.client.internal.SendQueue.OfferResult.ACCEPTED;
-import static org.mqtt4j.mqtj.client.internal.SendQueue.OfferResult.CLOSED;
-import static org.mqtt4j.mqtj.client.internal.SendQueue.OfferResult.FULL;
+import static org.mqtt4j.mqtj.common.io.SendQueue.OfferResult.ACCEPTED;
+import static org.mqtt4j.mqtj.common.io.SendQueue.OfferResult.CLOSED;
+import static org.mqtt4j.mqtj.common.io.SendQueue.OfferResult.FULL;
 
 class SendQueueTest {
 

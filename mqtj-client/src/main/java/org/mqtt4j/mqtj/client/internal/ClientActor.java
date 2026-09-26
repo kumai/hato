@@ -20,6 +20,7 @@ import org.mqtt4j.mqtj.Disconnection;
 import org.mqtt4j.mqtj.MqttCapacityException;
 import org.mqtt4j.mqtj.MqttClient;
 import org.mqtt4j.mqtj.MqttConnectException;
+import org.mqtt4j.mqtj.client.internal.common.io.SendQueue;
 import org.mqtt4j.mqtj.client.internal.common.log.Log;
 import org.mqtt4j.mqtj.client.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.spi.TimerScheduler;

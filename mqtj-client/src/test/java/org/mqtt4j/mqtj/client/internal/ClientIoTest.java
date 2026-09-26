@@ -29,15 +29,16 @@ import org.mqtt4j.mqtj.Qos;
 import org.mqtt4j.mqtj.ReasonCode;
 import org.mqtt4j.mqtj.Topic;
 import org.mqtt4j.mqtj.TopicFilter;
+import org.mqtt4j.mqtj.client.internal.common.io.SendQueue;
 import org.mqtt4j.mqtj.client.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.mqtj.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mqtt4j.mqtj.client.internal.SendQueue.OfferResult.ACCEPTED;
-import static org.mqtt4j.mqtj.client.internal.SendQueue.OfferResult.CLOSED;
-import static org.mqtt4j.mqtj.client.internal.SendQueue.OfferResult.FULL;
+import static org.mqtt4j.mqtj.client.internal.common.io.SendQueue.OfferResult.ACCEPTED;
+import static org.mqtt4j.mqtj.client.internal.common.io.SendQueue.OfferResult.CLOSED;
+import static org.mqtt4j.mqtj.client.internal.common.io.SendQueue.OfferResult.FULL;
 import static org.mqtt4j.mqtj.client.internal.common.protocol.Properties.EMPTY;
 
 class ClientIoTest {

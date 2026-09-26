@@ -20,6 +20,7 @@ import org.mqtt4j.mqtj.MqttConnectionLostException;
 import org.mqtt4j.mqtj.MqttNotConnectedException;
 import org.mqtt4j.mqtj.MqttProtocolException;
 import org.mqtt4j.mqtj.ReasonCode;
+import org.mqtt4j.mqtj.client.internal.common.io.SendQueue;
 import org.mqtt4j.mqtj.client.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.client.internal.common.protocol.PacketDecodeException;
 
