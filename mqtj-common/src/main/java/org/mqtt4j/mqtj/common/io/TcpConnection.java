@@ -31,6 +31,7 @@ public final class TcpConnection implements Closeable {
     private final OutputStream output;
 
     private TcpConnection(Socket socket) throws IOException {
+        socket.setTcpNoDelay(true);
         this.socket = socket;
         input = socket.getInputStream();
         output = socket.getOutputStream();
@@ -54,22 +55,39 @@ public final class TcpConnection implements Closeable {
             Duration connectTimeout
     ) throws IOException {
         requireNonNull(host, "host must not be null");
-        requireNonNull(connectTimeout, "connectTimeout must not be null");
         if (host.isBlank()) {
             throw new IllegalArgumentException("Host must not be blank");
         }
         if (port < 1 || port > 65535) {
             throw new IllegalArgumentException("Port must be between 1 and 65535");
         }
-        if (connectTimeout.isZero() || connectTimeout.isNegative()
-                || connectTimeout.compareTo(MAX_CONNECT_TIMEOUT) > 0) {
-            throw new IllegalArgumentException(
-                    "Connect timeout must be positive and at most 2147483647 milliseconds"
-            );
-        }
-        // The range check above also makes conversion to nanoseconds safe from overflow.
-        int timeoutMillis = (int) Math.ceilDiv(connectTimeout.toNanos(), 1_000_000L);
+        int timeoutMillis = timeoutMillis(connectTimeout);
         var address = new InetSocketAddress(host, port);
+        return connect(address, timeoutMillis);
+    }
+
+    /// Establishes a TCP connection without resolving a host name.
+    ///
+    /// Timeout bounds and socket ownership are the same as [#connect(String, int, Duration)].
+    ///
+    /// @throws IllegalArgumentException if the port is zero, or the timeout is not positive
+    ///         or exceeds the maximum
+    /// @throws java.net.UnknownHostException if the address is unresolved
+    /// @throws java.net.SocketTimeoutException if the TCP connect timeout expires
+    /// @throws IOException if connection or stream initialization fails
+    public static TcpConnection connect(
+            InetSocketAddress address,
+            Duration connectTimeout
+    ) throws IOException {
+        requireNonNull(address, "address must not be null");
+        if (address.getPort() == 0) {
+            throw new IllegalArgumentException("Port must be between 1 and 65535");
+        }
+        return connect(address, timeoutMillis(connectTimeout));
+    }
+
+    private static TcpConnection connect(InetSocketAddress address, int timeoutMillis)
+            throws IOException {
         var socket = new Socket();
         try {
             socket.connect(address, timeoutMillis);
@@ -84,6 +102,18 @@ public final class TcpConnection implements Closeable {
             }
             throw failure;
         }
+    }
+
+    private static int timeoutMillis(Duration connectTimeout) {
+        requireNonNull(connectTimeout, "connectTimeout must not be null");
+        if (connectTimeout.isZero() || connectTimeout.isNegative()
+                || connectTimeout.compareTo(MAX_CONNECT_TIMEOUT) > 0) {
+            throw new IllegalArgumentException(
+                    "Connect timeout must be positive and at most 2147483647 milliseconds"
+            );
+        }
+        // The range check above also makes conversion to nanoseconds safe from overflow.
+        return (int) Math.ceilDiv(connectTimeout.toNanos(), 1_000_000L);
     }
 
     /// Returns the borrowed input stream, for one reader at a time.

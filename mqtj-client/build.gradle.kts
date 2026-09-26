@@ -15,3 +15,19 @@ tasks.named<EmbedCommonSources>("embedCommonSources") {
 tasks.named<VerifyDisjointPackages>("verifyEmbeddedPackagesAreDisjoint") {
     allowedSharedPackages.add("org.mqtt4j.mqtj")
 }
+
+testing {
+    suites {
+        withType<JvmTestSuite>().configureEach {
+            dependencies {
+                implementation(project(":mqtj-testkit"))
+                implementation(libs.awaitility)
+            }
+        }
+        named<JvmTestSuite>("integrationTest") {
+            dependencies {
+                implementation(project(":test-support"))
+            }
+        }
+    }
+}

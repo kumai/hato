@@ -6,6 +6,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -140,6 +141,44 @@ class TcpConnectionTest {
                     LOOPBACK.getHostAddress(), unlistening.getLocalPort(), CONNECT_TIMEOUT
             )).isInstanceOf(IOException.class);
         }
+    }
+
+    @Test
+    void a_resolved_address_connects_without_looking_up_its_host_name() throws IOException {
+        // Arrange: the address carries an intentionally unresolvable host name.
+        InetAddress address = InetAddress.getByAddress("broker.invalid", LOOPBACK.getAddress());
+        try (
+                ServerSocket server = listen();
+                var sut = TcpConnection.connect(
+                        new InetSocketAddress(address, server.getLocalPort()),
+                        CONNECT_TIMEOUT
+                );
+                Socket peer = server.accept()
+        ) {
+            peer.setSoTimeout(5000);
+
+            // Act
+            sut.output().write(0x7F);
+
+            // Assert
+            assertThat(peer.getInputStream().read()).isEqualTo(0x7F);
+        }
+    }
+
+    @Test
+    void an_unresolved_address_is_rejected_without_resolving_it() {
+        var address = InetSocketAddress.createUnresolved("localhost", 1883);
+
+        assertThatThrownBy(() -> TcpConnection.connect(address, CONNECT_TIMEOUT))
+                .isInstanceOf(UnknownHostException.class);
+    }
+
+    @Test
+    void a_resolved_address_must_have_a_nonzero_port() {
+        var address = new InetSocketAddress(LOOPBACK, 0);
+
+        assertThatThrownBy(() -> TcpConnection.connect(address, CONNECT_TIMEOUT))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

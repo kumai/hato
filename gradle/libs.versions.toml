@@ -4,6 +4,7 @@
 [versions]
 junit = "6.1.3"
 assertj = "3.27.7"
+awaitility = "4.3.0"
 testcontainers = "2.0.5"
 graalvm-native = "1.1.14"
 jspecify = "1.0.1"
@@ -22,6 +23,7 @@ nullaway = { module = "com.uber.nullaway:nullaway", version.ref = "nullaway" }
 checkstyle = { module = "com.puppycrawl.tools:checkstyle", version.ref = "checkstyle" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
 assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+awaitility = { module = "org.awaitility:awaitility", version.ref = "awaitility" }
 # Real brokers in Docker for the integrationTest suites. Only the core library is used: each test
 # class decides whether a missing Docker skips it or, in CI, fails the build.
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
