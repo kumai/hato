@@ -4,6 +4,9 @@ import java.lang.System.Logger.Level;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.ResourceBundle;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -11,6 +14,59 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class LogTest {
+
+    @Test
+    void jul_infers_the_class_and_method_calling_the_facade() {
+        // Arrange
+        var jul = Logger.getLogger(LogTest.class.getName());
+        var sut = Log.of(LogTest.class);
+        var records = new ArrayList<LogRecord>();
+        var handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                // Resolve lazily inferred caller information while the caller is on the stack.
+                record.getSourceClassName();
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        jul.addHandler(handler);
+        try {
+            // Act
+            sut.info("caller {}", "test");
+
+            // Assert
+            assertThat(records).singleElement().satisfies(record -> {
+                assertThat(record.getSourceClassName()).isEqualTo(LogTest.class.getName());
+                assertThat(record.getSourceMethodName())
+                        .isEqualTo("jul_infers_the_class_and_method_calling_the_facade");
+            });
+        } finally {
+            jul.removeHandler(handler);
+        }
+    }
+
+    @Test
+    void system_logger_parameter_overloads_use_the_same_placeholder_syntax() {
+        // Arrange
+        var recording = new RecordingLogger(Level.TRACE);
+        System.Logger sut = Log.of(recording);
+
+        // Act
+        sut.log(Level.INFO, "value {}", "one");
+        sut.log(Level.INFO, (ResourceBundle) null, "value {}", "two");
+
+        // Assert
+        assertThat(recording.records).extracting(Record::message)
+                .containsExactly("value one", "value two");
+    }
 
     @Test
     void substitutes_placeholders_in_order() {
@@ -65,14 +121,19 @@ class LogTest {
     }
 
     @Test
-    void arrays_are_rendered_element_by_element() {
+    void arrays_render_their_elements_and_byte_arrays_render_as_hex() {
         var logger = new RecordingLogger(Level.TRACE);
         var sut = Log.of(logger);
 
-        sut.debug("bytes {} names {} nothing {}", new byte[] {1, 2}, new String[] {"a"}, null);
+        sut.debug(
+                "bytes {} names {} nothing {}",
+                new byte[] {0x30, (byte) 0xff},
+                new String[] {"a"},
+                null
+        );
 
         assertThat(logger.records.getFirst().message())
-                .isEqualTo("bytes [1, 2] names [a] nothing null");
+                .isEqualTo("bytes 30ff names [a] nothing null");
     }
 
     @Test
@@ -105,34 +166,9 @@ class LogTest {
     }
 
     @Test
-    void the_prefix_goes_in_front_of_every_message() {
-        var logger = new RecordingLogger(Level.TRACE);
-        var sut = Log.of(logger).withPrefix("client-1");
-
-        sut.info("reconnecting in {}", "5s");
-        sut.warnOnce("key", "slow");
-
-        assertThat(logger.records).extracting(Record::message)
-                .containsExactly("[client-1] reconnecting in 5s", "[client-1] slow");
-    }
-
-    @Test
-    void warn_once_logs_the_first_occurrence_of_a_key_only() {
-        var logger = new RecordingLogger(Level.TRACE);
-        var sut = Log.of(logger);
-
-        sut.warnOnce("puback-for-qos2", "PUBACK for QoS 2 packet {}", 1);
-        sut.warnOnce("puback-for-qos2", "PUBACK for QoS 2 packet {}", 2);
-        sut.warnOnce("other", "other {}", 3);
-
-        assertThat(logger.records).extracting(Record::message)
-                .containsExactly("PUBACK for QoS 2 packet 1", "other 3");
-    }
-
-    @Test
     void class_based_logs_are_named_after_the_class() {
-        assertThat(Log.of(LogTest.class).name()).isEqualTo(LogTest.class.getName());
-        assertThat(Log.of("org.mqtt4j.mqtj.test").name()).isEqualTo("org.mqtt4j.mqtj.test");
+        assertThat(Log.of(LogTest.class).getName()).isEqualTo(LogTest.class.getName());
+        assertThat(Log.of("org.mqtt4j.mqtj.test").getName()).isEqualTo("org.mqtt4j.mqtj.test");
     }
 
     private record Record(Level level, String message, @Nullable Throwable thrown) {

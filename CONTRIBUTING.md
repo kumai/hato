@@ -167,10 +167,10 @@ A few points sit outside code style and are checked in review:
   is internal and may change at any time. Adding a public type or method is a
   design decision; open an issue first.
 - Logging goes through `System.Logger` only, via the internal `Log` facade in
-  `common.log` with SLF4J-style `{}` placeholders. Logger names that users
-  configure belong to the distribution (`org.mqtt4j.mqtj.client.<component>`,
-  `org.mqtt4j.mqtj.broker.<component>`); shared code receives its `Log` from the
-  owner, and class-based names are for internal diagnostics. Never log at
+  `common.log` with SLF4J-style `{}` placeholders. Each class owns a static
+  `Log.of(Class)` logger. Package names identify the distribution; individual
+  class names are implementation details. Client worker names include the
+  client id; connection lifecycle messages include the id and endpoint. Never log at
   `INFO` on a hot path, and never log payloads below `TRACE`.
 - Java 25 is the baseline. Records, sealed types, pattern matching, and virtual
   threads are expected. Preview features are not used.
@@ -181,9 +181,36 @@ A few points sit outside code style and are checked in review:
 
 ## Commits and pull requests
 
-- Read `git log` and match what you see: the shape of the title and the level of
-  detail in the body. A message explains what the change makes possible and why
-  it is needed, not which files were edited.
+A commit title starts with the area of the change, a colon, and a summary that
+begins with a lowercase verb and has no final period. The verb says what kind of
+change it is, such as add, fix, or remove:
+
+```text
+client: fix a lost PUBACK after a reconnect that resumes the session
+```
+
+Use one of the areas below. When a change spans several, choose the one a
+reader should look at first; a change to both client and broker is usually
+better split.
+
+| Area | Covers |
+| --- | --- |
+| `client` | `mqtj-client`: the public API, sessions, reconnection, and delivery |
+| `broker` | `mqtj-broker` |
+| `testkit` | `mqtj-testkit` |
+| `protocol` | `protocol` and `value` in `mqtj-common`: packets, the codec, topics, and reason codes |
+| `io` | `io` in `mqtj-common`: TCP, TLS, WebSocket, and framing |
+| `common` | the other layers of `mqtj-common`, and changes that span several of its layers |
+| `build` | the Gradle build, `build-logic`, dependency versions, `distribution-tests`, and `native-smoke` |
+| `ci` | GitHub Actions and Dependabot |
+| `docs` | the README, this guide, the code conventions, and `examples` |
+
+- The body explains what the change makes possible and why it is needed: the
+  new capability or the corrected behavior, and the decisions behind it. The
+  code shows what was written, so do not list the files or classes that
+  changed.
+- Pull request titles take the same form, because a squashed pull request uses
+  its title as the commit title.
 - A pull request should contain one coherent change that can be reverted as a
   whole. Pull requests are merged either as one squashed commit or with a merge
   commit. Rebase merges are disabled so that the boundary of a change stays

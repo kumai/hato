@@ -1,9 +1,8 @@
 package org.mqtt4j.mqtj.common.log;
 
-import java.lang.System.Logger.Level;
 import java.util.Arrays;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.HexFormat;
+import java.util.ResourceBundle;
 
 import org.jspecify.annotations.Nullable;
 
@@ -16,21 +15,19 @@ import static java.util.Objects.requireNonNull;
 /// itself, only when the level is enabled, and hands the finished text to `System.Logger`.
 /// Applications keep configuring levels and backends through `System.Logger` names.
 ///
-/// Names matter to users. A component whose messages users configure gets a stable name owned by
-/// the distribution, such as `org.mqtt4j.mqtj.client.transport`. The shared implementation receives
-/// its `Log` from that owner. Class-based names are for internal diagnostics.
-public final class Log {
+/// Arguments are rendered only when the level is enabled, so pass values as they are instead of
+/// preformatting them or guarding the call. Arrays render their elements; byte arrays render as
+/// hexadecimal, as in wire dumps.
+///
+/// Each class owns a static log named after that class. Package names identify the distribution;
+/// individual class names are implementation details. Implementing `System.Logger` lets JUL infer
+/// the actual caller through this facade. Parameterized overloads all use `{}`, not MessageFormat.
+public final class Log implements System.Logger {
 
     private final System.Logger logger;
 
-    private final String prefix;
-
-    private final Set<String> warnedKeys;
-
-    private Log(System.Logger logger, String prefix, Set<String> warnedKeys) {
+    private Log(System.Logger logger) {
         this.logger = logger;
-        this.prefix = prefix;
-        this.warnedKeys = warnedKeys;
     }
 
     /// Returns the log with the given `System.Logger` name.
@@ -46,30 +43,38 @@ public final class Log {
     }
 
     static Log of(System.Logger logger) {
-        return new Log(
-                requireNonNull(logger, "logger must not be null"),
-                "",
-                ConcurrentHashMap.newKeySet()
-        );
-    }
-
-    /// Returns a log that puts `[prefix]` in front of every message, typically the client id.
-    /// The returned log has its own `warnOnce` history.
-    public Log withPrefix(String prefix) {
-        return new Log(logger, "[" + prefix + "] ", ConcurrentHashMap.newKeySet());
+        return new Log(requireNonNull(logger, "logger must not be null"));
     }
 
     /// The `System.Logger` name.
-    public String name() {
+    @Override
+    public String getName() {
         return logger.getName();
     }
 
-    public boolean isDebug() {
-        return logger.isLoggable(Level.DEBUG);
+    @Override
+    public boolean isLoggable(Level level) {
+        return logger.isLoggable(level);
     }
 
-    public boolean isTrace() {
-        return logger.isLoggable(Level.TRACE);
+    @Override
+    public void log(
+            Level level,
+            @Nullable ResourceBundle bundle,
+            String message,
+            @Nullable Throwable thrown
+    ) {
+        logger.log(level, bundle, message, thrown);
+    }
+
+    @Override
+    public void log(
+            Level level,
+            @Nullable ResourceBundle bundle,
+            String message,
+            @Nullable Object @Nullable ... args
+    ) {
+        formatAndLog(level, bundle, message, args == null ? new Object[0] : args);
     }
 
     public void error(String message, @Nullable Object... args) {
@@ -92,16 +97,17 @@ public final class Log {
         log(Level.TRACE, message, args);
     }
 
-    /// Logs a warning the first time `key` is seen by this log and ignores later calls with the
-    /// same key. Use it for tolerated protocol violations that would otherwise repeat per packet.
-    /// Keys must come from a bounded set, such as constants.
-    public void warnOnce(String key, String message, @Nullable Object... args) {
-        if (warnedKeys.add(key)) {
-            log(Level.WARNING, message, args);
-        }
+    @Override
+    public void log(Level level, String message, @Nullable Object... args) {
+        formatAndLog(level, null, message, args);
     }
 
-    private void log(Level level, String message, @Nullable Object[] args) {
+    private void formatAndLog(
+            Level level,
+            @Nullable ResourceBundle bundle,
+            String message,
+            @Nullable Object[] args
+    ) {
         if (!logger.isLoggable(level)) {
             return;
         }
@@ -112,12 +118,8 @@ public final class Log {
             thrown = last;
             used--;
         }
-        String text = prefix + substitute(message, args, used);
-        if (thrown == null) {
-            logger.log(level, text);
-        } else {
-            logger.log(level, text, thrown);
-        }
+        String text = substitute(message, args, used);
+        logger.log(level, bundle, text, thrown);
     }
 
     private static int countPlaceholders(String message) {
@@ -162,7 +164,7 @@ public final class Log {
             return switch (value) {
                 case null -> "null";
                 case Object[] array -> Arrays.deepToString(array);
-                case byte[] array -> Arrays.toString(array);
+                case byte[] array -> HexFormat.of().formatHex(array);
                 case int[] array -> Arrays.toString(array);
                 case long[] array -> Arrays.toString(array);
                 case char[] array -> Arrays.toString(array);
