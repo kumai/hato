@@ -1,4 +1,4 @@
-/// Test support for applications that use MQTJ. Packages are exported as the kit takes shape.
+/// Test support for applications that use MQTJ.
 /// The shared implementation is embedded privately here as well; the kit never reaches into the
 /// internals of the client or broker jars.
 module org.mqtt4j.mqtj.testkit {
@@ -7,4 +7,6 @@ module org.mqtt4j.mqtj.testkit {
 
     requires transitive org.mqtt4j.mqtj.client;
     requires transitive org.mqtt4j.mqtj.broker;
+
+    exports org.mqtt4j.mqtj.testkit;
 }
