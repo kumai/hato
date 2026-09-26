@@ -72,23 +72,56 @@ means no failure is reported; it does not confirm that DISCONNECT was sent.
 
 ## Embedded broker
 
-The broker is intended to start and stop with an application, without installing
-a separate service. Suitable uses include local tool integration, device
-simulators, demos, and temporary message routing where state can be recreated
-after a restart. Applications use `mqtj-broker` directly; the test kit is optional.
+The experimental broker starts and stops with an application. Use `mqtj-broker`
+directly; the test kit is optional. This example connects through the public APIs:
 
-All retained messages, subscriptions, sessions, and pending deliveries live in
-memory and are lost when the broker instance stops or restarts. There is no disk
+```java
+import java.net.URI;
+
+import org.mqtt4j.mqtj.MqttClient;
+import org.mqtt4j.mqtj.MqttVersion;
+import org.mqtt4j.mqtj.broker.MqttBroker;
+
+try (
+        MqttBroker broker = MqttBroker.start();
+        MqttClient client = MqttClient.builder()
+                .server(URI.create("mqtt://localhost:" + broker.port()))
+                .version(MqttVersion.V3_1_1)
+                .build()
+) {
+    client.connect().join();
+    client.disconnect().join();
+}
+```
+
+`start()` binds a system-assigned port on loopback; `port()` returns that port.
+Use `start(InetSocketAddress)` to select a bind address and port. Starting can
+throw `IOException`. Leaving the block calls `close()`, which stops the listener,
+closes all connections, and discards their state. Repeated close calls are harmless.
+
+The current broker supports MQTT 3.1.1 over TCP, clean sessions, subscriptions,
+and QoS 0/1 routing. Clean Session 0 and Will requests are refused with CONNACK
+0x03; an empty client identifier with Clean Session 0 is refused with 0x02.
+Retained publications reach current subscribers but are not stored. Credentials
+are not checked, and `$share/` filters are matched literally without shared routing.
+The client publish and subscribe APIs are still on the roadmap.
+
+A connection is disconnected when it exceeds its provisional send budget of 128
+packets or 16 MiB, or its 128 unacknowledged QoS 1 deliveries. The budget counts
+every outgoing packet, so a single publication whose packet exceeds 16 MiB
+disconnects each matching subscriber, even an idle one, while the publisher
+still receives its PUBACK. These are internal limits, not configurable settings
+or stable contracts. The broker API is experimental and outside the
+compatibility promise.
+
+The intended scope is local or trusted environments: tests, device simulators,
+demos, and temporary routing where state can be recreated. There is no disk
 persistence, clustering, replication, or high availability. QoS does not imply
-durability across broker restarts.
-
-The initial scope is TCP in local or trusted environments, with loopback binding
-by default and configurable limits on connections and stored data. Server-side
-TLS, authentication/ACLs, and WebSocket listeners are later candidates. The
-client's TLS and WebSocket support is independent of these broker features.
-Limited production use is an intended use case when these constraints fit;
-supported features and measured operating limits will be documented before a
-stable broker release.
+durability across restarts. Persistent sessions, Wills, retained storage, and
+configurable operating limits are future work. Server-side TLS, authentication/ACLs,
+and WebSocket listeners are later candidates, independent of the client's support.
+Limited production use remains a future goal; supported features and measured
+operating limits will be documented before a stable broker release.
 
 ## Roadmap
 
