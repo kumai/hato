@@ -3,9 +3,12 @@ package org.mqtt4j.mqtj;
 import java.util.concurrent.CompletableFuture;
 
 /// Owns an MQTT connection. A disconnected client can connect again until it is closed.
+/// Its methods and those of its subscriptions are safe to call concurrently from any thread.
 ///
 /// Operations report failure through their returned futures. Admission can fail immediately
 /// with [MqttCapacityException], or with [IllegalStateException] after the client is closed.
+/// A publication that exceeds the send capacity on its own always fails with
+/// [MqttCapacityException], whatever maximum incoming packet size is configured.
 /// Cancelling or completing a returned future does not cancel the underlying operation.
 ///
 /// The client completes operations independently of I/O and listener callbacks. One blocked
@@ -13,7 +16,7 @@ import java.util.concurrent.CompletableFuture;
 /// listeners retain capacity until they return, so further operations may be rejected.
 /// A returned future may already be complete; subsequently attached continuations follow the
 /// usual [CompletableFuture] execution rules and may run on the attaching application thread.
-public interface MqttClient extends AutoCloseable {
+public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable {
 
     /// Starts configuration without opening a connection.
     static MqttClientBuilder builder() {

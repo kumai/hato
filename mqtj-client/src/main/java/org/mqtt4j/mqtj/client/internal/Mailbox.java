@@ -6,7 +6,7 @@ import java.util.function.BooleanSupplier;
 
 import org.jspecify.annotations.Nullable;
 
-/// FIFO order is shared by both admission classes. Termination has its own slot.
+/// FIFO order is shared by all admission classes. Termination has its own slot.
 /// Generation changes and admission share the monitor so old callbacks cannot consume capacity.
 final class Mailbox {
 
@@ -16,31 +16,53 @@ final class Mailbox {
         STALE
     }
 
-    record Event(long generation, Runnable action, boolean control, int bytes) {
+    enum Kind {
+        COMMAND,
+        INCOMING,
+        CONTROL
+    }
+
+    record Event(long generation, Runnable action, Kind kind, int bytes) {
     }
 
     private final ArrayDeque<Event> events = new ArrayDeque<>();
 
-    private final int dataLimit;
+    private final int commandLimit;
+
+    private final long commandByteLimit;
+
+    private final int incomingLimit;
+
+    private final long incomingByteLimit;
 
     private final int controlLimit;
 
-    private final long byteLimit;
-
     private long activeGeneration;
 
-    private int dataCount;
+    private int commandCount;
+
+    private long commandBytes;
+
+    private int incomingCount;
+
+    private long incomingBytes;
 
     private int controlCount;
 
-    private long bytes;
-
     private @Nullable Event termination;
 
-    Mailbox(int dataLimit, int controlLimit, long byteLimit) {
-        this.dataLimit = dataLimit;
+    Mailbox(
+            int commandLimit,
+            long commandByteLimit,
+            int incomingLimit,
+            long incomingByteLimit,
+            int controlLimit
+    ) {
+        this.commandLimit = commandLimit;
+        this.commandByteLimit = commandByteLimit;
+        this.incomingLimit = incomingLimit;
+        this.incomingByteLimit = incomingByteLimit;
         this.controlLimit = controlLimit;
-        this.byteLimit = byteLimit;
     }
 
     /// Called by the actor before scheduling timers or opening I/O for the new connection.
@@ -53,18 +75,27 @@ final class Mailbox {
         if (event.generation() != 0 && event.generation() != activeGeneration) {
             return OfferResult.STALE;
         }
-        if (event.control()
-                ? controlCount >= controlLimit
-                : dataCount >= dataLimit || event.bytes() > byteLimit - bytes
-        ) {
+        boolean full = switch (event.kind()) {
+            case COMMAND -> commandCount >= commandLimit
+                    || event.bytes() > commandByteLimit - commandBytes;
+            case INCOMING -> incomingCount >= incomingLimit
+                    || event.bytes() > incomingByteLimit - incomingBytes;
+            case CONTROL -> controlCount >= controlLimit;
+        };
+        if (full) {
             return OfferResult.FULL;
         }
         events.addLast(event);
-        if (event.control()) {
-            controlCount++;
-        } else {
-            dataCount++;
-            bytes += event.bytes();
+        switch (event.kind()) {
+            case COMMAND -> {
+                commandCount++;
+                commandBytes += event.bytes();
+            }
+            case INCOMING -> {
+                incomingCount++;
+                incomingBytes += event.bytes();
+            }
+            case CONTROL -> controlCount++;
         }
         notifyAll();
         return OfferResult.ACCEPTED;
@@ -128,11 +159,16 @@ final class Mailbox {
     }
 
     private void release(Event event) {
-        if (event.control()) {
-            controlCount--;
-        } else {
-            dataCount--;
-            bytes -= event.bytes();
+        switch (event.kind()) {
+            case COMMAND -> {
+                commandCount--;
+                commandBytes -= event.bytes();
+            }
+            case INCOMING -> {
+                incomingCount--;
+                incomingBytes -= event.bytes();
+            }
+            case CONTROL -> controlCount--;
         }
     }
 }

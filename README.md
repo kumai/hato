@@ -70,6 +70,107 @@ complete before leaving the block, as above. Configure a `connectionListener` on
 the builder to receive disconnection notifications. A null notification cause
 means no failure is reported; it does not confirm that DISCONNECT was sent.
 
+## Publishing and subscribing
+
+After connecting, register a handler and publish a message:
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+import org.mqtt4j.mqtj.MqttMessage;
+import org.mqtt4j.mqtj.Qos;
+import org.mqtt4j.mqtj.Subscribe;
+import org.mqtt4j.mqtj.Subscription;
+import org.mqtt4j.mqtj.Topic;
+import org.mqtt4j.mqtj.TopicFilter;
+
+var received = new CompletableFuture<MqttMessage>();
+Subscription subscription = client.subscribe(
+        new Subscribe(new TopicFilter("sensors/#"), Qos.AT_MOST_ONCE),
+        delivery -> received.complete(delivery.message())
+).join();
+client.publish(new MqttMessage(
+        new Topic("sensors/temperature"),
+        new byte[] {21},
+        Qos.AT_MOST_ONCE,
+        false
+)).join();
+received.join();
+subscription.unsubscribe().join();
+```
+
+QoS 0 publication completes after the transport finishes writing; it does not
+confirm broker receipt. Subscription completes on SUBACK, but handlers can receive
+messages before that acknowledgement. Each subscription runs its handler serially
+on its own virtual thread. A handler can publish and wait for completion.
+Client and subscription methods are safe to call concurrently from any thread.
+`MqttPublisher` and `MqttSubscriber` expose these roles without connection ownership.
+`MqttMessage` copies its payload on construction and access.
+
+An identical filter is rejected with `IllegalStateException` while its
+subscription is pending, active, or being removed. Each incoming PUBLISH goes to
+every matching subscription. MQTT 3.1.1 cannot identify broker copies for
+overlapping subscriptions, so each copy also reaches every match.
+`$share/group/filter` is routed using the trailing filter on clients; the broker
+must support shared subscriptions to use it.
+If either filter is shared, overlapping subscriptions on the same client are
+rejected with `IllegalStateException`. This includes different shared groups and
+subscriptions awaiting SUBACK or UNSUBACK. Without a subscription identifier on
+received packets, an ordinary subscription's copy could otherwise reach a shared
+handler and defeat the broker's distribution. Use separate clients for such
+combinations. Ordinary subscriptions can still overlap each other.
+
+The third `Subscribe` argument sets its queued-plus-running delivery limit
+(default 256). Shared internal limits currently allow 256 subscription lanes,
+4096 recipient deliveries, and 32 MiB of received packet bytes (raised with
+`maxPacketSize` when necessary). Shared payloads count once. Up to 256 received
+packets can wait for the client's protocol thread; a longer back-to-back burst
+closes the connection even when handlers are fast. A full receive budget
+or a handler failure closes the connection and notifies `connectionListener`.
+Handler failures are logged even when their connection has already ended. Such
+late failures neither issue another disconnection notification nor affect a new
+connection. Interrupt status left by a normally returning handler is cleared
+before the next delivery.
+Queued deliveries are discarded and counted as abandoned on connection ending or
+UNSUBACK; an executing handler can finish and retains its capacity until returning.
+Lane capacity is released when its worker exits, so subscribing immediately after
+removal at the 256-lane limit can still be temporarily rejected.
+These limits are provisional and may change after load measurements.
+
+`unsubscribe()` stops new local admissions immediately. If its normal send budget
+is full, only that operation fails and the subscription becomes active again; it
+can be retried. While `disconnect()` is pending, it fails with
+`MqttNotConnectedException`. `Subscription.close()` starts unsubscribe without
+waiting and has no further effect while removal is pending.
+Each `unsubscribe()` call returns an independent future. Changing or timing out
+that future does not affect removal or later calls. Calls while removal is pending
+share the wire request, but each holds an operation slot until the exchange ends,
+even after its own future times out. Retrying after a timeout therefore cannot
+speed up removal and can make other operations, including `disconnect()`, fail
+with `MqttCapacityException`. Rejecting an additional call leaves the pending
+removal unchanged.
+When the connection ends, its subscription handles are retired. Later calls to
+`unsubscribe()` complete locally, including after reconnecting or requesting client
+shutdown; after a shutdown request they also discard queued deliveries. They do not
+remove a new subscription for the same filter or change the failure of a removal
+that was pending when the old connection ended.
+
+The client admits at most 64 operations at a time. Each holds its slot until its
+future completes and dependent callbacks return, so wait for results or bound the
+number of outstanding operations. Queued publications can hold up to 32 MiB of
+payload in total. A publication whose encoded packet exceeds the 16 MiB send
+budget always fails with `MqttCapacityException`; `maxPacketSize` limits only
+incoming packets, so retrying cannot succeed. A temporarily full send budget
+fails the affected operation the same way and preserves the connection.
+API commands and incoming packets have separate mailbox budgets, so queued
+publications do not consume receive capacity. Payload copying and PUBLISH encoding
+run on a separate sender, allowing the protocol thread to process incoming packets
+and timers while a large publication is prepared. Send capacity includes queued,
+preparing, and active writes across connection changes; capacity held by an old
+connection returns once both the sender and the transport have released the data.
+Disconnected publish/subscribe calls fail immediately. QoS 1/2 operations are
+currently rejected.
+
 ## Embedded broker
 
 The experimental broker starts and stops with an application. Use `mqtj-broker`
@@ -104,7 +205,8 @@ and QoS 0/1 routing. Clean Session 0 and Will requests are refused with CONNACK
 0x03; an empty client identifier with Clean Session 0 is refused with 0x02.
 Retained publications reach current subscribers but are not stored. Credentials
 are not checked, and `$share/` filters are matched literally without shared routing.
-The client publish and subscribe APIs are still on the roadmap.
+The client currently supports QoS 0 publishing and push subscriptions; QoS 1
+and pull subscriptions are planned next.
 
 A connection is disconnected when it exceeds its provisional send budget of 128
 packets or 16 MiB, or its 128 unacknowledged QoS 1 deliveries. The budget counts

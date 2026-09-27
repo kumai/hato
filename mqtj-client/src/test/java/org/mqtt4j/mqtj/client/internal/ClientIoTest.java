@@ -4,10 +4,13 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -24,6 +27,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.mqtj.MqttMessage;
 import org.mqtt4j.mqtj.MqttVersion;
 import org.mqtt4j.mqtj.Qos;
 import org.mqtt4j.mqtj.ReasonCode;
@@ -32,10 +36,13 @@ import org.mqtt4j.mqtj.TopicFilter;
 import org.mqtt4j.mqtj.client.internal.common.io.SendQueue;
 import org.mqtt4j.mqtj.client.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.mqtj.client.internal.common.protocol.Properties;
 import org.mqtt4j.mqtj.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.mqtj.client.internal.common.io.SendQueue.OfferResult.ACCEPTED;
 import static org.mqtt4j.mqtj.client.internal.common.io.SendQueue.OfferResult.CLOSED;
 import static org.mqtt4j.mqtj.client.internal.common.io.SendQueue.OfferResult.FULL;
@@ -47,6 +54,8 @@ class ClientIoTest {
 
     private final RecordingEvents events = new RecordingEvents();
 
+    private final RecordingCodec codec = new RecordingCodec();
+
     private final ClientIo sut = new ClientIo(
             URI.create("mqtt://localhost"),
             "io-test",
@@ -57,12 +66,13 @@ class ClientIoTest {
                 transports.add(transport);
                 return transport;
             },
-            events
+            events,
+            codec
     );
 
     @AfterEach
     void close() {
-        sut.close();
+        sut.shutdown();
     }
 
     @Test
@@ -71,7 +81,7 @@ class ClientIoTest {
         var jul = Logger.getLogger(ClientIo.class.getName());
         Level previousLevel = jul.getLevel();
         boolean previousParents = jul.getUseParentHandlers();
-        var records = new ArrayList<LogRecord>();
+        var records = new CopyOnWriteArrayList<LogRecord>();
         var handler = new Handler() {
             @Override
             public void publish(LogRecord record) {
@@ -106,6 +116,7 @@ class ClientIoTest {
             // Act: DEBUG describes admission, write completion, and decoded input.
             jul.setLevel(Level.FINE);
             sut.send(1, 1, packet);
+            await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
             requireNonNull(transport.listener).onBytes(bytes);
 
             // Assert
@@ -123,6 +134,7 @@ class ClientIoTest {
             records.clear();
             jul.setLevel(Level.FINER);
             sut.send(1, 2, packet);
+            await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L));
             requireNonNull(transport.listener).onBytes(bytes);
 
             // Assert
@@ -137,6 +149,7 @@ class ClientIoTest {
             records.clear();
             jul.setLevel(Level.OFF);
             sut.send(1, 3, packet);
+            await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L, 3L));
             requireNonNull(transport.listener).onBytes(bytes);
             assertThat(records).isEmpty();
         } finally {
@@ -164,16 +177,15 @@ class ClientIoTest {
 
         // Assert: the transport receives only one write and has no capacity policy.
         assertThat(result).isEqualTo(FULL);
-        assertThat(transport.attempts).containsExactly(1L);
+        await().untilAsserted(() -> assertThat(transport.attempts).containsExactly(1L));
         assertThat(events.failures).isEmpty();
         assertThat(events.ends).isEmpty();
         assertThat(transport.rejectSend).isFalse();
 
         // Act & Assert: completing one write permits a new send after the refusal.
         transport.complete();
-        drainCompletions();
+        await().untilAsserted(() -> assertThat(transport.attempts).containsExactly(1L, 2L));
         assertThat(sut.send(1, limit + 2, packet)).isEqualTo(ACCEPTED);
-        assertThat(transport.attempts).containsExactly(1L, 2L);
     }
 
     @Test
@@ -194,9 +206,10 @@ class ClientIoTest {
         assertThat(sut.send(1, 131, new Packet.PingReq())).isEqualTo(ACCEPTED);
         assertThat(sut.send(1, 132, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY)))
                 .isEqualTo(ACCEPTED);
+        transport.awaitActive();
         transport.completeInline = true;
         transport.complete();
-        drainCompletions();
+        await().untilAsserted(() -> assertThat(events.tickets).hasSize(131));
 
         // Assert
         assertThat(events.failures).isEmpty();
@@ -214,18 +227,19 @@ class ClientIoTest {
     ) {
         // Arrange: two 8 MiB payloads, or one 16 MiB payload, exceed the encoded byte budget.
         SingleWriteTransport transport = open(1);
-        Packet packet = publish(payloadSize);
+        MqttMessage message = message(payloadSize);
         for (int i = 1; i <= admitted; i++) {
-            assertThat(sut.send(1, i, packet)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, i, message)).isEqualTo(ACCEPTED);
         }
 
         // Act & Assert
-        assertThat(sut.send(1, 2, packet)).isEqualTo(FULL);
+        assertThat(sut.publish(1, 2, message)).isEqualTo(FULL);
         assertThat(sut.send(1, 3, publish())).isEqualTo(ACCEPTED);
         assertThat(sut.send(1, 4, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        transport.awaitActive();
         transport.completeInline = true;
         transport.complete();
-        drainCompletions();
+        await().untilAsserted(() -> assertThat(events.tickets).hasSize(admitted + 2));
         assertThat(transport.attempts).doesNotContain(2L).endsWith(3L, 4L);
         assertThat(events.failures).isEmpty();
         assertThat(events.ends).isEmpty();
@@ -233,20 +247,45 @@ class ClientIoTest {
     }
 
     @Test
-    void inline_completions_do_not_start_another_write_inside_the_callback() {
+    void refused_publications_are_not_encoded_and_use_only_the_regular_budget() {
+        // Arrange
+        SingleWriteTransport transport = open(1);
+        MqttMessage tooLarge = message(16 * 1024 * 1024);
+
+        // Act & Assert: payload plus its header does not fit even in an empty queue.
+        assertThat(sut.publish(1, 1, tooLarge)).isEqualTo(FULL);
+        assertThat(codec.prepared.get()).isZero();
+        for (int i = 1; i <= 128; i++) {
+            assertThat(sut.publish(1, i, message(0))).isEqualTo(ACCEPTED);
+        }
+        transport.awaitActive();
+        assertThat(sut.publish(1, 129, message(0))).isEqualTo(FULL);
+        assertThat(codec.prepared.get()).isEqualTo(1);
+        assertThat(sut.send(1, 130, new Packet.PingReq())).isEqualTo(ACCEPTED);
+
+        // Act & Assert: closure takes precedence and keeps the transport's cause.
+        var cause = new IOException("Connection ended");
+        transport.end(cause);
+        assertThat(sut.publish(1, 131, tooLarge)).isEqualTo(CLOSED);
+        assertThat(events.ends).containsExactly(cause);
+        assertThat(events.failures).isEmpty();
+    }
+
+    @Test
+    void inline_completions_advance_writes_without_actor_work_or_recursive_sends() {
         // Arrange
         SingleWriteTransport transport = open(1);
         for (int i = 1; i <= 16; i++) {
             sut.send(1, i, new Packet.PingReq());
         }
+        transport.awaitActive();
         transport.completeInline = true;
 
-        // Act
+        // Act: no actor consumes or forwards the recorded completion events.
         transport.complete();
 
-        // Assert: draining waits for the actor's completion event.
-        assertThat(transport.attempts).containsExactly(1L);
-        drainCompletions();
+        // Assert
+        await().untilAsserted(() -> assertThat(events.tickets).hasSize(16));
         assertThat(transport.attempts).hasSize(16);
         assertThat(transport.maximumSendDepth).isEqualTo(1);
         assertThat(events.failures).isEmpty();
@@ -261,13 +300,16 @@ class ClientIoTest {
         sut.send(1, 2, new Packet.PingReq());
         sut.send(1, 3, new Packet.PingReq());
         var failure = new IOException("Connection reset");
+        transport.awaitActive();
         transport.rejectSend = true;
         transport.endInsideSend = inline ? failure : null;
 
         // Act
         transport.complete();
-        drainCompletions();
-        assertThat(sut.send(1, 4, new Packet.PingReq())).isEqualTo(CLOSED);
+        await().untilAsserted(() -> assertThat(transport.rejections.get()).isEqualTo(1));
+        // A publication that never fits stays FULL until closure makes it CLOSED.
+        MqttMessage tooLarge = message(16 * 1024 * 1024);
+        await().untilAsserted(() -> assertThat(sut.publish(1, 4, tooLarge)).isEqualTo(CLOSED));
         if (!inline) {
             assertThat(events.ends).isEmpty();
             transport.end(failure);
@@ -277,7 +319,7 @@ class ClientIoTest {
         assertThat(transport.attempts).containsExactly(1L, 2L);
         assertThat(events.tickets).containsExactly(1L);
         assertThat(events.failures).isEmpty();
-        assertThat(events.ends).containsExactly(failure);
+        await().untilAsserted(() -> assertThat(events.ends).containsExactly(failure));
     }
 
     @Test
@@ -286,6 +328,7 @@ class ClientIoTest {
         SingleWriteTransport old = open(1);
         sut.send(1, 1, new Packet.PingReq());
         sut.send(1, 2, new Packet.PingReq());
+        old.awaitActive();
 
         // Act: transport shutdown is asynchronous and still owns its active buffer.
         sut.close();
@@ -295,16 +338,211 @@ class ClientIoTest {
         old.complete();
         old.end(new IOException("Old connection closed"));
         current.complete();
-        sut.sendNext(1);
+        await().untilAsserted(() -> assertThat(current.attempts).containsExactly(1L, 2L));
 
         // Assert: the old queue neither sends its pending item nor advances the new queue.
         assertThat(old.attempts).containsExactly(1L);
-        assertThat(current.attempts).containsExactly(1L);
-        assertThat(events.ready).containsExactly(2L);
+        assertThat(events.generations).containsExactly(2L);
         assertThat(events.ends).isEmpty();
-        drainCompletions();
-        assertThat(current.attempts).containsExactly(1L, 2L);
         assertThat(events.failures).isEmpty();
+    }
+
+    @Test
+    void closing_during_encoding_keeps_capacity_until_the_old_result_is_discarded()
+            throws Exception {
+        // Arrange: one large payload is being encoded while another publication waits.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        codec.beforeEncode = () -> {
+            entered.countDown();
+            waitFor(release);
+        };
+        MqttMessage large = message(8 * 1024 * 1024);
+        SingleWriteTransport old = open(1);
+        try {
+            assertThat(sut.publish(1, 1, large)).isEqualTo(ACCEPTED);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            assertThat(sut.publish(1, 2, message(0))).isEqualTo(ACCEPTED);
+
+            // Act: even onClosed cannot release the payload still used by the encoder.
+            sut.close();
+            old.end(new IOException("Old connection ended"));
+            SingleWriteTransport current = open(2);
+            assertThat(sut.publish(2, 3, large)).isEqualTo(FULL);
+            assertThat(sut.send(2, 4, new Packet.PingReq())).isEqualTo(ACCEPTED);
+
+            // Assert: input and callbacks remain usable while the sender is occupied.
+            requireNonNull(current.listener).onBytes(codec.encode(new Packet.PingResp()));
+            assertThat(events.received).containsExactly(new Packet.PingResp());
+            assertThat(current.attempts).isEmpty();
+            assertThat(old.attempts).isEmpty();
+
+            // Act: discard the old encoding, then use its returned capacity in the new connection.
+            release.countDown();
+            current.awaitActive();
+            assertThat(sut.publish(2, 5, large)).isEqualTo(ACCEPTED);
+            current.completeInline = true;
+            current.complete();
+
+            // Assert
+            await().untilAsserted(() -> assertThat(events.tickets).containsExactly(4L, 5L));
+            assertThat(codec.prepared.get()).isEqualTo(2);
+            assertThat(old.attempts).isEmpty();
+            assertThat(current.attempts).containsExactly(4L, 5L);
+            assertThat(events.failures).isEmpty();
+            assertThat(events.fatals).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void an_old_transport_retains_capacity_without_stopping_the_new_connections_sender() {
+        // Arrange
+        MqttMessage large = message(8 * 1024 * 1024);
+        SingleWriteTransport old = open(1);
+        assertThat(sut.publish(1, 1, large)).isEqualTo(ACCEPTED);
+        old.awaitActive();
+
+        // Act: close is asynchronous; the old transport still owns the encoded array.
+        sut.close();
+        SingleWriteTransport current = open(2);
+        assertThat(sut.publish(2, 2, large)).isEqualTo(FULL);
+        assertThat(sut.send(2, 3, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        current.awaitActive();
+
+        // Assert: the new connection progresses despite the old outstanding write.
+        assertThat(current.attempts).containsExactly(3L);
+        assertThat(events.tickets).isEmpty();
+
+        // Act: termination returns only the old transport's capacity.
+        old.end(new IOException("Old write released"));
+        assertThat(sut.publish(2, 4, large)).isEqualTo(ACCEPTED);
+        current.completeInline = true;
+        current.complete();
+
+        // Assert
+        await().untilAsserted(() -> assertThat(events.tickets).containsExactly(3L, 4L));
+        assertThat(events.generations).containsExactly(2L, 2L);
+        assertThat(old.attempts).containsExactly(1L);
+        assertThat(events.ends).isEmpty();
+        assertThat(events.failures).isEmpty();
+    }
+
+    @Test
+    void inline_completion_keeps_capacity_until_the_send_call_returns() throws Exception {
+        // Arrange: onSent completes inline, but the SPI call still retains its argument.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        MqttMessage large = message(8 * 1024 * 1024);
+        SingleWriteTransport old = open(1);
+        old.completeInline = true;
+        old.afterSent = () -> {
+            entered.countDown();
+            waitFor(release);
+        };
+        try {
+            assertThat(sut.publish(1, 1, large)).isEqualTo(ACCEPTED);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+
+            // Act
+            sut.close();
+            SingleWriteTransport current = open(2);
+            assertThat(sut.publish(2, 2, large)).isEqualTo(FULL);
+            assertThat(sut.send(2, 3, new Packet.PingReq())).isEqualTo(ACCEPTED);
+            release.countDown();
+            current.awaitActive();
+            assertThat(sut.publish(2, 4, large)).isEqualTo(ACCEPTED);
+
+            // Assert
+            assertThat(old.attempts).containsExactly(1L);
+            assertThat(current.attempts).containsExactly(3L);
+            assertThat(events.tickets).containsExactly(1L);
+            assertThat(events.failures).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void a_write_completion_can_immediately_reuse_its_capacity(boolean inline) throws Exception {
+        // Arrange: only one of these publications fits in the regular byte budget.
+        MqttMessage large = message(9 * 1024 * 1024);
+        var next = new CompletableFuture<SendQueue.OfferResult>();
+        SingleWriteTransport transport = open(1);
+        transport.completeInline = inline;
+        events.beforeSent = () -> {
+            events.beforeSent = () -> { };
+            next.complete(sut.publish(1, 2, large));
+        };
+
+        // Act: admit the second publication as soon as the first completion is posted.
+        assertThat(sut.publish(1, 1, large)).isEqualTo(ACCEPTED);
+        if (!inline) {
+            transport.complete();
+        }
+
+        // Assert
+        assertThat(next.get(5, SECONDS)).isEqualTo(ACCEPTED);
+        await().untilAsserted(() -> assertThat(transport.attempts).containsExactly(1L, 2L));
+        assertThat(events.failures).isEmpty();
+        assertThat(events.ends).isEmpty();
+    }
+
+    @Test
+    void a_send_runtime_exception_fails_only_its_connection() {
+        // Arrange
+        var failure = new IllegalStateException("Send failed");
+        SingleWriteTransport old = open(1);
+        old.beforeSend = () -> {
+            throw failure;
+        };
+
+        // Act
+        sut.send(1, 1, new Packet.PingReq());
+
+        // Assert
+        await().untilAsserted(() -> assertThat(events.ends).containsExactly(failure));
+        assertThat(events.failures).isEmpty();
+        assertThat(events.fatals).isEmpty();
+
+        // Act: the actor can close the failed connection and start a new one.
+        sut.close();
+        old.end(failure);
+        SingleWriteTransport current = open(2);
+        current.completeInline = true;
+        sut.send(2, 2, new Packet.PingReq());
+
+        // Assert
+        await().untilAsserted(() -> assertThat(events.tickets).containsExactly(2L));
+    }
+
+    @Test
+    void a_send_error_is_reported_as_fatal_to_the_client() {
+        // Arrange
+        var failure = new AssertionError("Send failed fatally");
+        SingleWriteTransport transport = open(1);
+        transport.beforeSend = () -> {
+            throw failure;
+        };
+
+        // Act
+        sut.send(1, 1, new Packet.PingReq());
+
+        // Assert
+        await().untilAsserted(() -> assertThat(events.fatals).containsExactly(failure));
+        assertThat(events.failures).isEmpty();
+        assertThat(events.tickets).isEmpty();
+    }
+
+    private static void waitFor(CountDownLatch latch) {
+        try {
+            assertThat(latch.await(30, SECONDS)).isTrue();
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(failure);
+        }
     }
 
     private SingleWriteTransport open(long generation) {
@@ -312,20 +550,14 @@ class ClientIoTest {
         return transports.getLast();
     }
 
-    private void drainCompletions() {
-        while (!events.ready.isEmpty()) {
-            sut.sendNext(events.ready.removeFirst());
-        }
+    private static MqttMessage message(int payloadSize) {
+        return new MqttMessage(new Topic("a"), new byte[payloadSize], Qos.AT_MOST_ONCE, false);
     }
 
     private static Packet.Publish publish() {
-        return publish(0);
-    }
-
-    private static Packet.Publish publish(int payloadSize) {
         return new Packet.Publish(
                 new Topic("a"),
-                new byte[payloadSize],
+                new byte[0],
                 Qos.AT_MOST_ONCE,
                 false,
                 false,
@@ -368,12 +600,15 @@ class ClientIoTest {
 
     private static final class SingleWriteTransport implements Transport {
 
-        final List<Long> attempts = new ArrayList<>();
+        final List<Long> attempts = new CopyOnWriteArrayList<>();
+        final AtomicInteger rejections = new AtomicInteger();
         @Nullable Listener listener;
         long activeTicket;
-        boolean completeInline;
-        boolean rejectSend;
-        @Nullable Throwable endInsideSend;
+        volatile Runnable beforeSend = () -> { };
+        volatile Runnable afterSent = () -> { };
+        volatile boolean completeInline;
+        volatile boolean rejectSend;
+        volatile @Nullable Throwable endInsideSend;
         int sendDepth;
         int maximumSendDepth;
 
@@ -384,13 +619,15 @@ class ClientIoTest {
         }
 
         @Override
-        public SendResult send(long ticket, byte[] bytes) {
+        public synchronized SendResult send(long ticket, byte[] bytes) {
+            beforeSend.run();
             assertThat(activeTicket).isZero();
             sendDepth++;
             maximumSendDepth = Math.max(maximumSendDepth, sendDepth);
             try {
                 attempts.add(ticket);
                 if (rejectSend) {
+                    rejections.incrementAndGet();
                     if (endInsideSend != null) {
                         end(endInsideSend);
                     }
@@ -398,7 +635,8 @@ class ClientIoTest {
                 }
                 activeTicket = ticket;
                 if (completeInline) {
-                    complete();
+                    finish();
+                    afterSent.run();
                 }
                 return SendResult.ACCEPTED;
             } finally {
@@ -407,13 +645,26 @@ class ClientIoTest {
         }
 
         void complete() {
+            awaitActive();
+            finish();
+        }
+
+        synchronized void finish() {
             assertThat(activeTicket).isNotZero();
             long ticket = activeTicket;
             activeTicket = 0;
             requireNonNull(listener).onSent(ticket);
         }
 
-        void end(Throwable cause) {
+        void awaitActive() {
+            await().until(this::hasActive);
+        }
+
+        private synchronized boolean hasActive() {
+            return activeTicket != 0;
+        }
+
+        synchronized void end(Throwable cause) {
             activeTicket = 0;
             requireNonNull(listener).onClosed(cause);
         }
@@ -424,12 +675,60 @@ class ClientIoTest {
         }
     }
 
+    private static final class RecordingCodec implements PacketCodec {
+
+        private final PacketCodec delegate = PacketCodec.of(MqttVersion.V3_1_1);
+        final AtomicInteger prepared = new AtomicInteger();
+        volatile Runnable beforeEncode = () -> { };
+
+        @Override
+        public byte[] encode(Packet packet) {
+            return delegate.encode(packet);
+        }
+
+        @Override
+        public byte[] encodePublishHeader(
+                Topic topic,
+                Qos qos,
+                boolean retain,
+                boolean dup,
+                int packetId,
+                Properties properties,
+                int payloadSize
+        ) {
+            return delegate.encodePublishHeader(
+                    topic,
+                    qos,
+                    retain,
+                    dup,
+                    packetId,
+                    properties,
+                    payloadSize
+            );
+        }
+
+        @Override
+        public byte[] encodePublish(byte[] header, byte[] payload) {
+            prepared.incrementAndGet();
+            beforeEncode.run();
+            return delegate.encodePublish(header, payload);
+        }
+
+        @Override
+        public Packet decode(byte[] packet) {
+            return delegate.decode(packet);
+        }
+    }
+
     private static final class RecordingEvents implements ClientIo.Events {
 
-        final ArrayDeque<Long> ready = new ArrayDeque<>();
-        final List<Long> tickets = new ArrayList<>();
-        final List<Throwable> failures = new ArrayList<>();
-        final List<Throwable> ends = new ArrayList<>();
+        final List<Long> generations = new CopyOnWriteArrayList<>();
+        final List<Long> tickets = new CopyOnWriteArrayList<>();
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
+        final List<Throwable> ends = new CopyOnWriteArrayList<>();
+        final List<Throwable> fatals = new CopyOnWriteArrayList<>();
+        final List<Packet> received = new CopyOnWriteArrayList<>();
+        volatile Runnable beforeSent = () -> { };
 
         @Override
         public void connected(long generation) {
@@ -437,12 +736,16 @@ class ClientIoTest {
 
         @Override
         public void received(long generation, Packet packet, int size) {
+            received.add(packet);
         }
 
         @Override
-        public void sent(long generation, long ticket) {
-            tickets.add(ticket);
-            ready.addLast(generation);
+        public Runnable prepareSent(long generation, long ticket) {
+            return () -> {
+                beforeSent.run();
+                generations.add(generation);
+                tickets.add(ticket);
+            };
         }
 
         @Override
@@ -453,6 +756,11 @@ class ClientIoTest {
         @Override
         public void failed(long generation, Throwable cause) {
             failures.add(cause);
+        }
+
+        @Override
+        public void fatal(Throwable cause) {
+            fatals.add(cause);
         }
     }
 }

@@ -1,6 +1,12 @@
 package org.mqtt4j.mqtj.client.internal;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeoutException;
 
 import org.jspecify.annotations.Nullable;
@@ -10,14 +16,25 @@ import org.mqtt4j.mqtj.Disconnection;
 import org.mqtt4j.mqtj.MqttCapacityException;
 import org.mqtt4j.mqtj.MqttConnectException;
 import org.mqtt4j.mqtj.MqttConnectionLostException;
+import org.mqtt4j.mqtj.MqttMessage;
 import org.mqtt4j.mqtj.MqttNotConnectedException;
 import org.mqtt4j.mqtj.MqttProtocolException;
+import org.mqtt4j.mqtj.MqttSubscribeException;
 import org.mqtt4j.mqtj.MqttVersion;
+import org.mqtt4j.mqtj.PublishResult;
+import org.mqtt4j.mqtj.Qos;
 import org.mqtt4j.mqtj.ReasonCode;
+import org.mqtt4j.mqtj.Subscribe;
+import org.mqtt4j.mqtj.Subscription;
+import org.mqtt4j.mqtj.TopicFilter;
 import org.mqtt4j.mqtj.client.internal.common.io.SendQueue;
+import org.mqtt4j.mqtj.client.internal.common.log.Log;
 import org.mqtt4j.mqtj.client.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.client.internal.common.protocol.PacketDecodeException;
+import org.mqtt4j.mqtj.client.internal.common.protocol.PacketIds;
+import org.mqtt4j.mqtj.client.internal.common.protocol.SharedTopicFilter;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.mqtj.client.internal.common.protocol.Properties.EMPTY;
 
@@ -46,16 +63,36 @@ final class SessionCore {
         /// Reports queue admission, not write completion. The core handles refusal per operation.
         SendQueue.OfferResult send(long generation, long ticket, Packet packet);
 
+        /// Reports admission at the exact wire size, not write completion. The payload is copied
+        /// only after admission.
+        SendQueue.OfferResult publish(long generation, long ticket, MqttMessage message);
+
         void schedule(long generation, Timer timer, Duration delay);
 
         void cancel(Timer timer);
 
         void ignoredPingResponse();
 
-        void complete(long operation, @Nullable ConnAck result, @Nullable Throwable failure);
+        void complete(long operation, @Nullable Object result, @Nullable Throwable failure);
+
+        boolean registerSubscription(long generation, long id);
+
+        Subscription subscribed(long id, Qos granted);
+
+        boolean deliver(
+                long generation,
+                List<Long> ids,
+                MqttMessage message,
+                boolean dup,
+                int bytes
+        );
+
+        void removeSubscription(long id);
 
         void end(long generation, boolean established, Disconnection disconnection);
     }
+
+    private static final Log log = Log.of(SessionCore.class);
 
     private final Port port;
 
@@ -84,6 +121,16 @@ final class SessionCore {
     private boolean transportConnected;
 
     private boolean awaitingPing;
+
+    private PacketIds packetIds = new PacketIds();
+
+    private final Map<Long, Long> publications = new HashMap<>();
+
+    private final Map<Long, LocalSubscription> subscriptions = new LinkedHashMap<>();
+
+    private final Map<Integer, LocalSubscription> subscribing = new HashMap<>();
+
+    private final Map<Integer, UnsubscribeOperation> unsubscribing = new HashMap<>();
 
     SessionCore(Port port, String clientId, Duration timeout, Duration keepAlive) {
         this.port = port;
@@ -126,7 +173,7 @@ final class SessionCore {
         }
     }
 
-    void received(long connection, Packet packet, long now) {
+    void received(long connection, Packet packet, long now, int bytes) {
         if (connection != generation || state == State.DISCONNECTED || state == State.CLOSED) {
             return;
         }
@@ -160,6 +207,12 @@ final class SessionCore {
             } else {
                 port.ignoredPingResponse();
             }
+        } else if (packet instanceof Packet.SubAck ack) {
+            subscribed(ack);
+        } else if (packet instanceof Packet.UnsubAck ack) {
+            unsubscribed(ack);
+        } else if (packet instanceof Packet.Publish publish) {
+            deliver(publish, bytes);
         } else {
             failed(connection, protocolError("Unexpected " + packet.getClass().getSimpleName()));
         }
@@ -170,11 +223,194 @@ final class SessionCore {
             return;
         }
         lastSent = now;
+        Long publication = publications.remove(ticket);
+        if (publication != null) {
+            port.complete(publication, new PublishResult(), null);
+        }
         if (ticket == disconnectTicket) {
             long operation = disconnectOperation;
             disconnectOperation = 0;
             end(null, true, false);
             port.complete(operation, null, null);
+        }
+    }
+
+    void publish(long operation, MqttMessage message) {
+        if (!ready(operation) || !supportedQos(operation, message.qos())) {
+            return;
+        }
+        long ticket = ++nextTicket;
+        publications.put(ticket, operation);
+        if (port.publish(generation, ticket, message) == SendQueue.OfferResult.FULL) {
+            publications.remove(ticket);
+            capacityFailure(operation, "Send queue capacity");
+        }
+        // CLOSED waits for the connection's terminal notification, as do SUBSCRIBE/UNSUBSCRIBE.
+    }
+
+    void subscribe(long operation, Subscribe request) {
+        if (!ready(operation) || !supportedQos(operation, request.qos())) {
+            return;
+        }
+        if (subscriptions.values().stream()
+                .anyMatch(local -> local.filter.equals(request.filter()))) {
+            port.complete(operation, null, new IllegalStateException(
+                    "Subscription already exists: " + request.filter().pattern()
+            ));
+            return;
+        }
+        var local = new LocalSubscription(operation, request);
+        Optional<LocalSubscription> conflict = subscriptions.values().stream()
+                .filter(existing -> (local.shared || existing.shared)
+                        && filtersOverlap(local.matchingFilter, existing.matchingFilter))
+                .findFirst();
+        if (conflict.isPresent()) {
+            port.complete(operation, null, new IllegalStateException(
+                    "Subscription " + request.filter().pattern() + " overlaps "
+                            + conflict.orElseThrow().filter.pattern()
+                            + "; a shared subscription cannot overlap another subscription"
+            ));
+            return;
+        }
+
+        var allocated = packetIds.allocate();
+        if (allocated.isEmpty()) {
+            capacityFailure(operation, "Packet identifier capacity");
+            return;
+        }
+        int id = allocated.getAsInt();
+        subscriptions.put(operation, local);
+        subscribing.put(id, local);
+        // Registration precedes send: a broker may publish before sending SUBACK.
+        if (!port.registerSubscription(generation, operation)) {
+            subscribing.remove(id);
+            subscriptions.remove(operation);
+            packetIds.release(id);
+            capacityFailure(operation, "Subscription capacity");
+            return;
+        }
+        var packet = new Packet.Subscribe(id, List.of(new Packet.Subscription(
+                request.filter(), request.qos(), false, false, 0
+        )), EMPTY);
+        if (port.send(generation, ++nextTicket, packet) == SendQueue.OfferResult.FULL) {
+            subscribing.remove(id);
+            subscriptions.remove(operation);
+            packetIds.release(id);
+            port.removeSubscription(operation);
+            capacityFailure(operation, "Send queue capacity");
+        }
+    }
+
+    void unsubscribe(long operation, long subscriptionId) {
+        if (!ready(operation)) {
+            return;
+        }
+        LocalSubscription local = subscriptions.get(subscriptionId);
+        // The shell sends one removal per established handle of the current connection
+        // and resumes its delivery lane whenever the removal fails.
+        if (local == null || !local.established || local.removing) {
+            port.complete(operation, null, new IllegalStateException("Subscription is not active"));
+            return;
+        }
+        var allocated = packetIds.allocate();
+        if (allocated.isEmpty()) {
+            capacityFailure(operation, "Packet identifier capacity");
+            return;
+        }
+        int id = allocated.getAsInt();
+        local.removing = true;
+        unsubscribing.put(id, new UnsubscribeOperation(operation, local));
+        var packet = new Packet.Unsubscribe(id, List.of(local.filter), EMPTY);
+        if (port.send(generation, ++nextTicket, packet) == SendQueue.OfferResult.FULL) {
+            unsubscribing.remove(id);
+            local.removing = false;
+            packetIds.release(id);
+            capacityFailure(operation, "Send queue capacity");
+        }
+    }
+
+    private boolean ready(long operation) {
+        if (state == State.CLOSED) {
+            port.complete(operation, null, new IllegalStateException("Client is closed"));
+        } else if (state != State.CONNECTED || disconnectOperation != 0) {
+            port.complete(operation, null, new MqttNotConnectedException());
+        } else {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean supportedQos(long operation, Qos qos) {
+        if (qos == Qos.AT_MOST_ONCE) {
+            return true;
+        }
+        port.complete(operation, null, new IllegalArgumentException("Only QoS 0 is supported"));
+        return false;
+    }
+
+    private void capacityFailure(long operation, String message) {
+        port.complete(operation, null, new MqttCapacityException(message));
+    }
+
+    private void subscribed(Packet.SubAck ack) {
+        LocalSubscription local = subscribing.get(ack.packetId());
+        if (local == null || ack.reasonCodes().size() != 1) {
+            failed(generation, protocolError("Unexpected SUBACK"));
+            return;
+        }
+        ReasonCode reason = ack.reasonCodes().getFirst();
+        if (reason != ReasonCode.UNSPECIFIED_ERROR && reason != ReasonCode.SUCCESS) {
+            failed(generation, protocolError("SUBACK grants an unsupported QoS or reason"));
+            return;
+        }
+        subscribing.remove(ack.packetId());
+        packetIds.release(ack.packetId());
+        if (reason == ReasonCode.UNSPECIFIED_ERROR) {
+            subscriptions.remove(local.id);
+            port.removeSubscription(local.id);
+            port.complete(local.id, null, new MqttSubscribeException(reason));
+        } else {
+            local.established = true;
+            port.complete(local.id, port.subscribed(local.id, Qos.AT_MOST_ONCE), null);
+        }
+    }
+
+    private void unsubscribed(Packet.UnsubAck ack) {
+        UnsubscribeOperation pending = unsubscribing.get(ack.packetId());
+        if (pending == null || !ack.reasonCodes().isEmpty()) {
+            failed(generation, protocolError("Unexpected UNSUBACK"));
+            return;
+        }
+        unsubscribing.remove(ack.packetId());
+        packetIds.release(ack.packetId());
+        subscriptions.remove(pending.subscription.id);
+        port.removeSubscription(pending.subscription.id);
+        port.complete(pending.operation, null, null);
+    }
+
+    private void deliver(Packet.Publish publish, int bytes) {
+        if (publish.qos() != Qos.AT_MOST_ONCE) {
+            failed(generation, protocolError("Only QoS 0 delivery is supported"));
+            return;
+        }
+        var matches = new ArrayList<Long>();
+        // Matching is O(subscriptions). Replace with a topic tree if 0.4 measurements show
+        // this scan dominates, keeping TopicFilter.matches as the reference implementation.
+        for (var local : subscriptions.values()) {
+            if (!local.removing && local.matchingFilter.matches(publish.topic())) {
+                matches.add(local.id);
+            }
+        }
+        if (matches.isEmpty()) {
+            log.debug("Discarding unmatched QoS 0 delivery for {} on {}",
+                    publish.topic(), clientId);
+            return;
+        }
+        var message = new MqttMessage(
+                publish.topic(), publish.payload(), publish.qos(), publish.retain()
+        );
+        if (!port.deliver(generation, matches, message, publish.dup(), bytes)) {
+            failed(generation, new MqttCapacityException("Delivery capacity"));
         }
     }
 
@@ -254,7 +490,7 @@ final class SessionCore {
                 failed(generation, new MqttCapacityException("Reserved send queue capacity"));
                 yield false;
             }
-            // Wait for the transport's terminal callback to preserve its original cause.
+            // Wait for the connection's terminal notification to preserve its original cause.
             case CLOSED -> false;
         };
     }
@@ -290,6 +526,26 @@ final class SessionCore {
         awaitingPing = false;
         pingTicket = 0;
         disconnectTicket = 0;
+        for (long id : subscriptions.keySet()) {
+            port.removeSubscription(id);
+        }
+        subscriptions.clear();
+        var pendingFailure = (cause == null)
+                ? new MqttConnectionLostException()
+                : new MqttConnectionLostException(cause);
+        for (long operation : publications.values()) {
+            port.complete(operation, null, pendingFailure);
+        }
+        publications.clear();
+        for (var local : subscribing.values()) {
+            port.complete(local.id, null, pendingFailure);
+        }
+        subscribing.clear();
+        for (var pending : unsubscribing.values()) {
+            port.complete(pending.operation, null, pendingFailure);
+        }
+        unsubscribing.clear();
+        packetIds = new PacketIds();
         if (active) {
             port.end(generation, established, new Disconnection(cause, requested));
         }
@@ -318,5 +574,68 @@ final class SessionCore {
 
     private static PacketDecodeException protocolError(String message) {
         return new PacketDecodeException(ReasonCode.PROTOCOL_ERROR, message);
+    }
+
+    /// Whether both filters can match at least one valid, nonempty MQTT topic.
+    private static boolean filtersOverlap(TopicFilter first, TopicFilter second) {
+        String[] left = first.pattern().split("/", -1);
+        String[] right = second.pattern().split("/", -1);
+        boolean leftTail = left[left.length - 1].equals("#");
+        boolean rightTail = right[right.length - 1].equals("#");
+        int leftMinimum = left.length - (leftTail ? 1 : 0);
+        int rightMinimum = right.length - (rightTail ? 1 : 0);
+        int levels = Math.max(1, Math.max(leftMinimum, rightMinimum));
+        if ((!leftTail && leftMinimum != levels) || (!rightTail && rightMinimum != levels)) {
+            return false;
+        }
+
+        // Build the shortest common topic's byte count. A trailing # supplies unrestricted
+        // remaining levels; an unconstrained + level can be empty, including the first one.
+        int bytes = levels - 1;
+        boolean firstLevelFlexible = false;
+        for (int i = 0; i < levels; i++) {
+            String a = i < leftMinimum ? left[i] : "+";
+            String b = i < rightMinimum ? right[i] : "+";
+            if (i == 0 && ((a.startsWith("$") && b.equals("+"))
+                    || (b.startsWith("$") && a.equals("+")))) {
+                return false;
+            }
+            if (!a.equals("+") && !b.equals("+") && !a.equals(b)) {
+                return false;
+            }
+            String literal = a.equals("+") ? b : a;
+            if (literal.equals("+")) {
+                firstLevelFlexible |= i == 0;
+            } else {
+                bytes += literal.getBytes(UTF_8).length;
+            }
+        }
+
+        // An empty candidate is valid only if its first level can become nonempty, or both
+        // trailing # wildcards allow adding another empty level to form the topic "/".
+        return bytes <= 65535
+                && (bytes > 0 || firstLevelFlexible || (leftTail && rightTail));
+    }
+
+    private static final class LocalSubscription {
+
+        // The subscribe operation's token; the shell and its delivery lanes use the same id.
+        final long id;
+        final TopicFilter filter;
+        final TopicFilter matchingFilter;
+        final boolean shared;
+        boolean established;
+        boolean removing;
+
+        LocalSubscription(long id, Subscribe request) {
+            this.id = id;
+            filter = request.filter();
+            Optional<SharedTopicFilter> sharedFilter = SharedTopicFilter.parse(filter);
+            shared = sharedFilter.isPresent();
+            matchingFilter = sharedFilter.map(SharedTopicFilter::filter).orElse(filter);
+        }
+    }
+
+    private record UnsubscribeOperation(long operation, LocalSubscription subscription) {
     }
 }
