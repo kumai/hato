@@ -48,40 +48,49 @@ final class Mqtt311PacketCodec implements PacketCodec {
     public byte[] encode(Packet packet) {
         requireNonNull(packet, "packet must not be null");
         var body = new ByteArrayOutputStream();
-        PacketType type = switch (packet) {
+        PacketType type;
+        switch (packet) {
             case Packet.Connect p -> {
                 writeConnect(body, p);
-                yield PacketType.CONNECT;
+                type = PacketType.CONNECT;
             }
             case Packet.ConnAck p -> {
                 requireNoProperties(p.properties());
                 body.write(p.sessionPresent() ? 1 : 0);
                 body.write(connAckReturnCode(p.reasonCode()));
-                yield PacketType.CONNACK;
+                type = PacketType.CONNACK;
             }
             case Packet.Publish p -> {
-                writePublish(body, p);
-                yield PacketType.PUBLISH;
+                byte[] header = encodePublishHeader(
+                        p.topic(),
+                        p.qos(),
+                        p.retain(),
+                        p.dup(),
+                        p.packetId(),
+                        p.properties(),
+                        p.payload().length
+                );
+                return encodePublish(header, p.payload());
             }
             case Packet.PubAck p -> {
                 writeAcknowledgement(body, p.packetId(), p.reasonCode(), p.properties());
-                yield PacketType.PUBACK;
+                type = PacketType.PUBACK;
             }
             case Packet.PubRec p -> {
                 writeAcknowledgement(body, p.packetId(), p.reasonCode(), p.properties());
-                yield PacketType.PUBREC;
+                type = PacketType.PUBREC;
             }
             case Packet.PubRel p -> {
                 writeAcknowledgement(body, p.packetId(), p.reasonCode(), p.properties());
-                yield PacketType.PUBREL;
+                type = PacketType.PUBREL;
             }
             case Packet.PubComp p -> {
                 writeAcknowledgement(body, p.packetId(), p.reasonCode(), p.properties());
-                yield PacketType.PUBCOMP;
+                type = PacketType.PUBCOMP;
             }
             case Packet.Subscribe p -> {
                 writeSubscribe(body, p);
-                yield PacketType.SUBSCRIBE;
+                type = PacketType.SUBSCRIBE;
             }
             case Packet.SubAck p -> {
                 requireNoProperties(p.properties());
@@ -89,7 +98,7 @@ final class Mqtt311PacketCodec implements PacketCodec {
                 for (ReasonCode reason : p.reasonCodes()) {
                     body.write(subAckReturnCode(reason));
                 }
-                yield PacketType.SUBACK;
+                type = PacketType.SUBACK;
             }
             case Packet.Unsubscribe p -> {
                 requireNoProperties(p.properties());
@@ -97,7 +106,7 @@ final class Mqtt311PacketCodec implements PacketCodec {
                 for (TopicFilter filter : p.filters()) {
                     MqttString.write(body, filter.pattern());
                 }
-                yield PacketType.UNSUBSCRIBE;
+                type = PacketType.UNSUBSCRIBE;
             }
             case Packet.UnsubAck p -> {
                 requireNoProperties(p.properties());
@@ -105,29 +114,62 @@ final class Mqtt311PacketCodec implements PacketCodec {
                     throw new IllegalArgumentException("MQTT 3.1.1 UNSUBACK has no reason codes");
                 }
                 writeUnsignedShort(body, p.packetId());
-                yield PacketType.UNSUBACK;
+                type = PacketType.UNSUBACK;
             }
-            case Packet.PingReq _ -> PacketType.PINGREQ;
-            case Packet.PingResp _ -> PacketType.PINGRESP;
+            case Packet.PingReq _ -> type = PacketType.PINGREQ;
+            case Packet.PingResp _ -> type = PacketType.PINGRESP;
             case Packet.Disconnect p -> {
                 requireNoProperties(p.properties());
                 requireSuccess(p.reasonCode());
-                yield PacketType.DISCONNECT;
+                type = PacketType.DISCONNECT;
             }
             case Packet.Auth _ -> throw new IllegalArgumentException("MQTT 3.1.1 has no AUTH");
-        };
+        }
 
-        int flags = packet instanceof Packet.Publish p
-                ? (p.dup() ? 8 : 0) | (p.qos().level() << 1) | (p.retain() ? 1 : 0)
-                : type.fixedFlags().orElseThrow();
-        // Build the body first to know its length. This copies the body; use a sized writer
-        // if profiling shows these allocations becoming costly for large packets.
+        // Other packet types still build their body first. PUBLISH appends its large payload
+        // directly to the final array above; apply that approach here if profiling warrants.
         int packetSize = 1 + RemainingLength.encodedSize(body.size()) + body.size();
         var output = new ByteArrayOutputStream(packetSize);
-        output.write((type.value() << 4) | flags);
+        output.write((type.value() << 4) | type.fixedFlags().orElseThrow());
         RemainingLength.write(output, body.size());
         output.writeBytes(body.toByteArray());
         return output.toByteArray();
+    }
+
+    @Override
+    public byte[] encodePublishHeader(
+            Topic topic,
+            Qos qos,
+            boolean retain,
+            boolean dup,
+            int packetId,
+            Properties properties,
+            int payloadSize
+    ) {
+        if (payloadSize < 0) {
+            throw new IllegalArgumentException("PUBLISH payload size must not be negative");
+        }
+        // Reuse the packet model's field invariants without storage for the declared payload.
+        var packet = new Packet.Publish(topic, new byte[0], qos, retain, dup, packetId, properties);
+        requireNoProperties(packet.properties());
+        var variableHeader = new ByteArrayOutputStream();
+        MqttString.write(variableHeader, packet.topic().name());
+        if (packet.qos() != Qos.AT_MOST_ONCE) {
+            writeUnsignedShort(variableHeader, packet.packetId());
+        }
+        if (payloadSize > 268435455 - variableHeader.size()) {
+            throw new IllegalArgumentException("PUBLISH exceeds the Remaining Length limit");
+        }
+        int remainingLength = variableHeader.size() + payloadSize;
+        int headerSize = 1 + RemainingLength.encodedSize(remainingLength) + variableHeader.size();
+        var header = new ByteArrayOutputStream(headerSize);
+        int flags = (packet.dup() ? 8 : 0)
+                | (packet.qos().level() << 1)
+                | (packet.retain() ? 1 : 0);
+        header.write((PacketType.PUBLISH.value() << 4) | flags);
+        RemainingLength.write(header, remainingLength);
+        header.writeBytes(variableHeader.toByteArray());
+        return header.toByteArray();
     }
 
     /// Decodes exactly one complete packet, rejecting truncation and extra bytes.
@@ -294,19 +336,6 @@ final class Mqtt311PacketCodec implements PacketCodec {
         // Sections 3.2.2.1/2 prescribe sender behavior without requiring receiver rejection.
         // Ignore reserved bits; a refused connection cannot have a resumed session in the model.
         return new Packet.ConnAck(reason == SUCCESS && (flags & 1) != 0, reason, EMPTY);
-    }
-
-    private static void writePublish(ByteArrayOutputStream output, Packet.Publish packet) {
-        requireNoProperties(packet.properties());
-        MqttString.write(output, packet.topic().name());
-        if (packet.qos() != Qos.AT_MOST_ONCE) {
-            writeUnsignedShort(output, packet.packetId());
-        }
-        if (packet.payload().length > 268435455 - output.size()) {
-            throw new IllegalArgumentException("PUBLISH exceeds the Remaining Length limit");
-        }
-        // PUBLISH uses all remaining bytes; unlike Will Message, it has no length prefix.
-        output.writeBytes(packet.payload());
     }
 
     private static Packet.Publish readPublish(ByteBuffer input, int flags) {

@@ -1,9 +1,11 @@
 package org.mqtt4j.mqtj.common.protocol;
 
+import java.lang.management.ManagementFactory;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.stream.Stream;
 
+import com.sun.management.ThreadMXBean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -377,5 +379,227 @@ class PacketCodecTest {
                 new Topic("a"), new byte[]{0}, Qos.AT_MOST_ONCE, false, EMPTY
         ));
         assertThat(connect.password()).containsExactly((byte) 0xFF);
+    }
+
+    @ParameterizedTest
+    @CsvSource(textBlock = """
+            a, AT_MOST_ONCE, false, false, 0, 3005000161
+            a, AT_MOST_ONCE, true, false, 0, 3105000161
+            a, AT_LEAST_ONCE, false, false, 7, 32070001610007
+            a, AT_LEAST_ONCE, true, true, 65535, 3b07000161ffff
+            a, EXACTLY_ONCE, false, true, 42, 3c07000161002a
+            a, EXACTLY_ONCE, true, false, 1, 35070001610001
+            é, AT_MOST_ONCE, false, false, 0, 30060002c3a9
+            """)
+    void prepared_publish_headers_and_complete_packets_preserve_the_wire_format(
+            String topicName,
+            Qos qos,
+            boolean retain,
+            boolean dup,
+            int packetId,
+            String headerHex
+    ) {
+        // Arrange
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        var topic = new Topic(topicName);
+        var payload = new byte[] {0, (byte) 0xFF};
+        var packet = new Packet.Publish(topic, payload, qos, retain, dup, packetId, EMPTY);
+        byte[] expectedHeader = HexFormat.of().parseHex(headerHex);
+        byte[] expectedPacket = HexFormat.of().parseHex(headerHex + "00ff");
+
+        // Act
+        byte[] header = sut.encodePublishHeader(
+                topic,
+                qos,
+                retain,
+                dup,
+                packetId,
+                EMPTY,
+                payload.length
+        );
+        byte[] assembled = sut.encodePublish(header, payload);
+        byte[] encoded = sut.encode(packet);
+
+        // Assert
+        assertThat(header).isEqualTo(expectedHeader);
+        assertThat(assembled).isEqualTo(expectedPacket);
+        assertThat(encoded).isEqualTo(expectedPacket);
+        assertThat(payload).containsExactly((byte) 0, (byte) 0xFF);
+    }
+
+    @ParameterizedTest
+    @CsvSource(textBlock = """
+            AT_MOST_ONCE, 0, 3003000161
+            AT_MOST_ONCE, 124, 307f000161
+            AT_MOST_ONCE, 125, 308001000161
+            AT_MOST_ONCE, 16380, 30ff7f000161
+            AT_MOST_ONCE, 16381, 30808001000161
+            AT_MOST_ONCE, 2097148, 30ffff7f000161
+            AT_MOST_ONCE, 2097149, 3080808001000161
+            AT_MOST_ONCE, 268435452, 30ffffff7f000161
+            AT_LEAST_ONCE, 268435450, 32ffffff7f0001610001
+            EXACTLY_ONCE, 268435450, 34ffffff7f0001610001
+            """)
+    void publish_headers_account_for_the_payload_at_every_remaining_length_boundary(
+            Qos qos,
+            int payloadSize,
+            String headerHex
+    ) {
+        // Arrange: only the header is allocated, even at the maximum Remaining Length.
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        var topic = new Topic("a");
+        int packetId = qos == Qos.AT_MOST_ONCE ? 0 : 1;
+        byte[] expected = HexFormat.of().parseHex(headerHex);
+
+        // Act
+        byte[] header = sut.encodePublishHeader(
+                topic,
+                qos,
+                false,
+                false,
+                packetId,
+                EMPTY,
+                payloadSize
+        );
+
+        // Assert
+        assertThat(header).isEqualTo(expected);
+    }
+
+    @ParameterizedTest
+    @CsvSource(textBlock = """
+            AT_MOST_ONCE, -1
+            AT_MOST_ONCE, 268435453
+            AT_MOST_ONCE, 2147483647
+            AT_LEAST_ONCE, 268435451
+            EXACTLY_ONCE, 268435451
+            """)
+    void publish_headers_reject_payload_sizes_outside_the_remaining_length_limit(
+            Qos qos,
+            int payloadSize
+    ) {
+        // Arrange
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        var topic = new Topic("a");
+        int packetId = qos == Qos.AT_MOST_ONCE ? 0 : 1;
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.encodePublishHeader(
+                topic,
+                qos,
+                false,
+                false,
+                packetId,
+                EMPTY,
+                payloadSize
+        )).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest
+    @CsvSource(textBlock = """
+            AT_MOST_ONCE, true, 0
+            AT_MOST_ONCE, false, 1
+            AT_MOST_ONCE, false, -1
+            AT_LEAST_ONCE, false, 0
+            AT_LEAST_ONCE, false, 65536
+            EXACTLY_ONCE, false, 0
+            EXACTLY_ONCE, true, -1
+            """)
+    void publish_headers_reject_identifiers_and_dup_flags_inconsistent_with_qos(
+            Qos qos,
+            boolean dup,
+            int packetId
+    ) {
+        // Arrange
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        var topic = new Topic("a");
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.encodePublishHeader(
+                topic,
+                qos,
+                false,
+                dup,
+                packetId,
+                EMPTY,
+                0
+        )).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void mqtt_3_1_1_publish_headers_reject_properties() {
+        // Arrange
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        var topic = new Topic("a");
+        var properties = new Properties(List.of(new Property.UserProperty("name", "value")));
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.encodePublishHeader(
+                topic,
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                properties,
+                0
+        )).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("properties");
+    }
+
+    @Test
+    void an_assembled_publish_does_not_retain_its_header_or_payload() {
+        // Arrange
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        byte[] header = sut.encodePublishHeader(
+                new Topic("a"),
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                EMPTY,
+                2
+        );
+        var payload = new byte[] {0, (byte) 0xFF};
+        byte[] expected = HexFormat.of().parseHex("300500016100ff");
+
+        // Act
+        byte[] encoded = sut.encodePublish(header, payload);
+        header[0] = 0;
+        payload[0] = 1;
+
+        // Assert
+        assertThat(encoded).isEqualTo(expected);
+    }
+
+    @Test
+    void encoding_a_large_publish_allocates_only_one_payload_sized_buffer() {
+        // Arrange: construct the input and warm up encoding before measuring its allocations.
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        int payloadSize = 4 * 1024 * 1024;
+        var payload = new byte[payloadSize];
+        payload[0] = 0x5A;
+        payload[payloadSize - 1] = (byte) 0xFF;
+        var packet = new Packet.Publish(
+                new Topic("a"),
+                payload,
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                EMPTY
+        );
+        sut.encode(packet);
+        var memory = (ThreadMXBean) ManagementFactory.getThreadMXBean();
+
+        // Act
+        long before = memory.getCurrentThreadAllocatedBytes();
+        byte[] encoded = sut.encode(packet);
+        long allocated = memory.getCurrentThreadAllocatedBytes() - before;
+
+        // Assert: allow 1 MiB for header and JVM overhead, but not another full payload buffer.
+        assertThat(before).as("per-thread allocation measurement").isNotNegative();
+        assertThat(allocated).isLessThan(payloadSize + 1024 * 1024);
+        assertThat(encoded).hasSize(payloadSize + 8);
+        assertThat(encoded[8]).isEqualTo((byte) 0x5A);
+        assertThat(encoded[encoded.length - 1]).isEqualTo((byte) 0xFF);
     }
 }

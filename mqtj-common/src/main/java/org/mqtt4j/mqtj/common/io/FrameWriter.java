@@ -21,7 +21,9 @@ public final class FrameWriter {
 
     /// Writes one complete packet with one [OutputStream#write(byte[])] call, then flushes.
     ///
-    /// The caller supplies a packet from [org.mqtt4j.mqtj.common.protocol.PacketCodec#encode].
+    /// The caller supplies a complete packet from
+    /// [org.mqtt4j.mqtj.common.protocol.PacketCodec#encode] or
+    /// [org.mqtt4j.mqtj.common.protocol.PacketCodec#encodePublish].
     /// Its bytes are not validated here; do not modify the array during this call. A successful
     /// flush does not acknowledge peer receipt, and a failed write is not retried or flushed.
     ///

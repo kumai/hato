@@ -1,6 +1,8 @@
 package org.mqtt4j.mqtj.common.protocol;
 
 import org.mqtt4j.mqtj.common.value.MqttVersion;
+import org.mqtt4j.mqtj.common.value.Qos;
+import org.mqtt4j.mqtj.common.value.Topic;
 
 import static java.util.Objects.requireNonNull;
 
@@ -34,6 +36,38 @@ public interface PacketCodec {
     /// @throws IllegalArgumentException if a field cannot be represented in this MQTT version,
     ///         contains invalid text, or makes the packet exceed the Remaining Length limit
     byte[] encode(Packet packet);
+
+    /// Prepares a PUBLISH's fixed and variable headers without accessing its payload.
+    ///
+    /// Remaining Length includes `payloadSize`, so the full wire size is the returned array's
+    /// length plus `payloadSize`. The returned array is newly allocated and belongs to the caller;
+    /// treat it as immutable when passing it to another thread or to [#encodePublish].
+    ///
+    /// @throws IllegalArgumentException if `payloadSize` is negative, the PUBLISH fields are
+    ///         inconsistent or unsupported by this version, or Remaining Length exceeds its limit
+    byte[] encodePublishHeader(
+            Topic topic,
+            Qos qos,
+            boolean retain,
+            boolean dup,
+            int packetId,
+            Properties properties,
+            int payloadSize
+    );
+
+    /// Appends a payload to its prepared PUBLISH header in a new complete packet array.
+    ///
+    /// `header` must be the unchanged result of [#encodePublishHeader] with `payload.length` as
+    /// its declared payload size. This assembly does not validate the header again. Neither input
+    /// is retained or modified; callers must not modify either input during the call.
+    default byte[] encodePublish(byte[] header, byte[] payload) {
+        requireNonNull(header, "header must not be null");
+        requireNonNull(payload, "payload must not be null");
+        var packet = new byte[header.length + payload.length];
+        System.arraycopy(header, 0, packet, 0, header.length);
+        System.arraycopy(payload, 0, packet, header.length, payload.length);
+        return packet;
+    }
 
     /// Decodes exactly one complete packet, rejecting truncation and extra bytes.
     ///
