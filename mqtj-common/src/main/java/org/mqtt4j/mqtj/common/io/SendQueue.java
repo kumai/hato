@@ -5,8 +5,9 @@ import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
 
-/// A single FIFO with independent regular/reserved quotas. Active writes retain their quota.
-public final class SendQueue {
+/// A single FIFO whose regular and reserved quotas come from a possibly shared [Budget].
+/// Active sends retain their quota until completed or ended, even after close.
+public final class SendQueue<T> {
 
     public enum OfferResult {
         ACCEPTED,
@@ -14,50 +15,104 @@ public final class SendQueue {
         CLOSED
     }
 
-    public record Send(long ticket, byte[] bytes, boolean reserved) {
+    public record Send<T>(long ticket, T value, int byteCount, boolean reserved) {
     }
 
-    private final ArrayDeque<Send> pending = new ArrayDeque<>();
-    private final int[] maxCount;
-    private final long[] maxBytes;
-    private final int[] count = new int[2];
-    private final long[] bytes = new long[2];
+    /// Capacity shared by queues whose active sends can outlive their connection.
+    public static final class Budget {
+
+        private final int[] maxCount;
+        private final long[] maxBytes;
+        private final int[] count = new int[2];
+        private final long[] bytes = new long[2];
+
+        public Budget(int regularCount, long regularBytes, int reservedCount, long reservedBytes) {
+            if (regularCount < 0 || regularBytes < 0 || reservedCount < 0 || reservedBytes < 0) {
+                throw new IllegalArgumentException("Send capacity must not be negative");
+            }
+            maxCount = new int[] {regularCount, reservedCount};
+            maxBytes = new long[] {regularBytes, reservedBytes};
+        }
+
+        private synchronized boolean available(long byteCount, boolean reserved) {
+            if (byteCount < 0) {
+                throw new IllegalArgumentException("Send size must not be negative");
+            }
+            int kind = reserved ? 1 : 0;
+            return count[kind] < maxCount[kind]
+                    && byteCount <= maxBytes[kind] - bytes[kind];
+        }
+
+        private synchronized boolean reserve(int byteCount, boolean reserved) {
+            if (!available(byteCount, reserved)) {
+                return false;
+            }
+            int kind = reserved ? 1 : 0;
+            count[kind]++;
+            bytes[kind] += byteCount;
+            return true;
+        }
+
+        private synchronized void release(int byteCount, boolean reserved) {
+            int kind = reserved ? 1 : 0;
+            count[kind]--;
+            bytes[kind] -= byteCount;
+        }
+    }
+
+    private final ArrayDeque<Send<T>> pending = new ArrayDeque<>();
+
+    private final Budget budget;
 
     private boolean closed;
 
-    private @Nullable Send active;
+    private @Nullable Send<T> active;
 
     public SendQueue(int regularCount, long regularBytes, int reservedCount, long reservedBytes) {
-        maxCount = new int[] {regularCount, reservedCount};
-        maxBytes = new long[] {regularBytes, reservedBytes};
+        this(new Budget(regularCount, regularBytes, reservedCount, reservedBytes));
     }
 
-    public synchronized OfferResult offer(long ticket, byte[] value, boolean reserved) {
+    public SendQueue(Budget budget) {
+        this.budget = budget;
+    }
+
+    /// Checks current capacity without reserving it; [#offer] makes the final admission decision.
+    public synchronized OfferResult checkCapacity(long byteCount, boolean reserved) {
         if (closed) {
             return OfferResult.CLOSED;
         }
-        int kind = reserved ? 1 : 0;
-        if (count[kind] == maxCount[kind]
-                || value.length > maxBytes[kind] - bytes[kind]) {
+        return budget.available(byteCount, reserved) ? OfferResult.ACCEPTED : OfferResult.FULL;
+    }
+
+    public synchronized OfferResult offer(long ticket, T value, int byteCount, boolean reserved) {
+        if (closed) {
+            return OfferResult.CLOSED;
+        }
+        if (!budget.reserve(byteCount, reserved)) {
             return OfferResult.FULL;
         }
-        count[kind]++;
-        bytes[kind] += value.length;
-        pending.addLast(new Send(ticket, value, reserved));
+        pending.addLast(new Send<>(ticket, value, byteCount, reserved));
         return OfferResult.ACCEPTED;
     }
 
-    /// Starts the next write only when open and no other write is outstanding. Never waits.
-    public synchronized Optional<Send> poll() {
-        if (closed || active != null) {
-            return Optional.empty();
-        }
-        active = pending.pollFirst();
-        return Optional.ofNullable(active);
+    /// Reports whether a pending send can start without taking it or changing its quota.
+    public synchronized boolean hasReady() {
+        return !closed && active == null && !pending.isEmpty();
     }
 
+    /// Starts the next send only when open and no other send is outstanding. Never waits.
+    public synchronized Optional<Send<T>> poll() {
+        if (!hasReady()) {
+            return Optional.empty();
+        }
+        Send<T> send = pending.removeFirst();
+        active = send;
+        return Optional.of(send);
+    }
+
+    /// Releases the active send. Once closed, an unknown ticket is ignored instead of rejected.
     public synchronized void completed(long ticket) {
-        Send send = active;
+        Send<T> send = active;
         if (send == null || send.ticket() != ticket) {
             if (!closed) {
                 throw new IllegalStateException("Unexpected send completion: " + ticket);
@@ -68,26 +123,24 @@ public final class SendQueue {
         release(send);
     }
 
-    /// Stops admission and discards waiting sends. The active write stays with its writer.
+    /// Stops admission and discards waiting sends. The active send stays with its consumer.
     public synchronized void close() {
         closed = true;
         pending.forEach(this::release);
         pending.clear();
     }
 
-    /// Releases the active write only after its writer has stopped using the buffer.
+    /// Releases the active send only after its consumer has stopped using the value.
     public synchronized void ended() {
         close();
-        Send send = active;
+        Send<T> send = active;
         if (send != null) {
             active = null;
             release(send);
         }
     }
 
-    private void release(Send send) {
-        int kind = send.reserved() ? 1 : 0;
-        count[kind]--;
-        bytes[kind] -= send.bytes().length;
+    private void release(Send<T> send) {
+        budget.release(send.byteCount(), send.reserved());
     }
 }

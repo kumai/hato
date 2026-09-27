@@ -81,7 +81,7 @@ final class ClientIo {
             throw new SpiException(generation, failure);
         }
         var closed = new AtomicBoolean();
-        var queue = new SendQueue(
+        var queue = new SendQueue<byte[]>(
                 REGULAR_SEND_LIMIT,
                 REGULAR_SEND_BYTE_LIMIT,
                 RESERVED_SEND_LIMIT,
@@ -155,6 +155,7 @@ final class ClientIo {
         SendQueue.OfferResult admitted = connection.queue().offer(
                 ticket,
                 bytes,
+                bytes.length,
                 reserved
         );
         if (admitted == SendQueue.OfferResult.ACCEPTED) {
@@ -172,15 +173,15 @@ final class ClientIo {
         if (connection == null || connection.generation() != generation) {
             return;
         }
-        Optional<SendQueue.Send> next = connection.queue().poll();
+        Optional<SendQueue.Send<byte[]>> next = connection.queue().poll();
         if (next.isEmpty()) {
             return;
         }
-        SendQueue.Send send = next.orElseThrow();
-        log.trace("Write attempt for ticket {}: {}", send.ticket(), send.bytes());
+        SendQueue.Send<byte[]> send = next.orElseThrow();
+        log.trace("Write attempt for ticket {}: {}", send.ticket(), send.value());
         Transport.SendResult result;
         try {
-            result = connection.transport().send(send.ticket(), send.bytes());
+            result = connection.transport().send(send.ticket(), send.value());
         } catch (RuntimeException failure) {
             throw new SpiException(generation, failure);
         }
@@ -208,7 +209,7 @@ final class ClientIo {
             long generation,
             Transport transport,
             AtomicBoolean closed,
-            SendQueue queue
+            SendQueue<byte[]> queue
     ) {
     }
 }

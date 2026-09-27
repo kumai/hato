@@ -210,7 +210,7 @@ public final class BrokerServer implements AutoCloseable {
 
         private final FrameWriter writer;
 
-        private final SendQueue outgoing = new SendQueue(SEND_COUNT, sendBytes, 0, 0);
+        private final SendQueue<byte[]> outgoing = new SendQueue<>(SEND_COUNT, sendBytes, 0, 0);
 
         // Only routing reads/writes the subscriptions. The identifier is assigned once, on
         // acceptance, while holding both routing and this connection's monitor; either lock can
@@ -476,9 +476,11 @@ public final class BrokerServer implements AutoCloseable {
             if (ended) {
                 return false;
             }
+            byte[] bytes = codec.encode(packet);
             boolean enqueueFailed = outgoing.offer(
                     ++ticket,
-                    codec.encode(packet),
+                    bytes,
+                    bytes.length,
                     false
             ) != SendQueue.OfferResult.ACCEPTED;
             if (enqueueFailed) {
@@ -493,9 +495,9 @@ public final class BrokerServer implements AutoCloseable {
             String reason = "refusal sent";
             try {
                 while (true) {
-                    SendQueue.Send send;
+                    SendQueue.Send<byte[]> send;
                     synchronized (this) {
-                        Optional<SendQueue.Send> next = outgoing.poll();
+                        Optional<SendQueue.Send<byte[]>> next = outgoing.poll();
                         while (!ended && next.isEmpty()) {
                             wait();
                             next = outgoing.poll();
@@ -505,7 +507,7 @@ public final class BrokerServer implements AutoCloseable {
                         }
                         send = next.orElseThrow();
                     }
-                    writer.write(send.bytes());
+                    writer.write(send.value());
                     synchronized (this) {
                         outgoing.completed(send.ticket());
                         if (send.ticket() == closeAfterWrite) {
