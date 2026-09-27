@@ -1,14 +1,21 @@
 package org.mqtt4j.mqtj.nativesmoke;
 
 import java.net.URI;
+import java.util.concurrent.CompletableFuture;
 
 import org.mqtt4j.mqtj.MqttClient;
+import org.mqtt4j.mqtj.MqttMessage;
 import org.mqtt4j.mqtj.MqttVersion;
+import org.mqtt4j.mqtj.Qos;
+import org.mqtt4j.mqtj.Subscribe;
+import org.mqtt4j.mqtj.Subscription;
+import org.mqtt4j.mqtj.Topic;
+import org.mqtt4j.mqtj.TopicFilter;
 import org.mqtt4j.mqtj.broker.MqttBroker;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 
-/// Verifies that the packaged client and broker connect over TCP in a native image.
+/// Verifies that the packaged client and broker exchange QoS 0 over TCP in a native image.
 public final class NativeSmoke {
 
     private NativeSmoke() {
@@ -23,8 +30,20 @@ public final class NativeSmoke {
             if (client.connect().get(5, SECONDS).sessionPresent()) {
                 throw new AssertionError("Clean connection resumed a session");
             }
+            var received = new CompletableFuture<MqttMessage>();
+            Subscription subscription = client.subscribe(
+                    new Subscribe(new TopicFilter("smoke/#"), Qos.AT_MOST_ONCE),
+                    delivery -> received.complete(delivery.message())
+            ).get(5, SECONDS);
+            var message = new MqttMessage(new Topic("smoke/message"), new byte[] {42},
+                    Qos.AT_MOST_ONCE, false);
+            client.publish(message).get(5, SECONDS);
+            if (!message.equals(received.get(5, SECONDS))) {
+                throw new AssertionError("QoS 0 delivery changed the message");
+            }
+            subscription.unsubscribe().get(5, SECONDS);
             client.disconnect().get(5, SECONDS);
         }
-        System.out.println("mqtj native smoke: connect/disconnect OK");
+        System.out.println("mqtj native smoke: QoS 0 publish/subscribe/unsubscribe OK");
     }
 }

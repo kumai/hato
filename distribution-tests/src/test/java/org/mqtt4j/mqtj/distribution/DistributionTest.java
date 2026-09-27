@@ -88,16 +88,46 @@ class DistributionTest {
             """;
     private static final String CONNECTION_PROBE = """
             try (var broker = org.mqtt4j.mqtj.broker.MqttBroker.start();
-                    var connectedClient = org.mqtt4j.mqtj.MqttClient.builder()
+                    org.mqtt4j.mqtj.MqttClient sut = org.mqtt4j.mqtj.MqttClient.builder()
                             .server(java.net.URI.create("mqtt://localhost:" + broker.port()))
                             .version(org.mqtt4j.mqtj.MqttVersion.V3_1_1)
                             .build()) {
-                var connAck = connectedClient.connect()
+                org.mqtt4j.mqtj.ConnAck connAck = sut.connect()
                         .get(5, java.util.concurrent.TimeUnit.SECONDS);
                 if (connAck.sessionPresent()) {
                     throw new AssertionError("Clean connection resumed a session");
                 }
-                connectedClient.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
+
+                // Arrange: use the public messaging roles from the distributed client jar.
+                var received =
+                        new java.util.concurrent.CompletableFuture<org.mqtt4j.mqtj.MqttMessage>();
+                org.mqtt4j.mqtj.MqttSubscriber subscriber = sut;
+                org.mqtt4j.mqtj.MqttPublisher publisher = sut;
+                var message = new org.mqtt4j.mqtj.MqttMessage(
+                        new org.mqtt4j.mqtj.Topic("probe/message"),
+                        new byte[] {42},
+                        org.mqtt4j.mqtj.Qos.AT_MOST_ONCE,
+                        false
+                );
+
+                // Act
+                org.mqtt4j.mqtj.Subscription subscription = subscriber.subscribe(
+                        new org.mqtt4j.mqtj.Subscribe(
+                                new org.mqtt4j.mqtj.TopicFilter("probe/#"),
+                                org.mqtt4j.mqtj.Qos.AT_MOST_ONCE
+                        ),
+                        delivery -> received.complete(delivery.message())
+                ).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                publisher.publish(message).get(5, java.util.concurrent.TimeUnit.SECONDS);
+
+                // Assert
+                if (!message.equals(received.get(5, java.util.concurrent.TimeUnit.SECONDS))) {
+                    throw new AssertionError("QoS 0 delivery changed the message");
+                }
+
+                // Act & Assert: both lifecycle operations must finish within the deadline.
+                subscription.unsubscribe().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                sut.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
             }
             """;
 
