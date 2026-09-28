@@ -9,7 +9,7 @@ testcontainers = "2.0.5"
 graalvm-native = "1.1.14"
 jspecify = "1.0.1"
 errorprone = "2.50.0"
-nullaway = "0.14.1"
+nullaway = "0.14.2"
 errorprone-plugin = "5.1.1"
 checkstyle = "14.1.0"
 
