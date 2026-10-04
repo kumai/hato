@@ -2,8 +2,12 @@ package org.mqtt4j.mqtj.distribution;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.classfile.Attributes;
+import java.lang.classfile.ClassFile;
+import java.lang.classfile.ClassModel;
 import java.lang.module.ModuleDescriptor;
 import java.lang.module.ModuleFinder;
+import java.lang.reflect.AccessFlag;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -13,8 +17,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.zip.ZipFile;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -283,6 +289,53 @@ class DistributionTest {
     }
 
     @Test
+    void each_jar_exports_exactly_the_types_of_its_public_api() throws Exception {
+        // A change here is a change to the public API; update the list only on purpose.
+        assertThat(publicTypes(CLIENT)).containsExactlyInAnyOrder(
+                "org.mqtt4j.mqtj.AckMode",
+                "org.mqtt4j.mqtj.ConnAck",
+                "org.mqtt4j.mqtj.ConnectionListener",
+                "org.mqtt4j.mqtj.Disconnection",
+                "org.mqtt4j.mqtj.MqttCapacityException",
+                "org.mqtt4j.mqtj.MqttClient",
+                "org.mqtt4j.mqtj.MqttClientBuilder",
+                "org.mqtt4j.mqtj.MqttConnectException",
+                "org.mqtt4j.mqtj.MqttConnectionLostException",
+                "org.mqtt4j.mqtj.MqttDelivery",
+                "org.mqtt4j.mqtj.MqttException",
+                "org.mqtt4j.mqtj.MqttMessage",
+                "org.mqtt4j.mqtj.MqttNotConnectedException",
+                "org.mqtt4j.mqtj.MqttProtocolException",
+                "org.mqtt4j.mqtj.MqttPublisher",
+                "org.mqtt4j.mqtj.MqttSubscribeException",
+                "org.mqtt4j.mqtj.MqttSubscriber",
+                "org.mqtt4j.mqtj.MqttVersion",
+                "org.mqtt4j.mqtj.PublishResult",
+                "org.mqtt4j.mqtj.Qos",
+                "org.mqtt4j.mqtj.ReasonCode",
+                "org.mqtt4j.mqtj.ReceiveResult",
+                "org.mqtt4j.mqtj.ReceiveResult$Ended",
+                "org.mqtt4j.mqtj.ReceiveResult$Received",
+                "org.mqtt4j.mqtj.ReceiveResult$TimedOut",
+                "org.mqtt4j.mqtj.Subscribe",
+                "org.mqtt4j.mqtj.Subscription",
+                "org.mqtt4j.mqtj.Topic",
+                "org.mqtt4j.mqtj.TopicFilter",
+                "org.mqtt4j.mqtj.spi.TimerScheduler",
+                "org.mqtt4j.mqtj.spi.TimerScheduler$Cancellable",
+                "org.mqtt4j.mqtj.spi.Transport",
+                "org.mqtt4j.mqtj.spi.Transport$Factory",
+                "org.mqtt4j.mqtj.spi.Transport$Listener",
+                "org.mqtt4j.mqtj.spi.Transport$SendResult"
+        );
+        assertThat(publicTypes(BROKER)).containsExactly("org.mqtt4j.mqtj.broker.MqttBroker");
+        assertThat(publicTypes(testkitJar())).containsExactlyInAnyOrder(
+                "org.mqtt4j.mqtj.testkit.FaultyTransport",
+                "org.mqtt4j.mqtj.testkit.ManualTimerScheduler"
+        );
+    }
+
+    @Test
     void source_jars_match_the_embedded_packages() throws Exception {
         for (Path path : paths(System.getProperty("source.jars"))) {
             String owner = ownerOf(path);
@@ -406,6 +459,46 @@ class DistributionTest {
                     .filter(name -> !name.equals("module-info.class")).forEach(classes::add);
             return classes;
         }
+    }
+
+    /// Public types in the jar's exported packages, nested ones by binary name.
+    private static Set<String> publicTypes(Path jar) throws IOException {
+        Set<String> exported = ModuleFinder.of(jar).findAll().iterator().next().descriptor()
+                .exports().stream()
+                .map(ModuleDescriptor.Exports::source)
+                .collect(Collectors.toSet());
+        var types = new HashSet<String>();
+        try (var archive = new JarFile(jar.toFile())) {
+            for (JarEntry entry : archive.stream().toList()) {
+                String name = entry.getName();
+                if (!name.endsWith(".class") || name.endsWith("module-info.class")
+                        || name.endsWith("package-info.class")) {
+                    continue;
+                }
+                String type = name.substring(0, name.length() - ".class".length())
+                        .replace('/', '.');
+                if (!exported.contains(type.substring(0, type.lastIndexOf('.')))) {
+                    continue;
+                }
+                ClassModel model = ClassFile.of()
+                        .parse(archive.getInputStream(entry).readAllBytes());
+                if (isPublic(model)) {
+                    types.add(type);
+                }
+            }
+        }
+        return types;
+    }
+
+    /// A nested type's declared access is recorded in the InnerClasses attribute. Enclosing
+    /// types are not checked, so a public type nested in a hidden one is listed as well.
+    private static boolean isPublic(ClassModel model) {
+        String self = model.thisClass().asInternalName();
+        return model.flags().has(AccessFlag.PUBLIC)
+                && model.findAttribute(Attributes.innerClasses()).stream()
+                        .flatMap(attribute -> attribute.classes().stream())
+                        .filter(inner -> inner.innerClass().asInternalName().equals(self))
+                        .allMatch(inner -> inner.flags().contains(AccessFlag.PUBLIC));
     }
 
     /// JSpecify may only be `requires static`, never `transitive`: a transitive static requires
