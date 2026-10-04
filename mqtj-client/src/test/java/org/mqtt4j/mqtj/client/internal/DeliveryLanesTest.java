@@ -666,18 +666,18 @@ class DeliveryLanesTest {
         // Arrange: fill the delivery budget behind one running handler.
         var entered = new CountDownLatch(1);
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(5000), _ -> {
+        assertThat(sut.register(1, 1, request(70_000), _ -> {
             entered.countDown();
             waitFor(release);
         })).isTrue();
-        for (int i = 0; i < 4096; i++) {
+        for (int i = 0; i < 65_536; i++) {
             assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 1)).isTrue();
         }
         assertThat(entered.await(5, SECONDS)).isTrue();
 
         // Act & Assert: the global limit applies even though the lane has spare capacity.
         assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 1)).isFalse();
-        assertThat(sut.retainedDeliveries()).isEqualTo(4096);
+        assertThat(sut.retainedDeliveries()).isEqualTo(65_536);
 
         // Act
         sut.close(null);
@@ -685,7 +685,7 @@ class DeliveryLanesTest {
         // Assert: queued deliveries are abandoned; the executing handler keeps its reservation.
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(1);
-        assertThat(sut.abandonedDeliveries()).isEqualTo(4095);
+        assertThat(sut.abandonedDeliveries()).isEqualTo(65_535);
     }
 
     @Test

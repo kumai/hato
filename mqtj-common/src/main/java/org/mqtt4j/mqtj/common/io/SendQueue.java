@@ -69,6 +69,16 @@ public final class SendQueue<T> {
             count[kind]--;
             bytes[kind] -= byteCount;
         }
+
+        /// Sends holding either quota, including active ones.
+        public synchronized int count() {
+            return count[0] + count[1];
+        }
+
+        /// Bytes of the sends counted by [#count()].
+        public synchronized long bytes() {
+            return bytes[0] + bytes[1];
+        }
     }
 
     private final ArrayDeque<Send<T>> pending = new ArrayDeque<>();

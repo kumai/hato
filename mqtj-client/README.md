@@ -42,8 +42,9 @@ subscription.unsubscribe().join();
   to acknowledge before the handler runs, or `AckMode.MANUAL` to call `delivery.ack()`
   yourself for every message: `Subscribe.of(filter, Qos.AT_LEAST_ONCE).withAckMode(AckMode.MANUAL)`.
 - While the handler is busy, new messages for the subscription wait in a queue of
-  256, which also holds QoS 1 messages until they are acknowledged. Change its size with
-  `Subscribe.of(filter, qos).withBufferCapacity(1024)`.
+  1,024, which also holds QoS 1 messages until they are acknowledged. Messages can arrive
+  all at once, such as retained messages when you subscribe, so size the queue for them:
+  `Subscribe.of(filter, qos).withBufferCapacity(4096)`.
 - `subscription.close()` stops delivery at once and drops queued messages without
   waiting for the broker. Use `unsubscribe()` when you need to know that the broker
   has removed the subscription. The same filter can be registered again after removal
@@ -75,7 +76,7 @@ while (subscription.receive() instanceof ReceiveResult.Received(var delivery)) {
 - QoS 1 messages are acknowledged when `receive()` hands them over.
   Choose `AckMode.MANUAL`, as above, to acknowledge after your processing.
   `AckMode.AFTER_HANDLER` needs a handler.
-- The queue of 256 holds messages until a thread takes them, and QoS 1 `MANUAL`
+- The queue of 1,024 holds messages until a thread takes them, and QoS 1 `MANUAL`
   messages until `delivery.ack()`.
 - QoS 1 acknowledgements leave in arrival order across all subscriptions, so a message
   that nobody takes or acknowledges can stop the broker's later QoS 1 messages. If you

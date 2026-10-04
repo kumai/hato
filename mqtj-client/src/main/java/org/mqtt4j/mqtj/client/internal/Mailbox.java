@@ -179,6 +179,16 @@ final class Mailbox {
         notifyAll();
     }
 
+    /// Queued events, excluding a pending termination.
+    synchronized int size() {
+        return events.size();
+    }
+
+    /// Bytes of queued commands and incoming packets.
+    synchronized long bytes() {
+        return commandBytes + incomingBytes;
+    }
+
     private void release(Event event) {
         switch (event.kind()) {
             case COMMAND -> {

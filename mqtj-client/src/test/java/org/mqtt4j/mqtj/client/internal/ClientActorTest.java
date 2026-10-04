@@ -1,5 +1,6 @@
 package org.mqtt4j.mqtj.client.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.URI;
@@ -8,6 +9,7 @@ import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -80,6 +82,10 @@ import static org.mqtt4j.mqtj.spi.Transport.SendResult.CLOSED;
 class ClientActorTest {
 
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
+
+    private static final ClientActor.Usage NOTHING_HELD = new ClientActor.Usage(
+            0, 0, 0, 0, 0, 0, 0, 0, 0
+    );
 
     private final ManualTimerScheduler scheduler = new ManualTimerScheduler();
     private final LinkedBlockingQueue<Disconnection> ends = new LinkedBlockingQueue<>();
@@ -2037,6 +2043,135 @@ class ClientActorTest {
     }
 
     @Test
+    void a_burst_of_small_publications_waits_for_a_busy_actor_without_overload() throws Exception {
+        // Arrange: a pull subscription has room for the whole burst, and the actor is busy.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribePull(
+                    sut, transport, request().withBufferCapacity(65_536)
+            );
+            holdActor(transport, entered, release);
+            byte[] packet = codec.encode(publication(new byte[] {1}));
+            var burst = new ByteArrayOutputStream();
+            for (int i = 0; i < 65_536; i++) {
+                burst.writeBytes(packet);
+            }
+
+            // Act: one chunk queues as many packets as the incoming mailbox counts.
+            transport.receiver().onBytes(burst.toByteArray());
+            release.countDown();
+            // This command follows the burst through the mailbox, so it completes after routing.
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+
+            // Assert: the subscription holds the whole burst within the client-wide bound.
+            assertThat(((ClientActor) sut).usage().deliveries()).isEqualTo(65_536);
+            for (int i = 0; i < 65_536; i++) {
+                assertThat(subscription.receive(Duration.ofSeconds(5)))
+                        .isInstanceOf(ReceiveResult.Received.class);
+            }
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void connection_end_frees_io_timers_and_mailbox_while_application_code_still_runs()
+            throws Exception {
+        // Arrange: application code holds a continuation, an unacknowledged MANUAL delivery,
+        // a handler waiting for its own QoS 1 publication, and the connection listener.
+        var listening = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var publishFailure = new CompletableFuture<Throwable>();
+        try (MqttClient sut = client(end -> {
+            ends.add(end);
+            listening.countDown();
+            waitFor(release);
+        })) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription manual = subscribePull(sut, transport,
+                    Subscribe.of(new TopicFilter("manual"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL));
+            transport.receive(new Packet.Publish(new Topic("manual"), new byte[] {1},
+                    Qos.AT_LEAST_ONCE, false, false, 1, EMPTY));
+            assertThat(manual.receive(Duration.ofSeconds(5)))
+                    .isInstanceOf(ReceiveResult.Received.class);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    request().withBufferCapacity(2),
+                    _ -> {
+                        try {
+                            sut.publish(new MqttMessage(new Topic("replies"), new byte[] {2},
+                                    Qos.AT_LEAST_ONCE, false)).join();
+                        } catch (CompletionException failure) {
+                            publishFailure.complete(failure.getCause());
+                        }
+                        waitFor(release);
+                    }
+            );
+            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(
+                    subscribe.packetId(),
+                    List.of(ReasonCode.SUCCESS),
+                    EMPTY
+            ));
+            subscribing.get(5, SECONDS);
+            // Attach the continuation before the write completes, so it blocks a completion
+            // thread rather than this one.
+            transport.completeSends = false;
+            CompletableFuture<Void> continuation = sut.publish(message(new byte[] {3}))
+                    .thenRun(() -> waitFor(release));
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            transport.completeSend();
+
+            // Act: the handler waits for PUBACK behind a stalled write, another publication
+            // queues behind that write, and a burst of 1,000 overflows the handler's queue.
+            transport.receive(publication(new byte[] {4}));
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOfSatisfying(
+                    Packet.Publish.class,
+                    reply -> assertThat(reply.topic()).isEqualTo(new Topic("replies"))
+            );
+            CompletableFuture<PublishResult> queued = sut.publish(message(new byte[] {7}));
+            byte[] packet = codec.encode(publication(new byte[] {5}));
+            var burst = new ByteArrayOutputStream();
+            for (int i = 0; i < 1000; i++) {
+                burst.writeBytes(packet);
+            }
+            transport.receiver().onBytes(burst.toByteArray());
+            assertThat(listening.await(5, SECONDS)).isTrue();
+
+            // Assert: the overload fails both publications and discards the queued write.
+            // Timers and the mailbox are free; the transport still owns the stalled write.
+            assertThat(publishFailure.get(5, SECONDS))
+                    .isInstanceOf(MqttConnectionLostException.class)
+                    .hasCauseInstanceOf(MqttCapacityException.class);
+            assertThatThrownBy(() -> queued.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+            assertThat(scheduler.pendingTaskCount()).isZero();
+            assertThat(actor.usage().sends()).isEqualTo(1);
+
+            // Act: the transport's final callback releases the stalled write.
+            transport.receiver().onClosed(new IOException("Transport closed"));
+
+            // Assert: only the continuation, the listener, and the running handler with its
+            // 13-byte delivery still hold capacity.
+            var held = new ClientActor.Usage(1, 1, 0, 0, 0, 0, 1, 1, 13);
+            await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(held));
+
+            // Act
+            release.countDown();
+
+            // Assert
+            continuation.get(5, SECONDS);
+            await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(NOTHING_HELD));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void publish_continuations_retain_operation_capacity_until_they_return() throws Exception {
         // Arrange
         var entered = new AtomicInteger();
@@ -2603,7 +2738,7 @@ class ClientActorTest {
             Thread sender = encoding.get(5, SECONDS);
             holdActor(transport, actorHeld, releaseActor);
             CompletableFuture<PublishResult> queued = sut.publish(message(new byte[] {2}));
-            for (int i = 0; i < 257; i++) {
+            for (int i = 0; i < 65_537; i++) {
                 transport.receive(new Packet.PingResp());
             }
 

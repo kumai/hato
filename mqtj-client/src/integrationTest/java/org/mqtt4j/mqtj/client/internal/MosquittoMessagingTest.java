@@ -1,11 +1,15 @@
 package org.mqtt4j.mqtj.client.internal;
 
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.testcontainers.containers.GenericContainer;
 
@@ -98,6 +102,53 @@ class MosquittoMessagingTest extends MessagingTest {
             assertThat(requireNonNull(wildcard.poll(5, SECONDS)).message())
                     .isEqualTo(message(base + "/barrier", (byte) 4));
             assertThat(exact).isEmpty();
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void ten_thousand_retained_messages_arriving_at_once_fit_a_subscription_with_room()
+            throws Exception {
+        // Arrange
+        String base = uniqueTopic();
+        var handled = new CountDownLatch(10_000);
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (MqttClient publisher = client(); MqttClient sut = client(ended::add)) {
+            publisher.connect().get(5, SECONDS);
+            retain(publisher, base, 10_000, new byte[100]);
+            sut.connect().get(5, SECONDS);
+
+            // Act: Mosquitto sends every matching retained message right after SUBACK.
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE)
+                            .withBufferCapacity(10_000),
+                    _ -> handled.countDown()
+            ).get(5, SECONDS);
+
+            // Assert: the client holds the burst instead of ending the connection.
+            assertThat(handled.await(10, SECONDS)).isTrue();
+            assertThat(ended).isEmpty();
+            sut.disconnect().get(5, SECONDS);
+            retain(publisher, base, 10_000, new byte[0]);
+            publisher.disconnect().get(5, SECONDS);
+        }
+    }
+
+    /// Stores one retained message per topic below `base`; an empty payload clears them.
+    private static void retain(MqttClient publisher, String base, int count, byte[] payload)
+            throws Exception {
+        // A small window keeps operations, including slots still being returned, in capacity.
+        var window = new ArrayList<CompletableFuture<PublishResult>>();
+        for (int i = 0; i < count; i++) {
+            window.add(publisher.publish(new MqttMessage(
+                    new Topic(base + "/" + i), payload, Qos.AT_LEAST_ONCE, true
+            )));
+            if (window.size() == 16 || i == count - 1) {
+                for (CompletableFuture<PublishResult> publication : window) {
+                    publication.get(5, SECONDS);
+                }
+                window.clear();
+            }
         }
     }
 

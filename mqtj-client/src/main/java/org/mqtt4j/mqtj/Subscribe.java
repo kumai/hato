@@ -19,7 +19,7 @@ import static java.util.Objects.requireNonNull;
 /// All QoS values can be represented; the current client accepts QoS 0 and QoS 1 subscriptions.
 public final class Subscribe {
 
-    private static final int DEFAULT_BUFFER_CAPACITY = 256;
+    private static final int DEFAULT_BUFFER_CAPACITY = 1024;
 
     private final TopicFilter filter;
 
@@ -38,7 +38,7 @@ public final class Subscribe {
     }
 
     /// Requests `filter` with `qos` as the maximum quality of service, the default
-    /// acknowledgement mode, and a buffer capacity of 256.
+    /// acknowledgement mode, and a buffer capacity of 1024.
     ///
     /// @throws IllegalArgumentException if shared syntax is invalid
     public static Subscribe of(TopicFilter filter, Qos qos) {
@@ -84,7 +84,9 @@ public final class Subscribe {
     /// The maximum number of local deliveries this subscription holds at once. Pull subscriptions
     /// count queued deliveries and QoS 1 MANUAL deliveries awaiting ack; ON_RECEIVE and QoS 0
     /// release the slot at handoff. Push subscriptions also count running handlers and deliveries
-    /// whose PUBACK is pending; see [AckMode].
+    /// whose PUBACK is pending; see [AckMode]. The client also bounds the deliveries and bytes
+    /// held across all of its subscriptions. A message that exceeds any of these bounds ends the
+    /// connection.
     public int bufferCapacity() {
         return bufferCapacity;
     }

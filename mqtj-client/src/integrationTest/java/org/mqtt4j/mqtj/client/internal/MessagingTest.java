@@ -6,6 +6,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -35,6 +36,10 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
 /// Public messaging contracts shared by the embedded broker and Mosquitto.
 abstract class MessagingTest {
+
+    static final ClientActor.Usage NOTHING_HELD = new ClientActor.Usage(
+            0, 0, 0, 0, 0, 0, 0, 0, 0
+    );
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -548,6 +553,192 @@ abstract class MessagingTest {
         }
     }
 
+    @Test
+    @Timeout(60)
+    void a_blocked_handler_overflows_its_default_queue_and_frees_its_slots_after_returning()
+            throws Exception {
+        // Arrange: the handler holds the first publication before any other one is sent.
+        String topic = uniqueTopic();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (MqttClient sut = client(ended::add); MqttClient publisher = client()) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    _ -> {
+                        entered.countDown();
+                        waitFor(release);
+                    }
+            ).get(5, SECONDS);
+            publisher.publish(message(topic, (byte) 0)).get(5, SECONDS);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+
+            // Act: more publications than the default queue holds arrive behind the handler.
+            // Each QoS 1 publication waits for the broker, so none piles up there instead.
+            var publication = new MqttMessage(new Topic(topic), new byte[] {1},
+                    Qos.AT_LEAST_ONCE, false);
+            for (int i = 0; i < 2_000 && ended.isEmpty(); i++) {
+                publisher.publish(publication).get(5, SECONDS);
+            }
+
+            // Assert: overload ends the connection while the handler runs. Only that handler
+            // keeps its lane and delivery, until it returns.
+            assertThat(requireNonNull(ended.poll(10, SECONDS)).cause())
+                    .isInstanceOf(MqttCapacityException.class);
+            await().untilAsserted(() -> assertThat(usage(sut))
+                    .extracting(
+                            ClientActor.Usage::operations,
+                            ClientActor.Usage::notifications,
+                            ClientActor.Usage::mailboxEvents,
+                            ClientActor.Usage::sends,
+                            ClientActor.Usage::lanes,
+                            ClientActor.Usage::deliveries
+                    )
+                    .containsExactly(0, 0, 0, 0, 1, 1));
+            release.countDown();
+            await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_handler_can_wait_for_its_own_publication_while_its_queue_is_full() throws Exception {
+        // Arrange: a handler keeps its four-slot queue full until it may publish and wait.
+        String base = uniqueTopic();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var barrier = new CountDownLatch(1);
+        var handled = new LinkedBlockingQueue<Integer>();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (MqttClient sut = client(ended::add); MqttClient publisher = client()) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(base + "/barrier"), Qos.AT_MOST_ONCE),
+                    _ -> barrier.countDown()
+            ).get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(base + "/work"), Qos.AT_MOST_ONCE)
+                            .withBufferCapacity(4),
+                    delivery -> {
+                        int number = delivery.message().payload()[0];
+                        if (number == 0) {
+                            entered.countDown();
+                            waitFor(release);
+                            sut.publish(new MqttMessage(new Topic(base + "/reply"),
+                                    new byte[] {0}, Qos.AT_LEAST_ONCE, false)).join();
+                        }
+                        handled.add(number);
+                    }
+            ).get(5, SECONDS);
+            publisher.publish(message(base + "/work", (byte) 0)).get(5, SECONDS);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            for (int i = 1; i < 4; i++) {
+                publisher.publish(message(base + "/work", (byte) i)).get(5, SECONDS);
+            }
+            // The barrier follows the queued work through the broker and the client.
+            publisher.publish(message(base + "/barrier", (byte) 0)).get(5, SECONDS);
+            assertThat(barrier.await(5, SECONDS)).isTrue();
+
+            // Act: the PUBACK arrives while every queue slot is taken.
+            release.countDown();
+
+            // Assert: the publication completes, the queue drains, and the connection remains.
+            for (int i = 0; i < 4; i++) {
+                assertThat(handled.poll(5, SECONDS)).isEqualTo(i);
+            }
+            assertThat(ended).isEmpty();
+            sut.disconnect().get(5, SECONDS);
+            await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void overload_releases_a_handler_waiting_for_its_own_publication() throws Exception {
+        // Arrange: delayed input lets an overflowing publication precede the handler's PUBACK.
+        String base = uniqueTopic();
+        var scheduler = new ManualTimerScheduler();
+        var transport = new AtomicReference<FaultyTransport>();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var barrier = new CountDownLatch(1);
+        var replies = new LinkedBlockingQueue<MqttDelivery>();
+        var outcome = new CompletableFuture<Throwable>();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (
+                MqttClient sut = MqttClient.builder()
+                        .server(endpoint())
+                        .version(MqttVersion.V3_1_1)
+                        .connectionListener(ended::add)
+                        .transportFactory(id -> {
+                            var faulty = new FaultyTransport(Transport.tcp(id), scheduler);
+                            transport.set(faulty);
+                            return faulty;
+                        })
+                        .build();
+                MqttClient publisher = client()
+        ) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            publisher.subscribe(
+                    Subscribe.of(new TopicFilter(base + "/reply"), Qos.AT_MOST_ONCE),
+                    replies::add
+            ).get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(base + "/barrier"), Qos.AT_MOST_ONCE),
+                    _ -> barrier.countDown()
+            ).get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(base + "/work"), Qos.AT_MOST_ONCE)
+                            .withBufferCapacity(4),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 0) {
+                            entered.countDown();
+                            waitFor(release);
+                            try {
+                                sut.publish(new MqttMessage(new Topic(base + "/reply"),
+                                        new byte[] {0}, Qos.AT_LEAST_ONCE, false)).join();
+                                outcome.complete(null);
+                            } catch (CompletionException failure) {
+                                outcome.complete(failure.getCause());
+                            }
+                        }
+                    }
+            ).get(5, SECONDS);
+            publisher.publish(message(base + "/work", (byte) 0)).get(5, SECONDS);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            for (int i = 1; i < 4; i++) {
+                publisher.publish(message(base + "/work", (byte) i)).get(5, SECONDS);
+            }
+            publisher.publish(message(base + "/barrier", (byte) 0)).get(5, SECONDS);
+            assertThat(barrier.await(5, SECONDS)).isTrue();
+            requireNonNull(transport.get()).receiveDelay(Duration.ofSeconds(30));
+            publisher.publish(message(base + "/work", (byte) 4)).get(5, SECONDS);
+            await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
+            release.countDown();
+            // The broker has the handler's publication, so the handler now waits for PUBACK.
+            assertThat(replies.poll(5, SECONDS)).isNotNull();
+
+            // Act: delayed input delivers the overflowing publication before the PUBACK.
+            scheduler.advance(Duration.ofSeconds(30));
+
+            // Assert: no circular wait remains, and every slot returns once the handler does.
+            Disconnection end = requireNonNull(ended.poll(5, SECONDS));
+            assertThat(end.cause()).isInstanceOf(MqttCapacityException.class);
+            assertThat(outcome.get(5, SECONDS))
+                    .isInstanceOf(MqttConnectionLostException.class)
+                    .hasCause(end.cause());
+            await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
+        } finally {
+            release.countDown();
+        }
+    }
+
     MqttClient client() {
         return client(_ -> {});
     }
@@ -569,6 +760,19 @@ abstract class MessagingTest {
     }
 
     abstract URI endpoint();
+
+    static ClientActor.Usage usage(MqttClient client) {
+        return ((ClientActor) client).usage();
+    }
+
+    static void waitFor(CountDownLatch latch) {
+        try {
+            assertThat(latch.await(10, SECONDS)).isTrue();
+        } catch (InterruptedException cause) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(cause);
+        }
+    }
 
     private static MqttDelivery received(ReceiveResult result) {
         return assertInstanceOf(ReceiveResult.Received.class, result).delivery();

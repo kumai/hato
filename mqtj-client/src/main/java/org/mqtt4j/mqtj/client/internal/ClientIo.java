@@ -438,6 +438,15 @@ final class ClientIo {
         close();
     }
 
+    /// Sends holding the client-wide budget, including those an ended connection still owns.
+    int sends() {
+        return budget.count();
+    }
+
+    long sendBytes() {
+        return budget.bytes();
+    }
+
     /// activeTicket names the queue's active send, or 0; its capacity returns only after neither
     /// the sender nor the transport still uses it.
     private static final class Connection {

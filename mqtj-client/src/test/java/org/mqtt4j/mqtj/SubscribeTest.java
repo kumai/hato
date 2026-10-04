@@ -12,14 +12,14 @@ class SubscribeTest {
 
     @ParameterizedTest
     @EnumSource(Qos.class)
-    void defaults_leave_the_ack_mode_open_and_use_capacity_256_for_every_qos(Qos qos) {
+    void defaults_leave_the_ack_mode_open_and_use_capacity_1024_for_every_qos(Qos qos) {
         // Act
         var sut = Subscribe.of(new TopicFilter("events/#"), qos);
 
         // Assert
         assertThat(sut.qos()).isEqualTo(qos);
         assertThat(sut.ackMode()).isEmpty();
-        assertThat(sut.bufferCapacity()).isEqualTo(256);
+        assertThat(sut.bufferCapacity()).isEqualTo(1024);
     }
 
     @Test
@@ -33,7 +33,7 @@ class SubscribeTest {
 
         // Assert
         assertThat(sut.ackMode()).isEmpty();
-        assertThat(sut.bufferCapacity()).isEqualTo(256);
+        assertThat(sut.bufferCapacity()).isEqualTo(1024);
         assertThat(changed.ackMode()).contains(AckMode.MANUAL);
         assertThat(changed.bufferCapacity()).isEqualTo(8);
         Subscribe same = Subscribe.of(filter, Qos.AT_LEAST_ONCE)

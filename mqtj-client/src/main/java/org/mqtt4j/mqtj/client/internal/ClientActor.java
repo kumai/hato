@@ -57,7 +57,10 @@ public final class ClientActor implements MqttClient {
 
     private static final int NOTIFICATION_LIMIT = 64;
 
-    private static final int MAILBOX_INCOMING_LIMIT = 256;
+    // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
+    // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
+    // each when measured); the byte limit bounds the packets themselves.
+    private static final int MAILBOX_INCOMING_LIMIT = 65_536;
 
     private static final int MAILBOX_CONTROL_LIMIT = 256;
 
@@ -516,6 +519,22 @@ public final class ClientActor implements MqttClient {
         }
     }
 
+    /// What the client holds against its internal bounds. Tests compare this with the bounds
+    /// until applications get statistics. The parts are read one after another, not atomically.
+    Usage usage() {
+        return new Usage(
+                OPERATION_LIMIT - operationSlots.availablePermits(),
+                NOTIFICATION_LIMIT - notificationSlots.availablePermits(),
+                mailbox.size(),
+                mailbox.bytes(),
+                io.sends(),
+                io.sendBytes(),
+                lanes.retainedLanes(),
+                lanes.retainedDeliveries(),
+                lanes.retainedBytes()
+        );
+    }
+
     static Mailbox createMailbox(int maxPacketSize) {
         // Operation slots are taken before admission, so they also bound queued commands.
         return new Mailbox(
@@ -767,6 +786,21 @@ public final class ClientActor implements MqttClient {
                 mailbox.wake();
             }
         }
+    }
+
+    /// Operation and notification slots stay held until application continuations and listeners
+    /// return; lanes and deliveries until handlers return and acknowledgements are released.
+    record Usage(
+            int operations,
+            int notifications,
+            int mailboxEvents,
+            long mailboxBytes,
+            int sends,
+            long sendBytes,
+            int lanes,
+            int deliveries,
+            long deliveryBytes
+    ) {
     }
 
     private static final class TimerEntry {

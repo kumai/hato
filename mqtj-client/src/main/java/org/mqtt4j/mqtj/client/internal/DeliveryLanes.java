@@ -34,7 +34,10 @@ final class DeliveryLanes {
 
     private static final int LANE_LIMIT = 256;
 
-    private static final int DELIVERY_LIMIT = 4096;
+    // Bounds per-delivery overhead across all subscriptions (about 240 bytes each when measured);
+    // the byte limit bounds payloads. Keep it high enough not to override a subscription's own
+    // buffer capacity in ordinary use.
+    private static final int DELIVERY_LIMIT = 65_536;
 
     // One lock keeps fan-out reservations atomic; each lane's condition wakes only that lane's
     // worker or receivers.
