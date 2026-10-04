@@ -75,13 +75,16 @@ public final class Subscribe {
     }
 
     /// When this subscription permits acknowledgement of a QoS 1 delivery. Empty uses the
-    /// default: [AckMode#AFTER_HANDLER] for a subscription with a handler.
+    /// default: [AckMode#AFTER_HANDLER] with a handler, or [AckMode#ON_RECEIVE] for pull
+    /// subscriptions.
     public Optional<AckMode> ackMode() {
         return Optional.ofNullable(ackMode);
     }
 
-    /// The maximum number of deliveries this subscription holds at once: queued or running ones,
-    /// and QoS 1 ones whose PUBACK is still pending; see [AckMode].
+    /// The maximum number of local deliveries this subscription holds at once. Pull subscriptions
+    /// count queued deliveries and QoS 1 MANUAL deliveries awaiting ack; ON_RECEIVE and QoS 0
+    /// release the slot at handoff. Push subscriptions also count running handlers and deliveries
+    /// whose PUBACK is pending; see [AckMode].
     public int bufferCapacity() {
         return bufferCapacity;
     }

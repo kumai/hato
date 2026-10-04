@@ -6,14 +6,19 @@ package org.mqtt4j.mqtj;
 /// PUBACK follows receive order and waits until every subscription that received the message
 /// meets its condition. A delivery that has not met its condition therefore holds back the
 /// PUBACK of every later QoS 1 message on the connection, including other subscriptions'
-/// messages, which keep their subscription capacity meanwhile. Exhausted capacity ends the
-/// connection. Acknowledgement does not release capacity still occupied by a running handler.
+/// messages. Push subscriptions keep a delivery's capacity until its handler finishes and its
+/// PUBACK can be sent. Pull subscriptions release it at handoff (ON_RECEIVE) or at
+/// [MqttDelivery#ack()] (MANUAL). QoS 1 messages whose PUBACK is pending are also bounded per
+/// connection. Exhausting either bound ends the connection. Acknowledgement never releases a
+/// running handler's capacity.
 public enum AckMode {
 
-    /// Immediately before invoking the handler, without waiting for it to return.
+    /// Immediately before invoking the handler, or when a pull receive hands off the delivery.
+    /// The default for a pull subscription. Does not wait for application processing.
     ON_RECEIVE,
 
-    /// After the handler returns normally. The default for a subscription with a handler.
+    /// After the handler returns normally. The default for a subscription with a handler;
+    /// rejected for pull subscriptions.
     AFTER_HANDLER,
 
     /// When the application calls [MqttDelivery#ack()]. Call it for every delivery; it has no

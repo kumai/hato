@@ -1,6 +1,7 @@
 package org.mqtt4j.mqtj.client.internal;
 
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -104,8 +105,16 @@ final class SessionCore {
 
     private static final int ACKNOWLEDGEMENT_LIMIT = 4096;
 
+    // Broker registrations outlive locally closed handles until UNSUBACK or connection end,
+    // so they are bounded apart from the delivery lanes that local closure releases.
+    private static final int REGISTRATION_LIMIT = 256;
+
     // Bound queued completion events even when I/O returns capacity during an actor drain.
     private static final int ACK_WRITE_LIMIT = 16;
+
+    // Close has no public operation slot. Bound its in-flight exchanges separately, so a
+    // batch of closures cannot flood the actor with send completions and UNSUBACKs.
+    private static final int CLOSE_INFLIGHT_LIMIT = 16;
 
     private final Port port;
 
@@ -154,6 +163,11 @@ final class SessionCore {
     private final Map<Integer, LocalSubscription> subscribing = new HashMap<>();
 
     private final Map<Integer, UnsubscribeOperation> unsubscribing = new HashMap<>();
+
+    // At most one removal per registered subscription; the registry supplies the total bound.
+    private final ArrayDeque<UnsubscribeOperation> queuedClosures = new ArrayDeque<>();
+
+    private int closingInFlight;
 
     SessionCore(Port port, String clientId, Duration timeout, Duration keepAlive) {
         this.port = port;
@@ -242,6 +256,8 @@ final class SessionCore {
         } else {
             failed(connection, protocolError("Unexpected " + packet.getClass().getSimpleName()));
         }
+        // SUBACK/PUBACK/UNSUBACK can return packet identifiers or the close exchange window.
+        drainClosures();
     }
 
     void sent(long connection, long ticket, long now) {
@@ -323,6 +339,10 @@ final class SessionCore {
             ));
             return;
         }
+        if (subscriptions.size() >= REGISTRATION_LIMIT) {
+            capacityFailure(operation, "Subscription capacity");
+            return;
+        }
 
         var allocated = packetIds.allocate();
         if (allocated.isEmpty()) {
@@ -353,30 +373,69 @@ final class SessionCore {
     }
 
     void unsubscribe(long operation, long subscriptionId) {
+        beginUnsubscribe(operation, subscriptionId, false);
+    }
+
+    /// Records one permanent local closure. The shell drains send capacity after its batch.
+    void closeSubscription(long operation, long subscriptionId) {
+        beginUnsubscribe(operation, subscriptionId, true);
+    }
+
+    private void beginUnsubscribe(long operation, long subscriptionId, boolean background) {
         if (!ready(operation)) {
             return;
         }
         LocalSubscription local = subscriptions.get(subscriptionId);
         // The shell sends one removal per established handle of the current connection
-        // and resumes its delivery lane whenever the removal fails.
+        // and resumes its delivery lane when the removal fails, unless the handle was closed.
         if (local == null || !local.established || local.removing) {
             port.complete(operation, null, new IllegalStateException("Subscription is not active"));
             return;
         }
+        local.removing = true;
+        var removal = new UnsubscribeOperation(operation, local, background);
+        if (background) {
+            queuedClosures.addLast(removal);
+        } else {
+            sendUnsubscribe(removal).ifPresent(refusal -> {
+                local.removing = false;
+                capacityFailure(operation, refusal);
+            });
+        }
+    }
+
+    /// Returns which capacity refused the packet, or empty once the send queue admits it. A
+    /// refusal releases the packet identifier and leaves no pending UNSUBACK entry. CLOSED
+    /// counts as admitted and waits for the connection's terminal cause, like other admitted
+    /// protocol operations.
+    private Optional<String> sendUnsubscribe(UnsubscribeOperation removal) {
         var allocated = packetIds.allocate();
         if (allocated.isEmpty()) {
-            capacityFailure(operation, "Packet identifier capacity");
-            return;
+            return Optional.of("Packet identifier capacity");
         }
         int id = allocated.getAsInt();
-        local.removing = true;
-        unsubscribing.put(id, new UnsubscribeOperation(operation, local));
-        var packet = new Packet.Unsubscribe(id, List.of(local.filter), EMPTY);
+        unsubscribing.put(id, removal);
+        var packet = new Packet.Unsubscribe(id, List.of(removal.subscription.filter), EMPTY);
         if (port.send(generation, ++nextTicket, packet) == SendQueue.OfferResult.FULL) {
             unsubscribing.remove(id);
-            local.removing = false;
             packetIds.release(id);
-            capacityFailure(operation, "Send queue capacity");
+            return Optional.of("Send queue capacity");
+        }
+        return Optional.empty();
+    }
+
+    private void drainClosures() {
+        // DISCONNECT stays last, even when a PUBACK arrives while it is pending.
+        if (state != State.CONNECTED || disconnectOperation != 0) {
+            return;
+        }
+        // A refused closure stays first, so removals keep their close order.
+        while (closingInFlight < CLOSE_INFLIGHT_LIMIT && !queuedClosures.isEmpty()) {
+            if (sendUnsubscribe(queuedClosures.getFirst()).isPresent()) {
+                return;
+            }
+            queuedClosures.removeFirst();
+            closingInFlight++;
         }
     }
 
@@ -463,6 +522,9 @@ final class SessionCore {
         }
         unsubscribing.remove(ack.packetId());
         packetIds.release(ack.packetId());
+        if (pending.background) {
+            closingInFlight--;
+        }
         subscriptions.remove(pending.subscription.id);
         port.removeSubscription(pending.subscription.id);
         port.complete(pending.operation, null, null);
@@ -548,6 +610,7 @@ final class SessionCore {
             acknowledgements.submitted(ticket);
             port.releaseDelivery(entry.token());
         }
+        drainClosures();
     }
 
     void timer(long connection, Timer timer, long now) {
@@ -691,6 +754,11 @@ final class SessionCore {
             port.complete(pending.operation, null, pendingFailure);
         }
         unsubscribing.clear();
+        for (var pending : queuedClosures) {
+            port.complete(pending.operation, null, pendingFailure);
+        }
+        queuedClosures.clear();
+        closingInFlight = 0;
         packetIds = new PacketIds();
         if (connectOperation != 0) {
             Throwable failure = switch (cause) {
@@ -781,6 +849,10 @@ final class SessionCore {
         }
     }
 
-    private record UnsubscribeOperation(long operation, LocalSubscription subscription) {
+    private record UnsubscribeOperation(
+            long operation,
+            LocalSubscription subscription,
+            boolean background
+    ) {
     }
 }

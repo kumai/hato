@@ -50,17 +50,20 @@ class MailboxTest {
         var ready = new Mailbox.Event(1, () -> { }, Mailbox.Kind.DELIVERY_READY, 0);
         var capacity = new Mailbox.Event(1, () -> { }, Mailbox.Kind.SEND_CAPACITY, 0);
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
+        var closing = new Mailbox.Event(1, () -> { }, Mailbox.Kind.SUBSCRIPTION_CLOSE, 0);
         sut.activate(1);
         assertThat(sut.offer(control)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(control)).isEqualTo(FULL);
 
-        // Act: both wake classes remain available and repeated notices occupy no extra slots.
+        // Act: all wake classes remain available and repeated notices occupy no extra slots.
         assertThat(sut.offer(ready)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(capacity)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(closing)).isEqualTo(ACCEPTED);
         for (int i = 0; i < 300; i++) {
             assertThat(sut.offer(ready)).isEqualTo(ACCEPTED);
             assertThat(sut.offer(capacity)).isEqualTo(ACCEPTED);
+            assertThat(sut.offer(closing)).isEqualTo(ACCEPTED);
         }
         assertThat(sut.offer(control)).isEqualTo(FULL);
 
@@ -69,12 +72,16 @@ class MailboxTest {
         assertThat(sut.take(() -> false)).containsSame(ready);
         assertThat(sut.take(() -> false)).containsSame(command);
         assertThat(sut.take(() -> false)).containsSame(capacity);
+        assertThat(sut.take(() -> false)).containsSame(closing);
         assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
         assertThat(sut.take(() -> false)).containsSame(command);
     }
 
     @ParameterizedTest
-    @EnumSource(value = Mailbox.Kind.class, names = {"DELIVERY_READY", "SEND_CAPACITY"})
+    @EnumSource(
+            value = Mailbox.Kind.class,
+            names = {"DELIVERY_READY", "SEND_CAPACITY", "SUBSCRIPTION_CLOSE"}
+    )
     void taking_a_wake_rearms_it_before_its_action_runs(Mailbox.Kind kind) throws Exception {
         // Arrange
         var sut = new Mailbox(1, 0, 0, 0, 0);
@@ -100,7 +107,10 @@ class MailboxTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = Mailbox.Kind.class, names = {"DELIVERY_READY", "SEND_CAPACITY"})
+    @EnumSource(
+            value = Mailbox.Kind.class,
+            names = {"DELIVERY_READY", "SEND_CAPACITY", "SUBSCRIPTION_CLOSE"}
+    )
     void discarding_an_old_wake_does_not_clear_the_current_generations_marker(Mailbox.Kind kind)
             throws Exception {
         // Arrange: a new marker is admitted before the old generation is discarded.
@@ -126,7 +136,10 @@ class MailboxTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = Mailbox.Kind.class, names = {"DELIVERY_READY", "SEND_CAPACITY"})
+    @EnumSource(
+            value = Mailbox.Kind.class,
+            names = {"DELIVERY_READY", "SEND_CAPACITY", "SUBSCRIPTION_CLOSE"}
+    )
     void wakes_require_an_active_matching_generation(Mailbox.Kind kind) throws Exception {
         // Arrange
         var sut = new Mailbox(1, 0, 0, 0, 0);

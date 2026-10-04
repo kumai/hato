@@ -35,7 +35,7 @@ Subscription subscription = client.subscribe(
 subscription.unsubscribe().join();
 ```
 
-- By default, each subscription handles one message at a time on its own virtual
+- By default, each handler runs one message at a time on its own virtual
   thread. The handler can block, for example to write to a database or to publish
   and wait for the result.
 - QoS 1 messages are acknowledged after the handler returns. Choose `AckMode.ON_RECEIVE`
@@ -44,7 +44,43 @@ subscription.unsubscribe().join();
 - While the handler is busy, new messages for the subscription wait in a queue of
   256, which also holds QoS 1 messages until they are acknowledged. Change its size with
   `Subscribe.of(filter, qos).withBufferCapacity(1024)`.
+- `subscription.close()` stops delivery at once and drops queued messages without
+  waiting for the broker. Use `unsubscribe()` when you need to know that the broker
+  has removed the subscription. The same filter can be registered again after removal
+  completes.
 - The client and its subscriptions are safe to use from any thread.
+
+## Receiving on your own threads
+
+Omit the handler to create a pull subscription. Call `receive()` from one or more
+application threads:
+
+```java
+Subscription subscription = client.subscribe(
+        Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_LEAST_ONCE)
+                .withAckMode(AckMode.MANUAL)
+).join();
+
+while (subscription.receive() instanceof ReceiveResult.Received(var delivery)) {
+    repository.save(delivery.message());
+    delivery.ack();
+}
+```
+
+- Each message goes to one receiving thread.
+- `receive()` returns `ReceiveResult.Received` for each message and
+  `ReceiveResult.Ended` once the subscription ends normally. `receive(Duration)` can
+  also return `ReceiveResult.TimedOut`.
+- A connection failure throws `MqttConnectionLostException`.
+- QoS 1 messages are acknowledged when `receive()` hands them over.
+  Choose `AckMode.MANUAL`, as above, to acknowledge after your processing.
+  `AckMode.AFTER_HANDLER` needs a handler.
+- The queue of 256 holds messages until a thread takes them, and QoS 1 `MANUAL`
+  messages until `delivery.ack()`.
+- QoS 1 acknowledgements leave in arrival order across all subscriptions, so a message
+  that nobody takes or acknowledges can stop the broker's later QoS 1 messages. If you
+  cannot process one, end the connection.
+- After the connection ends, subscribe again. Messages not yet taken are dropped.
 
 ## Handling failures
 
@@ -66,7 +102,8 @@ the connection when:
 - a handler throws, by default. Catch exceptions inside the handler to keep the
   connection.
 - a subscription's queue fills up, for example with messages waiting for
-  `delivery.ack()`, rather than buffering without limit.
+  `delivery.ack()`, or too many QoS 1 messages wait behind one that is not yet
+  acknowledged, rather than buffering without limit.
 
 ## Passing the client to your code
 

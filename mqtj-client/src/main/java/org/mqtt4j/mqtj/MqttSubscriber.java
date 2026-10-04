@@ -6,6 +6,22 @@ import java.util.function.Consumer;
 /// The subscribing role of a client, without access to its connection lifecycle.
 public interface MqttSubscriber {
 
+    /// Registers a pull subscription, whose deliveries are consumed by the application's
+    /// receiving threads. Completes after a successful SUBACK. Publications received before
+    /// SUBACK are buffered within the subscription's capacity.
+    ///
+    /// [AckMode#AFTER_HANDLER] fails with [IllegalArgumentException] through the returned
+    /// future. Other registration restrictions and delivery rules, apart from those about the
+    /// handler, are as for [#subscribe(Subscribe, Consumer)].
+    ///
+    /// The default implementation fails with [UnsupportedOperationException], so implementations
+    /// of the subscribing role that only provide handlers remain source compatible.
+    default CompletableFuture<Subscription> subscribe(Subscribe request) {
+        return CompletableFuture.failedFuture(
+                new UnsupportedOperationException("Pull subscriptions are not supported")
+        );
+    }
+
     /// Registers one subscription and completes after a successful SUBACK.
     /// The current client supports QoS 0 and QoS 1; QoS 2 fails with
     /// [IllegalArgumentException] through the returned future.

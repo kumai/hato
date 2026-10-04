@@ -66,6 +66,130 @@ class SessionCoreTest {
     );
 
     @Test
+    void deferred_removal_waits_for_send_capacity_and_completes_only_after_unsuback() {
+        // Arrange
+        connected();
+        establishSubscriptions(1);
+        port.sendResult = SendQueue.OfferResult.FULL;
+
+        // Act
+        sut.closeSubscription(1000, 2);
+        sut.sendCapacityAvailable(1);
+        sut.sendCapacityAvailable(1);
+
+        // Assert
+        assertThat(port.results).doesNotContainKey(1000L);
+        assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
+        port.sendResult = SendQueue.OfferResult.ACCEPTED;
+        sut.sendCapacityAvailable(1);
+        var packet = (Packet.Unsubscribe) port.sent.getLast();
+        assertThat(port.results).doesNotContainKey(1000L);
+        receive(1, new Packet.UnsubAck(packet.packetId(), List.of(), EMPTY), 0);
+        assertThat(requireNonNull(port.results.get(1000L)).failure()).isNull();
+        assertThat(port.removed).containsExactly(2L);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void deferred_removals_bound_inflight_work_and_resume_as_each_unsuback_arrives() {
+        // Arrange
+        connected();
+        establishSubscriptions(100);
+        for (int i = 0; i < 100; i++) {
+            sut.closeSubscription(1000 + i, 2 + i);
+        }
+
+        // Act
+        sut.sendCapacityAvailable(1);
+
+        // Assert: only a bounded window is sent even though regular send capacity remains.
+        assertThat(port.sent).filteredOn(Packet.Unsubscribe.class::isInstance).hasSize(16);
+        for (int i = 0; i < 100; i++) {
+            List<Packet.Unsubscribe> removals = port.sent.stream()
+                    .filter(Packet.Unsubscribe.class::isInstance)
+                    .map(Packet.Unsubscribe.class::cast).toList();
+            assertThat(removals).hasSize(Math.min(100, i + 16));
+            Packet.Unsubscribe removal = removals.get(i);
+            assertThat(removal.filters()).containsExactly(new TopicFilter("slot/" + i));
+            receive(1, new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY), 0);
+            assertThat(requireNonNull(port.results.get(1000L + i)).failure()).isNull();
+        }
+        assertThat(port.removed).hasSize(100).doesNotHaveDuplicates();
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @ParameterizedTest
+    @EnumSource(SendQueue.OfferResult.class)
+    void termination_completes_sent_and_queued_closures_once_with_the_original_cause(
+            SendQueue.OfferResult result
+    ) {
+        // Arrange
+        connected();
+        establishSubscriptions(20);
+        port.sendResult = result;
+        for (int i = 0; i < 20; i++) {
+            sut.closeSubscription(1000 + i, 2 + i);
+        }
+        sut.sendCapacityAvailable(1);
+        var failure = new IOException("connection lost during removal");
+
+        // Act
+        sut.failed(1, failure);
+
+        // Assert: RecordingPort rejects any duplicate completion.
+        for (int i = 0; i < 20; i++) {
+            assertThat(requireNonNull(port.results.get(1000L + i)).failure())
+                    .isInstanceOf(MqttConnectionLostException.class).hasCause(failure);
+        }
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        port.sent.clear();
+        port.registered.clear();
+        port.sendResult = SendQueue.OfferResult.ACCEPTED;
+        sut.connect(2000, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        sut.sendCapacityAvailable(1);
+        sut.sendCapacityAvailable(2);
+        assertThat(port.sent).isEmpty();
+        // Exchanges abandoned with the old connection no longer occupy the closure window.
+        sut.subscribe(3000, subscription("slot/0"));
+        var subscribe = (Packet.Subscribe) port.sent.getLast();
+        receive(2, new Packet.SubAck(subscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
+        sut.closeSubscription(3001, 3000);
+        sut.sendCapacityAvailable(2);
+        assertThat(port.sent.getLast()).isInstanceOf(Packet.Unsubscribe.class);
+    }
+
+    @Test
+    void a_pending_disconnect_prevents_deferred_removals_from_being_sent() {
+        // Arrange
+        connected();
+        establishSubscriptions(1);
+        sut.publish(3, qosOneMessage());
+        int id = port.publicationIds.getLast();
+        sut.closeSubscription(1000, 2);
+
+        // Act: returned send capacity and a PUBACK can both arrive before DISCONNECT is written.
+        sut.disconnect(2000);
+        sut.sendCapacityAvailable(1);
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert
+        assertThat(port.sent.getLast()).isInstanceOf(Packet.Disconnect.class);
+        assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
+        sut.sent(1, port.ticket, 0);
+        assertThat(requireNonNull(port.results.get(1000L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class);
+    }
+
+    private void establishSubscriptions(int count) {
+        for (int i = 0; i < count; i++) {
+            sut.subscribe(2 + i, subscription("slot/" + i));
+            var packet = (Packet.Subscribe) port.sent.getLast();
+            receive(1, new Packet.SubAck(packet.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
+        }
+    }
+
+    @Test
     void connect_waits_for_connack_and_rejects_a_second_attempt() {
         // Arrange
         sut.connect(1, 0);

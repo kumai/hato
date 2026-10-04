@@ -23,7 +23,8 @@ final class Mailbox {
         INCOMING,
         CONTROL,
         DELIVERY_READY,
-        SEND_CAPACITY
+        SEND_CAPACITY,
+        SUBSCRIPTION_CLOSE
     }
 
     record Event(long generation, Runnable action, Kind kind, int bytes) {
@@ -82,7 +83,8 @@ final class Mailbox {
         if (event.generation() != 0 && event.generation() != activeGeneration) {
             return OfferResult.STALE;
         }
-        if (event.kind() == Kind.DELIVERY_READY || event.kind() == Kind.SEND_CAPACITY) {
+        if (event.kind() == Kind.DELIVERY_READY || event.kind() == Kind.SEND_CAPACITY
+                || event.kind() == Kind.SUBSCRIPTION_CLOSE) {
             if (event.generation() == 0) {
                 return OfferResult.STALE;
             }
@@ -97,7 +99,7 @@ final class Mailbox {
             case INCOMING -> incomingCount >= incomingLimit
                     || event.bytes() > incomingByteLimit - incomingBytes;
             case CONTROL -> controlCount >= controlLimit;
-            case DELIVERY_READY, SEND_CAPACITY -> false;
+            case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE -> false;
         };
         if (full) {
             return OfferResult.FULL;
@@ -113,7 +115,8 @@ final class Mailbox {
                 incomingBytes += event.bytes();
             }
             case CONTROL -> controlCount++;
-            case DELIVERY_READY, SEND_CAPACITY -> wakes.put(event.kind(), event);
+            case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE ->
+                    wakes.put(event.kind(), event);
         }
         notifyAll();
         return OfferResult.ACCEPTED;
@@ -187,7 +190,8 @@ final class Mailbox {
                 incomingBytes -= event.bytes();
             }
             case CONTROL -> controlCount--;
-            case DELIVERY_READY, SEND_CAPACITY -> wakes.remove(event.kind(), event);
+            case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE ->
+                    wakes.remove(event.kind(), event);
         }
     }
 }

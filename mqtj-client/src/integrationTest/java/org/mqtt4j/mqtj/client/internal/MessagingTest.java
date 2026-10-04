@@ -3,15 +3,22 @@ package org.mqtt4j.mqtj.client.internal;
 import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.mqtj.*;
 import org.mqtt4j.mqtj.spi.Transport;
@@ -24,9 +31,130 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
 /// Public messaging contracts shared by the embedded broker and Mosquitto.
 abstract class MessagingTest {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    @Timeout(30)
+    void a_hundred_subscriptions_can_close_together_and_register_the_same_filters_again(
+            boolean pull
+    ) throws Exception {
+        // Arrange
+        String base = uniqueTopic();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (MqttClient sut = client(ended::add)) {
+            sut.connect().get(5, SECONDS);
+            var subscriptions = new ArrayList<Subscription>();
+            for (int i = 0; i < 100; i++) {
+                var request = Subscribe.of(new TopicFilter(base + "/" + i), Qos.AT_LEAST_ONCE);
+                subscriptions.add((pull ? sut.subscribe(request) : sut.subscribe(request, _ -> { }))
+                        .get(5, SECONDS));
+            }
+
+            // Act: disposal does not require admission of 100 public operations at once.
+            subscriptions.forEach(Subscription::close);
+            for (Subscription subscription : subscriptions) {
+                subscription.unsubscribe().get(5, SECONDS);
+            }
+
+            // Assert: UNSUBACK released every filter, and new subscriptions can receive QoS 1.
+            for (Subscription subscription : subscriptions) {
+                Subscription replacement = sut.subscribe(
+                        Subscribe.of(subscription.filter(), Qos.AT_LEAST_ONCE)
+                ).get(5, SECONDS);
+                var message = new MqttMessage(new Topic(subscription.filter().pattern()),
+                        new byte[] {7}, Qos.AT_LEAST_ONCE, false);
+                sut.publish(message).get(5, SECONDS);
+                assertThat(received(replacement.receive(Duration.ofSeconds(5))).message())
+                        .isEqualTo(message);
+                replacement.unsubscribe().get(5, SECONDS);
+            }
+            assertThat(ended).isEmpty();
+            sut.disconnect().get(5, SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Qos.class, names = {"AT_MOST_ONCE", "AT_LEAST_ONCE"})
+    @Timeout(30)
+    void publications_round_trip_through_the_default_pull_subscription(Qos qos) throws Exception {
+        // Arrange
+        String topic = uniqueTopic();
+        var publication = new MqttMessage(new Topic(topic), new byte[] {1, 2, 3}, qos, false);
+        try (MqttClient sut = client()) {
+            sut.connect().get(5, SECONDS);
+            Subscription subscription = sut.subscribe(Subscribe.of(new TopicFilter(topic), qos))
+                    .get(5, SECONDS);
+
+            // Act
+            sut.publish(publication).get(5, SECONDS);
+            MqttDelivery delivery = received(subscription.receive(Duration.ofSeconds(5)));
+
+            // Assert
+            assertThat(delivery.message()).isEqualTo(publication);
+            subscription.unsubscribe().get(5, SECONDS);
+            assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
+            sut.disconnect().get(5, SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = AckMode.class, names = {"ON_RECEIVE", "MANUAL"})
+    void eight_virtual_receivers_share_five_hundred_twelve_publications_once_each(AckMode mode)
+            throws Exception {
+        // Arrange
+        String topic = uniqueTopic();
+        var received = ConcurrentHashMap.<Integer>newKeySet();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (MqttClient sut = client(ended::add); MqttClient publisher = client(ended::add);
+                var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
+                            .withAckMode(mode)
+                            .withBufferCapacity(64)
+            ).get(5, SECONDS);
+            var jobs = new ArrayList<Future<?>>();
+            for (int worker = 0; worker < 8; worker++) {
+                jobs.add(workers.submit(() -> {
+                    for (int item = 0; item < 64; item++) {
+                        MqttDelivery delivery = received(
+                                subscription.receive(Duration.ofSeconds(10))
+                        );
+                        var payload = new String(delivery.message().payload(), UTF_8);
+                        int value = Integer.parseInt(payload);
+                        assertThat(received.add(value)).isTrue();
+                        delivery.ack();
+                    }
+                    return null;
+                }));
+            }
+
+            // Act: publisher completions keep outgoing operations bounded while receivers race.
+            for (int value = 0; value < 512; value++) {
+                publisher.publish(new MqttMessage(new Topic(topic),
+                        Integer.toString(value).getBytes(UTF_8), Qos.AT_LEAST_ONCE, false))
+                        .get(5, SECONDS);
+            }
+            for (Future<?> job : jobs) {
+                job.get(15, SECONDS);
+            }
+
+            // Assert
+            assertThat(received).containsExactlyInAnyOrderElementsOf(
+                    IntStream.range(0, 512).boxed().toList()
+            );
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+            assertThat(ended).isEmpty();
+            subscription.unsubscribe().get(5, SECONDS);
+            sut.disconnect().get(5, SECONDS);
+            publisher.disconnect().get(5, SECONDS);
+        }
+    }
 
     @ParameterizedTest
     @EnumSource(AckMode.class)
@@ -441,4 +569,8 @@ abstract class MessagingTest {
     }
 
     abstract URI endpoint();
+
+    private static MqttDelivery received(ReceiveResult result) {
+        return assertInstanceOf(ReceiveResult.Received.class, result).delivery();
+    }
 }

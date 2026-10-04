@@ -1,10 +1,13 @@
 package org.mqtt4j.mqtj.client.internal;
 
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
@@ -14,14 +17,16 @@ import java.util.function.LongConsumer;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.mqtj.AckMode;
+import org.mqtt4j.mqtj.MqttConnectionLostException;
 import org.mqtt4j.mqtj.MqttDelivery;
 import org.mqtt4j.mqtj.MqttMessage;
+import org.mqtt4j.mqtj.ReceiveResult;
 import org.mqtt4j.mqtj.Subscribe;
 import org.mqtt4j.mqtj.client.internal.common.log.Log;
 
 import static java.util.Objects.requireNonNull;
 
-/// One virtual thread per subscription preserves SERIAL order without blocking the actor.
+/// Push subscriptions have one SERIAL worker; pull subscriptions use their callers' threads.
 /// Reservations include executing handlers and survive connection changes until they return.
 final class DeliveryLanes {
 
@@ -31,7 +36,8 @@ final class DeliveryLanes {
 
     private static final int DELIVERY_LIMIT = 4096;
 
-    // One lock keeps fan-out reservations atomic; each lane wakes only its own worker.
+    // One lock keeps fan-out reservations atomic; each lane's condition wakes only that lane's
+    // worker or receivers.
     private final ReentrantLock lock = new ReentrantLock();
 
     private final Map<Long, Lane> lanes = new HashMap<>();
@@ -71,10 +77,26 @@ final class DeliveryLanes {
     }
 
     boolean register(long generation, long id, Subscribe request, Consumer<MqttDelivery> handler) {
+        return registerLane(generation, id, request, handler).isPresent();
+    }
+
+    Optional<Receiver> registerPull(long generation, long id, Subscribe request) {
+        if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
+            throw new IllegalArgumentException("A pull subscription has no handler to acknowledge");
+        }
+        return registerLane(generation, id, request, null).map(Receiver::new);
+    }
+
+    private Optional<Lane> registerLane(
+            long generation,
+            long id,
+            Subscribe request,
+            @Nullable Consumer<MqttDelivery> handler
+    ) {
         lock.lock();
         try {
             if (retainedLanes >= LANE_LIMIT) {
-                return false;
+                return Optional.empty();
             }
             if (lanes.containsKey(id)) {
                 throw new IllegalStateException("Subscription lane is already registered: " + id);
@@ -83,13 +105,17 @@ final class DeliveryLanes {
                     generation,
                     id,
                     request.bufferCapacity(),
-                    // A handler acknowledges after it returns unless the request chooses a mode.
-                    request.ackMode().orElse(AckMode.AFTER_HANDLER),
+                    request.ackMode().orElse(
+                            handler == null ? AckMode.ON_RECEIVE : AckMode.AFTER_HANDLER
+                    ),
                     handler,
                     lock.newCondition()
             );
             lanes.put(id, lane);
             retainedLanes++;
+            if (handler == null) {
+                return Optional.of(lane);
+            }
             try {
                 Thread.ofVirtual().name("mqtj-" + clientId + "-delivery-" + id)
                         .start(() -> run(lane));
@@ -98,7 +124,7 @@ final class DeliveryLanes {
                 retainedLanes--;
                 throw failure;
             }
-            return true;
+            return Optional.of(lane);
         } finally {
             lock.unlock();
         }
@@ -116,8 +142,8 @@ final class DeliveryLanes {
         }
     }
 
-    /// A refused removal runs the QoS 1 deliveries held during the attempt, so none is
-    /// acknowledged without reaching the handler of a subscription that stays active.
+    /// A refused removal releases the QoS 1 deliveries held during the attempt, so none is
+    /// acknowledged without reaching the application of a subscription that stays active.
     void resume(long id) {
         lock.lock();
         try {
@@ -127,7 +153,7 @@ final class DeliveryLanes {
                 for (DeliveryView view : lane.queue) {
                     view.held = false;
                 }
-                lane.ready.signal();
+                lane.ready.signalAll();
             }
         } finally {
             lock.unlock();
@@ -151,11 +177,12 @@ final class DeliveryLanes {
     }
 
     /// Retires acknowledgements on connection end, keeping only running handler reservations.
-    /// The same manager admits new lanes after a reconnect.
-    void close() {
+    /// The same manager admits new lanes after a reconnect. Pull receivers end normally without
+    /// a failure; otherwise they throw [MqttConnectionLostException] with it.
+    void close(@Nullable Throwable failure) {
         lock.lock();
         try {
-            for (RetainedDelivery delivery : acknowledging.values()) {
+            for (RetainedDelivery delivery : List.copyOf(acknowledging.values())) {
                 delivery.retired = true;
                 delivery.released = true;
                 for (DeliveryView view : List.copyOf(delivery.views)) {
@@ -166,6 +193,7 @@ final class DeliveryLanes {
             acknowledging.clear();
             readyTokens.clear();
             for (Lane lane : List.copyOf(lanes.values())) {
+                lane.failure = failure;
                 stop(lane);
             }
         } finally {
@@ -298,6 +326,15 @@ final class DeliveryLanes {
         }
     }
 
+    int acknowledgingDeliveries() {
+        lock.lock();
+        try {
+            return acknowledging.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     long abandonedDeliveries() {
         lock.lock();
         try {
@@ -338,8 +375,7 @@ final class DeliveryLanes {
         boolean ready;
         lock.lock();
         try {
-            while (!lane.stopped && (lane.queue.isEmpty()
-                    || (lane.paused && requireNonNull(lane.queue.peekFirst()).held))) {
+            while (!lane.stopped && !lane.hasDelivery()) {
                 lane.ready.await();
             }
             if (lane.stopped) {
@@ -355,7 +391,7 @@ final class DeliveryLanes {
             if (ready) {
                 onReady.accept(lane.generation);
             }
-            lane.handler.accept(view);
+            requireNonNull(lane.handler).accept(view);
         } catch (Throwable failure) {
             lock.lock();
             try {
@@ -392,6 +428,7 @@ final class DeliveryLanes {
         lock.lock();
         try {
             ready = markReady(view);
+            releaseView(view);
         } finally {
             lock.unlock();
         }
@@ -444,6 +481,9 @@ final class DeliveryLanes {
 
     /// Caller holds lock; never interrupts an executing application handler.
     private boolean stop(Lane lane) {
+        if (lane.stopped) {
+            return false;
+        }
         boolean ready = false;
         lanes.remove(lane.id, lane);
         lane.stopped = true;
@@ -454,27 +494,100 @@ final class DeliveryLanes {
             ready |= markReady(view);
             releaseView(view);
         }
-        lane.ready.signal();
+        // Pull lanes have no worker to return this slot when it exits; the stopped guard above
+        // keeps this release single.
+        if (lane.handler == null) {
+            retainedLanes--;
+        }
+        lane.ready.signalAll();
         return ready;
     }
 
-    /// Caller holds lock. Counts remain charged until both local work and wire ack are released.
+    /// Pull capacity ends at handoff (or manual ack); the sequencer separately bounds wire ACKs.
+    /// Push views retain capacity until both the handler and wire acknowledgement are released.
     private void releaseView(DeliveryView view) {
         Lane lane = view.lane;
         RetainedDelivery delivery = view.delivery;
-        if (lane != null && view.localDone && delivery.released) {
+        if (lane != null && view.localDone
+                && (delivery.released || (lane.handler == null && view.ready))) {
             view.lane = null;
             view.acknowledgement = null;
             lane.retained--;
             retainedDeliveries--;
-            if (--delivery.remaining == 0) {
+            // A fast pull recipient must not remain referenced by a slower overlapping one.
+            delivery.views.remove(view);
+            if (delivery.views.isEmpty()) {
                 retainedBytes -= delivery.bytes;
-                delivery.views.clear();
+                acknowledging.remove(delivery.token, delivery);
             }
         }
     }
 
     private record Ready(long generation, long token) {
+    }
+
+    /// A stable handle preserves the receiver's end state after removal from the routing map.
+    final class Receiver {
+
+        private final Lane lane;
+
+        private Receiver(Lane lane) {
+            this.lane = lane;
+        }
+
+        ReceiveResult receive() throws InterruptedException {
+            return receiveNanos(-1);
+        }
+
+        ReceiveResult receive(Duration timeout) throws InterruptedException {
+            requireNonNull(timeout, "timeout");
+            if (timeout.isNegative()) {
+                throw new IllegalArgumentException("Receive timeout must not be negative");
+            }
+            // Saturation accepts large Durations without overflowing the relative wait budget.
+            return receiveNanos(TimeUnit.NANOSECONDS.convert(timeout));
+        }
+
+        private ReceiveResult receiveNanos(long remaining) throws InterruptedException {
+            boolean unlimited = remaining < 0;
+            DeliveryView view;
+            boolean ready;
+            lock.lockInterruptibly();
+            try {
+                while (!lane.stopped && !lane.hasDelivery()) {
+                    if (unlimited) {
+                        lane.ready.await();
+                    } else {
+                        if (remaining <= 0) {
+                            return new ReceiveResult.TimedOut();
+                        }
+                        remaining = lane.ready.awaitNanos(remaining);
+                    }
+                }
+                if (lane.stopped) {
+                    checkFailure();
+                    return new ReceiveResult.Ended();
+                }
+                // Claim, close, and acknowledgement share the lock. No other receiver can
+                // claim this view, and an interrupt cannot discard it after handoff commits.
+                view = lane.queue.removeFirst();
+                view.localDone = true;
+                ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
+                releaseView(view);
+            } finally {
+                lock.unlock();
+            }
+            if (ready) {
+                onReady.accept(lane.generation);
+            }
+            return new ReceiveResult.Received(view);
+        }
+
+        private void checkFailure() {
+            if (lane.failure != null) {
+                throw new MqttConnectionLostException(lane.failure);
+            }
+        }
     }
 
     private static final class Lane {
@@ -483,19 +596,20 @@ final class DeliveryLanes {
         final long id;
         final int capacity;
         final AckMode ackMode;
-        final Consumer<MqttDelivery> handler;
+        final @Nullable Consumer<MqttDelivery> handler;
         final Condition ready;
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
         int retained;
         boolean paused;
         boolean stopped;
+        @Nullable Throwable failure;
 
         Lane(
                 long generation,
                 long id,
                 int capacity,
                 AckMode ackMode,
-                Consumer<MqttDelivery> handler,
+                @Nullable Consumer<MqttDelivery> handler,
                 Condition ready
         ) {
             this.generation = generation;
@@ -504,6 +618,11 @@ final class DeliveryLanes {
             this.ackMode = ackMode;
             this.handler = handler;
             this.ready = ready;
+        }
+
+        /// Caller holds lock. Held deliveries wait for a resumed lane in both modes.
+        boolean hasDelivery() {
+            return !queue.isEmpty() && !(paused && requireNonNull(queue.peekFirst()).held);
         }
     }
 
@@ -514,8 +633,7 @@ final class DeliveryLanes {
         final MqttMessage message;
         final boolean dup;
         final int bytes;
-        final List<DeliveryView> views = new ArrayList<>();
-        int remaining;
+        final List<DeliveryView> views = new ArrayList<>(1);
         int pending;
         boolean released;
         boolean retired;
@@ -533,7 +651,6 @@ final class DeliveryLanes {
             this.message = message;
             this.dup = dup;
             this.bytes = bytes;
-            remaining = recipients;
             pending = recipients;
             released = token == 0;
         }
@@ -548,7 +665,8 @@ final class DeliveryLanes {
         volatile @Nullable Runnable acknowledgement;
         boolean localDone;
         boolean ready;
-        // Admitted while the lane awaited removal; it does not run until the lane resumes.
+        // Admitted while the lane awaited removal; it is not run or received until the lane
+        // resumes.
         boolean held;
 
         DeliveryView(RetainedDelivery delivery, Lane lane) {

@@ -2,7 +2,9 @@ package org.mqtt4j.mqtj;
 
 import java.io.Serial;
 
-/// A connection ended before an operation's outcome could be confirmed.
+/// A connection ended before an operation's outcome could be confirmed. A pull [Subscription]
+/// also throws it once a connection end with a cause has ended the subscription, carrying
+/// that cause; see [Subscription#receive()].
 /// Locally detected packet failures carry [MqttProtocolException] as their cause.
 public final class MqttConnectionLostException extends MqttException {
 
