@@ -98,35 +98,55 @@ class DistributionTest {
                     throw new AssertionError("Clean connection resumed a session");
                 }
 
-                // Arrange: use the public messaging roles from the distributed client jar.
-                var received =
-                        new java.util.concurrent.CompletableFuture<org.mqtt4j.mqtj.MqttMessage>();
+                // Arrange: use the public messaging roles from the distributed client jar,
+                // with one handler and one pull subscription.
+                var handled =
+                        new java.util.concurrent.LinkedBlockingQueue<org.mqtt4j.mqtj.MqttMessage>();
                 org.mqtt4j.mqtj.MqttSubscriber subscriber = sut;
                 org.mqtt4j.mqtj.MqttPublisher publisher = sut;
-                var message = new org.mqtt4j.mqtj.MqttMessage(
-                        new org.mqtt4j.mqtj.Topic("probe/message"),
-                        new byte[] {42},
-                        org.mqtt4j.mqtj.Qos.AT_MOST_ONCE,
-                        false
-                );
-
-                // Act
-                org.mqtt4j.mqtj.Subscription subscription = subscriber.subscribe(
+                org.mqtt4j.mqtj.Subscription push = subscriber.subscribe(
                         org.mqtt4j.mqtj.Subscribe.of(
-                                new org.mqtt4j.mqtj.TopicFilter("probe/#"),
-                                org.mqtt4j.mqtj.Qos.AT_MOST_ONCE
+                                new org.mqtt4j.mqtj.TopicFilter("probe/push"),
+                                org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE
                         ),
-                        delivery -> received.complete(delivery.message())
+                        delivery -> handled.add(delivery.message())
                 ).get(5, java.util.concurrent.TimeUnit.SECONDS);
-                publisher.publish(message).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                org.mqtt4j.mqtj.Subscription pull = subscriber.subscribe(
+                        org.mqtt4j.mqtj.Subscribe.of(
+                                new org.mqtt4j.mqtj.TopicFilter("probe/pull"),
+                                org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE
+                        ).withAckMode(org.mqtt4j.mqtj.AckMode.MANUAL)
+                ).get(5, java.util.concurrent.TimeUnit.SECONDS);
 
-                // Assert
-                if (!message.equals(received.get(5, java.util.concurrent.TimeUnit.SECONDS))) {
-                    throw new AssertionError("QoS 0 delivery changed the message");
+                // Act & Assert: QoS 0 and 1 reach the handler and the receiving thread intact.
+                for (var qos : java.util.List.of(
+                        org.mqtt4j.mqtj.Qos.AT_MOST_ONCE, org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE
+                )) {
+                    var pushed = new org.mqtt4j.mqtj.MqttMessage(
+                            new org.mqtt4j.mqtj.Topic("probe/push"), new byte[] {42}, qos, false
+                    );
+                    publisher.publish(pushed).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    if (!pushed.equals(handled.poll(5, java.util.concurrent.TimeUnit.SECONDS))) {
+                        throw new AssertionError(qos + " delivery to a handler changed");
+                    }
+                    var pulled = new org.mqtt4j.mqtj.MqttMessage(
+                            new org.mqtt4j.mqtj.Topic("probe/pull"), new byte[] {7}, qos, false
+                    );
+                    publisher.publish(pulled).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    if (!(pull.receive(java.time.Duration.ofSeconds(5))
+                            instanceof org.mqtt4j.mqtj.ReceiveResult.Received(var delivery))
+                            || !pulled.equals(delivery.message())) {
+                        throw new AssertionError(qos + " delivery to a receiver changed");
+                    }
+                    delivery.ack();
                 }
 
-                // Act & Assert: both lifecycle operations must finish within the deadline.
-                subscription.unsubscribe().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                // Act & Assert: lifecycle operations must finish within the deadline.
+                push.unsubscribe().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                pull.unsubscribe().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                if (!(pull.receive() instanceof org.mqtt4j.mqtj.ReceiveResult.Ended)) {
+                    throw new AssertionError("A removed subscription kept receiving");
+                }
                 sut.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
             }
             """;
