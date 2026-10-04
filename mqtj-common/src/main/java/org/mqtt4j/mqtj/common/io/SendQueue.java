@@ -34,17 +34,28 @@ public final class SendQueue<T> {
             maxBytes = new long[] {regularBytes, reservedBytes};
         }
 
-        private synchronized boolean available(long byteCount, boolean reserved) {
-            if (byteCount < 0) {
-                throw new IllegalArgumentException("Send size must not be negative");
+        private synchronized boolean available(
+                long byteCount,
+                boolean reserved,
+                int countHeadroom,
+                long byteHeadroom
+        ) {
+            if (byteCount < 0 || countHeadroom < 0 || byteHeadroom < 0) {
+                throw new IllegalArgumentException("Send size and headroom must not be negative");
             }
             int kind = reserved ? 1 : 0;
-            return count[kind] < maxCount[kind]
-                    && byteCount <= maxBytes[kind] - bytes[kind];
+            return count[kind] < maxCount[kind] - countHeadroom
+                    && byteHeadroom <= maxBytes[kind] - bytes[kind]
+                    && byteCount <= maxBytes[kind] - bytes[kind] - byteHeadroom;
         }
 
-        private synchronized boolean reserve(int byteCount, boolean reserved) {
-            if (!available(byteCount, reserved)) {
+        private synchronized boolean reserve(
+                int byteCount,
+                boolean reserved,
+                int countHeadroom,
+                long byteHeadroom
+        ) {
+            if (!available(byteCount, reserved, countHeadroom, byteHeadroom)) {
                 return false;
             }
             int kind = reserved ? 1 : 0;
@@ -81,14 +92,27 @@ public final class SendQueue<T> {
         if (closed) {
             return OfferResult.CLOSED;
         }
-        return budget.available(byteCount, reserved) ? OfferResult.ACCEPTED : OfferResult.FULL;
+        return budget.available(byteCount, reserved, 0, 0)
+                ? OfferResult.ACCEPTED : OfferResult.FULL;
     }
 
     public synchronized OfferResult offer(long ticket, T value, int byteCount, boolean reserved) {
+        return offer(ticket, value, byteCount, reserved, 0, 0);
+    }
+
+    /// Admits only if the selected shared quota retains the requested headroom afterwards.
+    public synchronized OfferResult offer(
+            long ticket,
+            T value,
+            int byteCount,
+            boolean reserved,
+            int countHeadroom,
+            long byteHeadroom
+    ) {
         if (closed) {
             return OfferResult.CLOSED;
         }
-        if (!budget.reserve(byteCount, reserved)) {
+        if (!budget.reserve(byteCount, reserved, countHeadroom, byteHeadroom)) {
             return OfferResult.FULL;
         }
         pending.addLast(new Send<>(ticket, value, byteCount, reserved));

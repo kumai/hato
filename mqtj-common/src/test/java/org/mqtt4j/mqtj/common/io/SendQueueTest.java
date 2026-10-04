@@ -131,6 +131,76 @@ class SendQueueTest {
         sut.ended();
     }
 
+    @Test
+    void headroom_counts_active_sends_across_connections_and_preserves_fifo() {
+        // Arrange: one old active send and one new send consume the non-headroom quota.
+        var budget = new SendQueue.Budget(1, 10, 4, 100);
+        var previous = new SendQueue<String>(budget);
+        var sut = new SendQueue<String>(budget);
+        assertThat(previous.offer(1, "old", 1, true, 2, 0)).isEqualTo(ACCEPTED);
+        previous.poll().orElseThrow();
+        previous.close();
+        assertThat(sut.offer(2, "regular", 1, false)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(3, "ack", 1, true, 2, 0)).isEqualTo(ACCEPTED);
+
+        // Act & Assert: only sends without headroom restrictions can use the remaining slots.
+        assertThat(sut.offer(4, "blocked ack", 1, true, 2, 0)).isEqualTo(FULL);
+        assertThat(sut.offer(5, "control", 1, true)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(6, "control", 1, true)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(7, "full", 1, true)).isEqualTo(FULL);
+        previous.completed(1);
+        assertThat(sut.offer(8, "still blocked ack", 1, true, 2, 0)).isEqualTo(FULL);
+        assertThat(sut.poll().orElseThrow().ticket()).isEqualTo(2);
+        sut.completed(2);
+        assertThat(sut.poll().orElseThrow().ticket()).isEqualTo(3);
+        sut.completed(3);
+        assertThat(sut.poll().orElseThrow().ticket()).isEqualTo(5);
+        sut.completed(5);
+        assertThat(sut.offer(9, "ack", 1, true, 2, 0)).isEqualTo(ACCEPTED);
+        assertThat(sut.poll().orElseThrow().ticket()).isEqualTo(6);
+        sut.ended();
+    }
+
+    @Test
+    void byte_headroom_is_shared_and_rejected_sends_reserve_nothing() {
+        // Arrange
+        var budget = new SendQueue.Budget(0, 0, 10, 100);
+        var previous = new SendQueue<String>(budget);
+        var sut = new SendQueue<String>(budget);
+        previous.offer(1, "old", 30, true);
+        previous.poll().orElseThrow();
+        previous.close();
+
+        // Act & Assert: an ACK must leave 40 bytes even when the old active send owns 30.
+        assertThat(sut.offer(2, "too large", 31, true, 0, 40)).isEqualTo(FULL);
+        assertThat(sut.offer(3, "ack", 30, true, 0, 40)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(4, "blocked ack", 1, true, 0, 40)).isEqualTo(FULL);
+        assertThat(sut.offer(5, "control", 40, true)).isEqualTo(ACCEPTED);
+        sut.close();
+        previous.completed(1);
+        var next = new SendQueue<String>(budget);
+        assertThat(next.offer(6, "ack", 60, true, 0, 40)).isEqualTo(ACCEPTED);
+        assertThat(next.offer(7, "control", 40, true)).isEqualTo(ACCEPTED);
+        next.ended();
+    }
+
+    @Test
+    void invalid_or_excessive_headroom_cannot_expand_capacity() {
+        // Arrange
+        var sut = new SendQueue<String>(0, 0, 2, 10);
+
+        // Act & Assert
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> sut.offer(1, "invalid", 0, true, -1, 0));
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> sut.offer(1, "invalid", 0, true, 0, -1));
+        assertThat(sut.offer(1, "full", 0, true, Integer.MAX_VALUE, 0)).isEqualTo(FULL);
+        assertThat(sut.offer(1, "full", 0, true, 0, Long.MAX_VALUE)).isEqualTo(FULL);
+        assertThat(sut.offer(1, "valid", 10, true)).isEqualTo(ACCEPTED);
+        sut.close();
+        assertThat(sut.offer(1, "closed", 0, true, -1, -1)).isEqualTo(CLOSED);
+    }
+
     @ParameterizedTest
     @CsvSource({"-1, 1, 1, 1", "1, -1, 1, 1", "1, 1, -1, 1", "1, 1, 1, -1"})
     void negative_capacity_is_rejected(
