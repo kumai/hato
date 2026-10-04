@@ -458,7 +458,7 @@ class ClientIoTest {
 
             // Assert: input and callbacks remain usable while the sender is occupied.
             requireNonNull(current.listener).onBytes(codec.encode(new Packet.PingResp()));
-            assertThat(events.received).containsExactly(new Packet.PingResp());
+            assertThat(events.pingResponses).containsExactly(new Packet.PingResp());
             assertThat(current.attempts).isEmpty();
             assertThat(old.attempts).isEmpty();
 
@@ -668,6 +668,26 @@ class ClientIoTest {
         }
     }
 
+    @Test
+    void only_a_pingresp_answering_a_pingreq_admitted_on_its_connection_goes_ahead() {
+        // Arrange: the old connection admits a PINGREQ that is never answered.
+        byte[] response = codec.encode(new Packet.PingResp());
+        open(1);
+        assertThat(sut.send(1, 1, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        sut.close();
+        Transport.Listener listener = requireNonNull(open(2).listener);
+
+        // Act: an unsolicited, an answering, and a repeated response on the new connection.
+        listener.onBytes(response);
+        assertThat(sut.send(2, 2, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        listener.onBytes(response);
+        listener.onBytes(response);
+
+        // Assert: only the answer may overtake earlier input; the others keep wire order.
+        assertThat(events.pingResponses).containsExactly(new Packet.PingResp());
+        assertThat(events.received).containsExactly(new Packet.PingResp(), new Packet.PingResp());
+    }
+
     private SingleWriteTransport open(long generation) {
         sut.open(generation);
         return transports.getLast();
@@ -862,6 +882,7 @@ class ClientIoTest {
         final List<Throwable> ends = new CopyOnWriteArrayList<>();
         final List<Throwable> fatals = new CopyOnWriteArrayList<>();
         final List<Packet> received = new CopyOnWriteArrayList<>();
+        final List<Packet> pingResponses = new CopyOnWriteArrayList<>();
         final List<Long> written = new CopyOnWriteArrayList<>();
         final List<Long> capacityGenerations = new CopyOnWriteArrayList<>();
         volatile Runnable beforeSent = () -> { };
@@ -873,6 +894,11 @@ class ClientIoTest {
         @Override
         public void received(long generation, Packet packet, int size) {
             received.add(packet);
+        }
+
+        @Override
+        public void pingResponse(long generation, Packet packet, int size) {
+            pingResponses.add(packet);
         }
 
         @Override

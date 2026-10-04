@@ -25,6 +25,10 @@ final class ClientIo {
 
         void received(long generation, Packet packet, int size);
 
+        /// A PINGRESP that answers a PINGREQ admitted on this connection, which may be handled
+        /// ahead of earlier input. Any other PINGRESP arrives through [#received].
+        void pingResponse(long generation, Packet packet, int size);
+
         /// Posts a completed PUBACK write as soon as the transport reports it, even if send is
         /// still returning. This must only enqueue an event, without calling external code.
         void written(long generation, long ticket);
@@ -121,7 +125,11 @@ final class ClientIo {
                 codec,
                 (packet, size) -> {
                     log.debug("Received {} ({} bytes)", packet.getClass().getSimpleName(), size);
-                    events.received(generation, packet, size);
+                    if (packet instanceof Packet.PingResp && answersPing(connection)) {
+                        events.pingResponse(generation, packet, size);
+                    } else {
+                        events.received(generation, packet, size);
+                    }
                 }
         );
         synchronized (sending) {
@@ -224,7 +232,14 @@ final class ClientIo {
                 EMPTY,
                 message.payloadSize()
         );
-        return enqueue(generation, ticket, new Outbound(header, message, false), false, "Publish");
+        return enqueue(
+                generation,
+                ticket,
+                new Outbound(header, message, false),
+                false,
+                "Publish",
+                false
+        );
     }
 
     SendQueue.OfferResult send(long generation, long ticket, Packet packet) {
@@ -239,7 +254,8 @@ final class ClientIo {
                 ticket,
                 new Outbound(bytes, null, packet instanceof Packet.PubAck),
                 reserved,
-                packet.getClass().getSimpleName()
+                packet.getClass().getSimpleName(),
+                packet instanceof Packet.PingReq
         );
     }
 
@@ -248,7 +264,8 @@ final class ClientIo {
             long ticket,
             Outbound outbound,
             boolean reserved,
-            String packetName
+            String packetName,
+            boolean ping
     ) {
         synchronized (sending) {
             Connection connection = current;
@@ -265,6 +282,10 @@ final class ClientIo {
                     outbound.acknowledgement() ? ACKNOWLEDGEMENT_BYTE_HEADROOM : 0
             );
             if (admitted == SendQueue.OfferResult.ACCEPTED) {
+                if (ping) {
+                    // Counted before the sender can write it, so its answer is recognized.
+                    connection.pings++;
+                }
                 log.debug("Queued {} ticket {} ({} bytes)", packetName, ticket, size);
                 wakeSender(connection);
             }
@@ -405,6 +426,17 @@ final class ClientIo {
         }
     }
 
+    /// No PINGREQ precedes CONNACK, so an answering PINGRESP cannot overtake it.
+    private boolean answersPing(Connection connection) {
+        synchronized (sending) {
+            if (connection.pings == 0) {
+                return false;
+            }
+            connection.pings--;
+            return true;
+        }
+    }
+
     private boolean isClosed(Connection connection) {
         synchronized (sending) {
             return connection.closed;
@@ -461,6 +493,8 @@ final class ClientIo {
         boolean transportOwnsActive;
         @Nullable Runnable sendCompletion;
         @Nullable Throwable pendingEnd;
+        // Admitted PINGREQs that no PINGRESP has answered yet.
+        int pings;
 
         Connection(long generation, Transport transport, SendQueue<Outbound> queue) {
             this.generation = generation;

@@ -2078,6 +2078,77 @@ class ClientActorTest {
     }
 
     @Test
+    void keep_alive_overtakes_a_receive_backlog_for_256_subscriptions() throws Exception {
+        // Arrange: each of 65,536 queued publications is matched against 256 filters.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var enteredAgain = new CountDownLatch(1);
+        var releaseAgain = new CountDownLatch(1);
+        var queuedAtPing = new LinkedBlockingQueue<Integer>();
+        var encoder = new ScriptCodec();
+        try (MqttClient sut = client("keep-alive", ends::add, 16 * 1024 * 1024, encoder)) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            for (int i = 0; i < 256; i++) {
+                CompletableFuture<Subscription> subscribing = sut.subscribe(
+                        Subscribe.of(new TopicFilter("backlog/" + i), Qos.AT_MOST_ONCE),
+                        _ -> { }
+                );
+                var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+                transport.receive(new Packet.SubAck(
+                        subscribe.packetId(),
+                        List.of(ReasonCode.SUCCESS),
+                        EMPTY
+                ));
+                subscribing.get(5, SECONDS);
+            }
+            // The actor encodes each packet it queues, so this records what still waits then.
+            encoder.beforeEncode = packet -> {
+                if (packet instanceof Packet.PingReq) {
+                    queuedAtPing.add(actor.usage().mailboxEvents());
+                }
+            };
+            var burst = new ByteArrayOutputStream();
+            for (int i = 0; i < 65_536; i++) {
+                burst.writeBytes(codec.encode(new Packet.Publish(new Topic("backlog/" + i % 256),
+                        new byte[1], Qos.AT_MOST_ONCE, false, false, 0, EMPTY)));
+            }
+            holdActor(transport, entered, release);
+            transport.receiver().onBytes(burst.toByteArray());
+
+            // Act: the keep-alive interval elapses with the whole backlog queued.
+            scheduler.advance(Duration.ofSeconds(10));
+            release.countDown();
+
+            // Assert: the PINGREQ is queued before the actor takes any of the publications.
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.PingReq.class);
+            assertThat(queuedAtPing.poll(5, SECONDS)).isGreaterThanOrEqualTo(65_536);
+
+            // Act: hold the actor inside the backlog while PINGRESP arrives and the next
+            // interval, with the PINGRESP deadline, elapses.
+            beforeActorTime = () -> {
+                enteredAgain.countDown();
+                waitFor(releaseAgain);
+            };
+            assertThat(enteredAgain.await(5, SECONDS)).isTrue();
+            transport.receive(new Packet.PingResp());
+            scheduler.advance(Duration.ofSeconds(10));
+            releaseAgain.countDown();
+
+            // Assert: PINGRESP also goes first, so the deadline passes and the next PINGREQ
+            // follows while most publications still wait.
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.PingReq.class);
+            assertThat(queuedAtPing.poll(5, SECONDS)).isGreaterThan(1_000);
+            await().atMost(Duration.ofSeconds(30))
+                    .until(() -> actor.usage().mailboxEvents() == 0);
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+            releaseAgain.countDown();
+        }
+    }
+
+    @Test
     void connection_end_frees_io_timers_and_mailbox_while_application_code_still_runs()
             throws Exception {
         // Arrange: application code holds a continuation, an unacknowledged MANUAL delivery,
@@ -2973,8 +3044,11 @@ class ClientActorTest {
 
         Runnable beforePublish = () -> { };
 
+        volatile Consumer<Packet> beforeEncode = _ -> { };
+
         @Override
         public byte[] encode(Packet packet) {
+            beforeEncode.accept(packet);
             return codec.encode(packet);
         }
 

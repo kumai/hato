@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 
@@ -67,6 +68,15 @@ public final class ClientActor implements MqttClient {
     private static final int MAILBOX_COMMAND_BYTE_LIMIT = 32 * 1024 * 1024;
 
     private static final int RECEIVE_BYTE_LIMIT = 32 * 1024 * 1024;
+
+    // Virtual threads are not preempted, so a busy actor keeps its carrier until it blocks. With
+    // a single carrier, the sender, the transport's workers, and delivery lanes would wait out a
+    // whole receive backlog, and a PINGREQ queued in time would not be written in time. Parking
+    // after this much continuous work lets them run; Thread.yield() alone did not when measured
+    // with one carrier. With 250 microseconds, a one-carrier burst of small publications stayed
+    // within the default queue of a fast handler; with one millisecond, it overflowed. Real time
+    // measures carrier use, which TimerScheduler time cannot express.
+    private static final long CARRIER_SLICE_NANOS = 250_000;
 
     private final URI endpoint;
 
@@ -310,6 +320,7 @@ public final class ClientActor implements MqttClient {
         Throwable failure = null;
         try {
             Optional<Mailbox.Event> next;
+            long busySince = System.nanoTime();
             while ((next = mailbox.take(stopping::get)).isPresent()) {
                 Mailbox.Event event = next.orElseThrow();
                 try {
@@ -317,6 +328,7 @@ public final class ClientActor implements MqttClient {
                 } catch (SpiException cause) {
                     core.failed(cause.generation(), requireNonNull(cause.getCause()));
                 }
+                busySince = shareCarrier(busySince);
             }
         } catch (Throwable cause) {
             failure = cause;
@@ -357,6 +369,20 @@ public final class ClientActor implements MqttClient {
                 }
             }
         }
+    }
+
+    /// Returns when the current slice of continuous work began.
+    private long shareCarrier(long busySince) {
+        long now = System.nanoTime();
+        if (now - busySince < CARRIER_SLICE_NANOS) {
+            return busySince;
+        }
+        if (mailbox.size() == 0) {
+            // The actor blocks next, which frees the carrier without parking.
+            return now;
+        }
+        LockSupport.parkNanos(1);
+        return System.nanoTime();
     }
 
     private void deliveryReady(long generation) {
@@ -426,9 +452,13 @@ public final class ClientActor implements MqttClient {
                 new Mailbox.Event(generation, action, kind, bytes)
         );
         if (admitted == Mailbox.OfferResult.FULL) {
-            signalFailure(generation, new MqttCapacityException(
-                    (kind == Mailbox.Kind.INCOMING ? "Incoming" : "Control") + " mailbox capacity"
-            ));
+            String admission = switch (kind) {
+                case COMMAND -> "Command";
+                case INCOMING -> "Incoming";
+                case KEEP_ALIVE -> "Keep-alive";
+                case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE -> "Control";
+            };
+            signalFailure(generation, new MqttCapacityException(admission + " mailbox capacity"));
         }
     }
 
@@ -591,6 +621,10 @@ public final class ClientActor implements MqttClient {
             cancel(timer);
             var entry = new TimerEntry();
             timers.put(timer, entry);
+            Mailbox.Kind kind = switch (timer) {
+                case KEEP_ALIVE, PING -> Mailbox.Kind.KEEP_ALIVE;
+                case CONNECT, DISCONNECT -> Mailbox.Kind.CONTROL;
+            };
             try {
                 entry.cancellation = scheduler.schedule(delay, () -> post(
                         generation,
@@ -600,7 +634,7 @@ public final class ClientActor implements MqttClient {
                                 core.timer(generation, timer, nanoTime(generation));
                             }
                         },
-                        Mailbox.Kind.CONTROL,
+                        kind,
                         0
                 ));
             } catch (RuntimeException failure) {
@@ -714,6 +748,16 @@ public final class ClientActor implements MqttClient {
         @Override
         public void connected(long generation) {
             post(generation, () -> core.opened(generation), Mailbox.Kind.CONTROL, 0);
+        }
+
+        @Override
+        public void pingResponse(long generation, Packet packet, int size) {
+            post(
+                    generation,
+                    () -> core.received(generation, packet, nanoTime(generation), size),
+                    Mailbox.Kind.KEEP_ALIVE,
+                    0
+            );
         }
 
         @Override

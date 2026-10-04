@@ -43,6 +43,52 @@ class MailboxTest {
     }
 
     @Test
+    void keep_alive_events_go_ahead_of_queued_input_but_not_of_termination() throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 1, 10, 1);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
+        var timer = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
+        var response = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
+        var end = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
+        sut.activate(1);
+        assertThat(sut.offer(incoming)).isEqualTo(ACCEPTED);
+
+        // Act
+        assertThat(sut.offer(timer)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(response)).isEqualTo(ACCEPTED);
+        sut.terminate(end);
+
+        // Assert: keep-alive events keep their own order between termination and the FIFO.
+        assertThat(sut.take(() -> false)).containsSame(end);
+        assertThat(sut.take(() -> false)).containsSame(timer);
+        assertThat(sut.take(() -> false)).containsSame(response);
+        assertThat(sut.take(() -> false)).containsSame(incoming);
+    }
+
+    @Test
+    void keep_alive_events_have_a_bounded_class_that_ends_with_its_connection() {
+        // Arrange
+        var sut = new Mailbox(1, 10, 1, 10, 1);
+        var current = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
+        var next = new Mailbox.Event(2, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
+        sut.activate(1);
+        for (int i = 0; i < 16; i++) {
+            assertThat(sut.offer(current)).isEqualTo(ACCEPTED);
+        }
+
+        // Act & Assert: the class is full without touching the others, and old events go.
+        assertThat(sut.offer(current)).isEqualTo(FULL);
+        assertThat(sut.offer(new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0)))
+                .isEqualTo(ACCEPTED);
+        assertThat(sut.offer(next)).isEqualTo(STALE);
+        sut.discard(1);
+        assertThat(sut.size()).isZero();
+        sut.activate(2);
+        assertThat(sut.offer(next)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(current)).isEqualTo(STALE);
+    }
+
+    @Test
     void coalesced_wakes_keep_independent_slots_when_control_capacity_is_full() throws Exception {
         // Arrange
         var sut = new Mailbox(1, 0, 0, 0, 1);
