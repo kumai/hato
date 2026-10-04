@@ -11,6 +11,10 @@ import java.util.concurrent.CompletableFuture;
 /// [MqttCapacityException], whatever maximum incoming packet size is configured.
 /// Cancelling or completing a returned future does not cancel the underlying operation.
 ///
+/// A QoS 1 retransmission marked DUP joins the original delivery while that delivery's PUBACK is
+/// still pending. Any other publication, including one without DUP that reuses a pending packet
+/// identifier, starts a new delivery. This does not guarantee exactly-once processing.
+///
 /// The client completes operations independently of I/O and listener callbacks. One blocked
 /// continuation does not prevent another operation from completing. Slow continuations and
 /// listeners retain capacity until they return, so further operations may be rejected.
@@ -33,6 +37,10 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
 
     /// Sends DISCONNECT and completes after writing it and requesting transport closure.
     /// Completion does not confirm that the broker received DISCONNECT.
+    /// This does not wait for PUBACK, although one that arrives before the connection ends still
+    /// completes its publication. Other pending QoS 1 publications fail with
+    /// [MqttConnectionLostException] when the connection ends; their outcome is unknown.
+    /// Wait for each publication's future before disconnecting to observe its acknowledgement.
     ///
     /// The future fails with [MqttNotConnectedException] when there is no established connection
     /// or a disconnect is already pending. A connection failure before the write completes is

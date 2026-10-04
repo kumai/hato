@@ -144,7 +144,12 @@ public final class ClientActor implements MqttClient {
         this.scheduler = scheduler;
         this.listener = listener;
         mailbox = createMailbox(maxPacketSize);
-        lanes = new DeliveryLanes(clientId, receiveByteLimit(maxPacketSize), this::signalFailure);
+        lanes = new DeliveryLanes(
+                clientId,
+                receiveByteLimit(maxPacketSize),
+                this::signalFailure,
+                this::deliveryReady
+        );
         io = new ClientIo(
                 endpoint,
                 clientId,
@@ -182,9 +187,9 @@ public final class ClientActor implements MqttClient {
     @Override
     public CompletableFuture<PublishResult> publish(MqttMessage message) {
         requireNonNull(message, "message");
-        if (message.qos() != Qos.AT_MOST_ONCE) {
+        if (message.qos() == Qos.EXACTLY_ONCE) {
             return CompletableFuture.failedFuture(
-                    new IllegalArgumentException("Only QoS 0 publish is implemented")
+                    new IllegalArgumentException("QoS 2 publish is not supported")
             );
         }
         return submit(false, true, message.payloadSize(),
@@ -198,9 +203,9 @@ public final class ClientActor implements MqttClient {
     ) {
         requireNonNull(request, "request");
         requireNonNull(handler, "handler");
-        if (request.qos() != Qos.AT_MOST_ONCE) {
+        if (request.qos() == Qos.EXACTLY_ONCE) {
             return CompletableFuture.failedFuture(
-                    new IllegalArgumentException("Only QoS 0 subscribe is implemented")
+                    new IllegalArgumentException("QoS 2 subscribe is not supported")
             );
         }
         return submit(false, true, 0, token -> {
@@ -323,6 +328,15 @@ public final class ClientActor implements MqttClient {
                 }
             }
         }
+    }
+
+    private void deliveryReady(long generation) {
+        post(
+                generation,
+                () -> core.deliveriesReady(generation, lanes.takeReady(generation)),
+                Mailbox.Kind.DELIVERY_READY,
+                0
+        );
     }
 
     private void post(long generation, Runnable action, Mailbox.Kind kind, int bytes) {
@@ -461,8 +475,13 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
-        public SendQueue.OfferResult publish(long generation, long ticket, MqttMessage message) {
-            return io.publish(generation, ticket, message);
+        public SendQueue.OfferResult publish(
+                long generation,
+                long ticket,
+                MqttMessage message,
+                int packetId
+        ) {
+            return io.publish(generation, ticket, message, packetId);
         }
 
         @Override
@@ -521,12 +540,18 @@ public final class ClientActor implements MqttClient {
         @Override
         public boolean deliver(
                 long generation,
+                long token,
                 List<Long> ids,
                 MqttMessage message,
                 boolean dup,
                 int bytes
         ) {
-            return lanes.deliver(generation, ids, message, dup, bytes);
+            return lanes.deliver(generation, token, ids, message, dup, bytes);
+        }
+
+        @Override
+        public void releaseDelivery(long token) {
+            lanes.release(token);
         }
 
         @Override
@@ -550,6 +575,7 @@ public final class ClientActor implements MqttClient {
                 connectedGeneration = 0;
             }
             lanes.close();
+            subscriptions.clear();
             mailbox.discard(generation);
             io.close();
             if (established) {
@@ -604,6 +630,21 @@ public final class ClientActor implements MqttClient {
                     generation,
                     () -> core.sent(generation, ticket, sentAt),
                     Mailbox.Kind.CONTROL,
+                    0
+            );
+        }
+
+        @Override
+        public void written(long generation, long ticket) {
+            post(generation, () -> core.written(generation, ticket), Mailbox.Kind.CONTROL, 0);
+        }
+
+        @Override
+        public void sendCapacityAvailable(long generation) {
+            post(
+                    generation,
+                    () -> core.sendCapacityAvailable(generation),
+                    Mailbox.Kind.SEND_CAPACITY,
                     0
             );
         }

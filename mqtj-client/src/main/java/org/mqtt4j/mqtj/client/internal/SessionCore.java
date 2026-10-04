@@ -65,7 +65,12 @@ final class SessionCore {
 
         /// Reports admission at the exact wire size, not write completion. The payload is copied
         /// only after admission.
-        SendQueue.OfferResult publish(long generation, long ticket, MqttMessage message);
+        SendQueue.OfferResult publish(
+                long generation,
+                long ticket,
+                MqttMessage message,
+                int packetId
+        );
 
         void schedule(long generation, Timer timer, Duration delay);
 
@@ -81,11 +86,14 @@ final class SessionCore {
 
         boolean deliver(
                 long generation,
+                long token,
                 List<Long> ids,
                 MqttMessage message,
                 boolean dup,
                 int bytes
         );
+
+        void releaseDelivery(long token);
 
         void removeSubscription(long id);
 
@@ -93,6 +101,11 @@ final class SessionCore {
     }
 
     private static final Log log = Log.of(SessionCore.class);
+
+    private static final int ACKNOWLEDGEMENT_LIMIT = 4096;
+
+    // Bound queued completion events even when I/O returns capacity during an actor drain.
+    private static final int ACK_WRITE_LIMIT = 16;
 
     private final Port port;
 
@@ -125,6 +138,16 @@ final class SessionCore {
     private PacketIds packetIds = new PacketIds();
 
     private final Map<Long, Long> publications = new HashMap<>();
+
+    private final Map<Integer, Long> inflight = new HashMap<>();
+
+    private final AckSequencer acknowledgements = new AckSequencer(ACKNOWLEDGEMENT_LIMIT);
+
+    private long nextDelivery;
+
+    private boolean unknownPubAckLogged;
+
+    private boolean reusedIdentifierLogged;
 
     private final Map<Long, LocalSubscription> subscriptions = new LinkedHashMap<>();
 
@@ -197,8 +220,11 @@ final class SessionCore {
                     scheduleKeepAlive(now);
                 }
             }
+        } else if (packet instanceof Packet.PubAck ack) {
+            // Completing a publication sends nothing, so it cannot disturb a pending shutdown.
+            acknowledged(ack);
         } else if (disconnectOperation != 0) {
-            // Input already in flight cannot change a local shutdown's write/close sequence.
+            // Other input already in flight cannot change a local shutdown's write/close sequence.
             return;
         } else if (packet instanceof Packet.PingResp) {
             if (awaitingPing) {
@@ -235,14 +261,39 @@ final class SessionCore {
         }
     }
 
+    /// Ends a PUBACK's retransmission window, independently of send-buffer release. Input may
+    /// arrive before or after it; the DUP flag decides how a reused identifier is treated.
+    void written(long connection, long ticket) {
+        if (connection == generation && state == State.CONNECTED) {
+            acknowledgements.written(ticket);
+            sendCapacityAvailable(connection);
+        }
+    }
+
     void publish(long operation, MqttMessage message) {
         if (!ready(operation) || !supportedQos(operation, message.qos())) {
             return;
         }
         long ticket = ++nextTicket;
-        publications.put(ticket, operation);
-        if (port.publish(generation, ticket, message) == SendQueue.OfferResult.FULL) {
-            publications.remove(ticket);
+        int packetId = 0;
+        if (message.qos() == Qos.AT_LEAST_ONCE) {
+            var allocated = packetIds.allocate();
+            if (allocated.isEmpty()) {
+                capacityFailure(operation, "Packet identifier capacity");
+                return;
+            }
+            packetId = allocated.getAsInt();
+            inflight.put(packetId, operation);
+        } else {
+            publications.put(ticket, operation);
+        }
+        if (port.publish(generation, ticket, message, packetId) == SendQueue.OfferResult.FULL) {
+            if (packetId == 0) {
+                publications.remove(ticket);
+            } else {
+                inflight.remove(packetId);
+                packetIds.release(packetId);
+            }
             capacityFailure(operation, "Send queue capacity");
         }
         // CLOSED waits for the connection's terminal notification, as do SUBSCRIBE/UNSUBSCRIBE.
@@ -341,15 +392,42 @@ final class SessionCore {
     }
 
     private boolean supportedQos(long operation, Qos qos) {
-        if (qos == Qos.AT_MOST_ONCE) {
+        if (qos != Qos.EXACTLY_ONCE) {
             return true;
         }
-        port.complete(operation, null, new IllegalArgumentException("Only QoS 0 is supported"));
+        port.complete(operation, null, new IllegalArgumentException("QoS 2 is not supported"));
         return false;
     }
 
     private void capacityFailure(long operation, String message) {
         port.complete(operation, null, new MqttCapacityException(message));
+    }
+
+    private void acknowledged(Packet.PubAck ack) {
+        Long operation = inflight.remove(ack.packetId());
+        if (operation == null) {
+            if (!unknownPubAckLogged) {
+                unknownPubAckLogged = true;
+                log.warn("Ignoring PUBACK for unknown packet identifier {} on {}",
+                        ack.packetId(), clientId);
+            }
+            return;
+        }
+        packetIds.release(ack.packetId());
+        port.complete(operation, new PublishResult(), null);
+    }
+
+    /// The earlier reception was a stale retransmission or a resend that omitted DUP. Either way
+    /// the new reception's PUBACK covers the broker's exchange, so the earlier one only releases
+    /// its local delivery and stops holding back later acknowledgements.
+    private void withdrawAcknowledgement(int packetId, long token) {
+        if (!reusedIdentifierLogged) {
+            reusedIdentifierLogged = true;
+            log.warn("Packet identifier {} was reused without DUP before its PUBACK on {}; "
+                    + "the earlier reception is not acknowledged", packetId, clientId);
+        }
+        port.releaseDelivery(token);
+        sendCapacityAvailable(generation);
     }
 
     private void subscribed(Packet.SubAck ack) {
@@ -359,7 +437,9 @@ final class SessionCore {
             return;
         }
         ReasonCode reason = ack.reasonCodes().getFirst();
-        if (reason != ReasonCode.UNSPECIFIED_ERROR && reason != ReasonCode.SUCCESS) {
+        if (reason != ReasonCode.UNSPECIFIED_ERROR
+                && (reason.value() > local.requestedQos.level()
+                        || reason.value() > Qos.AT_LEAST_ONCE.level())) {
             failed(generation, protocolError("SUBACK grants an unsupported QoS or reason"));
             return;
         }
@@ -371,7 +451,7 @@ final class SessionCore {
             port.complete(local.id, null, new MqttSubscribeException(reason));
         } else {
             local.established = true;
-            port.complete(local.id, port.subscribed(local.id, Qos.AT_MOST_ONCE), null);
+            port.complete(local.id, port.subscribed(local.id, Qos.of(reason.value())), null);
         }
     }
 
@@ -389,9 +469,29 @@ final class SessionCore {
     }
 
     private void deliver(Packet.Publish publish, int bytes) {
-        if (publish.qos() != Qos.AT_MOST_ONCE) {
-            failed(generation, protocolError("Only QoS 0 delivery is supported"));
+        if (publish.qos() == Qos.EXACTLY_ONCE) {
+            failed(generation, protocolError("QoS 2 delivery is not supported"));
             return;
+        }
+        long token = 0;
+        if (publish.qos() == Qos.AT_LEAST_ONCE) {
+            int packetId = publish.packetId();
+            if (acknowledgements.contains(packetId)) {
+                if (publish.dup()) {
+                    // A retransmission joins the reception that holds this identifier until its
+                    // PUBACK is written, without another delivery or acknowledgement.
+                    return;
+                }
+                // Without DUP this is a new publication. Senders reuse an identifier only after
+                // the earlier exchange is acknowledged, so that reception needs no PUBACK.
+                acknowledgements.supersede(packetId)
+                        .ifPresent(earlier -> withdrawAcknowledgement(packetId, earlier));
+            }
+            token = ++nextDelivery;
+            if (!acknowledgements.add(token, packetId)) {
+                failed(generation, new MqttCapacityException("Acknowledgement capacity"));
+                return;
+            }
         }
         var matches = new ArrayList<Long>();
         // Matching is O(subscriptions). Replace with a topic tree if 0.4 measurements show
@@ -402,15 +502,51 @@ final class SessionCore {
             }
         }
         if (matches.isEmpty()) {
-            log.debug("Discarding unmatched QoS 0 delivery for {} on {}",
-                    publish.topic(), clientId);
+            if (token != 0) {
+                deliveryReady(generation, token);
+            } else {
+                log.debug("Discarding unmatched QoS 0 delivery for {} on {}",
+                        publish.topic(), clientId);
+            }
             return;
         }
         var message = new MqttMessage(
                 publish.topic(), publish.payload(), publish.qos(), publish.retain()
         );
-        if (!port.deliver(generation, matches, message, publish.dup(), bytes)) {
+        if (!port.deliver(generation, token, matches, message, publish.dup(), bytes)) {
             failed(generation, new MqttCapacityException("Delivery capacity"));
+        }
+    }
+
+    void deliveryReady(long connection, long token) {
+        deliveriesReady(connection, List.of(token));
+    }
+
+    void deliveriesReady(long connection, List<Long> tokens) {
+        if (connection != generation || state != State.CONNECTED || disconnectOperation != 0) {
+            return;
+        }
+        tokens.forEach(acknowledgements::ready);
+        sendCapacityAvailable(connection);
+    }
+
+    void sendCapacityAvailable(long connection) {
+        if (connection != generation || state != State.CONNECTED || disconnectOperation != 0) {
+            return;
+        }
+        Optional<AckSequencer.Entry> ready;
+        while (acknowledgements.writingCount() < ACK_WRITE_LIMIT
+                && (ready = acknowledgements.nextReady()).isPresent()) {
+            AckSequencer.Entry entry = ready.orElseThrow();
+            long ticket = ++nextTicket;
+            if (port.send(generation, ticket,
+                    new Packet.PubAck(entry.packetId(), ReasonCode.SUCCESS, EMPTY))
+                    != SendQueue.OfferResult.ACCEPTED) {
+                // FULL waits for actual budget release; CLOSED waits for the original cause.
+                return;
+            }
+            acknowledgements.submitted(ticket);
+            port.releaseDelivery(entry.token());
         }
     }
 
@@ -526,6 +662,11 @@ final class SessionCore {
         awaitingPing = false;
         pingTicket = 0;
         disconnectTicket = 0;
+        if (active) {
+            // Retire delivery conditions before removing subscriptions: termination must not
+            // turn thousands of abandoned recipients into fresh readiness notifications.
+            port.end(generation, established, new Disconnection(cause, requested));
+        }
         for (long id : subscriptions.keySet()) {
             port.removeSubscription(id);
         }
@@ -537,6 +678,11 @@ final class SessionCore {
             port.complete(operation, null, pendingFailure);
         }
         publications.clear();
+        for (long operation : inflight.values()) {
+            port.complete(operation, null, pendingFailure);
+        }
+        inflight.clear();
+        acknowledgements.clear();
         for (var local : subscribing.values()) {
             port.complete(local.id, null, pendingFailure);
         }
@@ -546,9 +692,6 @@ final class SessionCore {
         }
         unsubscribing.clear();
         packetIds = new PacketIds();
-        if (active) {
-            port.end(generation, established, new Disconnection(cause, requested));
-        }
         if (connectOperation != 0) {
             Throwable failure = switch (cause) {
                 case null -> new MqttConnectException("Connection failed");
@@ -623,6 +766,7 @@ final class SessionCore {
         final long id;
         final TopicFilter filter;
         final TopicFilter matchingFilter;
+        final Qos requestedQos;
         final boolean shared;
         boolean established;
         boolean removing;
@@ -630,6 +774,7 @@ final class SessionCore {
         LocalSubscription(long id, Subscribe request) {
             this.id = id;
             filter = request.filter();
+            requestedQos = request.qos();
             Optional<SharedTopicFilter> sharedFilter = SharedTopicFilter.parse(filter);
             shared = sharedFilter.isPresent();
             matchingFilter = sharedFilter.map(SharedTopicFilter::filter).orElse(filter);

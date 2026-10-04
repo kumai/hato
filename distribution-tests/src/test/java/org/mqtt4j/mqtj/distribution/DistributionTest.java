@@ -112,7 +112,7 @@ class DistributionTest {
 
                 // Act
                 org.mqtt4j.mqtj.Subscription subscription = subscriber.subscribe(
-                        new org.mqtt4j.mqtj.Subscribe(
+                        org.mqtt4j.mqtj.Subscribe.of(
                                 new org.mqtt4j.mqtj.TopicFilter("probe/#"),
                                 org.mqtt4j.mqtj.Qos.AT_MOST_ONCE
                         ),

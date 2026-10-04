@@ -43,6 +43,112 @@ class MailboxTest {
     }
 
     @Test
+    void coalesced_wakes_keep_independent_slots_when_control_capacity_is_full() throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 0, 0, 0, 1);
+        var control = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
+        var ready = new Mailbox.Event(1, () -> { }, Mailbox.Kind.DELIVERY_READY, 0);
+        var capacity = new Mailbox.Event(1, () -> { }, Mailbox.Kind.SEND_CAPACITY, 0);
+        var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
+        sut.activate(1);
+        assertThat(sut.offer(control)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(control)).isEqualTo(FULL);
+
+        // Act: both wake classes remain available and repeated notices occupy no extra slots.
+        assertThat(sut.offer(ready)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(capacity)).isEqualTo(ACCEPTED);
+        for (int i = 0; i < 300; i++) {
+            assertThat(sut.offer(ready)).isEqualTo(ACCEPTED);
+            assertThat(sut.offer(capacity)).isEqualTo(ACCEPTED);
+        }
+        assertThat(sut.offer(control)).isEqualTo(FULL);
+
+        // Assert: the first marker keeps its FIFO position and each wake appears exactly once.
+        assertThat(sut.take(() -> false)).containsSame(control);
+        assertThat(sut.take(() -> false)).containsSame(ready);
+        assertThat(sut.take(() -> false)).containsSame(command);
+        assertThat(sut.take(() -> false)).containsSame(capacity);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+        assertThat(sut.take(() -> false)).containsSame(command);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Mailbox.Kind.class, names = {"DELIVERY_READY", "SEND_CAPACITY"})
+    void taking_a_wake_rearms_it_before_its_action_runs(Mailbox.Kind kind) throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 0, 0, 0, 0);
+        var first = new Mailbox.Event(1, () -> { }, kind, 0);
+        var next = new Mailbox.Event(1, () -> { }, kind, 0);
+        var duplicate = new Mailbox.Event(1, () -> { }, kind, 0);
+        var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
+        sut.activate(1);
+        assertThat(sut.offer(first)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(duplicate)).isEqualTo(ACCEPTED);
+
+        // Act: a producer can request another pass while the taken marker is being handled.
+        assertThat(sut.take(() -> false)).containsSame(first);
+        assertThat(sut.offer(next)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(duplicate)).isEqualTo(ACCEPTED);
+
+        // Assert: the new marker joins the tail, and duplicates do not replace either action.
+        assertThat(sut.take(() -> false)).containsSame(command);
+        assertThat(sut.take(() -> false)).containsSame(next);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+        assertThat(sut.take(() -> false)).containsSame(command);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Mailbox.Kind.class, names = {"DELIVERY_READY", "SEND_CAPACITY"})
+    void discarding_an_old_wake_does_not_clear_the_current_generations_marker(Mailbox.Kind kind)
+            throws Exception {
+        // Arrange: a new marker is admitted before the old generation is discarded.
+        var sut = new Mailbox(1, 0, 0, 0, 0);
+        var old = new Mailbox.Event(1, () -> { }, kind, 0);
+        var current = new Mailbox.Event(2, () -> { }, kind, 0);
+        var duplicate = new Mailbox.Event(2, () -> { }, kind, 0);
+        var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
+        sut.activate(1);
+        assertThat(sut.offer(old)).isEqualTo(ACCEPTED);
+        sut.activate(2);
+        assertThat(sut.offer(current)).isEqualTo(ACCEPTED);
+
+        // Act
+        sut.discard(1);
+        assertThat(sut.offer(old)).isEqualTo(STALE);
+        assertThat(sut.offer(duplicate)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+
+        // Assert: removing the old marker neither admits a duplicate nor deactivates generation 2.
+        assertThat(sut.take(() -> false)).containsSame(current);
+        assertThat(sut.take(() -> false)).containsSame(command);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Mailbox.Kind.class, names = {"DELIVERY_READY", "SEND_CAPACITY"})
+    void wakes_require_an_active_matching_generation(Mailbox.Kind kind) throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 0, 0, 0, 0);
+        var zero = new Mailbox.Event(0, () -> { }, kind, 0);
+        var old = new Mailbox.Event(1, () -> { }, kind, 0);
+        var current = new Mailbox.Event(2, () -> { }, kind, 0);
+
+        // Act & Assert: neither an unscoped wake nor a late callback can enter the FIFO.
+        assertThat(sut.offer(zero)).isEqualTo(STALE);
+        assertThat(sut.offer(old)).isEqualTo(STALE);
+        sut.activate(1);
+        assertThat(sut.offer(zero)).isEqualTo(STALE);
+        assertThat(sut.offer(old)).isEqualTo(ACCEPTED);
+        sut.discard(1);
+        assertThat(sut.offer(old)).isEqualTo(STALE);
+        sut.activate(2);
+        assertThat(sut.offer(old)).isEqualTo(STALE);
+        assertThat(sut.offer(current)).isEqualTo(ACCEPTED);
+        assertThat(sut.take(() -> false)).containsSame(current);
+    }
+
+    @Test
     void reconnect_keeps_queued_command_capacity_until_the_command_is_taken() throws Exception {
         // Arrange
         var sut = new Mailbox(1, 10, 1, 10, 1);

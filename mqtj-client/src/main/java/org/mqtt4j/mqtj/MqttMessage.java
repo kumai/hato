@@ -10,13 +10,12 @@ import static java.util.Objects.requireNonNull;
 /// An immutable application message. The payload is copied on construction and on access.
 /// Equality compares payload contents, and [#toString()] reports only its byte count.
 ///
-/// All QoS values can be represented; the current client accepts only QoS 0 operations.
+/// All QoS values can be represented; the current client accepts QoS 0 and QoS 1 operations.
 ///
 /// @param topic the published topic name
 /// @param payload the application bytes, possibly empty
 /// @param qos the requested or received quality of service
 /// @param retain whether publication requests retention, or reception is a retained delivery
-@SuppressWarnings("exports") // Nullness annotations are compile-time only.
 public record MqttMessage(Topic topic, byte[] payload, Qos qos, boolean retain) {
 
     public MqttMessage {
@@ -37,6 +36,7 @@ public record MqttMessage(Topic topic, byte[] payload, Qos qos, boolean retain) 
     }
 
     @Override
+    @SuppressWarnings("exports") // Nullness annotations are compile-time only.
     public boolean equals(@Nullable Object other) {
         return other instanceof MqttMessage that
                 && topic.equals(that.topic)

@@ -28,7 +28,7 @@ try-with-resources block, drops the connection without telling the broker.
 
 ```java
 Subscription subscription = client.subscribe(
-        new Subscribe(new TopicFilter("sensors/+/temperature"), Qos.AT_MOST_ONCE),
+        Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_MOST_ONCE),
         delivery -> repository.save(delivery.message())
 ).join();
 
@@ -38,8 +38,12 @@ subscription.unsubscribe().join();
 - By default, each subscription handles one message at a time on its own virtual
   thread. The handler can block, for example to write to a database or to publish
   and wait for the result.
+- QoS 1 messages are acknowledged after the handler returns. Choose `AckMode.ON_RECEIVE`
+  to acknowledge before the handler runs, or `AckMode.MANUAL` to call `delivery.ack()`
+  yourself for every message: `Subscribe.of(filter, Qos.AT_LEAST_ONCE).withAckMode(AckMode.MANUAL)`.
 - While the handler is busy, new messages for the subscription wait in a queue of
-  256. Pass a third argument to change it: `new Subscribe(filter, qos, 1024)`.
+  256, which also holds QoS 1 messages until they are acknowledged. Change its size with
+  `Subscribe.of(filter, qos).withBufferCapacity(1024)`.
 - The client and its subscriptions are safe to use from any thread.
 
 ## Handling failures
@@ -61,7 +65,8 @@ the connection when:
 
 - a handler throws, by default. Catch exceptions inside the handler to keep the
   connection.
-- a subscription's queue fills up, rather than buffering without limit.
+- a subscription's queue fills up, for example with messages waiting for
+  `delivery.ack()`, rather than buffering without limit.
 
 ## Passing the client to your code
 

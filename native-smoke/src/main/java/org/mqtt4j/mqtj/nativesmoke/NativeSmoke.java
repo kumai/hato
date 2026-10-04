@@ -32,7 +32,7 @@ public final class NativeSmoke {
             }
             var received = new CompletableFuture<MqttMessage>();
             Subscription subscription = client.subscribe(
-                    new Subscribe(new TopicFilter("smoke/#"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter("smoke/#"), Qos.AT_MOST_ONCE),
                     delivery -> received.complete(delivery.message())
             ).get(5, SECONDS);
             var message = new MqttMessage(new Topic("smoke/message"), new byte[] {42},

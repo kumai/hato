@@ -50,7 +50,7 @@ class MosquittoMessagingTest extends MessagingTest {
 
             // Act: the same connection preserves publish-before-subscribe order at the broker.
             sut.subscribe(
-                    new Subscribe(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     received::add
             ).get(5, SECONDS);
 
@@ -74,11 +74,11 @@ class MosquittoMessagingTest extends MessagingTest {
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE),
                     wildcard::add
             ).get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(base + "/data"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(base + "/data"), Qos.AT_MOST_ONCE),
                     exact::add
             ).get(5, SECONDS);
 

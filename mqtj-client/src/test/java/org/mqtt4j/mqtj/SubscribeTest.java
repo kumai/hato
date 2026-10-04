@@ -12,24 +12,60 @@ class SubscribeTest {
 
     @ParameterizedTest
     @EnumSource(Qos.class)
-    void default_capacity_is_256_for_every_representable_qos(Qos qos) {
+    void defaults_leave_the_ack_mode_open_and_use_capacity_256_for_every_qos(Qos qos) {
         // Act
-        var sut = new Subscribe(new TopicFilter("events/#"), qos);
+        var sut = Subscribe.of(new TopicFilter("events/#"), qos);
 
         // Assert
-        assertThat(sut.bufferCapacity()).isEqualTo(256);
         assertThat(sut.qos()).isEqualTo(qos);
+        assertThat(sut.ackMode()).isEmpty();
+        assertThat(sut.bufferCapacity()).isEqualTo(256);
+    }
+
+    @Test
+    void with_methods_return_changed_copies_that_compare_by_value() {
+        // Arrange
+        var filter = new TopicFilter("events/#");
+        var sut = Subscribe.of(filter, Qos.AT_LEAST_ONCE);
+
+        // Act
+        Subscribe changed = sut.withAckMode(AckMode.MANUAL).withBufferCapacity(8);
+
+        // Assert
+        assertThat(sut.ackMode()).isEmpty();
+        assertThat(sut.bufferCapacity()).isEqualTo(256);
+        assertThat(changed.ackMode()).contains(AckMode.MANUAL);
+        assertThat(changed.bufferCapacity()).isEqualTo(8);
+        Subscribe same = Subscribe.of(filter, Qos.AT_LEAST_ONCE)
+                .withBufferCapacity(8)
+                .withAckMode(AckMode.MANUAL);
+        assertThat(changed).isEqualTo(same).hasSameHashCodeAs(same).isNotEqualTo(sut);
+        assertThat(sut)
+                .isNotEqualTo(Subscribe.of(new TopicFilter("events/+"), Qos.AT_LEAST_ONCE))
+                .isNotEqualTo(Subscribe.of(filter, Qos.AT_MOST_ONCE));
+    }
+
+    @Test
+    void an_explicit_after_handler_mode_stays_distinguishable_from_the_default() {
+        // Arrange
+        var sut = Subscribe.of(new TopicFilter("events/#"), Qos.AT_LEAST_ONCE);
+
+        // Act
+        Subscribe explicit = sut.withAckMode(AckMode.AFTER_HANDLER);
+
+        // Assert: a receiving style with another default can still reject this choice.
+        assertThat(explicit.ackMode()).contains(AckMode.AFTER_HANDLER);
+        assertThat(explicit).isNotEqualTo(sut);
     }
 
     @ParameterizedTest(name = "accepts {0}")
     @ValueSource(strings = {"events/#", "$share", "$SHARE/group/events/#", "$share/group/events/#"})
     void preserves_ordinary_and_shared_filters(String pattern) {
         // Act
-        var sut = new Subscribe(new TopicFilter(pattern), Qos.AT_MOST_ONCE, 1);
+        var sut = Subscribe.of(new TopicFilter(pattern), Qos.AT_MOST_ONCE);
 
         // Assert
         assertThat(sut.filter().pattern()).isEqualTo(pattern);
-        assertThat(sut.bufferCapacity()).isEqualTo(1);
     }
 
     @ParameterizedTest(name = "rejects {0}")
@@ -39,29 +75,33 @@ class SubscribeTest {
         var filter = new TopicFilter(pattern);
 
         // Act & Assert
-        assertThatThrownBy(() -> new Subscribe(filter, Qos.AT_MOST_ONCE))
+        assertThatThrownBy(() -> Subscribe.of(filter, Qos.AT_MOST_ONCE))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @ParameterizedTest(name = "rejects {0}")
     @ValueSource(ints = {0, -1, Integer.MIN_VALUE})
     void capacity_must_be_positive(int capacity) {
+        // Arrange
+        var sut = Subscribe.of(new TopicFilter("events/#"), Qos.AT_MOST_ONCE);
+
         // Act & Assert
-        assertThatThrownBy(() -> new Subscribe(
-                new TopicFilter("events/#"),
-                Qos.AT_MOST_ONCE,
-                capacity
-        ))
+        assertThatThrownBy(() -> sut.withBufferCapacity(capacity))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    @SuppressWarnings("NullAway") // Deliberately violates the constructor's non-null contract.
-    void requires_filter_and_qos() {
+    @SuppressWarnings("NullAway") // Deliberately violates the non-null parameter contracts.
+    void requires_filter_qos_and_acknowledgement_mode() {
+        // Arrange
+        var sut = Subscribe.of(new TopicFilter("events/#"), Qos.AT_LEAST_ONCE);
+
         // Act & Assert
-        assertThatThrownBy(() -> new Subscribe(null, Qos.AT_MOST_ONCE))
+        assertThatThrownBy(() -> Subscribe.of(null, Qos.AT_MOST_ONCE))
                 .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new Subscribe(new TopicFilter("events/#"), null))
+        assertThatThrownBy(() -> Subscribe.of(new TopicFilter("events/#"), null))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> sut.withAckMode(null))
                 .isInstanceOf(NullPointerException.class);
     }
 }

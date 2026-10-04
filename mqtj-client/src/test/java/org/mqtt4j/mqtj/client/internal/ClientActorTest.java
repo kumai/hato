@@ -30,7 +30,9 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.mqtj.AckMode;
 import org.mqtt4j.mqtj.ConnAck;
 import org.mqtt4j.mqtj.ConnectionListener;
 import org.mqtt4j.mqtj.Disconnection;
@@ -907,6 +909,235 @@ class ClientActorTest {
     }
 
     @Test
+    void qos_one_puback_can_complete_before_the_write_notification() throws Exception {
+        // Arrange: hold the transport's completion while allowing inbound PUBACK.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            transport.completeSends = false;
+            var message = new MqttMessage(
+                    new Topic("messages"), new byte[] {1}, Qos.AT_LEAST_ONCE, false
+            );
+
+            // Act: a fast peer responds before the sender posts write completion.
+            CompletableFuture<PublishResult> publication = sut.publish(message);
+            var packet = (Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS));
+            assertThat(packet.qos()).isEqualTo(Qos.AT_LEAST_ONCE);
+            assertThat(packet.packetId()).isNotZero();
+            assertThat(publication).isNotDone();
+            transport.receive(new Packet.PubAck(packet.packetId(), ReasonCode.SUCCESS, EMPTY));
+
+            // Assert: PUBACK alone completes the operation; the late write stays harmless.
+            assertThat(publication.get(5, SECONDS)).isEqualTo(new PublishResult());
+            transport.completeSend();
+            transport.completeSends = true;
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+        }
+    }
+
+    @Test
+    void acknowledgements_made_while_the_actor_is_busy_share_one_mailbox_wake() throws Exception {
+        // Arrange: more MANUAL deliveries than the 256-event control mailbox can hold.
+        var delivered = new LinkedBlockingQueue<MqttDelivery>();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL)
+                            .withBufferCapacity(512),
+                    delivered::add
+            );
+            var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(
+                    request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY
+            ));
+            subscribing.get(5, SECONDS);
+            var deliveries = new ArrayList<MqttDelivery>();
+            for (int id = 1; id <= 300; id++) {
+                transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
+                        Qos.AT_LEAST_ONCE, false, false, id, EMPTY));
+                deliveries.add(requireNonNull(delivered.poll(5, SECONDS)));
+            }
+            holdActor(transport, entered, release);
+
+            // Act: every acknowledgement completes its condition before the actor resumes.
+            deliveries.forEach(MqttDelivery::ack);
+            release.countDown();
+
+            // Assert
+            for (int id = 1; id <= 300; id++) {
+                assertThat(transport.sent.poll(5, SECONDS))
+                        .isEqualTo(new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY));
+            }
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(AckMode.class)
+    void a_qos_one_burst_waits_for_send_capacity_without_losing_the_tail(AckMode mode)
+            throws Exception {
+        // Arrange: the first write holds the transport, with room for 100 local deliveries.
+        var delivered = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(mode)
+                            .withBufferCapacity(128),
+                    delivery -> {
+                        delivered.add(delivery);
+                        delivery.ack();
+                    }
+            );
+            var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(
+                    request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY
+            ));
+            subscribing.get(5, SECONDS);
+            transport.completeSends = false;
+            var blocked = sut.publish(message(new byte[] {0}));
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+
+            // Act
+            for (int id = 1; id <= 100; id++) {
+                transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
+                        Qos.AT_LEAST_ONCE, false, false, id, EMPTY));
+            }
+            for (int i = 0; i < 100; i++) {
+                assertThat(delivered.poll(5, SECONDS)).isNotNull();
+            }
+            transport.completeSends = true;
+            transport.completeSend();
+            blocked.get(5, SECONDS);
+
+            // Assert: completing the held write suffices; no new incoming packet wakes the pump.
+            for (int id = 1; id <= 100; id++) {
+                assertThat(transport.sent.poll(5, SECONDS))
+                        .isEqualTo(new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY));
+            }
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+        }
+    }
+
+    @ParameterizedTest(name = "reused id has DUP={0}")
+    @ValueSource(booleans = {false, true})
+    void id_reuse_after_inline_puback_completion_precedes_send_buffer_release(boolean dup)
+            throws Exception {
+        // Arrange: the completion callback runs, but send() has not returned its buffer yet.
+        var deliveries = new LinkedBlockingQueue<MqttDelivery>();
+        var releaseSender = new CountDownLatch(1);
+        var sentFirstAck = new AtomicBoolean();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            var subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL),
+                    deliveries::add
+            );
+            var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(
+                    request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY
+            ));
+            subscribing.get(5, SECONDS);
+            transport.afterSend = packet -> {
+                if (packet instanceof Packet.PubAck && sentFirstAck.compareAndSet(false, true)) {
+                    transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
+                            Qos.AT_LEAST_ONCE, false, dup, 7, EMPTY));
+                    waitFor(releaseSender);
+                }
+            };
+            transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
+                    Qos.AT_LEAST_ONCE, false, false, 7, EMPTY));
+            MqttDelivery first = requireNonNull(deliveries.poll(5, SECONDS));
+
+            // Act
+            first.ack();
+            MqttDelivery reused = requireNonNull(deliveries.poll(5, SECONDS));
+
+            // Assert: identical payload and DUP do not cause a legal reuse to be discarded.
+            assertThat(reused).isNotSameAs(first);
+            assertThat(reused.dup()).isEqualTo(dup);
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY));
+
+            // Act: old handles cannot acknowledge the new reception.
+            first.ack();
+            releaseSender.countDown();
+            sut.publish(message(new byte[] {2})).get(5, SECONDS);
+
+            // Assert: an outgoing write is a barrier after the old acknowledgement.
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            reused.ack();
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY));
+            assertThat(ends).isEmpty();
+        } finally {
+            releaseSender.countDown();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ApplicationCompletion.class)
+    void changing_publication_futures_neither_stops_writes_nor_releases_slots_before_puback(
+            ApplicationCompletion completion
+    ) throws Exception {
+        // Arrange: the transport holds the first write, so later publications stay unwritten.
+        var packets = new ArrayList<Packet.Publish>();
+        var publications = new ArrayList<CompletableFuture<PublishResult>>();
+        var message = new MqttMessage(
+                new Topic("messages"), new byte[] {1}, Qos.AT_LEAST_ONCE, false
+        );
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            transport.completeSends = false;
+            // The connect completion thread may still be returning its slot. Refused
+            // publications can retry because they never reach the wire.
+            await().pollInterval(Duration.ofMillis(1)).until(() -> {
+                CompletableFuture<PublishResult> publication = sut.publish(message);
+                if (publication.isCompletedExceptionally()) {
+                    assertThatThrownBy(publication::join)
+                            .hasCauseInstanceOf(MqttCapacityException.class);
+                } else {
+                    publications.add(publication);
+                }
+                return publications.size() == 64;
+            });
+            packets.add((Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS)));
+
+            // Act: an application changes its observable futures, not the wire operations.
+            for (CompletableFuture<PublishResult> publication : publications) {
+                assertThat(completion.apply.test(publication)).isTrue();
+            }
+            transport.completeSends = true;
+            transport.completeSend();
+
+            // Assert: every publication is still written, and none releases its operation slot
+            // before PUBACK.
+            for (int i = 1; i < 64; i++) {
+                packets.add((Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS)));
+            }
+            assertThatThrownBy(() -> sut.publish(message).join())
+                    .hasCauseInstanceOf(MqttCapacityException.class);
+            assertThat(transport.sent).isEmpty();
+            for (Packet.Publish packet : packets) {
+                transport.receive(new Packet.PubAck(packet.packetId(), ReasonCode.SUCCESS, EMPTY));
+            }
+
+            // Act & Assert: acknowledgements restore admission despite the changed futures.
+            await().untilAsserted(() -> assertThat(sut.publish(message))
+                    .isNotCompletedExceptionally());
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @Test
     void a_completed_large_publish_releases_capacity_before_its_continuation_republishes()
             throws Exception {
         // Arrange: the first inline completion still leaves its buffers on the sender's stack.
@@ -1090,7 +1321,8 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             CompletableFuture<Subscription> subscribing = sut.subscribe(
-                    new Subscribe(new TopicFilter("messages"), Qos.AT_MOST_ONCE, 1),
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
+                            .withBufferCapacity(1),
                     _ -> {
                         handlerEntered.countDown();
                         waitFor(releaseHandler);
@@ -1151,7 +1383,7 @@ class ClientActorTest {
             // Act & Assert: failed operations leave the connection and subscription usable.
             assertThatThrownBy(() -> subscription.unsubscribe().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class);
-            var other = new Subscribe(new TopicFilter("other"), Qos.AT_MOST_ONCE);
+            var other = Subscribe.of(new TopicFilter("other"), Qos.AT_MOST_ONCE);
             assertThatThrownBy(() -> sut.subscribe(other, _ -> { }).get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class);
             transport.receive(publication(new byte[] {3}));
@@ -1192,7 +1424,7 @@ class ClientActorTest {
             ));
             Subscription subscription = subscribing.get(5, SECONDS);
             CompletableFuture<Subscription> subscribingOther = sut.subscribe(
-                    new Subscribe(new TopicFilter("other"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter("other"), Qos.AT_MOST_ONCE),
                     _ -> { }
             );
             var subscribeOther = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
@@ -1234,7 +1466,8 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             CompletableFuture<Subscription> subscribing = sut.subscribe(
-                    new Subscribe(new TopicFilter("messages"), Qos.AT_MOST_ONCE, 1),
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
+                            .withBufferCapacity(1),
                     _ -> {
                         entered.countDown();
                         waitFor(release);
@@ -1270,7 +1503,8 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             CompletableFuture<Subscription> subscribing = sut.subscribe(
-                    new Subscribe(new TopicFilter("messages"), Qos.AT_MOST_ONCE, 3),
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
+                            .withBufferCapacity(3),
                     _ -> {
                         entered.countDown();
                         waitFor(release);
@@ -1983,7 +2217,7 @@ class ClientActorTest {
     }
 
     private static Subscribe request() {
-        return new Subscribe(new TopicFilter("messages"), Qos.AT_MOST_ONCE);
+        return Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE);
     }
 
     private static MqttMessage message(byte[] bytes) {
@@ -2216,8 +2450,10 @@ class ClientActorTest {
             }
             pendingTicket = ticket;
             Packet packet = codec.decode(bytes);
+            // Decide before a test can observe this send and change the flag for later sends.
+            boolean complete = completeSends;
             sent.add(packet);
-            if (completeSends) {
+            if (complete) {
                 completeSend();
             }
             afterSend.accept(packet);
@@ -2238,9 +2474,9 @@ class ClientActorTest {
         COMPLETE(future -> future.complete(null)),
         FAIL(future -> future.completeExceptionally(new IllegalArgumentException("application")));
 
-        final Predicate<CompletableFuture<Void>> apply;
+        final Predicate<CompletableFuture<?>> apply;
 
-        ApplicationCompletion(Predicate<CompletableFuture<Void>> apply) {
+        ApplicationCompletion(Predicate<CompletableFuture<?>> apply) {
             this.apply = apply;
         }
     }

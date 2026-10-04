@@ -25,9 +25,17 @@ final class ClientIo {
 
         void received(long generation, Packet packet, int size);
 
+        /// Posts a completed PUBACK write as soon as the transport reports it, even if send is
+        /// still returning. This must only enqueue an event, without calling external code.
+        void written(long generation, long ticket);
+
         /// Captures completion data outside the send monitor. The returned action only posts
         /// the event; it must not call external code or wait for the actor.
         Runnable prepareSent(long generation, long ticket);
+
+        /// Posts a capacity wakeup for the current connection, possibly while holding the send
+        /// monitor. This must only enqueue an event, without calling external code or waiting.
+        void sendCapacityAvailable(long generation);
 
         void ended(long generation, Throwable cause);
 
@@ -45,6 +53,12 @@ final class ClientIo {
     private static final int RESERVED_SEND_LIMIT = 16;
 
     private static final int RESERVED_SEND_BYTE_LIMIT = 128 * 1024;
+
+    // PUBACKs leave room for lifecycle control in the same budget and FIFO, including
+    // reservations still owned by an earlier connection.
+    private static final int ACKNOWLEDGEMENT_COUNT_HEADROOM = 2;
+
+    private static final int ACKNOWLEDGEMENT_BYTE_HEADROOM = 64 * 1024;
 
     private final URI endpoint;
 
@@ -136,6 +150,7 @@ final class ClientIo {
             @Override
             public void onSent(long ticket) {
                 boolean notify;
+                boolean acknowledgement;
                 synchronized (sending) {
                     if (connection.activeTicket != ticket || !connection.transportOwnsActive) {
                         if (!connection.closed) {
@@ -146,11 +161,15 @@ final class ClientIo {
                         return;
                     }
                     notify = !connection.closed;
+                    acknowledgement = connection.activeAcknowledgement;
                 }
                 Runnable completion = null;
                 try {
                     if (notify) {
                         log.debug("Written ticket {}", ticket);
+                        if (acknowledgement) {
+                            events.written(generation, ticket);
+                        }
                         completion = events.prepareSent(generation, ticket);
                     }
                 } finally {
@@ -175,7 +194,12 @@ final class ClientIo {
         }
     }
 
-    SendQueue.OfferResult publish(long generation, long ticket, MqttMessage message) {
+    SendQueue.OfferResult publish(
+            long generation,
+            long ticket,
+            MqttMessage message,
+            int packetId
+    ) {
         synchronized (sending) {
             Connection connection = current;
             if (shutdown || connection == null || connection.generation != generation) {
@@ -196,11 +220,11 @@ final class ClientIo {
                 message.qos(),
                 message.retain(),
                 false,
-                0,
+                packetId,
                 EMPTY,
                 message.payloadSize()
         );
-        return enqueue(generation, ticket, new Outbound(header, message), false, "Publish");
+        return enqueue(generation, ticket, new Outbound(header, message, false), false, "Publish");
     }
 
     SendQueue.OfferResult send(long generation, long ticket, Packet packet) {
@@ -213,7 +237,7 @@ final class ClientIo {
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(bytes, null),
+                new Outbound(bytes, null, packet instanceof Packet.PubAck),
                 reserved,
                 packet.getClass().getSimpleName()
         );
@@ -236,7 +260,9 @@ final class ClientIo {
                     ticket,
                     outbound,
                     size,
-                    reserved
+                    reserved,
+                    outbound.acknowledgement() ? ACKNOWLEDGEMENT_COUNT_HEADROOM : 0,
+                    outbound.acknowledgement() ? ACKNOWLEDGEMENT_BYTE_HEADROOM : 0
             );
             if (admitted == SendQueue.OfferResult.ACCEPTED) {
                 log.debug("Queued {} ticket {} ({} bytes)", packetName, ticket, size);
@@ -274,6 +300,7 @@ final class ClientIo {
                     if (next.isPresent()) {
                         SendQueue.Send<Outbound> send = next.orElseThrow();
                         connection.activeTicket = send.ticket();
+                        connection.activeAcknowledgement = send.value().acknowledgement();
                         connection.senderOwnsActive = true;
                         return Optional.of(new Write(connection, send));
                     }
@@ -344,6 +371,7 @@ final class ClientIo {
                 && connection.activeTicket != 0) {
             connection.queue.completed(connection.activeTicket);
             connection.activeTicket = 0;
+            notifySendCapacity();
             Runnable completion = connection.sendCompletion;
             connection.sendCompletion = null;
             if (completion != null) {
@@ -358,6 +386,15 @@ final class ClientIo {
             Throwable cause = connection.pendingEnd;
             connection.pendingEnd = null;
             events.ended(connection.generation, cause);
+        }
+    }
+
+    /// Caller holds sending; only the current open connection can consume returned capacity.
+    private void notifySendCapacity() {
+        Connection connection = current;
+        if (!shutdown && connection != null && !connection.closed
+                && connection.queue.checkCapacity(0, true) != SendQueue.OfferResult.CLOSED) {
+            events.sendCapacityAvailable(connection.generation);
         }
     }
 
@@ -410,6 +447,7 @@ final class ClientIo {
         final SendQueue<Outbound> queue;
         boolean closed;
         long activeTicket;
+        boolean activeAcknowledgement;
         boolean senderOwnsActive;
         boolean transportOwnsActive;
         @Nullable Runnable sendCompletion;
@@ -423,7 +461,11 @@ final class ClientIo {
     }
 
     /// The complete packet, or a PUBLISH header whose payload the sender copies from the message.
-    private record Outbound(byte[] header, @Nullable MqttMessage message) {
+    private record Outbound(
+            byte[] header,
+            @Nullable MqttMessage message,
+            boolean acknowledgement
+    ) {
 
         int size() {
             return header.length + (message == null ? 0 : message.payloadSize());

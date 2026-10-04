@@ -83,7 +83,7 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "fault injection wrapper: {0}")
+    @ParameterizedTest(name = "{displayName}, fault injection wrapper: {0}")
     @ValueSource(booleans = {false, true})
     void ordered_bytes_write_completions_and_a_single_terminal_event(boolean faulty)
             throws Exception {
@@ -144,9 +144,9 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "fault injection wrapper: {0}")
+    @ParameterizedTest(name = "{displayName}, fault injection wrapper: {0}")
     @ValueSource(booleans = {false, true})
-    void closing_releases_a_backed_up_writer_and_read_without_waiting(boolean faulty)
+    void stalled_writes_allow_reads_and_close_without_waiting(boolean faulty)
             throws Exception {
         // Arrange
         try (
@@ -163,6 +163,13 @@ class TransportContractTest {
                 assertThat(sut.send(1, new byte[16 * 1024 * 1024 + 1])).isEqualTo(ACCEPTED);
                 assertThatThrownBy(() -> sut.send(2, new byte[] {1}))
                         .isInstanceOf(IllegalStateException.class);
+
+                // Assert: the peer can send while deliberately refusing to drain our write.
+                socket.setSoTimeout(5000);
+                assertThat(socket.getInputStream().read()).isZero();
+                socket.getOutputStream().write(42);
+                assertThat(receiver.bytes.poll(5, SECONDS)).containsExactly((byte) 42);
+                assertThat(receiver.events).isEmpty();
 
                 // Act
                 sut.close();
@@ -181,7 +188,34 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "fault injection wrapper: {0}")
+    @ParameterizedTest(name = "{displayName}, fault injection wrapper: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_large_write_completes_for_a_peer_that_only_reads(boolean faulty) throws Exception {
+        // Arrange: the write exceeds the socket buffers, and the peer never sends anything.
+        byte[] payload = new byte[8 * 1024 * 1024];
+        try (
+                ServerSocket server = listen();
+                Transport sut = transport(faulty)
+        ) {
+            server.setReceiveBufferSize(64 * 1024);
+            var receiver = new Receiver();
+            sut.start(endpoint(server), Duration.ofSeconds(5), receiver);
+            try (Socket socket = server.accept()) {
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+                socket.setSoTimeout(5000);
+
+                // Act
+                assertThat(sut.send(1, payload)).isEqualTo(ACCEPTED);
+
+                // Assert: draining alone lets the transport finish the write.
+                assertThat(socket.getInputStream().readNBytes(payload.length).length)
+                        .isEqualTo(payload.length);
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo(1L);
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "{displayName}, fault injection wrapper: {0}")
     @ValueSource(booleans = {false, true})
     void close_before_start_never_establishes_a_connection(boolean faulty) throws Exception {
         // Arrange

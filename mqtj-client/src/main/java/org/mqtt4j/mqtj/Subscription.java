@@ -14,10 +14,15 @@ public interface Subscription extends AutoCloseable {
     /// Stops new local delivery when called and completes after UNSUBACK.
     /// Already queued deliveries may run while acknowledgement is pending; any still queued
     /// when it completes are discarded. Handlers already running can finish.
+    /// QoS 1 messages arriving while removal is pending wait without running, while QoS 0
+    /// messages arriving meanwhile are dropped.
+    /// Discarded deliveries release this subscription's acknowledgement condition.
+    /// An already delivered MANUAL message still needs [MqttDelivery#ack()] while its connection
+    /// remains active, even if its handler has returned and this subscription has been removed.
     ///
-    /// If capacity prevents admitting the removal, new delivery resumes and the future fails with
-    /// [MqttCapacityException]; the removal can be retried. Messages arriving during
-    /// the attempted removal are not replayed to this subscription.
+    /// If capacity prevents admitting the removal, delivery resumes, including the QoS 1 messages
+    /// that waited, and the future fails with [MqttCapacityException]; the removal can be
+    /// retried. QoS 0 messages dropped during the attempted removal are not replayed.
     /// While a disconnect is pending, the removal fails with [MqttNotConnectedException].
     /// Each call returns an independent future; changing it does not alter the wire request or
     /// later results. Calls during one attempt observe the same wire exchange and use the

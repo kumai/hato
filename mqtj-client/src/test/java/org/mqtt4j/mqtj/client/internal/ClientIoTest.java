@@ -11,6 +11,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -24,6 +25,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -219,6 +221,89 @@ class ClientIoTest {
         assertThat(events.tickets).containsExactlyElementsOf(transport.attempts);
     }
 
+    @Test
+    void pubacks_leave_capacity_for_connection_control_without_reordering_writes() {
+        // Arrange
+        SingleWriteTransport transport = open(1);
+        var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
+        for (int i = 1; i <= 14; i++) {
+            assertThat(sut.send(1, i, acknowledgement)).isEqualTo(ACCEPTED);
+        }
+
+        // Act
+        assertThat(sut.send(1, 15, acknowledgement)).isEqualTo(FULL);
+        assertThat(sut.send(1, 16, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 17, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY)))
+                .isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 18, acknowledgement)).isEqualTo(FULL);
+        transport.awaitActive();
+        transport.completeInline = true;
+        transport.complete();
+
+        // Assert
+        await().untilAsserted(() -> assertThat(events.tickets).hasSize(16));
+        assertThat(transport.attempts).containsExactlyElementsOf(
+                LongStream.rangeClosed(1, 17).filter(ticket -> ticket != 15).boxed().toList()
+        );
+        assertThat(events.ends).isEmpty();
+        assertThat(events.failures).isEmpty();
+    }
+
+    @Test
+    void puback_admission_keeps_byte_headroom_while_a_large_connect_is_active() {
+        // Arrange: the CONNECT consumes just over half of the reserved byte budget.
+        SingleWriteTransport transport = open(1);
+        var connect = new Packet.Connect(
+                "c".repeat(65_535), MqttVersion.V3_1_1, true, 60, null, null, null, EMPTY
+        );
+        var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
+        assertThat(sut.send(1, 1, connect)).isEqualTo(ACCEPTED);
+        transport.awaitActive();
+
+        // Act & Assert: PUBACK waits while connection control still has room.
+        assertThat(sut.send(1, 2, acknowledgement)).isEqualTo(FULL);
+        assertThat(sut.send(1, 3, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        transport.complete();
+        await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
+        assertThat(events.capacityGenerations).containsExactly(1L);
+        assertThat(sut.send(1, 4, acknowledgement)).isEqualTo(ACCEPTED);
+        assertThat(events.ends).isEmpty();
+    }
+
+    @ParameterizedTest
+    @EnumSource(OldWriteRelease.class)
+    void old_active_pubacks_share_headroom_and_return_capacity_to_the_current_generation(
+            OldWriteRelease release
+    ) {
+        // Arrange: the old connection keeps one active reservation after close.
+        var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
+        SingleWriteTransport old = open(1);
+        assertThat(sut.send(1, 1, acknowledgement)).isEqualTo(ACCEPTED);
+        old.awaitActive();
+        sut.close();
+        SingleWriteTransport current = open(2);
+        for (int i = 2; i <= 14; i++) {
+            assertThat(sut.send(2, i, acknowledgement)).isEqualTo(ACCEPTED);
+        }
+        current.awaitActive();
+        assertThat(sut.send(2, 15, acknowledgement)).isEqualTo(FULL);
+        assertThat(events.capacityGenerations).isEmpty();
+
+        // Act: either completion or final closure can release the old buffer.
+        release.apply.accept(old);
+
+        // Assert: no old protocol completion is needed to wake the new connection.
+        assertThat(events.capacityGenerations).containsExactly(2L);
+        assertThat(events.written).isEmpty();
+        assertThat(events.tickets).isEmpty();
+        assertThat(sut.send(2, 16, acknowledgement)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(2, 17, acknowledgement)).isEqualTo(FULL);
+        assertThat(sut.send(2, 18, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        assertThat(sut.send(2, 19, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY)))
+                .isEqualTo(ACCEPTED);
+        assertThat(events.ends).isEmpty();
+    }
+
     @ParameterizedTest(name = "payload bytes={0}, admitted={1}")
     @CsvSource({"8388608,1", "16777216,0"})
     void the_byte_limit_includes_headers_and_refusal_leaves_capacity_for_other_sends(
@@ -229,11 +314,11 @@ class ClientIoTest {
         SingleWriteTransport transport = open(1);
         MqttMessage message = message(payloadSize);
         for (int i = 1; i <= admitted; i++) {
-            assertThat(sut.publish(1, i, message)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, i, message, 0)).isEqualTo(ACCEPTED);
         }
 
         // Act & Assert
-        assertThat(sut.publish(1, 2, message)).isEqualTo(FULL);
+        assertThat(sut.publish(1, 2, message, 0)).isEqualTo(FULL);
         assertThat(sut.send(1, 3, publish())).isEqualTo(ACCEPTED);
         assertThat(sut.send(1, 4, new Packet.PingReq())).isEqualTo(ACCEPTED);
         transport.awaitActive();
@@ -253,20 +338,20 @@ class ClientIoTest {
         MqttMessage tooLarge = message(16 * 1024 * 1024);
 
         // Act & Assert: payload plus its header does not fit even in an empty queue.
-        assertThat(sut.publish(1, 1, tooLarge)).isEqualTo(FULL);
+        assertThat(sut.publish(1, 1, tooLarge, 0)).isEqualTo(FULL);
         assertThat(codec.prepared.get()).isZero();
         for (int i = 1; i <= 128; i++) {
-            assertThat(sut.publish(1, i, message(0))).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, i, message(0), 0)).isEqualTo(ACCEPTED);
         }
         transport.awaitActive();
-        assertThat(sut.publish(1, 129, message(0))).isEqualTo(FULL);
+        assertThat(sut.publish(1, 129, message(0), 0)).isEqualTo(FULL);
         assertThat(codec.prepared.get()).isEqualTo(1);
         assertThat(sut.send(1, 130, new Packet.PingReq())).isEqualTo(ACCEPTED);
 
         // Act & Assert: closure takes precedence and keeps the transport's cause.
         var cause = new IOException("Connection ended");
         transport.end(cause);
-        assertThat(sut.publish(1, 131, tooLarge)).isEqualTo(CLOSED);
+        assertThat(sut.publish(1, 131, tooLarge, 0)).isEqualTo(CLOSED);
         assertThat(events.ends).containsExactly(cause);
         assertThat(events.failures).isEmpty();
     }
@@ -309,7 +394,7 @@ class ClientIoTest {
         await().untilAsserted(() -> assertThat(transport.rejections.get()).isEqualTo(1));
         // A publication that never fits stays FULL until closure makes it CLOSED.
         MqttMessage tooLarge = message(16 * 1024 * 1024);
-        await().untilAsserted(() -> assertThat(sut.publish(1, 4, tooLarge)).isEqualTo(CLOSED));
+        await().untilAsserted(() -> assertThat(sut.publish(1, 4, tooLarge, 0)).isEqualTo(CLOSED));
         if (!inline) {
             assertThat(events.ends).isEmpty();
             transport.end(failure);
@@ -360,15 +445,15 @@ class ClientIoTest {
         MqttMessage large = message(8 * 1024 * 1024);
         SingleWriteTransport old = open(1);
         try {
-            assertThat(sut.publish(1, 1, large)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 1, large, 0)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
-            assertThat(sut.publish(1, 2, message(0))).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 2, message(0), 0)).isEqualTo(ACCEPTED);
 
             // Act: even onClosed cannot release the payload still used by the encoder.
             sut.close();
             old.end(new IOException("Old connection ended"));
             SingleWriteTransport current = open(2);
-            assertThat(sut.publish(2, 3, large)).isEqualTo(FULL);
+            assertThat(sut.publish(2, 3, large, 0)).isEqualTo(FULL);
             assertThat(sut.send(2, 4, new Packet.PingReq())).isEqualTo(ACCEPTED);
 
             // Assert: input and callbacks remain usable while the sender is occupied.
@@ -380,7 +465,7 @@ class ClientIoTest {
             // Act: discard the old encoding, then use its returned capacity in the new connection.
             release.countDown();
             current.awaitActive();
-            assertThat(sut.publish(2, 5, large)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(2, 5, large, 0)).isEqualTo(ACCEPTED);
             current.completeInline = true;
             current.complete();
 
@@ -401,13 +486,13 @@ class ClientIoTest {
         // Arrange
         MqttMessage large = message(8 * 1024 * 1024);
         SingleWriteTransport old = open(1);
-        assertThat(sut.publish(1, 1, large)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, large, 0)).isEqualTo(ACCEPTED);
         old.awaitActive();
 
         // Act: close is asynchronous; the old transport still owns the encoded array.
         sut.close();
         SingleWriteTransport current = open(2);
-        assertThat(sut.publish(2, 2, large)).isEqualTo(FULL);
+        assertThat(sut.publish(2, 2, large, 0)).isEqualTo(FULL);
         assertThat(sut.send(2, 3, new Packet.PingReq())).isEqualTo(ACCEPTED);
         current.awaitActive();
 
@@ -417,7 +502,7 @@ class ClientIoTest {
 
         // Act: termination returns only the old transport's capacity.
         old.end(new IOException("Old write released"));
-        assertThat(sut.publish(2, 4, large)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(2, 4, large, 0)).isEqualTo(ACCEPTED);
         current.completeInline = true;
         current.complete();
 
@@ -442,23 +527,61 @@ class ClientIoTest {
             waitFor(release);
         };
         try {
-            assertThat(sut.publish(1, 1, large)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 1, large, 0)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
             // Act
             sut.close();
             SingleWriteTransport current = open(2);
-            assertThat(sut.publish(2, 2, large)).isEqualTo(FULL);
+            assertThat(sut.publish(2, 2, large, 0)).isEqualTo(FULL);
             assertThat(sut.send(2, 3, new Packet.PingReq())).isEqualTo(ACCEPTED);
             release.countDown();
             current.awaitActive();
-            assertThat(sut.publish(2, 4, large)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(2, 4, large, 0)).isEqualTo(ACCEPTED);
 
             // Assert
             assertThat(old.attempts).containsExactly(1L);
             assertThat(current.attempts).containsExactly(3L);
             assertThat(events.tickets).containsExactly(1L);
             assertThat(events.failures).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void an_inline_puback_write_is_reported_while_its_capacity_remains_owned()
+            throws Exception {
+        // Arrange: a transport completes the write inline but has not returned from send.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        SingleWriteTransport transport = open(1);
+        transport.completeInline = true;
+        transport.afterSent = () -> {
+            transport.completeInline = false;
+            entered.countDown();
+            waitFor(release);
+        };
+        var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
+        try {
+            // Act
+            assertThat(sut.send(1, 1, acknowledgement)).isEqualTo(ACCEPTED);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+
+            // Assert: the write is reported at once, but the retained buffer keeps its capacity.
+            assertThat(events.written).containsExactly(1L);
+            assertThat(events.tickets).isEmpty();
+            assertThat(events.capacityGenerations).isEmpty();
+            for (int i = 2; i <= 14; i++) {
+                assertThat(sut.send(1, i, acknowledgement)).isEqualTo(ACCEPTED);
+            }
+            assertThat(sut.send(1, 15, acknowledgement)).isEqualTo(FULL);
+
+            // Act & Assert: release emits the capacity wake and user-visible completion.
+            release.countDown();
+            await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
+            assertThat(events.capacityGenerations).containsExactly(1L);
+            assertThat(events.written).containsExactly(1L);
         } finally {
             release.countDown();
         }
@@ -474,11 +597,11 @@ class ClientIoTest {
         transport.completeInline = inline;
         events.beforeSent = () -> {
             events.beforeSent = () -> { };
-            next.complete(sut.publish(1, 2, large));
+            next.complete(sut.publish(1, 2, large, 0));
         };
 
         // Act: admit the second publication as soon as the first completion is posted.
-        assertThat(sut.publish(1, 1, large)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, large, 0)).isEqualTo(ACCEPTED);
         if (!inline) {
             transport.complete();
         }
@@ -592,10 +715,21 @@ class ClientIoTest {
                 Arguments.of(new Packet.Connect(
                         "client", MqttVersion.V3_1_1, true, 60, null, null, null, EMPTY
                 ), 16),
-                Arguments.of(new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY), 16),
+                Arguments.of(new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY), 14),
                 Arguments.of(new Packet.PingReq(), 16),
                 Arguments.of(new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY), 16)
         );
+    }
+
+    private enum OldWriteRelease {
+        COMPLETION(SingleWriteTransport::complete),
+        CLOSURE(transport -> transport.end(new IOException("Old active write released")));
+
+        final Consumer<SingleWriteTransport> apply;
+
+        OldWriteRelease(Consumer<SingleWriteTransport> apply) {
+            this.apply = apply;
+        }
     }
 
     private static final class SingleWriteTransport implements Transport {
@@ -728,6 +862,8 @@ class ClientIoTest {
         final List<Throwable> ends = new CopyOnWriteArrayList<>();
         final List<Throwable> fatals = new CopyOnWriteArrayList<>();
         final List<Packet> received = new CopyOnWriteArrayList<>();
+        final List<Long> written = new CopyOnWriteArrayList<>();
+        final List<Long> capacityGenerations = new CopyOnWriteArrayList<>();
         volatile Runnable beforeSent = () -> { };
 
         @Override
@@ -737,6 +873,16 @@ class ClientIoTest {
         @Override
         public void received(long generation, Packet packet, int size) {
             received.add(packet);
+        }
+
+        @Override
+        public void written(long generation, long ticket) {
+            written.add(ticket);
+        }
+
+        @Override
+        public void sendCapacityAvailable(long generation) {
+            capacityGenerations.add(generation);
         }
 
         @Override

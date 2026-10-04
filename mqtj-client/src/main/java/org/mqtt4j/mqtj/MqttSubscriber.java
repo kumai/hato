@@ -7,7 +7,7 @@ import java.util.function.Consumer;
 public interface MqttSubscriber {
 
     /// Registers one subscription and completes after a successful SUBACK.
-    /// The current client supports only QoS 0; other QoS values fail with
+    /// The current client supports QoS 0 and QoS 1; QoS 2 fails with
     /// [IllegalArgumentException] through the returned future.
     ///
     /// Deliveries can reach the handler before the future completes. Each subscription's
@@ -17,6 +17,8 @@ public interface MqttSubscriber {
     /// or any effect on a later connection. Exhausted receive capacity also ends the connection.
     /// On connection termination, queued deliveries are discarded; a running handler can finish.
     /// Interrupt status left by a normally returning handler is cleared before the next delivery.
+    /// QoS 1 acknowledgement follows the request's [AckMode]. A QoS 1 message can be delivered
+    /// more than once.
     ///
     /// Every matching subscription receives each incoming publication. MQTT 3.1.1 cannot
     /// distinguish broker copies for overlapping subscriptions, so each copy is routed again.

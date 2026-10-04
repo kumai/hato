@@ -1,5 +1,10 @@
 package org.mqtt4j.mqtj;
 
+import java.util.Objects;
+import java.util.Optional;
+
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.mqtj.client.internal.common.protocol.SharedTopicFilter;
 
 import static java.util.Objects.requireNonNull;
@@ -7,26 +12,99 @@ import static java.util.Objects.requireNonNull;
 /// A request for one subscription. Shared filters use `$share/{group}/{filter}` syntax.
 /// The original filter, including a shared group, identifies duplicate subscriptions.
 ///
-/// All QoS values can be represented; the current client accepts only QoS 0 subscriptions.
+/// Instances are immutable values; each `with` method returns a copy with one setting changed.
+/// A setting left unchanged takes its default, which can depend on how the subscription
+/// receives messages.
 ///
-/// @param filter the filter sent to the broker
-/// @param qos the maximum quality of service requested
-/// @param bufferCapacity the maximum number of queued and running deliveries for this
-///         subscription; a running handler retains its capacity until it returns
-public record Subscribe(TopicFilter filter, Qos qos, int bufferCapacity) {
+/// All QoS values can be represented; the current client accepts QoS 0 and QoS 1 subscriptions.
+public final class Subscribe {
 
-    /// Uses capacity for 256 queued and running deliveries.
-    public Subscribe(TopicFilter filter, Qos qos) {
-        this(filter, qos, 256);
+    private static final int DEFAULT_BUFFER_CAPACITY = 256;
+
+    private final TopicFilter filter;
+
+    private final Qos qos;
+
+    // Null leaves the choice to the subscription style.
+    private final @Nullable AckMode ackMode;
+
+    private final int bufferCapacity;
+
+    private Subscribe(TopicFilter filter, Qos qos, @Nullable AckMode ackMode, int bufferCapacity) {
+        this.filter = filter;
+        this.qos = qos;
+        this.ackMode = ackMode;
+        this.bufferCapacity = bufferCapacity;
     }
 
-    /// @throws IllegalArgumentException if capacity is not positive or shared syntax is invalid
-    public Subscribe {
+    /// Requests `filter` with `qos` as the maximum quality of service, the default
+    /// acknowledgement mode, and a buffer capacity of 256.
+    ///
+    /// @throws IllegalArgumentException if shared syntax is invalid
+    public static Subscribe of(TopicFilter filter, Qos qos) {
         requireNonNull(filter, "Filter must not be null");
         requireNonNull(qos, "QoS must not be null");
+        SharedTopicFilter.parse(filter);
+        return new Subscribe(filter, qos, null, DEFAULT_BUFFER_CAPACITY);
+    }
+
+    /// Returns a copy that uses `ackMode` instead of the default.
+    public Subscribe withAckMode(AckMode ackMode) {
+        requireNonNull(ackMode, "Ack mode must not be null");
+        return new Subscribe(filter, qos, ackMode, bufferCapacity);
+    }
+
+    /// Returns a copy with a different [buffer capacity][#bufferCapacity()].
+    ///
+    /// @throws IllegalArgumentException if `bufferCapacity` is not positive
+    public Subscribe withBufferCapacity(int bufferCapacity) {
         if (bufferCapacity < 1) {
             throw new IllegalArgumentException("Buffer capacity must be positive");
         }
-        SharedTopicFilter.parse(filter);
+        return new Subscribe(filter, qos, ackMode, bufferCapacity);
+    }
+
+    /// The filter sent to the broker.
+    public TopicFilter filter() {
+        return filter;
+    }
+
+    /// The maximum quality of service requested.
+    public Qos qos() {
+        return qos;
+    }
+
+    /// When this subscription permits acknowledgement of a QoS 1 delivery. Empty uses the
+    /// default: [AckMode#AFTER_HANDLER] for a subscription with a handler.
+    public Optional<AckMode> ackMode() {
+        return Optional.ofNullable(ackMode);
+    }
+
+    /// The maximum number of deliveries this subscription holds at once: queued or running ones,
+    /// and QoS 1 ones whose PUBACK is still pending; see [AckMode].
+    public int bufferCapacity() {
+        return bufferCapacity;
+    }
+
+    @Override
+    @SuppressWarnings("exports") // Nullness annotations are compile-time only.
+    public boolean equals(@Nullable Object other) {
+        return other instanceof Subscribe that
+                && filter.equals(that.filter)
+                && qos == that.qos
+                && ackMode == that.ackMode
+                && bufferCapacity == that.bufferCapacity;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(filter, qos, ackMode, bufferCapacity);
+    }
+
+    @Override
+    public String toString() {
+        return "Subscribe[filter=" + filter + ", qos=" + qos + ", ackMode="
+                + (ackMode == null ? "default" : ackMode) + ", bufferCapacity=" + bufferCapacity
+                + "]";
     }
 }

@@ -1,6 +1,8 @@
 package org.mqtt4j.mqtj.client.internal;
 
 import java.util.ArrayDeque;
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.BooleanSupplier;
 
@@ -19,13 +21,18 @@ final class Mailbox {
     enum Kind {
         COMMAND,
         INCOMING,
-        CONTROL
+        CONTROL,
+        DELIVERY_READY,
+        SEND_CAPACITY
     }
 
     record Event(long generation, Runnable action, Kind kind, int bytes) {
     }
 
     private final ArrayDeque<Event> events = new ArrayDeque<>();
+
+    // Each wake has one independent FIFO slot. Its state lives at the producer, not in events.
+    private final Map<Kind, Event> wakes = new EnumMap<>(Kind.class);
 
     private final int commandLimit;
 
@@ -75,12 +82,22 @@ final class Mailbox {
         if (event.generation() != 0 && event.generation() != activeGeneration) {
             return OfferResult.STALE;
         }
+        if (event.kind() == Kind.DELIVERY_READY || event.kind() == Kind.SEND_CAPACITY) {
+            if (event.generation() == 0) {
+                return OfferResult.STALE;
+            }
+            Event pending = wakes.get(event.kind());
+            if (pending != null && pending.generation() == event.generation()) {
+                return OfferResult.ACCEPTED;
+            }
+        }
         boolean full = switch (event.kind()) {
             case COMMAND -> commandCount >= commandLimit
                     || event.bytes() > commandByteLimit - commandBytes;
             case INCOMING -> incomingCount >= incomingLimit
                     || event.bytes() > incomingByteLimit - incomingBytes;
             case CONTROL -> controlCount >= controlLimit;
+            case DELIVERY_READY, SEND_CAPACITY -> false;
         };
         if (full) {
             return OfferResult.FULL;
@@ -96,6 +113,7 @@ final class Mailbox {
                 incomingBytes += event.bytes();
             }
             case CONTROL -> controlCount++;
+            case DELIVERY_READY, SEND_CAPACITY -> wakes.put(event.kind(), event);
         }
         notifyAll();
         return OfferResult.ACCEPTED;
@@ -169,6 +187,7 @@ final class Mailbox {
                 incomingBytes -= event.bytes();
             }
             case CONTROL -> controlCount--;
+            case DELIVERY_READY, SEND_CAPACITY -> wakes.remove(event.kind(), event);
         }
     }
 }

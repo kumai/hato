@@ -3,13 +3,16 @@ package org.mqtt4j.mqtj.client.internal;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import com.sun.management.ThreadMXBean;
@@ -19,6 +22,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.mqtj.ConnAck;
 import org.mqtt4j.mqtj.Disconnection;
@@ -471,14 +475,14 @@ class SessionCoreTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = Qos.class, names = {"AT_LEAST_ONCE", "EXACTLY_ONCE"})
+    @EnumSource(value = Qos.class, names = "EXACTLY_ONCE")
     void unsupported_qos_is_rejected_without_sending_or_registering(Qos qos) {
         // Arrange
         connected();
 
         // Act
         sut.publish(2, new MqttMessage(new Topic("a"), new byte[0], qos, false));
-        sut.subscribe(3, new Subscribe(new TopicFilter("a"), qos, 1));
+        sut.subscribe(3, Subscribe.of(new TopicFilter("a"), qos).withBufferCapacity(1));
 
         // Assert
         assertThat(requireNonNull(port.results.get(2L)).failure())
@@ -1133,6 +1137,677 @@ class SessionCoreTest {
         return new MqttMessage(new Topic("a/b"), new byte[] {1, 2}, Qos.AT_MOST_ONCE, false);
     }
 
+    @Test
+    void qos_one_publish_waits_for_puback_and_ignores_repeated_acknowledgement() {
+        // Arrange
+        connected();
+        sut.publish(2, qosOneMessage());
+        int id = port.publicationIds.getLast();
+
+        // Act: a successful write is insufficient for QoS 1.
+        sut.sent(1, port.ticket, 0);
+
+        // Assert
+        assertThat(id).isPositive();
+        assertThat(port.results).doesNotContainKey(2L);
+
+        // Act
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert: RecordingPort also rejects completing an operation a second time.
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void puback_before_write_completion_completes_only_its_publication() {
+        // Arrange
+        connected();
+        sut.publish(2, qosOneMessage());
+        int firstId = port.publicationIds.getLast();
+        long ticket = port.ticket;
+
+        // Act: inbound and writer notifications may arrive in this order.
+        receive(1, new Packet.PubAck(firstId, ReasonCode.SUCCESS, EMPTY), 0);
+        sut.publish(3, qosOneMessage());
+        sut.sent(1, ticket, 0);
+        receive(1, new Packet.PubAck(firstId, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(port.results).doesNotContainKey(3L);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void puback_does_not_release_a_subscription_packet_identifier() {
+        // Arrange
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        int id = ((Packet.Subscribe) port.sent.getLast()).packetId();
+
+        // Act: an unknown PUBACK is tolerated even if another exchange uses its id.
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+        receive(1, new Packet.SubAck(id, List.of(ReasonCode.SUCCESS), EMPTY), 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).value()).isInstanceOf(Subscription.class);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void puback_before_close_completes_a_publication_exactly_once() {
+        // Arrange
+        connected();
+        sut.publish(2, qosOneMessage());
+        int id = port.publicationIds.getLast();
+
+        // Act
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+        sut.close(null);
+        sut.sent(1, port.ticket, 0);
+
+        // Assert: RecordingPort also rejects completing an operation a second time.
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(sut.state()).isEqualTo(CLOSED);
+    }
+
+    @Test
+    void close_before_puback_fails_a_publication_exactly_once() {
+        // Arrange
+        connected();
+        sut.publish(2, qosOneMessage());
+        int id = port.publicationIds.getLast();
+
+        // Act
+        sut.close(null);
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+        sut.sent(1, port.ticket, 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class);
+        assertThat(sut.state()).isEqualTo(CLOSED);
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void reordered_qos_one_events_complete_once_and_acknowledge_in_receive_order(int seed) {
+        // Arrange: each chain keeps its own causal order, and the seed interleaves the chains.
+        // Some runs end the connection at a random point; later events then arrive stale.
+        var random = new Random(seed);
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        var chains = new ArrayList<ArrayDeque<Runnable>>();
+        List<Long> operations = List.of(10L, 11L, 12L);
+        for (long operation : operations) {
+            chains.add(publicationChain(operation, random));
+        }
+        var admitted = new ArrayList<Integer>();
+        for (int id = 100; id < 104; id++) {
+            chains.add(receptionChain(id, random.nextBoolean() ? "a/b" : "other", admitted));
+        }
+        boolean terminates = random.nextBoolean();
+        if (terminates) {
+            Runnable end = random.nextBoolean()
+                    ? () -> sut.close(null)
+                    : () -> sut.failed(1, new IOException("Connection reset"));
+            chains.add(new ArrayDeque<>(List.of(end)));
+        }
+
+        // Act
+        while (!chains.isEmpty()) {
+            ArrayDeque<Runnable> chain = chains.get(random.nextInt(chains.size()));
+            chain.removeFirst().run();
+            if (chain.isEmpty()) {
+                chains.remove(chain);
+            }
+        }
+
+        // Assert: RecordingPort rejects a second completion and PacketIds a second release, so
+        // reaching here also shows that each happened at most once.
+        assertThat(operations).allSatisfy(operation -> {
+            Result result = requireNonNull(port.results.get(operation));
+            if (!terminates) {
+                assertThat(result.value()).isEqualTo(new PublishResult());
+            }
+        });
+        List<Integer> acknowledged = pubAckIds();
+        assertThat(acknowledged).hasSizeLessThanOrEqualTo(admitted.size());
+        assertThat(acknowledged).isEqualTo(admitted.subList(0, acknowledged.size()));
+        if (!terminates) {
+            assertThat(acknowledged).isEqualTo(admitted);
+        }
+        assertThat(port.released).doesNotHaveDuplicates().hasSize(acknowledged.size());
+    }
+
+    static IntStream seeds() {
+        return IntStream.range(0, 100);
+    }
+
+    @Test
+    void disconnect_completes_publications_acknowledged_before_it_ends_and_not_the_rest() {
+        // Arrange
+        connected();
+        sut.publish(2, qosOneMessage());
+        int acknowledgedId = port.publicationIds.getLast();
+        sut.publish(3, qosOneMessage());
+
+        // Act: shutdown does not wait for PUBACK, but uses one that arrives before it ends.
+        sut.disconnect(4);
+        receive(1, new Packet.PubAck(acknowledgedId, ReasonCode.SUCCESS, EMPTY), 0);
+        sut.sent(1, port.ticket, 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(requireNonNull(port.results.get(3L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class);
+        assertThat(requireNonNull(port.results.get(4L)).failure()).isNull();
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.sent).singleElement().isInstanceOf(Packet.Disconnect.class);
+    }
+
+    @Test
+    void refused_qos_one_publications_return_identifiers_across_allocator_wrap() {
+        // Arrange
+        connected();
+        MqttMessage message = qosOneMessage();
+        port.sendResult = SendQueue.OfferResult.FULL;
+
+        // Act: all identifiers are offered and refused once.
+        for (int i = 0; i < 65535; i++) {
+            sut.publish(i + 2L, message);
+        }
+        port.sendResult = SendQueue.OfferResult.ACCEPTED;
+        sut.publish(65537, message);
+        int id = port.publicationIds.getLast();
+        sut.subscribe(65538, subscription("other"));
+        int subscriptionId = ((Packet.Subscribe) port.sent.getLast()).packetId();
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert: the pool is shared with SUBSCRIBE and no refused operation retained an id.
+        assertThat(id).isEqualTo(1);
+        assertThat(subscriptionId).isEqualTo(2);
+        assertThat(requireNonNull(port.results.get(65536L)).failure())
+                .isInstanceOf(MqttCapacityException.class);
+        assertThat(requireNonNull(port.results.get(65537L)).value()).isEqualTo(new PublishResult());
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void acknowledged_qos_one_publications_return_identifiers_across_allocator_wrap() {
+        // Arrange
+        connected();
+        MqttMessage message = qosOneMessage();
+
+        // Act: one connection publishes more QoS 1 messages than there are identifiers.
+        for (int i = 0; i < 65536; i++) {
+            sut.publish(i + 2L, message);
+            int id = port.publicationIds.getLast();
+            receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+        }
+
+        // Assert: the last publication wrapped to an identifier that PUBACK had returned.
+        assertThat(port.publicationIds).hasSize(65536);
+        assertThat(port.publicationIds.getLast()).isEqualTo(1);
+        assertThat(requireNonNull(port.results.get(65537L)).value())
+                .isEqualTo(new PublishResult());
+    }
+
+    @Test
+    void a_puback_for_a_refused_publication_is_unknown() {
+        // Arrange: send admission refuses the publication after it allocated an identifier.
+        connected();
+        port.sendResult = SendQueue.OfferResult.FULL;
+        sut.publish(2, qosOneMessage());
+        int id = port.publicationIds.getLast();
+        port.sendResult = SendQueue.OfferResult.ACCEPTED;
+
+        // Act
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert: RecordingPort also rejects completing the refused operation a second time.
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttCapacityException.class);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void closed_send_queue_preserves_the_terminal_cause_for_qos_one_publish() {
+        // Arrange
+        connected();
+        port.sendResult = SendQueue.OfferResult.CLOSED;
+        var failure = new IOException("Peer reset before PUBACK");
+
+        // Act
+        sut.publish(2, qosOneMessage());
+
+        // Assert
+        assertThat(port.results).doesNotContainKey(2L);
+
+        // Act
+        sut.failed(1, failure);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class)
+                .hasCause(failure);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Qos.class, names = {"AT_MOST_ONCE", "AT_LEAST_ONCE"})
+    void qos_one_subscriptions_accept_the_requested_or_lower_grant(Qos granted) {
+        // Arrange
+        connected();
+        sut.subscribe(2, Subscribe.of(new TopicFilter("a/#"), Qos.AT_LEAST_ONCE));
+        int id = ((Packet.Subscribe) port.sent.getLast()).packetId();
+
+        // Act
+        receive(1, new Packet.SubAck(id, List.of(ReasonCode.of(granted.level())), EMPTY), 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).value())
+                .isInstanceOfSatisfying(Subscription.class, value ->
+                        assertThat(value.grantedQos()).isEqualTo(granted));
+    }
+
+    @Test
+    void qos_one_deliveries_wait_for_all_recipients_and_preserve_receive_order() {
+        // Arrange: the lane aggregates each publication's per-recipient completion conditions.
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        sut.subscribe(3, subscription("a/+"));
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        receive(1, qosOnePublication(8, "a/b", false), 0);
+        long first = port.deliveries.getFirst().token();
+        long second = port.deliveries.getLast().token();
+
+        // Act: later recipients are all ready while the first publication is still pending.
+        sut.deliveryReady(1, second);
+        sut.deliveryReady(1, second);
+
+        // Assert
+        assertThat(pubAckIds()).isEmpty();
+        assertThat(port.released).isEmpty();
+        assertThat(port.deliveries).allSatisfy(delivery ->
+                assertThat(delivery.ids()).containsExactly(2L, 3L));
+
+        // Act
+        sut.deliveryReady(1, first);
+        sut.deliveryReady(1, first);
+
+        // Assert
+        assertThat(pubAckIds()).containsExactly(7, 8);
+        assertThat(port.released).containsExactly(first, second);
+    }
+
+    @Test
+    void unmatched_qos_one_delivery_waits_behind_an_earlier_matching_delivery() {
+        // Arrange
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        long first = port.deliveries.getFirst().token();
+
+        // Act
+        receive(1, qosOnePublication(8, "other", false), 0);
+
+        // Assert
+        assertThat(pubAckIds()).isEmpty();
+        assertThat(port.deliveries).hasSize(1);
+
+        // Act
+        sut.deliveryReady(1, first);
+
+        // Assert
+        assertThat(pubAckIds()).containsExactly(7, 8);
+        assertThat(port.released).hasSize(2);
+    }
+
+    @Test
+    void qos_zero_delivery_bypasses_a_pending_qos_one_acknowledgement() {
+        // Arrange
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+
+        // Act
+        receive(1, publication(), 0);
+
+        // Assert
+        assertThat(port.deliveries).hasSize(2);
+        assertThat(port.deliveries.getLast().token()).isZero();
+        assertThat(port.deliveries.getLast().message().qos()).isEqualTo(Qos.AT_MOST_ONCE);
+        assertThat(pubAckIds()).isEmpty();
+    }
+
+    @Test
+    void retransmissions_share_delivery_and_ack_until_the_puback_is_written() {
+        // Arrange
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        for (int id = 1; id <= 32; id++) {
+            receive(1, qosOnePublication(id, "a/b", false), 0);
+        }
+
+        // Act: more retransmissions than the acknowledgement limit do not consume new slots.
+        for (int round = 0; round < 130; round++) {
+            for (int id = 1; id <= 32; id++) {
+                receive(1, qosOnePublication(id, "a/b", true), 0);
+            }
+        }
+        sut.deliveriesReady(1, port.deliveries.stream().map(Received::token).toList());
+        receive(1, qosOnePublication(1, "a/b", true), 0);
+
+        // Assert: even an admitted PUBACK has not yet ended the exchange.
+        assertThat(port.deliveries).hasSize(32);
+        assertThat(pubAckIds()).hasSize(16).doesNotHaveDuplicates();
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+
+        // Act
+        for (int i = 0; i < 32; i++) {
+            sut.written(1, port.ackTickets.get(i));
+        }
+
+        // Assert
+        assertThat(pubAckIds()).isEqualTo(IntStream.rangeClosed(1, 32).boxed().toList());
+        assertThat(port.released).hasSize(32).doesNotHaveDuplicates();
+    }
+
+    @ParameterizedTest(name = "reused id has DUP={0}")
+    @ValueSource(booleans = {false, true})
+    void a_written_puback_allows_id_reuse_regardless_of_dup_and_ignores_the_old_ack(boolean dup) {
+        // Arrange
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(7, "a/b", true), 0);
+        long first = port.deliveries.getFirst().token();
+        sut.deliveryReady(1, first);
+        long ackTicket = port.ackTickets.getFirst();
+        sut.written(1, ackTicket);
+
+        // Act: the next message may even have identical topic and payload.
+        receive(1, qosOnePublication(7, "a/b", dup), 0);
+        sut.deliveryReady(1, first);
+        sut.written(1, ackTicket);
+
+        // Assert: the new exchange has its own readiness condition.
+        assertThat(port.deliveries).hasSize(2);
+        assertThat(pubAckIds()).containsExactly(7);
+
+        // Act
+        sut.deliveryReady(1, port.deliveries.getLast().token());
+
+        // Assert
+        assertThat(pubAckIds()).containsExactly(7, 7);
+    }
+
+    @Test
+    void reuse_without_dup_before_its_puback_is_queued_withdraws_the_earlier_acknowledgement() {
+        // Arrange: the earlier reception is not ready, so its PUBACK is not queued yet.
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        receive(1, qosOnePublication(8, "a/b", false), 0);
+        long earlier = port.deliveries.get(0).token();
+        long following = port.deliveries.get(1).token();
+        sut.deliveryReady(1, following);
+
+        // Act: a sender reuses an identifier only for an exchange it considers acknowledged.
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        long later = port.deliveries.getLast().token();
+
+        // Assert: the earlier reception no longer holds back the ready follower.
+        assertThat(port.deliveries).hasSize(3);
+        assertThat(port.released).containsExactly(earlier, following);
+        assertThat(pubAckIds()).containsExactly(8);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+
+        // Act
+        sut.deliveriesReady(1, List.of(earlier, later));
+
+        // Assert: one PUBACK covers the reused identifier.
+        assertThat(pubAckIds()).containsExactly(8, 7);
+        assertThat(port.released).containsExactly(earlier, following, later);
+    }
+
+    @Test
+    void reuse_without_dup_after_its_puback_is_queued_starts_a_new_reception() {
+        // Arrange: the earlier PUBACK is queued, but its write has not been reported.
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        sut.deliveryReady(1, port.deliveries.getFirst().token());
+        long earlierAck = port.ackTickets.getFirst();
+
+        // Act: the reported write must not free the identifier of the new reception.
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        sut.written(1, earlierAck);
+        receive(1, qosOnePublication(7, "a/b", true), 0);
+
+        // Assert: the retransmission joins the new reception.
+        assertThat(port.deliveries).hasSize(2);
+        assertThat(pubAckIds()).containsExactly(7);
+
+        // Act
+        sut.deliveryReady(1, port.deliveries.getLast().token());
+
+        // Assert
+        assertThat(pubAckIds()).containsExactly(7, 7);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void old_generation_readiness_and_puback_do_not_finish_new_connection_work() {
+        // Arrange
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        long oldToken = port.deliveries.getLast().token();
+        sut.failed(1, new IOException("Lost connection"));
+        sut.connect(3, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        sut.subscribe(4, subscription("a/#"));
+        receive(2, qosOnePublication(7, "a/b", false), 0);
+        long newToken = port.deliveries.getLast().token();
+        sut.publish(5, qosOneMessage());
+        int id = port.publicationIds.getLast();
+
+        // Act
+        sut.deliveryReady(1, oldToken);
+        sut.deliveryReady(2, oldToken);
+        receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert
+        assertThat(newToken).isGreaterThan(oldToken);
+        assertThat(pubAckIds()).isEmpty();
+        assertThat(port.results).doesNotContainKey(5L);
+
+        // Act
+        sut.deliveryReady(2, newToken);
+        receive(2, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert
+        assertThat(pubAckIds()).containsExactly(7);
+        assertThat(requireNonNull(port.results.get(5L)).value()).isEqualTo(new PublishResult());
+    }
+
+    @Test
+    void pending_unmatched_acknowledgements_are_bounded_and_cleared_on_connection_end() {
+        // Arrange: one unfinished delivery holds the head, including unmatched followers.
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(1, "a/b", false), 0);
+        for (int id = 2; id <= 4096; id++) {
+            receive(1, qosOnePublication(id, "other", false), 0);
+        }
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+
+        // Act
+        receive(1, qosOnePublication(4097, "other", false), 0);
+
+        // Assert
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.ends).singleElement().satisfies(end ->
+                assertThat(end.cause()).isInstanceOf(MqttCapacityException.class));
+        assertThat(pubAckIds()).isEmpty();
+
+        // Act
+        sut.connect(3, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        receive(2, qosOnePublication(1, "other", false), 0);
+
+        // Assert
+        assertThat(pubAckIds()).containsExactly(1);
+    }
+
+    @Test
+    void full_puback_reservation_keeps_the_head_and_resumes_only_as_capacity_returns() {
+        // Arrange
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        for (int id = 1; id <= 100; id++) {
+            receive(1, qosOnePublication(id, "a/b", false), 0);
+        }
+        port.ackSlots = 2;
+
+        // Act
+        sut.deliveriesReady(1, port.deliveries.stream().map(Received::token).toList());
+
+        // Assert
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+        assertThat(pubAckIds()).containsExactly(1, 2);
+        assertThat(port.released).hasSize(2);
+        assertThat(port.ends).isEmpty();
+
+        // Act: write observation precedes budget release; neither event loses the waiting head.
+        for (int i = 0; i < 100; i++) {
+            sut.written(1, port.ackTickets.get(i));
+            port.ackSlots++;
+            sut.sendCapacityAvailable(1);
+        }
+
+        // Assert: draining requires no new input or delivery notification.
+        assertThat(pubAckIds()).isEqualTo(IntStream.rangeClosed(1, 100).boxed().toList());
+        assertThat(port.released).hasSize(100).doesNotHaveDuplicates();
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void disconnect_prevents_deferred_pubacks_from_refilling_the_queue() {
+        // Arrange
+        connected();
+        receive(1, qosOnePublication(7, "other", false), 0);
+        port.ackSlots = 0;
+        receive(1, qosOnePublication(8, "other", false), 0);
+        sut.disconnect(2);
+
+        // Act
+        port.ackSlots = 14;
+        sut.written(1, port.ackTickets.getFirst());
+        sut.sendCapacityAvailable(1);
+
+        // Assert
+        assertThat(pubAckIds()).containsExactly(7);
+        assertThat(port.sent.getLast()).isInstanceOf(Packet.Disconnect.class);
+    }
+
+    @Test
+    void closed_puback_queue_preserves_the_original_terminal_cause() {
+        // Arrange
+        connected();
+        port.sendResult = SendQueue.OfferResult.CLOSED;
+
+        // Act
+        receive(1, qosOnePublication(7, "other", false), 0);
+
+        // Assert
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+        assertThat(port.released).isEmpty();
+        assertThat(port.ends).isEmpty();
+
+        // Act
+        var failure = new IOException("Transport closed during PUBACK");
+        sut.failed(1, failure);
+
+        // Assert
+        assertThat(port.ends).containsExactly(new Disconnection(failure, false));
+    }
+
+    /// Publishes, then reports the write completion and PUBACK in a seed-chosen order.
+    private ArrayDeque<Runnable> publicationChain(long operation, Random random) {
+        var exchange = new Exchange();
+        Runnable written = () -> {
+            if (exchange.packetId != 0) {
+                sut.sent(1, exchange.ticket, 0);
+            }
+        };
+        Runnable acknowledged = () -> {
+            if (exchange.packetId != 0) {
+                receive(1, new Packet.PubAck(exchange.packetId, ReasonCode.SUCCESS, EMPTY), 0);
+            }
+        };
+        var chain = new ArrayDeque<Runnable>();
+        chain.add(() -> {
+            int published = port.publicationIds.size();
+            sut.publish(operation, qosOneMessage());
+            if (port.publicationIds.size() > published) {
+                exchange.packetId = port.publicationIds.getLast();
+                exchange.ticket = port.ticket;
+            }
+        });
+        chain.addAll(random.nextBoolean()
+                ? List.of(written, acknowledged)
+                : List.of(acknowledged, written));
+        return chain;
+    }
+
+    /// Receives a QoS 1 publication, then reports its delivery readiness if it was routed.
+    /// Receptions while connected are admitted in this order, which PUBACKs must follow.
+    private ArrayDeque<Runnable> receptionChain(
+            int packetId,
+            String topic,
+            List<Integer> admitted
+    ) {
+        var exchange = new Exchange();
+        var chain = new ArrayDeque<Runnable>();
+        chain.add(() -> {
+            if (sut.state() == CONNECTED) {
+                admitted.add(packetId);
+            }
+            int routed = port.deliveries.size();
+            receive(1, qosOnePublication(packetId, topic, false), 0);
+            if (port.deliveries.size() > routed) {
+                exchange.token = port.deliveries.getLast().token();
+            }
+        });
+        chain.add(() -> {
+            if (exchange.token != 0) {
+                sut.deliveryReady(1, exchange.token);
+            }
+        });
+        return chain;
+    }
+
+    private List<Integer> pubAckIds() {
+        return port.sent.stream()
+                .filter(Packet.PubAck.class::isInstance)
+                .map(Packet.PubAck.class::cast)
+                .map(Packet.PubAck::packetId)
+                .toList();
+    }
+
+    private static MqttMessage qosOneMessage() {
+        return new MqttMessage(new Topic("a/b"), new byte[] {1, 2}, Qos.AT_LEAST_ONCE, false);
+    }
+
+    private static Packet.Publish qosOnePublication(int packetId, String topic, boolean dup) {
+        return new Packet.Publish(
+                new Topic(topic), new byte[] {1, 2}, Qos.AT_LEAST_ONCE, false, dup, packetId, EMPTY
+        );
+    }
+
     private static Packet.Publish publication() {
         return new Packet.Publish(
                 new Topic("a/b"),
@@ -1146,7 +1821,7 @@ class SessionCoreTest {
     }
 
     private static Subscribe subscription(String filter) {
-        return new Subscribe(new TopicFilter(filter), Qos.AT_MOST_ONCE, 4);
+        return Subscribe.of(new TopicFilter(filter), Qos.AT_MOST_ONCE).withBufferCapacity(4);
     }
 
     private void connected() {
@@ -1171,13 +1846,28 @@ class SessionCoreTest {
     private record Result(@Nullable Object value, @Nullable Throwable failure) {
     }
 
-    private record Received(List<Long> ids, MqttMessage message, int bytes) {
+    /// State one exchange's later steps read after its first step; all steps run on one thread.
+    private static final class Exchange {
+
+        int packetId;
+        long ticket;
+        long token;
+    }
+
+    private record Received(
+            long token,
+            List<Long> ids,
+            MqttMessage message,
+            boolean dup,
+            int bytes
+    ) {
     }
 
     private static final class RecordingPort implements SessionCore.Port {
 
         final List<Packet> sent = new ArrayList<>();
         final List<MqttMessage> publications = new ArrayList<>();
+        final List<Integer> publicationIds = new ArrayList<>();
         final List<Disconnection> ends = new ArrayList<>();
         final List<Boolean> established = new ArrayList<>();
         final Map<Long, Result> results = new HashMap<>();
@@ -1186,6 +1876,9 @@ class SessionCoreTest {
         final List<Long> registered = new ArrayList<>();
         final List<Long> removed = new ArrayList<>();
         final List<Received> deliveries = new ArrayList<>();
+        final List<Long> released = new ArrayList<>();
+        final List<Long> ackTickets = new ArrayList<>();
+        int ackSlots = Integer.MAX_VALUE;
         boolean acceptRegistration = true;
         boolean acceptDelivery = true;
         SendQueue.OfferResult sendResult = SendQueue.OfferResult.ACCEPTED;
@@ -1200,16 +1893,29 @@ class SessionCoreTest {
         @Override
         public SendQueue.OfferResult send(long generation, long id, Packet packet) {
             ticket = id;
+            if (packet instanceof Packet.PubAck && ackSlots == 0) {
+                return SendQueue.OfferResult.FULL;
+            }
             if (sendResult == SendQueue.OfferResult.ACCEPTED) {
+                if (packet instanceof Packet.PubAck) {
+                    ackSlots--;
+                    ackTickets.add(id);
+                }
                 sent.add(packet);
             }
             return sendResult;
         }
 
         @Override
-        public SendQueue.OfferResult publish(long generation, long id, MqttMessage message) {
+        public SendQueue.OfferResult publish(
+                long generation,
+                long id,
+                MqttMessage message,
+                int packetId
+        ) {
             ticket = id;
             publications.add(message);
+            publicationIds.add(packetId);
             return sendResult;
         }
 
@@ -1279,16 +1985,22 @@ class SessionCoreTest {
         @Override
         public boolean deliver(
                 long generation,
+                long token,
                 List<Long> ids,
                 MqttMessage message,
                 boolean dup,
                 int bytes
         ) {
             if (acceptDelivery) {
-                deliveries.add(new Received(List.copyOf(ids), message, bytes));
+                deliveries.add(new Received(token, List.copyOf(ids), message, dup, bytes));
             }
 
             return acceptDelivery;
+        }
+
+        @Override
+        public void releaseDelivery(long token) {
+            released.add(token);
         }
 
         @Override

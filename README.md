@@ -89,7 +89,7 @@ void main() {
             .build()) {
         client.connect().join();
         client.subscribe(
-                new Subscribe(new TopicFilter("sensors/+/temperature"), Qos.AT_MOST_ONCE),
+                Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_MOST_ONCE),
                 delivery -> show(delivery.message())
         ).join();
 

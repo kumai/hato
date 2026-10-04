@@ -1,6 +1,8 @@
 package org.mqtt4j.mqtj.client.internal;
 
+import java.io.IOException;
 import java.net.URI;
+import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -8,9 +10,15 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.mqtj.*;
+import org.mqtt4j.mqtj.spi.Transport;
+import org.mqtt4j.mqtj.testkit.FaultyTransport;
+import org.mqtt4j.mqtj.testkit.ManualTimerScheduler;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -19,6 +27,124 @@ import static org.awaitility.Awaitility.await;
 
 /// Public messaging contracts shared by the embedded broker and Mosquitto.
 abstract class MessagingTest {
+
+    @ParameterizedTest
+    @EnumSource(AckMode.class)
+    void qos_one_publications_round_trip_with_each_acknowledgement_mode(AckMode ackMode)
+            throws Exception {
+        // Arrange
+        String topic = uniqueTopic();
+        var received = new LinkedBlockingQueue<MqttDelivery>();
+        var publication = new MqttMessage(
+                new Topic(topic), new byte[] {1, 2, 3}, Qos.AT_LEAST_ONCE, false
+        );
+        try (MqttClient sut = client()) {
+            sut.connect().get(5, SECONDS);
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE).withAckMode(ackMode),
+                    received::add
+            ).get(5, SECONDS);
+
+            // Act
+            PublishResult result = sut.publish(publication).get(5, SECONDS);
+            MqttDelivery delivery = requireNonNull(received.poll(5, SECONDS));
+            delivery.ack();
+
+            // Assert
+            assertThat(result).isEqualTo(new PublishResult());
+            assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+            assertThat(delivery.message()).isEqualTo(publication);
+            assertThat(delivery.dup()).isFalse();
+            subscription.unsubscribe().get(5, SECONDS);
+            sut.disconnect().get(5, SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(AckMode.class)
+    void five_hundred_qos_one_publications_arrive_in_order_without_disconnect(AckMode ackMode)
+            throws Exception {
+        // Arrange
+        String topic = uniqueTopic();
+        var received = new LinkedBlockingQueue<MqttMessage>();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (MqttClient sut = client(ended::add); MqttClient publisher = client(ended::add)) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE).withAckMode(ackMode),
+                    delivery -> {
+                        received.add(delivery.message());
+                        if (ackMode == AckMode.MANUAL) {
+                            delivery.ack();
+                        }
+                    }
+            ).get(5, SECONDS);
+
+            // Act: bound publisher operations while the subscriber continuously handles input.
+            for (int i = 0; i < 500; i++) {
+                publisher.publish(new MqttMessage(
+                        new Topic(topic),
+                        Integer.toString(i).getBytes(UTF_8),
+                        Qos.AT_LEAST_ONCE,
+                        false
+                )).get(5, SECONDS);
+            }
+
+            // Assert
+            for (int i = 0; i < 500; i++) {
+                MqttMessage message = requireNonNull(received.poll(5, SECONDS));
+                assertThat(message.payload()).containsExactly(Integer.toString(i).getBytes(UTF_8));
+                assertThat(message.qos()).isEqualTo(Qos.AT_LEAST_ONCE);
+            }
+            assertThat(received).isEmpty();
+            subscription.unsubscribe().get(5, SECONDS);
+            assertThat(ended).isEmpty();
+            sut.disconnect().get(5, SECONDS);
+            publisher.disconnect().get(5, SECONDS);
+        }
+    }
+
+    @Test
+    void a_connection_lost_before_puback_leaves_the_publication_outcome_unknown()
+            throws Exception {
+        // Arrange: this scheduler controls only delayed inbound transport bytes.
+        var scheduler = new ManualTimerScheduler();
+        var transport = new AtomicReference<FaultyTransport>();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        var failure = new IOException("Connection cut before PUBACK reached the client");
+        try (MqttClient sut = MqttClient.builder()
+                .server(endpoint())
+                .version(MqttVersion.V3_1_1)
+                .connectionListener(ended::add)
+                .transportFactory(id -> {
+                    var faulty = new FaultyTransport(Transport.tcp(id), scheduler);
+                    transport.set(faulty);
+                    return faulty;
+                })
+                .build()) {
+            sut.connect().get(5, SECONDS);
+            FaultyTransport faulty = requireNonNull(transport.get());
+            faulty.receiveDelay(Duration.ofSeconds(30));
+            CompletableFuture<PublishResult> publication = sut.publish(new MqttMessage(
+                    new Topic(uniqueTopic()), new byte[] {1}, Qos.AT_LEAST_ONCE, false
+            ));
+            await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
+            assertThat(publication).isNotDone();
+
+            // Act: the broker's PUBACK is present but has not crossed the delay boundary.
+            faulty.disconnect(failure);
+
+            // Assert
+            assertThatThrownBy(() -> publication.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectionLostException.class)
+                    .hasRootCause(failure);
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
+            assertThat(scheduler.pendingTaskCount()).isZero();
+            scheduler.advance(Duration.ofSeconds(30));
+            assertThat(ended).isEmpty();
+        }
+    }
 
     @Test
     void public_api_publishes_subscribes_and_reuses_a_filter_after_unsubscribe() throws Exception {
@@ -31,7 +157,7 @@ abstract class MessagingTest {
 
             // Act: establish the first subscription.
             Subscription first = sut.subscribe(
-                    new Subscribe(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     firstDeliveries::add
             ).get(5, SECONDS);
 
@@ -50,7 +176,7 @@ abstract class MessagingTest {
             // Act: remove the first subscription, then reuse its filter.
             first.unsubscribe().get(5, SECONDS);
             Subscription second = sut.subscribe(
-                    new Subscribe(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     secondDeliveries::add
             ).get(5, SECONDS);
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -76,7 +202,7 @@ abstract class MessagingTest {
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     delivery -> {
                         int number = delivery.message().payload()[0];
                         if (number == 0) {
@@ -115,14 +241,14 @@ abstract class MessagingTest {
         // Arrange: the ordinary subscription already covers the shared filter's topics.
         String base = uniqueTopic();
         var received = new LinkedBlockingQueue<MqttDelivery>();
-        var shared = new Subscribe(
+        var shared = Subscribe.of(
                 new TopicFilter("$share/workers/" + base + "/+"),
                 Qos.AT_MOST_ONCE
         );
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
             Subscription ordinary = sut.subscribe(
-                    new Subscribe(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE),
                     received::add
             ).get(5, SECONDS);
 
@@ -151,7 +277,7 @@ abstract class MessagingTest {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     _ -> {
                         throw failure;
                     }
@@ -180,7 +306,7 @@ abstract class MessagingTest {
         try (MqttClient sut = client(ended::add)) {
             sut.connect().get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     _ -> {
                         worker.set(Thread.currentThread());
                         entered.countDown();
@@ -199,7 +325,7 @@ abstract class MessagingTest {
             assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
             sut.connect().get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     received::add
             ).get(5, SECONDS);
 
@@ -231,7 +357,7 @@ abstract class MessagingTest {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(topic), Qos.AT_MOST_ONCE, 1),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE).withBufferCapacity(1),
                     _ -> {
                         entered.countDown();
                         try {
@@ -273,11 +399,11 @@ abstract class MessagingTest {
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(base + "/reply"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(base + "/reply"), Qos.AT_MOST_ONCE),
                     replies::add
             ).get(5, SECONDS);
             sut.subscribe(
-                    new Subscribe(new TopicFilter(base + "/request"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(base + "/request"), Qos.AT_MOST_ONCE),
                     delivery -> {
                         sut.publish(message(base + "/reply", delivery.message().payload())).join();
                         handled.complete(null);
