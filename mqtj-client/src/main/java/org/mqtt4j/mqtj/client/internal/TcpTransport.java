@@ -201,7 +201,9 @@ public final class TcpTransport implements Transport {
                 synchronized (callbacks) {
                     pending = null;
                     Listener receiver = listener;
-                    if (!closed && receiver != null) {
+                    // Report a finished write even while closing, as when the peer closes after
+                    // reading DISCONNECT. onClosed waits for this worker, so it still comes last.
+                    if (receiver != null) {
                         receiver.onSent(send.ticket());
                     }
                 }
