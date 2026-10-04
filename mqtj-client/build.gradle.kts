@@ -28,6 +28,13 @@ testing {
             dependencies {
                 implementation(project(":test-support"))
             }
+            // Virtual threads are not preempted, so on a single carrier, as in a one-CPU
+            // container, one busy virtual thread holds up all others. Run the suite that way too.
+            targets.register("integrationTestSingleCarrier") {
+                testTask.configure {
+                    jvmArgs("-Djdk.virtualThreadScheduler.parallelism=1")
+                }
+            }
         }
     }
 }
