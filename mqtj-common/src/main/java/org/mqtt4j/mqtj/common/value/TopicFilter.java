@@ -59,27 +59,44 @@ public record TopicFilter(String pattern) {
     public boolean matches(Topic topic) {
         Objects.requireNonNull(topic, "Topic must not be null");
 
-        // Splitting preserves empty levels; switch to a direct scan if allocations become costly.
-        String[] filterLevels = pattern.split("/", -1);
-        // [MQTT-4.7.2-1]
-        if (topic.name().startsWith("$")
-                && (filterLevels[0].equals("+") || filterLevels[0].equals("#"))) {
+        String name = topic.name();
+        // [MQTT-4.7.2-1]. Validation guarantees that a leading wildcard is the whole first level.
+        if (name.startsWith("$") && (pattern.startsWith("+") || pattern.startsWith("#"))) {
             return false;
         }
 
-        String[] topicLevels = topic.name().split("/", -1);
-        for (int i = 0; i < filterLevels.length; i++) {
-            String level = filterLevels[i];
+        // Compare one level at a time in place: routing checks every subscription for each
+        // received message, so this must not allocate. A start past the end means that no
+        // level remains, while a start equal to the length is a final empty level.
+        int filterStart = 0;
+        int nameStart = 0;
+        while (true) {
+            int filterEnd = levelEnd(pattern, filterStart);
+            int length = filterEnd - filterStart;
             // [MQTT-4.7.1-2]: # also matches when the topic has no remaining levels.
-            if (level.equals("#")) {
+            if (length == 1 && pattern.charAt(filterStart) == '#') {
                 return true;
             }
-            // [MQTT-4.7.1-3]: + consumes one level, including an empty one.
-            if (i >= topicLevels.length
-                    || (!level.equals("+") && !level.equals(topicLevels[i]))) {
+            if (nameStart > name.length()) {
                 return false;
             }
+            int nameEnd = levelEnd(name, nameStart);
+            // [MQTT-4.7.1-3]: + consumes one level, including an empty one.
+            boolean wildcard = length == 1 && pattern.charAt(filterStart) == '+';
+            if (!wildcard && (length != nameEnd - nameStart
+                    || !pattern.regionMatches(filterStart, name, nameStart, length))) {
+                return false;
+            }
+            if (filterEnd == pattern.length()) {
+                return nameEnd == name.length();
+            }
+            filterStart = filterEnd + 1;
+            nameStart = nameEnd + 1;
         }
-        return topicLevels.length == filterLevels.length;
+    }
+
+    private static int levelEnd(String text, int start) {
+        int end = text.indexOf('/', start);
+        return end < 0 ? text.length() : end;
     }
 }

@@ -1,14 +1,23 @@
 package org.mqtt4j.mqtj.common.value;
 
+import java.util.List;
+import java.util.Random;
+import java.util.stream.IntStream;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class TopicFilterTest {
+
+    private static final List<String> FILTER_LEVELS = List.of("", "a", "b", "ab", "$a", "+");
+
+    private static final List<String> TOPIC_LEVELS = List.of("", "a", "b", "ab", "$a");
 
     @ParameterizedTest
     @ValueSource(strings = {
@@ -252,5 +261,62 @@ class TopicFilterTest {
         var sut = new TopicFilter(name);
 
         assertThat(sut.matches(new Topic(name))).isTrue();
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void matching_agrees_with_splitting_both_names_into_levels(int seed) {
+        // Arrange: short levels from a small alphabet make empty levels, wildcards, a leading
+        // $, and differing level counts frequent.
+        var random = new Random(seed);
+        for (int i = 0; i < 1_000; i++) {
+            String pattern = randomName(random, FILTER_LEVELS, true);
+            String topicName = randomName(random, TOPIC_LEVELS, false);
+            var sut = new TopicFilter(pattern);
+
+            // Act & Assert
+            assertThat(sut.matches(new Topic(topicName)))
+                    .as("%s matches %s", pattern, topicName)
+                    .isEqualTo(matchesByLevels(pattern, topicName));
+        }
+    }
+
+    static IntStream seeds() {
+        return IntStream.range(0, 100);
+    }
+
+    /// One to four levels; a filter may end with #. A lone empty level would be an empty name.
+    private static String randomName(Random random, List<String> levels, boolean filter) {
+        var name = new StringBuilder();
+        int count = 1 + random.nextInt(4);
+        for (int level = 0; level < count; level++) {
+            if (level > 0) {
+                name.append('/');
+            }
+            boolean last = level == count - 1;
+            name.append(filter && last && random.nextInt(4) == 0
+                    ? "#" : levels.get(random.nextInt(levels.size())));
+        }
+        return name.isEmpty() ? "a" : name.toString();
+    }
+
+    /// The level-by-level definition of MQTT 4.7, kept as an independent reference.
+    private static boolean matchesByLevels(String pattern, String topicName) {
+        String[] filterLevels = pattern.split("/", -1);
+        if (topicName.startsWith("$")
+                && (filterLevels[0].equals("+") || filterLevels[0].equals("#"))) {
+            return false;
+        }
+        String[] topicLevels = topicName.split("/", -1);
+        for (int i = 0; i < filterLevels.length; i++) {
+            if (filterLevels[i].equals("#")) {
+                return true;
+            }
+            if (i >= topicLevels.length
+                    || (!filterLevels[i].equals("+") && !filterLevels[i].equals(topicLevels[i]))) {
+                return false;
+            }
+        }
+        return topicLevels.length == filterLevels.length;
     }
 }
