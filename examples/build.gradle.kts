@@ -7,7 +7,7 @@ description = "Usage examples. Not published."
 
 dependencies {
     implementation(project(":mqtj-client"))
-    implementation(project(":mqtj-testkit"))
+    implementation(project(":mqtj-broker"))
 }
 
 application {
