@@ -16,9 +16,12 @@ import org.mqtt4j.mqtj.client.internal.TcpTransport;
 /// admission policy belong to the caller, not the transport.
 ///
 /// Callbacks are serialized. `onConnected` precedes bytes and send completions. Bytes arrive in
-/// wire order with arbitrary chunk boundaries. Each admitted send completes once after writing;
-/// admission alone is not completion. The next send is allowed once `onSent` is invoked,
-/// including from that callback. A single final `onClosed` releases an unfinished send instead
+/// wire order with arbitrary chunk boundaries. Each successfully written send must be reported
+/// exactly once through `onSent`, before `onClosed`, even if EOF, failure, or a close request races
+/// with write completion. Shutdown must not discard a successful write's pending notification.
+/// Completion means successful local writing, not admission or confirmation of peer receipt.
+/// The next send is allowed once `onSent` is invoked, including from that callback, unless closing.
+/// A single final `onClosed` releases any send whose write did not complete successfully instead
 /// of `onSent`. No callbacks follow it. Closing releases pending I/O and delayed work, including
 /// a connection that finishes after close was requested.
 /// Runtime exceptions from the factory, start, or send fail the current connection attempt or

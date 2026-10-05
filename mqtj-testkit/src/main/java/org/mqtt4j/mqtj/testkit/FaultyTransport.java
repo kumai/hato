@@ -82,7 +82,8 @@ public final class FaultyTransport implements Transport {
             @Override
             public void onSent(long ticket) {
                 synchronized (FaultyTransport.this) {
-                    if (ended == null) {
+                    // Successful writes still complete during shutdown, before the final callback.
+                    if (listener != null) {
                         receiver.onSent(ticket);
                     }
                 }
@@ -178,7 +179,9 @@ public final class FaultyTransport implements Transport {
         return delegate.send(ticket, bytes);
     }
 
-    /// Ends the connection immediately and discards delayed input.
+    /// Ends the connection with `cause`: later sends are rejected, delayed and later input is
+    /// discarded, and the delegate is closed. A write the delegate has already completed is
+    /// still reported through `onSent` before the final `onClosed`, which carries `cause`.
     public void disconnect(Throwable cause) {
         synchronized (this) {
             if (ended != null) {

@@ -30,7 +30,7 @@ public final class TcpConnection implements Closeable {
 
     private final OutputStream output;
 
-    private TcpConnection(Socket socket) throws IOException {
+    TcpConnection(Socket socket) throws IOException {
         socket.setTcpNoDelay(true);
         this.socket = socket;
         input = socket.getInputStream();
