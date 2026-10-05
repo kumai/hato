@@ -11,7 +11,7 @@ jspecify = "1.0.1"
 errorprone = "2.50.0"
 nullaway = "0.14.2"
 errorprone-plugin = "5.1.1"
-checkstyle = "14.1.0"
+checkstyle = "14.3.0"
 
 [libraries]
 # Nullness annotations. Build-time only: never a runtime or POM dependency of the published jars.
