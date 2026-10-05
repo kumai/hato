@@ -1410,6 +1410,62 @@ class SessionCoreTest {
         return IntStream.range(0, 100);
     }
 
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void reordered_old_readiness_cannot_acknowledge_a_reused_id_after_reconnect(int seed) {
+        // Arrange: an old snapshot may reach the core before or after the next CONNACK.
+        var random = new Random(seed);
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        long oldToken = port.deliveries.getLast().token();
+        List<Long> snapshot = List.of(oldToken);
+        var current = new Exchange();
+        var expected = new ArrayList<Integer>();
+        var chains = new ArrayList<ArrayDeque<Runnable>>();
+        chains.add(new ArrayDeque<>(List.of(
+                () -> sut.failed(1, new IOException("Lost connection")),
+                () -> sut.connect(3, 0),
+                () -> receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0),
+                () -> {
+                    sut.subscribe(4, subscription("a/#"));
+                    receive(2, qosOnePublication(7, "a/b", false), 0);
+                    current.token = port.deliveries.getLast().token();
+                    assertThat(current.token).isGreaterThan(oldToken);
+                },
+                () -> {
+                    expected.add(7);
+                    sut.deliveryReady(current.token);
+                }
+        )));
+        chains.add(new ArrayDeque<>(List.of(
+                () -> sut.deliveriesReady(snapshot),
+                () -> sut.deliveriesReady(snapshot)
+        )));
+        chains.add(new ArrayDeque<>(List.of(
+                () -> sut.sendCapacityAvailable(1),
+                () -> sut.written(1, port.ticket)
+        )));
+
+        // Act & Assert: readiness before connection loss may finish the original receipt,
+        // but only the new delivery's readiness can acknowledge the reused identifier.
+        while (!chains.isEmpty()) {
+            ArrayDeque<Runnable> chain = chains.get(random.nextInt(chains.size()));
+            chain.removeFirst().run();
+            if (chain.isEmpty()) {
+                chains.remove(chain);
+            }
+            var acknowledged = new ArrayList<Integer>();
+            if (port.released.contains(oldToken)) {
+                acknowledged.add(7);
+            }
+            acknowledged.addAll(expected);
+            assertThat(pubAckIds()).isEqualTo(acknowledged);
+        }
+        assertThat(port.released).contains(current.token).doesNotHaveDuplicates();
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
     @Test
     void disconnect_completes_publications_acknowledged_before_it_ends_and_not_the_rest() {
         // Arrange
@@ -1548,8 +1604,8 @@ class SessionCoreTest {
         long second = port.deliveries.getLast().token();
 
         // Act: later recipients are all ready while the first publication is still pending.
-        sut.deliveryReady(1, second);
-        sut.deliveryReady(1, second);
+        sut.deliveryReady(second);
+        sut.deliveryReady(second);
 
         // Assert
         assertThat(pubAckIds()).isEmpty();
@@ -1558,8 +1614,8 @@ class SessionCoreTest {
                 assertThat(delivery.ids()).containsExactly(2L, 3L));
 
         // Act
-        sut.deliveryReady(1, first);
-        sut.deliveryReady(1, first);
+        sut.deliveryReady(first);
+        sut.deliveryReady(first);
 
         // Assert
         assertThat(pubAckIds()).containsExactly(7, 8);
@@ -1582,7 +1638,7 @@ class SessionCoreTest {
         assertThat(port.deliveries).hasSize(1);
 
         // Act
-        sut.deliveryReady(1, first);
+        sut.deliveryReady(first);
 
         // Assert
         assertThat(pubAckIds()).containsExactly(7, 8);
@@ -1621,7 +1677,7 @@ class SessionCoreTest {
                 receive(1, qosOnePublication(id, "a/b", true), 0);
             }
         }
-        sut.deliveriesReady(1, port.deliveries.stream().map(Received::token).toList());
+        sut.deliveriesReady(port.deliveries.stream().map(Received::token).toList());
         receive(1, qosOnePublication(1, "a/b", true), 0);
 
         // Assert: even an admitted PUBACK has not yet ended the exchange.
@@ -1647,13 +1703,13 @@ class SessionCoreTest {
         sut.subscribe(2, subscription("a/#"));
         receive(1, qosOnePublication(7, "a/b", true), 0);
         long first = port.deliveries.getFirst().token();
-        sut.deliveryReady(1, first);
+        sut.deliveryReady(first);
         long ackTicket = port.ackTickets.getFirst();
         sut.written(1, ackTicket);
 
         // Act: the next message may even have identical topic and payload.
         receive(1, qosOnePublication(7, "a/b", dup), 0);
-        sut.deliveryReady(1, first);
+        sut.deliveryReady(first);
         sut.written(1, ackTicket);
 
         // Assert: the new exchange has its own readiness condition.
@@ -1661,7 +1717,7 @@ class SessionCoreTest {
         assertThat(pubAckIds()).containsExactly(7);
 
         // Act
-        sut.deliveryReady(1, port.deliveries.getLast().token());
+        sut.deliveryReady(port.deliveries.getLast().token());
 
         // Assert
         assertThat(pubAckIds()).containsExactly(7, 7);
@@ -1676,7 +1732,7 @@ class SessionCoreTest {
         receive(1, qosOnePublication(8, "a/b", false), 0);
         long earlier = port.deliveries.get(0).token();
         long following = port.deliveries.get(1).token();
-        sut.deliveryReady(1, following);
+        sut.deliveryReady(following);
 
         // Act: a sender reuses an identifier only for an exchange it considers acknowledged.
         receive(1, qosOnePublication(7, "a/b", false), 0);
@@ -1689,7 +1745,7 @@ class SessionCoreTest {
         assertThat(sut.state()).isEqualTo(CONNECTED);
 
         // Act
-        sut.deliveriesReady(1, List.of(earlier, later));
+        sut.deliveriesReady(List.of(earlier, later));
 
         // Assert: one PUBACK covers the reused identifier.
         assertThat(pubAckIds()).containsExactly(8, 7);
@@ -1702,7 +1758,7 @@ class SessionCoreTest {
         connected();
         sut.subscribe(2, subscription("a/#"));
         receive(1, qosOnePublication(7, "a/b", false), 0);
-        sut.deliveryReady(1, port.deliveries.getFirst().token());
+        sut.deliveryReady(port.deliveries.getFirst().token());
         long earlierAck = port.ackTickets.getFirst();
 
         // Act: the reported write must not free the identifier of the new reception.
@@ -1715,7 +1771,7 @@ class SessionCoreTest {
         assertThat(pubAckIds()).containsExactly(7);
 
         // Act
-        sut.deliveryReady(1, port.deliveries.getLast().token());
+        sut.deliveryReady(port.deliveries.getLast().token());
 
         // Assert
         assertThat(pubAckIds()).containsExactly(7, 7);
@@ -1739,8 +1795,8 @@ class SessionCoreTest {
         int id = port.publicationIds.getLast();
 
         // Act
-        sut.deliveryReady(1, oldToken);
-        sut.deliveryReady(2, oldToken);
+        sut.deliveryReady(oldToken);
+        sut.deliveryReady(oldToken);
         receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Assert
@@ -1749,7 +1805,7 @@ class SessionCoreTest {
         assertThat(port.results).doesNotContainKey(5L);
 
         // Act
-        sut.deliveryReady(2, newToken);
+        sut.deliveryReady(newToken);
         receive(2, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Assert
@@ -1797,7 +1853,7 @@ class SessionCoreTest {
         port.ackSlots = 2;
 
         // Act
-        sut.deliveriesReady(1, port.deliveries.stream().map(Received::token).toList());
+        sut.deliveriesReady(port.deliveries.stream().map(Received::token).toList());
 
         // Assert
         assertThat(sut.state()).isEqualTo(CONNECTED);
@@ -1908,7 +1964,7 @@ class SessionCoreTest {
         });
         chain.add(() -> {
             if (exchange.token != 0) {
-                sut.deliveryReady(1, exchange.token);
+                sut.deliveryReady(exchange.token);
             }
         });
         return chain;

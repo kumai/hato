@@ -12,7 +12,6 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
-import java.util.function.LongConsumer;
 
 import org.jspecify.annotations.Nullable;
 
@@ -49,7 +48,7 @@ final class DeliveryLanes {
 
     // Each core-admitted QoS 1 receipt enters once. The core's 4096-receipt limit also bounds
     // this metadata-only queue, including receipts with no local recipient.
-    private final ArrayDeque<Ready> readyTokens = new ArrayDeque<>();
+    private final ArrayDeque<Long> readyTokens = new ArrayDeque<>();
 
     private final String clientId;
 
@@ -57,7 +56,7 @@ final class DeliveryLanes {
 
     private final BiConsumer<Long, Throwable> onFailure;
 
-    private final LongConsumer onReady;
+    private final Runnable onReady;
 
     private int retainedLanes;
 
@@ -71,7 +70,7 @@ final class DeliveryLanes {
             String clientId,
             long byteLimit,
             BiConsumer<Long, Throwable> onFailure,
-            LongConsumer onReady
+            Runnable onReady
     ) {
         this.clientId = clientId;
         this.byteLimit = byteLimit;
@@ -164,18 +163,18 @@ final class DeliveryLanes {
     }
 
     void remove(long id) {
-        long readyGeneration = 0;
+        boolean ready = false;
         lock.lock();
         try {
             Lane lane = lanes.get(id);
             if (lane != null && stop(lane)) {
-                readyGeneration = lane.generation;
+                ready = true;
             }
         } finally {
             lock.unlock();
         }
-        if (readyGeneration != 0) {
-            onReady.accept(readyGeneration);
+        if (ready) {
+            onReady.run();
         }
     }
 
@@ -237,7 +236,7 @@ final class DeliveryLanes {
                     return false;
                 }
                 var delivery = new RetainedDelivery(
-                        generation, token, message, dup, bytes, recipients.size()
+                        token, message, dup, bytes, recipients.size()
                 );
                 if (token != 0) {
                     acknowledging.put(token, delivery);
@@ -256,30 +255,24 @@ final class DeliveryLanes {
                     lane.ready.signal();
                 }
             } else if (token != 0) {
-                readyTokens.addLast(new Ready(generation, token));
+                readyTokens.addLast(token);
             }
         } finally {
             lock.unlock();
         }
         if (empty && token != 0) {
-            onReady.accept(generation);
+            onReady.run();
         }
         return true;
     }
 
     /// Takes one finite snapshot. A concurrent completion belongs to this or the next wake;
     /// the mailbox rearms its coalesced wake before the actor calls this method.
-    List<Long> takeReady(long generation) {
+    List<Long> takeReady() {
         lock.lock();
         try {
-            var result = new ArrayList<Long>();
-            readyTokens.removeIf(ready -> {
-                if (ready.generation() == generation) {
-                    result.add(ready.token());
-                    return true;
-                }
-                return false;
-            });
+            var result = new ArrayList<>(readyTokens);
+            readyTokens.clear();
             return result;
         } finally {
             lock.unlock();
@@ -392,7 +385,7 @@ final class DeliveryLanes {
         }
         try {
             if (ready) {
-                onReady.accept(lane.generation);
+                onReady.run();
             }
             requireNonNull(lane.handler).accept(view);
         } catch (Throwable failure) {
@@ -421,7 +414,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.accept(lane.generation);
+            onReady.run();
         }
         return true;
     }
@@ -436,7 +429,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.accept(view.delivery.generation);
+            onReady.run();
         }
     }
 
@@ -447,7 +440,7 @@ final class DeliveryLanes {
             view.ready = true;
             view.acknowledgement = null;
             if (--delivery.pending == 0) {
-                readyTokens.addLast(new Ready(delivery.generation, delivery.token));
+                readyTokens.addLast(delivery.token);
                 return true;
             }
         }
@@ -526,9 +519,6 @@ final class DeliveryLanes {
         }
     }
 
-    private record Ready(long generation, long token) {
-    }
-
     /// A stable handle preserves the receiver's end state after removal from the routing map.
     final class Receiver {
 
@@ -581,7 +571,7 @@ final class DeliveryLanes {
                 lock.unlock();
             }
             if (ready) {
-                onReady.accept(lane.generation);
+                onReady.run();
             }
             return new ReceiveResult.Received(view);
         }
@@ -631,7 +621,6 @@ final class DeliveryLanes {
 
     private static final class RetainedDelivery {
 
-        final long generation;
         final long token;
         final MqttMessage message;
         final boolean dup;
@@ -642,14 +631,12 @@ final class DeliveryLanes {
         boolean retired;
 
         RetainedDelivery(
-                long generation,
                 long token,
                 MqttMessage message,
                 boolean dup,
                 int bytes,
                 int recipients
         ) {
-            this.generation = generation;
             this.token = token;
             this.message = message;
             this.dup = dup;

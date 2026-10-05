@@ -565,7 +565,7 @@ final class SessionCore {
         }
         if (matches.isEmpty()) {
             if (token != 0) {
-                deliveryReady(generation, token);
+                deliveryReady(token);
             } else {
                 log.debug("Discarding unmatched QoS 0 delivery for {} on {}",
                         publish.topic(), clientId);
@@ -580,16 +580,17 @@ final class SessionCore {
         }
     }
 
-    void deliveryReady(long connection, long token) {
-        deliveriesReady(connection, List.of(token));
+    void deliveryReady(long token) {
+        deliveriesReady(List.of(token));
     }
 
-    void deliveriesReady(long connection, List<Long> tokens) {
-        if (connection != generation || state != State.CONNECTED || disconnectOperation != 0) {
+    /// Tokens belong to the client lifetime; only entries still in the receive table can advance.
+    void deliveriesReady(List<Long> tokens) {
+        if (state != State.CONNECTED || disconnectOperation != 0) {
             return;
         }
         tokens.forEach(acknowledgements::ready);
-        sendCapacityAvailable(connection);
+        sendCapacityAvailable(generation);
     }
 
     void sendCapacityAvailable(long connection) {

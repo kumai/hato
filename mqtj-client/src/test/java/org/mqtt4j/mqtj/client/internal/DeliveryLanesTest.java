@@ -12,7 +12,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.LongConsumer;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -47,7 +46,7 @@ class DeliveryLanesTest {
 
     private final LinkedBlockingQueue<Failure> failures = new LinkedBlockingQueue<>();
 
-    private final LinkedBlockingQueue<Ready> ready = new LinkedBlockingQueue<>();
+    private final LinkedBlockingQueue<Long> ready = new LinkedBlockingQueue<>();
 
     private final List<DeliveryLanes> managers = new ArrayList<>();
 
@@ -99,7 +98,7 @@ class DeliveryLanesTest {
         assertThat(ready).isEmpty();
         assertThat(sut.retainedBytes()).isEqualTo(30);
         current.ack();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(2, 12));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(12L);
         assertThat(sut.retainedBytes()).isZero();
     }
 
@@ -130,7 +129,7 @@ class DeliveryLanesTest {
 
         // Assert: a stalled sequencer retains metadata, not this subscription's payload budget.
         assertThat(first.message()).isEqualTo(qosOneMessage());
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
         assertThat(sut.acknowledgingDeliveries()).isZero();
@@ -158,7 +157,7 @@ class DeliveryLanesTest {
         assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isFalse();
         delivery.ack();
         delivery.ack();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(ready).isEmpty();
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
@@ -184,7 +183,7 @@ class DeliveryLanesTest {
         assertThat(sut.retainedBytes()).isEqualTo(10);
         assertThat(ready).isEmpty();
         push.ack();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         sut.release(10);
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
     }
@@ -310,7 +309,7 @@ class DeliveryLanesTest {
         // Act & Assert: a refused removal hands the held delivery over before acknowledging it.
         sut.resume(1);
         assertThat(received(receiver.receive(Duration.ZERO)).message()).isEqualTo(qosOneMessage());
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
     }
 
@@ -357,7 +356,7 @@ class DeliveryLanesTest {
 
         // Assert
         assertThat(receiver.receive()).isEqualTo(new ReceiveResult.Ended());
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(sut.abandonedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedLanes()).isZero();
         assertThat(sut.retainedDeliveries()).isZero();
@@ -825,7 +824,7 @@ class DeliveryLanesTest {
         delivery.ack();
 
         // Assert: ordered acknowledgement release is a separate boundary.
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(ready).isEmpty();
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         sut.release(10);
@@ -855,7 +854,7 @@ class DeliveryLanesTest {
 
         // Assert: the queued message is not yet acknowledged, and explicit ack is a no-op.
         assertThat(acknowledgementsAtEntry.poll(5, SECONDS)).isEqualTo(1);
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(ready).isEmpty();
         sut.release(10);
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
@@ -866,7 +865,7 @@ class DeliveryLanesTest {
 
         // Assert
         assertThat(received.poll(5, SECONDS)).isNotNull();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 11));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isEqualTo(1));
         sut.release(11);
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
@@ -910,7 +909,7 @@ class DeliveryLanesTest {
         third.ack();
         assertThat(ready).isEmpty();
         handlerRelease.countDown();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(sut.retainedDeliveries()).isEqualTo(3);
         sut.release(10);
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isEqualTo(1));
@@ -929,8 +928,8 @@ class DeliveryLanesTest {
         assertThat(sut.register(1, 1, request(AckMode.AFTER_HANDLER, 2), _ -> { })).isTrue();
         assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
         assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isTrue();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 11));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
 
         // Act & Assert
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
@@ -964,13 +963,13 @@ class DeliveryLanesTest {
         await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
 
         // Assert: the delivered view still requires its explicit ack after handler return.
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 11));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
         assertThat(ready).isEmpty();
         assertThat(received).isEmpty();
         assertThat(sut.abandonedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
         delivery.ack();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         sut.release(10);
         sut.release(11);
         assertThat(sut.retainedBytes()).isZero();
@@ -1010,7 +1009,7 @@ class DeliveryLanesTest {
         executing.ack();
         assertThat(ready).isEmpty();
         fresh.ack();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(2, 12));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(12L);
         sut.release(12);
         release.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
@@ -1020,7 +1019,7 @@ class DeliveryLanesTest {
     void absent_recipients_do_not_leave_an_ack_obligation() throws Exception {
         // Act & Assert: zero admitted recipients still reports readiness for this QoS 1 packet.
         assertThat(sut.deliver(1, 10, List.of(99L), qosOneMessage(), false, 10)).isTrue();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
     }
@@ -1046,7 +1045,7 @@ class DeliveryLanesTest {
         // Assert: the held delivery reaches the handler before it is acknowledged.
         MqttDelivery delivery = requireNonNull(received.poll(5, SECONDS));
         assertThat(delivery.message().qos()).isEqualTo(Qos.AT_LEAST_ONCE);
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(received).isEmpty();
     }
 
@@ -1062,7 +1061,7 @@ class DeliveryLanesTest {
         sut.remove(1);
 
         // Assert: the abandoned delivery releases its condition, and the worker never ran it.
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
         assertThat(received).isEmpty();
         assertThat(sut.abandonedDeliveries()).isEqualTo(1);
@@ -1141,7 +1140,7 @@ class DeliveryLanesTest {
         assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isNotNull();
         assertThat(sut.deliver(1, 11, List.of(1L, 2L), qosOneMessage(), false, 20)).isTrue();
-        assertThat(ready.poll(5, SECONDS)).isEqualTo(new Ready(1, 10));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
 
         // Act: the first lane fails, then the other recipient finishes the shared delivery.
         failRelease.countDown();
@@ -1175,8 +1174,8 @@ class DeliveryLanesTest {
     void removing_a_deep_queue_records_one_snapshot_without_per_delivery_notifications()
             throws Exception {
         // Arrange: the first handler keeps 320 subsequent deliveries queued.
-        var wakes = new LinkedBlockingQueue<Long>();
-        DeliveryLanes sut = lanes(BYTE_LIMIT, wakes::add);
+        var wakes = new LinkedBlockingQueue<Boolean>();
+        DeliveryLanes sut = lanes(BYTE_LIMIT, () -> wakes.add(true));
         CountDownLatch release = release();
         var entered = new CountDownLatch(1);
         assertThat(sut.register(1, 1, request(AckMode.ON_RECEIVE, 321), _ -> {
@@ -1185,8 +1184,8 @@ class DeliveryLanesTest {
         })).isTrue();
         assertThat(sut.deliver(1, 1, List.of(1L), qosOneMessage(), false, 1)).isTrue();
         assertThat(entered.await(5, SECONDS)).isTrue();
-        assertThat(wakes.poll(5, SECONDS)).isEqualTo(1L);
-        assertThat(sut.takeReady(1)).containsExactly(1L);
+        assertThat(wakes.poll(5, SECONDS)).isTrue();
+        assertThat(sut.takeReady()).containsExactly(1L);
         sut.release(1);
         for (long token = 2; token <= 321; token++) {
             assertThat(sut.deliver(1, token, List.of(1L), qosOneMessage(), false, 1)).isTrue();
@@ -1196,9 +1195,9 @@ class DeliveryLanesTest {
         sut.remove(1);
 
         // Assert: reservations wait for send admission while a single wake covers the whole batch.
-        assertThat(wakes).containsExactly(1L);
-        assertThat(sut.takeReady(1)).isEqualTo(LongStream.rangeClosed(2, 321).boxed().toList());
-        assertThat(sut.takeReady(1)).isEmpty();
+        assertThat(wakes).containsExactly(true);
+        assertThat(sut.takeReady()).isEqualTo(LongStream.rangeClosed(2, 321).boxed().toList());
+        assertThat(sut.takeReady()).isEmpty();
         assertThat(sut.retainedDeliveries()).isEqualTo(321);
         for (long token = 2; token <= 321; token++) {
             sut.release(token);
@@ -1210,8 +1209,8 @@ class DeliveryLanesTest {
     void a_completion_after_a_snapshot_is_reported_again_and_double_ack_is_ignored()
             throws Exception {
         // Arrange
-        var wakes = new LinkedBlockingQueue<Long>();
-        DeliveryLanes sut = lanes(BYTE_LIMIT, wakes::add);
+        var wakes = new LinkedBlockingQueue<Boolean>();
+        DeliveryLanes sut = lanes(BYTE_LIMIT, () -> wakes.add(true));
         var received = new LinkedBlockingQueue<MqttDelivery>();
         assertThat(sut.register(1, 1, request(AckMode.MANUAL, 2), received::add)).isTrue();
         assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 1)).isTrue();
@@ -1221,22 +1220,22 @@ class DeliveryLanesTest {
 
         // Act
         first.ack();
-        assertThat(wakes.poll(5, SECONDS)).isEqualTo(1L);
-        assertThat(sut.takeReady(1)).containsExactly(10L);
+        assertThat(wakes.poll(5, SECONDS)).isTrue();
+        assertThat(sut.takeReady()).containsExactly(10L);
         second.ack();
         first.ack();
         second.ack();
 
         // Assert
-        assertThat(wakes).containsExactly(1L);
-        assertThat(sut.takeReady(1)).containsExactly(11L);
+        assertThat(wakes).containsExactly(true);
+        assertThat(sut.takeReady()).containsExactly(11L);
     }
 
     @Test
-    void close_drops_pending_ready_tokens_without_signalling_and_old_snapshots_leave_new_work() {
+    void close_drops_pending_ready_tokens_and_the_next_snapshot_takes_new_work() {
         // Arrange: an empty recipient set records only a token, without retaining payload bytes.
-        var wakes = new LinkedBlockingQueue<Long>();
-        DeliveryLanes sut = lanes(1, wakes::add);
+        var wakes = new LinkedBlockingQueue<Boolean>();
+        DeliveryLanes sut = lanes(1, () -> wakes.add(true));
         for (long token = 1; token <= 4096; token++) {
             assertThat(sut.deliver(1, token, List.of(), qosOneMessage(), false, 10)).isTrue();
         }
@@ -1248,14 +1247,14 @@ class DeliveryLanesTest {
 
         // Assert
         assertThat(wakes).isEmpty();
-        assertThat(sut.takeReady(1)).isEmpty();
+        assertThat(sut.takeReady()).isEmpty();
 
         // Act
         assertThat(sut.deliver(2, 4097, List.of(), qosOneMessage(), false, 10)).isTrue();
 
-        // Assert: a stale drain cannot consume a newer connection's readiness.
-        assertThat(sut.takeReady(1)).isEmpty();
-        assertThat(sut.takeReady(2)).containsExactly(4097L);
+        // Assert: every wake takes current work; the core rejects tokens outside its receive table.
+        assertThat(sut.takeReady()).containsExactly(4097L);
+        assertThat(sut.takeReady()).isEmpty();
         assertThat(sut.retainedBytes()).isZero();
     }
 
@@ -1271,14 +1270,13 @@ class DeliveryLanesTest {
 
     private DeliveryLanes lanes(long byteLimit) {
         var owner = new AtomicReference<DeliveryLanes>();
-        DeliveryLanes manager = lanes(byteLimit, generation ->
-                requireNonNull(owner.get()).takeReady(generation)
-                        .forEach(token -> ready.add(new Ready(generation, token))));
+        DeliveryLanes manager = lanes(byteLimit, () ->
+                ready.addAll(requireNonNull(owner.get()).takeReady()));
         owner.set(manager);
         return manager;
     }
 
-    private DeliveryLanes lanes(long byteLimit, LongConsumer onReady) {
+    private DeliveryLanes lanes(long byteLimit, Runnable onReady) {
         var manager = new DeliveryLanes(
                 "lane-test",
                 byteLimit,
@@ -1312,9 +1310,6 @@ class DeliveryLanesTest {
             Thread.currentThread().interrupt();
             throw new AssertionError(failure);
         }
-    }
-
-    private record Ready(long generation, long token) {
     }
 
     private record Failure(long generation, Throwable cause) {

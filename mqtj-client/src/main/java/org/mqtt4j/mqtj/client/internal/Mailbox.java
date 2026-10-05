@@ -92,15 +92,12 @@ final class Mailbox {
     }
 
     synchronized OfferResult offer(Event event) {
-        // API commands use generation zero and survive connection changes.
+        // Client-owned commands and wakes use generation zero and survive connection changes.
         if (event.generation() != 0 && event.generation() != activeGeneration) {
             return OfferResult.STALE;
         }
         if (event.kind() == Kind.DELIVERY_READY || event.kind() == Kind.SEND_CAPACITY
                 || event.kind() == Kind.SUBSCRIPTION_CLOSE) {
-            if (event.generation() == 0) {
-                return OfferResult.STALE;
-            }
             Event pending = wakes.get(event.kind());
             if (pending != null && pending.generation() == event.generation()) {
                 return OfferResult.ACCEPTED;

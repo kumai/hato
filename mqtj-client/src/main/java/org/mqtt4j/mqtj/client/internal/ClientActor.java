@@ -385,10 +385,10 @@ public final class ClientActor implements MqttClient {
         return System.nanoTime();
     }
 
-    private void deliveryReady(long generation) {
+    private void deliveryReady() {
         post(
-                generation,
-                () -> core.deliveriesReady(generation, lanes.takeReady(generation)),
+                0,
+                () -> core.deliveriesReady(lanes.takeReady()),
                 Mailbox.Kind.DELIVERY_READY,
                 0
         );

@@ -189,15 +189,12 @@ class MailboxTest {
     void wakes_require_an_active_matching_generation(Mailbox.Kind kind) throws Exception {
         // Arrange
         var sut = new Mailbox(1, 0, 0, 0, 0);
-        var zero = new Mailbox.Event(0, () -> { }, kind, 0);
         var old = new Mailbox.Event(1, () -> { }, kind, 0);
         var current = new Mailbox.Event(2, () -> { }, kind, 0);
 
-        // Act & Assert: neither an unscoped wake nor a late callback can enter the FIFO.
-        assertThat(sut.offer(zero)).isEqualTo(STALE);
+        // Act & Assert: a connection-scoped wake still rejects late callbacks.
         assertThat(sut.offer(old)).isEqualTo(STALE);
         sut.activate(1);
-        assertThat(sut.offer(zero)).isEqualTo(STALE);
         assertThat(sut.offer(old)).isEqualTo(ACCEPTED);
         sut.discard(1);
         assertThat(sut.offer(old)).isEqualTo(STALE);
@@ -205,6 +202,43 @@ class MailboxTest {
         assertThat(sut.offer(old)).isEqualTo(STALE);
         assertThat(sut.offer(current)).isEqualTo(ACCEPTED);
         assertThat(sut.take(() -> false)).containsSame(current);
+    }
+
+    @ParameterizedTest
+    @EnumSource(
+            value = Mailbox.Kind.class,
+            names = {"DELIVERY_READY", "SEND_CAPACITY", "SUBSCRIPTION_CLOSE"}
+    )
+    void client_wakes_survive_connection_end_and_rearm_before_their_action(Mailbox.Kind kind)
+            throws Exception {
+        // Arrange: every ordinary admission class is full, even while disconnected.
+        var sut = new Mailbox(0, 0, 0, 0, 0);
+        var first = new Mailbox.Event(0, () -> { }, kind, 0);
+        var next = new Mailbox.Event(0, () -> { }, kind, 0);
+        assertThat(sut.offer(first)).isEqualTo(ACCEPTED);
+        sut.activate(1);
+        for (int i = 0; i < 300; i++) {
+            assertThat(sut.offer(next)).isEqualTo(ACCEPTED);
+        }
+
+        // Act: ending one connection and starting another must not lose the pending wake.
+        sut.discard(1);
+        assertThat(sut.offer(next)).isEqualTo(ACCEPTED);
+        sut.activate(2);
+
+        // Assert: duplicates kept the first action and taking it releases its independent slot.
+        assertThat(sut.size()).isEqualTo(1);
+        assertThat(sut.take(() -> false)).containsSame(first);
+        assertThat(sut.offer(next)).isEqualTo(ACCEPTED);
+        assertThat(sut.take(() -> false)).containsSame(next);
+        assertThat(sut.size()).isZero();
+
+        // Act & Assert: closing the client clears the wake and its marker as well.
+        assertThat(sut.offer(first)).isEqualTo(ACCEPTED);
+        sut.discard(0);
+        assertThat(sut.size()).isZero();
+        assertThat(sut.offer(next)).isEqualTo(ACCEPTED);
+        assertThat(sut.take(() -> false)).containsSame(next);
     }
 
     @Test
