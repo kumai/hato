@@ -81,13 +81,12 @@ final class SessionCore {
 
         void complete(long operation, @Nullable Object result, @Nullable Throwable failure);
 
-        boolean registerSubscription(long generation, long id);
+        boolean registerSubscription(long id);
 
         Subscription subscribed(long id, Qos granted);
 
         boolean deliver(
-                long generation,
-                long token,
+                DeliveryToken token,
                 List<Long> ids,
                 MqttMessage message,
                 boolean dup,
@@ -353,7 +352,7 @@ final class SessionCore {
         subscriptions.put(operation, local);
         subscribing.put(id, local);
         // Registration precedes send: a broker may publish before sending SUBACK.
-        if (!port.registerSubscription(generation, operation)) {
+        if (!port.registerSubscription(operation)) {
             subscribing.remove(id);
             subscriptions.remove(operation);
             packetIds.release(id);
@@ -575,13 +574,19 @@ final class SessionCore {
         var message = new MqttMessage(
                 publish.topic(), publish.payload(), publish.qos(), publish.retain()
         );
-        if (!port.deliver(generation, token, matches, message, publish.dup(), bytes)) {
+        if (!port.deliver(new DeliveryToken(generation, token),
+                matches, message, publish.dup(), bytes)) {
             failed(generation, new MqttCapacityException("Delivery capacity"));
         }
     }
 
     void deliveryReady(long token) {
         deliveriesReady(List.of(token));
+    }
+
+    /// QoS 0 and already acknowledged deliveries have no entry in the receive table.
+    void deliveryFailed(DeliveryToken token, Throwable cause) {
+        failed(token.connection(), cause);
     }
 
     /// Tokens belong to the client lifetime; only entries still in the receive table can advance.

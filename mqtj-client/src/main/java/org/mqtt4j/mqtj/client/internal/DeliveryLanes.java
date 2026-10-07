@@ -54,7 +54,7 @@ final class DeliveryLanes {
 
     private final long byteLimit;
 
-    private final BiConsumer<Long, Throwable> onFailure;
+    private final BiConsumer<DeliveryToken, Throwable> onFailure;
 
     private final Runnable onReady;
 
@@ -69,7 +69,7 @@ final class DeliveryLanes {
     DeliveryLanes(
             String clientId,
             long byteLimit,
-            BiConsumer<Long, Throwable> onFailure,
+            BiConsumer<DeliveryToken, Throwable> onFailure,
             Runnable onReady
     ) {
         this.clientId = clientId;
@@ -78,19 +78,18 @@ final class DeliveryLanes {
         this.onReady = onReady;
     }
 
-    boolean register(long generation, long id, Subscribe request, Consumer<MqttDelivery> handler) {
-        return registerLane(generation, id, request, handler).isPresent();
+    boolean register(long id, Subscribe request, Consumer<MqttDelivery> handler) {
+        return registerLane(id, request, handler).isPresent();
     }
 
-    Optional<Receiver> registerPull(long generation, long id, Subscribe request) {
+    Optional<Receiver> registerPull(long id, Subscribe request) {
         if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
             throw new IllegalArgumentException("A pull subscription has no handler to acknowledge");
         }
-        return registerLane(generation, id, request, null).map(Receiver::new);
+        return registerLane(id, request, null).map(Receiver::new);
     }
 
     private Optional<Lane> registerLane(
-            long generation,
             long id,
             Subscribe request,
             @Nullable Consumer<MqttDelivery> handler
@@ -104,7 +103,6 @@ final class DeliveryLanes {
                 throw new IllegalStateException("Subscription lane is already registered: " + id);
             }
             var lane = new Lane(
-                    generation,
                     id,
                     request.bufferCapacity(),
                     request.ackMode().orElse(
@@ -204,10 +202,8 @@ final class DeliveryLanes {
     }
 
     /// Reserves every matching lane together so overload cannot deliver only part of a fan-out.
-    /// Token zero is QoS 0; other tokens are unique for the client's lifetime.
     boolean deliver(
-            long generation,
-            long token,
+            DeliveryToken token,
             List<Long> ids,
             MqttMessage message,
             boolean dup,
@@ -221,8 +217,7 @@ final class DeliveryLanes {
                 Lane lane = lanes.get(id);
                 // A paused lane awaits removal. It holds QoS 1 until UNSUBACK abandons it or a
                 // refused removal resumes it; QoS 0 is dropped as at-most-once delivery allows.
-                if (lane != null && lane.generation == generation
-                        && (!lane.paused || token != 0)) {
+                if (lane != null && (!lane.paused || token.acknowledgement() != 0)) {
                     if (lane.retained >= lane.capacity) {
                         return false;
                     }
@@ -238,15 +233,15 @@ final class DeliveryLanes {
                 var delivery = new RetainedDelivery(
                         token, message, dup, bytes, recipients.size()
                 );
-                if (token != 0) {
-                    acknowledging.put(token, delivery);
+                if (token.acknowledgement() != 0) {
+                    acknowledging.put(token.acknowledgement(), delivery);
                 }
                 retainedBytes += bytes;
                 retainedDeliveries += recipients.size();
                 for (Lane lane : recipients) {
                     var view = new DeliveryView(delivery, lane);
                     view.held = lane.paused;
-                    if (token != 0 && lane.ackMode == AckMode.MANUAL) {
+                    if (token.acknowledgement() != 0 && lane.ackMode == AckMode.MANUAL) {
                         view.acknowledgement = () -> acknowledge(view);
                     }
                     delivery.views.add(view);
@@ -254,13 +249,13 @@ final class DeliveryLanes {
                     lane.queue.addLast(view);
                     lane.ready.signal();
                 }
-            } else if (token != 0) {
-                readyTokens.addLast(token);
+            } else if (token.acknowledgement() != 0) {
+                readyTokens.addLast(token.acknowledgement());
             }
         } finally {
             lock.unlock();
         }
-        if (empty && token != 0) {
+        if (empty && token.acknowledgement() != 0) {
             onReady.run();
         }
         return true;
@@ -345,17 +340,6 @@ final class DeliveryLanes {
             while (runNext(lane)) {
                 // Each call drops its delivery reference before the next wait.
             }
-        } catch (Throwable failure) {
-            lock.lock();
-            try {
-                stopFailed(lane);
-            } finally {
-                lock.unlock();
-            }
-            reportFailure(lane, failure);
-            if (failure instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
         } finally {
             lock.lock();
             try {
@@ -366,13 +350,14 @@ final class DeliveryLanes {
         }
     }
 
-    private boolean runNext(Lane lane) throws InterruptedException {
+    private boolean runNext(Lane lane) {
         DeliveryView view;
         boolean ready;
         lock.lock();
         try {
             while (!lane.stopped && !lane.hasDelivery()) {
-                lane.ready.await();
+                // The private worker ends through stop(), which signals this condition.
+                lane.ready.awaitUninterruptibly();
             }
             if (lane.stopped) {
                 return false;
@@ -388,6 +373,20 @@ final class DeliveryLanes {
                 onReady.run();
             }
             requireNonNull(lane.handler).accept(view);
+            // Clear handler-owned interrupt state before the next delivery or queue wait.
+            Thread.interrupted();
+            lock.lock();
+            try {
+                view.localDone = true;
+                ready = lane.ackMode == AckMode.AFTER_HANDLER && markReady(view);
+                releaseView(view);
+            } finally {
+                lock.unlock();
+            }
+            if (ready) {
+                onReady.run();
+            }
+            return true;
         } catch (Throwable failure) {
             lock.lock();
             try {
@@ -400,23 +399,9 @@ final class DeliveryLanes {
             } finally {
                 lock.unlock();
             }
-            reportFailure(lane, failure);
+            reportFailure(lane.id, view.delivery.token, failure);
             return false;
         }
-        // Clear handler-owned interrupt state before the next delivery or queue wait.
-        Thread.interrupted();
-        lock.lock();
-        try {
-            view.localDone = true;
-            ready = lane.ackMode == AckMode.AFTER_HANDLER && markReady(view);
-            releaseView(view);
-        } finally {
-            lock.unlock();
-        }
-        if (ready) {
-            onReady.run();
-        }
-        return true;
     }
 
     private void acknowledge(DeliveryView view) {
@@ -436,26 +421,27 @@ final class DeliveryLanes {
     /// Caller holds lock. A recipient's condition is independent from its handler lifetime.
     private boolean markReady(DeliveryView view) {
         RetainedDelivery delivery = view.delivery;
-        if (delivery.token != 0 && !view.ready && !delivery.retired && !delivery.released) {
+        if (delivery.token.acknowledgement() != 0
+                && !view.ready && !delivery.retired && !delivery.released) {
             view.ready = true;
             view.acknowledgement = null;
             if (--delivery.pending == 0) {
-                readyTokens.addLast(delivery.token);
+                readyTokens.addLast(delivery.token.acknowledgement());
                 return true;
             }
         }
         return false;
     }
 
-    private void reportFailure(Lane lane, Throwable failure) {
+    private void reportFailure(long id, DeliveryToken token, Throwable failure) {
         try {
             log.warn("Delivery lane failed for {} (subscription {}, generation {})",
-                    clientId, lane.id, lane.generation, failure);
+                    clientId, id, token.connection(), failure);
         } catch (Throwable _) {
             // A logging backend must not replace the original failure or suppress notification.
         }
         try {
-            onFailure.accept(lane.generation, failure);
+            onFailure.accept(token, failure);
         } catch (Throwable callbackFailure) {
             try {
                 log.warn("Delivery failure notification failed for {}", clientId, callbackFailure);
@@ -514,7 +500,7 @@ final class DeliveryLanes {
             delivery.views.remove(view);
             if (delivery.views.isEmpty()) {
                 retainedBytes -= delivery.bytes;
-                acknowledging.remove(delivery.token, delivery);
+                acknowledging.remove(delivery.token.acknowledgement(), delivery);
             }
         }
     }
@@ -585,7 +571,6 @@ final class DeliveryLanes {
 
     private static final class Lane {
 
-        final long generation;
         final long id;
         final int capacity;
         final AckMode ackMode;
@@ -598,14 +583,12 @@ final class DeliveryLanes {
         @Nullable Throwable failure;
 
         Lane(
-                long generation,
                 long id,
                 int capacity,
                 AckMode ackMode,
                 @Nullable Consumer<MqttDelivery> handler,
                 Condition ready
         ) {
-            this.generation = generation;
             this.id = id;
             this.capacity = capacity;
             this.ackMode = ackMode;
@@ -621,7 +604,7 @@ final class DeliveryLanes {
 
     private static final class RetainedDelivery {
 
-        final long token;
+        final DeliveryToken token;
         final MqttMessage message;
         final boolean dup;
         final int bytes;
@@ -631,7 +614,7 @@ final class DeliveryLanes {
         boolean retired;
 
         RetainedDelivery(
-                long token,
+                DeliveryToken token,
                 MqttMessage message,
                 boolean dup,
                 int bytes,
@@ -642,7 +625,7 @@ final class DeliveryLanes {
             this.dup = dup;
             this.bytes = bytes;
             pending = recipients;
-            released = token == 0;
+            released = token.acknowledgement() == 0;
         }
     }
 

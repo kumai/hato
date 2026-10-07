@@ -71,11 +71,11 @@ class DeliveryLanesTest {
             throws Exception {
         // Arrange
         DeliveryLanes.Receiver receiver = sut.registerPull(
-                1, 1, request(AckMode.MANUAL, 2)
+                1, request(AckMode.MANUAL, 2)
         ).orElseThrow();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         MqttDelivery handedOff = received(receiver.receive());
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isTrue();
         var failure = new IOException("Connection ended");
 
         // Act
@@ -90,9 +90,9 @@ class DeliveryLanesTest {
         assertThatThrownBy(receiver::receive)
                 .isInstanceOf(MqttConnectionLostException.class).hasCause(failure);
         DeliveryLanes.Receiver fresh = sut.registerPull(
-                2, 2, request(AckMode.MANUAL, 1)
+                2, request(AckMode.MANUAL, 1)
         ).orElseThrow();
-        assertThat(sut.deliver(2, 12, List.of(2L), qosOneMessage(), false, 30)).isTrue();
+        assertThat(sut.deliver(token(2, 12), List.of(2L), qosOneMessage(), false, 30)).isTrue();
         MqttDelivery current = received(fresh.receive());
         handedOff.ack();
         assertThat(ready).isEmpty();
@@ -105,8 +105,8 @@ class DeliveryLanesTest {
     @Test
     void normal_connection_end_discards_pull_buffers_and_ends_receiving() throws Exception {
         // Arrange
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(1)).orElseThrow();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 10)).isTrue();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(1)).orElseThrow();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
 
         // Act
         sut.close(null);
@@ -121,8 +121,8 @@ class DeliveryLanesTest {
     @Test
     void pulling_releases_local_capacity_before_the_wire_ack_is_admitted() throws Exception {
         // Arrange
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(1)).orElseThrow();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(1)).orElseThrow();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
 
         // Act
         MqttDelivery first = received(receiver.receive(Duration.ZERO));
@@ -133,7 +133,7 @@ class DeliveryLanesTest {
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
         assertThat(sut.acknowledgingDeliveries()).isZero();
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isTrue();
         sut.release(10);
         first.ack();
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
@@ -146,32 +146,32 @@ class DeliveryLanesTest {
             throws Exception {
         // Arrange
         DeliveryLanes.Receiver receiver = sut.registerPull(
-                1, 1, request(AckMode.MANUAL, 1)
+                1, request(AckMode.MANUAL, 1)
         ).orElseThrow();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
 
         // Act & Assert
         MqttDelivery delivery = received(receiver.receive());
         assertThat(ready).isEmpty();
         assertThat(sut.retainedBytes()).isEqualTo(10);
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isFalse();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isFalse();
         delivery.ack();
         delivery.ack();
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(ready).isEmpty();
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isTrue();
     }
 
     @Test
     void overlapping_push_and_pull_views_share_bytes_but_have_independent_ack_conditions()
             throws Exception {
         // Arrange
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(1)).orElseThrow();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(1)).orElseThrow();
         var pushed = new LinkedBlockingQueue<MqttDelivery>();
-        assertThat(sut.register(1, 2, request(AckMode.MANUAL, 1), pushed::add)).isTrue();
-        assertThat(sut.deliver(1, 10, List.of(1L, 2L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.register(2, request(AckMode.MANUAL, 1), pushed::add)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L), qosOneMessage(), false, 10)).isTrue();
         MqttDelivery push = requireNonNull(pushed.poll(5, SECONDS));
 
         // Act
@@ -192,15 +192,15 @@ class DeliveryLanesTest {
     void pulling_respects_the_shared_byte_limit_and_reuses_it_after_handoff() throws Exception {
         // Arrange
         DeliveryLanes sut = lanes(10);
-        DeliveryLanes.Receiver first = sut.registerPull(1, 1, request(8)).orElseThrow();
-        DeliveryLanes.Receiver second = sut.registerPull(1, 2, request(8)).orElseThrow();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 6)).isTrue();
+        DeliveryLanes.Receiver first = sut.registerPull(1, request(8)).orElseThrow();
+        DeliveryLanes.Receiver second = sut.registerPull(2, request(8)).orElseThrow();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 6)).isTrue();
 
         // Act & Assert: per-subscription slots remain, but shared bytes are exhausted.
-        assertThat(sut.deliver(1, 11, List.of(2L), qosOneMessage(), false, 6)).isFalse();
+        assertThat(sut.deliver(token(1, 11), List.of(2L), qosOneMessage(), false, 6)).isFalse();
         assertThat(sut.retainedBytes()).isEqualTo(6);
         assertThat(first.receive()).isInstanceOf(ReceiveResult.Received.class);
-        assertThat(sut.deliver(1, 11, List.of(2L), qosOneMessage(), false, 6)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(2L), qosOneMessage(), false, 6)).isTrue();
         assertThat(second.receive()).isInstanceOf(ReceiveResult.Received.class);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
@@ -209,14 +209,14 @@ class DeliveryLanesTest {
     @Test
     void pull_timeouts_and_interrupts_do_not_consume_the_next_delivery() throws Exception {
         // Arrange
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(1)).orElseThrow();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(1)).orElseThrow();
 
         // Act & Assert
         assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
         assertThat(receiver.receive(Duration.ofMillis(10))).isEqualTo(new ReceiveResult.TimedOut());
         assertThatThrownBy(() -> receiver.receive(Duration.ofNanos(-1)))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
         Thread.currentThread().interrupt();
         try {
             assertThatThrownBy(receiver::receive).isInstanceOf(InterruptedException.class);
@@ -232,7 +232,7 @@ class DeliveryLanesTest {
     @Test
     void a_timed_wait_reports_normal_end_without_waiting_for_its_deadline() throws Exception {
         // Arrange
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(1)).orElseThrow();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(1)).orElseThrow();
         var waiting = new FutureTask<>(() -> receiver.receive(Duration.ofMinutes(5)));
         Thread worker = Thread.ofVirtual().start(waiting);
         try {
@@ -252,7 +252,7 @@ class DeliveryLanesTest {
     @Test
     void waiting_receivers_share_deliveries_and_all_end_when_closed() throws Exception {
         // Arrange
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(256)).orElseThrow();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(256)).orElseThrow();
         var received = new LinkedBlockingQueue<MqttMessage>();
         var jobs = new ArrayList<FutureTask<Void>>();
         var workers = new ArrayList<Thread>();
@@ -275,7 +275,7 @@ class DeliveryLanesTest {
 
             // Act
             for (int i = 0; i < 256; i++) {
-                assertThat(sut.deliver(1, 0, List.of(1L), message(i), false, 1)).isTrue();
+                assertThat(sut.deliver(token(1, 0), List.of(1L), message(i), false, 1)).isTrue();
             }
 
             // Assert: one receiver takes each item, and close ends every loop normally.
@@ -294,12 +294,12 @@ class DeliveryLanesTest {
     @Test
     void a_paused_pull_lane_holds_qos_one_until_a_refused_removal_resumes_it() throws Exception {
         // Arrange: the pull subscription is awaiting removal.
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(2)).orElseThrow();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(2)).orElseThrow();
         sut.pause(1);
 
         // Act
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
 
         // Assert: QoS 1 is held without acknowledgement, and QoS 0 is dropped.
         assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
@@ -316,10 +316,10 @@ class DeliveryLanesTest {
     @Test
     void resuming_a_paused_pull_lane_wakes_every_waiting_receiver() throws Exception {
         // Arrange: two receivers wait while the paused lane holds two QoS 1 deliveries.
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(2)).orElseThrow();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(2)).orElseThrow();
         sut.pause(1);
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         var jobs = new ArrayList<FutureTask<ReceiveResult>>();
         var workers = new ArrayList<Thread>();
         try {
@@ -347,9 +347,9 @@ class DeliveryLanesTest {
     void removing_a_paused_pull_lane_abandons_held_qos_one_without_handing_it_off()
             throws Exception {
         // Arrange
-        DeliveryLanes.Receiver receiver = sut.registerPull(1, 1, request(1)).orElseThrow();
+        DeliveryLanes.Receiver receiver = sut.registerPull(1, request(1)).orElseThrow();
         sut.pause(1);
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
 
         // Act: UNSUBACK removes the lane.
         sut.remove(1);
@@ -368,7 +368,7 @@ class DeliveryLanesTest {
         var entered = new LinkedBlockingQueue<MqttDelivery>();
         var virtual = new AtomicBoolean();
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(2), delivery -> {
+        assertThat(sut.register(1, request(2), delivery -> {
             virtual.set(Thread.currentThread().isVirtual());
             entered.add(delivery);
             waitFor(release);
@@ -377,10 +377,10 @@ class DeliveryLanesTest {
         MqttMessage second = message(2);
 
         // Act & Assert: a running handler consumes one of the two per-subscription slots.
-        assertThat(sut.deliver(1, 0, List.of(1L), first, false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), first, false, 10)).isTrue();
         assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(first);
-        assertThat(sut.deliver(1, 0, List.of(1L), second, false, 20)).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(3), false, 30)).isFalse();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), second, false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(3), false, 30)).isFalse();
 
         // Assert: the second handler waits for the first, with both reservations retained.
         assertThat(virtual.get()).isTrue();
@@ -405,14 +405,14 @@ class DeliveryLanesTest {
         // Arrange: each handler leaves the worker interrupted after returning normally.
         var workers = new LinkedBlockingQueue<Thread>();
         var interruptStates = new LinkedBlockingQueue<Boolean>();
-        assertThat(sut.register(1, 1, request(1), _ -> {
+        assertThat(sut.register(1, request(1), _ -> {
             interruptStates.add(Thread.currentThread().isInterrupted());
             workers.add(Thread.currentThread());
             Thread.currentThread().interrupt();
         })).isTrue();
 
         // Act
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
 
         // Assert: the worker stays alive and waits for another delivery without reporting failure.
         Thread worker = requireNonNull(workers.poll(5, SECONDS));
@@ -427,7 +427,7 @@ class DeliveryLanesTest {
         assertThat(failures).isEmpty();
 
         // Act & Assert: delivery resumes after the idle wait with a clear interrupt state.
-        assertThat(sut.deliver(1, 0, List.of(1L), message(2), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 10)).isTrue();
         assertThat(workers.poll(5, SECONDS)).isSameAs(worker);
         assertThat(interruptStates.poll(5, SECONDS)).isFalse();
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
@@ -442,7 +442,7 @@ class DeliveryLanesTest {
         CountDownLatch release = release();
         var first = new AtomicBoolean(true);
         var interruptStates = new LinkedBlockingQueue<Boolean>();
-        assertThat(sut.register(1, 1, request(2), _ -> {
+        assertThat(sut.register(1, request(2), _ -> {
             interruptStates.add(Thread.currentThread().isInterrupted());
             if (first.getAndSet(false)) {
                 entered.countDown();
@@ -450,10 +450,10 @@ class DeliveryLanesTest {
                 Thread.currentThread().interrupt();
             }
         })).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
         assertThat(entered.await(5, SECONDS)).isTrue();
         assertThat(interruptStates.poll(5, SECONDS)).isFalse();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(2), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 20)).isTrue();
 
         // Act: returning the first handler dispatches the queued delivery without an idle wait.
         release.countDown();
@@ -472,13 +472,13 @@ class DeliveryLanesTest {
         Set<Thread> workers = ConcurrentHashMap.newKeySet();
         List<Long> ids = List.of(1L, 2L, 3L);
         for (long id : ids) {
-            assertThat(sut.register(1, id, request(1), _ -> {
+            assertThat(sut.register(id, request(1), _ -> {
                 workers.add(Thread.currentThread());
                 entered.add(id);
             })).isTrue();
         }
 
-        assertThat(sut.deliver(1, 0, ids, message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), ids, message(1), false, 10)).isTrue();
         var first = new ArrayList<Long>();
         for (int i = 0; i < ids.size(); i++) {
             first.add(requireNonNull(entered.poll(5, SECONDS)));
@@ -497,9 +497,9 @@ class DeliveryLanesTest {
         await().untilAsserted(() -> assertThat(sut.retainedLanes()).isEqualTo(2));
 
         // Act & Assert: each surviving recipient wakes independently.
-        assertThat(sut.deliver(1, 0, List.of(3L), message(2), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(3L), message(2), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isEqualTo(3L);
-        assertThat(sut.deliver(1, 0, List.of(1L, 2L), message(3), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L, 2L), message(3), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isEqualTo(1L);
         assertThat(entered).isEmpty();
         assertThat(sut.abandonedDeliveries()).isZero();
@@ -510,22 +510,22 @@ class DeliveryLanesTest {
         // Arrange: the first lane is full and the second lane is empty.
         var entered = new LinkedBlockingQueue<Long>();
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(1), _ -> {
+        assertThat(sut.register(1, request(1), _ -> {
             entered.add(1L);
             waitFor(release);
         })).isTrue();
-        assertThat(sut.register(1, 2, request(1), _ -> entered.add(2L))).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.register(2, request(1), _ -> entered.add(2L))).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isEqualTo(1L);
 
         // Act & Assert: discovering the full lane second does not reserve the empty one.
-        assertThat(sut.deliver(1, 0, List.of(2L, 1L), message(2), false, 20)).isFalse();
+        assertThat(sut.deliver(token(1, 0), List.of(2L, 1L), message(2), false, 20)).isFalse();
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(10);
         assertThat(entered).isEmpty();
 
         // Act & Assert: refusing the fan-out leaves the empty lane's capacity available.
-        assertThat(sut.deliver(1, 0, List.of(2L), message(3), false, 30)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(3), false, 30)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isEqualTo(2L);
     }
 
@@ -535,15 +535,16 @@ class DeliveryLanesTest {
         var entered = new CountDownLatch(2);
         CountDownLatch firstRelease = release();
         CountDownLatch secondRelease = release();
-        assertThat(sut.register(1, 1, request(2), _ -> {
+        assertThat(sut.register(1, request(2), _ -> {
             entered.countDown();
             waitFor(firstRelease);
         })).isTrue();
-        assertThat(sut.register(1, 2, request(2), _ -> {
+        assertThat(sut.register(2, request(2), _ -> {
             entered.countDown();
             waitFor(secondRelease);
         })).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L, 2L), message(1), false, BYTE_LIMIT)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L, 2L), message(1), false, BYTE_LIMIT))
+                .isTrue();
         assertThat(entered.await(5, SECONDS)).isTrue();
 
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
@@ -553,12 +554,12 @@ class DeliveryLanesTest {
         firstRelease.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isEqualTo(1));
         assertThat(sut.retainedBytes()).isEqualTo(BYTE_LIMIT);
-        assertThat(sut.deliver(1, 0, List.of(1L), message(2), false, 1)).isFalse();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 1)).isFalse();
 
         // Act & Assert: the last handler returns the shared capacity.
         secondRelease.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
-        assertThat(sut.deliver(1, 0, List.of(1L), message(2), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 1)).isTrue();
     }
 
     @Test
@@ -566,14 +567,14 @@ class DeliveryLanesTest {
         // Arrange
         DeliveryLanes sut = lanes(BYTE_LIMIT + 1);
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(2), _ -> waitFor(release))).isTrue();
+        assertThat(sut.register(1, request(2), _ -> waitFor(release))).isTrue();
 
         // Act & Assert: rejection preserves capacity for a packet at the configured limit.
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, BYTE_LIMIT + 2))
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, BYTE_LIMIT + 2))
                 .isFalse();
         assertThat(sut.retainedBytes()).isZero();
         assertThat(sut.retainedDeliveries()).isZero();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, BYTE_LIMIT + 1))
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, BYTE_LIMIT + 1))
                 .isTrue();
     }
 
@@ -582,17 +583,17 @@ class DeliveryLanesTest {
         // Arrange: one handler is running and another delivery is queued.
         var entered = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(2), delivery -> {
+        assertThat(sut.register(1, request(2), delivery -> {
             entered.add(delivery);
             waitFor(release);
         })).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isNotNull();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(2), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 20)).isTrue();
 
         // Act & Assert: pausing rejects new work without discarding the existing deliveries.
         sut.pause(1);
-        assertThat(sut.deliver(1, 0, List.of(1L, 999L), message(3), false, 30)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L, 999L), message(3), false, 30)).isTrue();
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
         release.countDown();
         assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(2));
@@ -600,7 +601,7 @@ class DeliveryLanesTest {
 
         // Act & Assert: rolling back the pause permits another delivery.
         sut.resume(1);
-        assertThat(sut.deliver(1, 0, List.of(1L), message(4), false, 40)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(4), false, 40)).isTrue();
         assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(4));
         assertThat(sut.abandonedDeliveries()).isZero();
     }
@@ -610,14 +611,14 @@ class DeliveryLanesTest {
         // Arrange: keep one handler running with two deliveries queued behind it.
         var entered = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(3), delivery -> {
+        assertThat(sut.register(1, request(3), delivery -> {
             entered.add(delivery);
             waitFor(release);
         })).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isNotNull();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(2), false, 20)).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(3), false, 30)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(3), false, 30)).isTrue();
 
         // Act
         sut.remove(1);
@@ -636,28 +637,27 @@ class DeliveryLanesTest {
     }
 
     @Test
-    void connection_end_retains_running_bytes_and_ignores_stale_generations() throws Exception {
+    void connection_end_retains_running_bytes_until_old_handlers_finish() throws Exception {
         // Arrange: one handler retains the entire byte budget.
         var entered = new CountDownLatch(1);
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(2), _ -> {
+        assertThat(sut.register(1, request(2), _ -> {
             entered.countDown();
             waitFor(release);
         })).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, BYTE_LIMIT)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, BYTE_LIMIT)).isTrue();
         assertThat(entered.await(5, SECONDS)).isTrue();
 
         // Act & Assert: a new generation cannot reuse the old handler's byte reservation.
         sut.close(null);
-        assertThat(sut.register(2, 2, request(2), _ -> { })).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(2L), message(2), false, 1)).isTrue();
-        assertThat(sut.deliver(2, 0, List.of(2L), message(2), false, 1)).isFalse();
+        assertThat(sut.register(2, request(2), _ -> { })).isTrue();
+        assertThat(sut.deliver(token(2, 0), List.of(2L), message(2), false, 1)).isFalse();
         assertThat(sut.retainedBytes()).isEqualTo(BYTE_LIMIT);
 
         // Act & Assert: returning the old handler permits delivery in the new generation.
         release.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
-        assertThat(sut.deliver(2, 0, List.of(2L), message(2), false, 1)).isTrue();
+        assertThat(sut.deliver(token(2, 0), List.of(2L), message(2), false, 1)).isTrue();
     }
 
     @Test
@@ -665,17 +665,17 @@ class DeliveryLanesTest {
         // Arrange: fill the delivery budget behind one running handler.
         var entered = new CountDownLatch(1);
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(70_000), _ -> {
+        assertThat(sut.register(1, request(70_000), _ -> {
             entered.countDown();
             waitFor(release);
         })).isTrue();
         for (int i = 0; i < 65_536; i++) {
-            assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 1)).isTrue();
+            assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
         }
         assertThat(entered.await(5, SECONDS)).isTrue();
 
         // Act & Assert: the global limit applies even though the lane has spare capacity.
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 1)).isFalse();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isFalse();
         assertThat(sut.retainedDeliveries()).isEqualTo(65_536);
 
         // Act
@@ -693,23 +693,23 @@ class DeliveryLanesTest {
         var entered = new CountDownLatch(256);
         CountDownLatch release = release();
         for (long id = 1; id <= 256; id++) {
-            assertThat(sut.register(1, id, request(1), _ -> {
+            assertThat(sut.register(id, request(1), _ -> {
                 entered.countDown();
                 waitFor(release);
             })).isTrue();
-            assertThat(sut.deliver(1, 0, List.of(id), message(1), false, 1)).isTrue();
+            assertThat(sut.deliver(token(1, 0), List.of(id), message(1), false, 1)).isTrue();
         }
         assertThat(entered.await(5, SECONDS)).isTrue();
 
         // Act & Assert: closing does not release thread reservations for running handlers.
         sut.close(null);
         assertThat(sut.retainedLanes()).isEqualTo(256);
-        assertThat(sut.register(2, 257, request(1), _ -> { })).isFalse();
+        assertThat(sut.register(257, request(1), _ -> { })).isFalse();
 
         // Act & Assert: returning the handlers permits a new lane.
         release.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
-        assertThat(sut.register(2, 257, request(1), _ -> { })).isTrue();
+        assertThat(sut.register(257, request(1), _ -> { })).isTrue();
     }
 
     @Test
@@ -720,29 +720,89 @@ class DeliveryLanesTest {
         var cause = new AssertionError("application failure");
         var calls = new AtomicInteger();
         CountDownLatch release = release();
-        assertThat(sut.register(7, 1, request(2), _ -> {
+        assertThat(sut.register(1, request(2), _ -> {
             calls.incrementAndGet();
             entered.countDown();
             waitFor(release);
             Thread.currentThread().interrupt();
             throw cause;
         })).isTrue();
-        assertThat(sut.deliver(7, 0, List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(7, 0), List.of(1L), message(1), false, 10)).isTrue();
         assertThat(entered.await(5, SECONDS)).isTrue();
-        assertThat(sut.deliver(7, 0, List.of(1L), message(2), false, 20)).isTrue();
+        assertThat(sut.deliver(token(7, 0), List.of(1L), message(2), false, 20)).isTrue();
 
         // Act
         release.countDown();
 
         // Assert
         Failure failure = requireNonNull(failures.poll(5, SECONDS));
-        assertThat(failure.generation()).isEqualTo(7);
+        assertThat(failure.token().connection()).isEqualTo(7);
         assertThat(failure.cause()).isSameAs(cause);
         await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
         assertThat(sut.abandonedDeliveries()).isEqualTo(2);
         assertThat(calls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void a_failure_after_connection_end_keeps_its_origin_and_releases_the_lane() throws Exception {
+        // Arrange: the handler outlives the connection that received its QoS 0 delivery.
+        var workers = new LinkedBlockingQueue<Thread>();
+        CountDownLatch release = release();
+        var cause = new IllegalStateException("old handler failed");
+        assertThat(sut.register(1, request(1), _ -> {
+            workers.add(Thread.currentThread());
+            waitFor(release);
+            throw cause;
+        })).isTrue();
+        assertThat(sut.deliver(token(7, 0), List.of(1L), message(1), false, 10)).isTrue();
+        Thread worker = requireNonNull(workers.poll(5, SECONDS));
+        sut.close(null);
+        assertThat(sut.retainedLanes()).isEqualTo(1);
+
+        // Act
+        release.countDown();
+        assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+
+        // Assert: the callback retains the receipt's origin without retaining its resources.
+        assertThat(failures.poll(5, SECONDS)).isEqualTo(new Failure(token(7, 0), cause));
+        assertThat(sut.retainedLanes()).isZero();
+        assertThat(sut.retainedDeliveries()).isZero();
+        assertThat(sut.retainedBytes()).isZero();
+        assertThat(ready).isEmpty();
+    }
+
+    @Test
+    void failure_uses_the_receiving_connection_after_the_acknowledgement_is_released()
+            throws Exception {
+        // Arrange: a lane itself has no connection; its second delivery fails after PUBACK.
+        var received = new LinkedBlockingQueue<MqttDelivery>();
+        var cause = new IllegalStateException("failed after PUBACK");
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(AckMode.MANUAL, 2), delivery -> {
+            received.add(delivery);
+            if (delivery.message().qos() == Qos.AT_LEAST_ONCE) {
+                waitFor(release);
+                throw cause;
+            }
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
+        assertThat(received.poll(5, SECONDS)).isNotNull();
+        assertThat(sut.deliver(token(2, 10), List.of(1L), qosOneMessage(), false, 1)).isTrue();
+        requireNonNull(received.poll(5, SECONDS)).ack();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        sut.release(10);
+        assertThat(sut.acknowledgingDeliveries()).isZero();
+
+        // Act
+        release.countDown();
+
+        // Assert: the failure still names the second delivery's origin and original cause.
+        assertThat(failures.poll(5, SECONDS))
+                .isEqualTo(new Failure(token(2, 10), cause));
+        await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
+        assertThat(sut.retainedBytes()).isZero();
     }
 
     @Test
@@ -774,16 +834,16 @@ class DeliveryLanesTest {
         jul.setLevel(Level.WARNING);
         jul.setUseParentHandlers(false);
         try {
-            assertThat(sut.register(7, 1, request(1), _ -> {
+            assertThat(sut.register(1, request(1), _ -> {
                 throw cause;
             })).isTrue();
 
             // Act
-            assertThat(sut.deliver(7, 0, List.of(1L), message(1), false, 10)).isTrue();
+            assertThat(sut.deliver(token(7, 0), List.of(1L), message(1), false, 10)).isTrue();
 
             // Assert: the original cause is reported once and all reservations are released.
             Failure failure = requireNonNull(failures.poll(5, SECONDS));
-            assertThat(failure.generation()).isEqualTo(7);
+            assertThat(failure.token().connection()).isEqualTo(7);
             assertThat(failure.cause()).isSameAs(cause);
             await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
             assertThat(failures).isEmpty();
@@ -804,11 +864,11 @@ class DeliveryLanesTest {
         // Arrange: the handler returns without acknowledging its delivery.
         var received = new LinkedBlockingQueue<MqttDelivery>();
         var workers = new LinkedBlockingQueue<Thread>();
-        assertThat(sut.register(1, 1, request(AckMode.MANUAL, 1), delivery -> {
+        assertThat(sut.register(1, request(AckMode.MANUAL, 1), delivery -> {
             workers.add(Thread.currentThread());
             received.add(delivery);
         })).isTrue();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), true, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), true, 10)).isTrue();
         MqttDelivery delivery = requireNonNull(received.poll(5, SECONDS));
         Thread worker = requireNonNull(workers.poll(5, SECONDS));
         await().until(() -> worker.getState() == Thread.State.WAITING);
@@ -817,7 +877,7 @@ class DeliveryLanesTest {
         assertThat(delivery.dup()).isTrue();
         assertThat(ready).isEmpty();
         assertThat(sut.retainedBytes()).isEqualTo(10);
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 10)).isFalse();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 10)).isFalse();
 
         // Act: repeated acknowledgements represent one completed recipient condition.
         delivery.ack();
@@ -842,15 +902,15 @@ class DeliveryLanesTest {
         var received = new LinkedBlockingQueue<MqttDelivery>();
         var acknowledgementsAtEntry = new LinkedBlockingQueue<Integer>();
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(AckMode.ON_RECEIVE, 2), delivery -> {
+        assertThat(sut.register(1, request(AckMode.ON_RECEIVE, 2), delivery -> {
             acknowledgementsAtEntry.add(ready.size());
             received.add(delivery);
             delivery.ack();
             waitFor(release);
         })).isTrue();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         assertThat(received.poll(5, SECONDS)).isNotNull();
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isTrue();
 
         // Assert: the queued message is not yet acknowledged, and explicit ack is a no-op.
         assertThat(acknowledgementsAtEntry.poll(5, SECONDS)).isEqualTo(1);
@@ -878,19 +938,19 @@ class DeliveryLanesTest {
         var received = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch receiveRelease = release();
         CountDownLatch handlerRelease = release();
-        assertThat(sut.register(1, 1, request(AckMode.ON_RECEIVE, 1), delivery -> {
+        assertThat(sut.register(1, request(AckMode.ON_RECEIVE, 1), delivery -> {
             received.add(delivery);
             waitFor(receiveRelease);
         })).isTrue();
-        assertThat(sut.register(1, 2, request(AckMode.AFTER_HANDLER, 1), delivery -> {
+        assertThat(sut.register(2, request(AckMode.AFTER_HANDLER, 1), delivery -> {
             received.add(delivery);
             delivery.ack();
             waitFor(handlerRelease);
         })).isTrue();
         var manual = new LinkedBlockingQueue<MqttDelivery>();
-        assertThat(sut.register(1, 3, request(AckMode.MANUAL, 1), manual::add)).isTrue();
+        assertThat(sut.register(3, request(AckMode.MANUAL, 1), manual::add)).isTrue();
         MqttMessage message = qosOneMessage();
-        assertThat(sut.deliver(1, 10, List.of(1L, 2L, 3L), message, false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L, 3L), message, false, 10)).isTrue();
         MqttDelivery first = requireNonNull(received.poll(5, SECONDS));
         MqttDelivery second = requireNonNull(received.poll(5, SECONDS));
         MqttDelivery third = requireNonNull(manual.poll(5, SECONDS));
@@ -925,16 +985,16 @@ class DeliveryLanesTest {
     void completed_handlers_behind_a_sequencer_head_keep_their_delivery_budget()
             throws Exception {
         // Arrange: both handlers complete, but the sequencer releases neither receipt yet.
-        assertThat(sut.register(1, 1, request(AckMode.AFTER_HANDLER, 2), _ -> { })).isTrue();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isTrue();
+        assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 2), _ -> { })).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isTrue();
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
 
         // Act & Assert
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
         assertThat(sut.retainedBytes()).isEqualTo(30);
-        assertThat(sut.deliver(1, 12, List.of(1L), qosOneMessage(), false, 1)).isFalse();
+        assertThat(sut.deliver(token(1, 12), List.of(1L), qosOneMessage(), false, 1)).isFalse();
         sut.release(10);
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(20);
@@ -949,13 +1009,13 @@ class DeliveryLanesTest {
         // Arrange: one MANUAL delivery is running and another waits behind it.
         var received = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(AckMode.MANUAL, 2), delivery -> {
+        assertThat(sut.register(1, request(AckMode.MANUAL, 2), delivery -> {
             received.add(delivery);
             waitFor(release);
         })).isTrue();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         MqttDelivery delivery = requireNonNull(received.poll(5, SECONDS));
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isTrue();
 
         // Act: successful removal abandons only the work not yet handed to the application.
         sut.remove(1);
@@ -983,27 +1043,27 @@ class DeliveryLanesTest {
         var workers = new LinkedBlockingQueue<Thread>();
         var running = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch release = release();
-        assertThat(sut.register(1, 1, request(AckMode.MANUAL, 1), delivery -> {
+        assertThat(sut.register(1, request(AckMode.MANUAL, 1), delivery -> {
             workers.add(Thread.currentThread());
             completed.add(delivery);
         })).isTrue();
-        assertThat(sut.register(1, 2, request(AckMode.MANUAL, 1), delivery -> {
+        assertThat(sut.register(2, request(AckMode.MANUAL, 1), delivery -> {
             running.add(delivery);
             waitFor(release);
         })).isTrue();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         MqttDelivery finished = requireNonNull(completed.poll(5, SECONDS));
         Thread worker = requireNonNull(workers.poll(5, SECONDS));
         await().until(() -> worker.getState() == Thread.State.WAITING);
-        assertThat(sut.deliver(1, 11, List.of(2L), qosOneMessage(), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(2L), qosOneMessage(), false, 20)).isTrue();
         MqttDelivery executing = requireNonNull(running.poll(5, SECONDS));
 
         // Act & Assert: ending the connection releases only locally completed reservations.
         sut.close(null);
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(20);
-        assertThat(sut.register(2, 3, request(AckMode.MANUAL, 1), completed::add)).isTrue();
-        assertThat(sut.deliver(2, 12, List.of(3L), qosOneMessage(), false, 30)).isTrue();
+        assertThat(sut.register(3, request(AckMode.MANUAL, 1), completed::add)).isTrue();
+        assertThat(sut.deliver(token(2, 12), List.of(3L), qosOneMessage(), false, 30)).isTrue();
         MqttDelivery fresh = requireNonNull(completed.poll(5, SECONDS));
         finished.ack();
         executing.ack();
@@ -1018,7 +1078,7 @@ class DeliveryLanesTest {
     @Test
     void absent_recipients_do_not_leave_an_ack_obligation() throws Exception {
         // Act & Assert: zero admitted recipients still reports readiness for this QoS 1 packet.
-        assertThat(sut.deliver(1, 10, List.of(99L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(99L), qosOneMessage(), false, 10)).isTrue();
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
@@ -1028,12 +1088,12 @@ class DeliveryLanesTest {
     void a_paused_lane_keeps_qos_one_for_a_refused_removal_and_drops_qos_zero() throws Exception {
         // Arrange: the subscription is awaiting removal.
         var received = new LinkedBlockingQueue<MqttDelivery>();
-        assertThat(sut.register(1, 1, request(AckMode.AFTER_HANDLER, 2), received::add)).isTrue();
+        assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 2), received::add)).isTrue();
         sut.pause(1);
 
         // Act
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
 
         // Assert: the QoS 1 delivery keeps its acknowledgement obligation.
         assertThat(ready).isEmpty();
@@ -1053,9 +1113,9 @@ class DeliveryLanesTest {
     void removal_abandons_qos_one_held_by_a_paused_lane_without_running_it() throws Exception {
         // Arrange
         var received = new LinkedBlockingQueue<MqttDelivery>();
-        assertThat(sut.register(1, 1, request(AckMode.AFTER_HANDLER, 1), received::add)).isTrue();
+        assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 1), received::add)).isTrue();
         sut.pause(1);
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
 
         // Act: UNSUBACK removes the lane.
         sut.remove(1);
@@ -1073,16 +1133,17 @@ class DeliveryLanesTest {
     void a_failing_after_handler_does_not_ack_even_if_application_calls_ack() throws Exception {
         // Arrange
         var cause = new IllegalStateException("handler failed");
-        assertThat(sut.register(1, 1, request(AckMode.AFTER_HANDLER, 1), delivery -> {
+        assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 1), delivery -> {
             delivery.ack();
             throw cause;
         })).isTrue();
 
         // Act
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
 
         // Assert: failure notification retires the connection; it is never a successful ack.
-        assertThat(failures.poll(5, SECONDS)).isEqualTo(new Failure(1, cause));
+        assertThat(failures.poll(5, SECONDS))
+                .isEqualTo(new Failure(token(1, 10), cause));
         assertThat(ready).isEmpty();
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         sut.close(null);
@@ -1095,22 +1156,23 @@ class DeliveryLanesTest {
         var cause = new IllegalStateException("handler failed after ack");
         var completed = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch otherRelease = release();
-        assertThat(sut.register(1, 2, request(AckMode.AFTER_HANDLER, 2), delivery -> {
+        assertThat(sut.register(2, request(AckMode.AFTER_HANDLER, 2), delivery -> {
             if (delivery.message().qos() == Qos.AT_LEAST_ONCE) {
                 waitFor(otherRelease);
             }
             completed.add(delivery);
         })).isTrue();
-        assertThat(sut.register(1, 1, request(AckMode.MANUAL, 1), delivery -> {
+        assertThat(sut.register(1, request(AckMode.MANUAL, 1), delivery -> {
             delivery.ack();
             throw cause;
         })).isTrue();
 
         // Act: the other recipient finishes only after the failure.
-        assertThat(sut.deliver(1, 10, List.of(1L, 2L), qosOneMessage(), false, 10)).isTrue();
-        assertThat(failures.poll(5, SECONDS)).isEqualTo(new Failure(1, cause));
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(failures.poll(5, SECONDS))
+                .isEqualTo(new Failure(token(1, 10), cause));
         otherRelease.countDown();
-        assertThat(sut.deliver(1, 0, List.of(2L), message(1), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(1), false, 1)).isTrue();
 
         // Assert: the later QoS 0 handler runs only after the shared delivery's completion.
         assertThat(completed.poll(5, SECONDS)).isNotNull();
@@ -1124,29 +1186,30 @@ class DeliveryLanesTest {
         var cause = new IllegalStateException("handler failed");
         var entered = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch failRelease = release();
-        assertThat(sut.register(1, 1, request(AckMode.ON_RECEIVE, 2), delivery -> {
+        assertThat(sut.register(1, request(AckMode.ON_RECEIVE, 2), delivery -> {
             entered.add(delivery);
             waitFor(failRelease);
             throw cause;
         })).isTrue();
         var completed = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch otherRelease = release();
-        assertThat(sut.register(1, 2, request(AckMode.AFTER_HANDLER, 2), delivery -> {
+        assertThat(sut.register(2, request(AckMode.AFTER_HANDLER, 2), delivery -> {
             if (delivery.message().qos() == Qos.AT_LEAST_ONCE) {
                 waitFor(otherRelease);
             }
             completed.add(delivery);
         })).isTrue();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isNotNull();
-        assertThat(sut.deliver(1, 11, List.of(1L, 2L), qosOneMessage(), false, 20)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L, 2L), qosOneMessage(), false, 20)).isTrue();
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
 
         // Act: the first lane fails, then the other recipient finishes the shared delivery.
         failRelease.countDown();
-        assertThat(failures.poll(5, SECONDS)).isEqualTo(new Failure(1, cause));
+        assertThat(failures.poll(5, SECONDS))
+                .isEqualTo(new Failure(token(1, 10), cause));
         otherRelease.countDown();
-        assertThat(sut.deliver(1, 0, List.of(2L), message(1), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(1), false, 1)).isTrue();
 
         // Assert: the later QoS 0 handler runs only after the shared delivery's completion.
         assertThat(completed.poll(5, SECONDS)).isNotNull();
@@ -1158,10 +1221,10 @@ class DeliveryLanesTest {
     void qos_zero_manual_delivery_does_not_wait_for_ack() throws Exception {
         // Arrange
         var received = new LinkedBlockingQueue<MqttDelivery>();
-        assertThat(sut.register(1, 1, request(AckMode.MANUAL, 1), received::add)).isTrue();
+        assertThat(sut.register(1, request(AckMode.MANUAL, 1), received::add)).isTrue();
 
         // Act
-        assertThat(sut.deliver(1, 0, List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
         MqttDelivery delivery = requireNonNull(received.poll(5, SECONDS));
 
         // Assert
@@ -1178,17 +1241,18 @@ class DeliveryLanesTest {
         DeliveryLanes sut = lanes(BYTE_LIMIT, () -> wakes.add(true));
         CountDownLatch release = release();
         var entered = new CountDownLatch(1);
-        assertThat(sut.register(1, 1, request(AckMode.ON_RECEIVE, 321), _ -> {
+        assertThat(sut.register(1, request(AckMode.ON_RECEIVE, 321), _ -> {
             entered.countDown();
             waitFor(release);
         })).isTrue();
-        assertThat(sut.deliver(1, 1, List.of(1L), qosOneMessage(), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 1), List.of(1L), qosOneMessage(), false, 1)).isTrue();
         assertThat(entered.await(5, SECONDS)).isTrue();
         assertThat(wakes.poll(5, SECONDS)).isTrue();
         assertThat(sut.takeReady()).containsExactly(1L);
         sut.release(1);
         for (long token = 2; token <= 321; token++) {
-            assertThat(sut.deliver(1, token, List.of(1L), qosOneMessage(), false, 1)).isTrue();
+            assertThat(sut.deliver(token(1, token), List.of(1L), qosOneMessage(), false, 1))
+                    .isTrue();
         }
 
         // Act
@@ -1212,9 +1276,9 @@ class DeliveryLanesTest {
         var wakes = new LinkedBlockingQueue<Boolean>();
         DeliveryLanes sut = lanes(BYTE_LIMIT, () -> wakes.add(true));
         var received = new LinkedBlockingQueue<MqttDelivery>();
-        assertThat(sut.register(1, 1, request(AckMode.MANUAL, 2), received::add)).isTrue();
-        assertThat(sut.deliver(1, 10, List.of(1L), qosOneMessage(), false, 1)).isTrue();
-        assertThat(sut.deliver(1, 11, List.of(1L), qosOneMessage(), false, 1)).isTrue();
+        assertThat(sut.register(1, request(AckMode.MANUAL, 2), received::add)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 1)).isTrue();
         MqttDelivery first = requireNonNull(received.poll(5, SECONDS));
         MqttDelivery second = requireNonNull(received.poll(5, SECONDS));
 
@@ -1237,7 +1301,8 @@ class DeliveryLanesTest {
         var wakes = new LinkedBlockingQueue<Boolean>();
         DeliveryLanes sut = lanes(1, () -> wakes.add(true));
         for (long token = 1; token <= 4096; token++) {
-            assertThat(sut.deliver(1, token, List.of(), qosOneMessage(), false, 10)).isTrue();
+            assertThat(sut.deliver(token(1, token), List.of(), qosOneMessage(), false, 10))
+                    .isTrue();
         }
         wakes.clear();
         assertThat(sut.retainedBytes()).isZero();
@@ -1250,12 +1315,19 @@ class DeliveryLanesTest {
         assertThat(sut.takeReady()).isEmpty();
 
         // Act
-        assertThat(sut.deliver(2, 4097, List.of(), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(2, 4097), List.of(), qosOneMessage(), false, 10)).isTrue();
 
         // Assert: every wake takes current work; the core rejects tokens outside its receive table.
         assertThat(sut.takeReady()).containsExactly(4097L);
         assertThat(sut.takeReady()).isEmpty();
         assertThat(sut.retainedBytes()).isZero();
+    }
+
+    private record Failure(DeliveryToken token, Throwable cause) {
+    }
+
+    private static DeliveryToken token(long connection, long acknowledgement) {
+        return new DeliveryToken(connection, acknowledgement);
     }
 
     private static Subscribe request(AckMode ackMode, int capacity) {
@@ -1280,7 +1352,7 @@ class DeliveryLanesTest {
         var manager = new DeliveryLanes(
                 "lane-test",
                 byteLimit,
-                (generation, cause) -> failures.add(new Failure(generation, cause)),
+                (token, cause) -> failures.add(new Failure(token, cause)),
                 onReady
         );
         managers.add(manager);
@@ -1310,9 +1382,6 @@ class DeliveryLanesTest {
             Thread.currentThread().interrupt();
             throw new AssertionError(failure);
         }
-    }
-
-    private record Failure(long generation, Throwable cause) {
     }
 
     private static MqttDelivery received(ReceiveResult result) {

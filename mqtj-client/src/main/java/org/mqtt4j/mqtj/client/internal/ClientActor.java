@@ -167,7 +167,7 @@ public final class ClientActor implements MqttClient {
         lanes = new DeliveryLanes(
                 clientId,
                 receiveByteLimit(maxPacketSize),
-                this::signalFailure,
+                this::deliveryFailed,
                 this::deliveryReady
         );
         io = new ClientIo(
@@ -463,10 +463,19 @@ public final class ClientActor implements MqttClient {
     }
 
     private void signalFailure(long generation, Throwable failure) {
+        terminate(generation, () -> core.failed(generation, failure));
+    }
+
+    private void deliveryFailed(DeliveryToken token, Throwable failure) {
+        // Reject old receipts before they can occupy the current connection's termination slot.
+        terminate(token.connection(), () -> core.deliveryFailed(token, failure));
+    }
+
+    private void terminate(long generation, Runnable action) {
         if (!stopping.get()) {
             mailbox.terminate(new Mailbox.Event(
                     generation,
-                    () -> core.failed(generation, failure),
+                    action,
                     Mailbox.Kind.CONTROL,
                     0
             ));
@@ -661,14 +670,14 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
-        public boolean registerSubscription(long generation, long id) {
+        public boolean registerSubscription(long id) {
             ClientSubscription subscription = requireNonNull(subscriptions.get(id));
             if (subscription.handler == null) {
-                subscription.receiver = lanes.registerPull(generation, id, subscription.request)
+                subscription.receiver = lanes.registerPull(id, subscription.request)
                         .orElse(null);
                 return subscription.receiver != null;
             }
-            return lanes.register(generation, id, subscription.request, subscription.handler);
+            return lanes.register(id, subscription.request, subscription.handler);
         }
 
         @Override
@@ -680,14 +689,13 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public boolean deliver(
-                long generation,
-                long token,
+                DeliveryToken token,
                 List<Long> ids,
                 MqttMessage message,
                 boolean dup,
                 int bytes
         ) {
-            return lanes.deliver(generation, token, ids, message, dup, bytes);
+            return lanes.deliver(token, ids, message, dup, bytes);
         }
 
         @Override

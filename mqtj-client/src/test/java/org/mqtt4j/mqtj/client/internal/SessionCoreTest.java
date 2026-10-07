@@ -1412,6 +1412,60 @@ class SessionCoreTest {
 
     @ParameterizedTest(name = "seed {0}")
     @MethodSource("seeds")
+    void reordered_delivery_failures_stop_only_the_receiving_connection(int seed) {
+        // Arrange: an old failure crosses connect and CONNACK, while the current failure may
+        // come from QoS 0 or a QoS 1 delivery whose PUBACK has already been written.
+        var random = new Random(seed);
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, qosOnePublication(7, "a/b", false), 0);
+        DeliveryToken old = port.deliveries.getLast().delivery();
+        sut.failed(1, new IOException("Lost connection"));
+        var expected = new ArrayList<>(port.ends);
+        var failure = new IllegalStateException("current handler failed");
+        var oldFailure = new IllegalStateException("old handler failed");
+        var chains = new ArrayList<ArrayDeque<Runnable>>();
+        chains.add(new ArrayDeque<>(List.of(
+                () -> sut.connect(3, 0),
+                () -> receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0),
+                () -> {
+                    sut.subscribe(4, subscription("a/#"));
+                    receive(2, seed % 2 == 0 ? publication()
+                            : qosOnePublication(7, "a/b", false), 0);
+                },
+                () -> {
+                    DeliveryToken current = port.deliveries.getLast().delivery();
+                    sut.deliveryReady(current.acknowledgement());
+                    if (current.acknowledgement() != 0) {
+                        sut.written(2, port.ackTickets.getLast());
+                    }
+                },
+                () -> {
+                    expected.add(new Disconnection(failure, false));
+                    sut.deliveryFailed(port.deliveries.getLast().delivery(), failure);
+                }
+        )));
+        chains.add(new ArrayDeque<>(List.of(
+                () -> sut.deliveryFailed(old, oldFailure),
+                () -> sut.deliveryReady(old.acknowledgement()),
+                () -> sut.deliveryFailed(old, oldFailure)
+        )));
+
+        // Act & Assert: old failures never add a termination, including during establishment.
+        while (!chains.isEmpty()) {
+            ArrayDeque<Runnable> chain = chains.get(random.nextInt(chains.size()));
+            chain.removeFirst().run();
+            if (chain.isEmpty()) {
+                chains.remove(chain);
+            }
+            assertThat(port.ends).isEqualTo(expected);
+        }
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(pubAckIds()).isEqualTo(seed % 2 == 0 ? List.of() : List.of(7));
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
     void reordered_old_readiness_cannot_acknowledge_a_reused_id_after_reconnect(int seed) {
         // Arrange: an old snapshot may reach the core before or after the next CONNACK.
         var random = new Random(seed);
@@ -2035,12 +2089,15 @@ class SessionCoreTest {
     }
 
     private record Received(
-            long token,
+            DeliveryToken delivery,
             List<Long> ids,
             MqttMessage message,
             boolean dup,
             int bytes
     ) {
+        long token() {
+            return delivery.acknowledgement();
+        }
     }
 
     private static final class RecordingPort implements SessionCore.Port {
@@ -2121,7 +2178,7 @@ class SessionCoreTest {
         }
 
         @Override
-        public boolean registerSubscription(long generation, long id) {
+        public boolean registerSubscription(long id) {
             if (acceptRegistration) {
                 registered.add(id);
             }
@@ -2164,8 +2221,7 @@ class SessionCoreTest {
 
         @Override
         public boolean deliver(
-                long generation,
-                long token,
+                DeliveryToken token,
                 List<Long> ids,
                 MqttMessage message,
                 boolean dup,

@@ -1976,6 +1976,216 @@ class ClientActorTest {
     }
 
     @Test
+    void a_queued_handler_failure_is_processed_before_its_acknowledgement() throws Exception {
+        // Arrange: both the explicit ack and failure arrive while the actor is held.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var failure = new IllegalStateException("handler failed after ack");
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL),
+                    delivery -> {
+                        workers.add(Thread.currentThread());
+                        waitFor(releaseHandler);
+                        delivery.ack();
+                        throw failure;
+                    }
+            );
+            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(
+                    subscribe.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY
+            ));
+            subscribing.get(5, SECONDS);
+            transport.receive(new Packet.Publish(
+                    new Topic("messages"), new byte[] {1}, Qos.AT_LEAST_ONCE,
+                    false, false, 7, EMPTY
+            ));
+            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            holdActor(transport, actorHeld, releaseActor);
+
+            // Act: the worker exits with a pending failure and a coalesced readiness wake.
+            releaseHandler.countDown();
+            assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+            releaseActor.countDown();
+
+            // Assert: processing the failure retires the queued ACK and preserves its cause.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
+            assertThat(transport.sent).isEmpty();
+            assertThat(transport.closed).isTrue();
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
+    @ParameterizedTest(name = "subscriptions: {0}")
+    @ValueSource(ints = {1, 256})
+    void handler_failure_overtakes_queued_input_and_commands(int subscriptions) throws Exception {
+        // Arrange: a publication reaches every lane before input and a command wait in the actor.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var delivered = new CountDownLatch(subscriptions);
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var received = new AtomicInteger();
+        var encoded = new AtomicInteger();
+        var failure = new IllegalStateException("handler failed before queued work");
+        var encoder = new ScriptCodec();
+        try (MqttClient sut = client("handler-priority", ends::add, 16 * 1024 * 1024, encoder)) {
+            ScriptTransport transport = connect(sut);
+            var registered = new ArrayList<Subscription>();
+            for (int i = 0; i < subscriptions; i++) {
+                boolean failing = i == 0;
+                var request = Subscribe.of(new TopicFilter("a/".repeat(i) + "#"), Qos.AT_MOST_ONCE);
+                CompletableFuture<Subscription> subscribing = sut.subscribe(request, _ -> {
+                    if (failing) {
+                        workers.add(Thread.currentThread());
+                    }
+                    delivered.countDown();
+                    waitFor(releaseHandler);
+                    if (failing) {
+                        throw failure;
+                    }
+                });
+                var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+                transport.receive(new Packet.SubAck(subscribe.packetId(),
+                        List.of(ReasonCode.SUCCESS), EMPTY));
+                registered.add(subscribing.get(5, SECONDS));
+            }
+            var incoming = new Packet.Publish(new Topic("a/".repeat(subscriptions) + "message"),
+                    new byte[] {1}, Qos.AT_MOST_ONCE, false, false, 0, EMPTY);
+            transport.receive(incoming);
+            assertThat(delivered.await(5, SECONDS)).isTrue();
+            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            holdActor(transport, actorHeld, releaseActor);
+            // The held clock call keeps its original callback. Later calls count input handling.
+            beforeActorTime = received::incrementAndGet;
+            encoder.beforeEncode = packet -> {
+                if (packet instanceof Packet.Unsubscribe) {
+                    encoded.incrementAndGet();
+                }
+            };
+            for (int i = 0; i < 32; i++) {
+                transport.receive(incoming);
+            }
+            CompletableFuture<Void> queued = registered.getLast().unsubscribe();
+
+            // Act: joining the worker proves its failure notification precedes actor resumption.
+            releaseHandler.countDown();
+            assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+            releaseActor.countDown();
+
+            // Assert: termination discards input and rejects the queued command without sending.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
+            assertThatThrownBy(() -> queued.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+            assertThat(List.of(received.get(), encoded.get())).containsExactly(0, 0);
+            assertThat(transport.closed).isTrue();
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
+    @ParameterizedTest(name = "handler failure first: {0}")
+    @ValueSource(booleans = {false, true})
+    void handler_and_transport_failures_preserve_the_first_notification(boolean handlerFirst)
+            throws Exception {
+        // Arrange: both failures arrive while the actor cannot consume either notification.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var failure = new IllegalStateException("handler failed");
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), _ -> {
+                workers.add(Thread.currentThread());
+                waitFor(releaseHandler);
+                throw failure;
+            });
+            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(subscribe.packetId(),
+                    List.of(ReasonCode.SUCCESS), EMPTY));
+            subscribing.get(5, SECONDS);
+            transport.receive(publication(new byte[] {1}));
+            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            holdActor(transport, actorHeld, releaseActor);
+
+            // Act: invalid input uses the termination slot; a joined worker has notified too.
+            if (!handlerFirst) {
+                transport.receiver().onBytes(new byte[] {(byte) 0xff, 0});
+            }
+            releaseHandler.countDown();
+            assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+            if (handlerFirst) {
+                transport.receiver().onBytes(new byte[] {(byte) 0xff, 0});
+            }
+            releaseActor.countDown();
+
+            // Assert: the second failure cannot replace the first admitted cause.
+            Disconnection end = requireNonNull(ends.poll(5, SECONDS));
+            if (handlerFirst) {
+                assertThat(end).isEqualTo(new Disconnection(failure, false));
+            } else {
+                assertProtocolFailure(end.cause(), ReasonCode.MALFORMED_PACKET);
+                assertThat(end.userRequested()).isFalse();
+            }
+            assertThat(transport.closed).isTrue();
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
+    @Test
+    void old_handler_failure_cannot_hide_the_current_transport_failure() throws Exception {
+        // Arrange: the old handler is still running after a new connection is established.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var failure = new IllegalStateException("old handler failed");
+        try (MqttClient sut = client()) {
+            ScriptTransport old = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), _ -> {
+                workers.add(Thread.currentThread());
+                waitFor(releaseHandler);
+                throw failure;
+            });
+            var subscribe = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
+            old.receive(new Packet.SubAck(subscribe.packetId(),
+                    List.of(ReasonCode.SUCCESS), EMPTY));
+            subscribing.get(5, SECONDS);
+            old.receive(publication(new byte[] {1}));
+            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+            ScriptTransport current = connect(sut);
+            holdActor(current, actorHeld, releaseActor);
+
+            // Act: the stale failure arrives first but cannot reserve current termination.
+            releaseHandler.countDown();
+            assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+            current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
+            releaseActor.countDown();
+
+            // Assert: the valid current cause still ends the connection.
+            Disconnection end = requireNonNull(ends.poll(5, SECONDS));
+            assertProtocolFailure(end.cause(), ReasonCode.MALFORMED_PACKET);
+            assertThat(end.userRequested()).isFalse();
+            assertThat(current.closed).isTrue();
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
+    @Test
     void received_packet_size_counts_toward_the_delivery_byte_budget() throws Exception {
         // Arrange: three deliveries fit the subscription's slots but not the 32 MiB budget.
         var entered = new CountDownLatch(1);
