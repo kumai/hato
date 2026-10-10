@@ -78,7 +78,7 @@ class TransportContractTest {
 
                 // Assert: onSent must reach the core before onClosed for this to succeed.
                 disconnected.get(5, SECONDS);
-                assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
                 assertThat(ended).isEmpty();
             }
         }

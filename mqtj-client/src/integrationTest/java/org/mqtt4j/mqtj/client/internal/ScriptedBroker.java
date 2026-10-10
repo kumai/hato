@@ -131,7 +131,7 @@ final class ScriptedBroker implements AutoCloseable {
     }
 
     void roundTripBarrier(MqttClient sut) throws Exception {
-        CompletableFuture<PublishResult> published = sut.publish(new MqttMessage(
+        CompletableFuture<PublishResult> published = sut.publish(MqttMessage.of(
                 new Topic("barrier"), new byte[] {0}, Qos.AT_LEAST_ONCE, false
         ));
         var publication = (Packet.Publish) receive();

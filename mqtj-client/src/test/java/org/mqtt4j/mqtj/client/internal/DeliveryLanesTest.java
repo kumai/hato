@@ -1353,7 +1353,7 @@ class DeliveryLanesTest {
     }
 
     private static MqttMessage qosOneMessage() {
-        return new MqttMessage(new Topic("a"), new byte[] {1}, Qos.AT_LEAST_ONCE, false);
+        return MqttMessage.of(new Topic("a"), new byte[] {1}, Qos.AT_LEAST_ONCE, false);
     }
 
     private DeliveryLanes lanes(long byteLimit) {
@@ -1394,7 +1394,7 @@ class DeliveryLanesTest {
     }
 
     private static MqttMessage message(int value) {
-        return new MqttMessage(new Topic("a"), new byte[] {(byte) value}, Qos.AT_MOST_ONCE, false);
+        return MqttMessage.of(new Topic("a"), new byte[] {(byte) value}, Qos.AT_MOST_ONCE, false);
     }
 
     private static void waitFor(CountDownLatch latch) {

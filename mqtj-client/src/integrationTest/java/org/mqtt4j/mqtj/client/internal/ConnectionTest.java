@@ -37,7 +37,7 @@ abstract class ConnectionTest {
                 .connectionListener(ended::add)
                 .build()) {
             // Act & Assert: keep the connection alive across successive ping exchanges.
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(new ConnAck(false));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
             for (int i = 0; i < 3; i++) {
                 scheduler.advance(Duration.ofSeconds(10));
@@ -45,7 +45,7 @@ abstract class ConnectionTest {
                 await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
             }
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isZero());
         }
     }
@@ -79,7 +79,7 @@ abstract class ConnectionTest {
             Disconnection disconnection = requireNonNull(ended.poll(5, SECONDS));
 
             // Assert
-            assertThat(disconnection.cause()).isInstanceOf(TimeoutException.class);
+            assertThat(disconnection.cause().orElseThrow()).isInstanceOf(TimeoutException.class);
             assertThat(disconnection.userRequested()).isFalse();
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isZero());
             scheduler.advance(Duration.ofSeconds(30));

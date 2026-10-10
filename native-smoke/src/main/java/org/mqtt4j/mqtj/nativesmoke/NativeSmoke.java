@@ -46,13 +46,13 @@ public final class NativeSmoke {
             ).get(5, SECONDS);
 
             for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
-                var pushed = new MqttMessage(new Topic("smoke/push"), new byte[] {42}, qos, false);
+                var pushed = MqttMessage.of(new Topic("smoke/push"), new byte[] {42}, qos, false);
                 client.publish(pushed).get(5, SECONDS);
                 if (!pushed.equals(handled.poll(5, SECONDS))) {
                     throw new AssertionError(qos + " delivery to a handler changed the message");
                 }
 
-                var pulled = new MqttMessage(new Topic("smoke/pull"), new byte[] {7}, qos, false);
+                var pulled = MqttMessage.of(new Topic("smoke/pull"), new byte[] {7}, qos, false);
                 client.publish(pulled).get(5, SECONDS);
                 if (!(pull.receive(Duration.ofSeconds(5))
                         instanceof ReceiveResult.Received(var delivery))

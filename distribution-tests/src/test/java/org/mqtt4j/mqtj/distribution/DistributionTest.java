@@ -27,6 +27,8 @@ import javax.xml.parsers.DocumentBuilderFactory;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -55,9 +57,7 @@ class DistributionTest {
                     .server(java.net.URI.create("mqtt://localhost"))
                     .version(org.mqtt4j.mqtj.MqttVersion.V3_1_1)
                     .connectionListener(end -> {
-                        if (end.cause() != null) {
-                            end.cause().getMessage();
-                        }
+                        end.cause().ifPresent(cause -> cause.getMessage());
                     })
                     .build();
             client.close();
@@ -83,6 +83,26 @@ class DistributionTest {
                     || failure.getCause() != cause
                     || cause.getCause() != null) {
                 throw new AssertionError("Public protocol failure is not usable");
+            }
+            var disconnection = org.mqtt4j.mqtj.Disconnection.of(cause, false);
+            var message = org.mqtt4j.mqtj.MqttMessage.of(
+                    new org.mqtt4j.mqtj.Topic("a/b"), new byte[0],
+                    org.mqtt4j.mqtj.Qos.AT_MOST_ONCE, false
+            ).withTopic(new org.mqtt4j.mqtj.Topic("a/c"))
+                    .withPayload(new byte[] {42})
+                    .withQos(org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE)
+                    .withRetain(true);
+            if (disconnection.cause().orElseThrow() != cause
+                    || disconnection.userRequested()
+                    || org.mqtt4j.mqtj.Disconnection.of(null, true).cause().isPresent()
+                    || !org.mqtt4j.mqtj.ConnAck.of(true).sessionPresent()
+                    || !org.mqtt4j.mqtj.PublishResult.of()
+                            .equals(org.mqtt4j.mqtj.PublishResult.of())
+                    || !message.equals(org.mqtt4j.mqtj.MqttMessage.of(
+                            new org.mqtt4j.mqtj.Topic("a/c"), new byte[] {42},
+                            org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE, true
+                    ))) {
+                throw new AssertionError("Client value factories are not usable");
             }
             """;
     private static final String BROKER_PROBE = """
@@ -128,14 +148,14 @@ class DistributionTest {
                 for (var qos : java.util.List.of(
                         org.mqtt4j.mqtj.Qos.AT_MOST_ONCE, org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE
                 )) {
-                    var pushed = new org.mqtt4j.mqtj.MqttMessage(
+                    var pushed = org.mqtt4j.mqtj.MqttMessage.of(
                             new org.mqtt4j.mqtj.Topic("probe/push"), new byte[] {42}, qos, false
                     );
                     publisher.publish(pushed).get(5, java.util.concurrent.TimeUnit.SECONDS);
                     if (!pushed.equals(handled.poll(5, java.util.concurrent.TimeUnit.SECONDS))) {
                         throw new AssertionError(qos + " delivery to a handler changed");
                     }
-                    var pulled = new org.mqtt4j.mqtj.MqttMessage(
+                    var pulled = org.mqtt4j.mqtj.MqttMessage.of(
                             new org.mqtt4j.mqtj.Topic("probe/pull"), new byte[] {7}, qos, false
                     );
                     publisher.publish(pulled).get(5, java.util.concurrent.TimeUnit.SECONDS);
@@ -333,6 +353,24 @@ class DistributionTest {
                 "org.mqtt4j.mqtj.testkit.FaultyTransport",
                 "org.mqtt4j.mqtj.testkit.ManualTimerScheduler"
         );
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Disconnection", "ConnAck", "PublishResult", "MqttMessage"})
+    void evolving_value_types_are_final_classes_with_private_constructors(String type)
+            throws Exception {
+        try (var archive = new JarFile(CLIENT.toFile())) {
+            var entry = archive.getJarEntry("org/mqtt4j/mqtj/" + type + ".class");
+            assertThat(entry).as(type).isNotNull();
+            ClassModel model = ClassFile.of().parse(archive.getInputStream(entry).readAllBytes());
+            assertThat(model.flags().has(AccessFlag.FINAL)).as(type).isTrue();
+            assertThat(model.findAttribute(Attributes.record())).as(type).isEmpty();
+            assertThat(model.methods())
+                    .filteredOn(method -> method.methodName().equalsString("<init>"))
+                    .as(type).isNotEmpty()
+                    .allSatisfy(method -> assertThat(method.flags().has(AccessFlag.PRIVATE))
+                            .as(type).isTrue());
+        }
     }
 
     @Test

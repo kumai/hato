@@ -66,7 +66,7 @@ public final class Hello {
     }
 
     private static MqttMessage message(String topic, String payload, Qos qos) {
-        return new MqttMessage(new Topic(topic), payload.getBytes(UTF_8), qos, false);
+        return MqttMessage.of(new Topic(topic), payload.getBytes(UTF_8), qos, false);
     }
 
     private static void show(String via, MqttMessage message) {

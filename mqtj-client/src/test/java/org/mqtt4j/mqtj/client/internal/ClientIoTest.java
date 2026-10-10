@@ -694,7 +694,7 @@ class ClientIoTest {
     }
 
     private static MqttMessage message(int payloadSize) {
-        return new MqttMessage(new Topic("a"), new byte[payloadSize], Qos.AT_MOST_ONCE, false);
+        return MqttMessage.of(new Topic("a"), new byte[payloadSize], Qos.AT_MOST_ONCE, false);
     }
 
     private static Packet.Publish publish() {

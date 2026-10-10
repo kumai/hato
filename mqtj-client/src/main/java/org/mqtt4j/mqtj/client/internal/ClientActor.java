@@ -718,11 +718,12 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void end(long generation, boolean established, Disconnection disconnection) {
+            Throwable cause = disconnection.cause().orElse(null);
             synchronized (lifecycleLock) {
                 connectedGeneration = 0;
-                var failure = disconnection.cause() == null
+                var failure = cause == null
                         ? new MqttConnectionLostException()
-                        : new MqttConnectionLostException(disconnection.cause());
+                        : new MqttConnectionLostException(cause);
                 for (UnsubscribeAttempt closing : closingAttempts.values()) {
                     closing.completeObservers(failure);
                 }
@@ -733,7 +734,7 @@ public final class ClientActor implements MqttClient {
             lanes.connectionEnded();
             io.close();
             if (established) {
-                log.info("Disconnected {} from {}", clientId, endpoint, disconnection.cause());
+                log.info("Disconnected {} from {}", clientId, endpoint, cause);
                 synchronized (notifications) {
                     notifications.addLast(disconnection);
                     if (!notifying) {
@@ -748,7 +749,7 @@ public final class ClientActor implements MqttClient {
                 log.info(
                         "Connection failed for {} at {}",
                         clientId, endpoint,
-                        disconnection.cause()
+                        cause
                 );
             }
         }

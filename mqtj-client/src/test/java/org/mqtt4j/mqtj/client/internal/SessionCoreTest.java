@@ -212,7 +212,7 @@ class SessionCoreTest {
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Assert: CONNECT completes before recreation, and the pending initial attempt ends.
-        assertThat(requireNonNull(port.results.get(4L)).value()).isEqualTo(new ConnAck(false));
+        assertThat(requireNonNull(port.results.get(4L)).value()).isEqualTo(ConnAck.of(false));
         assertThat(requireNonNull(port.results.get(3L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class).hasCause(failure);
         assertThat(port.removed).containsExactly(3L);
@@ -503,7 +503,7 @@ class SessionCoreTest {
 
         accept();
         assertThat(sut.state()).isEqualTo(CONNECTED);
-        assertThat(requireNonNull(port.results.get(1L)).value()).isEqualTo(new ConnAck(false));
+        assertThat(requireNonNull(port.results.get(1L)).value()).isEqualTo(ConnAck.of(false));
         assertThat(port.timers).doesNotContainKey(CONNECT);
     }
 
@@ -558,7 +558,7 @@ class SessionCoreTest {
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end -> {
-            assertThat(end.cause()).isInstanceOf(MqttCapacityException.class);
+            assertThat(end.cause().orElseThrow()).isInstanceOf(MqttCapacityException.class);
             assertThat(end.userRequested()).isFalse();
         });
         assertThat(port.timers).isEmpty();
@@ -576,9 +576,9 @@ class SessionCoreTest {
 
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
-        Throwable cause = port.ends.getFirst().cause();
+        Throwable cause = port.ends.getFirst().cause().orElseThrow();
         assertThat(cause).isInstanceOf(MqttCapacityException.class);
-        assertThat(port.ends).containsExactly(new Disconnection(cause, true));
+        assertThat(port.ends).containsExactly(Disconnection.of(cause, true));
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasCause(cause);
@@ -608,7 +608,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasCause(failure);
-        assertThat(port.ends).containsExactly(new Disconnection(failure, true));
+        assertThat(port.ends).containsExactly(Disconnection.of(failure, true));
     }
 
     @Test
@@ -741,7 +741,7 @@ class SessionCoreTest {
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end -> {
-            assertThat(end.cause()).isInstanceOf(TimeoutException.class);
+            assertThat(end.cause().orElseThrow()).isInstanceOf(TimeoutException.class);
             assertThat(end.userRequested()).isFalse();
         });
         assertThat(port.timers).isEmpty();
@@ -766,7 +766,7 @@ class SessionCoreTest {
         sut.sent(1, ticket, seconds(1));
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(requireNonNull(port.results.get(2L)).failure()).isNull();
-        assertThat(port.ends).containsExactly(new Disconnection(null, true));
+        assertThat(port.ends).containsExactly(Disconnection.of(null, true));
     }
 
     @Test
@@ -781,7 +781,7 @@ class SessionCoreTest {
 
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
-        Throwable cause = port.ends.getFirst().cause();
+        Throwable cause = port.ends.getFirst().cause().orElseThrow();
         assertThat(cause).isInstanceOfSatisfying(MqttProtocolException.class, failure -> {
             assertThat(failure.reasonCode()).isEqualTo(ReasonCode.MALFORMED_PACKET);
             assertThat(failure).hasMessage("Invalid packet").hasCause(original);
@@ -828,7 +828,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasNoCause();
-        assertThat(port.ends).containsExactly(new Disconnection(null, true));
+        assertThat(port.ends).containsExactly(Disconnection.of(null, true));
     }
 
     @Test
@@ -836,7 +836,7 @@ class SessionCoreTest {
         // Arrange
         connected();
         var payload = new byte[] {1, 2};
-        var message = new MqttMessage(new Topic("a/b"), payload, Qos.AT_MOST_ONCE, true);
+        var message = MqttMessage.of(new Topic("a/b"), payload, Qos.AT_MOST_ONCE, true);
 
         // Act
         sut.publish(2, message);
@@ -861,7 +861,7 @@ class SessionCoreTest {
         sut.sent(1, ticket, 0);
 
         // Assert
-        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(PublishResult.of());
     }
 
     @Test
@@ -900,7 +900,7 @@ class SessionCoreTest {
         connected();
 
         // Act
-        sut.publish(2, new MqttMessage(new Topic("a"), new byte[0], qos, false));
+        sut.publish(2, MqttMessage.of(new Topic("a"), new byte[0], qos, false));
         sut.subscribe(3, Subscribe.of(new TopicFilter("a"), qos).withBufferCapacity(1));
 
         // Assert
@@ -1255,7 +1255,7 @@ class SessionCoreTest {
         // Arrange
         connected();
         port.sendResult = result;
-        var message = new MqttMessage(
+        var message = MqttMessage.of(
                 new Topic("a/b"),
                 new byte[16 * 1024 * 1024 + 1],
                 Qos.AT_MOST_ONCE,
@@ -1312,7 +1312,7 @@ class SessionCoreTest {
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end ->
-                assertThat(end.cause()).isInstanceOf(MqttProtocolException.class));
+                assertThat(end.cause().orElseThrow()).isInstanceOf(MqttProtocolException.class));
     }
 
     @Test
@@ -1376,7 +1376,7 @@ class SessionCoreTest {
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end -> {
-            assertThat(end.cause()).isInstanceOf(MqttProtocolException.class);
+            assertThat(end.cause().orElseThrow()).isInstanceOf(MqttProtocolException.class);
         });
     }
 
@@ -1396,7 +1396,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(2L)).failure()).isNull();
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end -> {
-            assertThat(end.cause()).isInstanceOf(MqttProtocolException.class);
+            assertThat(end.cause().orElseThrow()).isInstanceOf(MqttProtocolException.class);
         });
         assertThat(port.removed).isEmpty();
     }
@@ -1420,7 +1420,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(3L)).failure()).isNull();
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end -> {
-            assertThat(end.cause()).isInstanceOf(MqttProtocolException.class);
+            assertThat(end.cause().orElseThrow()).isInstanceOf(MqttProtocolException.class);
         });
         assertThat(port.removed).containsExactly(2L);
     }
@@ -1506,7 +1506,7 @@ class SessionCoreTest {
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end -> {
-            assertThat(end.cause()).isInstanceOf(MqttCapacityException.class);
+            assertThat(end.cause().orElseThrow()).isInstanceOf(MqttCapacityException.class);
         });
         assertThat(port.removed).containsExactly(2L);
     }
@@ -1553,7 +1553,7 @@ class SessionCoreTest {
     }
 
     private static MqttMessage message() {
-        return new MqttMessage(new Topic("a/b"), new byte[] {1, 2}, Qos.AT_MOST_ONCE, false);
+        return MqttMessage.of(new Topic("a/b"), new byte[] {1, 2}, Qos.AT_MOST_ONCE, false);
     }
 
     @Test
@@ -1575,7 +1575,7 @@ class SessionCoreTest {
         receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Assert: RecordingPort also rejects completing an operation a second time.
-        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(PublishResult.of());
         assertThat(sut.state()).isEqualTo(CONNECTED);
     }
 
@@ -1594,7 +1594,7 @@ class SessionCoreTest {
         receive(1, new Packet.PubAck(firstId, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Assert
-        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(PublishResult.of());
         assertThat(port.results).doesNotContainKey(3L);
         assertThat(sut.state()).isEqualTo(CONNECTED);
     }
@@ -1628,7 +1628,7 @@ class SessionCoreTest {
         sut.sent(1, port.ticket, 0);
 
         // Assert: RecordingPort also rejects completing an operation a second time.
-        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(PublishResult.of());
         assertThat(sut.state()).isEqualTo(CLOSED);
     }
 
@@ -1689,7 +1689,7 @@ class SessionCoreTest {
         assertThat(operations).allSatisfy(operation -> {
             Result result = requireNonNull(port.results.get(operation));
             if (!terminates) {
-                assertThat(result.value()).isEqualTo(new PublishResult());
+                assertThat(result.value()).isEqualTo(PublishResult.of());
             }
         });
         List<Integer> acknowledged = pubAckIds();
@@ -1817,7 +1817,7 @@ class SessionCoreTest {
                     }
                 },
                 () -> {
-                    expected.add(new Disconnection(failure, false));
+                    expected.add(Disconnection.of(failure, false));
                     sut.deliveryFailed(port.deliveries.getLast().delivery(), failure);
                 }
         )));
@@ -1910,7 +1910,7 @@ class SessionCoreTest {
         sut.sent(1, port.ticket, 0);
 
         // Assert
-        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(new PublishResult());
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(PublishResult.of());
         assertThat(requireNonNull(port.results.get(3L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class);
         assertThat(requireNonNull(port.results.get(4L)).failure()).isNull();
@@ -1941,7 +1941,7 @@ class SessionCoreTest {
         assertThat(subscriptionId).isEqualTo(2);
         assertThat(requireNonNull(port.results.get(65536L)).failure())
                 .isInstanceOf(MqttCapacityException.class);
-        assertThat(requireNonNull(port.results.get(65537L)).value()).isEqualTo(new PublishResult());
+        assertThat(requireNonNull(port.results.get(65537L)).value()).isEqualTo(PublishResult.of());
         assertThat(sut.state()).isEqualTo(CONNECTED);
     }
 
@@ -1962,7 +1962,7 @@ class SessionCoreTest {
         assertThat(port.publicationIds).hasSize(65536);
         assertThat(port.publicationIds.getLast()).isEqualTo(1);
         assertThat(requireNonNull(port.results.get(65537L)).value())
-                .isEqualTo(new PublishResult());
+                .isEqualTo(PublishResult.of());
     }
 
     @Test
@@ -2240,7 +2240,7 @@ class SessionCoreTest {
 
         // Assert
         assertThat(pubAckIds()).containsExactly(7);
-        assertThat(requireNonNull(port.results.get(5L)).value()).isEqualTo(new PublishResult());
+        assertThat(requireNonNull(port.results.get(5L)).value()).isEqualTo(PublishResult.of());
     }
 
     @Test
@@ -2260,7 +2260,7 @@ class SessionCoreTest {
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end ->
-                assertThat(end.cause()).isInstanceOf(MqttCapacityException.class));
+                assertThat(end.cause().orElseThrow()).isInstanceOf(MqttCapacityException.class));
         assertThat(pubAckIds()).isEmpty();
 
         // Act
@@ -2342,7 +2342,7 @@ class SessionCoreTest {
         sut.failed(1, failure);
 
         // Assert
-        assertThat(port.ends).containsExactly(new Disconnection(failure, false));
+        assertThat(port.ends).containsExactly(Disconnection.of(failure, false));
     }
 
     /// Publishes, then reports the write completion and PUBACK in a seed-chosen order.
@@ -2409,7 +2409,7 @@ class SessionCoreTest {
     }
 
     private static MqttMessage qosOneMessage() {
-        return new MqttMessage(new Topic("a/b"), new byte[] {1, 2}, Qos.AT_LEAST_ONCE, false);
+        return MqttMessage.of(new Topic("a/b"), new byte[] {1, 2}, Qos.AT_LEAST_ONCE, false);
     }
 
     private static Packet.Publish qosOnePublication(int packetId, String topic, boolean dup) {

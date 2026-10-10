@@ -47,7 +47,7 @@ class MosquittoMessagingTest extends MessagingTest {
         // Arrange
         String topic = uniqueTopic();
         var received = new LinkedBlockingQueue<MqttDelivery>();
-        var retained = new MqttMessage(new Topic(topic), new byte[] {9}, Qos.AT_MOST_ONCE, true);
+        var retained = MqttMessage.of(new Topic(topic), new byte[] {9}, Qos.AT_MOST_ONCE, true);
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
             sut.publish(retained).get(5, SECONDS);
@@ -62,7 +62,7 @@ class MosquittoMessagingTest extends MessagingTest {
             assertThat(requireNonNull(received.poll(5, SECONDS)).message()).isEqualTo(retained);
 
             // Remove retained state before finishing the connection.
-            sut.publish(new MqttMessage(new Topic(topic), new byte[0], Qos.AT_MOST_ONCE, true))
+            sut.publish(MqttMessage.of(new Topic(topic), new byte[0], Qos.AT_MOST_ONCE, true))
                     .get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
         }
@@ -140,7 +140,7 @@ class MosquittoMessagingTest extends MessagingTest {
         // A small window keeps operations, including slots still being returned, in capacity.
         var window = new ArrayList<CompletableFuture<PublishResult>>();
         for (int i = 0; i < count; i++) {
-            window.add(publisher.publish(new MqttMessage(
+            window.add(publisher.publish(MqttMessage.of(
                     new Topic(base + "/" + i), payload, Qos.AT_LEAST_ONCE, true
             )));
             if (window.size() == 16 || i == count - 1) {

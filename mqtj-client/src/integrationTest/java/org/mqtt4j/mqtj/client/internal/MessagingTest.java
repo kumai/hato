@@ -71,7 +71,7 @@ abstract class MessagingTest {
                 Subscription replacement = sut.subscribe(
                         Subscribe.of(subscription.filter(), Qos.AT_LEAST_ONCE)
                 ).get(5, SECONDS);
-                var message = new MqttMessage(new Topic(subscription.filter().pattern()),
+                var message = MqttMessage.of(new Topic(subscription.filter().pattern()),
                         new byte[] {7}, Qos.AT_LEAST_ONCE, false);
                 sut.publish(message).get(5, SECONDS);
                 assertThat(received(replacement.receive(Duration.ofSeconds(5))).message())
@@ -89,7 +89,7 @@ abstract class MessagingTest {
     void publications_round_trip_through_the_default_pull_subscription(Qos qos) throws Exception {
         // Arrange
         String topic = uniqueTopic();
-        var publication = new MqttMessage(new Topic(topic), new byte[] {1, 2, 3}, qos, false);
+        var publication = MqttMessage.of(new Topic(topic), new byte[] {1, 2, 3}, qos, false);
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
             Subscription subscription = sut.subscribe(Subscribe.of(new TopicFilter(topic), qos))
@@ -142,7 +142,7 @@ abstract class MessagingTest {
 
             // Act: publisher completions keep outgoing operations bounded while receivers race.
             for (int value = 0; value < 512; value++) {
-                publisher.publish(new MqttMessage(new Topic(topic),
+                publisher.publish(MqttMessage.of(new Topic(topic),
                         Integer.toString(value).getBytes(UTF_8), Qos.AT_LEAST_ONCE, false))
                         .get(5, SECONDS);
             }
@@ -169,7 +169,7 @@ abstract class MessagingTest {
         // Arrange
         String topic = uniqueTopic();
         var received = new LinkedBlockingQueue<MqttDelivery>();
-        var publication = new MqttMessage(
+        var publication = MqttMessage.of(
                 new Topic(topic), new byte[] {1, 2, 3}, Qos.AT_LEAST_ONCE, false
         );
         try (MqttClient sut = client()) {
@@ -185,7 +185,7 @@ abstract class MessagingTest {
             delivery.ack();
 
             // Assert
-            assertThat(result).isEqualTo(new PublishResult());
+            assertThat(result).isEqualTo(PublishResult.of());
             assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
             assertThat(delivery.message()).isEqualTo(publication);
             assertThat(delivery.dup()).isFalse();
@@ -217,7 +217,7 @@ abstract class MessagingTest {
 
             // Act: bound publisher operations while the subscriber continuously handles input.
             for (int i = 0; i < 500; i++) {
-                publisher.publish(new MqttMessage(
+                publisher.publish(MqttMessage.of(
                         new Topic(topic),
                         Integer.toString(i).getBytes(UTF_8),
                         Qos.AT_LEAST_ONCE,
@@ -260,7 +260,7 @@ abstract class MessagingTest {
             sut.connect().get(5, SECONDS);
             FaultyTransport faulty = requireNonNull(transport.get());
             faulty.receiveDelay(Duration.ofSeconds(30));
-            CompletableFuture<PublishResult> publication = sut.publish(new MqttMessage(
+            CompletableFuture<PublishResult> publication = sut.publish(MqttMessage.of(
                     new Topic(uniqueTopic()), new byte[] {1}, Qos.AT_LEAST_ONCE, false
             ));
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
@@ -273,7 +273,7 @@ abstract class MessagingTest {
             assertThatThrownBy(() -> publication.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class)
                     .hasRootCause(failure);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
             assertThat(scheduler.pendingTaskCount()).isZero();
             scheduler.advance(Duration.ofSeconds(30));
             assertThat(ended).isEmpty();
@@ -437,9 +437,9 @@ abstract class MessagingTest {
                 sut.disconnect().get(5, SECONDS);
             }
             assertThat(ended.poll(5, SECONDS))
-                    .isEqualTo(new Disconnection(failure ? cause : null, !failure));
+                    .isEqualTo(Disconnection.of(failure ? cause : null, !failure));
             sut.connect().get(5, SECONDS);
-            var next = new MqttMessage(new Topic(topic), new byte[] {2}, Qos.AT_LEAST_ONCE, false);
+            var next = MqttMessage.of(new Topic(topic), new byte[] {2}, Qos.AT_LEAST_ONCE, false);
             // One restoration fits the send capacity, before this same connection's PUBLISH.
             sut.publish(next).get(5, SECONDS);
 
@@ -479,7 +479,7 @@ abstract class MessagingTest {
 
             // Act: the subscriber has no pending operation to carry this failure.
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
             sut.connect().get(5, SECONDS);
             // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -518,7 +518,7 @@ abstract class MessagingTest {
             sut.publish(message(topic, (byte) 1)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
             sut.connect().get(5, SECONDS);
             // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -533,7 +533,7 @@ abstract class MessagingTest {
                     .containsExactly((byte) 2);
             subscription.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
             assertThat(ended).isEmpty();
         } finally {
             release.countDown();
@@ -573,7 +573,8 @@ abstract class MessagingTest {
             Disconnection disconnection = requireNonNull(ended.poll(5, SECONDS));
 
             // Assert: shutdown progresses while application code is blocked.
-            assertThat(disconnection.cause()).isInstanceOf(MqttCapacityException.class);
+            assertThat(disconnection.cause().orElseThrow())
+                    .isInstanceOf(MqttCapacityException.class);
             assertThat(disconnection.userRequested()).isFalse();
             assertThat(returned.getCount()).isEqualTo(1);
 
@@ -640,14 +641,14 @@ abstract class MessagingTest {
 
             // Act: more publications than the default queue holds arrive behind the handler.
             // Each QoS 1 publication waits for the broker, so none piles up there instead.
-            var publication = new MqttMessage(new Topic(topic), new byte[] {1},
+            var publication = MqttMessage.of(new Topic(topic), new byte[] {1},
                     Qos.AT_LEAST_ONCE, false);
             for (int i = 0; i < 2_000 && ended.isEmpty(); i++) {
                 publisher.publish(publication).get(5, SECONDS);
             }
 
             // Assert: overload discards queued work while the running handler keeps its delivery.
-            assertThat(requireNonNull(ended.poll(10, SECONDS)).cause())
+            assertThat(requireNonNull(ended.poll(10, SECONDS)).cause().orElseThrow())
                     .isInstanceOf(MqttCapacityException.class);
             await().untilAsserted(() -> assertThat(usage(sut))
                     .extracting(
@@ -694,7 +695,7 @@ abstract class MessagingTest {
                         if (number == 0) {
                             entered.countDown();
                             waitFor(release);
-                            sut.publish(new MqttMessage(new Topic(base + "/reply"),
+                            sut.publish(MqttMessage.of(new Topic(base + "/reply"),
                                     new byte[] {0}, Qos.AT_LEAST_ONCE, false)).join();
                         }
                         handled.add(number);
@@ -771,7 +772,7 @@ abstract class MessagingTest {
                             entered.countDown();
                             waitFor(release);
                             try {
-                                sut.publish(new MqttMessage(new Topic(base + "/reply"),
+                                sut.publish(MqttMessage.of(new Topic(base + "/reply"),
                                         new byte[] {0}, Qos.AT_LEAST_ONCE, false)).join();
                                 outcome.complete(null);
                             } catch (CompletionException failure) {
@@ -799,10 +800,10 @@ abstract class MessagingTest {
 
             // Assert: no circular wait remains; only the subscriptions survive connection failure.
             Disconnection end = requireNonNull(ended.poll(5, SECONDS));
-            assertThat(end.cause()).isInstanceOf(MqttCapacityException.class);
+            assertThat(end.cause().orElseThrow()).isInstanceOf(MqttCapacityException.class);
             assertThat(outcome.get(5, SECONDS))
                     .isInstanceOf(MqttConnectionLostException.class)
-                    .hasCause(end.cause());
+                    .hasCause(end.cause().orElseThrow());
             await().untilAsserted(() -> assertThat(usage(sut))
                     .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0)));
             sut.close();
@@ -829,7 +830,7 @@ abstract class MessagingTest {
     }
 
     static MqttMessage message(String topic, byte... payload) {
-        return new MqttMessage(new Topic(topic), payload, Qos.AT_MOST_ONCE, false);
+        return MqttMessage.of(new Topic(topic), payload, Qos.AT_MOST_ONCE, false);
     }
 
     abstract URI endpoint();

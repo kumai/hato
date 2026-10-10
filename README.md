@@ -54,7 +54,7 @@ void main() {
             .version(MqttVersion.V3_1_1)
             .build()) {
         client.connect().join();
-        client.publish(new MqttMessage(
+        client.publish(MqttMessage.of(
                 new Topic("sensors/kitchen/temperature"),
                 "21.5".getBytes(UTF_8),
                 Qos.AT_MOST_ONCE,

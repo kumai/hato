@@ -236,7 +236,7 @@ final class SessionCore {
                 port.cancel(Timer.CONNECT);
                 long operation = connectOperation;
                 connectOperation = 0;
-                port.complete(operation, new ConnAck(false), null);
+                port.complete(operation, ConnAck.of(false), null);
                 for (LocalSubscription local : List.copyOf(subscriptions.values())) {
                     if (local.closed) {
                         removeSubscription(local, null);
@@ -283,7 +283,7 @@ final class SessionCore {
         lastSent = now;
         Long publication = publications.remove(ticket);
         if (publication != null) {
-            port.complete(publication, new PublishResult(), null);
+            port.complete(publication, PublishResult.of(), null);
         }
         if (ticket == disconnectTicket) {
             long operation = disconnectOperation;
@@ -570,7 +570,7 @@ final class SessionCore {
             return;
         }
         packetIds.release(ack.packetId());
-        port.complete(operation, new PublishResult(), null);
+        port.complete(operation, PublishResult.of(), null);
     }
 
     /// The earlier reception was a stale retransmission or a resend that omitted DUP. Either way
@@ -687,7 +687,7 @@ final class SessionCore {
             }
             return;
         }
-        var message = new MqttMessage(
+        var message = MqttMessage.of(
                 publish.topic(), publish.payload(), publish.qos(), publish.retain()
         );
         if (!port.deliver(new DeliveryToken(generation, token),
@@ -851,7 +851,7 @@ final class SessionCore {
         if (active) {
             // Retire delivery conditions before removing subscriptions: termination must not
             // turn thousands of abandoned recipients into fresh readiness notifications.
-            port.end(generation, established, new Disconnection(cause, requested));
+            port.end(generation, established, Disconnection.of(cause, requested));
         }
         var pendingFailure = (cause == null)
                 ? new MqttConnectionLostException()
