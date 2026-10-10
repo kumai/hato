@@ -34,6 +34,7 @@ import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.mqtj.spi.Transport.SendResult.ACCEPTED;
 import static org.mqtt4j.mqtj.spi.Transport.SendResult.CLOSED;
 
@@ -84,20 +85,25 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, wrapper: {0}, local close: {1}, write fails: {2}")
+    @ParameterizedTest(name = "{displayName}, wrapper: {0}, local close: {1}, "
+            + "write fails: {2}, delayed: {3}")
     @CsvSource({
-            "false, false, false", "false, false, true",
-            "false, true, false", "false, true, true",
-            "true, false, false", "true, false, true",
-            "true, true, false", "true, true, true"
+            "false, false, false, false", "false, false, true, false",
+            "false, true, false, false", "false, true, true, false",
+            "true, false, false, false", "true, false, true, false",
+            "true, true, false, false", "true, true, true, false",
+            "true, false, false, true", "true, false, true, true",
+            "true, true, false, true", "true, true, true, true"
     })
     void shutdown_preserves_the_local_write_result(
             boolean faulty,
             boolean localClose,
-            boolean writeFails
+            boolean writeFails,
+            boolean delayed
     ) throws Exception {
         // Arrange: local writing returns or fails only after the socket has been closed.
         byte[] packet = {(byte) 0xE0, 0x00};
+        var clock = new ManualTimerScheduler();
         try (
                 ServerSocket server = listen();
                 Socket socket = socketWithDelayedDisconnectCompletion(writeFails)
@@ -106,13 +112,20 @@ class TransportContractTest {
             try (
                     TcpConnection connection = TcpConnectionTestSupport.wrap(socket);
                     Socket peer = server.accept();
-                    Transport sut = transport(faulty, connection)
+                    Transport sut = transport(faulty, connection, clock)
             ) {
                 peer.setSoTimeout(5000);
                 var receiver = new Receiver();
                 sut.start(endpoint(server), Duration.ofSeconds(5), receiver);
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+                if (delayed) {
+                    ((FaultyTransport) sut).sendDelay(Duration.ofSeconds(1));
+                }
                 assertThat(sut.send(1, packet)).isEqualTo(ACCEPTED);
+                if (delayed) {
+                    assertThat(clock.pendingTaskCount()).isEqualTo(1);
+                    clock.advance(Duration.ofSeconds(1));
+                }
                 assertThat(peer.getInputStream().readNBytes(packet.length)).isEqualTo(packet);
 
                 // Act: terminate after peer receipt, before the local write's result is known.
@@ -129,6 +142,7 @@ class TransportContractTest {
                 assertThat(receiver.events.poll(5, SECONDS)).isInstanceOf(IOException.class);
                 assertThat(sut.send(2, packet)).isEqualTo(CLOSED);
                 sut.close();
+                assertThat(clock.pendingTaskCount()).isZero();
                 assertThat(receiver.events).isEmpty();
             }
         }
@@ -186,20 +200,26 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, fault injection wrapper: {0}")
-    @ValueSource(booleans = {false, true})
-    void ordered_bytes_write_completions_and_a_single_terminal_event(boolean faulty)
-            throws Exception {
+    @ParameterizedTest(name = "{displayName}, fault injection wrapper: {0}, delayed: {1}")
+    @CsvSource({"false, false", "true, false", "true, true"})
+    void ordered_bytes_write_completions_and_a_single_terminal_event(
+            boolean faulty,
+            boolean delayed
+    ) throws Exception {
         // Arrange
+        var clock = new ManualTimerScheduler();
         try (
                 ServerSocket server = listen();
-                Transport sut = transport(faulty)
+                Transport sut = transport(faulty, clock)
         ) {
             var receiver = new Receiver();
             sut.start(endpoint(server), Duration.ofSeconds(5), receiver);
             try (Socket socket = server.accept()) {
                 socket.setSoTimeout(5000);
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+                if (delayed) {
+                    ((FaultyTransport) sut).sendDelay(Duration.ofSeconds(1));
+                }
 
                 // Act: the completion callback may start the next write immediately.
                 receiver.sent = ticket -> {
@@ -209,6 +229,19 @@ class TransportContractTest {
                 };
                 byte[] first = {1, 2, 3};
                 assertThat(sut.send(1, first)).isEqualTo(ACCEPTED);
+                if (delayed) {
+                    assertThatThrownBy(() -> sut.send(3, new byte[] {9}))
+                            .isInstanceOf(IllegalStateException.class);
+                    assertThat(clock.pendingTaskCount()).isEqualTo(1);
+                    clock.advance(Duration.ofMillis(999));
+                    assertThat(receiver.events).isEmpty();
+                    clock.advance(Duration.ofMillis(1));
+                    // TCP reports completion on its worker; wait for its reentrant send's timer.
+                    await().untilAsserted(() -> assertThat(clock.pendingTaskCount()).isEqualTo(1));
+                    clock.advance(Duration.ofMillis(999));
+                    assertThat(receiver.events).containsExactly(1L);
+                    clock.advance(Duration.ofMillis(1));
+                }
 
                 // Assert
                 assertThat(socket.getInputStream().readNBytes(5)).containsExactly(1, 2, 3, 4, 5);
@@ -242,6 +275,52 @@ class TransportContractTest {
                 sut.close();
                 assertThat(sut.send(3, new byte[] {1})).isEqualTo(CLOSED);
                 assertThat(socket.getInputStream().read()).isEqualTo(-1);
+                assertThat(clock.pendingTaskCount()).isZero();
+                assertThat(receiver.events).isEmpty();
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "{displayName}, ending: {0}")
+    @ValueSource(strings = {"close", "disconnect", "peer EOF"})
+    void ending_a_delayed_send_returns_ownership_without_writing(String ending) throws Exception {
+        // Arrange: the wrapper owns the bytes, but TCP has not received a send yet.
+        var clock = new ManualTimerScheduler();
+        var failure = new IOException("Injected disconnect before writing");
+        byte[] bytes = {1, 2, 3};
+        try (
+                ServerSocket server = listen();
+                var sut = new FaultyTransport(Transport.tcp("contract"), clock)
+                        .sendDelay(Duration.ofSeconds(1))
+        ) {
+            var receiver = new Receiver();
+            sut.start(endpoint(server), Duration.ofSeconds(5), receiver);
+            try (Socket peer = server.accept()) {
+                peer.setSoTimeout(5000);
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+                assertThat(sut.send(1, bytes)).isEqualTo(ACCEPTED);
+                assertThat(clock.pendingTaskCount()).isEqualTo(1);
+
+                // Act: peer EOF uses a half-close so its input remains readable afterward.
+                switch (ending) {
+                    case "close" -> sut.close();
+                    case "disconnect" -> sut.disconnect(failure);
+                    case "peer EOF" -> peer.shutdownOutput();
+                    default -> throw new AssertionError(ending);
+                }
+
+                // Assert: termination alone returns ownership; there was no successful write.
+                Object terminal = receiver.events.poll(5, SECONDS);
+                assertThat(terminal).isInstanceOf(IOException.class);
+                if (ending.equals("disconnect")) {
+                    assertThat(terminal).isSameAs(failure);
+                }
+                assertThat(clock.pendingTaskCount()).isZero();
+                bytes[0] = 9;
+                clock.advance(Duration.ofSeconds(1));
+                assertThat(peer.getInputStream().read()).isEqualTo(-1);
+                assertThat(sut.send(2, bytes)).isEqualTo(CLOSED);
+                sut.close();
                 assertThat(receiver.events).isEmpty();
             }
         }
@@ -339,18 +418,30 @@ class TransportContractTest {
     }
 
     private static Transport transport(boolean faulty) {
+        return transport(faulty, new ManualTimerScheduler());
+    }
+
+    private static Transport transport(boolean faulty, ManualTimerScheduler clock) {
         Transport tcp = Transport.tcp("contract");
-        return faulty ? new FaultyTransport(tcp, new ManualTimerScheduler()) : tcp;
+        return faulty ? new FaultyTransport(tcp, clock) : tcp;
     }
 
     private static Transport transport(boolean faulty, TcpConnection connection) {
+        return transport(faulty, connection, new ManualTimerScheduler());
+    }
+
+    private static Transport transport(
+            boolean faulty,
+            TcpConnection connection,
+            ManualTimerScheduler clock
+    ) {
         var tcp = new TcpTransport(
                 "contract",
                 new Semaphore(1),
                 InetAddress::getByName,
                 (_, _) -> connection
         );
-        return faulty ? new FaultyTransport(tcp, new ManualTimerScheduler()) : tcp;
+        return faulty ? new FaultyTransport(tcp, clock) : tcp;
     }
 
     private static Socket socketWithDelayedDisconnectCompletion(boolean writeFails) {

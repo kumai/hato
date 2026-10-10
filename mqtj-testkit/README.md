@@ -38,10 +38,15 @@ If you only need a broker, you can depend on `mqtj-broker` directly.
 - [FaultyTransport](src/main/java/org/mqtt4j/mqtj/testkit/FaultyTransport.java)
   wraps a transport such as `Transport.tcp(clientId)`. Supply a fresh wrapper through
   the client's `transportFactory` for each connection. Call `disconnect(cause)`
-  to simulate a connection failure or `receiveDelay(Duration)` to delay incoming
-  data.
+  to simulate a connection failure, `receiveDelay(Duration)` to delay incoming
+  data, or `sendDelay(Duration)` to delay outgoing writes. Use a long delay in
+  either direction to simulate stopped traffic. Disconnect while a send is still
+  delayed to fail it before writing.
 - [ManualTimerScheduler](src/main/java/org/mqtt4j/mqtj/testkit/ManualTimerScheduler.java)
   lets a test advance time with `advance(Duration)` instead of sleeping. Supply
   it to the client's `timerScheduler` or to `FaultyTransport` to control their
   timers. Advancing time runs due timers; wait separately for the client's
   response before checking the result.
+
+`FaultyTransport` is experimental, like the `Transport` SPI it wraps. Its API may
+change as that SPI evolves.
