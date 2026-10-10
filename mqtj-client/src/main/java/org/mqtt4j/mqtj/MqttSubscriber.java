@@ -32,6 +32,10 @@ public interface MqttSubscriber {
     /// A failure after that connection ends is logged without another disconnection notification
     /// or any effect on a later connection. Exhausted receive capacity also ends the connection.
     /// On connection termination, queued deliveries are discarded; a running handler can finish.
+    /// An established subscription survives termination and resumes on the same handle after
+    /// the client's next successful [MqttClient#connect()]. New deliveries wait for a previous
+    /// connection's running handler to finish, preserving serial execution. A handler failure
+    /// also retains the subscription for that next connection.
     /// Interrupt status left by a normally returning handler is cleared before the next delivery.
     /// QoS 1 acknowledgement follows the request's [AckMode]. A QoS 1 message can be delivered
     /// more than once.
@@ -49,5 +53,9 @@ public interface MqttSubscriber {
     /// or awaiting unsubscribe acknowledgement. A broker refusal fails with
     /// [MqttSubscribeException]. An unconnected client fails with [MqttNotConnectedException];
     /// admission failures use [MqttCapacityException].
+    /// If the connection ends before the initial SUBACK, the future fails with
+    /// [MqttConnectionLostException] and the registration is not retained. A broker refusal
+    /// during re-creation ends only that established subscription; other subscriptions and the
+    /// connection continue. A pull subscription reports that refusal from its receive methods.
     CompletableFuture<Subscription> subscribe(Subscribe request, Consumer<MqttDelivery> handler);
 }

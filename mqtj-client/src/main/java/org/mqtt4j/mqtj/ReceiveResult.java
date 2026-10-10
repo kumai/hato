@@ -3,8 +3,9 @@ package org.mqtt4j.mqtj;
 import static java.util.Objects.requireNonNull;
 
 /// The outcome of one pull receive. A timeout leaves the subscription active; normal
-/// termination ends it permanently. Connection failures and interruption are thrown by
-/// [Subscription#receive()].
+/// termination ends it permanently. Connection termination leaves receiving subscriptions
+/// waiting for a later connection. A broker refusal during re-creation, an internal failure
+/// that closes the client, and interruption are thrown by [Subscription#receive()].
 public sealed interface ReceiveResult {
 
     /// One delivery handed to this caller. Its acknowledgement follows the subscription's
@@ -20,8 +21,9 @@ public sealed interface ReceiveResult {
     record TimedOut() implements ReceiveResult {
     }
 
-    /// The subscription ended normally. No subsequent receive on this handle can deliver a
-    /// message, including after the client reconnects.
+    /// The subscription ended through its close, successful unsubscribe, or [MqttClient#close()].
+    /// No subsequent receive on this handle can deliver a message, including after the client
+    /// reconnects.
     record Ended() implements ReceiveResult {
     }
 }

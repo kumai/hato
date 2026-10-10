@@ -1,6 +1,5 @@
 package org.mqtt4j.mqtj.client.internal;
 
-import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -12,6 +11,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiPredicate;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -23,7 +23,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import org.mqtt4j.mqtj.AckMode;
-import org.mqtt4j.mqtj.MqttConnectionLostException;
 import org.mqtt4j.mqtj.MqttDelivery;
 import org.mqtt4j.mqtj.MqttMessage;
 import org.mqtt4j.mqtj.Qos;
@@ -67,7 +66,7 @@ class DeliveryLanesTest {
     }
 
     @Test
-    void connection_failure_abandons_queued_pull_work_and_retires_handed_off_acknowledgements()
+    void connection_end_discards_queued_pull_work_and_retires_handed_off_acknowledgements()
             throws Exception {
         // Arrange
         DeliveryLanes.Receiver receiver = sut.registerPull(
@@ -76,24 +75,20 @@ class DeliveryLanesTest {
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         MqttDelivery handedOff = received(receiver.receive());
         assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isTrue();
-        var failure = new IOException("Connection ended");
 
         // Act
-        sut.close(failure);
+        sut.connectionEnded();
 
         // Assert
-        assertThat(sut.abandonedDeliveries()).isEqualTo(1);
-        assertThat(sut.retainedLanes()).isZero();
+        assertThat(sut.abandonedDeliveries()).isZero();
+        assertThat(sut.discardedDeliveries()).isEqualTo(1);
+        assertThat(sut.retainedLanes()).isEqualTo(1);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
         assertThat(ready).isEmpty();
-        assertThatThrownBy(receiver::receive)
-                .isInstanceOf(MqttConnectionLostException.class).hasCause(failure);
-        DeliveryLanes.Receiver fresh = sut.registerPull(
-                2, request(AckMode.MANUAL, 1)
-        ).orElseThrow();
-        assertThat(sut.deliver(token(2, 12), List.of(2L), qosOneMessage(), false, 30)).isTrue();
-        MqttDelivery current = received(fresh.receive());
+        assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+        assertThat(sut.deliver(token(2, 12), List.of(1L), qosOneMessage(), false, 30)).isTrue();
+        MqttDelivery current = received(receiver.receive());
         handedOff.ack();
         assertThat(ready).isEmpty();
         assertThat(sut.retainedBytes()).isEqualTo(30);
@@ -103,18 +98,19 @@ class DeliveryLanesTest {
     }
 
     @Test
-    void normal_connection_end_discards_pull_buffers_and_ends_receiving() throws Exception {
+    void connection_end_discards_pull_buffers_and_keeps_receiving() throws Exception {
         // Arrange
         DeliveryLanes.Receiver receiver = sut.registerPull(1, request(1)).orElseThrow();
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
 
         // Act
-        sut.close(null);
+        sut.connectionEnded();
 
         // Assert
-        assertThat(receiver.receive()).isEqualTo(new ReceiveResult.Ended());
-        assertThat(sut.abandonedDeliveries()).isEqualTo(1);
-        assertThat(sut.retainedLanes()).isZero();
+        assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+        assertThat(sut.abandonedDeliveries()).isZero();
+        assertThat(sut.discardedDeliveries()).isEqualTo(1);
+        assertThat(sut.retainedLanes()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isZero();
     }
 
@@ -649,7 +645,7 @@ class DeliveryLanesTest {
         assertThat(entered.await(5, SECONDS)).isTrue();
 
         // Act & Assert: a new generation cannot reuse the old handler's byte reservation.
-        sut.close(null);
+        sut.connectionEnded();
         assertThat(sut.register(2, request(2), _ -> { })).isTrue();
         assertThat(sut.deliver(token(2, 0), List.of(2L), message(2), false, 1)).isFalse();
         assertThat(sut.retainedBytes()).isEqualTo(BYTE_LIMIT);
@@ -713,7 +709,7 @@ class DeliveryLanesTest {
     }
 
     @Test
-    void interrupted_handler_errors_report_the_original_cause_and_abandon_the_remaining_work()
+    void interrupted_handler_errors_preserve_the_cause_and_discard_queued_work_on_connection_end()
             throws Exception {
         // Arrange: one handler will leave its interrupt flag set and throw with a delivery queued.
         var entered = new CountDownLatch(1);
@@ -738,39 +734,59 @@ class DeliveryLanesTest {
         Failure failure = requireNonNull(failures.poll(5, SECONDS));
         assertThat(failure.token().connection()).isEqualTo(7);
         assertThat(failure.cause()).isSameAs(cause);
-        await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
+        sut.connectionEnded();
+        assertThat(sut.retainedLanes()).isEqualTo(1);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
-        assertThat(sut.abandonedDeliveries()).isEqualTo(2);
+        assertThat(sut.abandonedDeliveries()).isEqualTo(1);
+        assertThat(sut.discardedDeliveries()).isEqualTo(1);
         assertThat(calls.get()).isEqualTo(1);
     }
 
     @Test
-    void a_failure_after_connection_end_keeps_its_origin_and_releases_the_lane() throws Exception {
+    void a_failure_after_connection_end_keeps_its_origin_and_resumes_the_lane() throws Exception {
         // Arrange: the handler outlives the connection that received its QoS 0 delivery.
+        var mailbox = new Mailbox(1, 10, 1, 10, 1);
+        mailbox.activate(7);
+        DeliveryLanes sut = lanes(BYTE_LIMIT, () -> { }, (token, cause) -> {
+            failures.add(new Failure(token, cause));
+            return mailbox.terminate(new Mailbox.Event(
+                    token.connection(), () -> { }, Mailbox.Kind.CONTROL, 0
+            ));
+        });
         var workers = new LinkedBlockingQueue<Thread>();
         CountDownLatch release = release();
         var cause = new IllegalStateException("old handler failed");
+        var first = new AtomicBoolean(true);
         assertThat(sut.register(1, request(1), _ -> {
             workers.add(Thread.currentThread());
-            waitFor(release);
-            throw cause;
+            if (first.getAndSet(false)) {
+                waitFor(release);
+                throw cause;
+            }
         })).isTrue();
         assertThat(sut.deliver(token(7, 0), List.of(1L), message(1), false, 10)).isTrue();
         Thread worker = requireNonNull(workers.poll(5, SECONDS));
-        sut.close(null);
+        mailbox.discard(7);
         assertThat(sut.retainedLanes()).isEqualTo(1);
 
-        // Act
+        // Act: the failure arrives after admission ends but before connection cleanup.
         release.countDown();
-        assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+        await().until(() -> worker.getState() == Thread.State.WAITING);
+        sut.connectionEnded();
 
         // Assert: the callback retains the receipt's origin without retaining its resources.
         assertThat(failures.poll(5, SECONDS)).isEqualTo(new Failure(token(7, 0), cause));
-        assertThat(sut.retainedLanes()).isZero();
+        assertThat(sut.retainedLanes()).isEqualTo(1);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
         assertThat(ready).isEmpty();
+
+        // Act & Assert: the same worker takes new input after the next connection starts.
+        mailbox.activate(8);
+        assertThat(sut.deliver(token(8, 0), List.of(1L), message(2), false, 10)).isTrue();
+        assertThat(workers.poll(5, SECONDS)).isSameAs(worker);
+        await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
     }
 
     @Test
@@ -801,7 +817,7 @@ class DeliveryLanesTest {
         // Assert: the failure still names the second delivery's origin and original cause.
         assertThat(failures.poll(5, SECONDS))
                 .isEqualTo(new Failure(token(2, 10), cause));
-        await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
+        assertThat(sut.retainedLanes()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isZero();
     }
 
@@ -845,7 +861,7 @@ class DeliveryLanesTest {
             Failure failure = requireNonNull(failures.poll(5, SECONDS));
             assertThat(failure.token().connection()).isEqualTo(7);
             assertThat(failure.cause()).isSameAs(cause);
-            await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
+            assertThat(sut.retainedLanes()).isEqualTo(1);
             assertThat(failures).isEmpty();
             assertThat(logCalls.get()).isEqualTo(1);
             assertThat(sut.retainedDeliveries()).isZero();
@@ -1349,10 +1365,18 @@ class DeliveryLanesTest {
     }
 
     private DeliveryLanes lanes(long byteLimit, Runnable onReady) {
+        return lanes(byteLimit, onReady, (token, cause) -> failures.add(new Failure(token, cause)));
+    }
+
+    private DeliveryLanes lanes(
+            long byteLimit,
+            Runnable onReady,
+            BiPredicate<DeliveryToken, Throwable> onFailure
+    ) {
         var manager = new DeliveryLanes(
                 "lane-test",
                 byteLimit,
-                (token, cause) -> failures.add(new Failure(token, cause)),
+                onFailure,
                 onReady
         );
         managers.add(manager);

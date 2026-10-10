@@ -1,11 +1,6 @@
 package org.mqtt4j.mqtj.client.internal;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.net.InetAddress;
 import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -13,7 +8,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -21,22 +15,20 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.mqtj.*;
-import org.mqtt4j.mqtj.client.internal.common.io.FrameReader;
-import org.mqtt4j.mqtj.client.internal.common.io.FrameWriter;
 import org.mqtt4j.mqtj.client.internal.common.protocol.Packet;
-import org.mqtt4j.mqtj.client.internal.common.protocol.PacketCodec;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.mqtt4j.mqtj.client.internal.ScriptedBroker.client;
+import static org.mqtt4j.mqtj.client.internal.ScriptedBroker.endpoint;
+import static org.mqtt4j.mqtj.client.internal.ScriptedBroker.listen;
 import static org.mqtt4j.mqtj.client.internal.common.protocol.Properties.EMPTY;
 
 /// A raw TCP peer makes the acknowledgement boundary visible independently of broker policy.
 class Qos1AcknowledgementTest {
-
-    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
 
     @Test
     @Timeout(30)
@@ -44,7 +36,7 @@ class Qos1AcknowledgementTest {
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
-                Peer peer = Peer.connect(server, sut)) {
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
             Subscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 512);
             peer.publish("data", 1);
             MqttDelivery first = received(subscription.receive(Duration.ofSeconds(5)));
@@ -76,7 +68,7 @@ class Qos1AcknowledgementTest {
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
-                Peer peer = Peer.connect(server, sut)) {
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
             CompletableFuture<Subscription> subscribing = sut.subscribe(
                     Subscribe.of(new TopicFilter("data"), Qos.AT_LEAST_ONCE)
             );
@@ -104,7 +96,7 @@ class Qos1AcknowledgementTest {
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
-                Peer peer = Peer.connect(server, sut)) {
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
             Subscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 128);
             peer.publishBurst("data", 1, 100, false);
             var deliveries = new ArrayList<MqttDelivery>();
@@ -129,7 +121,7 @@ class Qos1AcknowledgementTest {
     void a_slow_ack_head_does_not_hold_completed_pull_payload_capacity() throws Exception {
         // Arrange: a two-slot pull queue drains while another subscription holds all PUBACKs.
         try (ServerSocket server = listen(); MqttClient sut = client(server);
-                Peer peer = Peer.connect(server, sut)) {
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
             Subscription head = peer.subscribePull(sut, "head", AckMode.MANUAL, 1);
             Subscription tail = peer.subscribePull(sut, "tail", AckMode.ON_RECEIVE, 2);
             peer.publish("head", 1);
@@ -154,7 +146,7 @@ class Qos1AcknowledgementTest {
     void an_inflight_retransmission_does_not_fill_a_manual_pull_queue() throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
-                Peer peer = Peer.connect(server, sut)) {
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
             Subscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 2);
             peer.publish("data", 7);
             MqttDelivery first = received(subscription.receive(Duration.ofSeconds(5)));
@@ -183,7 +175,7 @@ class Qos1AcknowledgementTest {
         // Arrange
         var handled = new CountDownLatch(100);
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 peer.subscribe(sut, "data", ackMode, 128, delivery -> {
                     delivery.ack();
                     handled.countDown();
@@ -204,7 +196,7 @@ class Qos1AcknowledgementTest {
     void a_hundred_unmatched_publications_are_acknowledged_without_disconnect() throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 // Act
                 peer.publishBurst("unmatched", 1, 100, false);
 
@@ -222,7 +214,7 @@ class Qos1AcknowledgementTest {
         var received = new LinkedBlockingQueue<MqttDelivery>();
         var outstanding = new ArrayList<MqttDelivery>();
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 peer.subscribe(sut, "data", AckMode.MANUAL, 64, received::add);
                 peer.publishBurst("data", 1, 32, false);
                 for (int i = 0; i < 32; i++) {
@@ -261,7 +253,7 @@ class Qos1AcknowledgementTest {
         // Arrange
         var received = new LinkedBlockingQueue<MqttDelivery>();
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 peer.subscribe(sut, "data", AckMode.MANUAL, received::add);
                 peer.publish("data", 7);
                 MqttDelivery first = requireNonNull(received.poll(5, SECONDS));
@@ -298,7 +290,7 @@ class Qos1AcknowledgementTest {
         var release = new CountDownLatch(1);
         var handled = new AtomicInteger();
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 Subscription subscription = peer.subscribe(
                         sut, "data", AckMode.ON_RECEIVE, 512, _ -> {
                             handled.incrementAndGet();
@@ -337,7 +329,7 @@ class Qos1AcknowledgementTest {
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 peer.subscribe(sut, "data", AckMode.ON_RECEIVE, _ -> {
                     entered.countDown();
                     waitFor(release);
@@ -363,7 +355,7 @@ class Qos1AcknowledgementTest {
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 peer.subscribe(sut, "data", AckMode.AFTER_HANDLER, _ -> {
                     entered.countDown();
                     waitFor(release);
@@ -391,7 +383,7 @@ class Qos1AcknowledgementTest {
         // Arrange
         var received = new LinkedBlockingQueue<MqttDelivery>();
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 peer.subscribe(sut, "data", AckMode.MANUAL, received::add);
                 peer.publish("data", 7);
                 peer.publish("data", 2);
@@ -432,7 +424,7 @@ class Qos1AcknowledgementTest {
                         .connectionListener(ended::add)
                         .build()
         ) {
-            try (Peer peer = Peer.connect(server, sut)) {
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 peer.subscribe(sut, "data", AckMode.AFTER_HANDLER, _ -> {
                     throw failure;
                 });
@@ -441,27 +433,10 @@ class Qos1AcknowledgementTest {
                 peer.publish("data", 7);
 
                 // Assert: EOF is the first response to the failed delivery.
-                assertThat(peer.reader.read()).isEmpty();
+                peer.expectClosed();
                 assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
             }
         }
-    }
-
-    private static MqttClient client(ServerSocket server) {
-        return MqttClient.builder()
-                .server(endpoint(server))
-                .version(MqttVersion.V3_1_1)
-                .build();
-    }
-
-    private static ServerSocket listen() throws IOException {
-        var server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
-        server.setSoTimeout(5000);
-        return server;
-    }
-
-    private static URI endpoint(ServerSocket server) {
-        return URI.create("mqtt://127.0.0.1:" + server.getLocalPort());
     }
 
     private static void waitFor(CountDownLatch latch) {
@@ -470,131 +445,6 @@ class Qos1AcknowledgementTest {
         } catch (InterruptedException cause) {
             Thread.currentThread().interrupt();
             throw new AssertionError(cause);
-        }
-    }
-
-    private static final class Peer implements AutoCloseable {
-
-        private final Socket socket;
-        private final FrameReader reader;
-        private final FrameWriter writer;
-
-        private Peer(Socket socket) throws IOException {
-            this.socket = socket;
-            socket.setSoTimeout(5000);
-            reader = new FrameReader(socket.getInputStream(), 1024 * 1024);
-            writer = new FrameWriter(socket.getOutputStream());
-        }
-
-        static Peer connect(ServerSocket server, MqttClient sut) throws Exception {
-            CompletableFuture<ConnAck> connected = sut.connect();
-            var peer = new Peer(server.accept());
-            try {
-                assertThat(peer.receive()).isInstanceOf(Packet.Connect.class);
-                peer.send(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
-                connected.get(5, SECONDS);
-                return peer;
-            } catch (Exception | AssertionError failure) {
-                peer.close();
-                throw failure;
-            }
-        }
-
-        Subscription subscribe(
-                MqttClient sut,
-                String topic,
-                AckMode ackMode,
-                Consumer<MqttDelivery> handler
-        ) throws Exception {
-            return subscribe(sut, topic, ackMode, 256, handler);
-        }
-
-        Subscription subscribePull(MqttClient sut, String topic, AckMode mode, int capacity)
-                throws Exception {
-            CompletableFuture<Subscription> subscribed = sut.subscribe(
-                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
-                            .withAckMode(mode)
-                            .withBufferCapacity(capacity)
-            );
-            var request = (Packet.Subscribe) receive();
-            send(new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY));
-            return subscribed.get(5, SECONDS);
-        }
-
-        Subscription subscribe(
-                MqttClient sut,
-                String topic,
-                AckMode ackMode,
-                int capacity,
-                Consumer<MqttDelivery> handler
-        ) throws Exception {
-            CompletableFuture<Subscription> subscribed = sut.subscribe(
-                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
-                            .withAckMode(ackMode)
-                            .withBufferCapacity(capacity),
-                    handler
-            );
-            var request = (Packet.Subscribe) receive();
-            send(new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY));
-            return subscribed.get(5, SECONDS);
-        }
-
-        void publish(String topic, int packetId) throws IOException {
-            send(new Packet.Publish(
-                    new Topic(topic), new byte[] {1}, Qos.AT_LEAST_ONCE,
-                    false, false, packetId, EMPTY
-            ));
-        }
-
-        void publishBurst(String topic, int first, int count, boolean dup) throws IOException {
-            var bytes = new ByteArrayOutputStream();
-            for (int id = first; id < first + count; id++) {
-                bytes.writeBytes(codec.encode(new Packet.Publish(
-                        new Topic(topic), new byte[] {(byte) id}, Qos.AT_LEAST_ONCE,
-                        false, dup, id, EMPTY
-                )));
-            }
-            socket.getOutputStream().write(bytes.toByteArray());
-        }
-
-        void expectAcknowledgements(int first, int count) throws IOException {
-            for (int id = first; id < first + count; id++) {
-                assertThat(receive()).isEqualTo(new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY));
-            }
-        }
-
-        void roundTripBarrier(MqttClient sut) throws Exception {
-            CompletableFuture<PublishResult> published = sut.publish(new MqttMessage(
-                    new Topic("barrier"), new byte[] {0}, Qos.AT_LEAST_ONCE, false
-            ));
-            var publication = (Packet.Publish) receive();
-            assertThat(publication.topic()).isEqualTo(new Topic("barrier"));
-            send(new Packet.PubAck(publication.packetId(), ReasonCode.SUCCESS, EMPTY));
-            // This PUBACK follows all preceding input in the same byte stream and mailbox.
-            published.get(5, SECONDS);
-        }
-
-        void expectPublicationBarrier(MqttClient sut) throws Exception {
-            sut.publish(MessagingTest.message("barrier", (byte) 0)).get(5, SECONDS);
-            assertThat(receive()).isInstanceOfSatisfying(
-                    Packet.Publish.class,
-                    publication -> assertThat(publication.topic()).isEqualTo(new Topic("barrier"))
-            );
-        }
-
-        Packet receive() throws IOException {
-            return codec.decode(reader.read().orElseThrow(() -> new AssertionError(
-                    "The client closed the connection before sending the expected packet"
-            )));
-        }
-
-        void send(Packet packet) throws IOException {
-            writer.write(codec.encode(packet));
-        }
-
-        @Override
-        public void close() throws IOException {
-            socket.close();
         }
     }
 

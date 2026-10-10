@@ -18,6 +18,7 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -400,56 +401,118 @@ abstract class MessagingTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void an_established_subscription_resumes_after_explicit_reconnect(boolean pull, boolean failure)
+            throws Exception {
+        // Arrange
+        String topic = uniqueTopic();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        var received = new LinkedBlockingQueue<MqttDelivery>();
+        var transport = new AtomicReference<FaultyTransport>();
+        try (MqttClient sut = MqttClient.builder()
+                .server(endpoint())
+                .version(MqttVersion.V3_1_1)
+                .connectionListener(ended::add)
+                .transportFactory(id -> {
+                    var faulty = new FaultyTransport(Transport.tcp(id), new ManualTimerScheduler());
+                    transport.set(faulty);
+                    return faulty;
+                })
+                .build()) {
+            sut.connect().get(5, SECONDS);
+            var request = Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE);
+            Subscription subscription = (pull ? sut.subscribe(request)
+                    : sut.subscribe(request, received::add)).get(5, SECONDS);
+            sut.publish(message(topic, (byte) 1)).get(5, SECONDS);
+            MqttDelivery first = pull ? received(subscription.receive(Duration.ofSeconds(5)))
+                    : requireNonNull(received.poll(5, SECONDS));
+            assertThat(first.message().payload()).containsExactly((byte) 1);
+
+            // Act: keep the same handle while its connection ends and is explicitly reopened.
+            var cause = new IOException("connection lost");
+            if (failure) {
+                requireNonNull(transport.get()).disconnect(cause);
+            } else {
+                sut.disconnect().get(5, SECONDS);
+            }
+            assertThat(ended.poll(5, SECONDS))
+                    .isEqualTo(new Disconnection(failure ? cause : null, !failure));
+            sut.connect().get(5, SECONDS);
+            var next = new MqttMessage(new Topic(topic), new byte[] {2}, Qos.AT_LEAST_ONCE, false);
+            // One restoration fits the send capacity, before this same connection's PUBLISH.
+            sut.publish(next).get(5, SECONDS);
+
+            // Assert: the original registration receives again without another subscribe call.
+            MqttDelivery resumed = pull ? received(subscription.receive(Duration.ofSeconds(5)))
+                    : requireNonNull(received.poll(5, SECONDS));
+            assertThat(resumed.message()).isEqualTo(next);
+            assertThat(subscription.filter()).isEqualTo(new TopicFilter(topic));
+            subscription.unsubscribe().get(5, SECONDS);
+            if (pull) {
+                assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
+            }
+            assertThat(ended).isEmpty();
+        }
+    }
+
     @Test
-    void a_handler_failure_is_reported_without_a_pending_operation() throws Exception {
+    void a_handler_failure_is_reported_and_the_subscription_resumes_after_reconnect()
+            throws Exception {
         // Arrange
         String topic = uniqueTopic();
         var failure = new IllegalStateException("handler failed");
         var ended = new LinkedBlockingQueue<Disconnection>();
+        var received = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client(ended::add); MqttClient publisher = client()) {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
-            sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
-                    _ -> {
-                        throw failure;
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                        received.add(delivery);
                     }
             ).get(5, SECONDS);
 
             // Act: the subscriber has no pending operation to carry this failure.
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
-            Disconnection disconnection = requireNonNull(ended.poll(5, SECONDS));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
+            sut.connect().get(5, SECONDS);
+            // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
+            sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
 
-            // Assert
-            assertThat(disconnection.cause()).isSameAs(failure);
-            assertThat(disconnection.userRequested()).isFalse();
+            // Assert: failure did not remove the handler or its subscription handle.
+            assertThat(requireNonNull(received.poll(5, SECONDS)).message().payload())
+                    .containsExactly((byte) 2);
+            subscription.unsubscribe().get(5, SECONDS);
+            assertThat(ended).isEmpty();
         }
     }
 
     @Test
-    void a_late_handler_failure_does_not_end_the_new_connection() throws Exception {
-        // Arrange: keep an old connection's handler running across a reconnect.
+    void a_late_handler_failure_does_not_end_the_new_connection_or_stop_its_lane()
+            throws Exception {
+        // Arrange: keep the same subscription's handler running across a reconnect.
         String topic = uniqueTopic();
         var failure = new IllegalStateException("old handler failed");
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var worker = new AtomicReference<Thread>();
         var ended = new LinkedBlockingQueue<Disconnection>();
         var received = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client(ended::add)) {
             sut.connect().get(5, SECONDS);
-            sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
-                    _ -> {
-                        worker.set(Thread.currentThread());
-                        entered.countDown();
-                        try {
-                            assertThat(release.await(30, SECONDS)).isTrue();
-                        } catch (InterruptedException cause) {
-                            Thread.currentThread().interrupt();
-                            throw new AssertionError(cause);
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            entered.countDown();
+                            waitFor(release);
+                            throw failure;
                         }
-                        throw failure;
+                        received.add(delivery);
                     }
             ).get(5, SECONDS);
             sut.publish(message(topic, (byte) 1)).get(5, SECONDS);
@@ -457,19 +520,18 @@ abstract class MessagingTest {
             sut.disconnect().get(5, SECONDS);
             assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
             sut.connect().get(5, SECONDS);
-            sut.subscribe(
-                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
-                    received::add
-            ).get(5, SECONDS);
-
-            // Act: the old handler fails after the new connection is ready.
-            release.countDown();
-            await().until(() -> !requireNonNull(worker.get()).isAlive());
-
-            // Act & Assert: new delivery and the next ordered notification remain normal.
+            // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
-            assertThat(requireNonNull(received.poll(5, SECONDS)).message())
-                    .isEqualTo(message(topic, (byte) 2));
+            await().untilAsserted(() -> assertThat(usage(sut).deliveries()).isEqualTo(2));
+            assertThat(received).isEmpty();
+
+            // Act: the old handler fails with the current delivery already waiting in its lane.
+            release.countDown();
+
+            // Assert: handlers stay serial, and the old failure does not strand the queued work.
+            assertThat(requireNonNull(received.poll(5, SECONDS)).message().payload())
+                    .containsExactly((byte) 2);
+            subscription.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
             assertThat(ended.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
             assertThat(ended).isEmpty();
@@ -555,7 +617,8 @@ abstract class MessagingTest {
 
     @Test
     @Timeout(60)
-    void a_blocked_handler_overflows_its_default_queue_and_frees_its_slots_after_returning()
+    @SuppressWarnings("try") // Explicit close verifies final release of the retained subscriptions.
+    void a_blocked_handler_overflows_its_default_queue_and_keeps_its_subscription()
             throws Exception {
         // Arrange: the handler holds the first publication before any other one is sent.
         String topic = uniqueTopic();
@@ -583,8 +646,7 @@ abstract class MessagingTest {
                 publisher.publish(publication).get(5, SECONDS);
             }
 
-            // Assert: overload ends the connection while the handler runs. Only that handler
-            // keeps its lane and delivery, until it returns.
+            // Assert: overload discards queued work while the running handler keeps its delivery.
             assertThat(requireNonNull(ended.poll(10, SECONDS)).cause())
                     .isInstanceOf(MqttCapacityException.class);
             await().untilAsserted(() -> assertThat(usage(sut))
@@ -598,6 +660,9 @@ abstract class MessagingTest {
                     )
                     .containsExactly(0, 0, 0, 0, 1, 1));
             release.countDown();
+            await().untilAsserted(() -> assertThat(usage(sut))
+                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 1, 0, 0)));
+            sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
             release.countDown();
@@ -605,6 +670,7 @@ abstract class MessagingTest {
     }
 
     @Test
+    @SuppressWarnings("try") // Explicit close verifies final release of the retained subscriptions.
     void a_handler_can_wait_for_its_own_publication_while_its_queue_is_full() throws Exception {
         // Arrange: a handler keeps its four-slot queue full until it may publish and wait.
         String base = uniqueTopic();
@@ -652,6 +718,9 @@ abstract class MessagingTest {
             }
             assertThat(ended).isEmpty();
             sut.disconnect().get(5, SECONDS);
+            await().untilAsserted(() -> assertThat(usage(sut))
+                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0)));
+            sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
             release.countDown();
@@ -659,6 +728,7 @@ abstract class MessagingTest {
     }
 
     @Test
+    @SuppressWarnings("try") // Explicit close verifies final release of the retained subscriptions.
     void overload_releases_a_handler_waiting_for_its_own_publication() throws Exception {
         // Arrange: delayed input lets an overflowing publication precede the handler's PUBACK.
         String base = uniqueTopic();
@@ -727,12 +797,15 @@ abstract class MessagingTest {
             // Act: delayed input delivers the overflowing publication before the PUBACK.
             scheduler.advance(Duration.ofSeconds(30));
 
-            // Assert: no circular wait remains, and every slot returns once the handler does.
+            // Assert: no circular wait remains; only the subscriptions survive connection failure.
             Disconnection end = requireNonNull(ended.poll(5, SECONDS));
             assertThat(end.cause()).isInstanceOf(MqttCapacityException.class);
             assertThat(outcome.get(5, SECONDS))
                     .isInstanceOf(MqttConnectionLostException.class)
                     .hasCause(end.cause());
+            await().untilAsserted(() -> assertThat(usage(sut))
+                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0)));
+            sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
             release.countDown();

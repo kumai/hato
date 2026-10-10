@@ -9,9 +9,15 @@ import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -120,7 +126,7 @@ class SessionCoreTest {
 
     @ParameterizedTest
     @EnumSource(SendQueue.OfferResult.class)
-    void termination_completes_sent_and_queued_closures_once_with_the_original_cause(
+    void termination_preserves_sent_and_queued_closures_until_clean_session_reconciliation(
             SendQueue.OfferResult result
     ) {
         // Arrange
@@ -136,20 +142,22 @@ class SessionCoreTest {
         // Act
         sut.failed(1, failure);
 
-        // Assert: RecordingPort rejects any duplicate completion.
+        // Assert: a background close remains pending until the broker state is known.
         for (int i = 0; i < 20; i++) {
-            assertThat(requireNonNull(port.results.get(1000L + i)).failure())
-                    .isInstanceOf(MqttConnectionLostException.class).hasCause(failure);
+            assertThat(port.results).doesNotContainKey(1000L + i);
         }
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         port.sent.clear();
-        port.registered.clear();
         port.sendResult = SendQueue.OfferResult.ACCEPTED;
         sut.connect(2000, 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         sut.sendCapacityAvailable(1);
         sut.sendCapacityAvailable(2);
         assertThat(port.sent).isEmpty();
+        for (int i = 0; i < 20; i++) {
+            assertThat(requireNonNull(port.results.get(1000L + i)).failure()).isNull();
+        }
+        assertThat(port.removed).hasSize(20).doesNotHaveDuplicates();
         // Exchanges abandoned with the old connection no longer occupy the closure window.
         sut.subscribe(3000, subscription("slot/0"));
         var subscribe = (Packet.Subscribe) port.sent.getLast();
@@ -166,9 +174,11 @@ class SessionCoreTest {
         establishSubscriptions(1);
         sut.publish(3, qosOneMessage());
         int id = port.publicationIds.getLast();
+        port.sendResult = SendQueue.OfferResult.FULL;
         sut.closeSubscription(1000, 2);
 
         // Act: returned send capacity and a PUBACK can both arrive before DISCONNECT is written.
+        port.sendResult = SendQueue.OfferResult.ACCEPTED;
         sut.disconnect(2000);
         sut.sendCapacityAvailable(1);
         receive(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0);
@@ -177,8 +187,293 @@ class SessionCoreTest {
         assertThat(port.sent.getLast()).isInstanceOf(Packet.Disconnect.class);
         assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
         sut.sent(1, port.ticket, 0);
-        assertThat(requireNonNull(port.results.get(1000L)).failure())
-                .isInstanceOf(MqttConnectionLostException.class);
+        assertThat(port.results).doesNotContainKey(1000L);
+        sut.connect(2001, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        assertThat(requireNonNull(port.results.get(1000L)).failure()).isNull();
+        assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
+    }
+
+    @Test
+    void confirmed_subscriptions_keep_their_handles_and_refresh_the_grant_after_reconnect() {
+        // Arrange: one confirmed subscription and one whose first SUBACK never arrives.
+        connected();
+        sut.subscribe(2, Subscribe.of(new TopicFilter("a/#"), Qos.AT_LEAST_ONCE));
+        var initial = (Packet.Subscribe) port.sent.getLast();
+        receive(1, new Packet.SubAck(initial.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
+        Subscription handle = (Subscription) requireNonNull(port.results.get(2L)).value();
+        sut.subscribe(3, subscription("other/#"));
+        var failure = new IOException("lost before initial SUBACK");
+
+        // Act
+        sut.failed(1, failure);
+        port.sent.clear();
+        sut.connect(4, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert: CONNECT completes before recreation, and the pending initial attempt ends.
+        assertThat(requireNonNull(port.results.get(4L)).value()).isEqualTo(new ConnAck(false));
+        assertThat(requireNonNull(port.results.get(3L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class).hasCause(failure);
+        assertThat(port.removed).containsExactly(3L);
+        assertThat(port.registered).containsExactly(2L, 3L);
+        assertThat(port.sent).singleElement().isInstanceOfSatisfying(Packet.Subscribe.class,
+                packet -> assertThat(packet.subscriptions()).containsExactly(
+                        new Packet.Subscription(new TopicFilter("a/#"), Qos.AT_LEAST_ONCE,
+                                false, false, 0)));
+        assertThat(requireNonNull(handle).grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+
+        // Act: recreation updates the existing handle without completing its future again.
+        var recreated = (Packet.Subscribe) port.sent.getLast();
+        receive(2, new Packet.SubAck(recreated.packetId(),
+                List.of(ReasonCode.GRANTED_QOS_1), EMPTY), 0);
+
+        // Assert: RecordingPort rejects duplicate operation completion.
+        assertThat(requireNonNull(port.results.get(2L)).value()).isSameAs(handle);
+        assertThat(handle.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+        assertThat(port.grants).containsExactly(handle, handle);
+        sut.failed(2, new IOException("lost again"));
+        sut.close(null);
+        assertThat(port.removed).containsExactly(3L, 2L);
+    }
+
+    @Test
+    void recreating_the_subscription_limit_waits_for_capacity_and_bounds_the_suback_window() {
+        // Arrange: a full registration table is larger than the ordinary send queue.
+        connected();
+        establishSubscriptions(256);
+        sut.failed(1, new IOException("lost connection"));
+        port.sent.clear();
+        port.sendResult = SendQueue.OfferResult.FULL;
+        sut.connect(1000, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        assertThat(requireNonNull(port.results.get(1000L)).failure()).isNull();
+        assertThat(port.sent).isEmpty();
+
+        // Act: old capacity cannot resume work; current capacity opens only the bounded window.
+        port.sendResult = SendQueue.OfferResult.ACCEPTED;
+        sut.sendCapacityAvailable(1);
+        assertThat(port.sent).isEmpty();
+        sut.sendCapacityAvailable(2);
+
+        // Assert: each SUBACK admits one replacement without registering or completing again.
+        for (int i = 0; i < 256; i++) {
+            assertThat(port.sent).hasSize(Math.min(256, i + 16));
+            var packet = (Packet.Subscribe) port.sent.get(i);
+            assertThat(packet.subscriptions().getFirst().filter())
+                    .isEqualTo(new TopicFilter("slot/" + i));
+            receive(2, new Packet.SubAck(packet.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
+        }
+        assertThat(port.registered).hasSize(256).doesNotHaveDuplicates();
+        assertThat(port.grants).hasSize(512);
+        assertThat(port.removed).isEmpty();
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @ParameterizedTest(name = "logging failure: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_refused_recreation_ends_only_that_subscription_with_its_original_handle(
+            boolean loggingFailure
+    ) {
+        // Arrange: unsubscribe waits for recreation while another subscription stays active.
+        connected();
+        establishSubscriptions(2);
+        Object refused = requireNonNull(port.results.get(2L)).value();
+        sut.failed(1, new IOException("lost connection"));
+        port.sent.clear();
+        sut.connect(4, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        var first = (Packet.Subscribe) port.sent.getFirst();
+        var second = (Packet.Subscribe) port.sent.getLast();
+        sut.unsubscribe(5, 2);
+        var logCalls = new AtomicInteger();
+        var jul = Logger.getLogger(SessionCore.class.getName());
+        Level previousLevel = jul.getLevel();
+        boolean previousParents = jul.getUseParentHandlers();
+        var handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                logCalls.incrementAndGet();
+                if (loggingFailure) {
+                    throw new AssertionError("logging backend failure");
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        jul.addHandler(handler);
+        jul.setLevel(Level.WARNING);
+        jul.setUseParentHandlers(false);
+        try {
+            // Act
+            receive(2, new Packet.SubAck(first.packetId(),
+                    List.of(ReasonCode.UNSPECIFIED_ERROR), EMPTY), 0);
+            receive(2, new Packet.SubAck(second.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
+            receive(2, qosOnePublication(7, "slot/1", false), 0);
+
+            // Assert: even failed logging cannot interrupt removal or terminate the connection.
+            assertThat(port.removed).containsExactly(2L);
+            assertThat(port.removals).singleElement().satisfies(removal -> {
+                assertThat(removal.handle()).isSameAs(refused);
+                assertThat(removal.cause()).isInstanceOf(MqttSubscribeException.class);
+            });
+            assertThat(requireNonNull(port.results.get(5L)).failure()).isNull();
+            assertThat(port.deliveries).singleElement()
+                    .satisfies(delivery -> assertThat(delivery.ids()).containsExactly(3L));
+            assertThat(port.ends).hasSize(1);
+            assertThat(sut.state()).isEqualTo(CONNECTED);
+            assertThat(logCalls.get()).isEqualTo(1);
+        } finally {
+            jul.removeHandler(handler);
+            jul.setLevel(previousLevel);
+            jul.setUseParentHandlers(previousParents);
+        }
+    }
+
+    @Test
+    void an_interrupted_unsubscribe_restores_the_confirmed_subscription_for_recreation() {
+        // Arrange
+        connected();
+        establishSubscriptions(1);
+        sut.unsubscribe(3, 2);
+        var failure = new IOException("lost before UNSUBACK");
+
+        // Act
+        sut.failed(1, failure);
+        port.sent.clear();
+        sut.connect(4, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        var recreated = (Packet.Subscribe) port.sent.getLast();
+        receive(2, new Packet.SubAck(recreated.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
+        receive(2, qosOnePublication(7, "slot/0", false), 0);
+
+        // Assert: the failed operation stays failed while the original intent resumes delivery.
+        assertThat(requireNonNull(port.results.get(3L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class).hasCause(failure);
+        assertThat(port.registered).containsExactly(2L);
+        assertThat(port.removed).isEmpty();
+        assertThat(port.deliveries).singleElement()
+                .satisfies(delivery -> assertThat(delivery.ids()).containsExactly(2L));
+        sut.unsubscribe(5, 2);
+        var removal = (Packet.Unsubscribe) port.sent.getLast();
+        receive(2, new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY), 0);
+        assertThat(requireNonNull(port.results.get(5L)).failure()).isNull();
+        assertThat(port.removed).containsExactly(2L);
+    }
+
+    @ParameterizedTest(name = "close while connecting: {0}")
+    @ValueSource(booleans = {false, true})
+    void closing_without_an_established_connection_finishes_on_clean_session_connack(
+            boolean connecting
+    ) {
+        // Arrange
+        connected();
+        establishSubscriptions(1);
+        sut.failed(1, new IOException("lost connection"));
+        port.sent.clear();
+        if (connecting) {
+            sut.connect(4, 0);
+        }
+
+        // Act
+        sut.closeSubscription(3, 2);
+        assertThat(port.results).doesNotContainKey(3L);
+        if (!connecting) {
+            sut.connect(4, 0);
+        }
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        sut.sendCapacityAvailable(2);
+
+        // Assert: neither SUBSCRIBE nor UNSUBSCRIBE is needed for the closed intention.
+        assertThat(requireNonNull(port.results.get(3L)).failure()).isNull();
+        assertThat(port.sent).isEmpty();
+        assertThat(port.removed).containsExactly(2L);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @ParameterizedTest(name = "recreation refused: {0}, handle closed: {1}")
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void unsubscribe_during_recreation_waits_for_suback_and_accepts_its_refusal(
+            boolean refused,
+            boolean closed
+    ) {
+        // Arrange
+        connected();
+        establishSubscriptions(1);
+        Object handle = requireNonNull(port.results.get(2L)).value();
+        sut.failed(1, new IOException("lost connection"));
+        port.sent.clear();
+        sut.connect(3, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        var recreated = (Packet.Subscribe) port.sent.getLast();
+
+        // Act
+        sut.unsubscribe(4, 2);
+        if (closed) {
+            sut.closeSubscription(5, 2);
+            assertThat(port.results).doesNotContainKey(5L);
+        }
+        assertThat(port.results).doesNotContainKey(4L);
+        assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
+        receive(2, new Packet.SubAck(recreated.packetId(), List.of(refused
+                ? ReasonCode.UNSPECIFIED_ERROR : ReasonCode.SUCCESS), EMPTY), 0);
+
+        // Assert: refusal already proves that the broker has no matching subscription.
+        if (refused) {
+            assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
+            assertThat(port.removals).singleElement().satisfies(removal ->
+                    assertThat(removal.cause()).isInstanceOf(MqttSubscribeException.class));
+        } else {
+            var removal = (Packet.Unsubscribe) port.sent.getLast();
+            assertThat(port.results).doesNotContainKey(4L);
+            receive(2, new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY), 0);
+        }
+        assertThat(requireNonNull(port.results.get(4L)).failure()).isNull();
+        if (closed) {
+            assertThat(requireNonNull(port.results.get(5L)).failure()).isNull();
+        }
+        assertThat(requireNonNull(port.results.get(2L)).value()).isSameAs(handle);
+        assertThat(port.removed).containsExactly(2L);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @ParameterizedTest(name = "recreation sent: {0}")
+    @ValueSource(booleans = {false, true})
+    void close_during_recreation_waits_only_for_an_already_sent_subscribe(boolean sent) {
+        // Arrange
+        connected();
+        establishSubscriptions(1);
+        sut.failed(1, new IOException("lost connection"));
+        port.sent.clear();
+        port.sendResult = sent ? SendQueue.OfferResult.ACCEPTED : SendQueue.OfferResult.FULL;
+        sut.connect(3, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Act
+        sut.closeSubscription(4, 2);
+        port.sendResult = SendQueue.OfferResult.ACCEPTED;
+        sut.sendCapacityAvailable(2);
+
+        // Assert
+        if (sent) {
+            assertThat(port.results).doesNotContainKey(4L);
+            assertThat(port.sent).singleElement().isInstanceOf(Packet.Subscribe.class);
+            var recreated = (Packet.Subscribe) port.sent.getLast();
+            receive(2, new Packet.SubAck(recreated.packetId(),
+                    List.of(ReasonCode.SUCCESS), EMPTY), 0);
+            var removal = (Packet.Unsubscribe) port.sent.getLast();
+            receive(2, new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY), 0);
+        } else {
+            assertThat(port.sent).isEmpty();
+        }
+        assertThat(requireNonNull(port.results.get(4L)).failure()).isNull();
+        assertThat(port.removed).containsExactly(2L);
     }
 
     private void establishSubscriptions(int count) {
@@ -1048,7 +1343,7 @@ class SessionCoreTest {
                     .isInstanceOf(MqttConnectionLostException.class)
                     .hasCause(failure);
         }
-        assertThat(port.removed).containsExactly(2L, 4L);
+        assertThat(port.removed).containsExactly(4L);
     }
 
     @ParameterizedTest(name = "invalid SUBACK reasons: {0}")
@@ -1103,7 +1398,7 @@ class SessionCoreTest {
         assertThat(port.ends).singleElement().satisfies(end -> {
             assertThat(end.cause()).isInstanceOf(MqttProtocolException.class);
         });
-        assertThat(port.removed).containsExactly(2L);
+        assertThat(port.removed).isEmpty();
     }
 
     @Test
@@ -1148,7 +1443,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(3L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasCauseInstanceOf(MqttProtocolException.class);
-        assertThat(port.removed).containsExactly(2L);
+        assertThat(port.removed).isEmpty();
     }
 
     @Test
@@ -1408,6 +1703,87 @@ class SessionCoreTest {
 
     static IntStream seeds() {
         return IntStream.range(0, 100);
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void reordered_recreation_removals_and_old_events_preserve_subscription_intent(int seed) {
+        // Arrange: one continuing subscription, one close, and one explicit unsubscribe.
+        var random = new Random(seed);
+        connected();
+        establishSubscriptions(3);
+        Object continuing = requireNonNull(port.results.get(2L)).value();
+        long oldTicket = port.ticket;
+        receive(1, qosOnePublication(7, "slot/0", false), 0);
+        DeliveryToken old = port.deliveries.getLast().delivery();
+        sut.failed(1, new IOException("lost connection"));
+        List<Disconnection> expectedEnds = List.copyOf(port.ends);
+        port.sent.clear();
+        sut.connect(100, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        List<Packet.Subscribe> recreated = port.sent.stream()
+                .map(Packet.Subscribe.class::cast).toList();
+        boolean refused = seed % 2 == 0;
+        var chains = new ArrayList<ArrayDeque<Runnable>>();
+        chains.add(new ArrayDeque<>(List.of(() -> receive(2, new Packet.SubAck(
+                recreated.getFirst().packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0))));
+        chains.add(new ArrayDeque<>(List.of(() -> {
+            sut.closeSubscription(200, 3);
+            sut.sendCapacityAvailable(2);
+        })));
+        chains.add(new ArrayDeque<>(List.of(() -> receive(2, new Packet.SubAck(
+                recreated.get(1).packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0))));
+        chains.add(new ArrayDeque<>(List.of(
+                () -> sut.unsubscribe(300, 4),
+                () -> receive(2, new Packet.SubAck(recreated.getLast().packetId(), List.of(refused
+                        ? ReasonCode.UNSPECIFIED_ERROR : ReasonCode.SUCCESS), EMPTY), 0)
+        )));
+        chains.add(new ArrayDeque<>(List.of(
+                () -> receive(1, new Packet.SubAck(recreated.getFirst().packetId(),
+                        List.of(ReasonCode.SUCCESS), EMPTY), 0),
+                () -> receive(1, new Packet.UnsubAck(recreated.getLast().packetId(),
+                        List.of(), EMPTY), 0),
+                () -> sut.deliveryReady(old.acknowledgement()),
+                () -> sut.deliveryFailed(old, new IllegalStateException("old handler failed")),
+                () -> sut.sent(1, oldTicket, 0),
+                () -> sut.sendCapacityAvailable(1)
+        )));
+
+        // Act & Assert: stale events never complete or terminate current work.
+        while (!chains.isEmpty()) {
+            ArrayDeque<Runnable> chain = chains.get(random.nextInt(chains.size()));
+            chain.removeFirst().run();
+            if (chain.isEmpty()) {
+                chains.remove(chain);
+            }
+            assertThat(port.ends).isEqualTo(expectedEnds);
+            assertThat(sut.state()).isEqualTo(CONNECTED);
+            assertThat(requireNonNull(port.results.get(2L)).value()).isSameAs(continuing);
+            assertThat(port.registered).containsExactly(2L, 3L, 4L);
+        }
+        List<Packet.Unsubscribe> removals = port.sent.stream()
+                .filter(Packet.Unsubscribe.class::isInstance)
+                .map(Packet.Unsubscribe.class::cast).toList();
+        assertThat(removals).hasSize(refused ? 1 : 2);
+        for (Packet.Unsubscribe removal : removals) {
+            receive(2, new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY), 0);
+        }
+        assertThat(requireNonNull(port.results.get(200L)).failure()).isNull();
+        assertThat(requireNonNull(port.results.get(300L)).failure()).isNull();
+        assertThat(port.removed).containsExactlyInAnyOrder(3L, 4L);
+        assertThat(port.removals).filteredOn(removal -> removal.id() == 4)
+                .singleElement().satisfies(removal -> {
+                    if (refused) {
+                        assertThat(removal.cause()).isInstanceOf(MqttSubscribeException.class);
+                    } else {
+                        assertThat(removal.cause()).isNull();
+                    }
+                });
+        assertThat(pubAckIds()).isEmpty();
+        port.deliveries.clear();
+        receive(2, qosOnePublication(7, "slot/0", false), 0);
+        assertThat(port.deliveries).singleElement()
+                .satisfies(delivery -> assertThat(delivery.ids()).containsExactly(2L));
     }
 
     @ParameterizedTest(name = "seed {0}")
@@ -2100,6 +2476,40 @@ class SessionCoreTest {
         }
     }
 
+    private record Removal(long id, Subscription handle, @Nullable Throwable cause) {
+    }
+
+    private static final class TestSubscription implements Subscription {
+
+        final long id;
+        @Nullable TopicFilter filter;
+        Qos granted = Qos.AT_MOST_ONCE;
+
+        TestSubscription(long id) {
+            this.id = id;
+        }
+
+        @Override
+        public TopicFilter filter() {
+            return requireNonNull(filter);
+        }
+
+        @Override
+        public Qos grantedQos() {
+            return granted;
+        }
+
+        @Override
+        public CompletableFuture<Void> unsubscribe() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void close() {
+            throw new UnsupportedOperationException();
+        }
+    }
+
     private static final class RecordingPort implements SessionCore.Port {
 
         final List<Packet> sent = new ArrayList<>();
@@ -2112,6 +2522,9 @@ class SessionCoreTest {
         final List<Long> opened = new ArrayList<>();
         final List<Long> registered = new ArrayList<>();
         final List<Long> removed = new ArrayList<>();
+        final List<Removal> removals = new ArrayList<>();
+        final List<Subscription> grants = new ArrayList<>();
+        @Nullable TestSubscription registering;
         final List<Received> deliveries = new ArrayList<>();
         final List<Long> released = new ArrayList<>();
         final List<Long> ackTickets = new ArrayList<>();
@@ -2130,6 +2543,10 @@ class SessionCoreTest {
         @Override
         public SendQueue.OfferResult send(long generation, long id, Packet packet) {
             ticket = id;
+            if (packet instanceof Packet.Subscribe subscribe && registering != null) {
+                registering.filter = subscribe.subscriptions().getFirst().filter();
+                registering = null;
+            }
             if (packet instanceof Packet.PubAck && ackSlots == 0) {
                 return SendQueue.OfferResult.FULL;
             }
@@ -2178,45 +2595,20 @@ class SessionCoreTest {
         }
 
         @Override
-        public boolean registerSubscription(long id) {
-            if (acceptRegistration) {
-                registered.add(id);
+        public Optional<Subscription> registerSubscription(long id) {
+            if (!acceptRegistration) {
+                return Optional.empty();
             }
-
-            return acceptRegistration;
+            registered.add(id);
+            var handle = new TestSubscription(id);
+            registering = handle;
+            return Optional.of(handle);
         }
 
         @Override
-        public Subscription subscribed(long id, Qos granted) {
-            TopicFilter filter = sent.stream()
-                    .filter(Packet.Subscribe.class::isInstance)
-                    .map(Packet.Subscribe.class::cast)
-                    .toList()
-                    .get(registered.indexOf(id))
-                    .subscriptions()
-                    .getFirst()
-                    .filter();
-            return new Subscription() {
-                @Override
-                public TopicFilter filter() {
-                    return filter;
-                }
-
-                @Override
-                public Qos grantedQos() {
-                    return granted;
-                }
-
-                @Override
-                public CompletableFuture<Void> unsubscribe() {
-                    throw new UnsupportedOperationException();
-                }
-
-                @Override
-                public void close() {
-                    throw new UnsupportedOperationException();
-                }
-            };
+        public void subscribed(Subscription handle, Qos granted) {
+            ((TestSubscription) handle).granted = granted;
+            grants.add(handle);
         }
 
         @Override
@@ -2240,8 +2632,10 @@ class SessionCoreTest {
         }
 
         @Override
-        public void removeSubscription(long id) {
+        public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
+            assertThat(((TestSubscription) handle).id).isEqualTo(id);
             removed.add(id);
+            removals.add(new Removal(id, handle, cause));
         }
 
         @Override

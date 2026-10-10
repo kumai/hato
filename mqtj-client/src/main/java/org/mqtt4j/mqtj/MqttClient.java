@@ -28,6 +28,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     }
 
     /// Establishes a clean session and completes after a successful CONNACK.
+    /// Previously established subscriptions are re-created on the broker using their existing
+    /// handles. This future does not wait for their SUBACK responses; a refusal ends only the
+    /// affected subscription. A pull subscription reports it through [Subscription#receive()].
     ///
     /// The future fails with [MqttConnectException] if establishment fails, the broker refuses
     /// the connection, or the connection deadline expires. Connecting while already connected

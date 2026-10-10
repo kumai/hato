@@ -136,14 +136,17 @@ final class Mailbox {
         return OfferResult.ACCEPTED;
     }
 
-    synchronized void terminate(Event event) {
+    /// Returns whether the receipt belongs to the active connection, including when an earlier
+    /// valid termination already owns the slot. A rejected receipt must not keep its lane paused.
+    synchronized boolean terminate(Event event) {
         if (event.generation() == 0 || event.generation() != activeGeneration) {
-            return;
+            return false;
         }
         if (termination == null) {
             termination = event;
         }
         notifyAll();
+        return true;
     }
 
     /// Preserves preceding input when possible; a full FIFO must not hide the terminal cause.

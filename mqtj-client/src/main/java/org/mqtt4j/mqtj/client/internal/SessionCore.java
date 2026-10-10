@@ -81,9 +81,9 @@ final class SessionCore {
 
         void complete(long operation, @Nullable Object result, @Nullable Throwable failure);
 
-        boolean registerSubscription(long id);
+        Optional<Subscription> registerSubscription(long id);
 
-        Subscription subscribed(long id, Qos granted);
+        void subscribed(Subscription handle, Qos granted);
 
         boolean deliver(
                 DeliveryToken token,
@@ -95,7 +95,7 @@ final class SessionCore {
 
         void releaseDelivery(long token);
 
-        void removeSubscription(long id);
+        void removeSubscription(long id, Subscription handle, @Nullable Throwable cause);
 
         void end(long generation, boolean established, Disconnection disconnection);
     }
@@ -104,8 +104,8 @@ final class SessionCore {
 
     private static final int ACKNOWLEDGEMENT_LIMIT = 4096;
 
-    // Broker registrations outlive locally closed handles until UNSUBACK or connection end,
-    // so they are bounded apart from the delivery lanes that local closure releases.
+    // Broker registrations outlive locally closed handles until UNSUBACK or the next clean
+    // CONNACK, so they are bounded apart from the delivery lanes that local closure releases.
     private static final int REGISTRATION_LIMIT = 256;
 
     // Bound queued completion events even when I/O returns capacity during an actor drain.
@@ -114,6 +114,10 @@ final class SessionCore {
     // Close has no public operation slot. Bound its in-flight exchanges separately, so a
     // batch of closures cannot flood the actor with send completions and UNSUBACKs.
     private static final int CLOSE_INFLIGHT_LIMIT = 16;
+
+    // Re-creation after CONNACK has no public operation slot either. Bound its pending SUBACKs
+    // apart from closures, so many retained subscriptions cannot flood the actor.
+    private static final int RESTORE_INFLIGHT_LIMIT = 16;
 
     private final Port port;
 
@@ -165,6 +169,10 @@ final class SessionCore {
 
     // At most one removal per registered subscription; the registry supplies the total bound.
     private final ArrayDeque<UnsubscribeOperation> queuedClosures = new ArrayDeque<>();
+
+    private final ArrayDeque<LocalSubscription> queuedSubscriptions = new ArrayDeque<>();
+
+    private int restoringInFlight;
 
     private int closingInFlight;
 
@@ -229,6 +237,14 @@ final class SessionCore {
                 long operation = connectOperation;
                 connectOperation = 0;
                 port.complete(operation, new ConnAck(false), null);
+                for (LocalSubscription local : List.copyOf(subscriptions.values())) {
+                    if (local.closed) {
+                        removeSubscription(local, null);
+                        finishRemoval(local);
+                    } else {
+                        queuedSubscriptions.addLast(local);
+                    }
+                }
                 if (!keepAlive.isZero()) {
                     scheduleKeepAlive(now);
                 }
@@ -257,6 +273,7 @@ final class SessionCore {
         }
         // SUBACK/PUBACK/UNSUBACK can return packet identifiers or the close exchange window.
         drainClosures();
+        drainSubscriptions();
     }
 
     void sent(long connection, long ticket, long now) {
@@ -349,55 +366,76 @@ final class SessionCore {
             return;
         }
         int id = allocated.getAsInt();
-        subscriptions.put(operation, local);
-        subscribing.put(id, local);
         // Registration precedes send: a broker may publish before sending SUBACK.
-        if (!port.registerSubscription(operation)) {
-            subscribing.remove(id);
-            subscriptions.remove(operation);
+        Optional<Subscription> registered = port.registerSubscription(operation);
+        if (registered.isEmpty()) {
             packetIds.release(id);
             capacityFailure(operation, "Subscription capacity");
             return;
         }
-        var packet = new Packet.Subscribe(id, List.of(new Packet.Subscription(
-                request.filter(), request.qos(), false, false, 0
-        )), EMPTY);
+        local.handle = registered.orElseThrow();
+        subscriptions.put(operation, local);
+        subscribing.put(id, local);
+        var packet = subscriptionPacket(local, id);
         if (port.send(generation, ++nextTicket, packet) == SendQueue.OfferResult.FULL) {
             subscribing.remove(id);
             subscriptions.remove(operation);
             packetIds.release(id);
-            port.removeSubscription(operation);
+            port.removeSubscription(operation, requireNonNull(local.handle), null);
             capacityFailure(operation, "Send queue capacity");
         }
     }
 
     void unsubscribe(long operation, long subscriptionId) {
-        beginUnsubscribe(operation, subscriptionId, false);
-    }
-
-    /// Records one permanent local closure. The shell drains send capacity after its batch.
-    void closeSubscription(long operation, long subscriptionId) {
-        beginUnsubscribe(operation, subscriptionId, true);
-    }
-
-    private void beginUnsubscribe(long operation, long subscriptionId, boolean background) {
         if (!ready(operation)) {
             return;
         }
         LocalSubscription local = subscriptions.get(subscriptionId);
-        // The shell sends one removal per established handle of the current connection
-        // and resumes its delivery lane when the removal fails, unless the handle was closed.
-        if (local == null || !local.established || local.removing) {
+        if (local == null || local.closed) {
+            port.complete(operation, null, null);
+            return;
+        }
+        if (local.removing) {
             port.complete(operation, null, new IllegalStateException("Subscription is not active"));
             return;
         }
         local.removing = true;
+        beginRemoval(operation, local, false);
+    }
+
+    /// Local close survives connection loss, including a close while disconnected.
+    void closeSubscription(long operation, long subscriptionId) {
+        LocalSubscription local = subscriptions.get(subscriptionId);
+        if (local == null) {
+            port.complete(operation, null, null);
+            return;
+        }
+        local.closed = true;
+        local.removing = true;
+        local.closeOperation = operation;
+        if (state != State.CONNECTED || disconnectOperation != 0) {
+            return;
+        }
+        if (local.removal == null) {
+            beginRemoval(operation, local, true);
+        }
+        drainClosures();
+        drainSubscriptions();
+    }
+
+    private void beginRemoval(long operation, LocalSubscription local, boolean background) {
         var removal = new UnsubscribeOperation(operation, local, background);
-        if (background) {
+        local.removal = removal;
+        if (!local.established && !subscribing.containsValue(local)) {
+            // Clean Session has no broker registration yet when restoration is still queued.
+            removeSubscription(local, null);
+            finishRemoval(local);
+        } else if (background || !local.established) {
             queuedClosures.addLast(removal);
         } else {
             sendUnsubscribe(removal).ifPresent(refusal -> {
                 local.removing = false;
+                local.removal = null;
                 capacityFailure(operation, refusal);
             });
         }
@@ -408,6 +446,9 @@ final class SessionCore {
     /// counts as admitted and waits for the connection's terminal cause, like other admitted
     /// protocol operations.
     private Optional<String> sendUnsubscribe(UnsubscribeOperation removal) {
+        if (!removal.subscription.established) {
+            return Optional.of("Subscription acknowledgement pending");
+        }
         var allocated = packetIds.allocate();
         if (allocated.isEmpty()) {
             return Optional.of("Packet identifier capacity");
@@ -433,9 +474,66 @@ final class SessionCore {
             if (sendUnsubscribe(queuedClosures.getFirst()).isPresent()) {
                 return;
             }
-            queuedClosures.removeFirst();
-            closingInFlight++;
+            UnsubscribeOperation removal = queuedClosures.removeFirst();
+            if (removal.background) {
+                closingInFlight++;
+            }
         }
+    }
+
+    /// Restoration uses no application operation slots and resumes when capacity returns.
+    private void drainSubscriptions() {
+        if (state != State.CONNECTED || disconnectOperation != 0) {
+            return;
+        }
+        while (restoringInFlight < RESTORE_INFLIGHT_LIMIT && !queuedSubscriptions.isEmpty()) {
+            LocalSubscription local = queuedSubscriptions.getFirst();
+            if (!subscriptions.containsKey(local.id)) {
+                queuedSubscriptions.removeFirst();
+                continue;
+            }
+            var allocated = packetIds.allocate();
+            if (allocated.isEmpty()) {
+                return;
+            }
+            int id = allocated.getAsInt();
+            subscribing.put(id, local);
+            if (port.send(generation, ++nextTicket, subscriptionPacket(local, id))
+                    == SendQueue.OfferResult.FULL) {
+                subscribing.remove(id);
+                packetIds.release(id);
+                return;
+            }
+            queuedSubscriptions.removeFirst();
+            restoringInFlight++;
+        }
+    }
+
+    private static Packet.Subscribe subscriptionPacket(LocalSubscription local, int id) {
+        return new Packet.Subscribe(id, List.of(new Packet.Subscription(
+                local.filter, local.requestedQos, false, false, 0
+        )), EMPTY);
+    }
+
+    private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
+        subscriptions.remove(local.id);
+        queuedSubscriptions.remove(local);
+        port.removeSubscription(local.id, requireNonNull(local.handle), cause);
+    }
+
+    private void finishRemoval(LocalSubscription local) {
+        UnsubscribeOperation removal = local.removal;
+        if (removal != null) {
+            queuedClosures.remove(removal);
+            if (!removal.background) {
+                port.complete(removal.operation, null, null);
+            }
+        }
+        if (local.closeOperation != 0) {
+            port.complete(local.closeOperation, null, null);
+            local.closeOperation = 0;
+        }
+        local.removal = null;
     }
 
     private boolean ready(long operation) {
@@ -503,13 +601,32 @@ final class SessionCore {
         }
         subscribing.remove(ack.packetId());
         packetIds.release(ack.packetId());
+        boolean restoring = local.confirmed;
+        if (restoring) {
+            restoringInFlight--;
+        }
         if (reason == ReasonCode.UNSPECIFIED_ERROR) {
-            subscriptions.remove(local.id);
-            port.removeSubscription(local.id);
-            port.complete(local.id, null, new MqttSubscribeException(reason));
+            var refusal = new MqttSubscribeException(reason);
+            removeSubscription(local, refusal);
+            if (!restoring) {
+                port.complete(local.id, null, refusal);
+            } else {
+                try {
+                    log.warn("Subscription restoration refused for {} (subscription {})",
+                            clientId, local.id, refusal);
+                } catch (Throwable _) {
+                    // A logging backend failure must not turn local refusal into client closure.
+                }
+                finishRemoval(local);
+            }
         } else {
+            local.confirmed = true;
             local.established = true;
-            port.complete(local.id, port.subscribed(local.id, Qos.of(reason.value())), null);
+            Subscription handle = requireNonNull(local.handle);
+            port.subscribed(handle, Qos.of(reason.value()));
+            if (!restoring) {
+                port.complete(local.id, handle, null);
+            }
         }
     }
 
@@ -524,9 +641,8 @@ final class SessionCore {
         if (pending.background) {
             closingInFlight--;
         }
-        subscriptions.remove(pending.subscription.id);
-        port.removeSubscription(pending.subscription.id);
-        port.complete(pending.operation, null, null);
+        removeSubscription(pending.subscription, null);
+        finishRemoval(pending.subscription);
     }
 
     private void deliver(Packet.Publish publish, int bytes) {
@@ -617,6 +733,7 @@ final class SessionCore {
             port.releaseDelivery(entry.token());
         }
         drainClosures();
+        drainSubscriptions();
     }
 
     void timer(long connection, Timer timer, long now) {
@@ -736,13 +853,22 @@ final class SessionCore {
             // turn thousands of abandoned recipients into fresh readiness notifications.
             port.end(generation, established, new Disconnection(cause, requested));
         }
-        for (long id : subscriptions.keySet()) {
-            port.removeSubscription(id);
-        }
-        subscriptions.clear();
         var pendingFailure = (cause == null)
                 ? new MqttConnectionLostException()
                 : new MqttConnectionLostException(cause);
+        for (LocalSubscription local : List.copyOf(subscriptions.values())) {
+            if (permanent || !local.confirmed) {
+                removeSubscription(local, permanent ? cause : null);
+                if (permanent && local.closeOperation != 0) {
+                    port.complete(local.closeOperation, null, pendingFailure);
+                    local.closeOperation = 0;
+                }
+            } else {
+                local.established = false;
+                local.removing = local.closed;
+            }
+            local.removal = null;
+        }
         for (long operation : publications.values()) {
             port.complete(operation, null, pendingFailure);
         }
@@ -753,17 +879,25 @@ final class SessionCore {
         inflight.clear();
         acknowledgements.clear();
         for (var local : subscribing.values()) {
-            port.complete(local.id, null, pendingFailure);
+            if (!local.confirmed) {
+                port.complete(local.id, null, pendingFailure);
+            }
         }
         subscribing.clear();
         for (var pending : unsubscribing.values()) {
-            port.complete(pending.operation, null, pendingFailure);
+            if (!pending.background) {
+                port.complete(pending.operation, null, pendingFailure);
+            }
         }
         unsubscribing.clear();
         for (var pending : queuedClosures) {
-            port.complete(pending.operation, null, pendingFailure);
+            if (!pending.background) {
+                port.complete(pending.operation, null, pendingFailure);
+            }
         }
         queuedClosures.clear();
+        queuedSubscriptions.clear();
+        restoringInFlight = 0;
         closingInFlight = 0;
         packetIds = new PacketIds();
         if (connectOperation != 0) {
@@ -842,8 +976,13 @@ final class SessionCore {
         final TopicFilter matchingFilter;
         final Qos requestedQos;
         final boolean shared;
+        @Nullable Subscription handle;
+        boolean confirmed;
         boolean established;
         boolean removing;
+        boolean closed;
+        long closeOperation;
+        @Nullable UnsubscribeOperation removal;
 
         LocalSubscription(long id, Subscribe request) {
             this.id = id;

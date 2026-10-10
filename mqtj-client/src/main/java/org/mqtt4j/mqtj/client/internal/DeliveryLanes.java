@@ -10,7 +10,7 @@ import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.BiConsumer;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 
 import org.jspecify.annotations.Nullable;
@@ -19,6 +19,7 @@ import org.mqtt4j.mqtj.AckMode;
 import org.mqtt4j.mqtj.MqttConnectionLostException;
 import org.mqtt4j.mqtj.MqttDelivery;
 import org.mqtt4j.mqtj.MqttMessage;
+import org.mqtt4j.mqtj.MqttSubscribeException;
 import org.mqtt4j.mqtj.ReceiveResult;
 import org.mqtt4j.mqtj.Subscribe;
 import org.mqtt4j.mqtj.client.internal.common.log.Log;
@@ -54,7 +55,9 @@ final class DeliveryLanes {
 
     private final long byteLimit;
 
-    private final BiConsumer<DeliveryToken, Throwable> onFailure;
+    // True when the failure ends the current connection or the client; the lane then runs
+    // nothing more until connection cleanup or removal. An old receipt returns false.
+    private final BiPredicate<DeliveryToken, Throwable> onFailure;
 
     private final Runnable onReady;
 
@@ -66,10 +69,12 @@ final class DeliveryLanes {
 
     private long abandonedDeliveries;
 
+    private long discardedDeliveries;
+
     DeliveryLanes(
             String clientId,
             long byteLimit,
-            BiConsumer<DeliveryToken, Throwable> onFailure,
+            BiPredicate<DeliveryToken, Throwable> onFailure,
             Runnable onReady
     ) {
         this.clientId = clientId;
@@ -161,12 +166,17 @@ final class DeliveryLanes {
     }
 
     void remove(long id) {
+        remove(id, null);
+    }
+
+    void remove(long id, @Nullable Throwable failure) {
         boolean ready = false;
         lock.lock();
         try {
             Lane lane = lanes.get(id);
-            if (lane != null && stop(lane)) {
-                ready = true;
+            if (lane != null) {
+                lane.failure = failure;
+                ready = stop(lane);
             }
         } finally {
             lock.unlock();
@@ -176,22 +186,33 @@ final class DeliveryLanes {
         }
     }
 
-    /// Retires acknowledgements on connection end, keeping only running handler reservations.
-    /// The same manager admits new lanes after a reconnect. Pull receivers end normally without
-    /// a failure; otherwise they throw [MqttConnectionLostException] with it.
-    void close(@Nullable Throwable failure) {
+    /// Clean Session retires receipt conditions, but the subscription and worker remain alive.
+    void connectionEnded() {
         lock.lock();
         try {
-            for (RetainedDelivery delivery : List.copyOf(acknowledging.values())) {
-                delivery.retired = true;
-                delivery.released = true;
-                for (DeliveryView view : List.copyOf(delivery.views)) {
+            retireAcknowledgements();
+            for (Lane lane : lanes.values()) {
+                while (!lane.queue.isEmpty()) {
+                    DeliveryView view = lane.queue.removeFirst();
+                    discardedDeliveries++;
+                    view.localDone = true;
+                    view.delivery.retired = true;
                     view.acknowledgement = null;
                     releaseView(view);
                 }
+                lane.failed = false;
+                lane.ready.signalAll();
             }
-            acknowledging.clear();
-            readyTokens.clear();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Ends every local subscription; application handlers already executing may finish.
+    void close(@Nullable Throwable failure) {
+        lock.lock();
+        try {
+            retireAcknowledgements();
             for (Lane lane : List.copyOf(lanes.values())) {
                 lane.failure = failure;
                 stop(lane);
@@ -199,6 +220,20 @@ final class DeliveryLanes {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// Caller holds lock. Running handlers retain their payload until they return.
+    private void retireAcknowledgements() {
+        for (RetainedDelivery delivery : List.copyOf(acknowledging.values())) {
+            delivery.retired = true;
+            delivery.released = true;
+            for (DeliveryView view : List.copyOf(delivery.views)) {
+                view.acknowledgement = null;
+                releaseView(view);
+            }
+        }
+        acknowledging.clear();
+        readyTokens.clear();
     }
 
     /// Reserves every matching lane together so overload cannot deliver only part of a fan-out.
@@ -218,7 +253,10 @@ final class DeliveryLanes {
                 // A paused lane awaits removal. It holds QoS 1 until UNSUBACK abandons it or a
                 // refused removal resumes it; QoS 0 is dropped as at-most-once delivery allows.
                 if (lane != null && (!lane.paused || token.acknowledgement() != 0)) {
-                    if (lane.retained >= lane.capacity) {
+                    // An accepted failure ends the connection before the actor takes another
+                    // event. Its lane holds this event's delivery unrun beyond capacity, so
+                    // overload cannot replace the failure as the cause; cleanup discards it.
+                    if (lane.retained >= lane.capacity && !lane.failed) {
                         return false;
                     }
                     recipients.add(lane);
@@ -335,6 +373,15 @@ final class DeliveryLanes {
         }
     }
 
+    long discardedDeliveries() {
+        lock.lock();
+        try {
+            return discardedDeliveries;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void run(Lane lane) {
         try {
             while (runNext(lane)) {
@@ -355,7 +402,7 @@ final class DeliveryLanes {
         boolean ready;
         lock.lock();
         try {
-            while (!lane.stopped && !lane.hasDelivery()) {
+            while (!lane.stopped && (lane.failed || !lane.hasDelivery())) {
                 // The private worker ends through stop(), which signals this condition.
                 lane.ready.awaitUninterruptibly();
             }
@@ -395,12 +442,12 @@ final class DeliveryLanes {
                 view.delivery.retired = true;
                 view.acknowledgement = null;
                 releaseView(view);
-                stopFailed(lane);
             } finally {
                 lock.unlock();
             }
-            reportFailure(lane.id, view.delivery.token, failure);
-            return false;
+            Thread.interrupted();
+            reportFailure(lane, view.delivery.token, failure);
+            return true;
         }
     }
 
@@ -433,32 +480,31 @@ final class DeliveryLanes {
         return false;
     }
 
-    private void reportFailure(long id, DeliveryToken token, Throwable failure) {
+    private void reportFailure(Lane lane, DeliveryToken token, Throwable failure) {
         try {
             log.warn("Delivery lane failed for {} (subscription {}, generation {})",
-                    clientId, id, token.connection(), failure);
+                    clientId, lane.id, token.connection(), failure);
         } catch (Throwable _) {
             // A logging backend must not replace the original failure or suppress notification.
         }
+        Throwable callbackFailure = null;
+        lock.lock();
         try {
-            onFailure.accept(token, failure);
-        } catch (Throwable callbackFailure) {
+            // Admission and connection cleanup see either no decision or the final one. The
+            // callback only offers a termination to the mailbox, which never calls these lanes.
+            lane.failed = onFailure.test(token, failure);
+        } catch (Throwable cause) {
+            callbackFailure = cause;
+        } finally {
+            lock.unlock();
+        }
+        if (callbackFailure != null) {
             try {
                 log.warn("Delivery failure notification failed for {}", clientId, callbackFailure);
             } catch (Throwable _) {
-                // Both reporting paths failed; preserve lane cleanup without notifying twice.
+                // Both reporting paths failed; the lane resumes without notifying twice.
             }
         }
-    }
-
-    /// Caller holds lock. A failure stops the connection, so deliveries this lane never processed
-    /// withhold their PUBACK even if other matching subscriptions finish them. Removal instead
-    /// abandons them and releases this lane's acknowledgement condition.
-    private void stopFailed(Lane lane) {
-        for (DeliveryView view : lane.queue) {
-            view.delivery.retired = true;
-        }
-        stop(lane);
     }
 
     /// Caller holds lock; never interrupts an executing application handler.
@@ -563,6 +609,10 @@ final class DeliveryLanes {
         }
 
         private void checkFailure() {
+            if (lane.failure instanceof MqttSubscribeException rejection) {
+                // Concurrent receivers must not share one throwable's trace and suppressions.
+                throw new MqttSubscribeException(rejection.reasonCode());
+            }
             if (lane.failure != null) {
                 throw new MqttConnectionLostException(lane.failure);
             }
@@ -580,6 +630,7 @@ final class DeliveryLanes {
         int retained;
         boolean paused;
         boolean stopped;
+        boolean failed;
         @Nullable Throwable failure;
 
         Lane(

@@ -20,7 +20,8 @@ MqttClient client = MqttClient.builder()
 random one. The other settings have defaults; see the
 [builder Javadoc](src/main/java/org/mqtt4j/mqtj/MqttClientBuilder.java).
 
-Connect with `connect()`. After `disconnect()`, the client can connect again. End with
+Connect with `connect()`. After `disconnect()` or a connection failure, the client can
+connect again, and established subscriptions resume on their existing handles. End with
 `disconnect()` rather than just closing the client: `close()`, including leaving a
 try-with-resources block, drops the connection without telling the broker.
 
@@ -49,6 +50,8 @@ subscription.unsubscribe().join();
   waiting for the broker. Use `unsubscribe()` when you need to know that the broker
   has removed the subscription. The same filter can be registered again after removal
   completes.
+- Subscriptions survive connection failures, `disconnect()`, and handler failures.
+  After the next `connect()`, messages arrive again without another `subscribe()`.
 - The client and its subscriptions are safe to use from any thread.
 
 ## Receiving on your own threads
@@ -72,7 +75,7 @@ while (subscription.receive() instanceof ReceiveResult.Received(var delivery)) {
 - `receive()` returns `ReceiveResult.Received` for each message and
   `ReceiveResult.Ended` once the subscription ends normally. `receive(Duration)` can
   also return `ReceiveResult.TimedOut`.
-- A connection failure throws `MqttConnectionLostException`.
+- A waiting `receive()` keeps waiting across reconnections.
 - QoS 1 messages are acknowledged when `receive()` hands them over.
   Choose `AckMode.MANUAL`, as above, to acknowledge after your processing.
   `AckMode.AFTER_HANDLER` needs a handler.
@@ -81,7 +84,7 @@ while (subscription.receive() instanceof ReceiveResult.Received(var delivery)) {
 - QoS 1 acknowledgements leave in arrival order across all subscriptions, so a message
   that nobody takes or acknowledges can stop the broker's later QoS 1 messages. If you
   cannot process one, end the connection.
-- After the connection ends, subscribe again. Messages not yet taken are dropped.
+- Messages not yet taken are dropped when the connection ends.
 
 ## Handling failures
 

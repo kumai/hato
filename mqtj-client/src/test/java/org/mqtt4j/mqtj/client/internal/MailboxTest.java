@@ -363,10 +363,10 @@ class MailboxTest {
         sut.activate(2);
 
         // Act: the old callback resumes after the connection has changed.
-        sut.terminate(old);
-        sut.terminate(current);
-        sut.terminate(old);
-        sut.terminate(later);
+        assertThat(sut.terminate(old)).isFalse();
+        assertThat(sut.terminate(current)).isTrue();
+        assertThat(sut.terminate(old)).isFalse();
+        assertThat(sut.terminate(later)).isTrue();
 
         // Assert: preserve the first failure of the current connection.
         assertThat(sut.take(() -> false)).containsSame(current);
@@ -405,11 +405,11 @@ class MailboxTest {
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
         sut.activate(1);
         assertThat(sut.offer(incoming)).isEqualTo(ACCEPTED);
-        sut.terminate(end);
+        assertThat(sut.terminate(end)).isTrue();
 
         // Act
         sut.discard(generation);
-        sut.terminate(end);
+        assertThat(sut.terminate(end)).isFalse();
 
         // Assert: neither the pending failure nor a late callback survives disconnection.
         assertThat(sut.offer(incoming)).isEqualTo(STALE);

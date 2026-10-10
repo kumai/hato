@@ -83,15 +83,151 @@ class ClientActorTest {
 
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
 
-    private static final ClientActor.Usage NOTHING_HELD = new ClientActor.Usage(
-            0, 0, 0, 0, 0, 0, 0, 0, 0
-    );
-
     private final ManualTimerScheduler scheduler = new ManualTimerScheduler();
     private final LinkedBlockingQueue<Disconnection> ends = new LinkedBlockingQueue<>();
     private final LinkedBlockingQueue<ScriptTransport> transports = new LinkedBlockingQueue<>();
 
     private volatile Runnable beforeActorTime = () -> { };
+
+    @Test
+    void a_waiting_pull_receiver_survives_disconnect_and_receives_after_resubscribe()
+            throws Exception {
+        // Arrange: the application is waiting on the original subscription before disconnect.
+        var receiver = new AtomicReference<Thread>();
+        try (MqttClient sut = client(); var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+            ScriptTransport old = connect(sut);
+            Subscription subscription = subscribePull(sut, old,
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE));
+            Future<ReceiveResult> waiting = workers.submit(() -> {
+                receiver.set(Thread.currentThread());
+                return subscription.receive();
+            });
+            try {
+                await().until(() -> receiver.get() != null
+                        && requireNonNull(receiver.get()).getState() == Thread.State.WAITING);
+
+                // Act: the clean session ends but the subscription and its waiting caller stay.
+                sut.disconnect().get(5, SECONDS);
+                assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+                assertThat(subscription.receive(Duration.ZERO))
+                        .isEqualTo(new ReceiveResult.TimedOut());
+                assertThat(waiting).isNotDone();
+                ScriptTransport current = connect(sut);
+                var subscribe = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
+                assertThat(subscribe.subscriptions().getFirst().filter())
+                        .isEqualTo(subscription.filter());
+                current.receive(new Packet.SubAck(subscribe.packetId(),
+                        List.of(ReasonCode.SUCCESS), EMPTY));
+                current.receive(publication(new byte[] {9}));
+
+                // Assert: the same handle observes the new grant and receives the new delivery.
+                assertThat(received(waiting.get(5, SECONDS)).message().payload())
+                        .containsExactly((byte) 9);
+                assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+                assertThat(ends).isEmpty();
+            } finally {
+                waiting.cancel(true);
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "old handler fails: {0}")
+    @ValueSource(booleans = {false, true})
+    void one_subscription_keeps_serial_delivery_across_reconnect(boolean oldHandlerFails)
+            throws Exception {
+        // Arrange: a handler outlives its connection while its subscription stays registered.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var delivered = new LinkedBlockingQueue<MqttDelivery>();
+        var active = new AtomicInteger();
+        var maximum = new AtomicInteger();
+        var oldFailure = new IllegalStateException("old handler failed");
+        var currentFailure = new IllegalStateException("current handler failed");
+        try (MqttClient sut = client()) {
+            ScriptTransport old = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), delivery -> {
+                maximum.accumulateAndGet(active.incrementAndGet(), Math::max);
+                try {
+                    byte payload = delivery.message().payload()[0];
+                    if (payload == 1) {
+                        entered.countDown();
+                        waitFor(release);
+                        if (oldHandlerFails) {
+                            throw oldFailure;
+                        }
+                    } else if (payload == 3) {
+                        throw currentFailure;
+                    } else {
+                        delivered.add(delivery);
+                    }
+                } finally {
+                    active.decrementAndGet();
+                }
+            });
+            var subscribe = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
+            old.receive(new Packet.SubAck(subscribe.packetId(),
+                    List.of(ReasonCode.SUCCESS), EMPTY));
+            Subscription subscription = subscribing.get(5, SECONDS);
+            old.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+            ScriptTransport current = connect(sut);
+            acknowledgeResubscription(current, subscription);
+
+            // Act: current input reaches the actor while the old invocation still holds its lane.
+            current.receive(publication(new byte[] {2}));
+            sut.publish(message(new byte[] {0})).get(5, SECONDS);
+            assertThat(current.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            assertThat(delivered).isEmpty();
+            release.countDown();
+
+            // Assert: success and failure of the old invocation both allow the next delivery.
+            assertThat(requireNonNull(delivered.poll(5, SECONDS)).message().payload())
+                    .containsExactly((byte) 2);
+            assertThat(maximum).hasValue(1);
+            assertThat(ends).isEmpty();
+
+            // Act & Assert: a failure of a delivery from this connection still stops it.
+            current.receive(publication(new byte[] {3}));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(currentFailure, false));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void closing_a_subscription_from_the_end_listener_prevents_its_resubscription()
+            throws Exception {
+        // Arrange: the listener disposes the same public handle that existed before disconnect.
+        var handle = new AtomicReference<Subscription>();
+        var removing = new AtomicReference<CompletableFuture<Void>>();
+        try (MqttClient sut = client(end -> {
+            Subscription subscription = requireNonNull(handle.get());
+            subscription.close();
+            removing.set(subscription.unsubscribe());
+            ends.add(end);
+        })) {
+            ScriptTransport old = connect(sut);
+            handle.set(subscribePull(sut, old, request()));
+
+            // Act
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+            CompletableFuture<Void> pending = requireNonNull(removing.get());
+            assertThatThrownBy(pending::join).hasCauseInstanceOf(MqttNotConnectedException.class);
+            ScriptTransport current = connect(sut);
+
+            // Assert: a fresh clean session needs neither recreation nor remote removal.
+            assertThat(current.sent).isEmpty();
+            assertThat(requireNonNull(handle.get()).receive()).isEqualTo(new ReceiveResult.Ended());
+            Subscription replacement = subscribePull(sut, current, request());
+            requireNonNull(handle.get()).unsubscribe().get(5, SECONDS);
+            current.receive(publication(new byte[] {9}));
+            assertThat(received(replacement.receive(Duration.ofSeconds(5))).message().payload())
+                    .containsExactly((byte) 9);
+        }
+    }
 
     @Test
     void closing_a_push_subscription_waits_for_send_capacity_without_resuming_delivery()
@@ -145,7 +281,7 @@ class ClientActorTest {
 
     @Test
     @Timeout(10)
-    void abnormal_connection_end_discards_pull_buffers_and_preserves_the_cause_after_reconnect()
+    void abnormal_connection_end_discards_pull_buffers_and_preserves_the_subscription()
             throws Exception {
         // Arrange
         var failure = new IOException("Peer reset the connection");
@@ -161,17 +297,14 @@ class ClientActorTest {
             transport.receiver().onClosed(failure);
             assertThat(ends.poll(5, SECONDS)).isNotNull();
 
-            // Assert: neither API can drain the abandoned buffer or turn failure into EOF.
-            assertThatThrownBy(subscription::receive)
-                    .isInstanceOf(MqttConnectionLostException.class).hasCause(failure);
-            assertThatThrownBy(() -> subscription.receive(Duration.ZERO)).hasCause(failure);
+            // Assert: connection loss clears buffered input without ending this receiver.
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
             ScriptTransport replacement = connect(sut);
-            Subscription fresh = subscribePull(sut, replacement, request());
-            subscription.close();
-            assertThatThrownBy(subscription::receive).hasCause(failure);
+            acknowledgeResubscription(replacement, subscription);
             replacement.receive(publication(new byte[] {9}));
-            assertThat(received(fresh.receive(Duration.ofSeconds(5))).message().payload())
+            assertThat(received(subscription.receive(Duration.ofSeconds(5))).message().payload())
                     .containsExactly((byte) 9);
+            assertThat(ends).isEmpty();
         }
     }
 
@@ -209,7 +342,7 @@ class ClientActorTest {
     }
 
     @Test
-    void pull_buffer_overflow_ends_the_connection_and_reports_the_cause_to_receivers()
+    void pull_buffer_overflow_reports_the_cause_without_ending_receivers()
             throws Exception {
         // Arrange
         try (MqttClient sut = client()) {
@@ -222,17 +355,16 @@ class ClientActorTest {
             // Act
             transport.receive(publication(new byte[] {2}));
 
-            // Assert: a pull-only application observes overload through its next receive.
+            // Assert: overload goes to the listener while the receiver can resume later.
             Throwable cause = requireNonNull(ends.poll(5, SECONDS)).cause();
             assertThat(cause).isInstanceOf(MqttCapacityException.class);
-            assertThatThrownBy(() -> subscription.receive(Duration.ZERO))
-                    .isInstanceOf(MqttConnectionLostException.class).hasCause(cause);
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
         }
     }
 
     @Test
     @Timeout(10)
-    void normal_disconnect_discards_pull_buffers_and_ends_receiving() throws Exception {
+    void normal_disconnect_discards_pull_buffers_without_ending_receiving() throws Exception {
         // Arrange
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
@@ -247,7 +379,8 @@ class ClientActorTest {
 
             // Assert
             assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
-            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+            subscription.close();
             assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
         }
     }
@@ -417,8 +550,9 @@ class ClientActorTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void connection_loss_retires_background_removal_and_its_observers(boolean beforeStart)
-            throws Exception {
+    void connection_loss_keeps_background_removal_pending_until_the_next_clean_session(
+            boolean beforeStart
+    ) throws Exception {
         // Arrange: optionally hold the close wake until termination takes its priority slot.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -439,19 +573,103 @@ class ClientActorTest {
             release.countDown();
 
             // Assert
-            assertThatThrownBy(() -> observer.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttConnectionLostException.class)
-                    .hasRootCauseInstanceOf(PacketDecodeException.class);
             assertThat(ends.poll(5, SECONDS)).isNotNull();
+            assertThatThrownBy(() -> observer.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectionLostException.class);
             // The connection failure came after close(), so it does not replace the normal end.
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
             ScriptTransport current = connect(sut);
             subscription.close();
             subscription.unsubscribe().get(5, SECONDS);
+            assertThatThrownBy(observer::join)
+                    .hasCauseInstanceOf(MqttConnectionLostException.class);
             assertThat(subscribePull(sut, current, request())).isNotNull();
             assertThat(current.sent).isEmpty();
         } finally {
             release.countDown();
+        }
+    }
+
+    @Test
+    void offline_observers_of_a_closed_subscription_leave_capacity_for_reconnect()
+            throws Exception {
+        // Arrange: local disposal persists while there is no connection to observe removal on.
+        try (MqttClient sut = client()) {
+            ScriptTransport old = connect(sut);
+            Subscription subscription = subscribePull(sut, old, request());
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
+            await().until(() -> ((ClientActor) sut).usage().operations() == 0);
+            subscription.close();
+            assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
+            var observers = new ArrayList<CompletableFuture<Void>>();
+
+            // Act: enough calls to consume the entire operation budget must all refuse locally.
+            for (int i = 0; i < 64; i++) {
+                observers.add(subscription.unsubscribe());
+            }
+            CompletableFuture<ConnAck> reconnecting = sut.connect();
+
+            // Assert: observing an offline removal cannot prevent its clean-session resolution.
+            assertThat(reconnecting).isNotCompletedExceptionally();
+            for (CompletableFuture<Void> observer : observers) {
+                assertThatThrownBy(observer::join)
+                        .hasCauseInstanceOf(MqttNotConnectedException.class);
+            }
+            ScriptTransport current = nextTransport();
+            current.accept();
+            reconnecting.get(5, SECONDS);
+            subscription.unsubscribe().get(5, SECONDS);
+            assertThat(current.sent).isEmpty();
+            assertThat(subscribePull(sut, current, request())).isNotNull();
+        }
+    }
+
+    @ParameterizedTest(name = "closed subscriptions: {0}")
+    @ValueSource(ints = {1, 64})
+    void connection_loss_releases_every_close_observer_but_preserves_local_disposal(
+            int registrations
+    ) throws Exception {
+        // Arrange: background removals share the full budget of public observers.
+        var failure = new IOException("connection ended before removal was confirmed");
+        try (MqttClient sut = client()) {
+            ScriptTransport old = connect(sut);
+            var subscriptions = new ArrayList<Subscription>();
+            for (int i = 0; i < registrations; i++) {
+                subscriptions.add(subscribePull(sut, old,
+                        Subscribe.of(new TopicFilter("closed/" + i), Qos.AT_MOST_ONCE)));
+            }
+            subscriptions.forEach(Subscription::close);
+            // More removals than the send window can wait without ever reaching the transport.
+            assertThat(old.sent.poll(5, SECONDS)).isInstanceOf(Packet.Unsubscribe.class);
+            await().until(() -> ((ClientActor) sut).usage().operations() == 0);
+            var observers = new ArrayList<CompletableFuture<Void>>();
+            for (int i = 0; i < 64; i++) {
+                observers.add(subscriptions.get(i % registrations).unsubscribe());
+            }
+            assertThat(((ClientActor) sut).usage().operations()).isEqualTo(64);
+            assertThat(observers).allSatisfy(observer -> assertThat(observer).isNotDone());
+
+            // Act: FIFO closure follows admission of every observer.
+            old.receiver().onClosed(failure);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
+
+            // Assert: public observations end with their connection and return operation slots.
+            for (CompletableFuture<Void> observer : observers) {
+                assertThatThrownBy(() -> observer.get(5, SECONDS))
+                        .hasCauseInstanceOf(MqttConnectionLostException.class)
+                        .hasRootCause(failure);
+            }
+            await().until(() -> ((ClientActor) sut).usage().operations() == 0);
+            ScriptTransport current = connect(sut);
+            for (Subscription subscription : subscriptions) {
+                assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
+                subscription.unsubscribe().get(5, SECONDS);
+            }
+            assertThat(current.sent).isEmpty();
+            assertThat(subscribePull(sut, current, Subscribe.of(
+                    subscriptions.getFirst().filter(), Qos.AT_MOST_ONCE))).isNotNull();
+            assertThatThrownBy(() -> observers.getFirst().join()).hasRootCause(failure);
         }
     }
 
@@ -2007,9 +2225,9 @@ class ClientActorTest {
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             holdActor(transport, actorHeld, releaseActor);
 
-            // Act: the worker exits with a pending failure and a coalesced readiness wake.
+            // Act: the worker waits after notifying failure and coalescing acknowledgement.
             releaseHandler.countDown();
-            assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+            await().until(() -> worker.getState() == Thread.State.WAITING);
             releaseActor.countDown();
 
             // Assert: processing the failure retires the queued ACK and preserves its cause.
@@ -2074,9 +2292,9 @@ class ClientActorTest {
             }
             CompletableFuture<Void> queued = registered.getLast().unsubscribe();
 
-            // Act: joining the worker proves its failure notification precedes actor resumption.
+            // Act: the untimed lane wait follows notification, unlike the handler's timed wait.
             releaseHandler.countDown();
-            assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+            await().until(() -> worker.getState() == Thread.State.WAITING);
             releaseActor.countDown();
 
             // Assert: termination discards input and rejects the queued command without sending.
@@ -2116,12 +2334,12 @@ class ClientActorTest {
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             holdActor(transport, actorHeld, releaseActor);
 
-            // Act: invalid input uses the termination slot; a joined worker has notified too.
+            // Act: invalid input uses the termination slot; the lane wait follows notification.
             if (!handlerFirst) {
                 transport.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             }
             releaseHandler.countDown();
-            assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+            await().until(() -> worker.getState() == Thread.State.WAITING);
             if (handlerFirst) {
                 transport.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             }
@@ -2166,11 +2384,14 @@ class ClientActorTest {
             sut.disconnect().get(5, SECONDS);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
             ScriptTransport current = connect(sut);
+            var resubscribe = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
+            current.receive(new Packet.SubAck(resubscribe.packetId(),
+                    List.of(ReasonCode.SUCCESS), EMPTY));
             holdActor(current, actorHeld, releaseActor);
 
             // Act: the stale failure arrives first but cannot reserve current termination.
             releaseHandler.countDown();
-            assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+            await().until(() -> worker.getState() == Thread.State.WAITING);
             current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             releaseActor.countDown();
 
@@ -2179,6 +2400,104 @@ class ClientActorTest {
             assertProtocolFailure(end.cause(), ReasonCode.MALFORMED_PACKET);
             assertThat(end.userRequested()).isFalse();
             assertThat(current.closed).isTrue();
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
+    @Test
+    void a_publication_in_progress_cannot_turn_an_accepted_handler_failure_into_overload()
+            throws Exception {
+        // Arrange: the failing QoS 1 delivery keeps the lane's only slot, and the actor is held
+        // just before the next publication for that lane reaches the session.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var failure = new IllegalStateException("handler failed with a full lane");
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                            .withBufferCapacity(1),
+                    _ -> {
+                        workers.add(Thread.currentThread());
+                        waitFor(releaseHandler);
+                        throw failure;
+                    }
+            );
+            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(subscribe.packetId(),
+                    List.of(ReasonCode.GRANTED_QOS_1), EMPTY));
+            subscribing.get(5, SECONDS);
+            transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
+                    Qos.AT_LEAST_ONCE, false, false, 7, EMPTY));
+            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            beforeActorTime = () -> {
+                actorHeld.countDown();
+                waitFor(releaseActor);
+            };
+            transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {2},
+                    Qos.AT_LEAST_ONCE, false, false, 8, EMPTY));
+            assertThat(actorHeld.await(5, SECONDS)).isTrue();
+
+            // Act: the failure is accepted while that publication is still in progress.
+            releaseHandler.countDown();
+            await().until(() -> worker.getState() == Thread.State.WAITING);
+            releaseActor.countDown();
+
+            // Assert: the full lane neither replaces the accepted cause nor releases a PUBACK.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
+            assertThat(transport.sent).isEmpty();
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Shutdown starts inside the block while the actor is held.
+    void a_handler_failure_while_the_client_closes_does_not_run_the_next_delivery()
+            throws Exception {
+        // Arrange: a second delivery waits behind the failing handler, and the held actor
+        // cannot yet remove the lane during shutdown.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var failure = new IllegalStateException("handler failed during shutdown");
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), delivery -> {
+                byte payload = delivery.message().payload()[0];
+                handled.add(payload);
+                if (payload == 1) {
+                    workers.add(Thread.currentThread());
+                    waitFor(releaseHandler);
+                    throw failure;
+                }
+            });
+            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(subscribe.packetId(),
+                    List.of(ReasonCode.SUCCESS), EMPTY));
+            subscribing.get(5, SECONDS);
+            transport.receive(publication(new byte[] {1}));
+            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            transport.receive(publication(new byte[] {2}));
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 2);
+            holdActor(transport, actorHeld, releaseActor);
+
+            // Act: shutdown is requested before the handler fails.
+            sut.close();
+            releaseHandler.countDown();
+            await().until(() -> worker.getState() == Thread.State.WAITING);
+            releaseActor.countDown();
+
+            // Assert: the failed lane stays paused until shutdown stops its worker.
+            await().until(() -> !worker.isAlive());
+            assertThat(handled).containsExactly((byte) 1);
         } finally {
             releaseHandler.countDown();
             releaseActor.countDown();
@@ -2436,9 +2755,8 @@ class ClientActorTest {
             // Act: the transport's final callback releases the stalled write.
             transport.receiver().onClosed(new IOException("Transport closed"));
 
-            // Assert: only the continuation, the listener, and the running handler with its
-            // 13-byte delivery still hold capacity.
-            var held = new ClientActor.Usage(1, 1, 0, 0, 0, 0, 1, 1, 13);
+            // Assert: both subscriptions remain; only the running handler retains a delivery.
+            var held = new ClientActor.Usage(1, 1, 0, 0, 0, 0, 2, 1, 13);
             await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(held));
 
             // Act
@@ -2446,7 +2764,8 @@ class ClientActorTest {
 
             // Assert
             continuation.get(5, SECONDS);
-            await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(NOTHING_HELD));
+            var retained = new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0);
+            await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(retained));
         } finally {
             release.countDown();
         }
@@ -2586,7 +2905,7 @@ class ClientActorTest {
 
     @Test
     void an_old_subscription_can_be_disposed_without_removing_its_replacement() throws Exception {
-        // Arrange: graceful disconnect ends the clean session and its subscription.
+        // Arrange: graceful disconnect ends the clean session but retains the subscription.
         var received = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client()) {
             ScriptTransport oldTransport = connect(sut);
@@ -2595,11 +2914,14 @@ class ClientActorTest {
             assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(null, true));
 
             // Act: dispose the old handle while disconnected and while reconnecting.
-            oldSubscription.unsubscribe().get(5, SECONDS);
+            oldSubscription.close();
+            CompletableFuture<Void> removing = oldSubscription.unsubscribe();
+            assertThatThrownBy(removing::join).hasCauseInstanceOf(MqttNotConnectedException.class);
             CompletableFuture<ConnAck> connection = sut.connect();
             ScriptTransport current = nextTransport();
             oldSubscription.close();
-            oldSubscription.unsubscribe().get(5, SECONDS);
+            CompletableFuture<Void> observer = oldSubscription.unsubscribe();
+            assertThatThrownBy(observer::join).hasCauseInstanceOf(MqttNotConnectedException.class);
 
             // Assert: the new connection sends no UNSUBSCRIBE for the old session.
             assertThat(current.sent).isEmpty();
@@ -2634,12 +2956,13 @@ class ClientActorTest {
     }
 
     @Test
-    void connection_loss_fails_pending_removal_but_later_disposal_succeeds() throws Exception {
+    void connection_loss_rolls_back_explicit_removal_and_preserves_its_failed_observers()
+            throws Exception {
         // Arrange: two calls observe one removal that the broker has not acknowledged.
         var failure = new IOException("Peer reset during unsubscribe");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribe(sut, transport);
+            Subscription subscription = subscribePull(sut, transport, request());
             CompletableFuture<Void> first = subscription.unsubscribe();
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Unsubscribe.class);
             CompletableFuture<Void> observer = subscription.unsubscribe();
@@ -2656,9 +2979,16 @@ class ClientActorTest {
                     .hasRootCause(failure);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(new Disconnection(failure, false));
 
-            // Act: there is no subscription left for a later call to remove.
-            CompletableFuture<Void> disposed = subscription.unsubscribe();
+            // Act: the failed attempt restores the subscription for the next connection.
+            ScriptTransport current = connect(sut);
+            acknowledgeResubscription(current, subscription);
+            current.receive(publication(new byte[] {9}));
+            assertThat(received(subscription.receive(Duration.ofSeconds(5))).message().payload())
+                    .containsExactly((byte) 9);
             subscription.close();
+            CompletableFuture<Void> disposed = subscription.unsubscribe();
+            var unsubscribe = (Packet.Unsubscribe) requireNonNull(current.sent.poll(5, SECONDS));
+            current.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
 
             // Assert: disposal does not rewrite either result from the failed attempt.
             disposed.get(5, SECONDS);
@@ -3116,6 +3446,17 @@ class ClientActorTest {
         transport.receive(new Packet.SubAck(packet.packetId(),
                 List.of(ReasonCode.of(request.qos().level())), EMPTY));
         return subscribing.get(5, SECONDS);
+    }
+
+    private static void acknowledgeResubscription(
+            ScriptTransport transport,
+            Subscription subscription
+    ) throws Exception {
+        var packet = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+        assertThat(packet.subscriptions()).singleElement().satisfies(request ->
+                assertThat(request.filter()).isEqualTo(subscription.filter()));
+        transport.receive(new Packet.SubAck(packet.packetId(),
+                List.of(ReasonCode.of(packet.subscriptions().getFirst().qos().level())), EMPTY));
     }
 
     private static Subscribe request() {
