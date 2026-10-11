@@ -8,6 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.concurrent.TimeoutException;
 
 import org.jspecify.annotations.Nullable;
@@ -147,11 +148,9 @@ final class SessionCore {
 
     private boolean awaitingPing;
 
-    private PacketIds packetIds = new PacketIds();
+    private final Session session = new Session();
 
     private final Map<Long, Long> publications = new HashMap<>();
-
-    private final Map<Integer, Long> inflight = new HashMap<>();
 
     private final AckSequencer acknowledgements = new AckSequencer(ACKNOWLEDGEMENT_LIMIT);
 
@@ -309,13 +308,13 @@ final class SessionCore {
         long ticket = ++nextTicket;
         int packetId = 0;
         if (message.qos() == Qos.AT_LEAST_ONCE) {
-            var allocated = packetIds.allocate();
+            OptionalInt allocated = session.packetIds.allocate();
             if (allocated.isEmpty()) {
                 capacityFailure(operation, "Packet identifier capacity");
                 return;
             }
             packetId = allocated.getAsInt();
-            inflight.put(packetId, operation);
+            session.inflight.put(packetId, operation);
         } else {
             publications.put(ticket, operation);
         }
@@ -323,8 +322,8 @@ final class SessionCore {
             if (packetId == 0) {
                 publications.remove(ticket);
             } else {
-                inflight.remove(packetId);
-                packetIds.release(packetId);
+                session.inflight.remove(packetId);
+                session.packetIds.release(packetId);
             }
             capacityFailure(operation, "Send queue capacity");
         }
@@ -360,7 +359,7 @@ final class SessionCore {
             return;
         }
 
-        var allocated = packetIds.allocate();
+        OptionalInt allocated = session.packetIds.allocate();
         if (allocated.isEmpty()) {
             capacityFailure(operation, "Packet identifier capacity");
             return;
@@ -369,7 +368,7 @@ final class SessionCore {
         // Registration precedes send: a broker may publish before sending SUBACK.
         Optional<Subscription> registered = port.registerSubscription(operation);
         if (registered.isEmpty()) {
-            packetIds.release(id);
+            session.packetIds.release(id);
             capacityFailure(operation, "Subscription capacity");
             return;
         }
@@ -380,7 +379,7 @@ final class SessionCore {
         if (port.send(generation, ++nextTicket, packet) == SendQueue.OfferResult.FULL) {
             subscribing.remove(id);
             subscriptions.remove(operation);
-            packetIds.release(id);
+            session.packetIds.release(id);
             port.removeSubscription(operation, requireNonNull(local.handle), null);
             capacityFailure(operation, "Send queue capacity");
         }
@@ -449,7 +448,7 @@ final class SessionCore {
         if (!removal.subscription.established) {
             return Optional.of("Subscription acknowledgement pending");
         }
-        var allocated = packetIds.allocate();
+        OptionalInt allocated = session.packetIds.allocate();
         if (allocated.isEmpty()) {
             return Optional.of("Packet identifier capacity");
         }
@@ -458,7 +457,7 @@ final class SessionCore {
         var packet = new Packet.Unsubscribe(id, List.of(removal.subscription.filter), EMPTY);
         if (port.send(generation, ++nextTicket, packet) == SendQueue.OfferResult.FULL) {
             unsubscribing.remove(id);
-            packetIds.release(id);
+            session.packetIds.release(id);
             return Optional.of("Send queue capacity");
         }
         return Optional.empty();
@@ -492,7 +491,7 @@ final class SessionCore {
                 queuedSubscriptions.removeFirst();
                 continue;
             }
-            var allocated = packetIds.allocate();
+            OptionalInt allocated = session.packetIds.allocate();
             if (allocated.isEmpty()) {
                 return;
             }
@@ -501,7 +500,7 @@ final class SessionCore {
             if (port.send(generation, ++nextTicket, subscriptionPacket(local, id))
                     == SendQueue.OfferResult.FULL) {
                 subscribing.remove(id);
-                packetIds.release(id);
+                session.packetIds.release(id);
                 return;
             }
             queuedSubscriptions.removeFirst();
@@ -560,7 +559,7 @@ final class SessionCore {
     }
 
     private void acknowledged(Packet.PubAck ack) {
-        Long operation = inflight.remove(ack.packetId());
+        Long operation = session.inflight.remove(ack.packetId());
         if (operation == null) {
             if (!unknownPubAckLogged) {
                 unknownPubAckLogged = true;
@@ -569,7 +568,7 @@ final class SessionCore {
             }
             return;
         }
-        packetIds.release(ack.packetId());
+        session.packetIds.release(ack.packetId());
         port.complete(operation, PublishResult.of(), null);
     }
 
@@ -600,7 +599,7 @@ final class SessionCore {
             return;
         }
         subscribing.remove(ack.packetId());
-        packetIds.release(ack.packetId());
+        session.packetIds.release(ack.packetId());
         boolean restoring = local.confirmed;
         if (restoring) {
             restoringInFlight--;
@@ -637,7 +636,7 @@ final class SessionCore {
             return;
         }
         unsubscribing.remove(ack.packetId());
-        packetIds.release(ack.packetId());
+        session.packetIds.release(ack.packetId());
         if (pending.background) {
             closingInFlight--;
         }
@@ -839,6 +838,12 @@ final class SessionCore {
                     failure
             );
         }
+        endConnection(cause, requested, permanent);
+        finishOperations(cause, permanent);
+        discardSession();
+    }
+
+    private void endConnection(@Nullable Throwable cause, boolean requested, boolean permanent) {
         boolean established = state == State.CONNECTED;
         boolean active = state != State.DISCONNECTED;
         state = permanent ? State.CLOSED : State.DISCONNECTED;
@@ -853,6 +858,10 @@ final class SessionCore {
             // turn thousands of abandoned recipients into fresh readiness notifications.
             port.end(generation, established, Disconnection.of(cause, requested));
         }
+        acknowledgements.clear();
+    }
+
+    private void finishOperations(@Nullable Throwable cause, boolean permanent) {
         var pendingFailure = (cause == null)
                 ? new MqttConnectionLostException()
                 : new MqttConnectionLostException(cause);
@@ -873,11 +882,9 @@ final class SessionCore {
             port.complete(operation, null, pendingFailure);
         }
         publications.clear();
-        for (long operation : inflight.values()) {
+        for (long operation : session.inflight.values()) {
             port.complete(operation, null, pendingFailure);
         }
-        inflight.clear();
-        acknowledgements.clear();
         for (var local : subscribing.values()) {
             if (!local.confirmed) {
                 port.complete(local.id, null, pendingFailure);
@@ -899,7 +906,6 @@ final class SessionCore {
         queuedSubscriptions.clear();
         restoringInFlight = 0;
         closingInFlight = 0;
-        packetIds = new PacketIds();
         if (connectOperation != 0) {
             Throwable failure = switch (cause) {
                 case null -> new MqttConnectException("Connection failed");
@@ -921,6 +927,11 @@ final class SessionCore {
                             : new MqttConnectionLostException(cause)
             );
         }
+    }
+
+    private void discardSession() {
+        session.inflight.clear();
+        session.packetIds = new PacketIds();
     }
 
     private static PacketDecodeException protocolError(String message) {
@@ -966,6 +977,12 @@ final class SessionCore {
         // trailing # wildcards allow adding another empty level to form the topic "/".
         return bytes <= 65535
                 && (bytes > 0 || firstLevelFlexible || (leftTail && rightTail));
+    }
+
+    private static final class Session {
+
+        private PacketIds packetIds = new PacketIds();
+        private final Map<Integer, Long> inflight = new HashMap<>();
     }
 
     private static final class LocalSubscription {
