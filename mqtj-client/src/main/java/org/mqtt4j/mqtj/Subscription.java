@@ -4,7 +4,8 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
 /// One subscription established by a successful SUBACK. The same handle survives connection
-/// termination and is re-created after the client's next successful [MqttClient#connect()].
+/// termination. The client's next successful [MqttClient#connect()] resumes it when the broker
+/// retained the session, or re-creates it when [ConnAck#sessionPresent()] is false.
 /// Removal, local closure, permanent client closure, or a broker refusal during re-creation
 /// ends the subscription permanently.
 public interface Subscription extends AutoCloseable {
@@ -117,9 +118,9 @@ public interface Subscription extends AutoCloseable {
     /// or failure of that future neither cancels removal nor resumes local delivery.
     /// The retained broker registration record counts against subscription capacity and
     /// prevents registering the same filter again or, when either filter is shared, an
-    /// overlapping one until UNSUBACK or the next successful clean-session CONNACK confirms
-    /// its removal. Messages that still arrive for it are discarded, and QoS 1 ones are
-    /// acknowledged. This applies to both push and pull modes.
+    /// overlapping one until UNSUBACK or a successful CONNACK with [ConnAck#sessionPresent()]
+    /// false confirms its removal. Messages that still arrive for it are discarded, and QoS 1
+    /// messages are acknowledged. This applies to both push and pull modes.
     @Override
     void close();
 }

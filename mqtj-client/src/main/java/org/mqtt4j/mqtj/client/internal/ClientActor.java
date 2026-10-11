@@ -131,7 +131,8 @@ public final class ClientActor implements MqttClient {
             int maxPacketSize,
             TimerScheduler scheduler,
             ConnectionListener listener,
-            Transport.Factory transportFactory
+            Transport.Factory transportFactory,
+            boolean cleanStart
     ) {
         this(
                 endpoint,
@@ -142,7 +143,8 @@ public final class ClientActor implements MqttClient {
                 scheduler,
                 listener,
                 transportFactory,
-                PacketCodec.of(MqttVersion.V3_1_1)
+                PacketCodec.of(MqttVersion.V3_1_1),
+                cleanStart
         );
     }
 
@@ -155,7 +157,8 @@ public final class ClientActor implements MqttClient {
             TimerScheduler scheduler,
             ConnectionListener listener,
             Transport.Factory transportFactory,
-            PacketCodec codec
+            PacketCodec codec,
+            boolean cleanStart
     ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
@@ -177,7 +180,7 @@ public final class ClientActor implements MqttClient {
                 new IoEvents(),
                 codec
         );
-        core = new SessionCore(new CorePort(), clientId, timeout, keepAlive);
+        core = new SessionCore(new CorePort(), clientId, timeout, keepAlive, cleanStart);
         Thread.ofVirtual().name(threadName("actor")).start(this::run);
     }
 
@@ -619,9 +622,10 @@ public final class ClientActor implements MqttClient {
                 long generation,
                 long ticket,
                 MqttMessage message,
-                int packetId
+                int packetId,
+                @Nullable PublishTransmission transmission
         ) {
-            return io.publish(generation, ticket, message, packetId);
+            return io.publish(generation, ticket, message, packetId, transmission);
         }
 
         @Override

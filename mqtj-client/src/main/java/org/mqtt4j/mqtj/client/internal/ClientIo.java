@@ -206,7 +206,8 @@ final class ClientIo {
             long generation,
             long ticket,
             MqttMessage message,
-            int packetId
+            int packetId,
+            @Nullable PublishTransmission transmission
     ) {
         synchronized (sending) {
             Connection connection = current;
@@ -223,6 +224,7 @@ final class ClientIo {
                 return capacity;
             }
         }
+        // Encoding sets DUP from the transport receipt, which may change until the send starts.
         byte[] header = codec.encodePublishHeader(
                 message.topic(),
                 message.qos(),
@@ -235,7 +237,7 @@ final class ClientIo {
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(header, message, false),
+                new Outbound(header, message, false, transmission),
                 false,
                 "Publish",
                 false
@@ -252,7 +254,7 @@ final class ClientIo {
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(bytes, null, packet instanceof Packet.PubAck),
+                new Outbound(bytes, null, packet instanceof Packet.PubAck, null),
                 reserved,
                 packet.getClass().getSimpleName(),
                 packet instanceof Packet.PingReq
@@ -355,7 +357,10 @@ final class ClientIo {
                 rejectActive(connection);
                 throw failure;
             }
-            if (result == Transport.SendResult.CLOSED) {
+            PublishTransmission transmission = send.value().transmission();
+            if (result == Transport.SendResult.ACCEPTED && transmission != null) {
+                transmission.markAccepted();
+            } else if (result == Transport.SendResult.CLOSED) {
                 rejectActive(connection);
             }
         } finally {
@@ -507,7 +512,8 @@ final class ClientIo {
     private record Outbound(
             byte[] header,
             @Nullable MqttMessage message,
-            boolean acknowledgement
+            boolean acknowledgement,
+            @Nullable PublishTransmission transmission
     ) {
 
         int size() {
@@ -515,7 +521,16 @@ final class ClientIo {
         }
 
         byte[] encode(PacketCodec codec) {
-            return message == null ? header : codec.encodePublish(header, message.payload());
+            if (message == null) {
+                return header;
+            }
+            byte[] bytes = codec.encodePublish(header, message.payload());
+            if (transmission != null && transmission.accepted()) {
+                // The sole sender has returned from every earlier attempt before encoding this
+                // one, even if its queue admission preceded the old transport's send return.
+                bytes[0] |= 0x08;
+            }
+            return bytes;
         }
     }
 

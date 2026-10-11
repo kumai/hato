@@ -11,9 +11,10 @@ import java.util.concurrent.CompletableFuture;
 /// [MqttCapacityException], whatever maximum incoming packet size is configured.
 /// Cancelling or completing a returned future does not cancel the underlying operation.
 ///
-/// A QoS 1 retransmission marked DUP joins the original delivery while that delivery's PUBACK is
-/// still pending. Any other publication, including one without DUP that reuses a pending packet
-/// identifier, starts a new delivery. This does not guarantee exactly-once processing.
+/// Within one connection, a QoS 1 retransmission marked DUP joins the original delivery while
+/// that delivery's PUBACK is still pending. Any other publication, including one without DUP
+/// that reuses a pending packet identifier, starts a new delivery. A retransmission after
+/// reconnection starts a new delivery. This does not guarantee exactly-once processing.
 ///
 /// The client completes operations independently of I/O and listener callbacks. One blocked
 /// continuation does not prevent another operation from completing. Slow continuations and
@@ -27,10 +28,21 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
         return new MqttClientBuilder();
     }
 
-    /// Establishes a clean session and completes after a successful CONNACK.
-    /// Previously established subscriptions are re-created on the broker using their existing
-    /// handles. This future does not wait for their SUBACK responses; a refusal ends only the
-    /// affected subscription. A pull subscription reports it through [Subscription#receive()].
+    /// Establishes a connection and completes after a successful CONNACK.
+    /// With an existing local persistent session, [ConnAck#sessionPresent()] true continues
+    /// pending QoS 1 exchanges and established subscriptions. False discards the old exchanges
+    /// and re-creates subscriptions using their existing handles. Previously failed publication
+    /// futures remain failed. This future does not wait for replay or SUBACK responses; a
+    /// re-creation refusal ends only the affected subscription. A pull subscription reports it
+    /// through [Subscription#receive()].
+    ///
+    /// Local session state is held only in this client object's memory. On a persistent
+    /// connection, if the broker reports Session Present without matching local state, the
+    /// client sends DISCONNECT, closes that connection, and fails this attempt with
+    /// [MqttConnectException]. Its message preserves the session refusal; a failure while
+    /// closing is attached as a suppressed exception. The broker keeps that session, so later
+    /// attempts fail the same way until it is discarded. Connecting a client built with the
+    /// same identifier and the default [MqttClientBuilder#cleanStart(boolean)] discards it.
     ///
     /// The future fails with [MqttConnectException] if establishment fails, the broker refuses
     /// the connection, or the connection deadline expires. Connecting while already connected
@@ -43,6 +55,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// This does not wait for PUBACK, although one that arrives before the connection ends still
     /// completes its publication. Other pending QoS 1 publications fail with
     /// [MqttConnectionLostException] when the connection ends; their outcome is unknown.
+    /// A persistent session retains their exchanges for a later [#connect()], without changing
+    /// those failed futures. A nonpersistent session discards them.
     /// Wait for each publication's future before disconnecting to observe its acknowledgement.
     ///
     /// The future fails with [MqttNotConnectedException] when there is no established connection
@@ -53,6 +67,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
 
     /// Requests immediate, permanent shutdown without sending DISCONNECT or waiting for I/O
     /// or application callbacks. Repeated calls have no effect.
+    /// Discards local session state; a persistent session may remain on the broker.
     /// A Will registered with the broker may be published. For a graceful disconnect,
     /// wait for [#disconnect] to complete before calling this method.
     @Override

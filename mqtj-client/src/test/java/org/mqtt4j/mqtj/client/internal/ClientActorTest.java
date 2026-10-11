@@ -1115,6 +1115,54 @@ class ClientActorTest {
         }
     }
 
+    @Test
+    void a_session_refusal_survives_a_priority_packet_failure_during_disconnect()
+            throws Exception {
+        // Arrange: keep the refused session's DISCONNECT write outstanding.
+        try (MqttClient sut = MqttClient.builder()
+                .server(URI.create("mqtt://localhost"))
+                .version(MqttVersion.V3_1_1)
+                .clientId("actor-test")
+                .cleanStart(false)
+                .sessionExpiry(Duration.ofSeconds(30))
+                .timerScheduler(scheduler)
+                .connectionListener(ends::add)
+                .transportFactory(_ -> {
+                    var transport = new ScriptTransport();
+                    transports.add(transport);
+                    return transport;
+                })
+                .build()) {
+            CompletableFuture<ConnAck> connection = sut.connect();
+            ScriptTransport transport = nextTransport();
+            transport.completeSends = false;
+            transport.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
+            assertThat(connection).isNotDone();
+
+            // Act: decoding fails through the priority termination slot.
+            transport.receiver().onBytes(HexFormat.of().parseHex("d100"));
+
+            // Assert: cleanup failure supplements the original local-state refusal.
+            assertThatThrownBy(() -> connection.get(5, SECONDS)).cause().isInstanceOfSatisfying(
+                    MqttConnectException.class,
+                    failure -> {
+                        assertThat(failure).hasMessage("Broker session has no local state")
+                                .hasNoCause();
+                        assertThat(failure.reasonCode()).isEmpty();
+                        assertThat(failure.getSuppressed()).singleElement().satisfies(
+                                secondary -> assertProtocolFailure(
+                                        secondary,
+                                        ReasonCode.MALFORMED_PACKET
+                                )
+                        );
+                    }
+            );
+            assertThat(ends).isEmpty();
+        }
+    }
+
     @ParameterizedTest(name = "{0}: {1}")
     @MethodSource("invalidPackets")
     void received_packet_failures_notify_the_listener_with_a_public_reason(
@@ -3556,7 +3604,8 @@ class ClientActorTest {
                     transports.add(transport);
                     return transport;
                 },
-                packetCodec
+                packetCodec,
+                true
         );
     }
 

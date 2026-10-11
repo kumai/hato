@@ -16,9 +16,15 @@ MqttClient client = MqttClient.builder()
         .build();
 ```
 
-`server` and `version` are required. Without `clientId`, the client generates a
-random one. The other settings have defaults; see the
+`server` and `version` are required. By default, each connection starts a fresh
+session, and omitting `clientId` generates a random one. The other settings have
+defaults; see the
 [builder Javadoc](src/main/java/org/mqtt4j/mqtj/MqttClientBuilder.java).
+
+To retain a session between connections, use an explicit `clientId` and set
+`cleanStart(false).sessionExpiry(Duration.ofDays(1))`. For MQTT 3.1.1, a positive
+expiry selects a persistent session; the broker determines how long it retains
+the session. The client keeps its own session state in memory.
 
 Connect with `connect()`. After `disconnect()` or a connection failure, the client can
 connect again, and established subscriptions resume on their existing handles. End with
@@ -96,7 +102,7 @@ arrives as the cause of a `CompletionException`.
 | `MqttConnectException` | The broker could not be reached, refused the connection, or did not answer in time. |
 | `MqttNotConnectedException` | The client was not connected. |
 | `MqttConnectionLostException` | The connection ended before the result was known. A publication may or may not have reached the broker. |
-| `MqttCapacityException` | The client had too much work in progress. The connection stays up; wait for pending results, then try again. |
+| `MqttCapacityException` | The client reached an admission limit. The connection stays up; let outstanding work drain before retrying. |
 | `MqttSubscribeException` | The broker refused the subscription. |
 
 The `connectionListener` is called whenever a connection ends, whether you

@@ -32,6 +32,7 @@ import org.mqtt4j.mqtj.TopicFilter;
 import org.mqtt4j.mqtj.client.internal.common.io.SendQueue;
 import org.mqtt4j.mqtj.client.internal.common.log.Log;
 import org.mqtt4j.mqtj.client.internal.common.protocol.Packet;
+import org.mqtt4j.mqtj.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.mqtj.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.mqtj.client.internal.common.protocol.PacketIds;
 import org.mqtt4j.mqtj.client.internal.common.protocol.SharedTopicFilter;
@@ -66,12 +67,13 @@ final class SessionCore {
         SendQueue.OfferResult send(long generation, long ticket, Packet packet);
 
         /// Reports admission at the exact wire size, not write completion. The payload is copied
-        /// only after admission.
+        /// only after admission. DUP comes from `transmission` when the packet is encoded.
         SendQueue.OfferResult publish(
                 long generation,
                 long ticket,
                 MqttMessage message,
-                int packetId
+                int packetId,
+                @Nullable PublishTransmission transmission
         );
 
         void schedule(long generation, Timer timer, Duration delay);
@@ -103,10 +105,17 @@ final class SessionCore {
 
     private static final Log log = Log.of(SessionCore.class);
 
+    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
+
+    private static final int INFLIGHT_LIMIT = 64;
+
+    private static final long INFLIGHT_BYTE_LIMIT = 32L * 1024 * 1024;
+
     private static final int ACKNOWLEDGEMENT_LIMIT = 4096;
 
-    // Broker registrations outlive locally closed handles until UNSUBACK or the next clean
-    // CONNACK, so they are bounded apart from the delivery lanes that local closure releases.
+    // Broker registrations outlive locally closed handles until UNSUBACK or a CONNACK without
+    // Session Present, so they are bounded apart from the delivery lanes that local closure
+    // releases.
     private static final int REGISTRATION_LIMIT = 256;
 
     // Bound queued completion events even when I/O returns capacity during an actor drain.
@@ -128,6 +137,11 @@ final class SessionCore {
 
     private final Duration keepAlive;
 
+    private final boolean cleanStart;
+
+    // Broker registrations can survive even when their last local operation was unconfirmed.
+    private boolean sessionPresent;
+
     private State state = State.DISCONNECTED;
 
     private long generation;
@@ -148,7 +162,9 @@ final class SessionCore {
 
     private boolean awaitingPing;
 
-    private final Session session = new Session();
+    private @Nullable MqttConnectException sessionRefusal;
+
+    private Session session = new Session();
 
     private final Map<Long, Long> publications = new HashMap<>();
 
@@ -169,17 +185,25 @@ final class SessionCore {
     // At most one removal per registered subscription; the registry supplies the total bound.
     private final ArrayDeque<UnsubscribeOperation> queuedClosures = new ArrayDeque<>();
 
-    private final ArrayDeque<LocalSubscription> queuedSubscriptions = new ArrayDeque<>();
+    // At most 64 retained publications and 256 broker registrations await queue admission.
+    private final ArrayDeque<Deferred> deferred = new ArrayDeque<>();
 
     private int restoringInFlight;
 
     private int closingInFlight;
 
-    SessionCore(Port port, String clientId, Duration timeout, Duration keepAlive) {
+    SessionCore(
+            Port port,
+            String clientId,
+            Duration timeout,
+            Duration keepAlive,
+            boolean cleanStart
+    ) {
         this.port = port;
         this.clientId = clientId;
         this.timeout = timeout;
         this.keepAlive = keepAlive;
+        this.cleanStart = cleanStart;
     }
 
     State state() {
@@ -203,21 +227,28 @@ final class SessionCore {
     void opened(long connection) {
         if (connection == generation && state == State.CONNECTING) {
             transportConnected = true;
-            sendRequired(++nextTicket, new Packet.Connect(
-                    clientId,
-                    MqttVersion.V3_1_1,
-                    true,
-                    (int) keepAlive.toSeconds(),
-                    null,
-                    null,
-                    null,
-                    EMPTY
-            ));
+            sendRequired(
+                    ++nextTicket,
+                    new Packet.Connect(
+                            clientId,
+                            MqttVersion.V3_1_1,
+                            cleanStart,
+                            (int) keepAlive.toSeconds(),
+                            null,
+                            null,
+                            null,
+                            EMPTY
+                    )
+            );
         }
     }
 
     void received(long connection, Packet packet, long now, int bytes) {
         if (connection != generation || state == State.DISCONNECTED || state == State.CLOSED) {
+            return;
+        }
+        if (sessionRefusal != null) {
+            // This broker session has no local counterpart; only its DISCONNECT may progress.
             return;
         }
         if (state == State.CONNECTING) {
@@ -228,20 +259,42 @@ final class SessionCore {
                         "Broker refused connection",
                         ack.reasonCode()
                 ));
-            } else if (ack.sessionPresent()) {
+            } else if (ack.sessionPresent() && cleanStart) {
                 failed(connection, protocolError("Session Present with Clean Session"));
+            } else if (ack.sessionPresent() && !session.established) {
+                sessionRefusal = new MqttConnectException("Broker session has no local state");
+                port.cancel(Timer.CONNECT);
+                port.schedule(generation, Timer.DISCONNECT, timeout);
+                disconnectTicket = ++nextTicket;
+                sendRequired(disconnectTicket, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
             } else {
+                sessionPresent = ack.sessionPresent();
+                if (!ack.sessionPresent()) {
+                    discardSession();
+                    session.established = true;
+                    if (!cleanStart) {
+                        log.info("Started session for {}", clientId);
+                    }
+                } else {
+                    deferred.addAll(session.inflight.values());
+                }
                 state = State.CONNECTED;
                 port.cancel(Timer.CONNECT);
                 long operation = connectOperation;
                 connectOperation = 0;
-                port.complete(operation, ConnAck.of(false), null);
+                port.complete(operation, ConnAck.of(ack.sessionPresent()), null);
                 for (LocalSubscription local : List.copyOf(subscriptions.values())) {
                     if (local.closed) {
-                        removeSubscription(local, null);
-                        finishRemoval(local);
-                    } else {
-                        queuedSubscriptions.addLast(local);
+                        if (ack.sessionPresent()) {
+                            local.established = true;
+                            beginRemoval(local.closeOperation, local, true);
+                        } else {
+                            removeSubscription(local, null);
+                            finishRemoval(local);
+                        }
+                    } else if (!ack.sessionPresent() || !local.established) {
+                        local.established = false;
+                        deferred.addLast(local);
                     }
                 }
                 if (!keepAlive.isZero()) {
@@ -272,7 +325,7 @@ final class SessionCore {
         }
         // SUBACK/PUBACK/UNSUBACK can return packet identifiers or the close exchange window.
         drainClosures();
-        drainSubscriptions();
+        drainDeferred();
     }
 
     void sent(long connection, long ticket, long now) {
@@ -285,6 +338,10 @@ final class SessionCore {
             port.complete(publication, PublishResult.of(), null);
         }
         if (ticket == disconnectTicket) {
+            if (sessionRefusal != null) {
+                end(sessionRefusal, true, false);
+                return;
+            }
             long operation = disconnectOperation;
             disconnectOperation = 0;
             end(null, true, false);
@@ -305,25 +362,65 @@ final class SessionCore {
         if (!ready(operation) || !supportedQos(operation, message.qos())) {
             return;
         }
+        // Replays precede subscription restoration; SUBACK waiting does not block publication.
+        if (deferred.peekFirst() instanceof Inflight) {
+            capacityFailure(operation, "Publication replay pending");
+            return;
+        }
         long ticket = ++nextTicket;
         int packetId = 0;
+        PublishTransmission transmission = null;
         if (message.qos() == Qos.AT_LEAST_ONCE) {
+            if (session.inflight.size() >= INFLIGHT_LIMIT) {
+                capacityFailure(operation, "Publication capacity");
+                return;
+            }
+            int byteCount = 0;
+            if (!cleanStart) {
+                long remaining = INFLIGHT_BYTE_LIMIT - session.bytes;
+                if (message.payloadSize() > remaining) {
+                    capacityFailure(operation, "Publication byte capacity");
+                    return;
+                }
+                byteCount = codec.encodePublishHeader(
+                        message.topic(),
+                        message.qos(),
+                        message.retain(),
+                        false,
+                        1,
+                        EMPTY,
+                        message.payloadSize()
+                )
+                        .length + message.payloadSize();
+                if (byteCount > remaining) {
+                    capacityFailure(operation, "Publication byte capacity");
+                    return;
+                }
+            }
             OptionalInt allocated = session.packetIds.allocate();
             if (allocated.isEmpty()) {
                 capacityFailure(operation, "Packet identifier capacity");
                 return;
             }
             packetId = allocated.getAsInt();
-            session.inflight.put(packetId, operation);
+            var publication = new Inflight(
+                    packetId,
+                    operation,
+                    cleanStart ? null : message,
+                    byteCount
+            );
+            session.inflight.put(packetId, publication);
+            session.bytes += byteCount;
+            transmission = publication.transmission;
         } else {
             publications.put(ticket, operation);
         }
-        if (port.publish(generation, ticket, message, packetId) == SendQueue.OfferResult.FULL) {
+        if (port.publish(generation, ticket, message, packetId, transmission)
+                == SendQueue.OfferResult.FULL) {
             if (packetId == 0) {
                 publications.remove(ticket);
             } else {
-                session.inflight.remove(packetId);
-                session.packetIds.release(packetId);
+                removePublication(packetId);
             }
             capacityFailure(operation, "Send queue capacity");
         }
@@ -335,7 +432,7 @@ final class SessionCore {
             return;
         }
         if (subscriptions.values().stream()
-                .anyMatch(local -> local.filter.equals(request.filter()))) {
+                .anyMatch(local -> local.handle != null && local.filter.equals(request.filter()))) {
             port.complete(operation, null, new IllegalStateException(
                     "Subscription already exists: " + request.filter().pattern()
             ));
@@ -343,7 +440,7 @@ final class SessionCore {
         }
         var local = new LocalSubscription(operation, request);
         Optional<LocalSubscription> conflict = subscriptions.values().stream()
-                .filter(existing -> (local.shared || existing.shared)
+                .filter(existing -> existing.handle != null && (local.shared || existing.shared)
                         && filtersOverlap(local.matchingFilter, existing.matchingFilter))
                 .findFirst();
         if (conflict.isPresent()) {
@@ -382,6 +479,17 @@ final class SessionCore {
             session.packetIds.release(id);
             port.removeSubscription(operation, requireNonNull(local.handle), null);
             capacityFailure(operation, "Send queue capacity");
+        } else {
+            // Unsent cleanup of a failed registration must not remove its replacement.
+            // Already admitted UNSUBSCRIBE packets precede this SUBSCRIBE in the send FIFO.
+            for (LocalSubscription abandoned : List.copyOf(subscriptions.values())) {
+                if (abandoned.handle == null && abandoned.filter.equals(local.filter)
+                        && (abandoned.removal == null
+                                || queuedClosures.contains(abandoned.removal))) {
+                    removeSubscription(abandoned, null);
+                    finishRemoval(abandoned);
+                }
+            }
         }
     }
 
@@ -419,10 +527,15 @@ final class SessionCore {
             beginRemoval(operation, local, true);
         }
         drainClosures();
-        drainSubscriptions();
+        drainDeferred();
     }
 
     private void beginRemoval(long operation, LocalSubscription local, boolean background) {
+        deferred.remove(local);
+        if (sessionPresent && !subscribing.containsValue(local)) {
+            // An unsent restoration cannot prove that a persistent broker has no registration.
+            local.established = true;
+        }
         var removal = new UnsubscribeOperation(operation, local, background);
         local.removal = removal;
         if (!local.established && !subscribing.containsValue(local)) {
@@ -481,14 +594,35 @@ final class SessionCore {
     }
 
     /// Restoration uses no application operation slots and resumes when capacity returns.
-    private void drainSubscriptions() {
+    private void drainDeferred() {
         if (state != State.CONNECTED || disconnectOperation != 0) {
             return;
         }
-        while (restoringInFlight < RESTORE_INFLIGHT_LIMIT && !queuedSubscriptions.isEmpty()) {
-            LocalSubscription local = queuedSubscriptions.getFirst();
+        while (!deferred.isEmpty()) {
+            if (deferred.getFirst() instanceof Inflight publication) {
+                if (session.inflight.get(publication.packetId) != publication) {
+                    deferred.removeFirst();
+                    continue;
+                }
+                if (port.publish(
+                        generation,
+                        ++nextTicket,
+                        requireNonNull(publication.message),
+                        publication.packetId,
+                        requireNonNull(publication.transmission)
+                )
+                        != SendQueue.OfferResult.ACCEPTED) {
+                    return;
+                }
+                deferred.removeFirst();
+                continue;
+            }
+            if (restoringInFlight >= RESTORE_INFLIGHT_LIMIT) {
+                return;
+            }
+            var local = (LocalSubscription) deferred.getFirst();
             if (!subscriptions.containsKey(local.id)) {
-                queuedSubscriptions.removeFirst();
+                deferred.removeFirst();
                 continue;
             }
             OptionalInt allocated = session.packetIds.allocate();
@@ -503,7 +637,7 @@ final class SessionCore {
                 session.packetIds.release(id);
                 return;
             }
-            queuedSubscriptions.removeFirst();
+            deferred.removeFirst();
             restoringInFlight++;
         }
     }
@@ -516,8 +650,10 @@ final class SessionCore {
 
     private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
         subscriptions.remove(local.id);
-        queuedSubscriptions.remove(local);
-        port.removeSubscription(local.id, requireNonNull(local.handle), cause);
+        deferred.remove(local);
+        if (local.handle != null) {
+            port.removeSubscription(local.id, local.handle, cause);
+        }
     }
 
     private void finishRemoval(LocalSubscription local) {
@@ -559,8 +695,8 @@ final class SessionCore {
     }
 
     private void acknowledged(Packet.PubAck ack) {
-        Long operation = session.inflight.remove(ack.packetId());
-        if (operation == null) {
+        Inflight publication = removePublication(ack.packetId());
+        if (publication == null) {
             if (!unknownPubAckLogged) {
                 unknownPubAckLogged = true;
                 log.warn("Ignoring PUBACK for unknown packet identifier {} on {}",
@@ -568,8 +704,19 @@ final class SessionCore {
             }
             return;
         }
-        session.packetIds.release(ack.packetId());
-        port.complete(operation, PublishResult.of(), null);
+        if (publication.operation != 0) {
+            port.complete(publication.operation, PublishResult.of(), null);
+        }
+    }
+
+    private @Nullable Inflight removePublication(int packetId) {
+        Inflight publication = session.inflight.remove(packetId);
+        if (publication != null) {
+            session.packetIds.release(packetId);
+            session.bytes -= publication.bytes;
+            deferred.remove(publication);
+        }
+        return publication;
     }
 
     /// The earlier reception was a stale retransmission or a resend that omitted DUP. Either way
@@ -732,7 +879,7 @@ final class SessionCore {
             port.releaseDelivery(entry.token());
         }
         drainClosures();
-        drainSubscriptions();
+        drainDeferred();
     }
 
     void timer(long connection, Timer timer, long now) {
@@ -770,7 +917,7 @@ final class SessionCore {
                 }
             }
             case DISCONNECT -> {
-                if (disconnectOperation != 0) {
+                if (disconnectOperation != 0 || sessionRefusal != null) {
                     failed(connection, new TimeoutException("DISCONNECT write deadline expired"));
                 }
             }
@@ -838,9 +985,22 @@ final class SessionCore {
                     failure
             );
         }
-        endConnection(cause, requested, permanent);
-        finishOperations(cause, permanent);
-        discardSession();
+        if (sessionRefusal != null) {
+            // A failed DISCONNECT must not replace the reason this session was refused.
+            if (cause != null && cause != sessionRefusal) {
+                sessionRefusal.addSuppressed(cause);
+            }
+            cause = sessionRefusal;
+        }
+        try {
+            endConnection(cause, requested, permanent);
+            finishOperations(cause, permanent);
+        } finally {
+            // Shell teardown or a logging backend must not retain a closed client's payloads.
+            if (permanent || cleanStart) {
+                discardSession();
+            }
+        }
     }
 
     private void endConnection(@Nullable Throwable cause, boolean requested, boolean permanent) {
@@ -853,6 +1013,8 @@ final class SessionCore {
         awaitingPing = false;
         pingTicket = 0;
         disconnectTicket = 0;
+        sessionRefusal = null;
+        sessionPresent = false;
         if (active) {
             // Retire delivery conditions before removing subscriptions: termination must not
             // turn thousands of abandoned recipients into fresh readiness notifications.
@@ -866,14 +1028,25 @@ final class SessionCore {
                 ? new MqttConnectionLostException()
                 : new MqttConnectionLostException(cause);
         for (LocalSubscription local : List.copyOf(subscriptions.values())) {
-            if (permanent || !local.confirmed) {
+            if (permanent || (cleanStart && !local.confirmed)) {
                 removeSubscription(local, permanent ? cause : null);
                 if (permanent && local.closeOperation != 0) {
                     port.complete(local.closeOperation, null, pendingFailure);
                     local.closeOperation = 0;
                 }
+            } else if (!local.confirmed) {
+                // A failed initial SUBSCRIBE can still have reached a persistent broker.
+                // Keep only its bounded cleanup intent, without a handle or delivery lane.
+                if (local.handle != null) {
+                    port.removeSubscription(local.id, local.handle, null);
+                    local.handle = null;
+                }
+                local.closed = true;
+                local.removing = true;
             } else {
-                local.established = false;
+                if (cleanStart || (local.removing && !local.closed)) {
+                    local.established = false;
+                }
                 local.removing = local.closed;
             }
             local.removal = null;
@@ -882,20 +1055,25 @@ final class SessionCore {
             port.complete(operation, null, pendingFailure);
         }
         publications.clear();
-        for (long operation : session.inflight.values()) {
-            port.complete(operation, null, pendingFailure);
+        for (Inflight publication : session.inflight.values()) {
+            if (publication.operation != 0) {
+                port.complete(publication.operation, null, pendingFailure);
+                publication.operation = 0;
+            }
         }
         for (var local : subscribing.values()) {
             if (!local.confirmed) {
                 port.complete(local.id, null, pendingFailure);
             }
         }
+        subscribing.keySet().forEach(session.packetIds::release);
         subscribing.clear();
         for (var pending : unsubscribing.values()) {
             if (!pending.background) {
                 port.complete(pending.operation, null, pendingFailure);
             }
         }
+        unsubscribing.keySet().forEach(session.packetIds::release);
         unsubscribing.clear();
         for (var pending : queuedClosures) {
             if (!pending.background) {
@@ -903,7 +1081,7 @@ final class SessionCore {
             }
         }
         queuedClosures.clear();
-        queuedSubscriptions.clear();
+        deferred.clear();
         restoringInFlight = 0;
         closingInFlight = 0;
         if (connectOperation != 0) {
@@ -930,8 +1108,12 @@ final class SessionCore {
     }
 
     private void discardSession() {
-        session.inflight.clear();
-        session.packetIds = new PacketIds();
+        boolean established = session.established;
+        session = new Session();
+        // Every clean connection starts and discards a session; only persistent ones are news.
+        if (established && !cleanStart) {
+            log.info("Discarded session for {}", clientId);
+        }
     }
 
     private static PacketDecodeException protocolError(String message) {
@@ -979,13 +1161,42 @@ final class SessionCore {
                 && (bytes > 0 || firstLevelFlexible || (leftTail && rightTail));
     }
 
+    // Send state that a persistent session keeps across connections. A CONNACK without Session
+    // Present, permanent closure, or the end of a nonpersistent connection replaces it.
+    // SUBSCRIBE and UNSUBSCRIBE borrow its identifiers only until their connection ends.
     private static final class Session {
 
-        private PacketIds packetIds = new PacketIds();
-        private final Map<Integer, Long> inflight = new HashMap<>();
+        final PacketIds packetIds = new PacketIds();
+        // Unacknowledged QoS 1 publications in their original send order.
+        final Map<Integer, Inflight> inflight = new LinkedHashMap<>();
+        // A CONNACK without Session Present started this session; only then can a later
+        // Session Present continue it.
+        boolean established;
+        // Wire size of the inflight publications, counted only for a persistent session.
+        long bytes;
     }
 
-    private static final class LocalSubscription {
+    private sealed interface Deferred {
+    }
+
+    private static final class Inflight implements Deferred {
+
+        final int packetId;
+        final @Nullable MqttMessage message;
+        final int bytes;
+        final @Nullable PublishTransmission transmission;
+        long operation;
+
+        Inflight(int packetId, long operation, @Nullable MqttMessage message, int bytes) {
+            this.packetId = packetId;
+            this.operation = operation;
+            this.message = message;
+            this.bytes = bytes;
+            transmission = message == null ? null : new PublishTransmission();
+        }
+    }
+
+    private static final class LocalSubscription implements Deferred {
 
         // The subscribe operation's token; the shell and its delivery lanes use the same id.
         final long id;

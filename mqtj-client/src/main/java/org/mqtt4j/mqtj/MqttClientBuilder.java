@@ -27,6 +27,8 @@ public final class MqttClientBuilder {
 
     private static final Duration MAX_CONNECTION_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
 
+    private static final Duration MAX_SESSION_EXPIRY = Duration.ofSeconds(0xFFFF_FFFFL);
+
     private static final int DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024;
 
     private static final int MAX_PORT = 65_535;
@@ -50,6 +52,10 @@ public final class MqttClientBuilder {
     private Duration keepAlive = DEFAULT_KEEP_ALIVE;
 
     private Duration connectionTimeout = DEFAULT_CONNECTION_TIMEOUT;
+
+    private boolean cleanStart = true;
+
+    private Duration sessionExpiry = Duration.ZERO;
 
     private int maxPacketSize = DEFAULT_MAX_PACKET_SIZE;
 
@@ -102,7 +108,8 @@ public final class MqttClientBuilder {
         return at < 0 ? text : text.replace(part, "***" + part.substring(at));
     }
 
-    /// Uses this nonempty MQTT UTF-8 identifier. Omission generates 23 ASCII letters/digits.
+    /// Uses this nonempty MQTT UTF-8 identifier. Persistent sessions require an explicit value.
+    /// Otherwise, omission generates 23 ASCII letters/digits.
     public MqttClientBuilder clientId(String value) {
         requireNonNull(value, "clientId");
         MqttString.write(new ByteArrayOutputStream(), value);
@@ -119,6 +126,31 @@ public final class MqttClientBuilder {
             throw new IllegalArgumentException("Unsupported MQTT version: " + value);
         }
         version = value;
+        return this;
+    }
+
+    /// Selects whether a connection without local session state starts a new session; default
+    /// true. With false, even the first connection asks the broker to resume an existing session,
+    /// and [MqttClient#connect()] fails when the client has no state for it. A client gains local
+    /// state when one of its persistent connections succeeds, and its later connections request
+    /// resumption of that state.
+    /// MQTT 3.1.1 supports only true with zero [#sessionExpiry(Duration)], or false with a
+    /// positive expiry. [#build()] rejects other combinations. These map to Clean Session 1
+    /// and Clean Session 0, respectively. The broker determines the persistent session's lifetime.
+    public MqttClientBuilder cleanStart(boolean value) {
+        cleanStart = value;
+        return this;
+    }
+
+    /// Configures session retention after disconnection; default zero.
+    /// [#build()] accepts zero, or durations from 1 through 4294967295 seconds inclusive.
+    /// Fractional seconds are accepted within that range, such as 1.5 seconds.
+    /// MQTT 3.1.1 requires zero with [#cleanStart(boolean)] true, or a positive value with it
+    /// false and an explicit [#clientId(String)]. The positive duration is not sent to the
+    /// broker or enforced locally; every positive value selects Clean Session 0, and the
+    /// broker determines the session's lifetime.
+    public MqttClientBuilder sessionExpiry(Duration value) {
+        sessionExpiry = requireNonNull(value, "sessionExpiry");
         return this;
     }
 
@@ -188,13 +220,33 @@ public final class MqttClientBuilder {
     /// Creates a disconnected client. Call [MqttClient#connect] to open the connection.
     ///
     /// @throws IllegalStateException if the server or protocol version has not been specified
+    /// @throws IllegalArgumentException if session settings are outside the supported range,
+    ///     their combination is unsupported, or a persistent session has no explicit client id
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null || version == null) {
             throw new IllegalStateException("Server and MQTT version must be specified");
         }
+        if (!sessionExpiry.isZero()
+                && (sessionExpiry.compareTo(Duration.ofSeconds(1)) < 0
+                || sessionExpiry.compareTo(MAX_SESSION_EXPIRY) > 0)) {
+            throw new IllegalArgumentException(
+                    "Session expiry must be zero or 1..4294967295 seconds"
+            );
+        }
+        if (cleanStart != sessionExpiry.isZero()) {
+            throw new IllegalArgumentException(
+                    "MQTT 3.1.1 requires cleanStart true with zero session expiry, "
+                            + "or false with positive session expiry"
+            );
+        }
         String id = clientId;
         if (id == null) {
+            if (!cleanStart) {
+                throw new IllegalArgumentException(
+                        "Persistent sessions require an explicit client id"
+                );
+            }
             id = CLIENT_ID_PREFIX + UUID.randomUUID().toString().replace("-", "")
                     .substring(0, GENERATED_CLIENT_ID_LENGTH - CLIENT_ID_PREFIX.length());
         }
@@ -206,7 +258,8 @@ public final class MqttClientBuilder {
                 maxPacketSize,
                 scheduler,
                 listener,
-                transportFactory
+                transportFactory,
+                cleanStart
         );
     }
 }

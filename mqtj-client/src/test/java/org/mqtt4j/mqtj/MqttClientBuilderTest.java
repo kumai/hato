@@ -125,4 +125,88 @@ class MqttClientBuilderTest {
         assertThatThrownBy(() -> sut.clientId(""))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void default_clean_sessions_do_not_require_an_explicit_identifier() {
+        assertThatCode(() -> configuredBuilder().build().close()).doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest(name = "accepts cleanStart={0}, expiry={1}")
+    @CsvSource({
+            "true, PT0S",
+            "false, PT1S",
+            "false, PT1.5S",
+            "false, PT4294967295S"
+    })
+    void supported_session_settings_can_be_supplied_in_either_order(
+            boolean cleanStart,
+            String expiry
+    ) {
+        Duration duration = Duration.parse(expiry);
+
+        assertThatCode(() -> configuredBuilder()
+                .clientId("session-client")
+                .cleanStart(cleanStart)
+                .sessionExpiry(duration)
+                .build().close()).doesNotThrowAnyException();
+        assertThatCode(() -> configuredBuilder()
+                .clientId("session-client")
+                .sessionExpiry(duration)
+                .cleanStart(cleanStart)
+                .build().close()).doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest(name = "rejects cleanStart={0}, expiry={1} at build")
+    @CsvSource({"true, PT1S", "false, PT0S"})
+    void unsupported_session_combinations_are_rejected_at_build(
+            boolean cleanStart,
+            String expiry
+    ) {
+        MqttClientBuilder sut = configuredBuilder()
+                .clientId("session-client")
+                .cleanStart(cleanStart)
+                .sessionExpiry(Duration.parse(expiry));
+
+        assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void persistent_sessions_require_an_explicit_identifier() {
+        MqttClientBuilder sut = configuredBuilder()
+                .cleanStart(false)
+                .sessionExpiry(Duration.ofSeconds(1));
+
+        assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest(name = "rejects expiry {0} at build")
+    @ValueSource(strings = {
+            "PT-0.000000001S",
+            "PT0.000000001S",
+            "PT0.999999999S",
+            "PT4294967295.000000001S",
+            "PT4294967296S",
+            "PT9223372036854775807S"
+    })
+    void invalid_session_expiry_is_rejected_at_build(String expiry) {
+        MqttClientBuilder sut = configuredBuilder()
+                .clientId("session-client")
+                .cleanStart(false)
+                .sessionExpiry(Duration.parse(expiry));
+
+        assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    @SuppressWarnings("NullAway")
+    void session_expiry_cannot_be_null() {
+        assertThatThrownBy(() -> configuredBuilder().sessionExpiry(null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    private static MqttClientBuilder configuredBuilder() {
+        return MqttClient.builder()
+                .server(URI.create("mqtt://localhost"))
+                .version(MqttVersion.V3_1_1);
+    }
 }

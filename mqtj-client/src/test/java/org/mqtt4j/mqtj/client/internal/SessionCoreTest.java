@@ -68,7 +68,8 @@ class SessionCoreTest {
             port,
             "client",
             Duration.ofSeconds(30),
-            Duration.ofSeconds(10)
+            Duration.ofSeconds(10),
+            true
     );
 
     @Test
@@ -2565,7 +2566,8 @@ class SessionCoreTest {
                 long generation,
                 long id,
                 MqttMessage message,
-                int packetId
+                int packetId,
+                @Nullable PublishTransmission transmission
         ) {
             ticket = id;
             publications.add(message);

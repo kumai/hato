@@ -54,12 +54,21 @@ final class ScriptedBroker implements AutoCloseable {
     }
 
     static ScriptedBroker connect(ServerSocket server, MqttClient sut) throws Exception {
+        return connect(server, sut, false, _ -> { });
+    }
+
+    static ScriptedBroker connect(
+            ServerSocket server,
+            MqttClient sut,
+            boolean sessionPresent,
+            Consumer<Packet.Connect> verifyConnect
+    ) throws Exception {
         CompletableFuture<ConnAck> connected = sut.connect();
         var peer = new ScriptedBroker(server.accept());
         try {
-            assertThat(peer.receive()).isInstanceOf(Packet.Connect.class);
-            peer.send(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
-            connected.get(5, SECONDS);
+            assertThat(peer.receive()).isInstanceOfSatisfying(Packet.Connect.class, verifyConnect);
+            peer.send(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));
+            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent));
             return peer;
         } catch (Exception | AssertionError failure) {
             peer.close();
