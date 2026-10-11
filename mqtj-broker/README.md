@@ -64,9 +64,18 @@ port. The default listens only on loopback. Starting the broker throws
 ## Choosing where to use it
 
 Use the broker in local or trusted environments. It does not check credentials.
+It supports MQTT 3.1.1 and QoS 0/1. Wills are refused with Server unavailable;
+retained publications reach current subscribers but are not stored. `$share/`
+filters are matched literally, without shared routing.
+
+With Clean Session false, subscriptions and QoS 1 deliveries survive a disconnect,
+and reconnecting with the same client identifier resumes them. Delivery storage is
+bounded, so a subscriber that falls too far behind loses its session.
+
 State lives in memory and is lost when the broker stops; use test fixtures or your
 application to recreate it. MQTT delivery acknowledgements do not mean that data
-has been saved to disk.
+has been saved to disk. The broker API is experimental and outside the
+compatibility promise.
 
 See the [MqttBroker Javadoc](src/main/java/org/mqtt4j/mqtj/broker/MqttBroker.java)
 for the API contract, or the [test kit](../mqtj-testkit/README.md) to simulate

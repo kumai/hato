@@ -187,7 +187,8 @@ return dispatch(
                 subscription,
                 ack
         ),
-        deadline);
+        deadline
+);
 ```
 
 You may break a line that fits within 100 characters when doing so makes the correspondence of
@@ -205,7 +206,8 @@ text blocks, the accepted variants in section 3.4 also apply.
 ```java
 private SubAck subscribe(
         Subscribe request,
-        List<TopicFilter> filters) {
+        List<TopicFilter> filters
+) {
     return session.subscribe(request, filters);
 }
 ```
@@ -416,7 +418,8 @@ a nullable value plus the handling of its absence.
 ```java
 record SessionState(
         ClientId clientId,
-        @Nullable Will will) {
+        @Nullable Will will
+) {
     SessionState {
         requireNonNull(clientId, "clientId must not be null");
     }

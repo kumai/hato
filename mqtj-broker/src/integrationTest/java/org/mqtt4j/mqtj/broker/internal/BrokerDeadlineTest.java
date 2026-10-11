@@ -5,22 +5,30 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.mqtj.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.mqtj.broker.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.spi.TimerScheduler;
 import org.mqtt4j.mqtj.testkit.ManualTimerScheduler;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.mqtj.broker.internal.RawSession.connect;
+import static org.mqtt4j.mqtj.broker.internal.RawSession.connected;
+import static org.mqtt4j.mqtj.broker.internal.RawSession.publication;
+import static org.mqtt4j.mqtj.broker.internal.common.value.Qos.AT_MOST_ONCE;
 
 class BrokerDeadlineTest {
 
@@ -117,17 +125,21 @@ class BrokerDeadlineTest {
         }
     }
 
-    @Test
-    void a_taken_over_connections_dispatched_timer_does_not_affect_its_replacement()
-            throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void a_taken_over_connections_dispatched_timer_does_not_affect_its_replacement(
+            boolean cleanSession
+    ) throws Exception {
         var timer = new ManualTimer();
         try (BrokerServer sut = start(timer); var first = RawSession.open(sut.port())) {
-            first.send(connect("same-id", true, 1));
+            first.send(connect("same-id", cleanSession, 1));
             first.expect(Packet.ConnAck.class);
             Runnable stale = timer.actions.getLast();
             timer.clock.advance(Duration.ofSeconds(1));
 
-            try (var replacement = RawSession.connected(sut.port(), "same-id")) {
+            try (var replacement = connected(
+                    sut.port(), "same-id", cleanSession, !cleanSession
+            )) {
                 first.expectClosed();
                 assertThat(timer.clock.pendingTaskCount()).isZero();
                 timer.clock.advance(Duration.ofMillis(500));
@@ -136,6 +148,97 @@ class BrokerDeadlineTest {
                 replacement.ping();
                 assertThat(timer.clock.pendingTaskCount()).isZero();
             }
+        }
+    }
+
+    @Test
+    void expiry_preserves_the_session_and_its_old_timer_cannot_close_a_new_connection()
+            throws Exception {
+        var timer = new ManualTimer();
+        try (BrokerServer sut = start(timer);
+                var first = RawSession.open(sut.port());
+                var publisher = connected(sut.port(), "publisher")) {
+            first.send(connect("expired-session", false, 1));
+            first.expect(Packet.ConnAck.class);
+            first.subscribe("kept/#", AT_MOST_ONCE);
+            Runnable stale = timer.actions.getLast();
+
+            timer.clock.advance(KEEP_ALIVE_TIMEOUT);
+            first.expectClosed();
+            try (var replacement = connected(sut.port(), "expired-session", false, true)) {
+                stale.run();
+                publisher.publish("kept/topic", "after expiry", AT_MOST_ONCE, 0);
+                assertThat(replacement.expect(Packet.Publish.class)).isEqualTo(publication(
+                        "kept/topic", "after expiry", AT_MOST_ONCE, 0
+                ));
+                replacement.ping();
+                assertThat(timer.clock.pendingTaskCount()).isZero();
+            }
+        }
+    }
+
+    @Test
+    void connect_decoded_before_its_deadline_cannot_take_over_after_expiry() throws Exception {
+        var timer = new ManualTimer();
+        var armed = new AtomicBoolean();
+        var heldReader = new CompletableFuture<Thread>();
+        var release = new CountDownLatch(1);
+        try (BrokerServer sut = start(timer, packet -> {
+            if (packet instanceof Packet.Connect && armed.compareAndSet(true, false)) {
+                heldReader.complete(Thread.currentThread());
+                try {
+                    assertThat(release.await(5, SECONDS)).isTrue();
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(failure);
+                }
+            }
+        }); var existing = connected(sut.port(), "same-id", false, false)) {
+            existing.subscribe("kept/#", AT_MOST_ONCE);
+            armed.set(true);
+            try (var expired = RawSession.open(sut.port())) {
+                expired.send(connect("same-id", false, 0));
+                Thread reader = heldReader.get(5, SECONDS);
+                timer.clock.advance(CONNECT_TIMEOUT);
+                expired.expectClosed();
+                release.countDown();
+                assertThat(reader.join(Duration.ofSeconds(5))).isTrue();
+
+                existing.ping();
+                existing.publish("kept/topic", "still attached", AT_MOST_ONCE, 0);
+                assertThat(existing.expect(Packet.Publish.class)).isEqualTo(publication(
+                        "kept/topic", "still attached", AT_MOST_ONCE, 0
+                ));
+                assertThat(timer.clock.pendingTaskCount()).isZero();
+            }
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(TimerFailure.class)
+    void failed_keep_alive_startup_does_not_take_over_an_existing_session(TimerFailure failure)
+            throws Exception {
+        var timer = new ManualTimer();
+        try (BrokerServer sut = start(timer);
+                var existing = connected(sut.port(), "same-id", false, false);
+                var failed = RawSession.open(sut.port())) {
+            existing.subscribe("kept/#", AT_MOST_ONCE);
+            timer.awaitPendingTasks(1);
+            switch (failure) {
+                case NANO_TIME -> timer.failNextClockRead.set(true);
+                case SCHEDULE -> timer.failNextSchedule.set(true);
+            }
+            failed.send(connect("same-id", false, 1));
+            failed.expectClosed();
+
+            existing.ping();
+            existing.publish("kept/topic", "still attached", AT_MOST_ONCE, 0);
+            assertThat(existing.expect(Packet.Publish.class)).isEqualTo(publication(
+                    "kept/topic", "still attached", AT_MOST_ONCE, 0
+            ));
+            assertThat(timer.clock.pendingTaskCount()).isZero();
         }
     }
 
@@ -242,16 +345,25 @@ class BrokerDeadlineTest {
     }
 
     private static BrokerServer start(Timer timer) throws IOException {
-        return BrokerServer.start(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
-                CONNECT_TIMEOUT, 16 * 1024 * 1024L, 128, timer
-        );
+        return BrokerServer.builder()
+                .connectTimeout(CONNECT_TIMEOUT)
+                .scheduler(timer)
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
     }
 
-    private static final class ManualTimer implements Timer {
+    private static BrokerServer start(Timer timer, Consumer<Packet> beforeProcess)
+            throws IOException {
+        return BrokerServer.builder()
+                .connectTimeout(CONNECT_TIMEOUT)
+                .scheduler(timer)
+                .beforeProcess(beforeProcess)
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+    }
 
-        private final ManualTimerScheduler clock = new ManualTimerScheduler();
-        private final List<Runnable> actions = new CopyOnWriteArrayList<>();
+    static final class ManualTimer implements Timer {
+
+        final ManualTimerScheduler clock = new ManualTimerScheduler();
+        final List<Runnable> actions = new CopyOnWriteArrayList<>();
         private final AtomicBoolean failNextClockRead = new AtomicBoolean();
         private final AtomicBoolean failNextSchedule = new AtomicBoolean();
         private volatile boolean cancellationFails;
@@ -279,7 +391,7 @@ class BrokerDeadlineTest {
             };
         }
 
-        private void awaitPendingTasks(int expected) {
+        void awaitPendingTasks(int expected) {
             await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                     assertThat(clock.pendingTaskCount()).isEqualTo(expected));
         }

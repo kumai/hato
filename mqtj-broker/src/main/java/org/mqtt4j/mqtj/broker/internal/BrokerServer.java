@@ -5,14 +5,17 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 import org.jspecify.annotations.Nullable;
 
@@ -35,7 +38,7 @@ import org.mqtt4j.mqtj.broker.internal.common.value.TopicFilter;
 
 import static java.util.Objects.requireNonNull;
 
-/// One listener with independent reader/writer pairs and clean, in-memory sessions.
+/// One listener with independent reader/writer pairs and bounded, in-memory sessions.
 public final class BrokerServer implements AutoCloseable {
 
     private static final Log log = Log.of(BrokerServer.class);
@@ -50,6 +53,16 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int MAX_INFLIGHT = 128;
 
+    // Control responses queue apart from deliveries, up to the 128 the regular queue allowed
+    // them before sessions. A client's pipelined requests beyond that close the connection.
+    private static final int RESERVED_COUNT = 128;
+
+    private static final long RESERVED_BYTES = 1024 * 1024;
+
+    private static final int MAX_QUEUED = 128;
+
+    private static final int MAX_SESSIONS = 1024;
+
     // The framing format bounds packet size; a configurable broker cap comes later.
     private static final int MAX_PACKET_SIZE = 268_435_460;
 
@@ -61,73 +74,164 @@ public final class BrokerServer implements AutoCloseable {
 
     private final int maxInflight;
 
+    private final long maxInflightBytes;
+
+    private final int maxQueued;
+
+    private final long maxQueuedBytes;
+
+    private final int maxSessions;
+
     private final Timer scheduler;
 
-    // This global lock and linear subscription scan bound routing throughput. Replace them
-    // with a topic index and finer ownership if broker measurements justify productization.
-    // Lock order is routing -> Connection; a takeover locks the previous Connection while
-    // holding the new one. A Connection releases its lock before removal.
+    private final Consumer<Packet> beforeProcess;
+
+    private final Runnable beforeDeliveryWrite;
+
+    // This global lock and linear session/subscription scan bound routing throughput. Replace
+    // them with an index and finer ownership if broker measurements justify productization.
+    // Lock order is routing -> Connection. Readers/writers release their monitor before routing;
+    // timers stop I/O without routing, and reader/writer cleanup detaches the connection later.
     private final Object routing = new Object();
 
     private final Set<Connection> connections = new HashSet<>();
 
-    private final Map<String, Connection> sessions = new HashMap<>();
+    private final Map<String, Session> sessions = new HashMap<>();
 
     private boolean closed;
 
-    private BrokerServer(
-            ServerSocket listener,
-            long connectTimeout,
-            long sendBytes,
-            int maxInflight,
-            Timer scheduler
-    ) {
+    private BrokerServer(ServerSocket listener, Builder settings) {
         this.listener = listener;
-        this.connectTimeout = connectTimeout;
-        this.sendBytes = sendBytes;
-        this.maxInflight = maxInflight;
-        this.scheduler = scheduler;
+        this.connectTimeout = settings.connectTimeout.toNanos();
+        this.sendBytes = settings.sendBytes;
+        this.maxInflight = settings.maxInflight;
+        this.maxInflightBytes = settings.maxInflightBytes;
+        this.maxQueued = settings.maxQueued;
+        this.maxQueuedBytes = settings.maxQueuedBytes;
+        this.maxSessions = settings.maxSessions;
+        this.scheduler = settings.scheduler;
+        this.beforeProcess = settings.beforeProcess;
+        this.beforeDeliveryWrite = settings.beforeDeliveryWrite;
     }
 
     public static BrokerServer start(InetSocketAddress address) throws IOException {
-        return start(address, CONNECT_TIMEOUT, SEND_BYTES, MAX_INFLIGHT, TimerService.instance);
+        return builder().start(address);
     }
 
-    static BrokerServer start(
-            InetSocketAddress address,
-            Duration connectTimeout,
-            long sendBytes,
-            int maxInflight,
-            Timer scheduler
-    ) throws IOException {
-        requireNonNull(address, "address must not be null");
-        requireNonNull(scheduler, "scheduler must not be null");
-        if (connectTimeout.isNegative()
-            || connectTimeout.isZero()
-            || sendBytes <= 0
-            || maxInflight <= 0
-            || maxInflight > 65535
-        ) {
-            throw new IllegalArgumentException("Broker limits and timeout must be positive");
+    static Builder builder() {
+        return new Builder();
+    }
+
+    /// Internal limits and test hooks, copied when the broker starts. Not thread safe.
+    /// Values are checked together at [#start(InetSocketAddress)], so they can be set in any order.
+    static final class Builder {
+
+        private Duration connectTimeout = CONNECT_TIMEOUT;
+
+        private long sendBytes = SEND_BYTES;
+
+        private int maxInflight = MAX_INFLIGHT;
+
+        private long maxInflightBytes = SEND_BYTES;
+
+        private int maxQueued = MAX_QUEUED;
+
+        private long maxQueuedBytes = SEND_BYTES;
+
+        private int maxSessions = MAX_SESSIONS;
+
+        private Timer scheduler = TimerService.instance;
+
+        private Consumer<Packet> beforeProcess = _ -> { };
+
+        private Runnable beforeDeliveryWrite = () -> { };
+
+        private Builder() {
         }
-        long connectTimeoutNanos = connectTimeout.toNanos();
-        var listener = new ServerSocket();
-        try {
-            listener.bind(address);
-            var server = new BrokerServer(
-                    listener, connectTimeoutNanos, sendBytes, maxInflight, scheduler
-            );
-            Thread.ofVirtual()
-                    .name("mqtj-broker-" + server.port() + "-accept")
-                    .start(server::accept);
-            return server;
-        } catch (IOException | RuntimeException | Error failure) {
-            try {
-                listener.close();
-            } catch (IOException closeFailure) {
-                failure.addSuppressed(closeFailure);
+
+        Builder connectTimeout(Duration value) {
+            connectTimeout = requireNonNull(value, "connectTimeout must not be null");
+            return this;
+        }
+
+        Builder sendBytes(long value) {
+            sendBytes = value;
+            return this;
+        }
+
+        Builder maxInflight(int value) {
+            maxInflight = value;
+            return this;
+        }
+
+        Builder maxInflightBytes(long value) {
+            maxInflightBytes = value;
+            return this;
+        }
+
+        Builder maxQueued(int value) {
+            maxQueued = value;
+            return this;
+        }
+
+        Builder maxQueuedBytes(long value) {
+            maxQueuedBytes = value;
+            return this;
+        }
+
+        Builder maxSessions(int value) {
+            maxSessions = value;
+            return this;
+        }
+
+        Builder scheduler(Timer value) {
+            scheduler = requireNonNull(value, "scheduler must not be null");
+            return this;
+        }
+
+        Builder beforeProcess(Consumer<Packet> value) {
+            beforeProcess = requireNonNull(value, "beforeProcess must not be null");
+            return this;
+        }
+
+        Builder beforeDeliveryWrite(Runnable value) {
+            beforeDeliveryWrite = requireNonNull(value, "beforeDeliveryWrite must not be null");
+            return this;
+        }
+
+        BrokerServer start(InetSocketAddress address) throws IOException {
+            requireNonNull(address, "address must not be null");
+            if (connectTimeout.isNegative()
+                || connectTimeout.isZero()
+                || sendBytes <= 0
+                || maxInflight <= 0
+                || maxInflight > SEND_COUNT
+                || maxInflightBytes <= 0
+                || maxInflightBytes > sendBytes
+                || maxQueued <= 0
+                || maxQueuedBytes <= 0
+                || maxSessions <= 0
+            ) {
+                throw new IllegalArgumentException(
+                        "Broker limits must be positive and window fit queue"
+                );
             }
-            throw failure;
+            var listener = new ServerSocket();
+            try {
+                listener.bind(address);
+                var server = new BrokerServer(listener, this);
+                Thread.ofVirtual()
+                        .name("mqtj-broker-" + server.port() + "-accept")
+                        .start(server::accept);
+                return server;
+            } catch (IOException | RuntimeException | Error failure) {
+                try {
+                    listener.close();
+                } catch (IOException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                throw failure;
+            }
         }
     }
 
@@ -199,7 +303,196 @@ public final class BrokerServer implements AutoCloseable {
             for (Connection connection : List.copyOf(connections)) {
                 connection.close("broker closed");
             }
+            sessions.values().forEach(Session::clear);
+            sessions.clear();
         }
+    }
+
+    // Every session field, including the active connection, belongs to routing.
+    private final class Session {
+
+        private final String clientId;
+
+        private final boolean persistent;
+
+        private final Map<TopicFilter, Qos> subscriptions = new HashMap<>();
+
+        private final PacketIds packetIds = new PacketIds();
+
+        private final Map<Integer, Delivery> inflight = new LinkedHashMap<>();
+
+        private final ArrayDeque<Delivery> pending = new ArrayDeque<>();
+
+        private @Nullable Connection connection;
+
+        private long inflightBytes;
+
+        private long pendingBytes;
+
+        private Session(String clientId, boolean persistent) {
+            this.clientId = clientId;
+            this.persistent = persistent;
+        }
+
+        private void deliver(Packet.Publish publication, Qos qos) {
+            Connection peer = connection;
+            if (peer != null && peer.isEnded()) {
+                detach(peer);
+            }
+            boolean online = connection != null;
+            if (!online && (!persistent || qos == Qos.AT_MOST_ONCE)) {
+                return;
+            }
+            var delivery = new Delivery(publication, qos);
+            // A frame that can never fit must not block the head indefinitely.
+            if (delivery.byteCount > sendBytes
+                    || (qos != Qos.AT_MOST_ONCE && delivery.byteCount > maxInflightBytes)) {
+                discard("delivery exceeds send window");
+                return;
+            }
+            pending.addLast(delivery);
+            pendingBytes += delivery.byteCount;
+            drain();
+            if (pending.size() > maxQueued || pendingBytes > maxQueuedBytes) {
+                discard("delivery queue full");
+            }
+        }
+
+        private void resume() {
+            Connection peer = connection;
+            if (peer == null) {
+                return;
+            }
+            // The window fits this fresh connection's regular queue. CONNACK uses reserved space.
+            for (Delivery delivery : inflight.values()) {
+                if (peer.enqueue(delivery) != SendQueue.OfferResult.ACCEPTED) {
+                    return;
+                }
+            }
+            drain();
+        }
+
+        private void drain() {
+            Connection peer = connection;
+            if (peer == null || peer.isEnded()) {
+                return;
+            }
+            Delivery delivery;
+            while ((delivery = pending.peekFirst()) != null) {
+                boolean acknowledged = delivery.qos != Qos.AT_MOST_ONCE;
+                if (acknowledged && (inflight.size() == maxInflight
+                        || delivery.byteCount > maxInflightBytes - inflightBytes)) {
+                    return;
+                }
+                if (acknowledged) {
+                    delivery.packetId = packetIds.allocate().orElseThrow();
+                }
+                SendQueue.OfferResult result = peer.enqueue(delivery);
+                if (result != SendQueue.OfferResult.ACCEPTED) {
+                    if (acknowledged) {
+                        packetIds.release(delivery.packetId);
+                        delivery.packetId = 0;
+                    }
+                    // An ACK can free the logical window before the writer frees physical space.
+                    return;
+                }
+                pending.removeFirst();
+                pendingBytes -= delivery.byteCount;
+                if (acknowledged) {
+                    inflight.put(delivery.packetId, delivery);
+                    inflightBytes += delivery.byteCount;
+                }
+            }
+        }
+
+        private void acknowledge(int id) {
+            Delivery delivery = inflight.remove(id);
+            if (delivery != null) {
+                packetIds.release(id);
+                inflightBytes -= delivery.byteCount;
+                drain();
+            }
+        }
+
+        private void detach(Connection peer) {
+            if (connection != peer) {
+                return;
+            }
+            connection = null;
+            if (!persistent) {
+                sessions.remove(clientId, this);
+                clear();
+                return;
+            }
+            // QoS 0 belongs to the connection; only acknowledged deliveries survive it.
+            pending.removeIf(delivery -> {
+                if (delivery.qos == Qos.AT_MOST_ONCE) {
+                    pendingBytes -= delivery.byteCount;
+                    return true;
+                }
+                return false;
+            });
+        }
+
+        private void clear() {
+            subscriptions.clear();
+            inflight.clear();
+            pending.clear();
+            inflightBytes = 0;
+            pendingBytes = 0;
+            connection = null;
+        }
+
+        private void discard(String reason) {
+            Connection peer = connection;
+            sessions.remove(clientId, this);
+            clear();
+            if (peer != null) {
+                peer.close(reason);
+            }
+        }
+    }
+
+    private static final class Delivery {
+
+        private final Packet.Publish publication;
+
+        private final Qos qos;
+
+        private final int byteCount;
+
+        private int packetId;
+
+        private boolean sent;
+
+        private Delivery(Packet.Publish publication, Qos qos) {
+            this.publication = publication;
+            this.qos = qos;
+            byte[] encodedHeader = codec.encodePublishHeader(
+                    publication.topic(),
+                    qos,
+                    false,
+                    false,
+                    (qos == Qos.AT_MOST_ONCE) ? 0 : 1, Properties.EMPTY,
+                    publication.payload().length
+            );
+            byteCount = encodedHeader.length + publication.payload().length;
+        }
+
+        private Packet.Publish packet() {
+            return new Packet.Publish(
+                    publication.topic(),
+                    publication.payload(),
+                    qos,
+                    false,
+                    qos != Qos.AT_MOST_ONCE && sent,
+                    packetId,
+                    Properties.EMPTY
+            );
+        }
+    }
+
+    private record Outbound(byte[] bytes, @Nullable Delivery delivery) {
     }
 
     private final class Connection {
@@ -210,28 +503,32 @@ public final class BrokerServer implements AutoCloseable {
 
         private final FrameWriter writer;
 
-        private final SendQueue<byte[]> outgoing = new SendQueue<>(SEND_COUNT, sendBytes, 0, 0);
+        private final SendQueue<Outbound> outgoing = new SendQueue<>(
+                SEND_COUNT,
+                sendBytes,
+                RESERVED_COUNT,
+                RESERVED_BYTES
+        );
 
-        // Only routing reads/writes the subscriptions. The identifier is assigned once, on
-        // acceptance, while holding both routing and this connection's monitor; either lock can
-        // read it, and it stays empty for a connection that was never accepted.
-        private final Map<TopicFilter, Qos> subscriptions = new HashMap<>();
+        // The session reference belongs to routing; the identifier is assigned once under both
+        // locks on acceptance and can then be read under either lock for timer/logging purposes.
+        private @Nullable Session session;
 
         private String clientId = "";
 
         // Remaining state is guarded by this connection's monitor.
-        private final PacketIds packetIds = new PacketIds();
 
         private boolean ended;
 
         // Why the connection ended first; later failures are consequences of that end.
         private String endReason = "";
 
-        private int inflight;
-
         private long ticket;
 
         private long closeAfterWrite;
+
+        // A delivery found the regular queue full; the writer's next completion resumes it.
+        private boolean awaitingSpace;
 
         private long lastReceived = scheduler.nanoTime();
 
@@ -267,7 +564,9 @@ public final class BrokerServer implements AutoCloseable {
                 }
                 received();
                 try {
-                    writerCloses = !connect(PacketCodec.decodeConnect(first.get()));
+                    Packet.Connect request = PacketCodec.decodeConnect(first.get());
+                    beforeProcess.accept(request);
+                    writerCloses = !connect(request);
                 } catch (UnsupportedProtocolVersionException unsupported) {
                     refuse(
                             ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,
@@ -285,13 +584,15 @@ public final class BrokerServer implements AutoCloseable {
                     }
                     received();
                     Packet packet = codec.decode(bytes.get());
+                    beforeProcess.accept(packet);
                     log.debug("Broker received {} from {}", packet.getClass().getSimpleName(),
                             socket.getRemoteSocketAddress());
                     synchronized (routing) {
-                        if (isEnded()) {
+                        Session owner = currentSession();
+                        if (owner == null) {
                             return;
                         }
-                        process(packet);
+                        process(owner, packet);
                     }
                 }
             } catch (Throwable failure) {
@@ -304,14 +605,8 @@ public final class BrokerServer implements AutoCloseable {
         }
 
         private boolean connect(Packet.Connect request) {
-            // Refusal logs quote the identifier, which a refused client may have left empty.
-            if (!request.cleanStart()) {
-                refuse(
-                        request.clientId().isEmpty()
-                                ? ReasonCode.CLIENT_IDENTIFIER_NOT_VALID
-                                : ReasonCode.SERVER_UNAVAILABLE,
-                        "a persistent session for client '" + request.clientId() + "'"
-                );
+            if (!request.cleanStart() && request.clientId().isEmpty()) {
+                refuse(ReasonCode.CLIENT_IDENTIFIER_NOT_VALID, "an empty persistent identifier");
                 return false;
             }
             if (request.will() != null) {
@@ -323,9 +618,14 @@ public final class BrokerServer implements AutoCloseable {
             }
             String id;
             synchronized (routing) {
-                // Acceptance and its timer transition are atomic with deadline termination.
-                // Otherwise an expired connection could take over a live peer and rearm a timer.
+                Connection previous;
+                Session accepted;
                 synchronized (this) {
+                    if (ended) {
+                        return false;
+                    }
+                    // Inline expiry or a scheduling failure must happen before taking over a peer.
+                    keepAlive(request.keepAliveSeconds());
                     if (ended) {
                         return false;
                     }
@@ -335,18 +635,53 @@ public final class BrokerServer implements AutoCloseable {
                             id = "mqtj" + UUID.randomUUID().toString().replace("-", "");
                         } while (sessions.containsKey(id));
                     }
-                    clientId = id;
-                    Connection previous = sessions.put(id, this);
-                    if (previous != null) {
-                        previous.close("taken over by " + socket.getRemoteSocketAddress());
+                    Session existing = sessions.get(id);
+                    boolean present = !request.cleanStart()
+                            && existing != null && existing.persistent;
+                    if (!request.cleanStart() && !present
+                            && sessions.values().stream().filter(value -> value.persistent).count()
+                            >= maxSessions) {
+                        refuse(
+                                ReasonCode.SERVER_UNAVAILABLE,
+                                "persistent session capacity for client '" + id + "'"
+                        );
+                        return false;
                     }
-                    keepAlive(request.keepAliveSeconds());
-                    send(new Packet.ConnAck(false, ReasonCode.SUCCESS, Properties.EMPTY));
+                    previous = existing == null ? null : existing.connection;
+                    if (present) {
+                        accepted = requireNonNull(existing);
+                        if (previous != null) {
+                            accepted.detach(previous);
+                        }
+                    } else {
+                        if (existing != null) {
+                            existing.clear();
+                        }
+                        accepted = new Session(id, !request.cleanStart());
+                        sessions.put(id, accepted);
+                    }
+                    clientId = id;
+                    session = accepted;
+                    accepted.connection = this;
+                    enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, Properties.EMPTY));
                 }
+                // Do not hold the new peer's monitor while closing the old peer.
+                if (previous != null) {
+                    previous.close("taken over by " + socket.getRemoteSocketAddress());
+                }
+                // No publisher can enter between CONNACK, retransmissions, and queued deliveries.
+                accepted.resume();
             }
             log.info("Broker accepted client {} from {} on port {}",
                     id, socket.getRemoteSocketAddress(), port());
             return true;
+        }
+
+        private @Nullable Session currentSession() {
+            Session owner = session;
+            return (owner != null && owner.connection == this && !isEnded())
+                    ? owner
+                    : null;
         }
 
         private void refuse(ReasonCode reason, String request) {
@@ -362,13 +697,13 @@ public final class BrokerServer implements AutoCloseable {
             close("send queue full");
         }
 
-        private void process(Packet packet) throws IOException {
+        private void process(Session owner, Packet packet) throws IOException {
             switch (packet) {
                 case Packet.Subscribe request -> {
                     var grants = new ArrayList<ReasonCode>();
                     for (Packet.Subscription subscription : request.subscriptions()) {
                         Qos qos = Qos.of(Math.min(subscription.qos().level(), 1));
-                        subscriptions.put(subscription.filter(), qos);
+                        owner.subscriptions.put(subscription.filter(), qos);
                         grants.add(
                                 (qos == Qos.AT_MOST_ONCE)
                                         ? ReasonCode.SUCCESS
@@ -378,7 +713,7 @@ public final class BrokerServer implements AutoCloseable {
                     send(new Packet.SubAck(request.packetId(), grants, Properties.EMPTY));
                 }
                 case Packet.Unsubscribe request -> {
-                    request.filters().forEach(subscriptions::remove);
+                    request.filters().forEach(owner.subscriptions::remove);
                     send(new Packet.UnsubAck(request.packetId(), List.of(), Properties.EMPTY));
                 }
                 case Packet.Publish publish -> {
@@ -386,7 +721,7 @@ public final class BrokerServer implements AutoCloseable {
                         throw new IOException("QoS 2 publications are not supported");
                     }
                     // Snapshot permits an overloaded target to remove itself during delivery.
-                    for (Connection target : List.copyOf(sessions.values())) {
+                    for (Session target : List.copyOf(sessions.values())) {
                         int granted = -1;
                         for (var subscription : target.subscriptions.entrySet()) {
                             if (subscription.getKey().matches(publish.topic())) {
@@ -407,7 +742,7 @@ public final class BrokerServer implements AutoCloseable {
                         ));
                     }
                 }
-                case Packet.PubAck ack -> acknowledge(ack.packetId());
+                case Packet.PubAck ack -> owner.acknowledge(ack.packetId());
                 case Packet.PingReq _ -> send(new Packet.PingResp());
                 case Packet.Disconnect _ -> close("client sent DISCONNECT");
                 // Name only the type; a CONNECT's text would put its username in the INFO end log.
@@ -425,40 +760,23 @@ public final class BrokerServer implements AutoCloseable {
             }
         }
 
-        private void deliver(Packet.Publish publish, Qos qos) {
-            String overload = "unacknowledged delivery limit reached";
-            synchronized (this) {
-                if (ended) {
-                    return;
-                }
-                if (qos == Qos.AT_MOST_ONCE || inflight < maxInflight) {
-                    int id = 0;
-                    if (qos == Qos.AT_LEAST_ONCE) {
-                        id = packetIds.allocate().orElseThrow();
-                        inflight++;
-                    }
-                    if (enqueue(new Packet.Publish(
-                            publish.topic(),
-                            publish.payload(),
-                            qos,
-                            false,
-                            false,
-                            id,
-                            Properties.EMPTY
-                    ))) {
-                        return;
-                    }
-                    overload = "send queue full";
-                }
+        private synchronized SendQueue.OfferResult enqueue(Delivery delivery) {
+            SendQueue.OfferResult result = outgoing.checkCapacity(delivery.byteCount, false);
+            if (result == SendQueue.OfferResult.ACCEPTED) {
+                byte[] bytes = codec.encode(delivery.packet());
+                result = outgoing.offer(
+                        ++ticket,
+                        new Outbound(bytes, delivery),
+                        bytes.length,
+                        false
+                );
             }
-            close(overload);
-        }
-
-        private synchronized void acknowledge(int id) {
-            if (packetIds.isInUse(id)) {
-                packetIds.release(id);
-                inflight--;
+            if (result == SendQueue.OfferResult.ACCEPTED) {
+                notifyAll();
+            } else {
+                awaitingSpace = true;
             }
+            return result;
         }
 
         private void send(Packet packet) {
@@ -479,9 +797,9 @@ public final class BrokerServer implements AutoCloseable {
             byte[] bytes = codec.encode(packet);
             boolean enqueueFailed = outgoing.offer(
                     ++ticket,
-                    bytes,
+                    new Outbound(bytes, null),
                     bytes.length,
-                    false
+                    true
             ) != SendQueue.OfferResult.ACCEPTED;
             if (enqueueFailed) {
                 return false;
@@ -495,9 +813,9 @@ public final class BrokerServer implements AutoCloseable {
             String reason = "refusal sent";
             try {
                 while (true) {
-                    SendQueue.Send<byte[]> send;
+                    SendQueue.Send<Outbound> send;
                     synchronized (this) {
-                        Optional<SendQueue.Send<byte[]>> next = outgoing.poll();
+                        Optional<SendQueue.Send<Outbound>> next = outgoing.poll();
                         while (!ended && next.isEmpty()) {
                             wait();
                             next = outgoing.poll();
@@ -507,11 +825,34 @@ public final class BrokerServer implements AutoCloseable {
                         }
                         send = next.orElseThrow();
                     }
-                    writer.write(send.value());
+                    Delivery delivery = send.value().delivery();
+                    if (delivery != null) {
+                        beforeDeliveryWrite.run();
+                        synchronized (routing) {
+                            Session owner = currentSession();
+                            if (owner == null) {
+                                return;
+                            }
+                            delivery.sent = true;
+                        }
+                    }
+                    writer.write(send.value().bytes());
+                    boolean resume;
                     synchronized (this) {
                         outgoing.completed(send.ticket());
                         if (send.ticket() == closeAfterWrite) {
                             return;
+                        }
+                        // Refusal and completion share this monitor, so no wakeup is lost.
+                        resume = awaitingSpace;
+                        awaitingSpace = false;
+                    }
+                    if (resume) {
+                        synchronized (routing) {
+                            Session owner = currentSession();
+                            if (owner != null) {
+                                owner.drain();
+                            }
                         }
                     }
                 }
@@ -655,8 +996,10 @@ public final class BrokerServer implements AutoCloseable {
             }
             synchronized (routing) {
                 connections.remove(this);
-                sessions.remove(clientId, this);
-                subscriptions.clear();
+                Session owner = session;
+                if (owner != null) {
+                    owner.detach(this);
+                }
             }
         }
     }

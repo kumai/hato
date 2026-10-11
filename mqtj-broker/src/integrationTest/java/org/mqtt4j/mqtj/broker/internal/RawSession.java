@@ -56,11 +56,20 @@ final class RawSession implements AutoCloseable {
     }
 
     static RawSession connected(int port, String clientId) throws Exception {
+        return connected(port, clientId, true, false);
+    }
+
+    static RawSession connected(
+            int port,
+            String clientId,
+            boolean cleanSession,
+            boolean sessionPresent
+    ) throws Exception {
         RawSession session = open(port);
         try {
-            session.send(connect(clientId, true, 0));
+            session.send(connect(clientId, cleanSession, 0));
             assertThat(session.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(false, SUCCESS, EMPTY));
+                    .isEqualTo(new Packet.ConnAck(sessionPresent, SUCCESS, EMPTY));
             return session;
         } catch (Exception | AssertionError failure) {
             session.close();

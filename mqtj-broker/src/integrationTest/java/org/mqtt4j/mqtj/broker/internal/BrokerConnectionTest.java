@@ -12,7 +12,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.mqtj.broker.MqttBroker;
-import org.mqtt4j.mqtj.broker.internal.common.concurrent.TimerService;
 import org.mqtt4j.mqtj.broker.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.mqtj.broker.internal.common.value.ReasonCode;
@@ -129,12 +128,15 @@ class BrokerConnectionTest {
     }
 
     @Test
-    void clean_session_zero_is_explicitly_refused_until_sessions_are_supported() throws Exception {
-        try (var sut = MqttBroker.start(); var client = RawSession.open(sut.port())) {
-            client.send(connect("persistent", false, 0));
-            assertThat(client.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(false, ReasonCode.SERVER_UNAVAILABLE, EMPTY));
-            client.expectClosed();
+    void clean_session_zero_creates_and_then_resumes_a_session() throws Exception {
+        try (var sut = MqttBroker.start()) {
+            try (RawSession first = connected(sut.port(), "persistent", false, false)) {
+                first.send(new Packet.Disconnect(SUCCESS, EMPTY));
+                first.expectClosed();
+            }
+            try (RawSession resumed = connected(sut.port(), "persistent", false, true)) {
+                resumed.ping();
+            }
         }
     }
 
@@ -157,7 +159,7 @@ class BrokerConnectionTest {
         byte[] bytes = codec.encode(connect("", true, 0));
         bytes[9] = 0;
         try (var sut = MqttBroker.start(); var client = RawSession.open(sut.port())) {
-            // [MQTT-3.1.3-8]: return code 0x02 takes precedence over unsupported sessions.
+            // [MQTT-3.1.3-8]: persistence requires a nonempty identifier.
             client.sendRaw(bytes);
             assertThat(client.expect(Packet.ConnAck.class)).isEqualTo(new Packet.ConnAck(
                     false, ReasonCode.CLIENT_IDENTIFIER_NOT_VALID, EMPTY
@@ -187,10 +189,9 @@ class BrokerConnectionTest {
     }
 
     private static BrokerServer shortConnectDeadline() throws IOException {
-        return BrokerServer.start(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
-                Duration.ofMillis(600), 16 * 1024 * 1024L, 128, TimerService.instance
-        );
+        return BrokerServer.builder()
+                .connectTimeout(Duration.ofMillis(600))
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
     }
 
     private static void dripUntilClosed(RawSession client, byte[] bytes, Duration deadline)

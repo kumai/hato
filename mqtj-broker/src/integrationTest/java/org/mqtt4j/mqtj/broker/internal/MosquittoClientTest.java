@@ -1,9 +1,11 @@
 package org.mqtt4j.mqtj.broker.internal;
 
 import java.time.Duration;
+import java.util.List;
 
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -70,6 +72,66 @@ class MosquittoClientTest {
                 assertThat(docker.inspectExecCmd(subscription).exec().getExitCodeLong()).isZero();
                 assertThat(output.toString().lines().toList())
                         .contains(level + " independent exchange");
+            }
+        }
+    }
+
+    @Test
+    void independent_mosquitto_client_resumes_queued_qos_one_deliveries() throws Exception {
+        try (var sut = MqttBroker.start(); var clientTools = Mosquitto.container()) {
+            Testcontainers.exposeHostPorts(sut.port());
+            Mosquitto.start(clientTools);
+            String port = Integer.toString(sut.port());
+            String topic = "interop/persistent";
+            var docker = DockerClientFactory.instance().client();
+            for (int attempt = 0; attempt < 2; attempt++) {
+                if (attempt == 1) {
+                    for (String payload : List.of("offline first", "offline second")) {
+                        Container.ExecResult published = clientTools.execInContainer(
+                                "mosquitto_pub", "-h", "host.testcontainers.internal", "-p", port,
+                                "-V", "mqttv311", "-q", "1", "-t", topic, "-m", payload
+                        );
+                        assertThat(published.getExitCode()).as(published.getStderr()).isZero();
+                    }
+                }
+                var output = new StringBuffer();
+                String subscription = docker.execCreateCmd(clientTools.getContainerId())
+                        .withCmd(
+                                "mosquitto_sub", "-h", "host.testcontainers.internal", "-p", port,
+                                "-V", "mqttv311", "-c", "-i", "persistent-subscriber",
+                                "-q", "1", "-t", topic, "-C", attempt == 0 ? "1" : "2",
+                                "-W", "10", "-d", "-F", "%q %p"
+                        )
+                        .withTty(true)
+                        .withAttachStdout(true)
+                        .withAttachStderr(true)
+                        .exec()
+                        .getId();
+                try (var callback = new ResultCallback.Adapter<Frame>() {
+                    @Override
+                    public void onNext(Frame frame) {
+                        output.append(new String(frame.getPayload(), UTF_8));
+                    }
+                }) {
+                    docker.execStartCmd(subscription).withTty(true).exec(callback);
+                    if (attempt == 0) {
+                        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                                assertThat(output.toString()).contains("Subscribed (mid: 1): 1"));
+                        Container.ExecResult published = clientTools.execInContainer(
+                                "mosquitto_pub", "-h", "host.testcontainers.internal", "-p", port,
+                                "-V", "mqttv311", "-q", "1", "-t", topic, "-m", "registered"
+                        );
+                        assertThat(published.getExitCode()).as(published.getStderr()).isZero();
+                    }
+                    assertThat(callback.awaitCompletion(10, SECONDS)).isTrue();
+                    assertThat(docker.inspectExecCmd(subscription).exec().getExitCodeLong())
+                            .isZero();
+                    var payloads = output.toString().lines()
+                            .filter(line -> line.startsWith("1 ")).toList();
+                    assertThat(payloads).containsExactlyElementsOf(attempt == 0
+                            ? List.of("1 registered")
+                            : List.of("1 offline first", "1 offline second"));
+                }
             }
         }
     }

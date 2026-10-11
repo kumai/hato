@@ -13,6 +13,11 @@ testing {
                 implementation(project(":mqtj-testkit"))
                 implementation(libs.awaitility)
             }
+            targets.register("integrationTestSingleCarrier") {
+                testTask.configure {
+                    jvmArgs("-Djdk.virtualThreadScheduler.parallelism=1")
+                }
+            }
         }
     }
 }

@@ -12,7 +12,6 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.mqtj.broker.MqttBroker;
-import org.mqtt4j.mqtj.broker.internal.common.concurrent.TimerService;
 import org.mqtt4j.mqtj.broker.internal.common.protocol.Packet;
 import org.mqtt4j.mqtj.broker.internal.common.value.Qos;
 import org.mqtt4j.mqtj.broker.internal.common.value.TopicFilter;
@@ -248,7 +247,7 @@ class BrokerRoutingTest {
     }
 
     @Test
-    void inflight_identifiers_are_distinct_and_only_the_overloaded_subscriber_is_closed()
+    void a_full_inflight_window_queues_deliveries_and_resumes_only_the_acknowledged_slot()
             throws Exception {
         try (var sut = limitedBroker(1024 * 1024, 2);
                 var subscriber = connected(sut.port(), "subscriber");
@@ -262,9 +261,17 @@ class BrokerRoutingTest {
             Packet.Publish second = subscriber.expect(Packet.Publish.class);
             // [MQTT-2.3.1-2]: outstanding identifiers cannot be reused.
             assertThat(second.packetId()).isNotEqualTo(first.packetId());
-            publisher.publish("bounded", "overflow", AT_LEAST_ONCE, 7);
-            subscriber.expectClosed();
-            for (String message : List.of("first", "second", "overflow")) {
+            publisher.publish("bounded", "queued", AT_LEAST_ONCE, 7);
+            subscriber.ping();
+            subscriber.send(new Packet.PubAck(first.packetId(), SUCCESS, EMPTY));
+            Packet.Publish resumed = subscriber.expect(Packet.Publish.class);
+            assertThat(resumed).isEqualTo(
+                    publication("bounded", "queued", AT_LEAST_ONCE, resumed.packetId()));
+            assertThat(resumed.packetId()).isNotEqualTo(second.packetId());
+            subscriber.send(new Packet.PubAck(second.packetId(), SUCCESS, EMPTY));
+            subscriber.send(new Packet.PubAck(resumed.packetId(), SUCCESS, EMPTY));
+            subscriber.ping();
+            for (String message : List.of("first", "second", "queued")) {
                 assertThat(unaffected.expect(Packet.Publish.class))
                         .isEqualTo(publication("bounded", message, AT_MOST_ONCE, 0));
             }
@@ -288,9 +295,12 @@ class BrokerRoutingTest {
     }
 
     private static BrokerServer limitedBroker(long sendBytes, int maxInflight) throws IOException {
-        return BrokerServer.start(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
-                Duration.ofSeconds(5), sendBytes, maxInflight, TimerService.instance
-        );
+        return BrokerServer.builder()
+                .connectTimeout(Duration.ofSeconds(5))
+                .sendBytes(sendBytes)
+                .maxInflight(maxInflight)
+                .maxInflightBytes(sendBytes)
+                .maxQueuedBytes(sendBytes)
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
     }
 }
