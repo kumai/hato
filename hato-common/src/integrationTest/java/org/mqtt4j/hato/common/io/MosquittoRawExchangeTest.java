@@ -1,13 +1,6 @@
 package org.mqtt4j.hato.common.io;
 
-import java.io.IOException;
-import java.time.Duration;
 import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeoutException;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -25,7 +18,6 @@ import org.mqtt4j.hato.common.value.TopicFilter;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.common.value.ReasonCode.SUCCESS;
@@ -45,9 +37,6 @@ import static org.mqtt4j.hato.common.value.ReasonCode.SUCCESS;
 )
 class MosquittoRawExchangeTest {
 
-    private static final int MQTT_PORT = 1883;
-    private static final int MAX_PACKET_SIZE = 1024 * 1024;
-    private static final Duration READ_TIMEOUT = Duration.ofSeconds(10);
     private static final GenericContainer<?> mosquitto = Mosquitto.container();
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
 
@@ -69,7 +58,7 @@ class MosquittoRawExchangeTest {
 
     @Test
     void a_client_connects_pings_and_disconnects() throws Exception {
-        try (var client = RawSession.open()) {
+        try (var client = RawSession.open(codec, mosquitto)) {
             client.send(connect("hato-lifecycle", 60));
             // [MQTT-3.2.2-1]: a Clean Session connection is accepted without a stored session.
             assertThat(client.expect(Packet.ConnAck.class))
@@ -183,7 +172,7 @@ class MosquittoRawExchangeTest {
         byte[] connect = codec.encode(connect("hato-level-3", 60));
         assertThat(connect[8]).isEqualTo((byte) 4);
         connect[8] = 3;
-        try (var client = RawSession.open()) {
+        try (var client = RawSession.open(codec, mosquitto)) {
             client.sendRaw(connect);
 
             // [MQTT-3.1.2-2]: CONNACK return code 0x01, then the broker disconnects.
@@ -196,7 +185,7 @@ class MosquittoRawExchangeTest {
 
     @Test
     void the_broker_closes_a_connection_that_stays_silent_past_its_keep_alive() throws Exception {
-        try (var client = RawSession.open()) {
+        try (var client = RawSession.open(codec, mosquitto)) {
             client.send(connect("hato-keep-alive", 2));
             client.expect(Packet.ConnAck.class);
 
@@ -206,7 +195,7 @@ class MosquittoRawExchangeTest {
     }
 
     private static RawSession connected(String clientId) throws Exception {
-        var session = RawSession.open();
+        var session = RawSession.open(codec, mosquitto);
         session.send(connect(clientId, 60));
         assertThat(session.expect(Packet.ConnAck.class))
                 .isEqualTo(new Packet.ConnAck(false, SUCCESS, EMPTY));
@@ -231,66 +220,5 @@ class MosquittoRawExchangeTest {
 
     private static Packet.Publish publication(Topic topic, byte[] payload, Qos qos, int packetId) {
         return new Packet.Publish(topic, payload, qos, false, false, packetId, EMPTY);
-    }
-
-    /// One TCP connection to the broker that sends and receives whole packets. Each wait for an
-    /// incoming packet is bounded, so a missing response fails the test instead of hanging it.
-    private static final class RawSession implements AutoCloseable {
-
-        private final TcpConnection connection;
-        private final FrameReader reader;
-        private final FrameWriter writer;
-        private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-
-        private RawSession(TcpConnection connection) {
-            this.connection = connection;
-            this.reader = new FrameReader(connection.input(), MAX_PACKET_SIZE);
-            this.writer = new FrameWriter(connection.output());
-        }
-
-        static RawSession open() throws IOException {
-            return new RawSession(TcpConnection.connect(
-                    mosquitto.getHost(), mosquitto.getMappedPort(MQTT_PORT), Duration.ofSeconds(5)
-            ));
-        }
-
-        void send(Packet packet) throws IOException {
-            writer.write(codec.encode(packet));
-        }
-
-        /// Sends the bytes as given, for packets the model cannot represent.
-        void sendRaw(byte[] packet) throws IOException {
-            writer.write(packet);
-        }
-
-        <T extends Packet> T expect(Class<T> type) throws Exception {
-            byte[] frame = nextFrame().orElseThrow(() -> new AssertionError(
-                    "The broker closed the connection instead of sending " + type.getSimpleName()
-            ));
-            Packet packet = codec.decode(frame);
-            assertThat(packet).isInstanceOf(type);
-            return type.cast(packet);
-        }
-
-        void expectEndOfStream() throws Exception {
-            assertThat(nextFrame()).as("packet received instead of the end of stream").isEmpty();
-        }
-
-        private Optional<byte[]> nextFrame() throws Exception {
-            Future<Optional<byte[]>> frame = executor.submit(reader::read);
-            try {
-                return frame.get(READ_TIMEOUT.toMillis(), MILLISECONDS);
-            } catch (TimeoutException e) {
-                // Closing the socket releases the blocked read, so close() can end the executor.
-                connection.close();
-                throw new AssertionError("No packet from the broker within " + READ_TIMEOUT, e);
-            }
-        }
-
-        @Override
-        public void close() throws IOException {
-            connection.close();
-            executor.close();
-        }
     }
 }

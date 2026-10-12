@@ -14,7 +14,9 @@ class PacketDecodeExceptionTest {
     @ParameterizedTest
     @EnumSource(
             value = ReasonCode.class,
-            names = {"MALFORMED_PACKET", "PROTOCOL_ERROR", "PACKET_TOO_LARGE"}
+            names = {
+                    "MALFORMED_PACKET", "PROTOCOL_ERROR", "PACKET_TOO_LARGE", "TOPIC_ALIAS_INVALID"
+            }
     )
     void retains_the_reason_and_message(ReasonCode reasonCode) {
         var error = new PacketDecodeException(reasonCode, "Invalid packet");
@@ -40,7 +42,9 @@ class PacketDecodeExceptionTest {
     @EnumSource(
             value = ReasonCode.class,
             mode = EnumSource.Mode.EXCLUDE,
-            names = {"MALFORMED_PACKET", "PROTOCOL_ERROR", "PACKET_TOO_LARGE"}
+            names = {
+                    "MALFORMED_PACKET", "PROTOCOL_ERROR", "PACKET_TOO_LARGE", "TOPIC_ALIAS_INVALID"
+            }
     )
     void rejects_unrelated_reason_codes(ReasonCode reasonCode) {
         assertThatThrownBy(() -> new PacketDecodeException(reasonCode, "Invalid packet"))

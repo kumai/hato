@@ -90,13 +90,28 @@ where a value is deliberately ignored.
 | Tabs and line ends | No tabs, no trailing whitespace, and a newline at the end of the file |
 | Line length | At most 100 characters (exceptions below) |
 | Block indentation | 4 spaces per level |
-| Continuation lines | 8 spaces deeper than the line being continued |
+| Continuation lines | 8 spaces deeper than the continued line; `case` labels are the exception below |
 | Control statements | Braces around the body of every `if`, `else`, and loop |
 | Brace placement | The opening brace stays on the line of the declaration or control statement |
 
 `package` and `import` lines, and lines containing a URL, are exempt from the line length. This
 does not mean that a URL licenses an arbitrarily long line of code: distinguish a URL that cannot
 be split from surrounding code that can be wrapped.
+
+A `case` label that lists several constants may continue on the following lines with the
+constants aligned under the first one, five columns past `case`, so that the list reads as a
+column. The body after `->` follows the usual rule.
+
+```java
+return switch (this) {
+    case PUBREL,
+         SUBSCRIBE,
+         UNSUBSCRIBE -> OptionalInt.of(0b0010);
+    case CONNECT, CONNACK, PUBACK, PUBREC, PUBCOMP, SUBACK, UNSUBACK,
+         PINGREQ, PINGRESP, DISCONNECT, AUTH -> OptionalInt.of(0);
+    case PUBLISH -> OptionalInt.empty();
+};
+```
 
 Blank lines mark units of processing and the boundaries between members. An empty constructor,
 or the `{}` of a record with no body, may stay on one line.

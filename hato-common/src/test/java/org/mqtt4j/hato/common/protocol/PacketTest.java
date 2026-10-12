@@ -136,6 +136,18 @@ class PacketTest {
                         new byte[0], Qos.AT_LEAST_ONCE, false, id
                 )),
                 identified("Publish QoS 2", id -> publish(new byte[0], Qos.EXACTLY_ONCE, true, id)),
+                identified("AliasPublish QoS 1", id -> aliasPublish(
+                        new byte[0],
+                        Qos.AT_LEAST_ONCE,
+                        false,
+                        id
+                )),
+                identified("AliasPublish QoS 2", id -> aliasPublish(
+                        new byte[0],
+                        Qos.EXACTLY_ONCE,
+                        true,
+                        id
+                )),
                 identified("PubAck", id -> new Packet.PubAck(
                         id, ReasonCode.SUCCESS, Properties.EMPTY
                 )),
@@ -210,6 +222,82 @@ class PacketTest {
                 new Properties(List.of(new Property.UserProperty("key", "value")))
         ));
         assertThat(sut).isNotEqualTo(null).isNotEqualTo(new Packet.PingReq());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 1, 65535, 65536})
+    void alias_only_qos_zero_does_not_have_a_packet_identifier(int id) {
+        assertThatThrownBy(() -> aliasPublish(new byte[0], Qos.AT_MOST_ONCE, false, id))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void alias_only_qos_zero_cannot_set_dup() {
+        assertThatThrownBy(() -> aliasPublish(new byte[0], Qos.AT_MOST_ONCE, true, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void alias_only_payload_ownership_transfers_without_a_two_byte_length_limit() {
+        // Arrange
+        var payload = new byte[65536];
+        // Act
+        Packet.AliasPublish sut = aliasPublish(payload, Qos.AT_MOST_ONCE, false, 0);
+        // Assert
+        assertThat(sut.payload()).isSameAs(payload);
+    }
+
+    @Test
+    void alias_only_equality_uses_payload_contents_and_other_packet_fields() {
+        // Arrange
+        Packet.AliasPublish sut = aliasPublish(new byte[] {1, 2}, Qos.AT_LEAST_ONCE, false, 7);
+        Packet.AliasPublish same = aliasPublish(new byte[] {1, 2}, Qos.AT_LEAST_ONCE, false, 7);
+
+        // Act & Assert
+        assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same);
+        assertThat(sut).isNotEqualTo(aliasPublish(new byte[] {1, 3}, Qos.AT_LEAST_ONCE, false, 7));
+        assertThat(sut).isNotEqualTo(aliasPublish(new byte[] {1, 2}, Qos.EXACTLY_ONCE, false, 7));
+        assertThat(sut).isNotEqualTo(aliasPublish(new byte[] {1, 2}, Qos.AT_LEAST_ONCE, true, 7));
+        assertThat(sut).isNotEqualTo(aliasPublish(new byte[] {1, 2}, Qos.AT_LEAST_ONCE, false, 8));
+        assertThat(sut).isNotEqualTo(
+                new Packet.AliasPublish(
+                        new byte[] {1, 2},
+                        Qos.AT_LEAST_ONCE,
+                        true,
+                        false,
+                        7,
+                        Properties.EMPTY
+                )
+        );
+        assertThat(sut).isNotEqualTo(
+                new Packet.AliasPublish(
+                        new byte[] {1, 2},
+                        Qos.AT_LEAST_ONCE,
+                        false,
+                        false,
+                        7,
+                        new Properties(List.of(new Property.UserProperty("key", "value")))
+                )
+        );
+        assertThat(sut).isNotEqualTo(null).isNotEqualTo(
+                publish(new byte[] {1, 2}, Qos.AT_LEAST_ONCE, false, 7)
+        );
+    }
+
+    @Test
+    void mqtt_3_1_1_cannot_encode_an_alias_only_publication() {
+        // Arrange
+        PacketCodec sut = PacketCodec.of(MqttVersion.V3_1_1);
+        Packet.AliasPublish publication = aliasPublish(new byte[0], Qos.AT_MOST_ONCE, false, 0);
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.encode(publication))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("topic name");
+    }
+
+    private static Packet.AliasPublish aliasPublish(byte[] payload, Qos qos, boolean dup, int id) {
+        return new Packet.AliasPublish(payload, qos, false, dup, id, Properties.EMPTY);
     }
 
     @Test
@@ -359,6 +447,30 @@ class PacketTest {
         )).isInstanceOf(NullPointerException.class);
         assertThatThrownBy(() -> new Packet.Publish(
                 TOPIC, new byte[0], null, false, false, 0, Properties.EMPTY
+        )).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new Packet.AliasPublish(
+                null,
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                Properties.EMPTY
+        )).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new Packet.AliasPublish(
+                new byte[0],
+                null,
+                false,
+                false,
+                0,
+                Properties.EMPTY
+        )).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new Packet.AliasPublish(
+                new byte[0],
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                null
         )).isInstanceOf(NullPointerException.class);
         assertThatThrownBy(() -> new Packet.PubAck(1, null, Properties.EMPTY))
                 .isInstanceOf(NullPointerException.class);

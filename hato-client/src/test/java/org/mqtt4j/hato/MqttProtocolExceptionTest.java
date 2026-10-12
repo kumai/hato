@@ -4,9 +4,19 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MqttProtocolExceptionTest {
+
+    @Test
+    void an_invalid_topic_alias_keeps_its_specific_protocol_reason() {
+        var cause = new IllegalArgumentException("Topic Alias is zero");
+        var sut = new MqttProtocolException("Invalid alias", ReasonCode.TOPIC_ALIAS_INVALID, cause);
+
+        assertThat(sut.reasonCode()).isEqualTo(ReasonCode.TOPIC_ALIAS_INVALID);
+        assertThat(sut).hasCause(cause);
+    }
 
     @ParameterizedTest
     @EnumSource(value = ReasonCode.class, names = {"SUCCESS", "NOT_AUTHORIZED"})

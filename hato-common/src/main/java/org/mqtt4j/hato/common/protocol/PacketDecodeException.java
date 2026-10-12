@@ -18,7 +18,8 @@ import static java.util.Objects.requireNonNull;
 ///
 /// The supported reasons are [ReasonCode#MALFORMED_PACKET] (invalid packet structure),
 /// [ReasonCode#PROTOCOL_ERROR] (a protocol rule violation), and [ReasonCode#PACKET_TOO_LARGE]
-/// (the packet exceeds the configured receive limit).
+/// (the packet exceeds the configured receive limit). [ReasonCode#TOPIC_ALIAS_INVALID]
+/// identifies an invalid MQTT 5.0 Topic Alias.
 ///
 /// MQTT 5.0 reason codes also classify MQTT 3.1.1 failures internally. In MQTT 3.1.1, the
 /// receive size limit is local and exceeding it does not necessarily violate the protocol.
@@ -40,7 +41,7 @@ public final class PacketDecodeException extends RuntimeException {
     /// Creates a received-packet failure with no underlying cause.
     ///
     /// @throws IllegalArgumentException if `reasonCode` is not `MALFORMED_PACKET`,
-    ///         `PROTOCOL_ERROR`, or `PACKET_TOO_LARGE`
+    ///         `PROTOCOL_ERROR`, `PACKET_TOO_LARGE`, or `TOPIC_ALIAS_INVALID`
     public PacketDecodeException(ReasonCode reasonCode, String message) {
         this(reasonCode, message, null);
     }
@@ -48,7 +49,7 @@ public final class PacketDecodeException extends RuntimeException {
     /// Creates a received-packet failure, preserving the underlying cause when present.
     ///
     /// @throws IllegalArgumentException if `reasonCode` is not `MALFORMED_PACKET`,
-    ///         `PROTOCOL_ERROR`, or `PACKET_TOO_LARGE`
+    ///         `PROTOCOL_ERROR`, `PACKET_TOO_LARGE`, or `TOPIC_ALIAS_INVALID`
     public PacketDecodeException(
             ReasonCode reasonCode,
             String message,
@@ -58,9 +59,11 @@ public final class PacketDecodeException extends RuntimeException {
         this.reasonCode = requireNonNull(reasonCode, "reasonCode must not be null");
         if (reasonCode != ReasonCode.MALFORMED_PACKET
                 && reasonCode != ReasonCode.PROTOCOL_ERROR
-                && reasonCode != ReasonCode.PACKET_TOO_LARGE) {
+                && reasonCode != ReasonCode.PACKET_TOO_LARGE
+                && reasonCode != ReasonCode.TOPIC_ALIAS_INVALID) {
             throw new IllegalArgumentException(
-                    "Expected MALFORMED_PACKET, PROTOCOL_ERROR, or PACKET_TOO_LARGE"
+                    "Expected MALFORMED_PACKET, PROTOCOL_ERROR, PACKET_TOO_LARGE, "
+                            + "or TOPIC_ALIAS_INVALID"
             );
         }
     }

@@ -5,6 +5,8 @@ import java.util.Arrays;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -39,6 +41,75 @@ class PropertiesTest {
 
         assertThat(sut.name()).isEmpty();
         assertThat(sut.value()).isEmpty();
+    }
+
+    @Test
+    void property_identifiers_must_match_the_value_encoding() {
+        assertThatThrownBy(() -> new Property.ByteValue(PropertyId.TOPIC_ALIAS, 1))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.TwoByteValue(PropertyId.MESSAGE_EXPIRY_INTERVAL, 1))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.FourByteValue(PropertyId.TOPIC_ALIAS, 1))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.VariableByteValue(PropertyId.TOPIC_ALIAS, 1))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.StringValue(PropertyId.USER_PROPERTY, "v"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.BinaryValue(PropertyId.CONTENT_TYPE, new byte[0]))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"-1", "2", "255", "256"})
+    void byte_properties_accept_only_zero_and_one(int value) {
+        assertThatThrownBy(() -> new Property.ByteValue(PropertyId.PAYLOAD_FORMAT_INDICATOR, value))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void numeric_properties_enforce_unsigned_ranges_and_nonzero_requirements() {
+        assertThatThrownBy(() -> new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, -1))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.TwoByteValue(PropertyId.SERVER_KEEP_ALIVE, 65536))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.FourByteValue(PropertyId.MESSAGE_EXPIRY_INTERVAL, -1))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.FourByteValue(
+                PropertyId.SESSION_EXPIRY_INTERVAL,
+                0x1_0000_0000L
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Property.VariableByteValue(
+                PropertyId.SUBSCRIPTION_IDENTIFIER,
+                268435456
+        )).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void binary_properties_own_their_bytes_and_compare_by_content() {
+        // Arrange
+        var original = new byte[]{1, 2};
+        var sut = new Property.BinaryValue(PropertyId.CORRELATION_DATA, original);
+        var equal = new Property.BinaryValue(PropertyId.CORRELATION_DATA, original);
+
+        // Act
+        original[0] = 9;
+        sut.value()[1] = 9;
+
+        // Assert
+        assertThat(sut.value()).containsExactly((byte) 1, (byte) 2);
+        assertThat(sut).isEqualTo(equal).hasSameHashCodeAs(equal);
+    }
+
+    @Test
+    void binary_properties_are_limited_to_65535_bytes() {
+        assertThatThrownBy(() -> new Property.BinaryValue(
+                PropertyId.CORRELATION_DATA,
+                new byte[65536]
+        )).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
