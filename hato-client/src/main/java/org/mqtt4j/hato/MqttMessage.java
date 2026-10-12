@@ -11,7 +11,7 @@ import static java.util.Objects.requireNonNull;
 /// Equality compares payload contents, and [#toString()] reports only its byte count.
 /// Each `with` method returns a copy with one setting changed.
 ///
-/// All QoS values can be represented; the current client accepts QoS 0 and QoS 1 operations.
+/// All QoS values can be represented and published.
 public final class MqttMessage {
 
     private final Topic topic;

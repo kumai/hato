@@ -2,8 +2,9 @@ package org.mqtt4j.hato;
 
 import org.jspecify.annotations.Nullable;
 
-/// Successful completion of a publication: the transport write for QoS 0, or receipt of PUBACK
-/// for QoS 1. Neither confirms completion of any subscriber's application processing.
+/// Successful completion of a publication: the transport write for QoS 0, receipt of PUBACK
+/// for QoS 1, or receipt of PUBCOMP for QoS 2. None confirms completion of any subscriber's
+/// application processing.
 public final class PublishResult {
 
     // Stateless results are shared; a later field can make of() return new instances.

@@ -139,7 +139,7 @@ class SessionPersistenceTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = Qos.class, names = {"AT_MOST_ONCE", "AT_LEAST_ONCE"})
+    @EnumSource(Qos.class)
     void full_replay_capacity_keeps_the_head_and_rejects_new_publish_until_drained(Qos qos) {
         connect(false);
         publish(message("first"));
@@ -915,7 +915,7 @@ class SessionPersistenceTest {
         return MqttMessage.of(new Topic(topic), new byte[] {1}, Qos.AT_LEAST_ONCE, false);
     }
 
-    private static MqttMessage messageWithWireBytes(int bytes) {
+    static MqttMessage messageWithWireBytes(int bytes) {
         var codec = PacketCodec.of(MqttVersion.V3_1_1);
         var topic = new Topic("budget");
         int header = codec.encodePublishHeader(
@@ -958,7 +958,7 @@ class SessionPersistenceTest {
         return List.of(new IOException("client shutdown failed"));
     }
 
-    private record Publication(
+    record Publication(
             long generation,
             long ticket,
             MqttMessage message,
@@ -967,7 +967,7 @@ class SessionPersistenceTest {
     ) {
     }
 
-    private record Result(@Nullable Object value, @Nullable Throwable failure) {
+    record Result(@Nullable Object value, @Nullable Throwable failure) {
     }
 
     private static final class TestSubscription implements Subscription {
@@ -996,11 +996,15 @@ class SessionPersistenceTest {
         }
     }
 
-    private static final class RecordingPort implements SessionCore.Port {
+    static final class RecordingPort implements SessionCore.Port {
 
         final List<Packet> sent = new ArrayList<>();
         final List<Publication> offers = new ArrayList<>();
         final List<Publication> accepted = new ArrayList<>();
+        final List<Packet.PubRel> releases = new ArrayList<>();
+        final List<Long> releaseTickets = new ArrayList<>();
+        final List<Packet.PubAck> acknowledgements = new ArrayList<>();
+        final List<Integer> outgoingIds = new ArrayList<>();
         final Map<Long, Result> results = new HashMap<>();
         final Map<Long, TestSubscription> handles = new HashMap<>();
         final List<Long> removed = new ArrayList<>();
@@ -1012,7 +1016,11 @@ class SessionPersistenceTest {
         SendQueue.OfferResult subscribeResult = SendQueue.OfferResult.ACCEPTED;
         SendQueue.OfferResult unsubscribeResult = SendQueue.OfferResult.ACCEPTED;
         SendQueue.OfferResult disconnectResult = SendQueue.OfferResult.ACCEPTED;
+        SendQueue.OfferResult releaseResult = SendQueue.OfferResult.ACCEPTED;
         int publishAllowance = Integer.MAX_VALUE;
+        int releaseAllowance = Integer.MAX_VALUE;
+        // PUBACK and PUBREL share this room, as they share the send queue's reserved budget.
+        int acknowledgementAllowance = Integer.MAX_VALUE;
         long generation;
         long ticket;
         @Nullable TestSubscription registering;
@@ -1035,12 +1043,34 @@ class SessionPersistenceTest {
                 registering.filter = subscribe.subscriptions().getFirst().filter();
                 registering = null;
             }
-            return switch (packet) {
+            SendQueue.OfferResult result = switch (packet) {
                 case Packet.Subscribe _ -> subscribeResult;
                 case Packet.Unsubscribe _ -> unsubscribeResult;
                 case Packet.Disconnect _ -> disconnectResult;
+                case Packet.PubRel _ -> releaseAllowance == 0
+                        ? SendQueue.OfferResult.FULL : releaseResult;
                 default -> SendQueue.OfferResult.ACCEPTED;
             };
+            if ((packet instanceof Packet.PubAck || packet instanceof Packet.PubRel)
+                    && result == SendQueue.OfferResult.ACCEPTED) {
+                if (acknowledgementAllowance == 0) {
+                    result = SendQueue.OfferResult.FULL;
+                } else {
+                    acknowledgementAllowance--;
+                }
+            }
+            if (packet instanceof Packet.PubAck acknowledgement
+                    && result == SendQueue.OfferResult.ACCEPTED) {
+                acknowledgements.add(acknowledgement);
+            }
+            if (packet instanceof Packet.PubRel release
+                    && result == SendQueue.OfferResult.ACCEPTED) {
+                releaseAllowance--;
+                releases.add(release);
+                releaseTickets.add(id);
+                outgoingIds.add(release.packetId());
+            }
+            return result;
         }
 
         @Override
@@ -1061,6 +1091,7 @@ class SessionPersistenceTest {
             if (result == SendQueue.OfferResult.ACCEPTED) {
                 publishAllowance--;
                 accepted.add(publication);
+                outgoingIds.add(packetId);
             }
             return result;
         }

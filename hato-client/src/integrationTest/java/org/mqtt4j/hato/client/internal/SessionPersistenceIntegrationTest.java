@@ -18,6 +18,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.ConnAck;
@@ -622,7 +623,7 @@ class SessionPersistenceIntegrationTest {
     @Timeout(60)
     @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
     void mosquitto_continues_delivery_on_the_same_persistent_client() throws Exception {
-        try (var broker = Mosquitto.container()) {
+        try (GenericContainer<?> broker = Mosquitto.container()) {
             Mosquitto.start(broker);
             persistentDeliveryRoundTrip(
                     URI.create(
@@ -706,7 +707,7 @@ class SessionPersistenceIntegrationTest {
         });
     }
 
-    private static Throwable failureOf(CompletableFuture<?> operation) throws Exception {
+    static Throwable failureOf(CompletableFuture<?> operation) throws Exception {
         return requireNonNull(operation.handle((_, failure) -> failure).get(5, SECONDS));
     }
 

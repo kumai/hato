@@ -894,20 +894,19 @@ class SessionCoreTest {
         assertThat(port.publications).isEmpty();
     }
 
-    @ParameterizedTest
-    @EnumSource(value = Qos.class, names = "EXACTLY_ONCE")
-    void unsupported_qos_is_rejected_without_sending_or_registering(Qos qos) {
+    @Test
+    void qos_two_subscription_is_rejected_without_sending_or_registering() {
         // Arrange
         connected();
 
         // Act
-        sut.publish(2, MqttMessage.of(new Topic("a"), new byte[0], qos, false));
-        sut.subscribe(3, Subscribe.of(new TopicFilter("a"), qos).withBufferCapacity(1));
+        sut.subscribe(
+                2,
+                Subscribe.of(new TopicFilter("a"), Qos.EXACTLY_ONCE).withBufferCapacity(1)
+        );
 
         // Assert
         assertThat(requireNonNull(port.results.get(2L)).failure())
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThat(requireNonNull(port.results.get(3L)).failure())
                 .isInstanceOf(IllegalArgumentException.class);
         assertThat(port.sent).isEmpty();
         assertThat(port.registered).isEmpty();

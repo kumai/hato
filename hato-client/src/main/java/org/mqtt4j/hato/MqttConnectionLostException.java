@@ -4,11 +4,11 @@ import java.io.Serial;
 
 /// A connection ended before an operation's outcome could be confirmed. This includes an
 /// unacknowledged publication, whose outcome is unknown even if its exchange is later discarded.
-/// In a persistent session, QoS 1 exchanges survive connection termination in the same client.
-/// Its next successful [MqttClient#connect()] reports [ConnAck#sessionPresent()] true when those
-/// exchanges resume, or false when they are discarded without replay. Previously failed futures
-/// remain failed; neither Session Present value proves that a publication was never received.
-/// Closing the client discards its local exchanges.
+/// In a persistent session, QoS 1 and QoS 2 exchanges survive connection termination in the
+/// same client. Its next successful [MqttClient#connect()] reports [ConnAck#sessionPresent()]
+/// true when those exchanges resume, or false when they are discarded without replay.
+/// Previously failed futures remain failed; neither Session Present value proves that a
+/// publication was never received. Closing the client discards its local exchanges.
 ///
 /// An initial subscribe awaiting SUBACK or an unsubscribe awaiting removal also fails this way,
 /// including a call observing removal scheduled by [Subscription#close()]. That removal remains

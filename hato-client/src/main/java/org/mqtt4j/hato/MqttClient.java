@@ -33,9 +33,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
 
     /// Establishes a connection and completes after a successful CONNACK.
     /// With an existing local persistent session, [ConnAck#sessionPresent()] true continues
-    /// pending QoS 1 exchanges and established subscriptions. False discards the old exchanges
-    /// and re-creates subscriptions using their existing handles. Previously failed publication
-    /// futures remain failed. This future does not wait for replay or SUBACK responses; a
+    /// pending QoS 1 and QoS 2 exchanges and established subscriptions. False discards the old
+    /// exchanges and re-creates subscriptions using their existing handles. Previously failed
+    /// publication futures remain failed. This future does not wait for replay or SUBACK; a
     /// re-creation refusal ends only the affected subscription. A pull subscription reports it
     /// through [Subscription#receive()].
     ///
@@ -56,8 +56,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
 
     /// Sends DISCONNECT and completes after writing it and requesting transport closure.
     /// Completion does not confirm that the broker received DISCONNECT.
-    /// This does not wait for PUBACK, although one that arrives before the connection ends still
-    /// completes its publication. Other pending QoS 1 publications fail with
+    /// This does not wait for PUBACK or PUBCOMP, although either can complete its publication
+    /// before the connection ends. Other pending QoS 1 and QoS 2 publications fail with
     /// [MqttConnectionLostException] when the connection ends; their outcome is unknown.
     /// A persistent session retains their exchanges for a later [#connect()], without changing
     /// those failed futures. A nonpersistent session discards them.

@@ -1775,6 +1775,51 @@ class ClientActorTest {
     }
 
     @Test
+    void qos_two_publish_waits_for_pubcomp_and_can_complete_before_the_pubrel_write_notification()
+            throws Exception {
+        // Arrange: the peer may respond before the transport reports a completed write.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            transport.completeSends = false;
+            MqttMessage message = message(new byte[] {1}).withQos(Qos.EXACTLY_ONCE);
+
+            // Act: PUBREC advances the exchange without completing the publication.
+            CompletableFuture<PublishResult> publication = sut.publish(message);
+            var packet = (Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS));
+            assertThat(packet.qos()).isEqualTo(Qos.EXACTLY_ONCE);
+            assertThat(packet.packetId()).isNotZero();
+            transport.receive(new Packet.PubRec(packet.packetId(), ReasonCode.SUCCESS, EMPTY));
+            transport.completeSend();
+
+            // Assert: observing PUBREL establishes that PUBREC was handled.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubRel(packet.packetId(), ReasonCode.SUCCESS, EMPTY));
+            assertThat(publication).isNotDone();
+
+            // Act & Assert: PUBCOMP completes before the delayed PUBREL write notification.
+            transport.receive(new Packet.PubComp(packet.packetId(), ReasonCode.SUCCESS, EMPTY));
+            assertThat(publication.get(5, SECONDS)).isEqualTo(PublishResult.of());
+            transport.completeSend();
+            transport.completeSends = true;
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+        }
+    }
+
+    @Test
+    void qos_two_subscriptions_are_still_rejected() {
+        try (MqttClient sut = client()) {
+            var request = Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE);
+            assertThatThrownBy(() -> sut.subscribe(request).join())
+                    .hasCauseInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("QoS 2 subscribe is not supported");
+            assertThatThrownBy(() -> sut.subscribe(request, _ -> { }).join())
+                    .hasCauseInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("QoS 2 subscribe is not supported");
+        }
+    }
+
+    @Test
     void acknowledgements_made_while_the_actor_is_busy_share_one_mailbox_wake() throws Exception {
         // Arrange: more MANUAL deliveries than the 256-event control mailbox can hold.
         var delivered = new LinkedBlockingQueue<MqttDelivery>();
@@ -1809,6 +1854,35 @@ class ClientActorTest {
             for (int id = 1; id <= 300; id++) {
                 assertThat(transport.sent.poll(5, SECONDS))
                         .isEqualTo(new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY));
+            }
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_pubrec_burst_while_the_actor_is_busy_is_answered_without_flooding_the_mailbox()
+            throws Exception {
+        // Arrange: more unknown PUBRECs than the 256-event control mailbox can hold.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            var burst = new ByteArrayOutputStream();
+            for (int id = 1; id <= 1_000; id++) {
+                burst.writeBytes(codec.encode(new Packet.PubRec(id, ReasonCode.SUCCESS, EMPTY)));
+            }
+            holdActor(transport, entered, release);
+            transport.receiver().onBytes(burst.toByteArray());
+
+            // Act: each PUBREL write would report its completion behind the queued PUBRECs.
+            release.countDown();
+
+            // Assert
+            for (int id = 1; id <= 1_000; id++) {
+                assertThat(transport.sent.poll(5, SECONDS))
+                        .isEqualTo(new Packet.PubRel(id, ReasonCode.SUCCESS, EMPTY));
             }
             assertThat(ends).isEmpty();
         } finally {

@@ -36,6 +36,11 @@ connect again, and established subscriptions resume on their existing handles. E
 `disconnect()` rather than just closing the client: `close()`, including leaving a
 try-with-resources block, drops the connection without sending MQTT DISCONNECT.
 
+## Publishing
+
+Use `Qos.EXACTLY_ONCE` in the [publishing example](../README.md#publishing)
+to publish at QoS 2.
+
 ## Managing subscriptions
 
 ```java

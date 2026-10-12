@@ -249,18 +249,20 @@ class ClientIoTest {
         assertThat(events.failures).isEmpty();
     }
 
-    @Test
-    void puback_admission_keeps_byte_headroom_while_a_large_connect_is_active() {
+    @ParameterizedTest
+    @MethodSource("acknowledgements")
+    void acknowledgement_admission_keeps_byte_headroom_while_a_large_connect_is_active(
+            Packet acknowledgement
+    ) {
         // Arrange: the CONNECT consumes just over half of the reserved byte budget.
         SingleWriteTransport transport = open(1);
         var connect = new Packet.Connect(
                 "c".repeat(65_535), MqttVersion.V3_1_1, true, 60, null, null, null, EMPTY
         );
-        var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
         assertThat(sut.send(1, 1, connect, null)).isEqualTo(ACCEPTED);
         transport.awaitActive();
 
-        // Act & Assert: PUBACK waits while connection control still has room.
+        // Act & Assert: the acknowledgement waits while connection control still has room.
         assertThat(sut.send(1, 2, acknowledgement, null)).isEqualTo(FULL);
         assertThat(sut.send(1, 3, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         transport.complete();
@@ -845,9 +847,12 @@ class ClientIoTest {
         }
     }
 
-    @Test
-    void an_inline_puback_write_is_reported_while_its_capacity_remains_owned()
-            throws Exception {
+    @ParameterizedTest
+    @MethodSource("acknowledgementWrites")
+    void only_puback_reports_its_write_early_while_acknowledgements_keep_their_capacity(
+            Packet acknowledgement,
+            List<Long> written
+    ) throws Exception {
         // Arrange: a transport completes the write inline but has not returned from send.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -858,14 +863,13 @@ class ClientIoTest {
             entered.countDown();
             waitFor(release);
         };
-        var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
         try {
             // Act
             assertThat(sut.send(1, 1, acknowledgement, null)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
-            // Assert: the write is reported at once, but the retained buffer keeps its capacity.
-            assertThat(events.written).containsExactly(1L);
+            // Assert: only PUBACK reports early; all retained buffers keep their capacity.
+            assertThat(events.written).containsExactlyElementsOf(written);
             assertThat(events.tickets).isEmpty();
             assertThat(events.capacityGenerations).isEmpty();
             for (int i = 2; i <= 14; i++) {
@@ -877,7 +881,7 @@ class ClientIoTest {
             release.countDown();
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
             assertThat(events.capacityGenerations).containsExactly(1L);
-            assertThat(events.written).containsExactly(1L);
+            assertThat(events.written).containsExactlyElementsOf(written);
         } finally {
             release.countDown();
         }
@@ -1032,8 +1036,29 @@ class ClientIoTest {
                         "client", MqttVersion.V3_1_1, true, 60, null, null, null, EMPTY
                 ), 16),
                 Arguments.of(new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY), 14),
+                Arguments.of(new Packet.PubRec(1, ReasonCode.SUCCESS, EMPTY), 14),
+                Arguments.of(new Packet.PubRel(1, ReasonCode.SUCCESS, EMPTY), 14),
+                Arguments.of(new Packet.PubComp(1, ReasonCode.SUCCESS, EMPTY), 14),
                 Arguments.of(new Packet.PingReq(), 16),
                 Arguments.of(new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY), 16)
+        );
+    }
+
+    private static Stream<Packet> acknowledgements() {
+        return Stream.of(
+                new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY),
+                new Packet.PubRec(1, ReasonCode.SUCCESS, EMPTY),
+                new Packet.PubRel(1, ReasonCode.SUCCESS, EMPTY),
+                new Packet.PubComp(1, ReasonCode.SUCCESS, EMPTY)
+        );
+    }
+
+    private static Stream<Arguments> acknowledgementWrites() {
+        return Stream.of(
+                Arguments.of(new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY), List.of(1L)),
+                Arguments.of(new Packet.PubRec(1, ReasonCode.SUCCESS, EMPTY), List.of()),
+                Arguments.of(new Packet.PubRel(1, ReasonCode.SUCCESS, EMPTY), List.of()),
+                Arguments.of(new Packet.PubComp(1, ReasonCode.SUCCESS, EMPTY), List.of())
         );
     }
 

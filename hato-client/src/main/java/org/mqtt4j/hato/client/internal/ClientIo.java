@@ -54,12 +54,16 @@ final class ClientIo {
 
     private static final int REGULAR_SEND_BYTE_LIMIT = 16 * 1024 * 1024;
 
+    // PUBLISH must not consume the capacity needed to finish protocol exchanges. MQTT 3.1.1
+    // PUBACK/PUBREC/PUBREL/PUBCOMP each use four bytes; the core defers them when this budget is
+    // full and resumes on returned capacity, so a whole inflight window need not fit at once.
     private static final int RESERVED_SEND_LIMIT = 16;
 
     private static final int RESERVED_SEND_BYTE_LIMIT = 128 * 1024;
 
-    // PUBACKs leave room for lifecycle control in the same budget and FIFO, including
-    // reservations still owned by an earlier connection.
+    // Acknowledgements leave two slots and byte headroom for lifecycle control (CONNECT,
+    // PINGREQ, DISCONNECT) in the same budget and FIFO. Old connections still holding send
+    // buffers share this budget; protocol progress must leave room for the current connection.
     private static final int ACKNOWLEDGEMENT_COUNT_HEADROOM = 2;
 
     private static final int ACKNOWLEDGEMENT_BYTE_HEADROOM = 64 * 1024;
@@ -158,7 +162,7 @@ final class ClientIo {
             @Override
             public void onSent(long ticket) {
                 boolean notify;
-                boolean acknowledgement;
+                boolean notifyWritten;
                 synchronized (sending) {
                     if (connection.activeTicket != ticket || !connection.transportOwnsActive) {
                         if (!connection.closed) {
@@ -169,13 +173,13 @@ final class ClientIo {
                         return;
                     }
                     notify = !connection.closed;
-                    acknowledgement = connection.activeAcknowledgement;
+                    notifyWritten = connection.activeNotifyWritten;
                 }
                 Runnable completion = null;
                 try {
                     if (notify) {
                         log.debug("Written ticket {}", ticket);
-                        if (acknowledgement) {
+                        if (notifyWritten) {
                             events.written(generation, ticket);
                         }
                         completion = events.prepareSent(generation, ticket);
@@ -239,6 +243,7 @@ final class ClientIo {
                 ticket,
                 new Outbound(header, message, false, receipt),
                 false,
+                false,
                 "Publish",
                 false
         );
@@ -252,8 +257,11 @@ final class ClientIo {
     ) {
         byte[] bytes = codec.encode(packet);
         // Reserve capacity for connection progress, not for every MQTT control packet.
-        boolean reserved = packet instanceof Packet.Connect
-                || packet instanceof Packet.PubAck
+        boolean acknowledgement = packet instanceof Packet.PubAck
+                || packet instanceof Packet.PubRec
+                || packet instanceof Packet.PubRel
+                || packet instanceof Packet.PubComp;
+        boolean reserved = acknowledgement || packet instanceof Packet.Connect
                 || packet instanceof Packet.PingReq
                 || packet instanceof Packet.Disconnect;
         return enqueue(
@@ -261,6 +269,7 @@ final class ClientIo {
                 ticket,
                 new Outbound(bytes, null, packet instanceof Packet.PubAck, receipt),
                 reserved,
+                acknowledgement,
                 packet.getClass().getSimpleName(),
                 packet instanceof Packet.PingReq
         );
@@ -271,6 +280,7 @@ final class ClientIo {
             long ticket,
             Outbound outbound,
             boolean reserved,
+            boolean acknowledgement,
             String packetName,
             boolean ping
     ) {
@@ -285,8 +295,8 @@ final class ClientIo {
                     outbound,
                     size,
                     reserved,
-                    outbound.acknowledgement() ? ACKNOWLEDGEMENT_COUNT_HEADROOM : 0,
-                    outbound.acknowledgement() ? ACKNOWLEDGEMENT_BYTE_HEADROOM : 0
+                    acknowledgement ? ACKNOWLEDGEMENT_COUNT_HEADROOM : 0,
+                    acknowledgement ? ACKNOWLEDGEMENT_BYTE_HEADROOM : 0
             );
             if (admitted == SendQueue.OfferResult.ACCEPTED) {
                 if (ping) {
@@ -328,7 +338,7 @@ final class ClientIo {
                     if (next.isPresent()) {
                         SendQueue.Send<Outbound> send = next.orElseThrow();
                         connection.activeTicket = send.ticket();
-                        connection.activeAcknowledgement = send.value().acknowledgement();
+                        connection.activeNotifyWritten = send.value().notifyWritten();
                         connection.senderOwnsActive = true;
                         return Optional.of(new Write(connection, send));
                     }
@@ -498,7 +508,7 @@ final class ClientIo {
         final SendQueue<Outbound> queue;
         boolean closed;
         long activeTicket;
-        boolean activeAcknowledgement;
+        boolean activeNotifyWritten;
         boolean senderOwnsActive;
         boolean transportOwnsActive;
         @Nullable Runnable sendCompletion;
@@ -517,7 +527,7 @@ final class ClientIo {
     private record Outbound(
             byte[] header,
             @Nullable MqttMessage message,
-            boolean acknowledgement,
+            boolean notifyWritten,
             @Nullable SendReceipt receipt
     ) {
 

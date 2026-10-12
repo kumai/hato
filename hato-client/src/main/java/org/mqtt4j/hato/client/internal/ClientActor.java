@@ -208,11 +208,6 @@ public final class ClientActor implements MqttClient {
     @Override
     public CompletableFuture<PublishResult> publish(MqttMessage message) {
         requireNonNull(message, "message");
-        if (message.qos() == Qos.EXACTLY_ONCE) {
-            return CompletableFuture.failedFuture(
-                    new IllegalArgumentException("QoS 2 publish is not supported")
-            );
-        }
         return submit(false, true, message.payloadSize(),
                 token -> core.publish(token, message), null);
     }
