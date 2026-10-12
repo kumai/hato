@@ -56,6 +56,7 @@ vulnerability reporting for this repository instead.
 | `distribution-tests` | Final jar, JPMS, sources, and publication metadata checks | no |
 | `examples` | Usage examples | no |
 | `native-smoke` | GraalVM native-image smoke test | no |
+| `release-tools` | Release version and bundle checks, and the upload to Maven Central, run by the release workflow | no |
 | `build-logic` | Convention plugins and the source-embedding tasks | no |
 
 The client's public API package is `org.mqtt4j.mqtj`; the JPMS modules are
@@ -112,6 +113,9 @@ together, checks JPMS encapsulation, and verifies sources and POM/Gradle
 metadata. The separate
 `:build-logic:check` task is needed because `build-logic` is an included build;
 its checks do not run as part of `./gradlew build`.
+
+Maintainers can find bundle inspection, trial uploads, and publication steps in
+the [release guide](docs/releasing.md).
 
 ## Code conventions
 
@@ -202,7 +206,7 @@ better split.
 | `io` | `io` in `mqtj-common`: TCP, TLS, WebSocket, and framing |
 | `common` | the other layers of `mqtj-common`, and changes that span several of its layers |
 | `build` | the Gradle build, `build-logic`, dependency versions, `distribution-tests`, and `native-smoke` |
-| `ci` | GitHub Actions and Dependabot |
+| `ci` | GitHub Actions, the `release-tools` they run, and Dependabot |
 | `docs` | the README, this guide, the code conventions, and `examples` |
 
 - The body explains what the change makes possible and why it is needed: the

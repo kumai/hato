@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Pre-release trial version, such as 0.3.0-rc.1, matching the selected tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Reject a tag that cannot be released before the full build runs.
+  version:
+    name: Check the release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          validate-wrappers: true
+      - id: release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: ./gradlew :release-tools:checkReleaseTag
+
+  checks:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  upload:
+    name: Sign and upload for manual publication
+    needs: [version, checks]
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      # Third-party actions in this job run before the signing key reaches Gradle: pin them.
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          validate-wrappers: true
+          cache-disabled: true
+      - name: Build and check the signed bundle
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          MQTJ_SIGNING_KEY: ${{ secrets.MQTJ_SIGNING_KEY }}
+          MQTJ_SIGNING_PASSWORD: ${{ secrets.MQTJ_SIGNING_PASSWORD }}
+        run: |
+          test -n "$MQTJ_SIGNING_KEY" || { echo 'Missing MQTJ_SIGNING_KEY' >&2; exit 1; }
+          ./gradlew --no-configuration-cache \
+            :distribution-tests:verifyReleaseBundle :release-tools:installDist \
+            -Pversion="$RELEASE_VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mqtj-${{ needs.version.outputs.version }}
+          path: distribution-tests/build/distributions/mqtj-${{ needs.version.outputs.version }}.zip
+          if-no-files-found: error
+      # The installed tool runs outside Gradle, so the Portal token reaches only this step.
+      - name: Upload and wait for validation
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+        run: |
+          release-tools/build/install/release-tools/bin/release-tools upload \
+            "distribution-tests/build/distributions/mqtj-${RELEASE_VERSION}.zip"

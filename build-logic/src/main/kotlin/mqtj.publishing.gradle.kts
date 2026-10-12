@@ -1,5 +1,4 @@
-// Publishing conventions: the Maven publication, its POM, and optional signing.
-// The upload to Maven Central (Central Publisher Portal) is added when the first release is near.
+// Publishing conventions: the Maven publication, local staging, and optional signing.
 
 plugins {
     id("mqtj.java-conventions")
@@ -36,6 +35,12 @@ publishing {
             }
         }
     }
+    repositories {
+        maven {
+            name = "staging"
+            url = uri(layout.buildDirectory.dir("staging-repository"))
+        }
+    }
 }
 
 signing {
@@ -46,6 +51,31 @@ signing {
     if (signingKey.isPresent) {
         useInMemoryPgpKeys(signingKey.get(), signingPassword.orNull)
         sign(publishing.publications)
+    }
+}
+
+val stagingRepository = layout.buildDirectory.dir("staging-repository")
+val verifyReleaseVersion = tasks.register("verifyReleaseVersion") {
+    val releaseVersion = project.version.toString()
+    doLast {
+        // The same rule as the release workflow's version check.
+        if (releaseVersion.contains("SNAPSHOT", ignoreCase = true)) {
+            throw GradleException("Release staging requires -Pversion=<non-SNAPSHOT version>")
+        }
+    }
+}
+val prepareStagingRepository = tasks.register<Delete>("prepareStagingRepository") {
+    dependsOn(verifyReleaseVersion)
+    // A previous signed build must not leave signatures behind in an unsigned local bundle.
+    delete(stagingRepository)
+}
+val stagePublication = tasks.named("publishMavenPublicationToStagingRepository") {
+    dependsOn(prepareStagingRepository)
+}
+val stagedPublicationElements = configurations.consumable("stagedPublicationElements")
+artifacts {
+    add(stagedPublicationElements.name, stagingRepository) {
+        builtBy(stagePublication)
     }
 }
 
