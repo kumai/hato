@@ -1,5 +1,5 @@
 plugins {
-    id("mqtj.java-conventions")
+    id("hato.java-conventions")
     `java-library`
 }
 

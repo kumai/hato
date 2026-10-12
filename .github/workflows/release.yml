@@ -66,17 +66,17 @@ jobs:
       - name: Build and check the signed bundle
         env:
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
-          MQTJ_SIGNING_KEY: ${{ secrets.MQTJ_SIGNING_KEY }}
-          MQTJ_SIGNING_PASSWORD: ${{ secrets.MQTJ_SIGNING_PASSWORD }}
+          HATO_SIGNING_KEY: ${{ secrets.HATO_SIGNING_KEY }}
+          HATO_SIGNING_PASSWORD: ${{ secrets.HATO_SIGNING_PASSWORD }}
         run: |
-          test -n "$MQTJ_SIGNING_KEY" || { echo 'Missing MQTJ_SIGNING_KEY' >&2; exit 1; }
+          test -n "$HATO_SIGNING_KEY" || { echo 'Missing HATO_SIGNING_KEY' >&2; exit 1; }
           ./gradlew --no-configuration-cache \
             :distribution-tests:verifyReleaseBundle :release-tools:installDist \
             -Pversion="$RELEASE_VERSION"
       - uses: actions/upload-artifact@v7
         with:
-          name: mqtj-${{ needs.version.outputs.version }}
-          path: distribution-tests/build/distributions/mqtj-${{ needs.version.outputs.version }}.zip
+          name: hato-${{ needs.version.outputs.version }}
+          path: distribution-tests/build/distributions/hato-${{ needs.version.outputs.version }}.zip
           if-no-files-found: error
       # The installed tool runs outside Gradle, so the Portal token reaches only this step.
       - name: Upload and wait for validation
@@ -86,4 +86,4 @@ jobs:
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
         run: |
           release-tools/build/install/release-tools/bin/release-tools upload \
-            "distribution-tests/build/distributions/mqtj-${RELEASE_VERSION}.zip"
+            "distribution-tests/build/distributions/hato-${RELEASE_VERSION}.zip"

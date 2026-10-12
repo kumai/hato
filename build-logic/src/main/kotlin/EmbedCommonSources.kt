@@ -20,11 +20,11 @@ abstract class EmbedCommonSources : DefaultTask() {
     @get:PathSensitive(PathSensitivity.NONE)
     abstract val sourceArchives: ConfigurableFileCollection
 
-    /** The package the shared sources are written in, for example `org.mqtt4j.mqtj.common`. */
+    /** The package the shared sources are written in, for example `org.mqtt4j.hato.common`. */
     @get:Input
     abstract val sourcePackage: Property<String>
 
-    /** The package the sources are moved to, for example `org.mqtt4j.mqtj.client.internal.common`. */
+    /** The package the sources are moved to, for example `org.mqtt4j.hato.client.internal.common`. */
     @get:Input
     abstract val destinationPackage: Property<String>
 

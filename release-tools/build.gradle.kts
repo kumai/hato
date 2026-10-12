@@ -1,12 +1,12 @@
 plugins {
-    id("mqtj.java-conventions")
+    id("hato.java-conventions")
     application
 }
 
 description = "Release checks and the Maven Central upload for the release workflow. Not published."
 
 application {
-    mainClass = "org.mqtt4j.mqtj.release.ReleaseTool"
+    mainClass = "org.mqtt4j.hato.release.ReleaseTool"
 }
 
 // The first job of the release workflow. The tool reads the GitHub ref from the environment and

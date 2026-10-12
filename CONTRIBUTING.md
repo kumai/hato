@@ -1,6 +1,6 @@
-# Contributing to MQTJ
+# Contributing to Hato
 
-MQTJ is a compact MQTT 3.1.1 and 5.0 client library for Java 25 and later, with
+Hato is a compact MQTT 3.1.1 and 5.0 client library for Java 25 and later, with
 an in-memory broker and a test kit alongside it. Client and broker each ship as one
 plain jar with no runtime dependencies; the test kit depends on those two jars. The
 libraries use no runtime reflection or bytecode generation and are meant to work
@@ -18,15 +18,15 @@ and use the surrounding code as a guide where they leave room for choice.
 
 Open a GitHub issue. A report is most useful when it includes:
 
-- the MQTJ version, the Java version and vendor, and whether the application
+- the Hato version, the Java version and vendor, and whether the application
   runs on a JVM or as a native image;
 - the broker product and version on the other side of the connection, and the
   MQTT protocol version in use (3.1.1 or 5.0);
 - what you did, what you expected, and what happened instead;
-- the relevant log excerpt. MQTJ logs through `System.Logger`; the `DEBUG`
+- the relevant log excerpt. Hato logs through `System.Logger`; the `DEBUG`
   level shows the packets exchanged, which is usually what is needed;
 - when you can, a failing test written against the embedded broker from
-  `mqtj-testkit`.
+  `hato-testkit`.
 
 A reproducible report is at least as valuable as a fix. If you are not sure
 whether something is a bug, ask in an issue anyway.
@@ -37,7 +37,7 @@ vulnerability reporting for this repository instead.
 ## Proposing a change
 
 - Open an issue before changing the public API (the packages exported by the
-  module descriptors of `mqtj-client`, `mqtj-broker`, and `mqtj-testkit`), the
+  module descriptors of `hato-client`, `hato-broker`, and `hato-testkit`), the
   protocol state machine, a module boundary, or anything a broker can observe
   on the wire. Agreeing on the direction up front is far less work for everyone
   than reworking it once the code is already written.
@@ -49,36 +49,36 @@ vulnerability reporting for this repository instead.
 
 | Project | Contents | Published |
 | --- | --- | --- |
-| `mqtj-common` | Shared values and implementation for client, broker, and testkit: protocol, logging, concurrency, I/O | no; embedded at build time |
-| `mqtj-client` | Client API/SPI, session, transport, and delivery | `org.mqtt4j:mqtj-client`, one standalone jar |
-| `mqtj-broker` | In-memory, single-node broker | `org.mqtt4j:mqtj-broker`, one standalone jar with no client dependency |
-| `mqtj-testkit` | Broker test wrapper, fake client, fault injection, manual scheduler | `org.mqtt4j:mqtj-testkit`; depends on client and broker |
+| `hato-common` | Shared values and implementation for client, broker, and testkit: protocol, logging, concurrency, I/O | no; embedded at build time |
+| `hato-client` | Client API/SPI, session, transport, and delivery | `org.mqtt4j:hato-client`, one standalone jar |
+| `hato-broker` | In-memory, single-node broker | `org.mqtt4j:hato-broker`, one standalone jar with no client dependency |
+| `hato-testkit` | Broker test wrapper, fake client, fault injection, manual scheduler | `org.mqtt4j:hato-testkit`; depends on client and broker |
 | `distribution-tests` | Final jar, JPMS, sources, and publication metadata checks | no |
 | `examples` | Usage examples | no |
 | `native-smoke` | GraalVM native-image smoke test | no |
 | `release-tools` | Release version and bundle checks, and the upload to Maven Central, run by the release workflow | no |
 | `build-logic` | Convention plugins and the source-embedding tasks | no |
 
-The client's public API package is `org.mqtt4j.mqtj`; the JPMS modules are
-`org.mqtt4j.mqtj.client`, `org.mqtt4j.mqtj.broker`, and `org.mqtt4j.mqtj.testkit`.
-Client, broker, and testkit each embed the shared sources of `mqtj-common` in
+The client's public API package is `org.mqtt4j.hato`; the JPMS modules are
+`org.mqtt4j.hato.client`, `org.mqtt4j.hato.broker`, and `org.mqtt4j.hato.testkit`.
+Client, broker, and testkit each embed the shared sources of `hato-common` in
 their own internal packages, so client and broker ship as standalone jars that
 work separately or together, on the classpath or the module path. There is no
-additional jar and no special classloader; `mqtj-testkit` deliberately uses
+additional jar and no special classloader; `hato-testkit` deliberately uses
 ordinary dependencies on both.
 
 `./gradlew build` produces the complete runtime jars at
-`mqtj-client/build/libs/mqtj-client-<version>.jar` and
-`mqtj-broker/build/libs/mqtj-broker-<version>.jar`; the sources and Javadoc
+`hato-client/build/libs/hato-client-<version>.jar` and
+`hato-broker/build/libs/hato-broker-<version>.jar`; the sources and Javadoc
 jars beside them are for development tools. The build also runs
 `distribution-tests`: fresh Java processes consume only the final jars,
 individually and together, and verify JPMS encapsulation and the publication
 metadata. Run `./gradlew :distribution-tests:test` for just these checks.
 
-The shared sources are maintained only in `mqtj-common`. The
+The shared sources are maintained only in `hato-common`. The
 `embedCommonSources` task copies them to each consumer's `build/generated/`
-under `org.mqtt4j.mqtj.<distribution>.internal.common` before compilation; in
-the client, `common.value` maps onto the public `org.mqtt4j.mqtj` package. The
+under `org.mqtt4j.hato.<distribution>.internal.common` before compilation; in
+the client, `common.value` maps onto the public `org.mqtt4j.hato` package. The
 rules for shared sources are in the code conventions below.
 
 ## Before you open a pull request
@@ -89,7 +89,7 @@ itself. Both need network access once.
 
 Docker is needed for the integration tests that run against real brokers. Without
 it, `./gradlew build` fails and explains how to skip those tests: add
-`-Pmqtj.docker.required=false` to the command, or put `mqtj.docker.required=false`
+`-Phato.docker.required=false` to the command, or put `hato.docker.required=false`
 in `~/.gradle/gradle.properties` to skip them in every build. Skipped tests are
 listed in the build output, and CI always runs them. A GraalVM JDK is needed only
 for the native-image smoke test, which CI runs on every pull request.
@@ -100,14 +100,14 @@ before merge. Run the ones that match what you changed.
 | You changed | Run |
 | --- | --- |
 | Anything | `./gradlew build` |
-| One module | `./gradlew :mqtj-client:check` (substitute the module name) |
+| One module | `./gradlew :hato-client:check` (substitute the module name) |
 | `build-logic/`, `settings.gradle.kts`, or `gradle/libs.versions.toml` | `./gradlew build :build-logic:check` |
 | Anything that could affect native-image compatibility | `./gradlew :native-smoke:nativeCompile` (needs a GraalVM JDK 25) |
 
 `./gradlew build` compiles with every javac lint on, `-Werror`, and NullAway,
 checks the sources with Checkstyle, and runs the unit tests, the integration
 tests, and the check that the published modules have no external runtime
-dependencies. Client and broker also reject dependencies on other MQTJ jars.
+dependencies. Client and broker also reject dependencies on other Hato jars.
 `distribution-tests` compiles and runs probes using the final jars alone and
 together, checks JPMS encapsulation, and verifies sources and POM/Gradle
 metadata. The separate
@@ -143,14 +143,14 @@ A few points sit outside code style and are checked in review:
   is only the vehicle: its own bug patterns are switched off. When a finding is
   wrong, add `@SuppressWarnings("NullAway")` to the smallest enclosing
   declaration with a comment that says why; do not weaken the configuration.
-- `mqtj-common` is an internal development project and is not published.
-  Shared sources live under `org.mqtt4j.mqtj.common` in the layers `value`, `util`, `log`,
+- `hato-common` is an internal development project and is not published.
+  Shared sources live under `org.mqtt4j.hato.common` in the layers `value`, `util`, `log`,
   `protocol`, `concurrent`, and `io`; the build embeds them into
-  `org.mqtt4j.mqtj.<distribution>.internal.common` in client, broker, and testkit.
-  The client maps `common.value` to its public `org.mqtt4j.mqtj` package instead:
+  `org.mqtt4j.hato.<distribution>.internal.common` in client, broker, and testkit.
+  The client maps `common.value` to its public `org.mqtt4j.hato` package instead:
   `MqttVersion` and `Qos` have one source definition and no internal wrapper enum.
   Edit only the originals, never generated copies. Each layer imports only
-  itself and the layers below it, which the `mqtj-common` tests check. Resources, module
+  itself and the layers below it, which the `hato-common` tests check. Resources, module
   descriptors, or other languages in the source archive require explicit build
   support; unsupported files fail the build.
 - Keep internal shared types out of exported signatures. Reusable immutable
@@ -160,7 +160,7 @@ A few points sit outside code style and are checked in review:
   their distributions. Shared code must not depend on actors or broker routing
   state, and `protocol` must not depend on sockets or threads.
 - Publication group is `org.mqtt4j`; Java packages and JPMS names are rooted at
-  `org.mqtt4j.mqtj`. Include the artifact name only in module-specific packages
+  `org.mqtt4j.hato`. Include the artifact name only in module-specific packages
   and module names, not in the Maven group.
 - No reflection, `ServiceLoader`, dynamic proxies, `Unsafe`, Java
   serialization, or runtime class generation. Everything is wired explicitly
@@ -178,7 +178,7 @@ A few points sit outside code style and are checked in review:
   `INFO` on a hot path, and never log payloads below `TRACE`.
 - Java 25 is the baseline. Records, sealed types, pattern matching, and virtual
   threads are expected. Preview features are not used.
-- Unit tests must not need a network, a broker, or Docker. Use `mqtj-testkit`
+- Unit tests must not need a network, a broker, or Docker. Use `hato-testkit`
   for that: the embedded broker, the fake client, the fault-injecting
   transport, and the manual scheduler. Tests that need a real broker belong in
   the `integrationTest` suite.
@@ -199,12 +199,12 @@ better split.
 
 | Area | Covers |
 | --- | --- |
-| `client` | `mqtj-client`: the public API, sessions, reconnection, and delivery |
-| `broker` | `mqtj-broker` |
-| `testkit` | `mqtj-testkit` |
-| `protocol` | `protocol` and `value` in `mqtj-common`: packets, the codec, topics, and reason codes |
-| `io` | `io` in `mqtj-common`: TCP, TLS, WebSocket, and framing |
-| `common` | the other layers of `mqtj-common`, and changes that span several of its layers |
+| `client` | `hato-client`: the public API, sessions, reconnection, and delivery |
+| `broker` | `hato-broker` |
+| `testkit` | `hato-testkit` |
+| `protocol` | `protocol` and `value` in `hato-common`: packets, the codec, topics, and reason codes |
+| `io` | `io` in `hato-common`: TCP, TLS, WebSocket, and framing |
+| `common` | the other layers of `hato-common`, and changes that span several of its layers |
 | `build` | the Gradle build, `build-logic`, dependency versions, `distribution-tests`, and `native-smoke` |
 | `ci` | GitHub Actions, the `release-tools` they run, and Dependabot |
 | `docs` | the README, this guide, the code conventions, and `examples` |

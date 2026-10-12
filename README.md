@@ -1,4 +1,4 @@
-# MQTJ
+# Hato
 
 An MQTT client for Java. One jar, a plain API, and the things you need. It just works.
 
@@ -19,7 +19,7 @@ Gradle:
 
 ```kotlin
 dependencies {
-    implementation("org.mqtt4j:mqtj-client:x.y.z")
+    implementation("org.mqtt4j:hato-client:x.y.z")
 }
 ```
 
@@ -28,7 +28,7 @@ Maven:
 ```xml
 <dependency>
     <groupId>org.mqtt4j</groupId>
-    <artifactId>mqtj-client</artifactId>
+    <artifactId>hato-client</artifactId>
     <version>x.y.z</version>
 </dependency>
 ```
@@ -40,11 +40,11 @@ Send a temperature reading:
 ```java
 import java.net.URI;
 
-import org.mqtt4j.mqtj.MqttClient;
-import org.mqtt4j.mqtj.MqttMessage;
-import org.mqtt4j.mqtj.MqttVersion;
-import org.mqtt4j.mqtj.Qos;
-import org.mqtt4j.mqtj.Topic;
+import org.mqtt4j.hato.MqttClient;
+import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.Topic;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -73,12 +73,12 @@ example: it prints `sensors/kitchen/temperature: 21.5`.
 ```java
 import java.net.URI;
 
-import org.mqtt4j.mqtj.MqttClient;
-import org.mqtt4j.mqtj.MqttMessage;
-import org.mqtt4j.mqtj.MqttVersion;
-import org.mqtt4j.mqtj.Qos;
-import org.mqtt4j.mqtj.Subscribe;
-import org.mqtt4j.mqtj.TopicFilter;
+import org.mqtt4j.hato.MqttClient;
+import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.Subscribe;
+import org.mqtt4j.hato.TopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -106,11 +106,11 @@ void show(MqttMessage message) {
 
 ## Guides
 
-- [Client](mqtj-client/README.md): configure connections, manage subscriptions,
+- [Client](hato-client/README.md): configure connections, manage subscriptions,
   and handle failures.
-- [Embedded broker](mqtj-broker/README.md): run a broker inside your application
+- [Embedded broker](hato-broker/README.md): run a broker inside your application
   for tests, device simulators, and demos.
-- [Test kit](mqtj-testkit/README.md): simulate connection failures and control time
+- [Test kit](hato-testkit/README.md): simulate connection failures and control time
   in your tests.
 - [Examples](examples/README.md): compile and run the examples above, or try a
   complete round trip with the embedded broker.

@@ -1,4 +1,4 @@
-// Root of the MQTJ build. The root project holds settings and conventions only;
+// Root of the Hato build. The root project holds settings and conventions only;
 // all source code lives in the subprojects listed at the bottom.
 
 pluginManagement {
@@ -19,12 +19,12 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "mqtj"
+rootProject.name = "hato"
 
-include("mqtj-common")
-include("mqtj-client")
-include("mqtj-broker")
-include("mqtj-testkit")
+include("hato-common")
+include("hato-client")
+include("hato-broker")
+include("hato-testkit")
 include("examples")
 include("native-smoke")
 include("distribution-tests")

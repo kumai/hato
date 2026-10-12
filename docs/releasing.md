@@ -1,4 +1,4 @@
-# Releasing MQTJ
+# Releasing Hato
 
 Releases are uploaded to Maven Central for review. The release workflow never
 publishes or drops a deployment; the maintainer does that in the
@@ -16,8 +16,8 @@ with these secrets:
 
 | Secret | Value |
 | --- | --- |
-| `MQTJ_SIGNING_KEY` | ASCII-armored private PGP signing key |
-| `MQTJ_SIGNING_PASSWORD` | Passphrase for that key; empty for an unprotected key |
+| `HATO_SIGNING_KEY` | ASCII-armored private PGP signing key |
+| `HATO_SIGNING_PASSWORD` | Passphrase for that key; empty for an unprotected key |
 | `CENTRAL_USERNAME` | Username from the Portal user token |
 | `CENTRAL_PASSWORD` | Password from the Portal user token |
 
@@ -33,7 +33,7 @@ Gradle cache disabled.
 ./gradlew --no-configuration-cache :distribution-tests:releaseBundle -Pversion=0.3.0
 ```
 
-The bundle is `distribution-tests/build/distributions/mqtj-0.3.0.zip`. It contains
+The bundle is `distribution-tests/build/distributions/hato-0.3.0.zip`. It contains
 the client, broker, and testkit publications under `org/mqtt4j/`. SNAPSHOT versions
 are rejected. A local bundle can be built without a signing key for inspection.
 When the signing environment variables are set, build and verify the signed bundle

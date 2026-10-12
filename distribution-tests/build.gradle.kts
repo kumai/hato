@@ -1,5 +1,5 @@
 plugins {
-    id("mqtj.java-conventions")
+    id("hato.java-conventions")
 }
 
 description = "Tests the final library jars and their publication metadata. Not published."
@@ -38,10 +38,10 @@ val releaseTools = configurations.resolvable("releaseTools") {
 }
 
 dependencies {
-    add(clientJarDependencies.name, project(path = ":mqtj-client", configuration = "runtimeElements"))
-    add(brokerJarDependencies.name, project(path = ":mqtj-broker", configuration = "runtimeElements"))
-    add(testkitJarsDependencies.name, project(path = ":mqtj-testkit", configuration = "runtimeElements"))
-    for (module in listOf("mqtj-client", "mqtj-broker", "mqtj-testkit")) {
+    add(clientJarDependencies.name, project(path = ":hato-client", configuration = "runtimeElements"))
+    add(brokerJarDependencies.name, project(path = ":hato-broker", configuration = "runtimeElements"))
+    add(testkitJarsDependencies.name, project(path = ":hato-testkit", configuration = "runtimeElements"))
+    for (module in listOf("hato-client", "hato-broker", "hato-testkit")) {
         add(sourceJarsDependencies.name, project(path = ":$module", configuration = "sourcesElements"))
         add(javadocJarsDependencies.name, project(path = ":$module", configuration = "javadocElements"))
         add(
@@ -75,7 +75,7 @@ val releaseBundle = tasks.register<Zip>("releaseBundle") {
     group = "publishing"
     description = "Bundles the three Maven publications for a non-SNAPSHOT release."
     val releaseVersion = project.version.toString()
-    archiveFileName = "mqtj-$releaseVersion.zip"
+    archiveFileName = "hato-$releaseVersion.zip"
     destinationDirectory = layout.buildDirectory.dir("distributions")
     from(stagedPublications) {
         // Central accepts version contents, not repository-level maven-metadata files.
@@ -91,7 +91,7 @@ tasks.register<JavaExec>("verifyReleaseBundle") {
     val bundle = releaseBundle.flatMap { it.archiveFile }
     inputs.file(bundle)
     classpath = files(releaseTools)
-    mainClass = "org.mqtt4j.mqtj.release.ReleaseTool"
+    mainClass = "org.mqtt4j.hato.release.ReleaseTool"
     argumentProviders.add(CommandLineArgumentProvider {
         listOf("bundle", releaseVersion, bundle.get().asFile.absolutePath)
     })

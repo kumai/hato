@@ -1,15 +1,15 @@
 plugins {
-    id("mqtj.java-conventions")
+    id("hato.java-conventions")
     application
 }
 
 description = "Usage examples. Not published."
 
 dependencies {
-    implementation(project(":mqtj-client"))
-    implementation(project(":mqtj-broker"))
+    implementation(project(":hato-client"))
+    implementation(project(":hato-broker"))
 }
 
 application {
-    mainClass = "org.mqtt4j.mqtj.examples.Hello"
+    mainClass = "org.mqtt4j.hato.examples.Hello"
 }

@@ -1,5 +1,5 @@
 plugins {
-    id("mqtj.java-conventions")
+    id("hato.java-conventions")
     application
     alias(libs.plugins.graalvm.native)
 }
@@ -7,12 +7,12 @@ plugins {
 description = "GraalVM native-image smoke test: exercises the packaged client and broker. Not published."
 
 dependencies {
-    implementation(project(":mqtj-client"))
-    implementation(project(":mqtj-broker"))
+    implementation(project(":hato-client"))
+    implementation(project(":hato-broker"))
 }
 
 application {
-    mainClass = "org.mqtt4j.mqtj.nativesmoke.NativeSmoke"
+    mainClass = "org.mqtt4j.hato.nativesmoke.NativeSmoke"
 }
 
 graalvmNative {
@@ -20,7 +20,7 @@ graalvmNative {
     toolchainDetection = false
     binaries {
         named("main") {
-            imageName = "mqtj-native-smoke"
+            imageName = "hato-native-smoke"
             mainClass = application.mainClass
             // Fail instead of silently producing an image that still needs a JVM.
             buildArgs.add("--no-fallback")

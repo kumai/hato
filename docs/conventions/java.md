@@ -2,7 +2,7 @@
 
 # Java Code Conventions
 
-This document sets the shared standard for writing, reading, and reviewing MQTJ's Java code.
+This document sets the shared standard for writing, reading, and reviewing Hato's Java code.
 Its aim is to make types, the absence of values, and the boundaries of processing easy to read,
 and to remove notation that repeats without adding meaning.
 
@@ -11,7 +11,7 @@ and to remove notation that repeats without adding meaning.
 ### 1.1 Scope
 
 These conventions apply to the hand-written Java code in this repository: the client, the
-broker, the test kit, the shared sources in `mqtj-common`, and the tests. Tests follow the same
+broker, the test kit, the shared sources in `hato-common`, and the tests. Tests follow the same
 rules; test-specific treatment is noted in the relevant sections. The copies of the shared
 sources that the build generates are out of scope; edit the originals.
 Code examples are shortened for explanation and omit imports and surrounding declarations.
@@ -40,7 +40,7 @@ This value takes a different shape in production code and in test code.
 
 **Production code is written so that its behavior can be read from the source.**
 
-State in the code which objects are used and which operations are called. MQTJ uses no
+State in the code which objects are used and which operations are called. Hato uses no
 framework, reflection, or runtime code generation: collaborators are wired explicitly through
 constructors and builders, so the reader never has to guess what happens (see CONTRIBUTING.md).
 
@@ -61,7 +61,7 @@ community. For example, the case of identifiers follows these defaults.
 | --- | --- | --- |
 | Types (class, interface, record, enum, and so on) | UpperCamelCase | `ClientId`, `SessionStore` |
 | Methods, ordinary fields, parameters, local variables | lowerCamelCase | `findSubscription`, `clientId` |
-| Packages | lowercase | `org.mqtt4j.mqtj` |
+| Packages | lowercase | `org.mqtt4j.hato` |
 
 Rules stated explicitly in this document take precedence over these defaults; for example,
 constants and shared fields follow section 2.4 and test method names follow section 8.1. Where
@@ -121,7 +121,7 @@ within each group.
 
 1. Java standard library
 2. Third-party libraries
-3. `org.mqtt4j.mqtj.*`
+3. `org.mqtt4j.hato.*`
 4. Static imports
 
 Leave no unused or redundant imports. Static imports such as `requireNonNull` and AssertJ's
@@ -474,7 +474,7 @@ describes.
 
 **MUST**
 
-Non-null is the default contract in MQTJ, and every package says so: its `package-info.java`
+Non-null is the default contract in Hato, and every package says so: its `package-info.java`
 carries JSpecify's `@NullMarked`. Callers pass non-null values, and callees are written on that
 assumption. Mark nullable declarations with `@Nullable`; the annotation expresses the departure
 from the default, that is, that null is allowed.

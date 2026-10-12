@@ -45,4 +45,4 @@ jobs:
         with:
           validate-wrappers: true
       - run: ./gradlew :native-smoke:nativeCompile
-      - run: ./native-smoke/build/native/nativeCompile/mqtj-native-smoke
+      - run: ./native-smoke/build/native/nativeCompile/hato-native-smoke
