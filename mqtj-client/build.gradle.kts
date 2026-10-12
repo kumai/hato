@@ -3,7 +3,8 @@ plugins {
     id("mqtj.standalone-jar")
 }
 
-description = "MQTT 3.1.1 and 5.0 client for Java. One jar, no runtime dependencies."
+// Published in every version's POM, which cannot change after release: describe no planned feature.
+description = "MQTT client for Java. One jar, no runtime dependencies."
 
 // Version and QoS have one source definition in common. In the client they are the public
 // API values themselves, so there is no second internal enum and no converting wrapper.

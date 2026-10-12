@@ -14,6 +14,27 @@ java {
     withJavadocJar()
 }
 
+for (taskName in listOf("jar", "sourcesJar")) {
+    tasks.named<Jar>(taskName) {
+        from(layout.settingsDirectory.file("LICENSE")) {
+            into("META-INF")
+        }
+    }
+}
+
+tasks.named<Javadoc>("javadoc") {
+    exclude("**/internal/**")
+    // Public signatures may refer to internal supertypes. Resolve those sources without
+    // including their pages in the published API documentation.
+    inputs.files(sourceSets.main.map { it.allJava })
+        .withPropertyName("resolutionSources")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    (options as StandardJavadocDocletOptions).addStringOption(
+        "-source-path",
+        sourceSets.main.get().java.sourceDirectories.asPath
+    )
+}
+
 tasks.named<Jar>("jar") {
     manifest {
         attributes(

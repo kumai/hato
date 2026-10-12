@@ -14,8 +14,7 @@ publishing {
             pom {
                 name = project.name
                 description = provider { project.description }
-                // TODO: fill in the URLs and the developer entry before the first release.
-                url = "https://github.com/TODO/mqtj"
+                url = "https://github.com/kumai/mqtj"
                 licenses {
                     license {
                         name = "MIT License"
@@ -24,14 +23,15 @@ publishing {
                 }
                 developers {
                     developer {
-                        id = "TODO"
-                        name = "TODO"
+                        id = "kumai"
+                        name = "Ryuichi Kumai"
+                        url = "https://github.com/kumai"
                     }
                 }
                 scm {
-                    url = "https://github.com/TODO/mqtj"
-                    connection = "scm:git:https://github.com/TODO/mqtj.git"
-                    developerConnection = "scm:git:ssh://git@github.com/TODO/mqtj.git"
+                    url = "https://github.com/kumai/mqtj"
+                    connection = "scm:git:https://github.com/kumai/mqtj.git"
+                    developerConnection = "scm:git:ssh://git@github.com/kumai/mqtj.git"
                 }
             }
         }

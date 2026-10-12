@@ -25,6 +25,8 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathFactory;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -427,10 +429,6 @@ class DistributionTest {
     void publication_metadata_has_only_the_intended_dependencies() throws Exception {
         List<Path> metadata = paths(System.getProperty("publication.metadata"));
         assertThat(metadata).hasSize(6);
-        var xml = DocumentBuilderFactory.newInstance();
-        xml.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-        xml.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
-        xml.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
         for (Path path : metadata) {
             String contents = Files.readString(path);
             assertThat(contents).doesNotContain(
@@ -440,7 +438,7 @@ class DistributionTest {
                     "jspecify"
             );
             if (path.toString().endsWith(".xml")) {
-                Document document = xml.newDocumentBuilder().parse(path.toFile());
+                Document document = readPom(path);
                 NodeList groups = document.getElementsByTagName("groupId");
                 assertThat(groups.getLength()).isPositive();
                 for (int index = 0; index < groups.getLength(); index++) {
@@ -484,6 +482,119 @@ class DistributionTest {
                 }
             }
         }
+    }
+
+    @Test
+    void publication_poms_identify_the_project_license_developer_and_sources() throws Exception {
+        List<Path> poms = paths(System.getProperty("publication.metadata")).stream()
+                .filter(path -> path.toString().endsWith(".xml"))
+                .toList();
+        assertThat(poms).hasSize(3);
+        XPath xpath = XPathFactory.newInstance().newXPath();
+        var artifacts = new HashSet<String>();
+        for (Path pom : poms) {
+            Document document = readPom(pom);
+            artifacts.add(xpath.evaluate("/project/artifactId", document));
+            assertThat(Files.readString(pom)).as("POM %s", pom).doesNotContainIgnoringCase("TODO");
+            for (String field : List.of(
+                    "name",
+                    "description",
+                    "url",
+                    "licenses/license/name",
+                    "licenses/license/url",
+                    "developers/developer/id",
+                    "developers/developer/name",
+                    "developers/developer/url",
+                    "scm/connection",
+                    "scm/developerConnection",
+                    "scm/url"
+            )) {
+                assertThat(xpath.evaluate("/project/" + field, document))
+                        .as("%s in %s", field, pom)
+                        .isNotBlank();
+            }
+        }
+        assertThat(artifacts)
+                .containsExactlyInAnyOrder("mqtj-client", "mqtj-broker", "mqtj-testkit");
+    }
+
+    @Test
+    void javadoc_jars_document_only_the_public_api_in_english() throws Exception {
+        List<Path> javadocs = paths(System.getProperty("javadoc.jars"));
+        assertThat(javadocs).extracting(DistributionTest::ownerOf)
+                .containsExactlyInAnyOrder("client", "broker", "testkit");
+        for (Path javadoc : javadocs) {
+            Path library = List.of(CLIENT, BROKER, testkitJar()).stream()
+                    .filter(path -> ownerOf(path).equals(ownerOf(javadoc)))
+                    .findFirst()
+                    .orElseThrow();
+            ModuleDescriptor descriptor = ModuleFinder.of(library).findAll().iterator().next()
+                    .descriptor();
+            String modulePrefix = descriptor.name() + "/";
+            Set<String> packages = descriptor.exports().stream()
+                    .map(export -> export.source().replace('.', '/'))
+                    .collect(Collectors.toSet());
+            try (var archive = new ZipFile(javadoc.toFile())) {
+                List<String> pages = archive.stream()
+                        .map(ZipEntry::getName)
+                        .filter(name -> name.endsWith(".html"))
+                        .toList();
+                assertThat(pages).as("Javadoc pages in %s", javadoc).isNotEmpty()
+                        .noneMatch(name -> List.of(name.split("/")).contains("internal"));
+                for (String page : pages) {
+                    var contents = new String(
+                            archive.getInputStream(archive.getEntry(page)).readAllBytes(),
+                            UTF_8
+                    );
+                    assertThat(contents).as("%s in %s", page, javadoc)
+                            .contains("<html lang=\"en\">");
+                    if (page.contains("/")) {
+                        assertThat(page).startsWith(modulePrefix);
+                        String relative = page.substring(modulePrefix.length());
+                        if (relative.contains("/")) {
+                            assertThat(packages).as("Package of %s", page)
+                                    .contains(relative.substring(0, relative.lastIndexOf('/')));
+                        }
+                    }
+                }
+                for (String packagePath : packages) {
+                    assertThat(pages)
+                            .contains(modulePrefix + packagePath + "/package-summary.html");
+                }
+                for (String type : publicTypes(library)) {
+                    assertThat(pages)
+                            .contains(modulePrefix + type.replace('.', '/').replace('$', '.')
+                                    + ".html");
+                }
+            }
+        }
+    }
+
+    @Test
+    void runtime_and_source_jars_include_the_repository_license() throws Exception {
+        byte[] license = Files.readAllBytes(Path.of(System.getProperty("repository.license")));
+        List<Path> sources = paths(System.getProperty("source.jars"));
+        assertThat(sources).extracting(DistributionTest::ownerOf)
+                .containsExactlyInAnyOrder("client", "broker", "testkit");
+        var archives = new ArrayList<>(List.of(CLIENT, BROKER, testkitJar()));
+        archives.addAll(sources);
+        for (Path path : archives) {
+            try (var archive = new ZipFile(path.toFile())) {
+                ZipEntry entry = archive.getEntry("META-INF/LICENSE");
+                assertThat(entry).as("LICENSE in %s", path).isNotNull();
+                assertThat(archive.getInputStream(entry).readAllBytes())
+                        .as("LICENSE in %s", path)
+                        .isEqualTo(license);
+            }
+        }
+    }
+
+    private static Document readPom(Path path) throws Exception {
+        var xml = DocumentBuilderFactory.newInstance();
+        xml.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        xml.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+        xml.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+        return xml.newDocumentBuilder().parse(path.toFile());
     }
 
     private void runClasspathProbe(String name, String classpath, String body) throws Exception {

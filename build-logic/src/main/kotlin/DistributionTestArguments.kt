@@ -24,6 +24,14 @@ abstract class DistributionTestArguments : CommandLineArgumentProvider {
 
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.NONE)
+    abstract val javadocJars: ConfigurableFileCollection
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val repositoryLicense: ConfigurableFileCollection
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NONE)
     abstract val publicationMetadata: ConfigurableFileCollection
 
     override fun asArguments(): Iterable<String> = listOf(
@@ -31,6 +39,8 @@ abstract class DistributionTestArguments : CommandLineArgumentProvider {
         "-Dbroker.jar=${brokerJar.singleFile.absolutePath}",
         "-Dtestkit.jars=${testkitJars.asPath}",
         "-Dsource.jars=${sourceJars.asPath}",
+        "-Djavadoc.jars=${javadocJars.asPath}",
+        "-Drepository.license=${repositoryLicense.singleFile.absolutePath}",
         "-Dpublication.metadata=${publicationMetadata.asPath}",
     )
 }

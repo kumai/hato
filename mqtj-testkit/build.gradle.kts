@@ -2,7 +2,8 @@ plugins {
     id("mqtj.embedded-common")
 }
 
-description = "Test support for applications that use MQTJ: embedded broker, fake client, fault injection, and manual scheduler."
+// Published in every version's POM, which cannot change after release: describe no planned feature.
+description = "Test support for applications that use MQTJ: fault injection and a manual timer scheduler."
 
 dependencies {
     api(project(":mqtj-client"))

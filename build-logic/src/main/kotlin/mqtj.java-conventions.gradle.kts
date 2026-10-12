@@ -36,7 +36,7 @@ tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
     options.release = 25
     // Every lint category is on and warnings fail the build. Turn a category off here only with a reason.
-    options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror"))
+    options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror", "-Xdoclint:all,-missing"))
     options.errorprone {
         // Error Prone is the vehicle for NullAway only; its own bug patterns are not enabled.
         disableAllChecks = true
@@ -56,6 +56,7 @@ checkstyle {
 
 tasks.withType<Javadoc>().configureEach {
     options.encoding = "UTF-8"
+    options.locale = "en"
     // Javadoc is written in Markdown (JEP 467). Missing comments are not an error; wrong ones are.
     (options as StandardJavadocDocletOptions).addBooleanOption("Xdoclint:all,-missing", true)
 }
