@@ -22,6 +22,10 @@ import static java.util.Objects.requireNonNull;
 /// Each class owns a static log named after that class. Package names identify the distribution;
 /// individual class names are implementation details. Implementing `System.Logger` lets JUL infer
 /// the actual caller through this facade. Parameterized overloads all use `{}`, not MessageFormat.
+///
+/// A failing backend never reaches the caller. Logging happens in cleanup, notification, and
+/// failure-reporting paths, so a throwing handler must not interrupt them or replace the
+/// failure being reported.
 public final class Log implements System.Logger {
 
     private final System.Logger logger;
@@ -64,7 +68,11 @@ public final class Log implements System.Logger {
             String message,
             @Nullable Throwable thrown
     ) {
-        logger.log(level, bundle, message, thrown);
+        try {
+            logger.log(level, bundle, message, thrown);
+        } catch (Throwable _) {
+            // The statement is lost; the caller continues.
+        }
     }
 
     @Override
@@ -108,18 +116,22 @@ public final class Log implements System.Logger {
             String message,
             @Nullable Object[] args
     ) {
-        if (!logger.isLoggable(level)) {
-            return;
+        try {
+            if (!logger.isLoggable(level)) {
+                return;
+            }
+            // As in SLF4J, a trailing Throwable that no placeholder consumes is the cause.
+            int used = args.length;
+            Throwable thrown = null;
+            if (used > countPlaceholders(message) && args[used - 1] instanceof Throwable last) {
+                thrown = last;
+                used--;
+            }
+            String text = substitute(message, args, used);
+            logger.log(level, bundle, text, thrown);
+        } catch (Throwable _) {
+            // The statement is lost; the caller continues.
         }
-        // As in SLF4J, a trailing Throwable that no placeholder consumes is the cause.
-        int used = args.length;
-        Throwable thrown = null;
-        if (used > countPlaceholders(message) && args[used - 1] instanceof Throwable last) {
-            thrown = last;
-            used--;
-        }
-        String text = substitute(message, args, used);
-        logger.log(level, bundle, text, thrown);
     }
 
     private static int countPlaceholders(String message) {

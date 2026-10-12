@@ -166,6 +166,20 @@ class LogTest {
     }
 
     @Test
+    void a_failing_backend_does_not_reach_the_caller() {
+        // Arrange
+        var logger = new FailingLogger();
+        var sut = Log.of(logger);
+
+        // Act
+        sut.warn("value {}", 1);
+        sut.log(Level.ERROR, null, "text", new IllegalStateException("reported failure"));
+
+        // Assert: both statements reached the backend and returned normally.
+        assertThat(logger.calls).isEqualTo(2);
+    }
+
+    @Test
     void class_based_logs_are_named_after_the_class() {
         assertThat(Log.of(LogTest.class).getName()).isEqualTo(LogTest.class.getName());
         assertThat(Log.of("org.mqtt4j.hato.test").getName()).isEqualTo("org.mqtt4j.hato.test");
@@ -216,6 +230,34 @@ class LogTest {
                     .as("the facade must not delegate formatting to System.Logger")
                     .isNull();
             records.add(new Record(level, format, null));
+        }
+    }
+
+    /// A broken handler: every statement that reaches it throws.
+    private static final class FailingLogger implements System.Logger {
+
+        int calls;
+
+        @Override
+        public String getName() {
+            return "failing";
+        }
+
+        @Override
+        public boolean isLoggable(Level level) {
+            return true;
+        }
+
+        @Override
+        public void log(Level level, ResourceBundle bundle, String message, Throwable thrown) {
+            calls++;
+            throw new AssertionError("Logging backend failed");
+        }
+
+        @Override
+        public void log(Level level, ResourceBundle bundle, String format, Object... params) {
+            calls++;
+            throw new AssertionError("Logging backend failed");
         }
     }
 }

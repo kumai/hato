@@ -402,11 +402,7 @@ public final class FaultyTransport implements Transport {
             try {
                 pending.cancellation.cancel();
             } catch (Throwable failure) {
-                try {
-                    log.warn("Transport delay cancellation failed", failure);
-                } catch (Throwable _) {
-                    // A broken logging backend must not prevent closing and returning ownership.
-                }
+                log.warn("Transport delay cancellation failed", failure);
             }
         }
     }

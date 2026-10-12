@@ -638,12 +638,8 @@ final class DeliveryLanes {
     }
 
     private boolean reportFailure(Lane lane, DeliveryToken token, Throwable failure) {
-        try {
-            log.warn("Delivery lane failed for {} (subscription {}, generation {})",
-                    clientId, lane.id, token.connection(), failure);
-        } catch (Throwable _) {
-            // A logging backend must not replace the original failure or suppress notification.
-        }
+        log.warn("Delivery lane failed for {} (subscription {}, generation {})",
+                clientId, lane.id, token.connection(), failure);
         Throwable callbackFailure = null;
         boolean paused;
         lock.lock();
@@ -659,11 +655,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (callbackFailure != null) {
-            try {
-                log.warn("Delivery failure notification failed for {}", clientId, callbackFailure);
-            } catch (Throwable _) {
-                // Both reporting paths failed; the lane resumes without notifying twice.
-            }
+            log.warn("Delivery failure notification failed for {}", clientId, callbackFailure);
         }
         return paused;
     }
