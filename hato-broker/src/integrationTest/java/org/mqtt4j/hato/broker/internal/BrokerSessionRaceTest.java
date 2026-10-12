@@ -343,7 +343,7 @@ class BrokerSessionRaceTest {
                 .scheduler(timer);
     }
 
-    private static RawSession persistent(int port, boolean sessionPresent) throws Exception {
+    static RawSession persistent(int port, boolean sessionPresent) throws Exception {
         RawSession session = RawSession.open(port);
         try {
             session.send(connect("subscriber", false, 1));
@@ -360,7 +360,7 @@ class BrokerSessionRaceTest {
         return IntStream.range(0, 100);
     }
 
-    private static void awaitRelease(CountDownLatch release) {
+    static void awaitRelease(CountDownLatch release) {
         try {
             assertThat(release.await(5, SECONDS)).isTrue();
         } catch (InterruptedException failure) {

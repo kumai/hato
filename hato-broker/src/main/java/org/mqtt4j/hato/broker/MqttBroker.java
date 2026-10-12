@@ -8,20 +8,24 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 
 /// An experimental, in-memory MQTT 3.1.1 broker for tests.
 ///
-/// Each start creates an independent broker. Clean Session true and false and QoS 0/1
+/// Each start creates an independent broker. Clean Session true and false and QoS 0/1/2
 /// publications are supported. A persistent session retains subscriptions, unacknowledged
-/// QoS 1 deliveries, and queued QoS 1 deliveries while disconnected. Reconnecting with the
-/// same identifier resumes it with Session Present true and closes any previous connection
-/// with that identifier; Clean Session true discards its previous session.
-/// Incomplete QoS 1 deliveries resume before queued deliveries. A delivery whose transmission
+/// QoS 1/2 deliveries, received QoS 2 identifiers awaiting PUBREL, and queued QoS 1/2 deliveries
+/// while disconnected. Reconnecting with the same identifier resumes it with Session Present
+/// true and closes any previous connection with that identifier; Clean Session true discards
+/// its previous session.
+/// Incomplete QoS 1/2 deliveries resume before queued deliveries. A PUBLISH whose transmission
 /// was attempted but remains unacknowledged uses DUP true; one whose transmission has not
-/// started uses DUP false.
+/// started uses DUP false. Once PUBREC has arrived, QoS 2 resumes with PUBREL instead of PUBLISH.
+/// Incoming QoS 2 publications are forwarded on PUBLISH; repeated PUBLISH packets with the same
+/// identifier before PUBREL are acknowledged without forwarding again. A QoS 1 PUBLISH that
+/// reuses such an identifier ends that wait, as a client that lost its session state does.
 /// Offline QoS 0 deliveries are discarded. Wills are refused with Server unavailable;
 /// an empty identifier with Clean Session false is refused with Identifier rejected.
 /// Retained publications are forwarded to current subscribers but are not stored.
 /// Credentials are not checked. `$share/` filters are matched literally, without shared routing.
 ///
-/// QoS 1 deliveries wait when unacknowledged deliveries reach their count or size limit.
+/// QoS 1/2 deliveries wait when unacknowledged deliveries reach their count or size limit.
 /// Deliveries also wait while a subscriber's connection is slow to accept data. The number and
 /// total size of waiting deliveries are bounded. Exceeding either limit discards that session
 /// and closes its connection, if any; its next connection has Session Present false. A delivery

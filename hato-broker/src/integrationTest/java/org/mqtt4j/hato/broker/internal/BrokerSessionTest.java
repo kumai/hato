@@ -41,7 +41,7 @@ class BrokerSessionTest {
             try (RawSession previous = connected(sut.port(), "saved", false, false)) {
                 previous.subscribe("saved/#", AT_LEAST_ONCE);
                 if (graceful) {
-                    disconnect(previous);
+                    previous.disconnect();
                 } else {
                     previous.close();
                 }
@@ -62,7 +62,7 @@ class BrokerSessionTest {
             try (RawSession previous = connected(sut.port(), "offline", false, false)) {
                 previous.subscribe("offline/#", AT_LEAST_ONCE);
                 previous.subscribe("zero/#", AT_MOST_ONCE);
-                disconnect(previous);
+                previous.disconnect();
             }
             publisher.publish("offline/topic", "first", AT_LEAST_ONCE, 7);
             publisher.publish("offline/topic", "discard qos zero", AT_MOST_ONCE, 0);
@@ -99,7 +99,7 @@ class BrokerSessionTest {
                 publisher.publish("ordered", "queued-first", AT_LEAST_ONCE, 7);
                 publisher.publish("ordered", "queued-second", AT_LEAST_ONCE, 7);
                 previous.ping();
-                disconnect(previous);
+                previous.disconnect();
             }
 
             // connected() consumes CONNACK first, before any resumed publication.
@@ -193,7 +193,7 @@ class BrokerSessionTest {
             previous.subscribe("bounded", AT_LEAST_ONCE);
             unaffected.subscribe("bounded", AT_MOST_ONCE);
             if (offline) {
-                disconnect(previous);
+                previous.disconnect();
             } else {
                 publisher.publish("bounded", "held", AT_LEAST_ONCE, 7);
                 expectDelivery(previous, "bounded", "held");
@@ -236,7 +236,7 @@ class BrokerSessionTest {
                 RawSession publisher = connected(sut.port(), "publisher")) {
             previous.subscribe("oversized", AT_LEAST_ONCE);
             if (offline) {
-                disconnect(previous);
+                previous.disconnect();
             }
 
             // This fits the pending queue and socket queue, but never the inflight byte window.
@@ -341,7 +341,7 @@ class BrokerSessionTest {
             try (RawSession resumed = connected(sut.port(), "retained", false, true)) {
                 previous.expectClosed();
                 resumed.ping();
-                disconnect(resumed);
+                resumed.disconnect();
             }
             assertPersistentRefused(sut.port(), "new-id");
             try (RawSession clean = connected(sut.port(), "unrelated-clean")) {
@@ -361,7 +361,7 @@ class BrokerSessionTest {
         try (var sut = MqttBroker.start();
                 RawSession previous = connected(sut.port(), "restart", false, false)) {
             previous.subscribe("restart", AT_LEAST_ONCE);
-            disconnect(previous);
+            previous.disconnect();
             previous.close();
             var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), sut.port());
 
@@ -433,11 +433,6 @@ class BrokerSessionTest {
     private static void acknowledge(RawSession receiver, Packet.Publish publication)
             throws IOException {
         receiver.send(new Packet.PubAck(publication.packetId(), SUCCESS, EMPTY));
-    }
-
-    private static void disconnect(RawSession connection) throws Exception {
-        connection.send(new Packet.Disconnect(SUCCESS, EMPTY));
-        connection.expectClosed();
     }
 
     private static void assertPersistentRefused(int port, String clientId) throws Exception {

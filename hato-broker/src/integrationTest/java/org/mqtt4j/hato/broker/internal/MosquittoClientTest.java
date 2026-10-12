@@ -3,15 +3,16 @@ package org.mqtt4j.hato.broker.internal;
 import java.time.Duration;
 import java.util.List;
 
+import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.DockerClientFactory;
 import org.testcontainers.Testcontainers;
 import org.testcontainers.containers.Container;
+import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
@@ -30,21 +31,40 @@ class MosquittoClientTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {0, 1})
+    @ValueSource(ints = {0, 1, 2})
     void independent_mosquitto_clients_exchange_the_requested_qos(int qos) throws Exception {
-        try (var sut = MqttBroker.start(); var clientTools = Mosquitto.container()) {
+        // Arrange
+        try (
+                var sut = MqttBroker.start();
+                GenericContainer<?> clientTools = Mosquitto.container()
+        ) {
             Testcontainers.exposeHostPorts(sut.port());
             Mosquitto.start(clientTools);
             String port = Integer.toString(sut.port());
             String level = Integer.toString(qos);
             String topic = "interop/qos" + qos;
             var output = new StringBuffer();
-            var docker = DockerClientFactory.instance().client();
+            DockerClient docker = DockerClientFactory.instance().client();
             String subscription = docker.execCreateCmd(clientTools.getContainerId())
                     .withCmd(
-                            "mosquitto_sub", "-h", "host.testcontainers.internal", "-p", port,
-                            "-V", "mqttv311", "-q", level, "-t", topic,
-                            "-C", "1", "-W", "10", "-d", "-F", "%q %p"
+                            "mosquitto_sub",
+                            "-h",
+                            "host.testcontainers.internal",
+                            "-p",
+                            port,
+                            "-V",
+                            "mqttv311",
+                            "-q",
+                            level,
+                            "-t",
+                            topic,
+                            "-C",
+                            "1",
+                            "-W",
+                            "10",
+                            "-d",
+                            "-F",
+                            "%q %p"
                     )
                     // A terminal makes the CLI's debug output line-buffered, so SUBACK is
                     // observed before publishing without a guessed startup delay.
@@ -63,11 +83,10 @@ class MosquittoClientTest {
                 await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                         assertThat(output.toString()).contains("Subscribed (mid: 1): " + qos));
 
-                Container.ExecResult published = clientTools.execInContainer(
-                        "mosquitto_pub", "-h", "host.testcontainers.internal", "-p", port,
-                        "-V", "mqttv311", "-q", level, "-t", topic, "-m", "independent exchange"
-                );
-                assertThat(published.getExitCode()).as(published.getStderr()).isZero();
+                // Act
+                publish(clientTools, port, level, topic, "independent exchange");
+
+                // Assert
                 assertThat(callback.awaitCompletion(10, SECONDS)).isTrue();
                 assertThat(docker.inspectExecCmd(subscription).exec().getExitCodeLong()).isZero();
                 assertThat(output.toString().lines().toList())
@@ -76,31 +95,58 @@ class MosquittoClientTest {
         }
     }
 
-    @Test
-    void independent_mosquitto_client_resumes_queued_qos_one_deliveries() throws Exception {
-        try (var sut = MqttBroker.start(); var clientTools = Mosquitto.container()) {
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2})
+    void independent_mosquitto_client_resumes_queued_qos_one_and_two_deliveries(int qos)
+            throws Exception {
+        // Arrange
+        try (
+                var sut = MqttBroker.start();
+                GenericContainer<?> clientTools = Mosquitto.container()
+        ) {
             Testcontainers.exposeHostPorts(sut.port());
             Mosquitto.start(clientTools);
             String port = Integer.toString(sut.port());
             String topic = "interop/persistent";
-            var docker = DockerClientFactory.instance().client();
+            String level = Integer.toString(qos);
+            DockerClient docker = DockerClientFactory.instance().client();
+            // Act & Assert: register, disconnect, publish offline, and resume the subscription.
             for (int attempt = 0; attempt < 2; attempt++) {
                 if (attempt == 1) {
-                    for (String payload : List.of("offline first", "offline second")) {
-                        Container.ExecResult published = clientTools.execInContainer(
-                                "mosquitto_pub", "-h", "host.testcontainers.internal", "-p", port,
-                                "-V", "mqttv311", "-q", "1", "-t", topic, "-m", payload
+                    for (int publishedQos : List.of(1, 2)) {
+                        publish(
+                                clientTools,
+                                port,
+                                Integer.toString(publishedQos),
+                                topic,
+                                "offline qos " + publishedQos
                         );
-                        assertThat(published.getExitCode()).as(published.getStderr()).isZero();
                     }
                 }
                 var output = new StringBuffer();
                 String subscription = docker.execCreateCmd(clientTools.getContainerId())
                         .withCmd(
-                                "mosquitto_sub", "-h", "host.testcontainers.internal", "-p", port,
-                                "-V", "mqttv311", "-c", "-i", "persistent-subscriber",
-                                "-q", "1", "-t", topic, "-C", attempt == 0 ? "1" : "2",
-                                "-W", "10", "-d", "-F", "%q %p"
+                                "mosquitto_sub",
+                                "-h",
+                                "host.testcontainers.internal",
+                                "-p",
+                                port,
+                                "-V",
+                                "mqttv311",
+                                "-c",
+                                "-i",
+                                "persistent-subscriber",
+                                "-q",
+                                level,
+                                "-t",
+                                topic,
+                                "-C",
+                                attempt == 0 ? "1" : "2",
+                                "-W",
+                                "10",
+                                "-d",
+                                "-F",
+                                "%q %p"
                         )
                         .withTty(true)
                         .withAttachStdout(true)
@@ -116,23 +162,49 @@ class MosquittoClientTest {
                     docker.execStartCmd(subscription).withTty(true).exec(callback);
                     if (attempt == 0) {
                         await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                                assertThat(output.toString()).contains("Subscribed (mid: 1): 1"));
-                        Container.ExecResult published = clientTools.execInContainer(
-                                "mosquitto_pub", "-h", "host.testcontainers.internal", "-p", port,
-                                "-V", "mqttv311", "-q", "1", "-t", topic, "-m", "registered"
-                        );
-                        assertThat(published.getExitCode()).as(published.getStderr()).isZero();
+                                assertThat(output.toString())
+                                        .contains("Subscribed (mid: 1): " + qos));
+                        publish(clientTools, port, level, topic, "registered");
                     }
                     assertThat(callback.awaitCompletion(10, SECONDS)).isTrue();
                     assertThat(docker.inspectExecCmd(subscription).exec().getExitCodeLong())
                             .isZero();
-                    var payloads = output.toString().lines()
-                            .filter(line -> line.startsWith("1 ")).toList();
-                    assertThat(payloads).containsExactlyElementsOf(attempt == 0
-                            ? List.of("1 registered")
-                            : List.of("1 offline first", "1 offline second"));
+                    List<String> payloads = output.toString().lines()
+                            .filter(line -> line.startsWith("1 ") || line.startsWith("2 "))
+                            .toList();
+                    assertThat(payloads).containsExactlyElementsOf(
+                            attempt == 0
+                                    ? List.of(level + " registered")
+                                    : List.of("1 offline qos 1", level + " offline qos 2")
+                    );
                 }
             }
         }
+    }
+
+    /// Publishes `message` with the image's `mosquitto_pub` and checks that the command succeeded.
+    private static void publish(
+            GenericContainer<?> clientTools,
+            String port,
+            String qos,
+            String topic,
+            String message
+    ) throws Exception {
+        Container.ExecResult published = clientTools.execInContainer(
+                "mosquitto_pub",
+                "-h",
+                "host.testcontainers.internal",
+                "-p",
+                port,
+                "-V",
+                "mqttv311",
+                "-q",
+                qos,
+                "-t",
+                topic,
+                "-m",
+                message
+        );
+        assertThat(published.getExitCode()).as(published.getStderr()).isZero();
     }
 }

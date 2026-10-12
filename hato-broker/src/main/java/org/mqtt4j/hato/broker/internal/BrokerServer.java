@@ -7,6 +7,7 @@ import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -53,8 +54,8 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int MAX_INFLIGHT = 128;
 
-    // Control responses queue apart from deliveries, up to the 128 the regular queue allowed
-    // them before sessions. A client's pipelined requests beyond that close the connection.
+    // Responses to a client's requests queue apart from deliveries and PUBRELs, up to the 128
+    // the regular queue allowed them before sessions. Requests beyond that close the connection.
     private static final int RESERVED_COUNT = 128;
 
     private static final long RESERVED_BYTES = 1024 * 1024;
@@ -319,7 +320,16 @@ public final class BrokerServer implements AutoCloseable {
 
         private final PacketIds packetIds = new PacketIds();
 
-        private final Map<Integer, Delivery> inflight = new LinkedHashMap<>();
+        private final LinkedHashMap<Integer, Outgoing> inflight = new LinkedHashMap<>();
+
+        // Replays and PUBRELs waiting for space in the current connection's send queue, at most
+        // one per inflight identifier. It lives for one connection: resume() rebuilds it from
+        // inflight, and detaching the connection drops it.
+        private final LinkedHashMap<Integer, Outgoing> deferred = new LinkedHashMap<>();
+
+        // Only identifiers are retained for inbound QoS 2. The set grows by doubling on first use,
+        // so the 16-bit identifier space bounds it to 16 KiB.
+        private final BitSet received = new BitSet();
 
         private final ArrayDeque<Delivery> pending = new ArrayDeque<>();
 
@@ -359,16 +369,8 @@ public final class BrokerServer implements AutoCloseable {
         }
 
         private void resume() {
-            Connection peer = connection;
-            if (peer == null) {
-                return;
-            }
-            // The window fits this fresh connection's regular queue. CONNACK uses reserved space.
-            for (Delivery delivery : inflight.values()) {
-                if (peer.enqueue(delivery) != SendQueue.OfferResult.ACCEPTED) {
-                    return;
-                }
-            }
+            deferred.clear();
+            deferred.putAll(inflight);
             drain();
         }
 
@@ -376,6 +378,15 @@ public final class BrokerServer implements AutoCloseable {
             Connection peer = connection;
             if (peer == null || peer.isEnded()) {
                 return;
+            }
+            // Replays and PUBRELs precede new deliveries in the regular queue. When it is full,
+            // draining pauses here and the writer resumes it after freeing space.
+            while (!deferred.isEmpty()) {
+                Outgoing outgoing = deferred.firstEntry().getValue();
+                if (peer.enqueue(outgoing) != SendQueue.OfferResult.ACCEPTED) {
+                    return;
+                }
+                deferred.pollFirstEntry();
             }
             Delivery delivery;
             while ((delivery = pending.peekFirst()) != null) {
@@ -405,13 +416,47 @@ public final class BrokerServer implements AutoCloseable {
             }
         }
 
-        private void acknowledge(int id) {
-            Delivery delivery = inflight.remove(id);
-            if (delivery != null) {
-                packetIds.release(id);
-                inflightBytes -= delivery.byteCount;
-                drain();
+        private void acknowledge(int id, boolean complete) throws IOException {
+            Outgoing outgoing = inflight.get(id);
+            if (outgoing == null) {
+                return;
             }
+            boolean expected = complete
+                    ? outgoing instanceof Release
+                    : outgoing instanceof Delivery delivery && delivery.qos == Qos.AT_LEAST_ONCE;
+            if (!expected) {
+                throw new IOException("Acknowledgement does not match the outgoing QoS stage");
+            }
+            inflight.remove(id);
+            deferred.remove(id);
+            packetIds.release(id);
+            if (outgoing instanceof Delivery delivery) {
+                inflightBytes -= delivery.byteCount;
+            }
+            drain();
+        }
+
+        private void release(int id) throws IOException {
+            Outgoing outgoing = inflight.get(id);
+            if (outgoing == null) {
+                return;
+            }
+            // Drop the body on PUBREC, but retain the identifier and count until PUBCOMP.
+            // Moving to the end preserves PUBREC order for both initial and replayed PUBREL.
+            switch (outgoing) {
+                case Delivery delivery -> {
+                    if (delivery.qos != Qos.EXACTLY_ONCE) {
+                        throw new IOException("PUBREC does not match the outgoing QoS stage");
+                    }
+                    inflightBytes -= delivery.byteCount;
+                    var release = new Release(id);
+                    inflight.putLast(id, release);
+                    deferred.putLast(id, release);
+                }
+                // Duplicate PUBREC shares an unsent response without moving it behind later ids.
+                case Release release -> deferred.putIfAbsent(id, release);
+            }
+            drain();
         }
 
         private void detach(Connection peer) {
@@ -419,6 +464,7 @@ public final class BrokerServer implements AutoCloseable {
                 return;
             }
             connection = null;
+            deferred.clear();
             if (!persistent) {
                 sessions.remove(clientId, this);
                 clear();
@@ -436,7 +482,9 @@ public final class BrokerServer implements AutoCloseable {
 
         private void clear() {
             subscriptions.clear();
+            received.clear();
             inflight.clear();
+            deferred.clear();
             pending.clear();
             inflightBytes = 0;
             pendingBytes = 0;
@@ -453,7 +501,20 @@ public final class BrokerServer implements AutoCloseable {
         }
     }
 
-    private static final class Delivery {
+    private sealed interface Outgoing {
+
+        Packet packet();
+    }
+
+    private record Release(int packetId) implements Outgoing {
+
+        @Override
+        public Packet.PubRel packet() {
+            return new Packet.PubRel(packetId, ReasonCode.SUCCESS, Properties.EMPTY);
+        }
+    }
+
+    private static final class Delivery implements Outgoing {
 
         private final Packet.Publish publication;
 
@@ -473,13 +534,15 @@ public final class BrokerServer implements AutoCloseable {
                     qos,
                     false,
                     false,
-                    (qos == Qos.AT_MOST_ONCE) ? 0 : 1, Properties.EMPTY,
+                    (qos == Qos.AT_MOST_ONCE) ? 0 : 1,
+                    Properties.EMPTY,
                     publication.payload().length
             );
             byteCount = encodedHeader.length + publication.payload().length;
         }
 
-        private Packet.Publish packet() {
+        @Override
+        public Packet.Publish packet() {
             return new Packet.Publish(
                     publication.topic(),
                     publication.payload(),
@@ -527,7 +590,7 @@ public final class BrokerServer implements AutoCloseable {
 
         private long closeAfterWrite;
 
-        // A delivery found the regular queue full; the writer's next completion resumes it.
+        // A delivery or PUBREL found its queue full; the writer's next completion resumes it.
         private boolean awaitingSpace;
 
         private long lastReceived = scheduler.nanoTime();
@@ -669,7 +732,7 @@ public final class BrokerServer implements AutoCloseable {
                 if (previous != null) {
                     previous.close("taken over by " + socket.getRemoteSocketAddress());
                 }
-                // No publisher can enter between CONNACK, retransmissions, and queued deliveries.
+                // CONNACK, retransmissions, and queued deliveries stay ahead of later publications.
                 accepted.resume();
             }
             log.info("Broker accepted client {} from {} on port {}",
@@ -702,13 +765,14 @@ public final class BrokerServer implements AutoCloseable {
                 case Packet.Subscribe request -> {
                     var grants = new ArrayList<ReasonCode>();
                     for (Packet.Subscription subscription : request.subscriptions()) {
-                        Qos qos = Qos.of(Math.min(subscription.qos().level(), 1));
+                        Qos qos = subscription.qos();
                         owner.subscriptions.put(subscription.filter(), qos);
-                        grants.add(
-                                (qos == Qos.AT_MOST_ONCE)
-                                        ? ReasonCode.SUCCESS
-                                        : ReasonCode.GRANTED_QOS_1
-                        );
+                        ReasonCode granted = switch (qos) {
+                            case AT_MOST_ONCE -> ReasonCode.SUCCESS;
+                            case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
+                            case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
+                        };
+                        grants.add(granted);
                     }
                     send(new Packet.SubAck(request.packetId(), grants, Properties.EMPTY));
                 }
@@ -718,7 +782,20 @@ public final class BrokerServer implements AutoCloseable {
                 }
                 case Packet.Publish publish -> {
                     if (publish.qos() == Qos.EXACTLY_ONCE) {
-                        throw new IOException("QoS 2 publications are not supported");
+                        if (owner.received.get(publish.packetId())) {
+                            send(new Packet.PubRec(
+                                    publish.packetId(),
+                                    ReasonCode.SUCCESS,
+                                    Properties.EMPTY
+                            ));
+                            return;
+                        }
+                        owner.received.set(publish.packetId());
+                    } else if (publish.qos() == Qos.AT_LEAST_ONCE) {
+                        // Reusing the identifier abandons a QoS 2 exchange still waiting for
+                        // PUBREL, as a client that lost its state does. Its message was already
+                        // forwarded on PUBLISH, so nothing is lost.
+                        owner.received.clear(publish.packetId());
                     }
                     // Snapshot permits an overloaded target to remove itself during delivery.
                     for (Session target : List.copyOf(sessions.values())) {
@@ -740,9 +817,21 @@ public final class BrokerServer implements AutoCloseable {
                                 ReasonCode.SUCCESS,
                                 Properties.EMPTY
                         ));
+                    } else if (publish.qos() == Qos.EXACTLY_ONCE) {
+                        send(new Packet.PubRec(
+                                publish.packetId(),
+                                ReasonCode.SUCCESS,
+                                Properties.EMPTY
+                        ));
                     }
                 }
-                case Packet.PubAck ack -> owner.acknowledge(ack.packetId());
+                case Packet.PubAck ack -> owner.acknowledge(ack.packetId(), false);
+                case Packet.PubRec ack -> owner.release(ack.packetId());
+                case Packet.PubRel ack -> {
+                    owner.received.clear(ack.packetId());
+                    send(new Packet.PubComp(ack.packetId(), ReasonCode.SUCCESS, Properties.EMPTY));
+                }
+                case Packet.PubComp ack -> owner.acknowledge(ack.packetId(), true);
                 case Packet.PingReq _ -> send(new Packet.PingResp());
                 case Packet.Disconnect _ -> close("client sent DISCONNECT");
                 // Name only the type; a CONNECT's text would put its username in the INFO end log.
@@ -751,19 +840,23 @@ public final class BrokerServer implements AutoCloseable {
                      Packet.SubAck _,
                      Packet.UnsubAck _,
                      Packet.PingResp _,
-                     Packet.PubRec _,
-                     Packet.PubRel _,
-                     Packet.PubComp _,
                      Packet.Auth _ -> throw new IOException(
                              "Unexpected " + packet.getClass().getSimpleName() + " packet"
                      );
             }
         }
 
-        private synchronized SendQueue.OfferResult enqueue(Delivery delivery) {
-            SendQueue.OfferResult result = outgoing.checkCapacity(delivery.byteCount, false);
+        private synchronized SendQueue.OfferResult enqueue(Outgoing message) {
+            Delivery delivery = message instanceof Delivery value ? value : null;
+            // PUBLISH and PUBREL share the regular queue, whose window always fits a resumed
+            // session, and leave the reserved queue to responses to the client's requests.
+            // Only a PUBLISH is checked before encoding, so a full queue never copies its payload;
+            // the offer decides with the encoded size.
+            SendQueue.OfferResult result = delivery == null
+                    ? SendQueue.OfferResult.ACCEPTED
+                    : outgoing.checkCapacity(delivery.byteCount, false);
             if (result == SendQueue.OfferResult.ACCEPTED) {
-                byte[] bytes = codec.encode(delivery.packet());
+                byte[] bytes = codec.encode(message.packet());
                 result = outgoing.offer(
                         ++ticket,
                         new Outbound(bytes, delivery),

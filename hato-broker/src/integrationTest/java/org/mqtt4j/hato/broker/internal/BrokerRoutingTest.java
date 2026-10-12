@@ -18,6 +18,7 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.acknowledge;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
@@ -26,43 +27,56 @@ import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.EXACTLY_ONCE;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.GRANTED_QOS_1;
+import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.GRANTED_QOS_2;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.SUCCESS;
 
 class BrokerRoutingTest {
 
     @Test
-    void subscriptions_are_granted_in_request_order_with_a_maximum_qos_of_one() throws Exception {
-        try (var sut = MqttBroker.start(); var client = connected(sut.port(), "grants")) {
-            client.send(new Packet.Subscribe(7, List.of(
-                    subscription("zero", AT_MOST_ONCE),
-                    subscription("one", AT_LEAST_ONCE),
-                    subscription("two", EXACTLY_ONCE)
-            ), EMPTY));
+    void subscriptions_are_granted_in_request_order_including_qos_two() throws Exception {
+        try (MqttBroker sut = MqttBroker.start();
+                RawSession client = connected(sut.port(), "grants")) {
+            client.send(new Packet.Subscribe(
+                    7,
+                    List.of(
+                            subscription("zero", AT_MOST_ONCE),
+                            subscription("one", AT_LEAST_ONCE),
+                            subscription("two", EXACTLY_ONCE)
+                    ),
+                    EMPTY
+            ));
             // [MQTT-3.9.3-1], [MQTT-3.8.4-5].
             assertThat(client.expect(Packet.SubAck.class))
                     .isEqualTo(new Packet.SubAck(
-                            7, List.of(SUCCESS, GRANTED_QOS_1, GRANTED_QOS_1), EMPTY
+                            7,
+                            List.of(SUCCESS, GRANTED_QOS_1, GRANTED_QOS_2),
+                            EMPTY
                     ));
         }
     }
 
     @ParameterizedTest
-    @CsvSource({"0, 0", "0, 1", "1, 0", "1, 1"})
+    @CsvSource({"0, 0", "0, 1", "0, 2", "1, 0", "1, 1", "1, 2", "2, 0", "2, 1", "2, 2"})
     void deliveries_use_the_smaller_of_publication_and_granted_qos(int sentQos, int grantedQos)
             throws Exception {
-        try (var sut = MqttBroker.start();
-                var subscriber = connected(sut.port(), "subscriber");
-                var publisher = connected(sut.port(), "publisher")) {
+        try (MqttBroker sut = MqttBroker.start();
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                RawSession publisher = connected(sut.port(), "publisher")) {
             subscriber.subscribe("sensors/+", Qos.of(grantedQos));
             publisher.publish("sensors/temperature", "21", Qos.of(sentQos), sentQos == 0 ? 0 : 7);
             // [MQTT-3.8.4-6]. The broker allocates its own outgoing identifier.
             Packet.Publish delivery = subscriber.expect(Packet.Publish.class);
             Qos expected = Qos.of(Math.min(sentQos, grantedQos));
             assertThat(delivery).isEqualTo(publication(
-                    "sensors/temperature", "21", expected, delivery.packetId()
+                    "sensors/temperature",
+                    "21",
+                    expected,
+                    delivery.packetId()
             ));
             if (expected == AT_LEAST_ONCE) {
                 subscriber.send(new Packet.PubAck(delivery.packetId(), SUCCESS, EMPTY));
+            } else if (expected == EXACTLY_ONCE) {
+                acknowledge(subscriber, delivery);
             }
             subscriber.ping();
             publisher.ping();
@@ -80,18 +94,6 @@ class BrokerRoutingTest {
                     .isEqualTo(publication("echo", "self", AT_MOST_ONCE, 0));
             assertThat(client.expect(Packet.PubAck.class))
                     .isEqualTo(new Packet.PubAck(7, SUCCESS, EMPTY));
-        }
-    }
-
-    @Test
-    void unsupported_qos_two_closes_the_publisher_before_routing() throws Exception {
-        try (var sut = MqttBroker.start();
-                var subscriber = connected(sut.port(), "subscriber");
-                var publisher = connected(sut.port(), "publisher")) {
-            subscriber.subscribe("unsupported", AT_MOST_ONCE);
-            publisher.send(publication("unsupported", "qos two", EXACTLY_ONCE, 7));
-            publisher.expectClosed();
-            subscriber.ping();
         }
     }
 

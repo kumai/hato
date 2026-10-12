@@ -95,22 +95,39 @@ final class RawSession implements AutoCloseable {
 
     void subscribe(String filter, Qos qos) throws Exception {
         send(new Packet.Subscribe(1, List.of(subscription(filter, qos)), EMPTY));
-        ReasonCode granted = qos == Qos.AT_MOST_ONCE ? SUCCESS : ReasonCode.GRANTED_QOS_1;
+        ReasonCode granted = switch (qos) {
+            case AT_MOST_ONCE -> SUCCESS;
+            case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
+            case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
+        };
         assertThat(expect(Packet.SubAck.class))
                 .isEqualTo(new Packet.SubAck(1, List.of(granted), EMPTY));
     }
 
     void publish(String topic, String payload, Qos qos, int packetId) throws Exception {
         send(publication(topic, payload, qos, packetId));
-        if (qos == Qos.AT_LEAST_ONCE) {
-            assertThat(expect(Packet.PubAck.class))
+        switch (qos) {
+            case AT_MOST_ONCE -> { }
+            case AT_LEAST_ONCE -> assertThat(expect(Packet.PubAck.class))
                     .isEqualTo(new Packet.PubAck(packetId, SUCCESS, EMPTY));
+            case EXACTLY_ONCE -> {
+                assertThat(expect(Packet.PubRec.class))
+                        .isEqualTo(new Packet.PubRec(packetId, SUCCESS, EMPTY));
+                send(new Packet.PubRel(packetId, SUCCESS, EMPTY));
+                assertThat(expect(Packet.PubComp.class))
+                        .isEqualTo(new Packet.PubComp(packetId, SUCCESS, EMPTY));
+            }
         }
     }
 
     void ping() throws Exception {
         send(new Packet.PingReq());
         expect(Packet.PingResp.class);
+    }
+
+    void disconnect() throws Exception {
+        send(new Packet.Disconnect(SUCCESS, EMPTY));
+        expectClosed();
     }
 
     void send(Packet packet) throws IOException {
