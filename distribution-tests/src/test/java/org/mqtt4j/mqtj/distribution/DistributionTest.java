@@ -21,6 +21,7 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -29,6 +30,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.w3c.dom.Document;
+import org.w3c.dom.NodeList;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -86,8 +89,10 @@ class DistributionTest {
             }
             var disconnection = org.mqtt4j.mqtj.Disconnection.of(cause, false);
             var message = org.mqtt4j.mqtj.MqttMessage.of(
-                    new org.mqtt4j.mqtj.Topic("a/b"), new byte[0],
-                    org.mqtt4j.mqtj.Qos.AT_MOST_ONCE, false
+                    new org.mqtt4j.mqtj.Topic("a/b"),
+                    new byte[0],
+                    org.mqtt4j.mqtj.Qos.AT_MOST_ONCE,
+                    false
             ).withTopic(new org.mqtt4j.mqtj.Topic("a/c"))
                     .withPayload(new byte[] {42})
                     .withQos(org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE)
@@ -99,8 +104,10 @@ class DistributionTest {
                     || !org.mqtt4j.mqtj.PublishResult.of()
                             .equals(org.mqtt4j.mqtj.PublishResult.of())
                     || !message.equals(org.mqtt4j.mqtj.MqttMessage.of(
-                            new org.mqtt4j.mqtj.Topic("a/c"), new byte[] {42},
-                            org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE, true
+                            new org.mqtt4j.mqtj.Topic("a/c"),
+                            new byte[] {42},
+                            org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE,
+                            true
                     ))) {
                 throw new AssertionError("Client value factories are not usable");
             }
@@ -146,17 +153,24 @@ class DistributionTest {
 
                 // Act & Assert: QoS 0 and 1 reach the handler and the receiving thread intact.
                 for (var qos : java.util.List.of(
-                        org.mqtt4j.mqtj.Qos.AT_MOST_ONCE, org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE
+                        org.mqtt4j.mqtj.Qos.AT_MOST_ONCE,
+                        org.mqtt4j.mqtj.Qos.AT_LEAST_ONCE
                 )) {
                     var pushed = org.mqtt4j.mqtj.MqttMessage.of(
-                            new org.mqtt4j.mqtj.Topic("probe/push"), new byte[] {42}, qos, false
+                            new org.mqtt4j.mqtj.Topic("probe/push"),
+                            new byte[] {42},
+                            qos,
+                            false
                     );
                     publisher.publish(pushed).get(5, java.util.concurrent.TimeUnit.SECONDS);
                     if (!pushed.equals(handled.poll(5, java.util.concurrent.TimeUnit.SECONDS))) {
                         throw new AssertionError(qos + " delivery to a handler changed");
                     }
                     var pulled = org.mqtt4j.mqtj.MqttMessage.of(
-                            new org.mqtt4j.mqtj.Topic("probe/pull"), new byte[] {7}, qos, false
+                            new org.mqtt4j.mqtj.Topic("probe/pull"),
+                            new byte[] {7},
+                            qos,
+                            false
                     );
                     publisher.publish(pulled).get(5, java.util.concurrent.TimeUnit.SECONDS);
                     if (!(pull.receive(java.time.Duration.ofSeconds(5))
@@ -273,7 +287,8 @@ class DistributionTest {
         assertThat(brokerClasses).doesNotContainAnyElementsOf(testkitClasses);
 
         for (Path jar : List.of(CLIENT, BROKER, testkit)) {
-            var descriptor = ModuleFinder.of(jar).findAll().iterator().next().descriptor();
+            ModuleDescriptor descriptor = ModuleFinder.of(jar).findAll().iterator().next()
+                    .descriptor();
             assertThat(descriptor.isAutomatic()).isFalse();
             assertThat(descriptor.isOpen()).isFalse();
             assertThat(descriptor.opens()).isEmpty();
@@ -289,7 +304,8 @@ class DistributionTest {
         }
 
         Path root = temporaryDirectory.resolve("privateApi");
-        Path descriptor = write(root.resolve("src/module-info.java"),
+        Path descriptor = write(
+                root.resolve("src/module-info.java"),
                 "module probe { requires org.mqtt4j.mqtj.client; requires org.mqtt4j.mqtj.broker; "
                         + "requires org.mqtt4j.mqtj.testkit; }"
         );
@@ -299,9 +315,16 @@ class DistributionTest {
                     import org.mqtt4j.mqtj.%s.internal.common.log.Log;
                     public class Probe { Log value; }
                     """.formatted(owner));
-            var result = execute(root, "javac", "-XDrawDiagnostics", "--module-path",
-                    TESTKIT_JARS, "-d", root.resolve("classes").toString(),
-                    descriptor.toString(), source.toString()
+            ProcessResult result = execute(
+                    root,
+                    "javac",
+                    "-XDrawDiagnostics",
+                    "--module-path",
+                    TESTKIT_JARS,
+                    "-d",
+                    root.resolve("classes").toString(),
+                    descriptor.toString(),
+                    source.toString()
             );
             assertThat(result.exitCode()).isNotZero();
             assertThat(result.output()).contains("compiler.err.package.not.visible");
@@ -360,7 +383,7 @@ class DistributionTest {
     void evolving_value_types_are_final_classes_with_private_constructors(String type)
             throws Exception {
         try (var archive = new JarFile(CLIENT.toFile())) {
-            var entry = archive.getJarEntry("org/mqtt4j/mqtj/" + type + ".class");
+            JarEntry entry = archive.getJarEntry("org/mqtt4j/mqtj/" + type + ".class");
             assertThat(entry).as(type).isNotNull();
             ClassModel model = ClassFile.of().parse(archive.getInputStream(entry).readAllBytes());
             assertThat(model.flags().has(AccessFlag.FINAL)).as(type).isTrue();
@@ -381,12 +404,16 @@ class DistributionTest {
                 String valuePackage = owner.equals("client") ? "org.mqtt4j.mqtj"
                         : "org.mqtt4j.mqtj." + owner + ".internal.common.value";
                 for (String type : List.of(
-                        "MqttVersion", "Qos", "ReasonCode", "Topic", "TopicFilter"
+                        "MqttVersion",
+                        "Qos",
+                        "ReasonCode",
+                        "Topic",
+                        "TopicFilter"
                 )) {
                     String name = valuePackage.replace('.', '/') + "/" + type + ".java";
-                    var entry = archive.getEntry(name);
+                    ZipEntry entry = archive.getEntry(name);
                     assertThat(entry).as("%s in %s", name, path).isNotNull();
-                    String source = new String(archive.getInputStream(entry).readAllBytes(), UTF_8);
+                    var source = new String(archive.getInputStream(entry).readAllBytes(), UTF_8);
                     assertThat(source).contains("package " + valuePackage + ";");
                     assertThat(source).doesNotContain("org.mqtt4j.mqtj.common");
                 }
@@ -406,16 +433,20 @@ class DistributionTest {
         xml.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
         for (Path path : metadata) {
             String contents = Files.readString(path);
-            assertThat(contents).doesNotContain("mqtj-common", "mqtj-protocol", "mqtj-core",
-                    "jspecify");
+            assertThat(contents).doesNotContain(
+                    "mqtj-common",
+                    "mqtj-protocol",
+                    "mqtj-core",
+                    "jspecify"
+            );
             if (path.toString().endsWith(".xml")) {
-                var document = xml.newDocumentBuilder().parse(path.toFile());
-                var groups = document.getElementsByTagName("groupId");
+                Document document = xml.newDocumentBuilder().parse(path.toFile());
+                NodeList groups = document.getElementsByTagName("groupId");
                 assertThat(groups.getLength()).isPositive();
                 for (int index = 0; index < groups.getLength(); index++) {
                     assertThat(groups.item(index).getTextContent()).isEqualTo("org.mqtt4j");
                 }
-                var dependencies = document.getElementsByTagName("dependency");
+                NodeList dependencies = document.getElementsByTagName("dependency");
                 var artifacts = new HashSet<String>();
                 for (int index = 0; index < dependencies.getLength(); index++) {
                     var dependency = (org.w3c.dom.Element) dependencies.item(index);
@@ -429,15 +460,23 @@ class DistributionTest {
                     assertThat(artifacts).isEmpty();
                 }
             } else {
-                var groups = Pattern.compile("\"group\"\\s*:\\s*\"([^\"]+)\"")
-                        .matcher(contents).results().map(m -> m.group(1)).toList();
+                List<String> groups = Pattern.compile("\"group\"\\s*:\\s*\"([^\"]+)\"")
+                        .matcher(contents)
+                        .results()
+                        .map(m -> m.group(1))
+                        .toList();
                 assertThat(groups).isNotEmpty().containsOnly("org.mqtt4j");
-                var modules = Pattern.compile("\"module\"\\s*:\\s*\"([^\"]+)\"")
-                        .matcher(contents).results().map(m -> m.group(1)).toList();
+                List<String> modules = Pattern.compile("\"module\"\\s*:\\s*\"([^\"]+)\"")
+                        .matcher(contents)
+                        .results()
+                        .map(m -> m.group(1))
+                        .toList();
                 assertThat(modules).isNotEmpty();
                 if (modules.getFirst().equals("mqtj-testkit")) {
                     assertThat(new HashSet<>(modules)).containsExactlyInAnyOrder(
-                            "mqtj-testkit", "mqtj-client", "mqtj-broker"
+                            "mqtj-testkit",
+                            "mqtj-client",
+                            "mqtj-broker"
                     );
                 } else {
                     // No published variant may acquire a dependency, including an internal one.
@@ -453,7 +492,15 @@ class DistributionTest {
         Path classes = Files.createDirectories(root.resolve("classes"));
         // Every lint category on: the JSpecify annotations in our class files must not produce
         // warnings for consumers that do not have the annotation library.
-        succeed(root, "javac", "-Xlint:all", "-Werror", "-cp", classpath, "-d", classes.toString(),
+        succeed(
+                root,
+                "javac",
+                "-Xlint:all",
+                "-Werror",
+                "-cp",
+                classpath,
+                "-d",
+                classes.toString(),
                 source.toString()
         );
         succeed(root, "java", "-cp", classes + File.pathSeparator + classpath, "probe.Probe");
@@ -472,11 +519,25 @@ class DistributionTest {
                 "module probe { requires " + String.join("; requires ", requiredModules) + "; }"
         );
         Path classes = Files.createDirectories(root.resolve("classes"));
-        succeed(root, "javac", "-Xlint:all", "-Werror", "--module-path", modulepath, "-d",
-                classes.toString(), descriptor.toString(), source.toString()
+        succeed(
+                root,
+                "javac",
+                "-Xlint:all",
+                "-Werror",
+                "--module-path",
+                modulepath,
+                "-d",
+                classes.toString(),
+                descriptor.toString(),
+                source.toString()
         );
-        succeed(root, "java", "--module-path", classes + File.pathSeparator + modulepath,
-                "-m", "probe/probe.Probe"
+        succeed(
+                root,
+                "java",
+                "--module-path",
+                classes + File.pathSeparator + modulepath,
+                "-m",
+                "probe/probe.Probe"
         );
     }
 
@@ -488,7 +549,7 @@ class DistributionTest {
 
     private static Set<String> classEntries(Path jar) throws IOException {
         try (var archive = new JarFile(jar.toFile())) {
-            var entries = archive.stream().map(e -> e.getName()).toList();
+            List<String> entries = archive.stream().map(e -> e.getName()).toList();
             assertThat(entries).contains("module-info.class");
             assertThat(entries).noneMatch(name -> name.endsWith(".jar")
                     || name.startsWith("org/mqtt4j/mqtj/common/") || name.startsWith("dev/mqtj/"));
@@ -589,10 +650,13 @@ class DistributionTest {
         var command = new ArrayList<String>();
         command.add(Path.of(System.getProperty("java.home"), "bin", executable).toString());
         command.addAll(List.of(arguments));
-        Process process = new ProcessBuilder(command).redirectErrorStream(true)
-                .redirectOutput(log.toFile()).start();
+        Process process = new ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .redirectOutput(log.toFile())
+                .start();
         boolean finished = process.waitFor(
-                Duration.ofSeconds(30).toMillis(), TimeUnit.MILLISECONDS
+                Duration.ofSeconds(30).toMillis(),
+                TimeUnit.MILLISECONDS
         );
         if (!finished) {
             process.destroyForcibly();
