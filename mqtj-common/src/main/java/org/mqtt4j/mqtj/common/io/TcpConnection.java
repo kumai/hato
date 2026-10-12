@@ -63,7 +63,7 @@ public final class TcpConnection implements Closeable {
         }
         int timeoutMillis = timeoutMillis(connectTimeout);
         var address = new InetSocketAddress(host, port);
-        return connect(address, timeoutMillis);
+        return connect(new Socket(), address, Duration.ofMillis(timeoutMillis));
     }
 
     /// Establishes a TCP connection without resolving a host name.
@@ -79,28 +79,39 @@ public final class TcpConnection implements Closeable {
             InetSocketAddress address,
             Duration connectTimeout
     ) throws IOException {
-        requireNonNull(address, "address must not be null");
-        if (address.getPort() == 0) {
-            throw new IllegalArgumentException("Port must be between 1 and 65535");
-        }
-        return connect(address, timeoutMillis(connectTimeout));
+        return connect(new Socket(), address, connectTimeout);
     }
 
-    private static TcpConnection connect(InetSocketAddress address, int timeoutMillis)
-            throws IOException {
-        var socket = new Socket();
+    /// Connects a caller-created plain socket, taking ownership of it on success or failure.
+    /// This allows a TLS layer to retain the socket for cancellation while sharing TCP setup.
+    /// Address and timeout constraints are the same as [#connect(InetSocketAddress, Duration)].
+    public static TcpConnection connect(
+            Socket socket,
+            InetSocketAddress address,
+            Duration connectTimeout
+    ) throws IOException {
+        requireNonNull(socket, "socket must not be null");
         try {
+            requireNonNull(address, "address must not be null");
+            if (address.getPort() == 0) {
+                throw new IllegalArgumentException("Port must be between 1 and 65535");
+            }
+            int timeoutMillis = timeoutMillis(connectTimeout);
             socket.connect(address, timeoutMillis);
             return new TcpConnection(socket);
         } catch (IOException | RuntimeException | Error failure) {
             // Ownership transfers only after both streams are available. Keep the original
             // failure if releasing the partially initialized connection also fails.
-            try {
-                socket.close();
-            } catch (IOException closeFailure) {
-                failure.addSuppressed(closeFailure);
-            }
+            closeAfterFailure(socket, failure);
             throw failure;
+        }
+    }
+
+    private static void closeAfterFailure(Socket socket, Throwable failure) {
+        try {
+            socket.close();
+        } catch (IOException closeFailure) {
+            failure.addSuppressed(closeFailure);
         }
     }
 

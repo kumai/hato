@@ -1,6 +1,8 @@
 package org.mqtt4j.mqtj.common.io;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -14,6 +16,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
@@ -166,6 +169,79 @@ class TcpConnectionTest {
     }
 
     @Test
+    void a_caller_created_socket_is_configured_and_owned_by_the_connection() throws IOException {
+        // Arrange
+        try (ServerSocket server = listen(); var socket = new Socket()) {
+            assertThat(socket.getTcpNoDelay()).isFalse();
+
+            // Act
+            try (
+                    var sut = TcpConnection.connect(
+                            socket,
+                            new InetSocketAddress(LOOPBACK, server.getLocalPort()),
+                            CONNECT_TIMEOUT
+                    );
+                    Socket peer = server.accept()
+            ) {
+                // Assert: setup reuses the caller's socket and exposes its borrowed streams.
+                assertThat(socket.getTcpNoDelay()).isTrue();
+                assertThat(sut.input()).isSameAs(socket.getInputStream());
+                assertThat(sut.output()).isSameAs(socket.getOutputStream());
+                assertThat(socket.isClosed()).isFalse();
+                peer.setSoTimeout(5000);
+                sut.output().write(0x7F);
+                assertThat(peer.getInputStream().read()).isEqualTo(0x7F);
+            }
+            assertThat(socket.isClosed()).isTrue();
+        }
+    }
+
+    @ParameterizedTest(name = "input stream fails: {0}")
+    @ValueSource(booleans = {false, true})
+    void stream_initialization_failure_closes_the_owned_socket_once(boolean inputFails)
+            throws IOException {
+        // Arrange: cleanup also fails, but must preserve the stream initialization failure.
+        var failure = new IOException("stream initialization failed");
+        var closeFailure = new IOException("socket close failed");
+        var closes = new AtomicInteger();
+        var socket = new Socket() {
+            @Override
+            public InputStream getInputStream() throws IOException {
+                if (inputFails) {
+                    throw failure;
+                }
+                return super.getInputStream();
+            }
+
+            @Override
+            public OutputStream getOutputStream() throws IOException {
+                throw failure;
+            }
+
+            @Override
+            public void close() throws IOException {
+                closes.incrementAndGet();
+                super.close();
+                throw closeFailure;
+            }
+        };
+        try (ServerSocket server = listen()) {
+            // Act & Assert
+            assertThatThrownBy(() -> TcpConnection.connect(
+                    socket,
+                    new InetSocketAddress(LOOPBACK, server.getLocalPort()),
+                    CONNECT_TIMEOUT
+            )).isSameAs(failure).hasSuppressedException(closeFailure);
+            assertThat(closes).hasValue(1);
+            assertThat(socket.isClosed()).isTrue();
+            try (Socket peer = server.accept()) {
+                peer.setSoTimeout(5000);
+                assertThat(peer.getInputStream().read()).isEqualTo(-1);
+            }
+        }
+    }
+
+    @Test
     void an_unresolved_address_is_rejected_without_resolving_it() {
         var address = InetSocketAddress.createUnresolved("localhost", 1883);
 
@@ -174,11 +250,16 @@ class TcpConnectionTest {
     }
 
     @Test
-    void a_resolved_address_must_have_a_nonzero_port() {
+    void a_resolved_address_must_have_a_nonzero_port() throws IOException {
         var address = new InetSocketAddress(LOOPBACK, 0);
 
         assertThatThrownBy(() -> TcpConnection.connect(address, CONNECT_TIMEOUT))
                 .isInstanceOf(IllegalArgumentException.class);
+        try (var socket = new Socket()) {
+            assertThatThrownBy(() -> TcpConnection.connect(socket, address, CONNECT_TIMEOUT))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThat(socket.isClosed()).isTrue();
+        }
     }
 
     @Test
@@ -214,9 +295,17 @@ class TcpConnectionTest {
 
     @ParameterizedTest
     @MethodSource("invalidTimeouts")
-    void unbounded_or_unrepresentable_timeouts_are_rejected(Duration timeout) {
+    void unbounded_or_unrepresentable_timeouts_are_rejected(Duration timeout) throws IOException {
         assertThatThrownBy(() -> TcpConnection.connect("127.0.0.1", 1883, timeout))
                 .isInstanceOf(IllegalArgumentException.class);
+        try (var socket = new Socket()) {
+            assertThatThrownBy(() -> TcpConnection.connect(
+                    socket,
+                    new InetSocketAddress(LOOPBACK, 1883),
+                    timeout
+            )).isInstanceOf(IllegalArgumentException.class);
+            assertThat(socket.isClosed()).isTrue();
+        }
     }
 
     static Stream<Duration> invalidTimeouts() {
