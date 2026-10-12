@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -32,6 +33,101 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// Explicit broker replies expose subscription lifetime independently of reconnection timing.
 @Timeout(30)
 class SubscriptionContinuityTest {
+
+    @Test
+    void a_refused_recreation_notifies_the_original_handle_and_only_ends_that_subscription()
+            throws Exception {
+        // Arrange
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        var refused = new LinkedBlockingQueue<ResubscribeFailure>();
+        var listener = new ConnectionListener() {
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                ended.add(disconnection);
+            }
+
+            @Override
+            public void onResubscribeFailed(
+                    Subscription subscription,
+                    MqttSubscribeException failure
+            ) {
+                refused.add(new ResubscribeFailure(subscription, failure));
+            }
+        };
+        try (ServerSocket server = listen();
+                ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+                MqttClient sut = MqttClient.builder()
+                        .server(endpoint(server))
+                        .version(MqttVersion.V3_1_1)
+                        .connectionListener(listener)
+                        .build()) {
+            Subscription rejected;
+            Subscription survivor;
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
+                rejected = peer.subscribePull(sut, "refused", AckMode.ON_RECEIVE, 4);
+                survivor = peer.subscribePull(sut, "survivor", AckMode.ON_RECEIVE, 4);
+                sut.disconnect().get(5, SECONDS);
+            }
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            var receiving = new CountDownLatch(1);
+            var received = new CompletableFuture<ReceiveResult>();
+            executor.submit(() -> {
+                receiving.countDown();
+                try {
+                    received.complete(rejected.receive());
+                } catch (Exception failure) {
+                    received.completeExceptionally(failure);
+                }
+            });
+            assertThat(receiving.await(5, SECONDS)).isTrue();
+
+            // Act: one re-creation is refused while another succeeds on the same connection.
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
+                Packet.Subscribe first = assertInstanceOf(Packet.Subscribe.class, peer.receive());
+                Packet.Subscribe second = assertInstanceOf(Packet.Subscribe.class, peer.receive());
+                assertThat(List.of(first, second))
+                        .extracting(request -> request.subscriptions().getFirst().filter())
+                        .containsExactlyInAnyOrder(
+                                new TopicFilter("refused"),
+                                new TopicFilter("survivor")
+                        );
+                peer.roundTripBarrier(sut);
+                assertThat(received).isNotDone();
+                for (Packet.Subscribe request : List.of(first, second)) {
+                    ReasonCode reason = request.subscriptions().getFirst().filter()
+                            .equals(new TopicFilter("refused"))
+                            ? ReasonCode.UNSPECIFIED_ERROR : ReasonCode.GRANTED_QOS_1;
+                    peer.send(new Packet.SubAck(request.packetId(), List.of(reason), EMPTY));
+                }
+
+                // Assert: the listener and receiver share the original handle's refusal.
+                ResubscribeFailure notification = requireNonNull(refused.poll(5, SECONDS));
+                assertThat(notification.subscription()).isSameAs(rejected);
+                assertThat(notification.failure().reasonCode())
+                        .isEqualTo(ReasonCode.UNSPECIFIED_ERROR);
+                assertThat(received.handle((_, failure) -> failure).get(5, SECONDS))
+                        .isInstanceOfSatisfying(
+                                MqttSubscribeException.class,
+                                failure -> assertThat(failure.reasonCode())
+                                        .isEqualTo(notification.failure().reasonCode())
+                        );
+                assertThatThrownBy(() -> rejected.receive(Duration.ZERO))
+                        .isInstanceOfSatisfying(
+                                MqttSubscribeException.class,
+                                failure -> assertThat(failure.reasonCode())
+                                        .isEqualTo(notification.failure().reasonCode())
+                        );
+                peer.publish("survivor", 7);
+                assertThat(received(survivor.receive(Duration.ofSeconds(5))).message().payload())
+                        .containsExactly((byte) 1);
+                peer.expectAcknowledgements(7, 1);
+                peer.roundTripBarrier(sut);
+                sut.disconnect().get(5, SECONDS);
+                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+                assertThat(refused).isEmpty();
+            }
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -293,4 +389,6 @@ class SubscriptionContinuityTest {
     private static MqttDelivery received(ReceiveResult result) {
         return assertInstanceOf(ReceiveResult.Received.class, result).delivery();
     }
+
+    private record ResubscribeFailure(Subscription subscription, MqttSubscribeException failure) {}
 }

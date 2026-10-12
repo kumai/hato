@@ -2,6 +2,8 @@ package org.mqtt4j.hato.client.internal;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
@@ -9,9 +11,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.ConnAck;
+import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttClient;
+import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.PublishResult;
+import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
@@ -23,6 +30,72 @@ import static org.awaitility.Awaitility.await;
 
 /// The same public client contract runs against Mosquitto and the embedded broker.
 abstract class ConnectionTest {
+
+    @Test
+    void connection_callbacks_can_publish_and_keep_their_order_while_the_client_progresses()
+            throws Exception {
+        // Arrange
+        var client = new AtomicReference<MqttClient>();
+        var events = new LinkedBlockingQueue<Object>();
+        var release = new CountDownLatch(1);
+        var published = new CompletableFuture<PublishResult>();
+        var listener = new ConnectionListener() {
+            @Override
+            public void onConnected(ConnAck connAck) {
+                events.add(connAck);
+                if (published.isDone()) {
+                    return;
+                }
+                try {
+                    MqttMessage message = MqttMessage.of(
+                            new Topic("listener/publication"),
+                            new byte[] {1},
+                            Qos.AT_LEAST_ONCE,
+                            false
+                    );
+                    PublishResult result = requireNonNull(client.get()).publish(message)
+                            .get(5, SECONDS);
+                    published.complete(result);
+                    release.await();
+                } catch (Exception failure) {
+                    published.completeExceptionally(failure);
+                }
+            }
+
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                events.add(disconnection);
+            }
+        };
+        try (MqttClient sut = MqttClient.builder()
+                .server(endpoint())
+                .version(MqttVersion.V3_1_1)
+                .connectionListener(listener)
+                .build()) {
+            client.set(sut);
+            try {
+                // Act & Assert: the first onConnected publishes on its own connection.
+                ConnAck first = sut.connect().get(5, SECONDS);
+                assertThat(published.get(5, SECONDS)).isEqualTo(PublishResult.of());
+
+                // Act: both operations finish while the first callback remains blocked.
+                sut.disconnect().get(5, SECONDS);
+                ConnAck second = sut.connect().get(5, SECONDS);
+
+                // Assert: later callbacks wait without holding up I/O or completion.
+                assertThat(events).containsExactly(first);
+                assertThat(events.poll(5, SECONDS)).isEqualTo(first);
+                release.countDown();
+                assertThat(events.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+                assertThat(events.poll(5, SECONDS)).isEqualTo(second);
+                sut.disconnect().get(5, SECONDS);
+                assertThat(events.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+                assertThat(events).isEmpty();
+            } finally {
+                release.countDown();
+            }
+        }
+    }
 
     @Test
     void public_api_connects_pings_and_disconnects_with_virtual_time() throws Exception {

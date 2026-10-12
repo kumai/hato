@@ -30,6 +30,7 @@ import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
+import org.mqtt4j.hato.MqttSubscribeException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
@@ -61,7 +62,7 @@ class SessionPersistenceTest {
     @ValueSource(booleans = {true, false})
     void connect_uses_the_configured_clean_session_flag(boolean cleanStart) {
         SessionCore configured = core(cleanStart);
-        configured.connect(1, 0);
+        configured.connect(new ConnectionAttempt(1, null), 0);
         configured.opened(1);
 
         assertThat(port.sent).singleElement().satisfies(packet -> {
@@ -178,7 +179,7 @@ class SessionPersistenceTest {
     ) {
         // Arrange: leave more registrations to restore than the pending SUBACK window permits.
         SessionCore configured = core(cleanStart);
-        configured.connect(operation(), 0);
+        configured.connect(new ConnectionAttempt(operation(), null), 0);
         configured.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
         for (int i = 0; i < subscriptions; i++) {
             long subscription = operation();
@@ -204,7 +205,7 @@ class SessionPersistenceTest {
         }
         configured.failed(1, new IOException("connection lost before removal was confirmed"));
         port.sent.clear();
-        configured.connect(operation(), 0);
+        configured.connect(new ConnectionAttempt(operation(), null), 0);
         configured.received(2, new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY), 0, 0);
         assertThat(port.sent).hasSize(16).allMatch(Packet.Subscribe.class::isInstance);
 
@@ -354,7 +355,7 @@ class SessionPersistenceTest {
     @Test
     void clean_sessions_do_not_retain_the_new_session_byte_budget() {
         SessionCore clean = core(true);
-        clean.connect(1, 0);
+        clean.connect(new ConnectionAttempt(1, null), 0);
         clean.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
         MqttMessage half = messageWithWireBytes(16 * 1024 * 1024);
 
@@ -525,7 +526,7 @@ class SessionPersistenceTest {
     @Test
     void clean_session_present_remains_a_protocol_error() {
         SessionCore clean = core(true);
-        clean.connect(1, 0);
+        clean.connect(new ConnectionAttempt(1, null), 0);
         clean.received(1, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 0);
 
         assertThat(result(1L).failure()).isInstanceOf(MqttConnectException.class)
@@ -850,7 +851,7 @@ class SessionPersistenceTest {
 
     private long beginConnect() {
         long operation = operation();
-        sut.connect(operation, 0);
+        sut.connect(new ConnectionAttempt(operation, null), 0);
         generation = port.generation;
         sut.opened(generation);
         return operation;
@@ -1026,8 +1027,22 @@ class SessionPersistenceTest {
         @Nullable TestSubscription registering;
 
         @Override
-        public void open(long connection, long operation) {
+        public void open(long connection, ConnectionAttempt attempt) {
             generation = connection;
+        }
+
+        @Override
+        public void connected(long connection, ConnAck ack) {
+        }
+
+        @Override
+        public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+            long id = handles.entrySet().stream()
+                    .filter(entry -> entry.getValue() == handle)
+                    .mapToLong(Map.Entry::getKey)
+                    .findFirst()
+                    .orElseThrow();
+            removeSubscription(id, handle, failure);
         }
 
         @Override

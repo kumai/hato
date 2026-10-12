@@ -64,6 +64,8 @@ public interface MqttSubscriber {
     /// If the connection ends before the initial SUBACK, the future fails with
     /// [MqttConnectionLostException] and the registration is not retained. A broker refusal
     /// during re-creation ends only that established subscription; other subscriptions and the
-    /// connection continue. A pull subscription reports that refusal from its receive methods.
+    /// connection continue. The refusal is reported by
+    /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscribeException)]; a pull
+    /// subscription also reports it from its receive methods.
     CompletableFuture<Subscription> subscribe(Subscribe request, Consumer<MqttDelivery> handler);
 }

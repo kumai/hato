@@ -2,7 +2,6 @@ package org.mqtt4j.hato.client.internal;
 
 import java.net.URI;
 import java.time.Duration;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.LinkedHashMap;
@@ -31,6 +30,7 @@ import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
+import org.mqtt4j.hato.MqttSubscribeException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
@@ -55,8 +55,6 @@ public final class ClientActor implements MqttClient {
     private static final Log log = Log.of(ClientActor.class);
 
     private static final int OPERATION_LIMIT = 64;
-
-    private static final int NOTIFICATION_LIMIT = 64;
 
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
     // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
@@ -84,7 +82,7 @@ public final class ClientActor implements MqttClient {
 
     private final TimerScheduler scheduler;
 
-    private final ConnectionListener listener;
+    private final ListenerLane listenerLane;
 
     private final SessionCore core;
 
@@ -99,6 +97,9 @@ public final class ClientActor implements MqttClient {
 
     private long openedGeneration;
 
+    // The attempt of the latest connection; its reservation supplies both notifications.
+    private @Nullable ConnectionAttempt activeAttempt;
+
     // Admission and stopping share this lock so shutdown cannot miss a registered operation.
     private final Object lifecycleLock = new Object();
 
@@ -108,8 +109,6 @@ public final class ClientActor implements MqttClient {
 
     private final Semaphore operationSlots = new Semaphore(OPERATION_LIMIT);
 
-    private final Semaphore notificationSlots = new Semaphore(NOTIFICATION_LIMIT);
-
     private final Map<Long, Operation<?>> operations = new ConcurrentHashMap<>();
 
     private final AtomicLong sequence = new AtomicLong();
@@ -118,10 +117,6 @@ public final class ClientActor implements MqttClient {
 
     // Fatal I/O failures bypass mailbox capacity and survive connection generation changes.
     private @Nullable Throwable fatalFailure;
-
-    private final ArrayDeque<Disconnection> notifications = new ArrayDeque<>();
-
-    private boolean notifying;
 
     public ClientActor(
             URI endpoint,
@@ -163,7 +158,7 @@ public final class ClientActor implements MqttClient {
         this.endpoint = endpoint;
         this.clientId = clientId;
         this.scheduler = scheduler;
-        this.listener = listener;
+        listenerLane = new ListenerLane(endpoint, clientId, listener);
         mailbox = createMailbox(maxPacketSize);
         lanes = new DeliveryLanes(
                 clientId,
@@ -196,7 +191,7 @@ public final class ClientActor implements MqttClient {
                 ));
                 return;
             }
-            core.connect(token, now);
+            core.connect(requireNonNull(requireNonNull(operations.get(token)).attempt), now);
         }, null);
     }
 
@@ -254,15 +249,19 @@ public final class ClientActor implements MqttClient {
     ) {
         synchronized (lifecycleLock) {
             Throwable refusal = null;
+            ListenerLane.Reservation notifications = null;
             if (stopping.get()) {
                 refusal = new IllegalStateException("Client is closed");
             } else if (needsConnection && connectedGeneration == 0) {
                 refusal = new MqttNotConnectedException();
             } else if (!operationSlots.tryAcquire()) {
                 refusal = new MqttCapacityException("Operation capacity");
-            } else if (connect && !notificationSlots.tryAcquire()) {
-                operationSlots.release();
-                refusal = new MqttCapacityException("Listener capacity");
+            } else if (connect) {
+                notifications = listenerLane.tryReserveConnection();
+                if (notifications == null) {
+                    operationSlots.release();
+                    refusal = new MqttCapacityException("Listener capacity");
+                }
             }
             if (refusal != null) {
                 if (unsubscribe != null) {
@@ -273,7 +272,10 @@ public final class ClientActor implements MqttClient {
 
             long token = sequence.incrementAndGet();
             long generation = connectedGeneration;
-            var operation = new Operation<T>(connect, unsubscribe);
+            var operation = new Operation<T>(
+                    (notifications == null) ? null : new ConnectionAttempt(token, notifications),
+                    unsubscribe
+            );
             operations.put(token, operation);
             Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
                     0,
@@ -491,12 +493,6 @@ public final class ClientActor implements MqttClient {
             }
             return;
         }
-        if (result instanceof ConnAck) {
-            synchronized (lifecycleLock) {
-                connectedGeneration = openedGeneration;
-            }
-            log.info("Connected {} to {}", clientId, endpoint);
-        }
         if (failure != null) {
             ClientSubscription subscription = operation.subscription;
             if (subscription != null) {
@@ -506,8 +502,9 @@ public final class ClientActor implements MqttClient {
         if (operation.unsubscribe != null) {
             operation.unsubscribe.finish(failure);
         }
-        if (operation.notificationReserved) {
-            notificationSlots.release();
+        if (failure != null && operation.attempt != null) {
+            // An attempt that established no connection returns both of its notifications.
+            requireNonNull(operation.attempt.notifications).close();
         }
         Thread.ofVirtual().name(threadName("complete-" + token)).start(() -> {
             try {
@@ -516,26 +513,6 @@ public final class ClientActor implements MqttClient {
                 operationSlots.release();
             }
         });
-    }
-
-    private void notifyListener() {
-        while (true) {
-            Disconnection event;
-            synchronized (notifications) {
-                event = notifications.pollFirst();
-                if (event == null) {
-                    notifying = false;
-                    return;
-                }
-            }
-            try {
-                listener.onDisconnected(event);
-            } catch (Throwable t) {
-                log.warn("Connection listener failed for {} at {}", clientId, endpoint, t);
-            } finally {
-                notificationSlots.release();
-            }
-        }
     }
 
     private String threadName(String role) {
@@ -555,7 +532,8 @@ public final class ClientActor implements MqttClient {
     Usage usage() {
         return new Usage(
                 OPERATION_LIMIT - operationSlots.availablePermits(),
-                NOTIFICATION_LIMIT - notificationSlots.availablePermits(),
+                listenerLane.usage(),
+                listenerLane.subscriptionUsage(),
                 mailbox.size(),
                 mailbox.bytes(),
                 io.sends(),
@@ -593,14 +571,46 @@ public final class ClientActor implements MqttClient {
         private boolean unsolicitedPingResponseLogged;
 
         @Override
-        public void open(long generation, long token) {
-            // Transfer the reserved notification slot from the operation to the connection.
-            // A failed attempt releases it in end(); an established one in notifyListener().
-            requireNonNull(operations.get(token)).notificationReserved = false;
+        public void open(long generation, ConnectionAttempt attempt) {
+            activeAttempt = attempt;
             openedGeneration = generation;
             mailbox.activateSession(core.sessionNumber());
             mailbox.activate(generation);
             io.open(generation);
+        }
+
+        @Override
+        public void connected(long generation, ConnAck ack) {
+            // Admission opens before onConnected is queued, so the callback can always use it.
+            synchronized (lifecycleLock) {
+                connectedGeneration = generation;
+            }
+            notifications().connected(ack);
+            log.info("Connected {} to {}", clientId, endpoint);
+        }
+
+        private ListenerLane.Reservation notifications() {
+            return requireNonNull(requireNonNull(activeAttempt).notifications);
+        }
+
+        @Override
+        public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+            var subscription = (ClientSubscription) handle;
+            synchronized (lifecycleLock) {
+                if (subscription.retired || subscription.locallyClosed) {
+                    // The first ending decides; a local close only waited for this answer.
+                    retire(subscription, null);
+                    return;
+                }
+                // Transfer its existing reservation to the callback; normal retirement then
+                // removes the lane without returning the reservation ahead of that callback.
+                subscription.notificationReserved = false;
+                retire(subscription, failure);
+            }
+            listenerLane.submitResubscribeFailure(subscription, failure);
+            // Operators see the refusal even when the listener does not override the callback.
+            log.warn("Broker refused re-creation of subscription {} for {} at {}",
+                    subscription.filter().pattern(), clientId, endpoint, failure);
         }
 
         @Override
@@ -673,6 +683,11 @@ public final class ClientActor implements MqttClient {
             ClientSubscription subscription = requireNonNull(
                     requireNonNull(operations.get(id)).subscription
             );
+            if (!listenerLane.tryReserveSubscription()) {
+                return Optional.empty();
+            }
+            // Retirement returns it, also when a failed registration fails the operation.
+            subscription.notificationReserved = true;
             if (subscription.handler == null) {
                 subscription.receiver = lanes.registerPull(id, subscription.request).orElse(null);
                 return subscription.receiver == null ? Optional.empty() : Optional.of(subscription);
@@ -761,18 +776,10 @@ public final class ClientActor implements MqttClient {
             Map<Long, Boolean> handed = lanes.connectionEnded(preserveSession, stopped);
             io.close();
             if (established) {
+                // A failed attempt instead returns both notifications when its operation fails.
+                notifications().disconnected(disconnection);
                 log.info("Disconnected {} from {}", clientId, endpoint, cause);
-                synchronized (notifications) {
-                    notifications.addLast(disconnection);
-                    if (!notifying) {
-                        notifying = true;
-                        Thread.ofVirtual()
-                                .name(threadName("listener"))
-                                .start(ClientActor.this::notifyListener);
-                    }
-                }
             } else {
-                notificationSlots.release();
                 log.info(
                         "Connection failed for {} at {}",
                         clientId, endpoint,
@@ -875,9 +882,12 @@ public final class ClientActor implements MqttClient {
 
     /// Operation and notification slots stay held until application continuations and listeners
     /// return; lanes and deliveries until handlers return and acknowledgements are released.
+    /// A subscription notification slot stays held from registration until retirement, or until
+    /// the refusal callback for that subscription returns.
     record Usage(
             int operations,
             int notifications,
+            int subscriptionNotifications,
             int mailboxEvents,
             long mailboxBytes,
             int sends,
@@ -895,8 +905,15 @@ public final class ClientActor implements MqttClient {
 
     private void retire(ClientSubscription subscription, @Nullable Throwable cause) {
         synchronized (lifecycleLock) {
+            if (subscription.retired) {
+                return;
+            }
             subscription.retired = true;
             lanes.remove(subscription.id, cause);
+            if (subscription.notificationReserved) {
+                subscription.notificationReserved = false;
+                listenerLane.releaseSubscription();
+            }
         }
     }
 
@@ -919,6 +936,9 @@ public final class ClientActor implements MqttClient {
         private boolean locallyClosed;
 
         private boolean retired;
+
+        // The subscription owns its failure-notification reservation until retirement or handoff.
+        private boolean notificationReserved;
 
         ClientSubscription(long id, Subscribe request, @Nullable Consumer<MqttDelivery> handler) {
             this.id = id;
@@ -1047,14 +1067,16 @@ public final class ClientActor implements MqttClient {
     private static final class Operation<T> {
 
         final CompletableFuture<T> future = new CompletableFuture<>();
-        volatile boolean notificationReserved;
+
+        // Present for connect(): the attempt owns the notifications reserved at admission.
+        final @Nullable ConnectionAttempt attempt;
 
         final @Nullable UnsubscribeAttempt unsubscribe;
 
         @Nullable ClientSubscription subscription;
 
-        Operation(boolean notificationReserved, @Nullable UnsubscribeAttempt unsubscribe) {
-            this.notificationReserved = notificationReserved;
+        Operation(@Nullable ConnectionAttempt attempt, @Nullable UnsubscribeAttempt unsubscribe) {
+            this.attempt = attempt;
             this.unsubscribe = unsubscribe;
         }
 

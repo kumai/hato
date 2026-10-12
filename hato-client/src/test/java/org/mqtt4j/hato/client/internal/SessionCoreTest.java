@@ -13,11 +13,6 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.logging.Handler;
-import java.util.logging.Level;
-import java.util.logging.LogRecord;
-import java.util.logging.Logger;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -52,6 +47,7 @@ import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mqtt4j.hato.client.internal.Qos2SendTest.permutations;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.CLOSED;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.CONNECTED;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.CONNECTING;
@@ -150,7 +146,7 @@ class SessionCoreTest {
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         port.sent.clear();
         port.sendResult = SendQueue.OfferResult.ACCEPTED;
-        sut.connect(2000, 0);
+        sut.connect(attempt(2000), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         sut.sendCapacityAvailable(1);
         sut.sendCapacityAvailable(2);
@@ -189,7 +185,7 @@ class SessionCoreTest {
         assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
         sut.sent(1, port.ticket, 0);
         assertThat(port.results).doesNotContainKey(1000L);
-        sut.connect(2001, 0);
+        sut.connect(attempt(2001), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         assertThat(requireNonNull(port.results.get(1000L)).failure()).isNull();
         assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
@@ -209,7 +205,7 @@ class SessionCoreTest {
         // Act
         sut.failed(1, failure);
         port.sent.clear();
-        sut.connect(4, 0);
+        sut.connect(attempt(4), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Assert: CONNECT completes before recreation, and the pending initial attempt ends.
@@ -246,7 +242,7 @@ class SessionCoreTest {
         sut.failed(1, new IOException("lost connection"));
         port.sent.clear();
         port.sendResult = SendQueue.OfferResult.FULL;
-        sut.connect(1000, 0);
+        sut.connect(attempt(1000), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         assertThat(requireNonNull(port.results.get(1000L)).failure()).isNull();
         assertThat(port.sent).isEmpty();
@@ -271,70 +267,45 @@ class SessionCoreTest {
         assertThat(sut.state()).isEqualTo(CONNECTED);
     }
 
-    @ParameterizedTest(name = "logging failure: {0}")
-    @ValueSource(booleans = {false, true})
-    void a_refused_recreation_ends_only_that_subscription_with_its_original_handle(
-            boolean loggingFailure
-    ) {
+    @Test
+    void a_refused_recreation_ends_only_that_subscription_and_notifies_with_its_original_handle() {
         // Arrange: unsubscribe waits for recreation while another subscription stays active.
         connected();
         establishSubscriptions(2);
         Object refused = requireNonNull(port.results.get(2L)).value();
         sut.failed(1, new IOException("lost connection"));
         port.sent.clear();
-        sut.connect(4, 0);
+        sut.connect(attempt(4), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         var first = (Packet.Subscribe) port.sent.getFirst();
         var second = (Packet.Subscribe) port.sent.getLast();
         sut.unsubscribe(5, 2);
-        var logCalls = new AtomicInteger();
-        var jul = Logger.getLogger(SessionCore.class.getName());
-        Level previousLevel = jul.getLevel();
-        boolean previousParents = jul.getUseParentHandlers();
-        var handler = new Handler() {
-            @Override
-            public void publish(LogRecord record) {
-                logCalls.incrementAndGet();
-                if (loggingFailure) {
-                    throw new AssertionError("logging backend failure");
-                }
-            }
 
-            @Override
-            public void flush() {
-            }
+        // Act
+        receive(
+                2,
+                new Packet.SubAck(
+                        first.packetId(),
+                        List.of(ReasonCode.UNSPECIFIED_ERROR),
+                        EMPTY
+                ),
+                0
+        );
+        receive(2, new Packet.SubAck(second.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
+        receive(2, qosOnePublication(7, "slot/1", false), 0);
 
-            @Override
-            public void close() {
-            }
-        };
-        jul.addHandler(handler);
-        jul.setLevel(Level.WARNING);
-        jul.setUseParentHandlers(false);
-        try {
-            // Act
-            receive(2, new Packet.SubAck(first.packetId(),
-                    List.of(ReasonCode.UNSPECIFIED_ERROR), EMPTY), 0);
-            receive(2, new Packet.SubAck(second.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
-            receive(2, qosOnePublication(7, "slot/1", false), 0);
-
-            // Assert: even failed logging cannot interrupt removal or terminate the connection.
-            assertThat(port.removed).containsExactly(2L);
-            assertThat(port.removals).singleElement().satisfies(removal -> {
-                assertThat(removal.handle()).isSameAs(refused);
-                assertThat(removal.cause()).isInstanceOf(MqttSubscribeException.class);
-            });
-            assertThat(requireNonNull(port.results.get(5L)).failure()).isNull();
-            assertThat(port.deliveries).singleElement()
-                    .satisfies(delivery -> assertThat(delivery.ids()).containsExactly(3L));
-            assertThat(port.ends).hasSize(1);
-            assertThat(sut.state()).isEqualTo(CONNECTED);
-            assertThat(logCalls.get()).isEqualTo(1);
-        } finally {
-            jul.removeHandler(handler);
-            jul.setLevel(previousLevel);
-            jul.setUseParentHandlers(previousParents);
-        }
+        // Assert: refusal has one notification and cannot terminate another subscription.
+        assertThat(port.removed).containsExactly(2L);
+        assertThat(port.removals).singleElement().satisfies(removal -> {
+            assertThat(removal.handle()).isSameAs(refused);
+            assertThat(removal.cause()).isInstanceOf(MqttSubscribeException.class);
+        });
+        assertThat(port.resubscriptionFailures).containsExactlyElementsOf(port.removals);
+        assertThat(requireNonNull(port.results.get(5L)).failure()).isNull();
+        assertThat(port.deliveries).singleElement()
+                .satisfies(delivery -> assertThat(delivery.ids()).containsExactly(3L));
+        assertThat(port.ends).hasSize(1);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
     }
 
     @Test
@@ -348,7 +319,7 @@ class SessionCoreTest {
         // Act
         sut.failed(1, failure);
         port.sent.clear();
-        sut.connect(4, 0);
+        sut.connect(attempt(4), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         var recreated = (Packet.Subscribe) port.sent.getLast();
         receive(2, new Packet.SubAck(recreated.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
@@ -368,6 +339,23 @@ class SessionCoreTest {
         assertThat(port.removed).containsExactly(2L);
     }
 
+    @Test
+    void a_subscribe_exception_that_closes_the_client_is_not_a_recreation_refusal() {
+        // Arrange
+        connected();
+        establishSubscriptions(1);
+        var failure = new MqttSubscribeException(ReasonCode.UNSPECIFIED_ERROR);
+
+        // Act
+        sut.close(failure);
+
+        // Assert: an exception's type does not determine why the subscription ended.
+        assertThat(port.resubscriptionFailures).isEmpty();
+        assertThat(port.removals).singleElement()
+                .satisfies(removal -> assertThat(removal.cause()).isSameAs(failure));
+        assertThat(sut.state()).isEqualTo(CLOSED);
+    }
+
     @ParameterizedTest(name = "close while connecting: {0}")
     @ValueSource(booleans = {false, true})
     void closing_without_an_established_connection_finishes_on_clean_session_connack(
@@ -379,14 +367,14 @@ class SessionCoreTest {
         sut.failed(1, new IOException("lost connection"));
         port.sent.clear();
         if (connecting) {
-            sut.connect(4, 0);
+            sut.connect(attempt(4), 0);
         }
 
         // Act
         sut.closeSubscription(3, 2);
         assertThat(port.results).doesNotContainKey(3L);
         if (!connecting) {
-            sut.connect(4, 0);
+            sut.connect(attempt(4), 0);
         }
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         sut.sendCapacityAvailable(2);
@@ -410,7 +398,7 @@ class SessionCoreTest {
         Object handle = requireNonNull(port.results.get(2L)).value();
         sut.failed(1, new IOException("lost connection"));
         port.sent.clear();
-        sut.connect(3, 0);
+        sut.connect(attempt(3), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         var recreated = (Packet.Subscribe) port.sent.getLast();
 
@@ -453,7 +441,7 @@ class SessionCoreTest {
         sut.failed(1, new IOException("lost connection"));
         port.sent.clear();
         port.sendResult = sent ? SendQueue.OfferResult.ACCEPTED : SendQueue.OfferResult.FULL;
-        sut.connect(3, 0);
+        sut.connect(attempt(3), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Act
@@ -488,11 +476,11 @@ class SessionCoreTest {
     @Test
     void connect_waits_for_connack_and_rejects_a_second_attempt() {
         // Arrange
-        sut.connect(1, 0);
+        sut.connect(attempt(1), 0);
 
         // Act
         sut.opened(1);
-        sut.connect(2, 0);
+        sut.connect(attempt(2), 0);
 
         // Assert
         assertThat(sut.state()).isEqualTo(CONNECTING);
@@ -509,9 +497,170 @@ class SessionCoreTest {
     }
 
     @Test
+    void an_established_connection_is_announced_before_the_connect_operation_completes() {
+        // Arrange: connection admission must become possible independently of future completion.
+        ConnectionAttempt first = attempt(1);
+        sut.connect(first, 0);
+        port.onConnected = () -> {
+            assertThat(sut.state()).isEqualTo(CONNECTED);
+            assertThat(port.results).doesNotContainKey(1L);
+        };
+
+        // Act
+        accept();
+
+        // Assert
+        assertThat(port.connections).containsExactly(new Connection(1, ConnAck.of(false)));
+        assertThat(requireNonNull(port.results.get(1L)).value()).isEqualTo(ConnAck.of(false));
+        assertThat(port.attempts).containsExactly(first);
+    }
+
+    @Test
+    void a_tokenless_attempt_establishes_a_connection_without_completing_an_operation() {
+        // Arrange
+        ConnectionAttempt first = attempt(0);
+        ConnectionAttempt second = attempt(0);
+        sut.connect(first, 0);
+        sut.opened(1);
+
+        // Act
+        accept();
+        sut.failed(1, new IOException("connection ended"));
+        sut.connect(second, 0);
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        sut.close(null);
+
+        // Assert: each connection opens for its own attempt despite the shared absent token.
+        assertThat(port.results).isEmpty();
+        assertThat(port.connections).containsExactly(
+                new Connection(1, ConnAck.of(false)),
+                new Connection(2, ConnAck.of(false))
+        );
+        assertThat(port.attempts).containsExactly(first, second);
+        assertThat(port.established).containsExactly(true, true);
+        assertThat(sut.state()).isEqualTo(CLOSED);
+    }
+
+    @Test
+    void a_refused_tokenless_attempt_does_not_complete_an_operation_or_announce_a_connection() {
+        // Arrange
+        sut.connect(attempt(0), 0);
+
+        // Act
+        receive(1, new Packet.ConnAck(false, ReasonCode.NOT_AUTHORIZED, EMPTY), 0);
+
+        // Assert
+        assertThat(port.results).isEmpty();
+        assertThat(port.connections).isEmpty();
+        assertThat(port.established).containsExactly(false);
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+    }
+
+    @Test
+    void a_rejected_tokenless_attempt_does_not_replace_the_current_attempt() {
+        // Arrange
+        sut.connect(attempt(1), 0);
+
+        // Act
+        sut.connect(attempt(0), 0);
+        accept();
+
+        // Assert
+        assertThat(port.results).containsOnlyKeys(1L);
+        assertThat(port.opened).containsExactly(1L);
+        assertThat(port.connections).containsExactly(new Connection(1, ConnAck.of(false)));
+    }
+
+    @Test
+    void a_late_connack_cannot_announce_a_connection_after_the_attempt_ends() {
+        // Arrange
+        sut.connect(attempt(1), 0);
+        sut.failed(1, new IOException("first attempt failed"));
+        sut.connect(attempt(2), 0);
+
+        // Act & Assert: the ended attempt's CONNACK announces nothing.
+        receive(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+        assertThat(port.connections).isEmpty();
+
+        // Act
+        receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
+
+        // Assert
+        assertThat(port.connections).containsExactly(new Connection(2, ConnAck.of(false)));
+        assertThat(requireNonNull(port.results.get(1L)).failure())
+                .isInstanceOf(MqttConnectException.class);
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(ConnAck.of(false));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("attemptOrders")
+    void connection_attempt_events_have_one_outcome_in_every_order(AttemptOrder scenario) {
+        // Arrange: both public and tokenless attempts share the same connection lifecycle.
+        sut.connect(attempt(scenario.operation()), 0);
+        sut.opened(1);
+        var failure = new IOException("transport failed");
+        port.onConnected = () -> assertThat(port.ends).isEmpty();
+
+        // Act: after the first terminal event, the remaining events cannot change its outcome.
+        for (ConnectionEvent event : scenario.events()) {
+            switch (event) {
+                case CONNACK -> accept();
+                case FAILURE -> sut.failed(1, failure);
+                case DEADLINE -> sut.timer(1, CONNECT, seconds(30));
+                case CLOSE -> sut.close(null);
+            }
+        }
+
+        // Assert: only a CONNACK that precedes all terminal input can establish the connection.
+        boolean accepted = scenario.events().getFirst() == ConnectionEvent.CONNACK;
+        assertThat(port.connections).hasSize(accepted ? 1 : 0);
+        assertThat(port.established).containsExactly(accepted);
+        assertThat(port.ends).hasSize(1);
+        assertThat(port.opened).containsExactly(1L);
+        assertThat(port.timers).isEmpty();
+        assertThat(sut.state()).isEqualTo(CLOSED);
+        if (scenario.operation() == 0) {
+            assertThat(port.results).isEmpty();
+        } else {
+            assertThat(port.results).containsOnlyKeys(scenario.operation());
+            Result result = requireNonNull(port.results.get(scenario.operation()));
+            if (accepted) {
+                assertThat(result.value()).isEqualTo(ConnAck.of(false));
+                assertThat(result.failure()).isNull();
+            } else {
+                assertThat(result.value()).isNull();
+                assertThat(result.failure()).isInstanceOf(MqttConnectException.class);
+            }
+        }
+    }
+
+    private static Stream<AttemptOrder> attemptOrders() {
+        List<ConnectionEvent> events = List.of(ConnectionEvent.values());
+        List<List<ConnectionEvent>> orders = permutations(events).toList();
+        assertThat(orders).hasSize(24).doesNotHaveDuplicates()
+                .allSatisfy(order -> assertThat(order)
+                        .containsExactlyInAnyOrder(ConnectionEvent.values()));
+        List<AttemptOrder> scenarios = orders.stream()
+                .flatMap(order -> Stream.of(new AttemptOrder(1, order), new AttemptOrder(0, order)))
+                .toList();
+        assertThat(scenarios).hasSize(48).doesNotHaveDuplicates();
+        return scenarios.stream();
+    }
+
+    private enum ConnectionEvent {
+        CONNACK,
+        FAILURE,
+        DEADLINE,
+        CLOSE
+    }
+
+    private record AttemptOrder(long operation, List<ConnectionEvent> events) {
+    }
+
+    @Test
     void refusal_preserves_the_broker_reason_and_does_not_notify_the_listener() {
         // Arrange
-        sut.connect(1, 0);
+        sut.connect(attempt(1), 0);
 
         // Act
         receive(1, new Packet.ConnAck(false, ReasonCode.NOT_AUTHORIZED, EMPTY), 0);
@@ -525,13 +674,14 @@ class SessionCoreTest {
                                 .contains(ReasonCode.NOT_AUTHORIZED)
                 );
         assertThat(port.established).containsExactly(false);
+        assertThat(port.connections).isEmpty();
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
     }
 
     @Test
     void refusing_connect_for_capacity_fails_only_the_connection_attempt() {
         // Arrange
-        sut.connect(1, 0);
+        sut.connect(attempt(1), 0);
         port.sendResult = SendQueue.OfferResult.FULL;
 
         // Act
@@ -615,7 +765,7 @@ class SessionCoreTest {
     @Test
     void a_packet_before_connack_and_a_present_clean_session_are_protocol_errors() {
         // Arrange
-        sut.connect(1, 0);
+        sut.connect(attempt(1), 0);
 
         // Act
         receive(1, new Packet.PingResp(), 0);
@@ -623,7 +773,7 @@ class SessionCoreTest {
         // Assert
         assertThat(requireNonNull(port.results.get(1L)).failure())
                 .isInstanceOf(MqttConnectException.class);
-        sut.connect(2, 0);
+        sut.connect(attempt(2), 0);
         receive(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0);
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectException.class);
@@ -633,7 +783,7 @@ class SessionCoreTest {
     @Test
     void the_connect_deadline_and_old_connection_events_cannot_affect_a_new_attempt() {
         // Arrange
-        sut.connect(1, 0);
+        sut.connect(attempt(1), 0);
         sut.opened(1);
 
         // Act
@@ -649,7 +799,7 @@ class SessionCoreTest {
                 );
 
         // Act: deliver stale events after starting another connection attempt.
-        sut.connect(2, seconds(30));
+        sut.connect(attempt(2), seconds(30));
         sut.opened(1);
         sut.timer(1, CONNECT, seconds(60));
         sut.failed(1, new IllegalStateException("old reader"));
@@ -795,12 +945,12 @@ class SessionCoreTest {
     @Test
     void close_is_terminal_idempotent_and_fails_pending_operations() {
         // Arrange
-        sut.connect(1, 0);
+        sut.connect(attempt(1), 0);
 
         // Act
         sut.close(null);
         sut.close(null);
-        sut.connect(2, 0);
+        sut.connect(attempt(2), 0);
 
         // Assert
         assertThat(sut.state()).isEqualTo(CLOSED);
@@ -1146,6 +1296,7 @@ class SessionCoreTest {
                                 .isEqualTo(ReasonCode.UNSPECIFIED_ERROR)
                 );
         assertThat(port.removed).containsExactly(2L);
+        assertThat(port.resubscriptionFailures).isEmpty();
         assertThat(port.deliveries).isEmpty();
         assertThat(port.sent).hasSize(2);
         assertThat(sut.state()).isEqualTo(CONNECTED);
@@ -1501,7 +1652,7 @@ class SessionCoreTest {
         sut.subscribe(3, subscription("a/#"));
         int oldId = ((Packet.Subscribe) port.sent.getLast()).packetId();
         sut.failed(1, new IOException("Peer reset"));
-        sut.connect(4, 0);
+        sut.connect(attempt(4), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         sut.publish(5, message());
         sut.subscribe(6, subscription("a/#"));
@@ -1700,7 +1851,7 @@ class SessionCoreTest {
         sut.failed(1, new IOException("lost connection"));
         List<Disconnection> expectedEnds = List.copyOf(port.ends);
         port.sent.clear();
-        sut.connect(100, 0);
+        sut.connect(attempt(100), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         List<Packet.Subscribe> recreated = port.sent.stream()
                 .map(Packet.Subscribe.class::cast).toList();
@@ -1783,7 +1934,7 @@ class SessionCoreTest {
         var oldFailure = new IllegalStateException("old handler failed");
         var chains = new ArrayList<ArrayDeque<Runnable>>();
         chains.add(new ArrayDeque<>(List.of(
-                () -> sut.connect(3, 0),
+                () -> sut.connect(attempt(3), 0),
                 () -> receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0),
                 () -> {
                     sut.subscribe(4, subscription("a/#"));
@@ -1836,7 +1987,7 @@ class SessionCoreTest {
         var chains = new ArrayList<ArrayDeque<Runnable>>();
         chains.add(new ArrayDeque<>(List.of(
                 () -> sut.failed(1, new IOException("Lost connection")),
-                () -> sut.connect(3, 0),
+                () -> sut.connect(attempt(3), 0),
                 () -> receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0),
                 () -> {
                     sut.subscribe(4, subscription("a/#"));
@@ -2203,7 +2354,7 @@ class SessionCoreTest {
         receive(1, qosOnePublication(7, "a/b", false), 0);
         long oldToken = port.deliveries.getLast().token();
         sut.failed(1, new IOException("Lost connection"));
-        sut.connect(3, 0);
+        sut.connect(attempt(3), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         sut.subscribe(4, subscription("a/#"));
         receive(2, qosOnePublication(7, "a/b", false), 0);
@@ -2251,7 +2402,7 @@ class SessionCoreTest {
         assertThat(pubAckIds()).isEmpty();
 
         // Act
-        sut.connect(3, 0);
+        sut.connect(attempt(3), 0);
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         receive(2, qosOnePublication(1, "other", false), 0);
 
@@ -2422,8 +2573,12 @@ class SessionCoreTest {
     }
 
     private void connected() {
-        sut.connect(1, 0);
+        sut.connect(attempt(1), 0);
         accept();
+    }
+
+    private static ConnectionAttempt attempt(long operation) {
+        return new ConnectionAttempt(operation, null);
     }
 
     private void accept() {
@@ -2464,6 +2619,9 @@ class SessionCoreTest {
     }
 
     private record Removal(long id, Subscription handle, @Nullable Throwable cause) {
+    }
+
+    private record Connection(long generation, ConnAck ack) {
     }
 
     private static final class TestSubscription implements Subscription {
@@ -2507,9 +2665,12 @@ class SessionCoreTest {
         final Map<Long, Result> results = new HashMap<>();
         final Map<SessionCore.Timer, Duration> timers = new EnumMap<>(SessionCore.Timer.class);
         final List<Long> opened = new ArrayList<>();
+        final List<ConnectionAttempt> attempts = new ArrayList<>();
+        final List<Connection> connections = new ArrayList<>();
         final List<Long> registered = new ArrayList<>();
         final List<Long> removed = new ArrayList<>();
         final List<Removal> removals = new ArrayList<>();
+        final List<Removal> resubscriptionFailures = new ArrayList<>();
         final List<Subscription> grants = new ArrayList<>();
         @Nullable TestSubscription registering;
         final List<Received> deliveries = new ArrayList<>();
@@ -2521,10 +2682,26 @@ class SessionCoreTest {
         SendQueue.OfferResult sendResult = SendQueue.OfferResult.ACCEPTED;
         long ticket;
         int ignoredResponses;
+        Runnable onConnected = () -> {
+        };
 
         @Override
-        public void open(long generation, long operation) {
+        public void open(long generation, ConnectionAttempt attempt) {
             opened.add(generation);
+            attempts.add(attempt);
+        }
+
+        @Override
+        public void connected(long generation, ConnAck ack) {
+            connections.add(new Connection(generation, ack));
+            onConnected.run();
+        }
+
+        @Override
+        public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+            var subscription = (TestSubscription) handle;
+            removeSubscription(subscription.id, handle, failure);
+            resubscriptionFailures.add(new Removal(subscription.id, handle, failure));
         }
 
         @Override
@@ -2584,6 +2761,7 @@ class SessionCoreTest {
 
         @Override
         public void complete(long operation, @Nullable Object value, @Nullable Throwable failure) {
+            assertThat(operation).isPositive();
             assertThat(results.put(operation, new Result(value, failure))).isNull();
         }
 

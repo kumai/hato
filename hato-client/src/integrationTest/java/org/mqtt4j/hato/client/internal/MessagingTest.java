@@ -39,7 +39,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 abstract class MessagingTest {
 
     static final ClientActor.Usage NOTHING_HELD = new ClientActor.Usage(
-            0, 0, 0, 0, 0, 0, 0, 0, 0
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0
     );
 
     @ParameterizedTest
@@ -662,7 +662,7 @@ abstract class MessagingTest {
                     .containsExactly(0, 0, 0, 0, 1, 1));
             release.countDown();
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 1, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 1, 0, 0, 0, 0, 1, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
@@ -720,7 +720,7 @@ abstract class MessagingTest {
             assertThat(ended).isEmpty();
             sut.disconnect().get(5, SECONDS);
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
@@ -805,7 +805,7 @@ abstract class MessagingTest {
                     .isInstanceOf(MqttConnectionLostException.class)
                     .hasCause(end.cause().orElseThrow());
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {

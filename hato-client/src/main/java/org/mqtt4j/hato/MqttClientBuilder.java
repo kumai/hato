@@ -217,7 +217,8 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Registers the single listener for established connection endings; defaults to no action.
+    /// Registers the single listener for connection and subscription notifications; defaults
+    /// to no action.
     public MqttClientBuilder connectionListener(ConnectionListener value) {
         listener = requireNonNull(value, "connectionListener");
         return this;

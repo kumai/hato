@@ -69,7 +69,11 @@ final class SessionCore {
 
     interface Port {
 
-        void open(long generation, long operation);
+        void open(long generation, ConnectionAttempt attempt);
+
+        void connected(long generation, ConnAck ack);
+
+        void resubscribeFailed(Subscription handle, MqttSubscribeException failure);
 
         /// Reports queue admission, not write completion. The core handles refusal per operation.
         SendQueue.OfferResult send(
@@ -182,7 +186,7 @@ final class SessionCore {
 
     private long generation;
 
-    private long connectOperation;
+    private @Nullable ConnectionAttempt connecting;
 
     private long disconnectOperation;
 
@@ -278,17 +282,23 @@ final class SessionCore {
         return sessionNumber;
     }
 
-    void connect(long operation, long now) {
+    void connect(ConnectionAttempt attempt, long now) {
         if (state != State.DISCONNECTED) {
-            port.complete(operation, null, new IllegalStateException("Client is " + state));
+            if (attempt.operation != 0) {
+                port.complete(
+                        attempt.operation,
+                        null,
+                        new IllegalStateException("Client is " + state)
+                );
+            }
             return;
         }
         state = State.CONNECTING;
         generation++;
-        connectOperation = operation;
+        connecting = attempt;
         lastSent = now;
         transportConnected = false;
-        port.open(generation, operation);
+        port.open(generation, connecting);
         port.schedule(generation, Timer.CONNECT, timeout);
     }
 
@@ -348,10 +358,14 @@ final class SessionCore {
                     deferred.addAll(session.inflight.values());
                 }
                 state = State.CONNECTED;
+                var result = ConnAck.of(ack.sessionPresent());
+                port.connected(generation, result);
                 port.cancel(Timer.CONNECT);
-                long operation = connectOperation;
-                connectOperation = 0;
-                port.complete(operation, ConnAck.of(ack.sessionPresent()), null);
+                long operation = requireNonNull(connecting).operation;
+                connecting = null;
+                if (operation != 0) {
+                    port.complete(operation, result, null);
+                }
                 for (LocalSubscription local : List.copyOf(subscriptions.values())) {
                     if (local.closed) {
                         if (ack.sessionPresent()) {
@@ -984,16 +998,12 @@ final class SessionCore {
         }
         if (reason == ReasonCode.UNSPECIFIED_ERROR) {
             var refusal = new MqttSubscribeException(reason);
-            removeSubscription(local, refusal);
             if (!restoring) {
+                removeSubscription(local, refusal);
                 port.complete(local.id, null, refusal);
             } else {
-                try {
-                    log.warn("Subscription restoration refused for {} (subscription {})",
-                            clientId, local.id, refusal);
-                } catch (Throwable _) {
-                    // A logging backend failure must not turn local refusal into client closure.
-                }
+                subscriptions.remove(local.id);
+                port.resubscribeFailed(requireNonNull(local.handle), refusal);
                 finishRemoval(local);
             }
         } else {
@@ -1482,15 +1492,17 @@ final class SessionCore {
         unknownReleases.clear();
         restoringInFlight = 0;
         closingInFlight = 0;
-        if (connectOperation != 0) {
+        if (connecting != null) {
             Throwable failure = switch (cause) {
                 case null -> new MqttConnectException("Connection failed");
                 case MqttConnectException refusal -> refusal;
                 default -> new MqttConnectException("Connection failed", cause);
             };
-            long operation = connectOperation;
-            connectOperation = 0;
-            port.complete(operation, null, failure);
+            long operation = connecting.operation;
+            connecting = null;
+            if (operation != 0) {
+                port.complete(operation, null, failure);
+            }
         }
         if (disconnectOperation != 0) {
             long operation = disconnectOperation;

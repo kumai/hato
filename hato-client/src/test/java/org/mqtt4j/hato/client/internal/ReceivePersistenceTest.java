@@ -25,6 +25,7 @@ import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttSubscribeException;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
@@ -523,7 +524,7 @@ class ReceivePersistenceTest {
 
     private void connect(boolean present) {
         long operation = ++nextOperation;
-        sut.connect(operation, 0);
+        sut.connect(new ConnectionAttempt(operation, null), 0);
         generation = port.generation;
         sut.opened(generation);
         sut.received(generation, new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY), 0, 0);
@@ -638,8 +639,16 @@ class ReceivePersistenceTest {
         long generation;
 
         @Override
-        public void open(long generation, long operation) {
+        public void open(long generation, ConnectionAttempt attempt) {
             this.generation = generation;
+        }
+
+        @Override
+        public void connected(long generation, ConnAck ack) {
+        }
+
+        @Override
+        public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
         }
 
         @Override
@@ -684,6 +693,7 @@ class ReceivePersistenceTest {
 
         @Override
         public void complete(long operation, @Nullable Object value, @Nullable Throwable failure) {
+            assertThat(operation).isPositive();
             assertThat(results.put(operation, new Result(value, failure))).isNull();
         }
 

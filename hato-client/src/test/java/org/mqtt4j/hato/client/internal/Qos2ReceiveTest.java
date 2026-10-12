@@ -723,7 +723,7 @@ class Qos2ReceiveTest {
 
     private void connect(boolean present) {
         long operation = ++nextOperation;
-        sut.connect(operation, 0);
+        sut.connect(new ConnectionAttempt(operation, null), 0);
         generation = port.generation;
         sut.opened(generation);
         receive(new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY));

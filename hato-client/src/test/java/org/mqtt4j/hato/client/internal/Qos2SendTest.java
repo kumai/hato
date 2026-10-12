@@ -926,7 +926,7 @@ class Qos2SendTest {
 
     private void connect(boolean present) {
         long operation = ++nextOperation;
-        sut.connect(operation, 0);
+        sut.connect(new ConnectionAttempt(operation, null), 0);
         generation = port.generation;
         receive(new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY));
         assertThat(result(operation).value()).isEqualTo(ConnAck.of(present));
@@ -1050,7 +1050,7 @@ class Qos2SendTest {
         return orders.stream();
     }
 
-    private static Stream<List<Event>> permutations(List<Event> remaining) {
+    static <T> Stream<List<T>> permutations(List<T> remaining) {
         if (remaining.isEmpty()) {
             return Stream.of(List.of());
         }
@@ -1058,7 +1058,7 @@ class Qos2SendTest {
             var tail = new ArrayList<>(remaining);
             tail.remove(event);
             return permutations(tail).map(suffix -> {
-                var order = new ArrayList<Event>();
+                var order = new ArrayList<T>();
                 order.add(event);
                 order.addAll(suffix);
                 return List.copyOf(order);

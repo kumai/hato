@@ -42,8 +42,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// pending QoS 1 and QoS 2 exchanges and established subscriptions. False discards the old
     /// exchanges and re-creates subscriptions using their existing handles. Previously failed
     /// publication futures remain failed. This future does not wait for replay or SUBACK; a
-    /// re-creation refusal ends only the affected subscription. A pull subscription reports it
-    /// through [Subscription#receive()].
+    /// re-creation refusal ends only the affected subscription and is reported by
+    /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscribeException)]. A pull
+    /// subscription also reports it through [Subscription#receive()].
     ///
     /// Local session state is held only in this client object's memory. On a persistent
     /// connection, if the broker reports Session Present without matching local state, the

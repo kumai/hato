@@ -117,8 +117,35 @@ arrives as the cause of a `CompletionException`.
 | `MqttSubscribeException` | The broker refused the subscription. |
 
 The `connectionListener` is called whenever a connection ends, whether you
-disconnected or not. Besides broker and network failures, the client itself ends
-the connection when:
+disconnected or not. A lambda, as in the configuration example, handles just
+these endings; override the other listener methods to observe successful
+connections and subscriptions that the broker refuses to re-create:
+
+```java
+ConnectionListener listener = new ConnectionListener() {
+    @Override
+    public void onConnected(ConnAck connAck) {
+        System.out.println("Connected: " + connAck);
+    }
+
+    @Override
+    public void onDisconnected(Disconnection end) {
+        System.out.println("Connection ended: " + end);
+    }
+
+    @Override
+    public void onResubscribeFailed(Subscription subscription, MqttSubscribeException failure) {
+        System.err.println("Subscription ended: " + subscription.filter() + ": " + failure);
+    }
+};
+```
+
+Pass it with `connectionListener(listener)` when building the client. A refused
+subscription ends; the connection and its other subscriptions continue. See
+[ConnectionListener](src/main/java/org/mqtt4j/hato/ConnectionListener.java) for
+callback ordering and threading.
+
+Besides broker and network failures, the client itself ends the connection when:
 
 - a handler throws, including one still running from before a reconnection in a
   persistent session. Catch exceptions inside the handler to keep the connection.
