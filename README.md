@@ -112,6 +112,8 @@ void show(MqttMessage message) {
   for tests, device simulators, and demos.
 - [Test kit](mqtj-testkit/README.md): simulate connection failures and control time
   in your tests.
+- [Examples](examples/README.md): compile and run the examples above, or try a
+  complete round trip with the embedded broker.
 
 ## Contributing
 
