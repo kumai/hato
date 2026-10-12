@@ -9,7 +9,9 @@ import static java.util.Objects.requireNonNull;
 /// [ReasonCode#PACKET_TOO_LARGE] can indicate a local limit rather than a peer protocol violation.
 ///
 /// Reported as [Disconnection#cause] or as the cause of [MqttConnectException] or
-/// [MqttConnectionLostException]. An underlying cause is retained for diagnostics;
+/// [MqttConnectionLostException]. A QoS 2 publication that the broker acknowledges with PUBACK
+/// fails with this exception directly, without ending the connection; see
+/// [MqttPublisher#publish(MqttMessage)]. An underlying cause is retained for diagnostics;
 /// applications should use this exception and [#reasonCode] to classify the failure.
 public final class MqttProtocolException extends MqttException {
 

@@ -8,9 +8,11 @@ public interface MqttPublisher {
 
     /// Publishes a message and completes after its transport write for QoS 0, PUBACK for QoS 1,
     /// or PUBCOMP for QoS 2. Completion does not confirm a subscriber's application processing.
-    /// QoS 2 requires the full exchange; a broker replying with PUBACK instead of PUBREC ends
-    /// the connection with [MqttProtocolException] as the cause. That PUBACK has ended the
-    /// broker's exchange, so a persistent session does not resume it.
+    /// QoS 2 requires the full exchange. A broker without QoS 2, such as RabbitMQ with
+    /// MQTT 3.1.1, replies with PUBACK instead of PUBREC: it has accepted the message at QoS 1
+    /// and may deliver it more than once. The publication then fails with
+    /// [MqttProtocolException] while the connection stays usable, and a persistent session does
+    /// not resume it.
     ///
     /// An unconnected client fails with [MqttNotConnectedException]. Admission capacity
     /// failures use [MqttCapacityException] and leave the connection usable.

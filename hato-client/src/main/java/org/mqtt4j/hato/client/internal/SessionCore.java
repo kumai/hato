@@ -211,6 +211,8 @@ final class SessionCore {
 
     private boolean unknownPubAckLogged;
 
+    private boolean downgradedPubAckLogged;
+
     private boolean unknownPubRecLogged;
 
     private boolean unknownPubCompLogged;
@@ -824,27 +826,35 @@ final class SessionCore {
             }
             return;
         }
-        if (!(inflight instanceof Publication pending) || pending.qos != Qos.AT_LEAST_ONCE) {
-            String mismatch = "PUBACK does not match the outgoing QoS stage";
-            stageMismatch(mismatch);
-            if (inflight instanceof Publication) {
-                // PUBACK ended the broker's exchange, as when RabbitMQ downgrades QoS 2 to
-                // QoS 1. Resuming it in a persistent session would deliver the message again.
-                removeInflight(ack.packetId());
-                if (inflight.operation != 0) {
-                    // A pending DISCONNECT keeps the connection, so the future fails here.
-                    port.complete(
-                            inflight.operation,
-                            null,
-                            new MqttConnectionLostException(
-                                    new MqttProtocolException(mismatch, ReasonCode.PROTOCOL_ERROR)
-                            )
-                    );
-                }
-            }
-            return;
+        switch (inflight) {
+            case Release _ -> stageMismatch("PUBACK does not match the outgoing QoS stage");
+            case Publication publication when publication.qos == Qos.EXACTLY_ONCE ->
+                    downgraded(publication);
+            case Publication publication -> completePublication(publication);
         }
-        completePublication(inflight);
+    }
+
+    /// Brokers without QoS 2, such as RabbitMQ with MQTT 3.1.1, accept a QoS 2 PUBLISH as QoS 1
+    /// and answer PUBACK. That ends the broker's exchange, possibly after delivering the message.
+    /// Only this publication fails: the connection stays, even while disconnecting, and a
+    /// persistent session does not resume the exchange or deliver the message again.
+    private void downgraded(Publication publication) {
+        if (!downgradedPubAckLogged) {
+            downgradedPubAckLogged = true;
+            log.warn("Broker accepted QoS 2 packet identifier {} at QoS 1 with PUBACK on {}",
+                    publication.packetId, clientId);
+        }
+        removeInflight(publication.packetId);
+        if (publication.operation != 0) {
+            port.complete(
+                    publication.operation,
+                    null,
+                    new MqttProtocolException(
+                            "PUBACK accepted a QoS 2 publication at QoS 1",
+                            ReasonCode.PROTOCOL_ERROR
+                    )
+            );
+        }
     }
 
     private void release(int packetId) {

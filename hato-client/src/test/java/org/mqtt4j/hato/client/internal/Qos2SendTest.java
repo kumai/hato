@@ -374,13 +374,12 @@ class Qos2SendTest {
         assertThat(result(operation).failure()).isInstanceOf(MqttConnectionLostException.class);
     }
 
-    @ParameterizedTest(name = "{0}, after PUBREC={1}, receives {2}, resumed={3}")
-    @MethodSource("stageMismatchResumptions")
-    void a_persistent_session_resumes_a_mismatched_exchange_unless_puback_ended_it(
+    @ParameterizedTest(name = "{0}, after PUBREC={1}, receives {2}")
+    @MethodSource("stageMismatches")
+    void a_persistent_session_resumes_an_exchange_closed_by_a_stage_mismatch(
             Qos qos,
             boolean received,
-            String response,
-            boolean resumed
+            String response
     ) {
         // Arrange
         connect(false);
@@ -395,38 +394,61 @@ class Qos2SendTest {
         // Act
         connect(true);
 
-        // Assert
-        assertThat(port.outgoingIds).isEqualTo(resumed ? List.of(id) : List.of());
+        // Assert: the broker may still hold the identifier, so the exchange is not dropped.
+        assertThat(port.outgoingIds).containsExactly(id);
     }
 
-    @Test
-    void a_puback_for_a_qos_two_publication_while_disconnecting_also_ends_its_exchange() {
-        // Arrange
+    @ParameterizedTest(name = "disconnect pending={0}")
+    @ValueSource(booleans = {false, true})
+    void a_puback_for_a_qos_two_publication_fails_only_that_publication(boolean disconnecting) {
+        // Arrange: a broker without QoS 2 accepts QoS 2 at QoS 1 and answers PUBACK.
         connect(false);
-        long operation = publish(message());
+        long downgraded = publish(message());
         int id = port.accepted.getLast().packetId();
-        long disconnect = ++nextOperation;
-        sut.disconnect(disconnect);
-        long ticket = port.ticket;
+        long other = publish(message().withQos(Qos.AT_LEAST_ONCE));
+        int otherId = port.accepted.getLast().packetId();
+        if (disconnecting) {
+            sut.disconnect(++nextOperation);
+        }
 
         // Act
         receive(pubAck(id));
-        sut.sent(generation, ticket, 0);
 
         // Assert
-        assertThat(result(disconnect).failure()).isNull();
-        assertThat(result(operation).failure())
-                .isInstanceOf(MqttConnectionLostException.class)
-                .hasCauseInstanceOf(MqttProtocolException.class);
+        assertThat(result(downgraded).failure())
+                .isInstanceOfSatisfying(MqttProtocolException.class, failure ->
+                        assertThat(failure.reasonCode()).isEqualTo(ReasonCode.PROTOCOL_ERROR));
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+        assertThat(port.ends).isEmpty();
+        assertThat(port.results).doesNotContainKey(other);
 
-        // Act: the whole byte budget is available, and nothing is resumed.
+        // Act & Assert
+        receive(pubAck(otherId));
+        assertThat(result(other).value()).isEqualTo(PublishResult.of());
+    }
+
+    @Test
+    void a_resumed_qos_two_publication_answered_by_puback_is_dropped_with_its_byte_budget() {
+        // Arrange: the publication failed with its first connection and is resumed.
+        connect(false);
+        long operation = publish(message());
+        int id = port.accepted.getLast().packetId();
+        sut.failed(generation, new IOException("connection lost"));
+        Result failure = result(operation);
+        connect(true);
+
+        // Act
+        receive(pubAck(id));
+        sut.failed(generation, new IOException("connection lost"));
         port.outgoingIds.clear();
         connect(true);
         long large = publish(messageWithWireBytes(32 * 1024 * 1024).withQos(Qos.EXACTLY_ONCE));
 
-        // Assert
-        assertThat(port.results).doesNotContainKey(large);
+        // Assert: nothing is resumed again, and the whole byte budget is available.
         assertThat(port.outgoingIds).containsExactly(port.accepted.getLast().packetId());
+        assertThat(port.results).doesNotContainKey(large);
+        assertThat(result(operation)).isSameAs(failure);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
     }
 
     @Test
@@ -1014,20 +1036,8 @@ class Qos2SendTest {
         return Stream.of(
                 Arguments.of(Qos.AT_LEAST_ONCE, false, "PUBREC"),
                 Arguments.of(Qos.AT_LEAST_ONCE, false, "PUBCOMP"),
-                Arguments.of(Qos.EXACTLY_ONCE, false, "PUBACK"),
                 Arguments.of(Qos.EXACTLY_ONCE, false, "PUBCOMP"),
                 Arguments.of(Qos.EXACTLY_ONCE, true, "PUBACK")
-        );
-    }
-
-    /// Of these mismatches, only PUBACK before PUBREC shows that the broker ended the exchange.
-    private static Stream<Arguments> stageMismatchResumptions() {
-        return Stream.of(
-                Arguments.of(Qos.AT_LEAST_ONCE, false, "PUBREC", true),
-                Arguments.of(Qos.AT_LEAST_ONCE, false, "PUBCOMP", true),
-                Arguments.of(Qos.EXACTLY_ONCE, false, "PUBACK", false),
-                Arguments.of(Qos.EXACTLY_ONCE, false, "PUBCOMP", true),
-                Arguments.of(Qos.EXACTLY_ONCE, true, "PUBACK", true)
         );
     }
 

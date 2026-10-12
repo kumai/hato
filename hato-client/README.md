@@ -113,6 +113,7 @@ arrives as the cause of a `CompletionException`.
 | `MqttNotConnectedException` | The client was not connected. |
 | `MqttConnectionLostException` | The connection ended before the result was known. A publication may or may not have reached the broker. |
 | `MqttCapacityException` | The client reached an admission limit. The connection stays up; let outstanding work drain before retrying. |
+| `MqttProtocolException` | The broker accepted a QoS 2 publication only at QoS 1, so it may be delivered more than once. The connection stays up. |
 | `MqttSubscribeException` | The broker refused the subscription. |
 
 The `connectionListener` is called whenever a connection ends, whether you
