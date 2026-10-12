@@ -1,15 +1,22 @@
 package org.mqtt4j.mqtj;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.UUID;
+import java.util.function.Consumer;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
 
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.mqtj.client.internal.ClientActor;
 import org.mqtt4j.mqtj.client.internal.DefaultTimerScheduler;
+import org.mqtt4j.mqtj.client.internal.TcpTransport;
 import org.mqtt4j.mqtj.client.internal.common.protocol.MqttString;
 import org.mqtt4j.mqtj.spi.TimerScheduler;
 import org.mqtt4j.mqtj.spi.Transport;
@@ -63,12 +70,17 @@ public final class MqttClientBuilder {
 
     private ConnectionListener listener = _ -> { };
 
-    private Transport.Factory transportFactory = Transport::tcp;
+    private Transport.@Nullable Factory transportFactory;
+
+    private @Nullable SSLContext sslContext;
+
+    private @Nullable Consumer<SSLParameters> sslParameters;
 
     MqttClientBuilder() {
     }
 
-    /// A required TCP broker URI, such as `mqtt://localhost:1883`. The default port is 1883.
+    /// A required broker URI using `mqtt` for TCP or `mqtts` for TLS over TCP.
+    /// The default ports are 1883 and 8883, respectively.
     /// Hosts must satisfy [URI#parseServerAuthority]; names containing underscores are rejected.
     /// User information, paths, queries, and fragments are not accepted. Rejection messages
     /// hide any user information in the given URI.
@@ -80,7 +92,7 @@ public final class MqttClientBuilder {
             // The exception's message and input repeat the whole URI, so only the reason is kept.
             throw new IllegalArgumentException(failure.getReason() + ": " + redactUserInfo(value));
         }
-        if (!"mqtt".equals(value.getScheme())
+        if ((!"mqtt".equals(value.getScheme()) && !"mqtts".equals(value.getScheme()))
             || value.getHost() == null
             || value.getRawUserInfo() != null
             || value.getRawQuery() != null
@@ -90,7 +102,7 @@ public final class MqttClientBuilder {
             || value.getPort() > MAX_PORT
         ) {
             throw new IllegalArgumentException(
-                    "Expected mqtt://host[:port]: " + redactUserInfo(value)
+                    "Expected mqtt://host[:port] or mqtts://host[:port]: " + redactUserInfo(value)
             );
         }
         server = value;
@@ -169,7 +181,8 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Total deadline for transport establishment and CONNACK; also bounds the DISCONNECT write.
+    /// Total deadline for transport establishment, including any TLS handshake, and CONNACK;
+    /// also bounds the DISCONNECT write.
     /// Defaults to 30 seconds. Must be positive and no greater than 2147483647 milliseconds.
     public MqttClientBuilder connectionTimeout(Duration value) {
         requireNonNull(value, "connectionTimeout");
@@ -210,8 +223,41 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Supplies a fresh transport for each connection attempt; defaults to [Transport#tcp].
-    /// The client owns and closes the returned transports.
+    /// Supplies the TLS context for an `mqtts` connection, including trust and client keys.
+    /// If omitted, [#build()] obtains [SSLContext#getDefault()] once. The same context is
+    /// reused across connection attempts. Initialize it before building and do not reinitialize
+    /// it while the client is in use. Explicit TLS settings require `mqtts` and cannot be
+    /// combined with [#transportFactory(Transport.Factory)].
+    public MqttClientBuilder sslContext(SSLContext value) {
+        sslContext = requireNonNull(value, "sslContext");
+        return this;
+    }
+
+    /// Customizes TLS parameters once per [#build()], starting with the selected context's
+    /// defaults and endpoint identification set to `"HTTPS"` for hostname verification.
+    /// Setting the endpoint identification algorithm to `null` explicitly disables verification.
+    /// The parameters are validated during [#build()], and a detached snapshot is used
+    /// for every connection attempt. Custom algorithm constraints and SNI matchers remain shared;
+    /// do not mutate those objects while the client is in use.
+    /// A later call replaces the customizer.
+    /// Explicit TLS settings require `mqtts` and cannot be combined with
+    /// [#transportFactory(Transport.Factory)].
+    ///
+    /// For AWS IoT Core with X.509 client authentication on port 443, configure the client keys
+    /// in [#sslContext(SSLContext)] and set ALPN with:
+    /// ```java
+    /// builder.sslParameters(parameters ->
+    ///         parameters.setApplicationProtocols(new String[]{"x-amzn-mqtt-ca"}));
+    /// ```
+    public MqttClientBuilder sslParameters(Consumer<SSLParameters> value) {
+        sslParameters = requireNonNull(value, "sslParameters");
+        return this;
+    }
+
+    /// Supplies a fresh transport for each connection attempt. Defaults to TCP for `mqtt`
+    /// and TLS over TCP for `mqtts`. The client owns and closes the returned transports.
+    /// An explicit factory cannot be combined with [#sslContext(SSLContext)] or
+    /// [#sslParameters(Consumer)]. The factory's transports must reject unsupported URI schemes.
     public MqttClientBuilder transportFactory(Transport.Factory value) {
         transportFactory = requireNonNull(value, "transportFactory");
         return this;
@@ -220,12 +266,19 @@ public final class MqttClientBuilder {
     /// Creates a disconnected client. Call [MqttClient#connect] to open the connection.
     ///
     /// @throws IllegalStateException if the server or protocol version has not been specified
-    /// @throws IllegalArgumentException if session settings are outside the supported range,
-    ///     their combination is unsupported, or a persistent session has no explicit client id
+    /// @throws IllegalArgumentException if session or TLS settings are invalid or incompatible,
+    ///     or a persistent session has no explicit client id
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null || version == null) {
             throw new IllegalStateException("Server and MQTT version must be specified");
+        }
+        boolean tls = "mqtts".equals(endpoint.getScheme());
+        Transport.Factory factory = transportFactory;
+        if ((sslContext != null || sslParameters != null) && (!tls || factory != null)) {
+            throw new IllegalArgumentException(
+                    "TLS settings require mqtts and the default transport factory"
+            );
         }
         if (!sessionExpiry.isZero()
                 && (sessionExpiry.compareTo(Duration.ofSeconds(1)) < 0
@@ -250,6 +303,9 @@ public final class MqttClientBuilder {
             id = CLIENT_ID_PREFIX + UUID.randomUUID().toString().replace("-", "")
                     .substring(0, GENERATED_CLIENT_ID_LENGTH - CLIENT_ID_PREFIX.length());
         }
+        if (factory == null) {
+            factory = tls ? tlsTransportFactory() : Transport::tcp;
+        }
         return new ClientActor(
                 endpoint,
                 id,
@@ -258,8 +314,38 @@ public final class MqttClientBuilder {
                 maxPacketSize,
                 scheduler,
                 listener,
-                transportFactory,
+                factory,
                 cleanStart
         );
+    }
+
+    private Transport.Factory tlsTransportFactory() {
+        try {
+            SSLContext context = sslContext != null ? sslContext : SSLContext.getDefault();
+            SSLParameters parameters = defaultParameters(context);
+            parameters.setEndpointIdentificationAlgorithm("HTTPS");
+            if (sslParameters != null) {
+                sslParameters.accept(parameters);
+            }
+            // A fresh socket preserves an explicit null endpoint algorithm. Reading back its
+            // parameters also detaches the configuration from the customizer's mutable object.
+            try (var socket = (SSLSocket) context.getSocketFactory().createSocket()) {
+                socket.setSSLParameters(parameters);
+                SSLParameters snapshot = socket.getSSLParameters();
+                return id -> new TcpTransport(id, context, snapshot);
+            }
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            throw new IllegalArgumentException("Cannot initialize TLS configuration", failure);
+        }
+    }
+
+    /// JSSE reports a context without `init` as an illegal state; here it is a setting to fix.
+    /// Only this call is translated, so a customizer's own exceptions still pass through.
+    private static SSLParameters defaultParameters(SSLContext context) {
+        try {
+            return context.getDefaultSSLParameters();
+        } catch (IllegalStateException failure) {
+            throw new IllegalArgumentException("SSLContext is not initialized", failure);
+        }
     }
 }

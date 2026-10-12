@@ -21,6 +21,11 @@ session, and omitting `clientId` generates a random one. The other settings have
 defaults; see the
 [builder Javadoc](src/main/java/org/mqtt4j/mqtj/MqttClientBuilder.java).
 
+For TLS, use `mqtts://broker.example.com` (default port 8883). The client uses the
+JDK's default trust and verifies the broker hostname. Supply `sslContext(context)`
+for your own CA or client certificate, and `sslParameters(parameters -> ...)` for
+SNI, ALPN, or protocol settings.
+
 To retain a session between connections, use an explicit `clientId` and set
 `cleanStart(false).sessionExpiry(Duration.ofDays(1))`. For MQTT 3.1.1, a positive
 expiry selects a persistent session; the broker determines how long it retains
@@ -29,7 +34,7 @@ the session. The client keeps its own session state in memory.
 Connect with `connect()`. After `disconnect()` or a connection failure, the client can
 connect again, and established subscriptions resume on their existing handles. End with
 `disconnect()` rather than just closing the client: `close()`, including leaving a
-try-with-resources block, drops the connection without telling the broker.
+try-with-resources block, drops the connection without sending MQTT DISCONNECT.
 
 ## Managing subscriptions
 

@@ -37,7 +37,9 @@ public interface Transport extends AutoCloseable {
         CLOSED
     }
 
-    /// Starts one attempt. The timeout bounds connection establishment, not subsequent reads.
+    /// Starts one attempt. The timeout bounds connection establishment, including any TLS
+    /// handshake, not subsequent reads. Implementations must reject unsupported URI schemes
+    /// here with [IllegalArgumentException], rather than silently use a different transport.
     void start(URI endpoint, Duration timeout, Listener listener);
 
     /// Starts one write without waiting. Call after [Listener#onConnected] has been invoked
@@ -53,7 +55,8 @@ public interface Transport extends AutoCloseable {
     @Override
     void close();
 
-    /// Creates a TCP transport. The client identifier is used for diagnostics.
+    /// Creates a plain TCP transport accepting only `mqtt` URIs (default port 1883).
+    /// The client identifier is used for diagnostics.
     static Transport tcp(String clientId) {
         return new TcpTransport(clientId);
     }

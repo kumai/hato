@@ -1,19 +1,27 @@
 package org.mqtt4j.mqtj.client.internal;
 
+import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.Semaphore;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
 
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.mqtj.client.internal.common.io.FrameWriter;
 import org.mqtt4j.mqtj.client.internal.common.io.TcpConnection;
+import org.mqtt4j.mqtj.spi.TimerScheduler;
 import org.mqtt4j.mqtj.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
@@ -22,7 +30,11 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 /// Socket ownership and named reader/writer threads. Closing never waits for either worker.
 public final class TcpTransport implements Transport {
 
+    private static final Duration CLOSE_GRACE = Duration.ofSeconds(1);
+
     private static final int DEFAULT_PORT = 1883;
+
+    private static final int DEFAULT_TLS_PORT = 8883;
 
     private static final int READ_BUFFER_SIZE = 8192;
 
@@ -37,7 +49,30 @@ public final class TcpTransport implements Transport {
     @FunctionalInterface
     interface Connector {
 
-        TcpConnection connect(InetSocketAddress address, Duration timeout) throws IOException;
+        // The address is already resolved; TLS identifies the server by the URI's host.
+        Connection connect(String host, InetSocketAddress address, Duration timeout)
+                throws IOException;
+    }
+
+    interface Connection extends Closeable {
+
+        InputStream input() throws IOException;
+
+        OutputStream output() throws IOException;
+
+        default void handshake() throws IOException {
+        }
+
+        // Only a close that does more than abort, such as sending a TLS close_notify, needs a
+        // separate closing worker and a grace period.
+        default boolean closesGracefully() {
+            return false;
+        }
+
+        // Abort must release blocking I/O without taking a TLS read/write lock.
+        default void abort() throws IOException {
+            close();
+        }
     }
 
     // DNS resolution is not reliably cancellable. Bound active lookups across the JVM;
@@ -45,22 +80,30 @@ public final class TcpTransport implements Transport {
     private static final Semaphore resolving = new Semaphore(RESOLUTION_LIMIT, true);
 
     private final String threadName;
+    private final String scheme;
     private final Semaphore resolutionSlots;
     private final Resolver resolver;
     private final Connector connector;
+    private final TimerScheduler timer;
     private final Object callbacks = new Object();
 
     private @Nullable Listener listener;
-    private @Nullable TcpConnection connection;
+    private @Nullable Connection connection;
     private @Nullable Thread reader;
     private @Nullable Throwable terminalCause;
     private @Nullable Write pending;
     private int ioWorkers;
     private boolean closed;
     private boolean started;
+    private boolean connected;
 
     public TcpTransport(String clientId) {
-        this(clientId, resolving, InetAddress::getByName, TcpConnection::connect);
+        this(
+                clientId,
+                resolving,
+                InetAddress::getByName,
+                (_, address, timeout) -> plain(TcpConnection.connect(address, timeout))
+        );
     }
 
     TcpTransport(
@@ -69,10 +112,41 @@ public final class TcpTransport implements Transport {
             Resolver resolver,
             Connector connector
     ) {
+        this(
+                clientId,
+                "mqtt",
+                resolutionSlots,
+                resolver,
+                connector,
+                DefaultTimerScheduler.instance
+        );
+    }
+
+    public TcpTransport(String clientId, SSLContext context, SSLParameters parameters) {
+        this(
+                clientId,
+                "mqtts",
+                resolving,
+                InetAddress::getByName,
+                (host, address, timeout) -> tls(host, address, timeout, context, parameters),
+                DefaultTimerScheduler.instance
+        );
+    }
+
+    TcpTransport(
+            String clientId,
+            String scheme,
+            Semaphore resolutionSlots,
+            Resolver resolver,
+            Connector connector,
+            TimerScheduler timer
+    ) {
         threadName = "mqtj-" + requireNonNull(clientId, "clientId");
+        this.scheme = scheme;
         this.resolutionSlots = resolutionSlots;
         this.resolver = resolver;
         this.connector = connector;
+        this.timer = timer;
     }
 
     @Override
@@ -86,7 +160,10 @@ public final class TcpTransport implements Transport {
                     "Connect timeout must be positive and at most 2147483647 milliseconds"
             );
         }
-        long deadline = System.nanoTime() + timeout.toNanos();
+        if (!scheme.equals(endpoint.getScheme())) {
+            throw new IllegalArgumentException("Transport requires " + scheme + " scheme");
+        }
+        long deadline = timer.nanoTime() + timeout.toNanos();
         synchronized (callbacks) {
             if (started) {
                 throw new IllegalStateException("Transport already started");
@@ -100,15 +177,18 @@ public final class TcpTransport implements Transport {
             reader = Thread.ofVirtual().name(threadName + "-reader").unstarted(() -> {
                 boolean attached = false;
                 try {
-                    InetAddress host = resolve(endpoint.getHost(), deadline);
+                    String host = endpoint.getHost();
+                    // Connect to the resolved address itself, which keeps an IPv6 zone.
                     var address = new InetSocketAddress(
-                            host,
-                            endpoint.getPort() == -1 ? DEFAULT_PORT : endpoint.getPort()
+                            resolve(host, deadline),
+                            (endpoint.getPort() == -1)
+                                    ? (scheme.equals("mqtts") ? DEFAULT_TLS_PORT : DEFAULT_PORT)
+                                    : endpoint.getPort()
                     );
-                    TcpConnection socket = connector.connect(address, remaining(deadline));
+                    Connection socket = connector.connect(host, address, remaining(deadline));
                     synchronized (callbacks) {
-                        if (closed || deadline - System.nanoTime() <= 0) {
-                            socket.close();
+                        if (closed || deadline - timer.nanoTime() <= 0) {
+                            socket.abort();
                             if (!closed) {
                                 throw new SocketTimeoutException("TCP connection deadline expired");
                             }
@@ -117,6 +197,34 @@ public final class TcpTransport implements Transport {
                         connection = socket;
                         ioWorkers++;
                         attached = true;
+                    }
+                    // SO_TIMEOUT only bounds individual reads. Close the underlying TCP socket
+                    // at the total deadline even if the peer keeps making partial progress.
+                    TimerScheduler.Cancellable handshakeDeadline = timer.schedule(
+                            remaining(deadline),
+                            () -> {
+                                synchronized (callbacks) {
+                                    if (!connected) {
+                                        terminate(new SocketTimeoutException(
+                                                "Transport connection deadline expired"
+                                        ));
+                                    }
+                                }
+                            }
+                    );
+                    try {
+                        socket.handshake();
+                        synchronized (callbacks) {
+                            remaining(deadline);
+                            connected = true;
+                        }
+                    } finally {
+                        handshakeDeadline.cancel();
+                    }
+                    synchronized (callbacks) {
+                        if (closed) {
+                            return;
+                        }
                         receiver.onConnected();
                         if (closed) {
                             return;
@@ -162,17 +270,18 @@ public final class TcpTransport implements Transport {
                 throw new IOException("Transport closed");
             }
         }
-        long nanos = deadline - System.nanoTime();
+        long nanos = deadline - timer.nanoTime();
         if (nanos <= 0) {
             throw new SocketTimeoutException("TCP connection deadline expired");
         }
         return Duration.ofNanos(nanos);
     }
 
-    private void read(TcpConnection socket, Listener receiver) throws IOException {
+    private void read(Connection socket, Listener receiver) throws IOException {
         var buffer = new byte[READ_BUFFER_SIZE];
+        InputStream input = socket.input();
         int count;
-        while ((count = socket.input().read(buffer)) != -1) {
+        while ((count = input.read(buffer)) != -1) {
             synchronized (callbacks) {
                 if (closed) {
                     return;
@@ -183,7 +292,7 @@ public final class TcpTransport implements Transport {
         terminate(new EOFException("Peer closed the byte stream"));
     }
 
-    private void write(TcpConnection socket) {
+    private void write(Connection socket) {
         try {
             var writer = new FrameWriter(socket.output());
             while (true) {
@@ -222,7 +331,7 @@ public final class TcpTransport implements Transport {
             if (closed) {
                 return SendResult.CLOSED;
             }
-            if (connection == null) {
+            if (!connected) {
                 throw new IllegalStateException("Transport is not connected");
             }
             if (pending != null) {
@@ -236,10 +345,14 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void close() {
-        terminate(new IOException("Transport closed"));
+        terminate(new IOException("Transport closed"), true);
     }
 
     private void terminate(Throwable cause) {
+        terminate(cause, false);
+    }
+
+    private void terminate(Throwable cause, boolean graceful) {
         synchronized (callbacks) {
             if (closed) {
                 return;
@@ -247,13 +360,20 @@ public final class TcpTransport implements Transport {
             closed = true;
             terminalCause = cause;
             callbacks.notifyAll();
-            TcpConnection socket = connection;
+            Connection socket = connection;
             connection = null;
             if (socket != null) {
-                try {
-                    socket.close();
-                } catch (IOException failure) {
-                    cause.addSuppressed(failure);
+                if (graceful && connected && pending == null && socket.closesGracefully()) {
+                    ioWorkers++;
+                    Thread.ofVirtual().name(threadName + "-close").start(() -> {
+                        try {
+                            closeGracefully(socket, cause);
+                        } finally {
+                            workerEnded();
+                        }
+                    });
+                } else {
+                    abort(socket, cause);
                 }
             }
             Thread connectingThread = reader;
@@ -261,6 +381,108 @@ public final class TcpTransport implements Transport {
                 connectingThread.interrupt();
             }
             notifyClosed();
+        }
+    }
+
+    private void closeGracefully(Connection socket, Throwable cause) {
+        // SSLSocket.close can wait on a peer or TLS I/O lock (JDK-8241239). Never run it
+        // under the callback lock; the independent grace timer closes the plain socket.
+        TimerScheduler.Cancellable deadline = timer.schedule(
+                CLOSE_GRACE,
+                () -> abort(socket, cause)
+        );
+        try {
+            socket.close();
+        } catch (IOException failure) {
+            cause.addSuppressed(failure);
+        } finally {
+            deadline.cancel();
+            abort(socket, cause);
+        }
+    }
+
+    private static void abort(Connection socket, Throwable cause) {
+        try {
+            socket.abort();
+        } catch (IOException failure) {
+            cause.addSuppressed(failure);
+        }
+    }
+
+    static Connection plain(TcpConnection socket) {
+        return new Connection() {
+            @Override
+            public InputStream input() {
+                return socket.input();
+            }
+
+            @Override
+            public OutputStream output() {
+                return socket.output();
+            }
+
+            @Override
+            public void close() throws IOException {
+                socket.close();
+            }
+        };
+    }
+
+    static Connection tls(
+            String host,
+            InetSocketAddress address,
+            Duration timeout,
+            SSLContext context,
+            SSLParameters parameters
+    ) throws IOException {
+        var raw = new Socket();
+        TcpConnection tcp = TcpConnection.connect(raw, address, timeout);
+        try {
+            // Identify an IPv6 literal without the brackets that URI syntax requires.
+            String peerHost = host.startsWith("[") ? host.substring(1, host.length() - 1) : host;
+            var ssl = (SSLSocket) context.getSocketFactory().createSocket(
+                    raw,
+                    peerHost,
+                    address.getPort(),
+                    true
+            );
+            // Apply only once to a fresh socket, so an explicit null identification
+            // algorithm can disable the builder's HTTPS default.
+            ssl.setSSLParameters(parameters);
+            return new Connection() {
+                @Override
+                public InputStream input() throws IOException {
+                    return ssl.getInputStream();
+                }
+
+                @Override
+                public OutputStream output() throws IOException {
+                    return ssl.getOutputStream();
+                }
+
+                @Override
+                public void handshake() throws IOException {
+                    ssl.startHandshake();
+                }
+
+                @Override
+                public boolean closesGracefully() {
+                    return true;
+                }
+
+                @Override
+                public void close() throws IOException {
+                    ssl.close();
+                }
+
+                @Override
+                public void abort() throws IOException {
+                    tcp.close();
+                }
+            };
+        } catch (IOException | RuntimeException | Error failure) {
+            abort(plain(tcp), failure);
+            throw failure;
         }
     }
 
