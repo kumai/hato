@@ -547,35 +547,37 @@ class ClientIoTest {
         sut.send(1, 1, new Packet.PingReq(), null);
         transport.awaitActive();
         var receipt = new SendReceipt();
-        var packet = new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY);
+        var packet = new Packet.PubRec(7, ReasonCode.SUCCESS, EMPTY);
 
         // Act
         assertThat(sut.send(1, 2, packet, receipt)).isEqualTo(ACCEPTED);
         sut.close();
-        transport.end(new IOException("Connection ended before the queued PUBACK"));
+        transport.end(new IOException("Connection ended before the queued acknowledgement"));
 
         // Assert
+        assertThat(receipt.started()).isFalse();
         assertThat(receipt.accepted()).isFalse();
         assertThat(transport.attempts).containsExactly(1L);
         assertThat(events.written).isEmpty();
     }
 
-    @Test
-    void transport_admission_records_an_acknowledgement_without_write_completion()
+    @ParameterizedTest
+    @MethodSource("receiptAcknowledgements")
+    void transport_admission_records_an_acknowledgement_without_write_completion(Packet packet)
             throws Exception {
         // Arrange
         SingleWriteTransport transport = open(1);
         var observed = new CompletableFuture<Packet>();
         transport.beforeReturn = bytes -> observed.complete(codec.decode(bytes));
         var receipt = new SendReceipt();
-        var packet = new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY);
 
         // Act
         assertThat(sut.send(1, 1, packet, receipt)).isEqualTo(ACCEPTED);
-        await().until(receipt::accepted);
+        await().pollInterval(Duration.ofMillis(1)).until(receipt::accepted);
         transport.end(new IOException("Accepted without a successful write"));
 
         // Assert
+        assertThat(receipt.started()).isTrue();
         assertThat(receipt.accepted()).isTrue();
         assertThat(observed.get(5, SECONDS)).isEqualTo(packet);
         assertThat(events.written).isEmpty();
@@ -607,23 +609,26 @@ class ClientIoTest {
         assertThat(events.written).isEmpty();
     }
 
-    @Test
-    void an_acknowledgement_receipt_can_arrive_after_its_connection_ends() throws Exception {
+    @ParameterizedTest
+    @MethodSource("receiptAcknowledgements")
+    void an_acknowledgement_receipt_can_arrive_after_its_connection_ends(Packet packet)
+            throws Exception {
         // Arrange
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         var receipt = new SendReceipt();
         SingleWriteTransport old = open(1);
-        var failure = new IOException("Inline PUBACK termination");
+        var failure = new IOException("Inline acknowledgement termination");
         old.beforeReturn = _ -> {
             old.end(failure);
             entered.countDown();
             waitFor(release);
         };
         try {
-            sut.send(1, 1, new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY), receipt);
+            sut.send(1, 1, packet, receipt);
             assertThat(entered.await(5, SECONDS)).isTrue();
             assertThat(events.ends).containsExactly(failure);
+            assertThat(receipt.started()).isTrue();
             assertThat(receipt.accepted()).isFalse();
 
             // Act: this connection's sends wait for the old send call to return.
@@ -849,7 +854,7 @@ class ClientIoTest {
 
     @ParameterizedTest
     @MethodSource("acknowledgementWrites")
-    void only_puback_reports_its_write_early_while_acknowledgements_keep_their_capacity(
+    void reception_acknowledgements_report_early_writes_while_buffers_keep_their_capacity(
             Packet acknowledgement,
             List<Long> written
     ) throws Exception {
@@ -868,7 +873,7 @@ class ClientIoTest {
             assertThat(sut.send(1, 1, acknowledgement, null)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
-            // Assert: only PUBACK reports early; all retained buffers keep their capacity.
+            // Assert: receive acknowledgements report early; buffers still retain capacity.
             assertThat(events.written).containsExactlyElementsOf(written);
             assertThat(events.tickets).isEmpty();
             assertThat(events.capacityGenerations).isEmpty();
@@ -1053,12 +1058,17 @@ class ClientIoTest {
         );
     }
 
+    /// The core sends PUBREL without a transport receipt.
+    private static Stream<Packet> receiptAcknowledgements() {
+        return acknowledgements().filter(packet -> !(packet instanceof Packet.PubRel));
+    }
+
     private static Stream<Arguments> acknowledgementWrites() {
         return Stream.of(
                 Arguments.of(new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY), List.of(1L)),
-                Arguments.of(new Packet.PubRec(1, ReasonCode.SUCCESS, EMPTY), List.of()),
+                Arguments.of(new Packet.PubRec(1, ReasonCode.SUCCESS, EMPTY), List.of(1L)),
                 Arguments.of(new Packet.PubRel(1, ReasonCode.SUCCESS, EMPTY), List.of()),
-                Arguments.of(new Packet.PubComp(1, ReasonCode.SUCCESS, EMPTY), List.of())
+                Arguments.of(new Packet.PubComp(1, ReasonCode.SUCCESS, EMPTY), List.of(1L))
         );
     }
 

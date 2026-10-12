@@ -16,7 +16,7 @@ import static java.util.Objects.requireNonNull;
 /// A setting left unchanged takes its default, which can depend on how the subscription
 /// receives messages.
 ///
-/// All QoS values can be represented; the current client accepts QoS 0 and QoS 1 subscriptions.
+/// Subscriptions support QoS 0, QoS 1, and QoS 2.
 public final class Subscribe {
 
     private static final int DEFAULT_BUFFER_CAPACITY = 1024;
@@ -74,7 +74,7 @@ public final class Subscribe {
         return qos;
     }
 
-    /// When this subscription permits acknowledgement of a QoS 1 delivery. Empty uses the
+    /// When this subscription permits acknowledgement of a QoS 1 or 2 delivery. Empty uses the
     /// default: [AckMode#AFTER_HANDLER] with a handler, or [AckMode#ON_RECEIVE] for pull
     /// subscriptions.
     public Optional<AckMode> ackMode() {
@@ -82,11 +82,11 @@ public final class Subscribe {
     }
 
     /// The maximum number of local deliveries this subscription holds at once. Pull subscriptions
-    /// count queued deliveries and QoS 1 MANUAL deliveries awaiting ack; ON_RECEIVE and QoS 0
+    /// count queued deliveries and QoS 1/2 MANUAL deliveries awaiting ack; ON_RECEIVE and QoS 0
     /// release the slot at handoff. Push subscriptions also count running handlers and deliveries
-    /// whose PUBACK is pending; see [AckMode]. The client also bounds the deliveries and bytes
-    /// held across all of its subscriptions. A message that exceeds any of these bounds ends the
-    /// connection.
+    /// whose PUBACK or PUBREC is pending; see [AckMode]. The client also bounds deliveries and
+    /// bytes held across all of its subscriptions. A message that exceeds any of these bounds
+    /// ends the connection.
     public int bufferCapacity() {
         return bufferCapacity;
     }

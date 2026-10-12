@@ -50,8 +50,8 @@ final class DeliveryLanes {
 
     private final Map<Long, RetainedDelivery> acknowledging = new HashMap<>();
 
-    // Each core-admitted QoS 1 receipt enters once. The core's 4096-receipt limit also bounds
-    // this metadata-only queue, including receipts with no local recipient.
+    // Each core-admitted QoS 1 or QoS 2 receipt enters once. The core's 4096-receipt limit also
+    // bounds this metadata-only queue, including receipts with no local recipient.
     private final Set<Long> readyTokens = new LinkedHashSet<>();
 
     private final String clientId;
@@ -150,7 +150,7 @@ final class DeliveryLanes {
         }
     }
 
-    /// A refused removal releases the QoS 1 deliveries held during the attempt, so none is
+    /// A refused removal releases QoS 1 and 2 deliveries held during the attempt, so none is
     /// acknowledged without reaching the application of a subscription that stays active.
     void resume(long id) {
         lock.lock();
@@ -328,7 +328,7 @@ final class DeliveryLanes {
             if (first) {
                 for (long id : ids) {
                     Lane lane = lanes.get(id);
-                    // Removal holds QoS 1 until UNSUBACK or a refused removal resumes it.
+                    // Removal holds QoS 1/2 until UNSUBACK or a refused removal resumes it.
                     if (lane != null && (!lane.paused || token.acknowledgement() != 0)) {
                         recipients.add(lane);
                         states.add(new Recipient(id));
@@ -431,7 +431,7 @@ final class DeliveryLanes {
         }
     }
 
-    /// The sequencer has admitted this PUBACK; handlers still executing retain their capacity.
+    /// PUBACK or PUBREC entered the send queue; running handlers retain their capacity.
     void release(long token) {
         lock.lock();
         try {

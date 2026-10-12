@@ -45,7 +45,7 @@ to publish at QoS 2.
 
 ```java
 Subscription subscription = client.subscribe(
-        Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_MOST_ONCE),
+        Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.EXACTLY_ONCE),
         delivery -> repository.save(delivery.message())
 ).join();
 
@@ -55,11 +55,11 @@ subscription.unsubscribe().join();
 - Each subscription's handler runs one message at a time, independently of I/O
   and operation completion. The handler can block, for example to write to a
   database or to publish and wait for the result.
-- QoS 1 messages are acknowledged after the handler returns. Choose `AckMode.ON_RECEIVE`
+- QoS 1 and 2 messages are acknowledged after the handler returns. Choose `AckMode.ON_RECEIVE`
   to acknowledge before the handler runs, or `AckMode.MANUAL` to call `delivery.ack()`
   yourself for every message: `Subscribe.of(filter, Qos.AT_LEAST_ONCE).withAckMode(AckMode.MANUAL)`.
 - While the handler is busy, new messages for the subscription wait in a queue of
-  1,024, which also holds QoS 1 messages until they are acknowledged. Messages can arrive
+  1,024, which also holds QoS 1 and 2 messages until they are acknowledged. Messages can arrive
   all at once, such as retained messages when you subscribe, so size the queue for them:
   `Subscribe.of(filter, qos).withBufferCapacity(4096)`.
 - `subscription.close()` stops delivery at once and drops queued messages without
@@ -92,13 +92,13 @@ while (subscription.receive() instanceof ReceiveResult.Received(var delivery)) {
   `ReceiveResult.Ended` once the subscription ends normally. `receive(Duration)` can
   also return `ReceiveResult.TimedOut`.
 - A waiting `receive()` keeps waiting across reconnections.
-- QoS 1 messages are acknowledged when `receive()` hands them over.
+- QoS 1 and 2 messages are acknowledged when `receive()` hands them over.
   Choose `AckMode.MANUAL`, as above, to acknowledge after your processing.
   `AckMode.AFTER_HANDLER` needs a handler.
-- The queue of 1,024 holds messages until a thread takes them, and QoS 1 `MANUAL`
+- The queue of 1,024 holds messages until a thread takes them, and QoS 1/2 `MANUAL`
   messages until `delivery.ack()`.
-- QoS 1 acknowledgements leave in arrival order across all subscriptions, so a message
-  that nobody takes or acknowledges can stop the broker's later QoS 1 messages. If you
+- QoS 1 and 2 acknowledgements leave in arrival order across all subscriptions, so a message
+  that nobody takes or acknowledges can stop the broker's later QoS 1 and 2 messages. If you
   cannot process one, end the connection.
 - Messages not yet taken are dropped when the connection ends.
 
@@ -123,7 +123,7 @@ the connection when:
 - a handler throws, including one still running from before a reconnection in a
   persistent session. Catch exceptions inside the handler to keep the connection.
 - a subscription's queue fills up, for example with messages waiting for
-  `delivery.ack()`, or too many QoS 1 messages wait behind one that is not yet
+  `delivery.ack()`, or too many QoS 1 and 2 messages wait behind one that is not yet
   acknowledged, rather than buffering without limit.
 
 For a transient error, catch it and retry inside the handler with a bounded retry

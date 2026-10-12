@@ -12,12 +12,18 @@ import java.util.concurrent.CompletableFuture;
 /// Cancelling or completing a returned future does not cancel the underlying operation.
 ///
 /// Within one connection, a QoS 1 retransmission marked DUP joins the original delivery while
-/// that delivery's PUBACK is still pending. Any other publication on that connection, including
-/// one without DUP that reuses a pending packet identifier, starts a new delivery. After
-/// reconnection, a DUP-marked retransmission continues the earlier delivery only when a
+/// that delivery's PUBACK is still pending. A QoS 1 publication without DUP, including one that
+/// reuses a pending QoS 1 packet identifier, starts a new delivery. After reconnection, a
+/// DUP-marked retransmission continues the earlier delivery only when a
 /// persistent session resumes, a subscription still holds that delivery, and its PUBACK had
 /// not reached the transport; otherwise it starts a new delivery. See [MqttSubscriber].
-/// This does not guarantee exactly-once processing.
+/// QoS 2 publications that reuse the identifier of an unfinished QoS 2 reception join it until
+/// PUBREL, regardless of DUP. This also applies across connections that continue the same
+/// session. A QoS 1 publication on such an identifier, or a QoS 2 publication marked DUP on the
+/// identifier of an unacknowledged QoS 1 reception, ends the connection with
+/// [MqttProtocolException]; without DUP, that QoS 2 publication starts a new delivery.
+/// [MqttSubscriber] states when a retransmission reaches the application again. Session state
+/// is held in memory, so this does not guarantee exactly-once application processing.
 ///
 /// The client completes operations independently of I/O and listener callbacks. One blocked
 /// continuation does not prevent another operation from completing. Slow continuations and

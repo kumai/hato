@@ -22,7 +22,7 @@ public interface Subscription extends AutoCloseable {
     /// can return and finish processing in a different order.
     ///
     /// [AckMode#ON_RECEIVE] permits acknowledgement at handoff; [AckMode#MANUAL] waits for
-    /// [MqttDelivery#ack()]. Actual PUBACK writes still follow publication receive order.
+    /// [MqttDelivery#ack()]. PUBACK and PUBREC still follow receive order; see [AckMode].
     /// Returns [ReceiveResult.Received] at handoff, or [ReceiveResult.Ended] after [#close()],
     /// a completed [#unsubscribe()], or [MqttClient#close()]. Connection termination
     /// discards buffered deliveries but leaves this call waiting for delivery after the next
@@ -63,7 +63,7 @@ public interface Subscription extends AutoCloseable {
     /// Stops new local delivery when called and completes after UNSUBACK.
     /// Already queued deliveries may run or be received while acknowledgement is pending; any
     /// still queued when it completes are discarded. Handlers already running can finish.
-    /// QoS 1 messages arriving while removal is pending are neither run nor received, while
+    /// QoS 1 and 2 messages arriving while removal is pending are neither run nor received, while
     /// QoS 0 messages arriving meanwhile are dropped.
     /// Discarded deliveries release this subscription's acknowledgement condition.
     /// Removing this subscription does not acknowledge already delivered MANUAL messages.
@@ -71,7 +71,7 @@ public interface Subscription extends AutoCloseable {
     ///
     /// If capacity prevents admitting the removal, the future fails with [MqttCapacityException]
     /// and the removal can be retried. Unless [#close()] was called, delivery then resumes,
-    /// including the QoS 1 messages that waited. QoS 0 messages dropped during the attempted
+    /// including the QoS 1 and 2 messages that waited. QoS 0 messages dropped during the attempted
     /// removal are not replayed.
     /// While disconnected or connecting, a new removal fails with
     /// [MqttNotConnectedException], including an observation of removal scheduled by [#close()].
@@ -121,7 +121,7 @@ public interface Subscription extends AutoCloseable {
     /// prevents registering the same filter again or, when either filter is shared, an
     /// overlapping one until UNSUBACK or a successful CONNACK with [ConnAck#sessionPresent()]
     /// false confirms its removal. Messages that still arrive for it are discarded, and QoS 1
-    /// messages are acknowledged. This applies to both push and pull modes.
+    /// and 2 messages are acknowledged. This applies to both push and pull modes.
     @Override
     void close();
 }

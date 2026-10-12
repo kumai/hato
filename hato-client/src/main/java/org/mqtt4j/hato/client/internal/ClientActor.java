@@ -237,11 +237,6 @@ public final class ClientActor implements MqttClient {
             Subscribe request,
             @Nullable Consumer<MqttDelivery> handler
     ) {
-        if (request.qos() == Qos.EXACTLY_ONCE) {
-            return CompletableFuture.failedFuture(
-                    new IllegalArgumentException("QoS 2 subscribe is not supported")
-            );
-        }
         return submit(false, true, 0, token -> {
             // The operation token is also the subscription id in the core and lanes.
             requireNonNull(operations.get(token)).subscription =

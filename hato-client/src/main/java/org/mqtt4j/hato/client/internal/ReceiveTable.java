@@ -7,9 +7,18 @@ import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.Qos;
+
 /// Actor-owned reception state. Tokens remain unique for the client's lifetime, while packet
-/// identifiers can be reused after acknowledgement or superseded by a publication without DUP.
+/// identifiers can be reused after PUBACK or PUBREL. Capacity also counts completed receptions
+/// whose PUBCOMP is still waiting to be written, and superseded pending acknowledgements.
 final class ReceiveTable {
+
+    enum Stage {
+        RECEIVING,
+        WAITING_PUBREL,
+        COMPLETING
+    }
 
     private final int capacity;
 
@@ -25,11 +34,11 @@ final class ReceiveTable {
     }
 
     /// Superseded receptions keep counting until their pending write is removed.
-    Optional<Entry> add(long token, int packetId) {
+    Optional<Entry> add(long token, int packetId, Qos qos) {
         if (entries.size() >= capacity || identifiers.containsKey(packetId)) {
             return Optional.empty();
         }
-        var entry = new Entry(token, packetId);
+        var entry = new Entry(token, packetId, qos);
         entries.put(token, entry);
         identifiers.put(packetId, entry);
         return Optional.of(entry);
@@ -45,7 +54,7 @@ final class ReceiveTable {
 
     void ready(long token, boolean ready) {
         Entry entry = entries.get(token);
-        if (entry != null) {
+        if (entry != null && entry.stage == Stage.RECEIVING) {
             entry.ready = ready;
         }
     }
@@ -57,6 +66,13 @@ final class ReceiveTable {
     /// Frees the identifier without releasing capacity held by an admitted acknowledgement.
     Optional<Entry> supersede(int packetId) {
         return Optional.ofNullable(identifiers.remove(packetId));
+    }
+
+    /// PUBREL returns the identifier; its response still owns the reception's capacity.
+    void complete(Entry entry) {
+        identifiers.remove(entry.packetId(), entry);
+        entry.stage = Stage.COMPLETING;
+        entry.ready = true;
     }
 
     void remove(Entry entry) {
@@ -73,12 +89,15 @@ final class ReceiveTable {
 
         private final long token;
         private final int packetId;
+        private final Qos qos;
+        private Stage stage = Stage.RECEIVING;
         private boolean ready;
         private @Nullable SendReceipt receipt;
 
-        Entry(long token, int packetId) {
+        Entry(long token, int packetId, Qos qos) {
             this.token = token;
             this.packetId = packetId;
+            this.qos = qos;
         }
 
         long token() {
@@ -87,6 +106,14 @@ final class ReceiveTable {
 
         int packetId() {
             return packetId;
+        }
+
+        Qos qos() {
+            return qos;
+        }
+
+        Stage stage() {
+            return stage;
         }
 
         boolean ready() {
@@ -98,7 +125,25 @@ final class ReceiveTable {
         }
 
         void submitted(SendReceipt receipt) {
+            observeReceipt();
             this.receipt = receipt;
+        }
+
+        /// Transport can accept PUBREC before the actor sees its write completion. Returns the
+        /// single read of acceptance, so a caller that also judges it cannot see a later value.
+        boolean observeReceipt() {
+            boolean accepted = receipt != null && receipt.accepted();
+            if (accepted) {
+                pubrecAccepted();
+            }
+            return accepted;
+        }
+
+        void pubrecAccepted() {
+            if (qos == Qos.EXACTLY_ONCE && stage == Stage.RECEIVING) {
+                stage = Stage.WAITING_PUBREL;
+                ready = true;
+            }
         }
     }
 }

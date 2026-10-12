@@ -29,8 +29,8 @@ final class ClientIo {
         /// ahead of earlier input. Any other PINGRESP arrives through [#received].
         void pingResponse(long generation, Packet packet, int size);
 
-        /// Posts a completed PUBACK write as soon as the transport reports it, even if send is
-        /// still returning. This must only enqueue an event, without calling external code.
+        /// Posts a completed PUBACK, PUBREC, or PUBCOMP write as soon as the transport reports
+        /// it, even if send is still returning. Only enqueues an event, without external code.
         void written(long generation, long ticket);
 
         /// Captures completion data outside the send monitor. The returned action only posts
@@ -267,7 +267,13 @@ final class ClientIo {
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(bytes, null, packet instanceof Packet.PubAck, receipt),
+                new Outbound(
+                        bytes,
+                        null,
+                        packet instanceof Packet.PubAck || packet instanceof Packet.PubRec
+                                || packet instanceof Packet.PubComp,
+                        receipt
+                ),
                 reserved,
                 acknowledgement,
                 packet.getClass().getSimpleName(),
@@ -363,6 +369,11 @@ final class ClientIo {
                 connection.transportOwnsActive = true;
             }
             Transport.SendResult result;
+            SendReceipt receipt = send.value().receipt();
+            if (receipt != null) {
+                // The peer can reply before send returns or reports its write completion.
+                receipt.markStarted();
+            }
             try {
                 result = connection.transport.send(send.ticket(), bytes);
             } catch (RuntimeException failure) {
@@ -372,7 +383,6 @@ final class ClientIo {
                 rejectActive(connection);
                 throw failure;
             }
-            SendReceipt receipt = send.value().receipt();
             if (result == Transport.SendResult.ACCEPTED && receipt != null) {
                 receipt.markAccepted();
             } else if (result == Transport.SendResult.CLOSED) {

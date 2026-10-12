@@ -23,8 +23,7 @@ public interface MqttSubscriber {
     }
 
     /// Registers one subscription and completes after a successful SUBACK.
-    /// The current client supports QoS 0 and QoS 1; QoS 2 fails with
-    /// [IllegalArgumentException] through the returned future.
+    /// Supports QoS 0, QoS 1, and QoS 2.
     ///
     /// Deliveries can reach the handler before the future completes. Each subscription's
     /// handler runs serially, independently of I/O and operation completion. A handler failure
@@ -41,12 +40,15 @@ public interface MqttSubscriber {
     /// connection's running handler to finish, preserving serial execution. A handler failure
     /// also retains the subscription for that next connection.
     /// Interrupt status left by a normally returning handler is cleared before the next delivery.
-    /// QoS 1 acknowledgement follows the request's [AckMode]. A QoS 1 message can be delivered
-    /// more than once.
+    /// QoS 1 and QoS 2 acknowledgement follows the request's [AckMode]. QoS 1 messages can be
+    /// delivered more than once. Within a session, a QoS 2 message reaches each subscription at
+    /// most once, except that a delivery invalidated by a handler failure is delivered again
+    /// from the broker's retransmission unless its PUBREC had reached the transport; see
+    /// [MqttDelivery#ack()].
     ///
     /// Every matching subscription receives each incoming publication. MQTT 3.1.1 cannot
     /// distinguish broker copies for overlapping subscriptions, so each copy is routed again.
-    /// A retransmission joining a continued QoS 1 reception goes only to its original matching
+    /// A retransmission joining a continued QoS 1 or 2 reception goes only to its original matching
     /// subscriptions whose deliveries were discarded; handed-off deliveries keep their state.
     /// Shared subscriptions are matched against the filter after their shared group name.
     /// A shared subscription cannot overlap any other subscription on the same client, including

@@ -895,25 +895,6 @@ class SessionCoreTest {
     }
 
     @Test
-    void qos_two_subscription_is_rejected_without_sending_or_registering() {
-        // Arrange
-        connected();
-
-        // Act
-        sut.subscribe(
-                2,
-                Subscribe.of(new TopicFilter("a"), Qos.EXACTLY_ONCE).withBufferCapacity(1)
-        );
-
-        // Assert
-        assertThat(requireNonNull(port.results.get(2L)).failure())
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThat(port.sent).isEmpty();
-        assertThat(port.registered).isEmpty();
-        assertThat(port.publications).isEmpty();
-    }
-
-    @Test
     void matching_deliveries_reach_all_pending_and_active_subscriptions() {
         // Arrange: overlapping ordinary filters match the same topic.
         connected();
@@ -2005,12 +1986,18 @@ class SessionCoreTest {
                 .hasCause(failure);
     }
 
-    @ParameterizedTest
-    @EnumSource(value = Qos.class, names = {"AT_MOST_ONCE", "AT_LEAST_ONCE"})
-    void qos_one_subscriptions_accept_the_requested_or_lower_grant(Qos granted) {
+    @ParameterizedTest(name = "requested {0}, granted {1}")
+    @CsvSource({
+            "AT_LEAST_ONCE, AT_MOST_ONCE",
+            "AT_LEAST_ONCE, AT_LEAST_ONCE",
+            "EXACTLY_ONCE, AT_MOST_ONCE",
+            "EXACTLY_ONCE, AT_LEAST_ONCE",
+            "EXACTLY_ONCE, EXACTLY_ONCE"
+    })
+    void subscriptions_accept_the_requested_or_lower_grant(Qos requested, Qos granted) {
         // Arrange
         connected();
-        sut.subscribe(2, Subscribe.of(new TopicFilter("a/#"), Qos.AT_LEAST_ONCE));
+        sut.subscribe(2, Subscribe.of(new TopicFilter("a/#"), requested));
         int id = ((Packet.Subscribe) port.sent.getLast()).packetId();
 
         // Act

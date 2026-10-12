@@ -761,35 +761,39 @@ class ClientActorTest {
         }
     }
 
-    @Test
-    void a_manual_push_delivery_keeps_its_capacity_when_the_session_continues() throws Exception {
+    @ParameterizedTest
+    @EnumSource(value = Qos.class, names = {"AT_LEAST_ONCE", "EXACTLY_ONCE"})
+    void a_manual_push_delivery_keeps_its_capacity_when_the_session_continues(Qos qos)
+            throws Exception {
         // Arrange: the handler returns, but its manual acknowledgement is still outstanding.
         var delivered = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client(false)) {
             ScriptTransport old = connect(sut);
             CompletableFuture<Subscription> subscribing = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                    Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL)
                             .withBufferCapacity(1),
                     delivered::add
             );
             var request = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
-            old.receive(
-                    new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY)
-            );
+            old.receive(new Packet.SubAck(
+                    request.packetId(),
+                    List.of(ReasonCode.of(qos.level())),
+                    EMPTY
+            ));
             subscribing.get(5, SECONDS);
-            old.receive(qosOnePublication("messages", 7, false));
+            old.receive(acknowledgedPublication("messages", 7, qos, false));
             assertThat(delivered.poll(5, SECONDS)).isNotNull();
             old.receiver().onClosed(new IOException("connection lost"));
             assertThat(ends.poll(5, SECONDS)).isNotNull();
 
             // Act: joining the replay consumes no new slot; a different reception still needs one.
             ScriptTransport current = connect(sut, true);
-            current.receive(qosOnePublication("messages", 7, true));
+            current.receive(acknowledgedPublication("messages", 7, qos, true));
             sut.publish(message(new byte[] {0})).get(5, SECONDS);
             assertThat(current.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
             assertThat(delivered).isEmpty();
-            current.receive(qosOnePublication("messages", 8, false));
+            current.receive(acknowledgedPublication("messages", 8, qos, false));
 
             // Assert
             assertThat(requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow())
@@ -1807,20 +1811,127 @@ class ClientActorTest {
     }
 
     @Test
-    void qos_two_subscriptions_are_still_rejected() {
+    void qos_two_pull_subscriptions_acknowledge_after_manual_completion() throws Exception {
+        // Arrange
         try (MqttClient sut = client()) {
-            var request = Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE);
-            assertThatThrownBy(() -> sut.subscribe(request).join())
-                    .hasCauseInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("QoS 2 subscribe is not supported");
-            assertThatThrownBy(() -> sut.subscribe(request, _ -> { }).join())
-                    .hasCauseInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("QoS 2 subscribe is not supported");
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribePull(
+                    sut,
+                    transport,
+                    Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE)
+                            .withAckMode(AckMode.MANUAL)
+            );
+            assertThat(subscription.grantedQos()).isEqualTo(Qos.EXACTLY_ONCE);
+            transport.receive(acknowledgedPublication("messages", 7, Qos.EXACTLY_ONCE, false));
+            MqttDelivery delivery = received(subscription.receive(Duration.ofSeconds(5)));
+            assertThat(delivery.message().qos()).isEqualTo(Qos.EXACTLY_ONCE);
+            assertThat(transport.sent).isEmpty();
+
+            // Act
+            delivery.ack();
+
+            // Assert
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubRec(7, ReasonCode.SUCCESS, EMPTY));
+            transport.receive(new Packet.PubRel(7, ReasonCode.SUCCESS, EMPTY));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubComp(7, ReasonCode.SUCCESS, EMPTY));
+            assertThat(ends).isEmpty();
         }
     }
 
     @Test
-    void acknowledgements_made_while_the_actor_is_busy_share_one_mailbox_wake() throws Exception {
+    void a_pubrel_can_arrive_before_the_pubrec_send_returns_or_reports_write_completion()
+            throws Exception {
+        // Arrange: a peer answers after seeing PUBREC, before either transport notification.
+        var answered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribePull(
+                    sut,
+                    transport,
+                    Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE)
+                            .withAckMode(AckMode.MANUAL)
+            );
+            transport.completeSends = false;
+            transport.afterSend = packet -> {
+                if (packet instanceof Packet.PubRec) {
+                    transport.receive(new Packet.PubRel(7, ReasonCode.SUCCESS, EMPTY));
+                    answered.countDown();
+                    waitFor(release);
+                }
+            };
+            transport.receive(acknowledgedPublication("messages", 7, Qos.EXACTLY_ONCE, false));
+            MqttDelivery delivery = received(subscription.receive(Duration.ofSeconds(5)));
+
+            // Act: PUBREL reaches the actor before its PUBREC write completion event.
+            delivery.ack();
+            assertThat(answered.await(5, SECONDS)).isTrue();
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubRec(7, ReasonCode.SUCCESS, EMPTY));
+            // Observe the queued response before returning ACCEPTED or posting onSent.
+            await().pollInterval(Duration.ofMillis(1)).untilAsserted(() ->
+                    assertThat(((ClientActor) sut).usage().sends()).isEqualTo(2));
+            transport.completeSends = true;
+            transport.completeSend();
+            release.countDown();
+
+            // Assert
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubComp(7, ReasonCode.SUCCESS, EMPTY));
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_handler_can_publish_qos_two_while_its_delivery_holds_the_receive_acknowledgements()
+            throws Exception {
+        // Arrange: AFTER_HANDLER holds the receive sequence until its publication completes.
+        var completed = new CompletableFuture<PublishResult>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE),
+                    _ -> completed.complete(sut.publish(
+                            message(new byte[] {2}).withQos(Qos.EXACTLY_ONCE)
+                    ).join())
+            );
+            var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(
+                    request.packetId(),
+                    List.of(ReasonCode.GRANTED_QOS_2),
+                    EMPTY
+            ));
+            subscribing.get(5, SECONDS);
+
+            // Act: this receipt cannot be acknowledged while the handler waits for PUBCOMP.
+            transport.receive(acknowledgedPublication("messages", 7, Qos.EXACTLY_ONCE, false));
+            var outgoing = (Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS));
+            assertThat(outgoing.qos()).isEqualTo(Qos.EXACTLY_ONCE);
+            transport.receive(new Packet.PubRec(outgoing.packetId(), ReasonCode.SUCCESS, EMPTY));
+
+            // Assert: the independent send sequence advances before the receive head is ready.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubRel(outgoing.packetId(), ReasonCode.SUCCESS, EMPTY));
+            assertThat(completed).isNotDone();
+            transport.receive(new Packet.PubComp(outgoing.packetId(), ReasonCode.SUCCESS, EMPTY));
+            assertThat(completed.get(5, SECONDS)).isEqualTo(PublishResult.of());
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubRec(7, ReasonCode.SUCCESS, EMPTY));
+            transport.receive(new Packet.PubRel(7, ReasonCode.SUCCESS, EMPTY));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.PubComp(7, ReasonCode.SUCCESS, EMPTY));
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Qos.class, names = {"AT_LEAST_ONCE", "EXACTLY_ONCE"})
+    void acknowledgements_made_while_the_actor_is_busy_share_one_mailbox_wake(Qos qos)
+            throws Exception {
         // Arrange: more MANUAL deliveries than the 256-event control mailbox can hold.
         var delivered = new LinkedBlockingQueue<MqttDelivery>();
         var entered = new CountDownLatch(1);
@@ -1828,20 +1939,21 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             CompletableFuture<Subscription> subscribing = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                    Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL)
                             .withBufferCapacity(512),
                     delivered::add
             );
             var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(new Packet.SubAck(
-                    request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY
+                    request.packetId(),
+                    List.of(ReasonCode.of(qos.level())),
+                    EMPTY
             ));
             subscribing.get(5, SECONDS);
             var deliveries = new ArrayList<MqttDelivery>();
             for (int id = 1; id <= 300; id++) {
-                transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
-                        Qos.AT_LEAST_ONCE, false, false, id, EMPTY));
+                transport.receive(acknowledgedPublication("messages", id, qos, false));
                 deliveries.add(requireNonNull(delivered.poll(5, SECONDS)));
             }
             holdActor(transport, entered, release);
@@ -1853,7 +1965,7 @@ class ClientActorTest {
             // Assert
             for (int id = 1; id <= 300; id++) {
                 assertThat(transport.sent.poll(5, SECONDS))
-                        .isEqualTo(new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY));
+                        .isEqualTo(acknowledgement(qos, id));
             }
             assertThat(ends).isEmpty();
         } finally {
@@ -1890,16 +2002,16 @@ class ClientActorTest {
         }
     }
 
-    @ParameterizedTest
-    @EnumSource(AckMode.class)
-    void a_qos_one_burst_waits_for_send_capacity_without_losing_the_tail(AckMode mode)
+    @ParameterizedTest(name = "{0}, {1}")
+    @MethodSource("acknowledgedQosModes")
+    void acknowledged_bursts_wait_for_send_capacity_without_losing_the_tail(Qos qos, AckMode mode)
             throws Exception {
         // Arrange: the first write holds the transport, with room for 100 local deliveries.
         var delivered = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             CompletableFuture<Subscription> subscribing = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                    Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(mode)
                             .withBufferCapacity(128),
                     delivery -> {
@@ -1909,7 +2021,9 @@ class ClientActorTest {
             );
             var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(new Packet.SubAck(
-                    request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY
+                    request.packetId(),
+                    List.of(ReasonCode.of(qos.level())),
+                    EMPTY
             ));
             subscribing.get(5, SECONDS);
             transport.completeSends = false;
@@ -1918,8 +2032,7 @@ class ClientActorTest {
 
             // Act
             for (int id = 1; id <= 100; id++) {
-                transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
-                        Qos.AT_LEAST_ONCE, false, false, id, EMPTY));
+                transport.receive(acknowledgedPublication("messages", id, qos, false));
             }
             for (int i = 0; i < 100; i++) {
                 assertThat(delivered.poll(5, SECONDS)).isNotNull();
@@ -1931,16 +2044,19 @@ class ClientActorTest {
             // Assert: completing the held write suffices; no new incoming packet wakes the pump.
             for (int id = 1; id <= 100; id++) {
                 assertThat(transport.sent.poll(5, SECONDS))
-                        .isEqualTo(new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY));
+                        .isEqualTo(acknowledgement(qos, id));
             }
             sut.disconnect().get(5, SECONDS);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
         }
     }
 
-    @ParameterizedTest(name = "reused id has DUP={0}")
-    @ValueSource(booleans = {false, true})
-    void id_reuse_after_inline_puback_completion_precedes_send_buffer_release(boolean dup)
+    @ParameterizedTest(name = "{0}, reused id has DUP={1}")
+    @CsvSource({
+            "AT_LEAST_ONCE, false", "AT_LEAST_ONCE, true",
+            "EXACTLY_ONCE, false", "EXACTLY_ONCE, true"
+    })
+    void id_reuse_after_inline_receive_completion_precedes_send_buffer_release(Qos qos, boolean dup)
             throws Exception {
         // Arrange: the completion callback runs, but send() has not returned its buffer yet.
         var deliveries = new LinkedBlockingQueue<MqttDelivery>();
@@ -1948,36 +2064,44 @@ class ClientActorTest {
         var sentFirstAck = new AtomicBoolean();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            var subscribing = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL),
                     deliveries::add
             );
             var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(new Packet.SubAck(
-                    request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY
+                    request.packetId(),
+                    List.of(ReasonCode.of(qos.level())),
+                    EMPTY
             ));
             subscribing.get(5, SECONDS);
             transport.afterSend = packet -> {
-                if (packet instanceof Packet.PubAck && sentFirstAck.compareAndSet(false, true)) {
-                    transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
-                            Qos.AT_LEAST_ONCE, false, dup, 7, EMPTY));
+                if ((packet instanceof Packet.PubAck || packet instanceof Packet.PubComp)
+                        && sentFirstAck.compareAndSet(false, true)) {
+                    transport.receive(acknowledgedPublication("messages", 7, qos, dup));
                     waitFor(releaseSender);
                 }
             };
-            transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
-                    Qos.AT_LEAST_ONCE, false, false, 7, EMPTY));
+            transport.receive(acknowledgedPublication("messages", 7, qos, false));
             MqttDelivery first = requireNonNull(deliveries.poll(5, SECONDS));
 
             // Act
             first.ack();
+            if (qos == Qos.EXACTLY_ONCE) {
+                assertThat(transport.sent.poll(5, SECONDS))
+                        .isEqualTo(new Packet.PubRec(7, ReasonCode.SUCCESS, EMPTY));
+                transport.receive(new Packet.PubRel(7, ReasonCode.SUCCESS, EMPTY));
+            }
             MqttDelivery reused = requireNonNull(deliveries.poll(5, SECONDS));
 
             // Assert: identical payload and DUP do not cause a legal reuse to be discarded.
             assertThat(reused).isNotSameAs(first);
             assertThat(reused.dup()).isEqualTo(dup);
             assertThat(transport.sent.poll(5, SECONDS))
-                    .isEqualTo(new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY));
+                    .isEqualTo(qos == Qos.AT_LEAST_ONCE
+                            ? new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY)
+                            : new Packet.PubComp(7, ReasonCode.SUCCESS, EMPTY));
 
             // Act: old handles cannot acknowledge the new reception.
             first.ack();
@@ -1988,7 +2112,7 @@ class ClientActorTest {
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
             reused.ack();
             assertThat(transport.sent.poll(5, SECONDS))
-                    .isEqualTo(new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY));
+                    .isEqualTo(acknowledgement(qos, 7));
             assertThat(ends).isEmpty();
         } finally {
             releaseSender.countDown();
@@ -2408,8 +2532,10 @@ class ClientActorTest {
         }
     }
 
-    @Test
-    void a_queued_handler_failure_is_processed_before_its_acknowledgement() throws Exception {
+    @ParameterizedTest
+    @EnumSource(value = Qos.class, names = {"AT_LEAST_ONCE", "EXACTLY_ONCE"})
+    void a_queued_handler_failure_is_processed_before_its_acknowledgement(Qos qos)
+            throws Exception {
         // Arrange: both the explicit ack and failure arrive while the actor is held.
         var workers = new LinkedBlockingQueue<Thread>();
         var releaseHandler = new CountDownLatch(1);
@@ -2419,7 +2545,7 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             CompletableFuture<Subscription> subscribing = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                    Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL),
                     delivery -> {
                         workers.add(Thread.currentThread());
@@ -2430,13 +2556,12 @@ class ClientActorTest {
             );
             var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(new Packet.SubAck(
-                    subscribe.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY
+                    subscribe.packetId(),
+                    List.of(ReasonCode.of(qos.level())),
+                    EMPTY
             ));
             subscribing.get(5, SECONDS);
-            transport.receive(new Packet.Publish(
-                    new Topic("messages"), new byte[] {1}, Qos.AT_LEAST_ONCE,
-                    false, false, 7, EMPTY
-            ));
+            transport.receive(acknowledgedPublication("messages", 7, qos, false));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             holdActor(transport, actorHeld, releaseActor);
 
@@ -2621,9 +2746,15 @@ class ClientActorTest {
         }
     }
 
-    @ParameterizedTest(name = "session present: {0}, handler failure first: {1}")
-    @CsvSource({"true, true", "true, false", "false, true", "false, false"})
+    @ParameterizedTest(name = "{0}, session present: {1}, handler failure first: {2}")
+    @CsvSource({
+            "AT_LEAST_ONCE, true, true", "AT_LEAST_ONCE, true, false",
+            "AT_LEAST_ONCE, false, true", "AT_LEAST_ONCE, false, false",
+            "EXACTLY_ONCE, true, true", "EXACTLY_ONCE, true, false",
+            "EXACTLY_ONCE, false, true", "EXACTLY_ONCE, false, false"
+    })
     void a_previous_connections_handler_failure_is_prioritized_only_for_the_retained_session(
+            Qos qos,
             boolean sessionPresent,
             boolean handlerFirst
     ) throws Exception {
@@ -2647,7 +2778,7 @@ class ClientActorTest {
         ) {
             ScriptTransport old = connect(sut);
             CompletableFuture<Subscription> subscribing = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                    Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.AFTER_HANDLER),
                     _ -> {
                         workers.add(Thread.currentThread());
@@ -2656,17 +2787,19 @@ class ClientActorTest {
                     }
             );
             var request = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
-            old.receive(
-                    new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY)
-            );
+            old.receive(new Packet.SubAck(
+                    request.packetId(),
+                    List.of(ReasonCode.of(qos.level())),
+                    EMPTY
+            ));
             Subscription subscription = subscribing.get(5, SECONDS);
-            old.receive(qosOnePublication("messages", 7, false));
+            old.receive(acknowledgedPublication("messages", 7, qos, false));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             old.receiver().onClosed(new IOException("connection lost"));
             assertThat(ends.poll(5, SECONDS)).isNotNull();
             ScriptTransport current = connect(sut, sessionPresent);
             if (sessionPresent) {
-                current.receive(qosOnePublication("messages", 7, true));
+                current.receive(acknowledgedPublication("messages", 7, qos, true));
             } else {
                 acknowledgeResubscription(current, subscription);
             }
@@ -3853,15 +3986,37 @@ class ClientActorTest {
     }
 
     private static Packet.Publish qosOnePublication(String topic, int packetId, boolean duplicate) {
+        return acknowledgedPublication(topic, packetId, Qos.AT_LEAST_ONCE, duplicate);
+    }
+
+    private static Packet.Publish acknowledgedPublication(
+            String topic,
+            int packetId,
+            Qos qos,
+            boolean duplicate
+    ) {
         return new Packet.Publish(
                 new Topic(topic),
                 new byte[] {(byte) packetId},
-                Qos.AT_LEAST_ONCE,
+                qos,
                 false,
                 duplicate,
                 packetId,
                 EMPTY
         );
+    }
+
+    private static Packet acknowledgement(Qos qos, int packetId) {
+        return switch (qos) {
+            case AT_MOST_ONCE -> throw new IllegalArgumentException("QoS 0 has no acknowledgement");
+            case AT_LEAST_ONCE -> new Packet.PubAck(packetId, ReasonCode.SUCCESS, EMPTY);
+            case EXACTLY_ONCE -> new Packet.PubRec(packetId, ReasonCode.SUCCESS, EMPTY);
+        };
+    }
+
+    private static Stream<Arguments> acknowledgedQosModes() {
+        return Stream.of(Qos.AT_LEAST_ONCE, Qos.EXACTLY_ONCE)
+                .flatMap(qos -> Stream.of(AckMode.values()).map(mode -> Arguments.of(qos, mode)));
     }
 
     private static Stream<Arguments> invalidPackets() {

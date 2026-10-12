@@ -587,7 +587,7 @@ class ReceivePersistenceTest {
         return IntStream.range(0, 100);
     }
 
-    private record Sent(
+    record Sent(
             long generation,
             long ticket,
             Packet packet,
@@ -595,7 +595,7 @@ class ReceivePersistenceTest {
     ) {
     }
 
-    private record Result(@Nullable Object value, @Nullable Throwable failure) {
+    record Result(@Nullable Object value, @Nullable Throwable failure) {
     }
 
     private static final class TestSubscription implements Subscription {
@@ -621,7 +621,7 @@ class ReceivePersistenceTest {
         }
     }
 
-    private static final class RecordingPort implements SessionCore.Port {
+    static final class RecordingPort implements SessionCore.Port {
 
         final List<Sent> sent = new ArrayList<>();
         final List<DeliveryToken> deliveries = new ArrayList<>();
@@ -630,6 +630,10 @@ class ReceivePersistenceTest {
         final Map<Long, Boolean> handed = new HashMap<>();
         final Map<Long, Result> results = new HashMap<>();
         SendQueue.OfferResult ackAdmission = SendQueue.OfferResult.ACCEPTED;
+        // Runs whenever the core reads the readiness that end() returned. The I/O sender can
+        // accept a write while the core reconciles the ended connection.
+        Runnable duringEndReconcile = () -> {
+        };
         long session;
         long generation;
 
@@ -645,7 +649,9 @@ class ReceivePersistenceTest {
                 Packet packet,
                 @Nullable SendReceipt receipt
         ) {
-            if (packet instanceof Packet.PubAck
+            if ((packet instanceof Packet.PubAck
+                    || packet instanceof Packet.PubRec
+                    || packet instanceof Packet.PubComp)
                     && ackAdmission != SendQueue.OfferResult.ACCEPTED) {
                 return ackAdmission;
             }
@@ -749,7 +755,14 @@ class ReceivePersistenceTest {
             if (!preserveSession) {
                 handed.clear();
             }
-            return receiveState();
+            Runnable concurrently = duringEndReconcile;
+            return new HashMap<>(receiveState()) {
+                @Override
+                public @Nullable Boolean get(@Nullable Object token) {
+                    concurrently.run();
+                    return super.get(token);
+                }
+            };
         }
     }
 }

@@ -34,6 +34,9 @@ import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.client.internal.AckSequencer.Acknowledgement;
+import org.mqtt4j.hato.client.internal.AckSequencer.Kind;
+import org.mqtt4j.hato.client.internal.ReceiveTable.Stage;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
@@ -239,9 +242,8 @@ final class SessionCore {
     // Tickets of PUBREC responses admitted to I/O whose write notification is still pending.
     private final Set<Long> releaseWrites = new HashSet<>();
 
-    // PUBACK and PUBREL share the acknowledgement room of the send queue. Returned room goes
-    // first to the kind that did not take the last slot, so a steady supply of either kind
-    // cannot starve the other.
+    // Incoming acknowledgements and outgoing PUBREL share the reserved send quota. Returned
+    // room goes first to the side that did not take the last slot, so neither can starve.
     private boolean releasesFirst;
 
     // Unknown exchanges have no future or persistent state, but their PUBCOMP must not land
@@ -342,7 +344,7 @@ final class SessionCore {
                         log.info("Started session for {}", clientId);
                     }
                 } else {
-                    reconcileReceptions(port.receiveState());
+                    reconcileReceptions(port.receiveState(), false);
                     deferred.addAll(session.inflight.values());
                 }
                 state = State.CONNECTED;
@@ -392,6 +394,8 @@ final class SessionCore {
             unsubscribed(ack);
         } else if (packet instanceof Packet.Publish publish) {
             deliver(publish, bytes);
+        } else if (packet instanceof Packet.PubRel release) {
+            released(release.packetId());
         } else {
             failed(connection, protocolError("Unexpected " + packet.getClass().getSimpleName()));
         }
@@ -424,12 +428,17 @@ final class SessionCore {
         }
     }
 
-    /// Ends a PUBACK's retransmission window, independently of send-buffer release. Input may
-    /// arrive before or after it; the DUP flag decides how a reused identifier is treated.
+    /// Write completion retires PUBACK/PUBCOMP, while PUBREC retains the id for PUBREL.
+    /// The immutable acknowledgement kind keeps an old PUBREC write from retiring a later stage.
     void written(long connection, long ticket) {
         if (connection == generation && state == State.CONNECTED) {
-            acknowledgements.written(ticket).ifPresent(entry -> {
-                session.received.remove(entry);
+            acknowledgements.written(ticket).ifPresent(acknowledgement -> {
+                ReceiveTable.Entry entry = acknowledgement.entry();
+                if (acknowledgement.kind() == Kind.PUBREC) {
+                    entry.pubrecAccepted();
+                } else {
+                    session.received.remove(entry);
+                }
                 port.forgetDelivery(entry.token());
             });
             sendCapacityAvailable(connection);
@@ -507,7 +516,7 @@ final class SessionCore {
     }
 
     void subscribe(long operation, Subscribe request) {
-        if (!ready(operation) || !supportedQos(operation, request.qos())) {
+        if (!ready(operation)) {
             return;
         }
         if (subscriptions.values().stream()
@@ -789,14 +798,6 @@ final class SessionCore {
         return false;
     }
 
-    private boolean supportedQos(long operation, Qos qos) {
-        if (qos != Qos.EXACTLY_ONCE) {
-            return true;
-        }
-        port.complete(operation, null, new IllegalArgumentException("QoS 2 is not supported"));
-        return false;
-    }
-
     private void capacityFailure(long operation, String message) {
         port.complete(operation, null, new MqttCapacityException(message));
     }
@@ -948,9 +949,10 @@ final class SessionCore {
         }
     }
 
-    /// The earlier reception was a stale retransmission or a resend that omitted DUP. Either way
-    /// the new reception's PUBACK covers the broker's exchange, so the earlier one only releases
-    /// its local delivery and stops holding back later acknowledgements.
+    /// The earlier QoS 1 reception was a stale retransmission, or the id was reused without DUP
+    /// for another publication. Either way the new reception's PUBACK or PUBREC covers the
+    /// broker's exchange, so the earlier one only releases its local delivery and stops holding
+    /// back later acknowledgements.
     private void withdrawAcknowledgement(int packetId, long token) {
         if (!reusedIdentifierLogged) {
             reusedIdentifierLogged = true;
@@ -970,8 +972,7 @@ final class SessionCore {
         }
         ReasonCode reason = ack.reasonCodes().getFirst();
         if (reason != ReasonCode.UNSPECIFIED_ERROR
-                && (reason.value() > local.requestedQos.level()
-                        || reason.value() > Qos.AT_LEAST_ONCE.level())) {
+                && reason.value() > local.requestedQos.level()) {
             failed(generation, protocolError("SUBACK grants an unsupported QoS or reason"));
             return;
         }
@@ -1022,29 +1023,44 @@ final class SessionCore {
     }
 
     private void deliver(Packet.Publish publish, int bytes) {
-        if (publish.qos() == Qos.EXACTLY_ONCE) {
-            failed(generation, protocolError("QoS 2 delivery is not supported"));
-            return;
-        }
         long token = 0;
         boolean continued = false;
-        if (publish.qos() == Qos.AT_LEAST_ONCE) {
+        if (publish.qos() != Qos.AT_MOST_ONCE) {
             int packetId = publish.packetId();
+            Kind kind = switch (publish.qos()) {
+                case AT_MOST_ONCE -> throw new IllegalStateException("QoS 0 is not acknowledged");
+                case AT_LEAST_ONCE -> Kind.PUBACK;
+                case EXACTLY_ONCE -> Kind.PUBREC;
+            };
             Optional<ReceiveTable.Entry> existing = session.received.find(packetId);
             if (existing.isPresent()) {
                 ReceiveTable.Entry earlier = existing.orElseThrow();
-                if (publish.dup()) {
-                    if (acknowledgements.contains(earlier)) {
+                earlier.observeReceipt();
+                // QoS 2 joins its unfinished reception until PUBREL even without DUP, while
+                // QoS 1 joins only a DUP retransmission. Neither may change the id's QoS.
+                if (earlier.qos() == Qos.EXACTLY_ONCE || publish.dup()) {
+                    if (publish.qos() != earlier.qos()) {
+                        failed(generation, protocolError("PUBLISH changes an unfinished id's QoS"));
+                        return;
+                    }
+                    if (earlier.stage() == Stage.WAITING_PUBREL) {
+                        // A repeated PUBLISH is answered by a new or still pending PUBREC, but
+                        // is never delivered again.
+                        acknowledgements.add(earlier, Kind.PUBREC);
+                        sendCapacityAvailable(generation);
+                        return;
+                    }
+                    if (acknowledgements.contains(earlier, kind)) {
                         return;
                     }
                     // A continued reception joins this connection only when its resend arrives.
                     token = earlier.token();
                     continued = true;
-                    acknowledgements.add(earlier);
+                    acknowledgements.add(earlier, kind);
                 } else {
                     session.received.supersede(packetId);
-                    if (acknowledgements.remove(earlier)
-                            || !acknowledgements.contains(earlier)) {
+                    if (acknowledgements.remove(earlier, Kind.PUBACK)
+                            || !acknowledgements.contains(earlier, Kind.PUBACK)) {
                         session.received.remove(earlier);
                         withdrawAcknowledgement(packetId, earlier.token());
                     }
@@ -1052,12 +1068,16 @@ final class SessionCore {
             }
             if (token == 0) {
                 token = ++nextDelivery;
-                Optional<ReceiveTable.Entry> added = session.received.add(token, packetId);
+                Optional<ReceiveTable.Entry> added = session.received.add(
+                        token,
+                        packetId,
+                        publish.qos()
+                );
                 if (added.isEmpty()) {
                     failed(generation, new MqttCapacityException("Acknowledgement capacity"));
                     return;
                 }
-                acknowledgements.add(added.orElseThrow());
+                acknowledgements.add(added.orElseThrow(), kind);
             }
         }
         var matches = new ArrayList<Long>();
@@ -1097,11 +1117,54 @@ final class SessionCore {
         }
     }
 
+    private void released(int packetId) {
+        Optional<ReceiveTable.Entry> existing = session.received.find(packetId);
+        ReceiveTable.Entry entry;
+        if (existing.isPresent()) {
+            entry = existing.orElseThrow();
+            if (entry.qos() != Qos.EXACTLY_ONCE) {
+                failed(generation, protocolError("PUBREL targets an unfinished QoS 1 id"));
+                return;
+            }
+            SendReceipt receipt = entry.receipt();
+            if (receipt != null && receipt.started()) {
+                // The peer's PUBREL proves PUBREC arrived, even when Transport.send has not
+                // returned ACCEPTED or reported the write. A queue-only receipt is not enough.
+                entry.pubrecAccepted();
+            }
+            if (entry.stage() != Stage.WAITING_PUBREL) {
+                failed(generation, protocolError("PUBREL precedes PUBREC for the received id"));
+                return;
+            }
+            // A PUBREL makes queued duplicate PUBRECs obsolete. Writes already admitted keep
+            // their immutable kind and capacity until their own completion notification.
+            acknowledgements.remove(entry, Kind.PUBREC);
+            port.forgetDelivery(entry.token());
+        } else if (acknowledgements.completing(packetId)) {
+            return;
+        } else {
+            // An unknown PUBREL owns response capacity without occupying its packet identifier.
+            Optional<ReceiveTable.Entry> added = session.received.add(
+                    ++nextDelivery,
+                    packetId,
+                    Qos.EXACTLY_ONCE
+            );
+            if (added.isEmpty()) {
+                failed(generation, new MqttCapacityException("Acknowledgement capacity"));
+                return;
+            }
+            entry = added.orElseThrow();
+        }
+        session.received.complete(entry);
+        acknowledgements.add(entry, Kind.PUBCOMP);
+        sendCapacityAvailable(generation);
+    }
+
     void deliveryReady(long token) {
         deliveriesReady(List.of(token));
     }
 
-    /// QoS 0 and already acknowledged deliveries have no entry in the receive table.
+    /// QoS 0 deliveries and receptions whose PUBACK or PUBCOMP was written have no table entry.
     void deliveryFailed(DeliveryToken token, Throwable cause) {
         if (token.session() == sessionNumber
                 && state != State.DISCONNECTED
@@ -1132,16 +1195,22 @@ final class SessionCore {
     }
 
     private void sendAcknowledgements() {
-        Optional<ReceiveTable.Entry> ready;
+        Optional<Acknowledgement> ready;
         while (acknowledgements.writingCount() < ACK_WRITE_LIMIT
                 && (ready = acknowledgements.nextReady()).isPresent()) {
-            ReceiveTable.Entry entry = ready.orElseThrow();
+            Acknowledgement acknowledgement = ready.orElseThrow();
+            ReceiveTable.Entry entry = acknowledgement.entry();
             long ticket = ++nextTicket;
             var receipt = new SendReceipt();
+            Packet packet = switch (acknowledgement.kind()) {
+                case PUBACK -> new Packet.PubAck(entry.packetId(), ReasonCode.SUCCESS, EMPTY);
+                case PUBREC -> new Packet.PubRec(entry.packetId(), ReasonCode.SUCCESS, EMPTY);
+                case PUBCOMP -> new Packet.PubComp(entry.packetId(), ReasonCode.SUCCESS, EMPTY);
+            };
             if (port.send(
                     generation,
                     ticket,
-                    new Packet.PubAck(entry.packetId(), ReasonCode.SUCCESS, EMPTY),
+                    packet,
                     receipt
             )
                     != SendQueue.OfferResult.ACCEPTED) {
@@ -1152,7 +1221,9 @@ final class SessionCore {
             releasesFirst = true;
             acknowledgements.submitted(ticket);
             entry.submitted(receipt);
-            port.releaseDelivery(entry.token());
+            if (entry.stage() == Stage.RECEIVING) {
+                port.releaseDelivery(entry.token());
+            }
         }
     }
 
@@ -1313,7 +1384,7 @@ final class SessionCore {
                     !permanent && !cleanStart,
                     stopped
             );
-            reconcileReceptions(handedReadiness);
+            reconcileReceptions(handedReadiness, true);
         }
         acknowledgements.clear();
         if (permanent || cleanStart) {
@@ -1322,11 +1393,22 @@ final class SessionCore {
     }
 
     /// `handedReadiness` follows [Port#receiveState()]: receptions it omits reached no recipient.
-    private void reconcileReceptions(Map<Long, Boolean> handedReadiness) {
+    private void reconcileReceptions(Map<Long, Boolean> handedReadiness, boolean ending) {
         for (ReceiveTable.Entry entry : session.received.entries()) {
+            // The sender can accept a PUBREC during this pass. Judge it by one read, so a QoS 2
+            // reception that missed WAITING_PUBREL is not dropped by the QoS 1 rule below.
+            boolean accepted = entry.observeReceipt();
             SendReceipt receipt = entry.receipt();
             Boolean ready = handedReadiness.get(entry.token());
-            if ((receipt != null && receipt.accepted()) || ready == null
+            if (entry.stage() == Stage.WAITING_PUBREL) {
+                port.forgetDelivery(entry.token());
+            } else if (ending && entry.qos() == Qos.EXACTLY_ONCE
+                    && entry.stage() == Stage.RECEIVING && receipt != null && ready == null) {
+                // Inline closure can precede Transport.send returning ACCEPTED. Retain this
+                // receipt until CONNACK can settle whether PUBREC made the exchange persistent:
+                // the single I/O sender returns from this send before it writes the next CONNECT.
+                port.forgetDelivery(entry.token());
+            } else if (entry.stage() == Stage.COMPLETING || accepted || ready == null
                     || session.received.find(entry.packetId()).orElse(null) != entry) {
                 session.received.remove(entry);
                 port.forgetDelivery(entry.token());
