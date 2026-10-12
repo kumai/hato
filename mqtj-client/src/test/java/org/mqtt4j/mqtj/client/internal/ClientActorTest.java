@@ -706,6 +706,99 @@ class ClientActorTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(value = AckMode.class, names = {"ON_RECEIVE", "MANUAL"})
+    @Timeout(30)
+    void retained_receptions_keep_their_limit_without_holding_completed_pull_capacity(AckMode mode)
+            throws Exception {
+        // Arrange: half the receive table is occupied before reconnect, with local capacity one.
+        try (MqttClient sut = client(false)) {
+            ScriptTransport old = connect(sut);
+            Subscription head = subscribePull(
+                    sut,
+                    old,
+                    Subscribe.of(new TopicFilter("head"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL)
+                            .withBufferCapacity(1)
+            );
+            Subscription tail = subscribePull(
+                    sut,
+                    old,
+                    Subscribe.of(new TopicFilter("tail"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(mode)
+                            .withBufferCapacity(1)
+            );
+            old.receive(qosOnePublication("head", 1, false));
+            received(head.receive(Duration.ofSeconds(5)));
+            for (int id = 2; id <= 2048; id++) {
+                old.receive(qosOnePublication("tail", id, false));
+                received(tail.receive(Duration.ofSeconds(5))).ack();
+            }
+            old.receiver().onClosed(new IOException("connection lost"));
+            assertThat(ends.poll(5, SECONDS)).isNotNull();
+
+            // Act: all replays join, then the remaining receive slots accept new local handoffs.
+            ScriptTransport current = connect(sut, true);
+            current.receive(qosOnePublication("head", 1, true));
+            for (int id = 2; id <= 2048; id++) {
+                current.receive(qosOnePublication("tail", id, true));
+            }
+            sut.publish(message(new byte[] {0})).get(5, SECONDS);
+            assertThat(current.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            assertThat(tail.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+            for (int id = 2049; id <= 4096; id++) {
+                current.receive(qosOnePublication("tail", id, false));
+                received(tail.receive(Duration.ofSeconds(5))).ack();
+            }
+            assertThat(current.sent).isEmpty();
+            assertThat(ends).isEmpty();
+            current.receive(qosOnePublication("tail", 4097, false));
+
+            // Assert: retained wire metadata, rather than either one-slot pull buffer, is full.
+            assertThat(requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow())
+                    .isInstanceOf(MqttCapacityException.class)
+                    .hasMessage("Acknowledgement capacity");
+        }
+    }
+
+    @Test
+    void a_manual_push_delivery_keeps_its_capacity_when_the_session_continues() throws Exception {
+        // Arrange: the handler returns, but its manual acknowledgement is still outstanding.
+        var delivered = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client(false)) {
+            ScriptTransport old = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL)
+                            .withBufferCapacity(1),
+                    delivered::add
+            );
+            var request = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
+            old.receive(
+                    new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY)
+            );
+            subscribing.get(5, SECONDS);
+            old.receive(qosOnePublication("messages", 7, false));
+            assertThat(delivered.poll(5, SECONDS)).isNotNull();
+            old.receiver().onClosed(new IOException("connection lost"));
+            assertThat(ends.poll(5, SECONDS)).isNotNull();
+
+            // Act: joining the replay consumes no new slot; a different reception still needs one.
+            ScriptTransport current = connect(sut, true);
+            current.receive(qosOnePublication("messages", 7, true));
+            sut.publish(message(new byte[] {0})).get(5, SECONDS);
+            assertThat(current.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            assertThat(delivered).isEmpty();
+            current.receive(qosOnePublication("messages", 8, false));
+
+            // Assert
+            assertThat(requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow())
+                    .isInstanceOf(MqttCapacityException.class)
+                    .hasMessage("Delivery capacity");
+            assertThat(current.sent).isEmpty();
+        }
+    }
+
     @Test
     void pull_subscriptions_reject_after_handler_before_sending_subscribe() throws Exception {
         // Arrange
@@ -2454,6 +2547,160 @@ class ClientActorTest {
         }
     }
 
+    @ParameterizedTest(name = "session present: {0}, handler failure first: {1}")
+    @CsvSource({"true, true", "true, false", "false, true", "false, false"})
+    void a_previous_connections_handler_failure_is_prioritized_only_for_the_retained_session(
+            boolean sessionPresent,
+            boolean handlerFirst
+    ) throws Exception {
+        // Arrange: the old handler remains active while a new connection's actor is held.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var handledInput = new AtomicInteger();
+        var encodedCommands = new AtomicInteger();
+        var failure = new IllegalStateException("retained handler failed");
+        var encoder = new ScriptCodec();
+        try (
+                MqttClient sut = client(
+                        "session-priority",
+                        ends::add,
+                        16 * 1024 * 1024,
+                        encoder,
+                        false
+                )
+        ) {
+            ScriptTransport old = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.AFTER_HANDLER),
+                    _ -> {
+                        workers.add(Thread.currentThread());
+                        waitFor(releaseHandler);
+                        throw failure;
+                    }
+            );
+            var request = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
+            old.receive(
+                    new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY)
+            );
+            Subscription subscription = subscribing.get(5, SECONDS);
+            old.receive(qosOnePublication("messages", 7, false));
+            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            old.receiver().onClosed(new IOException("connection lost"));
+            assertThat(ends.poll(5, SECONDS)).isNotNull();
+            ScriptTransport current = connect(sut, sessionPresent);
+            if (sessionPresent) {
+                current.receive(qosOnePublication("messages", 7, true));
+            } else {
+                acknowledgeResubscription(current, subscription);
+            }
+            holdActor(current, actorHeld, releaseActor);
+            beforeActorTime = handledInput::incrementAndGet;
+            encoder.beforeEncode = packet -> {
+                if (packet instanceof Packet.Unsubscribe) {
+                    encodedCommands.incrementAndGet();
+                }
+            };
+            for (int i = 0; i < 32; i++) {
+                current.receive(publication(new byte[] {1}));
+            }
+            CompletableFuture<Void> queued = subscription.unsubscribe();
+
+            // Act: the lane's untimed wait follows notification; the actor cannot consume it yet.
+            if (!handlerFirst) {
+                current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
+            }
+            releaseHandler.countDown();
+            await().until(() -> worker.getState() == Thread.State.WAITING);
+            if (handlerFirst) {
+                current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
+            }
+            releaseActor.countDown();
+
+            // Assert: valid termination overtakes every queued packet and application command.
+            Disconnection end = requireNonNull(ends.poll(5, SECONDS));
+            if (sessionPresent && handlerFirst) {
+                assertThat(end).isEqualTo(Disconnection.of(failure, false));
+            } else {
+                assertProtocolFailure(end.cause().orElseThrow(), ReasonCode.MALFORMED_PACKET);
+            }
+            assertThatThrownBy(() -> queued.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+            assertThat(List.of(handledInput.get(), encodedCommands.get())).containsExactly(0, 0);
+            assertThat(current.sent).isEmpty();
+            assertThat(current.closed).isTrue();
+            assertThat(ends).isEmpty();
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
+    @ParameterizedTest(name = "session present: {0}")
+    @ValueSource(booleans = {false, true})
+    void connack_keeps_the_first_applicable_failure_when_handler_and_io_both_arrive_during_it(
+            boolean sessionPresent
+    ) throws Exception {
+        // Arrange: CONNACK is taken, but its clock read precedes the session identity decision.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var failure = new IllegalStateException("handler failed during CONNACK");
+        try (MqttClient sut = client(false)) {
+            ScriptTransport old = connect(sut);
+            CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE),
+                    _ -> {
+                        workers.add(Thread.currentThread());
+                        waitFor(releaseHandler);
+                        throw failure;
+                    }
+            );
+            var request = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
+            old.receive(
+                    new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY)
+            );
+            subscribing.get(5, SECONDS);
+            old.receive(qosOnePublication("messages", 7, false));
+            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            old.receiver().onClosed(new IOException("connection lost"));
+            assertThat(ends.poll(5, SECONDS)).isNotNull();
+            CompletableFuture<ConnAck> connected = sut.connect();
+            ScriptTransport current = nextTransport();
+            beforeActorTime = () -> {
+                actorHeld.countDown();
+                waitFor(releaseActor);
+            };
+            current.receive(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));
+            assertThat(actorHeld.await(5, SECONDS)).isTrue();
+
+            // Act: I/O failure follows an admitted handler failure before CONNACK resumes.
+            releaseHandler.countDown();
+            await().until(() -> worker.getState() == Thread.State.WAITING);
+            current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
+            releaseActor.countDown();
+
+            // Assert: SP=0 withdraws only the old handler cause, preserving the waiting I/O cause.
+            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent));
+            Disconnection end = requireNonNull(ends.poll(5, SECONDS));
+            if (sessionPresent) {
+                assertThat(end).isEqualTo(Disconnection.of(failure, false));
+            } else {
+                assertProtocolFailure(end.cause().orElseThrow(), ReasonCode.MALFORMED_PACKET);
+                assertThat(end.userRequested()).isFalse();
+            }
+            assertThat(current.closed).isTrue();
+            assertThat(current.sent).noneMatch(Packet.PubAck.class::isInstance);
+            assertThat(ends).isEmpty();
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
     @Test
     void a_publication_in_progress_cannot_turn_an_accepted_handler_failure_into_overload()
             throws Exception {
@@ -3465,10 +3712,14 @@ class ClientActorTest {
     }
 
     private ScriptTransport connect(MqttClient client) throws Exception {
+        return connect(client, false);
+    }
+
+    private ScriptTransport connect(MqttClient client, boolean sessionPresent) throws Exception {
         CompletableFuture<ConnAck> connection = client.connect();
         ScriptTransport transport = nextTransport();
-        transport.accept();
-        connection.get(5, SECONDS);
+        transport.receive(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));
+        assertThat(connection.get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent));
         return transport;
     }
 
@@ -3527,6 +3778,18 @@ class ClientActorTest {
         );
     }
 
+    private static Packet.Publish qosOnePublication(String topic, int packetId, boolean duplicate) {
+        return new Packet.Publish(
+                new Topic(topic),
+                new byte[] {(byte) packetId},
+                Qos.AT_LEAST_ONCE,
+                false,
+                duplicate,
+                packetId,
+                EMPTY
+        );
+    }
+
     private static Stream<Arguments> invalidPackets() {
         return Stream.of(
                 Arguments.of("30ffffffff", ReasonCode.MALFORMED_PACKET),
@@ -3553,6 +3816,10 @@ class ClientActorTest {
         return client(ends::add);
     }
 
+    private MqttClient client(boolean cleanStart) {
+        return client("actor-test", ends::add, 16 * 1024 * 1024, codec, cleanStart);
+    }
+
     private MqttClient client(ConnectionListener listener) {
         return client(listener, 16 * 1024 * 1024);
     }
@@ -3570,6 +3837,16 @@ class ClientActorTest {
             ConnectionListener listener,
             int maxPacketSize,
             PacketCodec packetCodec
+    ) {
+        return client(clientId, listener, maxPacketSize, packetCodec, true);
+    }
+
+    private MqttClient client(
+            String clientId,
+            ConnectionListener listener,
+            int maxPacketSize,
+            PacketCodec packetCodec,
+            boolean cleanStart
     ) {
         var clock = new TimerScheduler() {
             private volatile @Nullable Thread actor;
@@ -3605,7 +3882,7 @@ class ClientActorTest {
                     return transport;
                 },
                 packetCodec,
-                true
+                cleanStart
         );
     }
 

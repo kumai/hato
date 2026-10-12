@@ -60,6 +60,9 @@ final class Mailbox {
 
     private long activeGeneration;
 
+    // Session numbers start at one; zero means none.
+    private long activeSession;
+
     private int commandCount;
 
     private long commandBytes;
@@ -71,6 +74,13 @@ final class Mailbox {
     private int controlCount;
 
     private @Nullable Event termination;
+
+    // The session whose handler failure owns the termination slot, or zero for other causes.
+    private long terminationSession;
+
+    // A handler may be retired by a CONNACK already executing. Keep the first I/O failure
+    // behind it so replacing that session cannot erase the connection's terminal cause.
+    private @Nullable Event connectionTermination;
 
     Mailbox(
             int commandLimit,
@@ -89,6 +99,17 @@ final class Mailbox {
     /// Called by the actor before scheduling timers or opening I/O for the new connection.
     synchronized void activate(long generation) {
         activeGeneration = generation;
+    }
+
+    /// Session replacement and failure admission share the monitor. An admitted old handler
+    /// must not occupy the new session's failure slot while its CONNACK is being processed.
+    synchronized void activateSession(long session) {
+        activeSession = session;
+        if (terminationSession != 0 && terminationSession != session) {
+            termination = connectionTermination;
+            connectionTermination = null;
+            terminationSession = 0;
+        }
     }
 
     synchronized OfferResult offer(Event event) {
@@ -144,6 +165,21 @@ final class Mailbox {
         }
         if (termination == null) {
             termination = event;
+        } else if (terminationSession != 0 && connectionTermination == null) {
+            connectionTermination = event;
+        }
+        notifyAll();
+        return true;
+    }
+
+    /// Admits a handler failure for the active connection only while its session is current.
+    synchronized boolean terminateSession(long session, Runnable action) {
+        if (session != activeSession || activeGeneration == 0) {
+            return false;
+        }
+        if (termination == null) {
+            termination = new Event(activeGeneration, action, Kind.CONTROL, 0);
+            terminationSession = session;
         }
         notifyAll();
         return true;
@@ -168,6 +204,8 @@ final class Mailbox {
         Event end = termination;
         if (end != null) {
             termination = null;
+            terminationSession = 0;
+            connectionTermination = null;
             return Optional.of(end);
         }
         Event event = keepAlive.isEmpty() ? events.removeFirst() : keepAlive.removeFirst();
@@ -183,6 +221,8 @@ final class Mailbox {
         }
         if (termination != null && (generation == 0 || termination.generation() == generation)) {
             termination = null;
+            terminationSession = 0;
+            connectionTermination = null;
         }
         for (ArrayDeque<Event> queue : List.of(keepAlive, events)) {
             queue.removeIf(event -> {

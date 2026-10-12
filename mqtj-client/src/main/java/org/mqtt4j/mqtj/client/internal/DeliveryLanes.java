@@ -4,9 +4,12 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -49,7 +52,7 @@ final class DeliveryLanes {
 
     // Each core-admitted QoS 1 receipt enters once. The core's 4096-receipt limit also bounds
     // this metadata-only queue, including receipts with no local recipient.
-    private final ArrayDeque<Long> readyTokens = new ArrayDeque<>();
+    private final Set<Long> readyTokens = new LinkedHashSet<>();
 
     private final String clientId;
 
@@ -186,26 +189,92 @@ final class DeliveryLanes {
         }
     }
 
-    /// Clean Session retires receipt conditions, but the subscription and worker remain alive.
-    void connectionEnded() {
+    /// The discarded session's receipt conditions end. A lane paused by one of its handler
+    /// failures resumes, because that failure no longer ends a connection.
+    void sessionDiscarded() {
         lock.lock();
         try {
             retireAcknowledgements();
             for (Lane lane : lanes.values()) {
-                while (!lane.queue.isEmpty()) {
-                    DeliveryView view = lane.queue.removeFirst();
-                    discardedDeliveries++;
-                    view.localDone = true;
-                    view.delivery.retired = true;
-                    view.acknowledgement = null;
-                    releaseView(view);
-                }
                 lane.failed = false;
                 lane.ready.signalAll();
             }
         } finally {
             lock.unlock();
         }
+    }
+
+    /// Pending views are discarded; a continuing session keeps handed-off receipt conditions.
+    Map<Long, Boolean> connectionEnded(boolean preserveSession, boolean stopped) {
+        lock.lock();
+        try {
+            if (!preserveSession) {
+                retireAcknowledgements();
+            }
+            for (Lane lane : lanes.values()) {
+                while (!lane.queue.isEmpty()) {
+                    DeliveryView view = lane.queue.removeFirst();
+                    view.recipient.queued = false;
+                    discardedDeliveries++;
+                    view.localDone = true;
+                    view.released = true;
+                    invalidate(view);
+                }
+                lane.failed = false;
+                lane.ready.signalAll();
+            }
+            if (preserveSession) {
+                for (RetainedDelivery delivery : acknowledging.values()) {
+                    for (DeliveryView view : List.copyOf(delivery.views)) {
+                        if (!view.valid || (stopped && !view.recipient.ready)) {
+                            view.released = true;
+                            invalidate(view);
+                        }
+                    }
+                }
+            }
+            Map<Long, Boolean> result = receiveStateLocked();
+            for (long token : List.copyOf(acknowledging.keySet())) {
+                if (!result.containsKey(token)) {
+                    retire(requireNonNull(acknowledging.remove(token)));
+                }
+            }
+            readyTokens.clear();
+            return result;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Includes authoritative readiness after handlers may have finished while disconnected.
+    Map<Long, Boolean> receiveState() {
+        lock.lock();
+        try {
+            return receiveStateLocked();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    boolean isReady(long token) {
+        lock.lock();
+        try {
+            RetainedDelivery delivery = acknowledging.get(token);
+            return delivery != null && delivery.pending == 0;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private Map<Long, Boolean> receiveStateLocked() {
+        var result = new HashMap<Long, Boolean>();
+        for (var entry : acknowledging.entrySet()) {
+            RetainedDelivery delivery = entry.getValue();
+            if (delivery.recipients.values().stream().anyMatch(recipient -> recipient.handed)) {
+                result.put(entry.getKey(), delivery.pending == 0);
+            }
+        }
+        return result;
     }
 
     /// Ends every local subscription; application handlers already executing may finish.
@@ -225,15 +294,19 @@ final class DeliveryLanes {
     /// Caller holds lock. Running handlers retain their payload until they return.
     private void retireAcknowledgements() {
         for (RetainedDelivery delivery : List.copyOf(acknowledging.values())) {
-            delivery.retired = true;
-            delivery.released = true;
-            for (DeliveryView view : List.copyOf(delivery.views)) {
-                view.acknowledgement = null;
-                releaseView(view);
-            }
+            retire(delivery);
         }
         acknowledging.clear();
         readyTokens.clear();
+    }
+
+    private void retire(RetainedDelivery delivery) {
+        delivery.retired = true;
+        for (DeliveryView view : List.copyOf(delivery.views)) {
+            view.acknowledgement = null;
+            view.released = true;
+            releaseView(view);
+        }
     }
 
     /// Reserves every matching lane together so overload cannot deliver only part of a fan-out.
@@ -244,56 +317,96 @@ final class DeliveryLanes {
             boolean dup,
             int bytes
     ) {
-        boolean empty;
+        boolean ready;
         lock.lock();
         try {
             var recipients = new ArrayList<Lane>();
-            for (long id : ids) {
-                Lane lane = lanes.get(id);
-                // A paused lane awaits removal. It holds QoS 1 until UNSUBACK abandons it or a
-                // refused removal resumes it; QoS 0 is dropped as at-most-once delivery allows.
-                if (lane != null && (!lane.paused || token.acknowledgement() != 0)) {
-                    // An accepted failure ends the connection before the actor takes another
-                    // event. Its lane holds this event's delivery unrun beyond capacity, so
-                    // overload cannot replace the failure as the cause; cleanup discards it.
-                    if (lane.retained >= lane.capacity && !lane.failed) {
-                        return false;
+            var states = new ArrayList<Recipient>();
+            var abandoned = new ArrayList<Recipient>();
+            RetainedDelivery delivery = acknowledging.get(token.acknowledgement());
+            boolean first = delivery == null;
+            if (first) {
+                for (long id : ids) {
+                    Lane lane = lanes.get(id);
+                    // Removal holds QoS 1 until UNSUBACK or a refused removal resumes it.
+                    if (lane != null && (!lane.paused || token.acknowledgement() != 0)) {
+                        recipients.add(lane);
+                        states.add(new Recipient(id));
                     }
-                    recipients.add(lane);
+                }
+                delivery = new RetainedDelivery(token, bytes);
+            } else {
+                for (Recipient recipient : requireNonNull(delivery).recipients.values()) {
+                    if (!recipient.handed && !recipient.ready && !recipient.queued) {
+                        Lane lane = lanes.get(recipient.id);
+                        if (lane == null) {
+                            abandoned.add(recipient);
+                        } else {
+                            recipients.add(lane);
+                            states.add(recipient);
+                        }
+                    }
                 }
             }
-            empty = recipients.isEmpty();
-            if (!empty) {
-                if (recipients.size() > DELIVERY_LIMIT - retainedDeliveries
-                        || bytes > byteLimit - retainedBytes) {
+            for (Lane lane : recipients) {
+                // A pending failure owns termination; don't replace it with a capacity failure.
+                if (lane.retained >= lane.capacity && !lane.failed) {
                     return false;
                 }
-                var delivery = new RetainedDelivery(
-                        token, message, dup, bytes, recipients.size()
-                );
-                if (token.acknowledgement() != 0) {
-                    acknowledging.put(token.acknowledgement(), delivery);
+            }
+            RetainedDelivery retained = requireNonNull(delivery);
+            long addedBytes = recipients.isEmpty() || !retained.views.isEmpty()
+                    ? 0 : retained.bytes;
+            if (recipients.size() > DELIVERY_LIMIT - retainedDeliveries
+                    || addedBytes > byteLimit - retainedBytes) {
+                return false;
+            }
+            if (first && token.acknowledgement() != 0) {
+                acknowledging.put(token.acknowledgement(), retained);
+            }
+            for (Recipient recipient : abandoned) {
+                recipient.ready = true;
+                retained.pending--;
+            }
+            if (!recipients.isEmpty()) {
+                if (retained.message == null) {
+                    retained.message = message;
                 }
-                retainedBytes += bytes;
+                retainedBytes += addedBytes;
                 retainedDeliveries += recipients.size();
-                for (Lane lane : recipients) {
-                    var view = new DeliveryView(delivery, lane);
+                for (int index = 0; index < recipients.size(); index++) {
+                    Lane lane = recipients.get(index);
+                    Recipient recipient = states.get(index);
+                    if (first && token.acknowledgement() != 0) {
+                        retained.recipients.put(recipient.id, recipient);
+                        retained.pending++;
+                    }
+                    var view = new DeliveryView(
+                            retained,
+                            recipient,
+                            lane,
+                            requireNonNull(retained.message),
+                            dup
+                    );
                     view.held = lane.paused;
                     if (token.acknowledgement() != 0 && lane.ackMode == AckMode.MANUAL) {
                         view.acknowledgement = () -> acknowledge(view);
                     }
-                    delivery.views.add(view);
+                    retained.views.add(view);
+                    recipient.queued = true;
                     lane.retained++;
                     lane.queue.addLast(view);
                     lane.ready.signal();
                 }
-            } else if (token.acknowledgement() != 0) {
-                readyTokens.addLast(token.acknowledgement());
+            }
+            ready = recipients.isEmpty() && retained.pending == 0;
+            if (ready && token.acknowledgement() != 0) {
+                readyTokens.add(token.acknowledgement());
             }
         } finally {
             lock.unlock();
         }
-        if (empty && token.acknowledgement() != 0) {
+        if (ready && token.acknowledgement() != 0) {
             onReady.run();
         }
         return true;
@@ -304,7 +417,13 @@ final class DeliveryLanes {
     List<Long> takeReady() {
         lock.lock();
         try {
-            var result = new ArrayList<>(readyTokens);
+            var result = new ArrayList<Long>();
+            for (long token : readyTokens) {
+                RetainedDelivery delivery = acknowledging.get(token);
+                if (delivery != null && delivery.pending == 0) {
+                    result.add(token);
+                }
+            }
             readyTokens.clear();
             return result;
         } finally {
@@ -316,12 +435,26 @@ final class DeliveryLanes {
     void release(long token) {
         lock.lock();
         try {
-            RetainedDelivery delivery = acknowledging.remove(token);
+            RetainedDelivery delivery = acknowledging.get(token);
             if (delivery != null) {
-                delivery.released = true;
                 for (DeliveryView view : List.copyOf(delivery.views)) {
+                    view.released = true;
                     releaseView(view);
                 }
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// The receive table has retired this receipt; old handlers may still retain local capacity.
+    void forget(long token) {
+        lock.lock();
+        try {
+            readyTokens.remove(token);
+            RetainedDelivery delivery = acknowledging.remove(token);
+            if (delivery != null) {
+                retire(delivery);
             }
         } finally {
             lock.unlock();
@@ -411,6 +544,8 @@ final class DeliveryLanes {
             }
             // Claiming and stopping share the lock. A claimed handler may finish.
             view = lane.queue.removeFirst();
+            view.recipient.queued = false;
+            view.recipient.handed = true;
             ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
         } finally {
             lock.unlock();
@@ -439,14 +574,20 @@ final class DeliveryLanes {
             try {
                 abandonedDeliveries++;
                 view.localDone = true;
-                view.delivery.retired = true;
-                view.acknowledgement = null;
-                releaseView(view);
+                invalidate(view);
             } finally {
                 lock.unlock();
             }
             Thread.interrupted();
-            reportFailure(lane, view.delivery.token, failure);
+            if (!reportFailure(lane, view.delivery.token, failure)) {
+                lock.lock();
+                try {
+                    view.released = true;
+                    releaseView(view);
+                } finally {
+                    lock.unlock();
+                }
+            }
             return true;
         }
     }
@@ -469,18 +610,34 @@ final class DeliveryLanes {
     private boolean markReady(DeliveryView view) {
         RetainedDelivery delivery = view.delivery;
         if (delivery.token.acknowledgement() != 0
-                && !view.ready && !delivery.retired && !delivery.released) {
-            view.ready = true;
+                && view.valid && !view.recipient.ready && !delivery.retired) {
+            view.recipient.ready = true;
             view.acknowledgement = null;
             if (--delivery.pending == 0) {
-                readyTokens.addLast(delivery.token.acknowledgement());
+                readyTokens.add(delivery.token.acknowledgement());
                 return true;
             }
         }
         return false;
     }
 
-    private void reportFailure(Lane lane, DeliveryToken token, Throwable failure) {
+    /// Caller holds lock. A failed or stopped view cannot complete its replacement's condition.
+    private void invalidate(DeliveryView view) {
+        if (view.valid) {
+            view.valid = false;
+            if (!view.delivery.retired) {
+                view.recipient.handed = false;
+                if (view.recipient.ready) {
+                    view.recipient.ready = false;
+                    view.delivery.pending++;
+                }
+            }
+            view.acknowledgement = null;
+        }
+        releaseView(view);
+    }
+
+    private boolean reportFailure(Lane lane, DeliveryToken token, Throwable failure) {
         try {
             log.warn("Delivery lane failed for {} (subscription {}, generation {})",
                     clientId, lane.id, token.connection(), failure);
@@ -488,13 +645,16 @@ final class DeliveryLanes {
             // A logging backend must not replace the original failure or suppress notification.
         }
         Throwable callbackFailure = null;
+        boolean paused;
         lock.lock();
         try {
             // Admission and connection cleanup see either no decision or the final one. The
             // callback only offers a termination to the mailbox, which never calls these lanes.
             lane.failed = onFailure.test(token, failure);
+            paused = lane.failed;
         } catch (Throwable cause) {
             callbackFailure = cause;
+            paused = false;
         } finally {
             lock.unlock();
         }
@@ -505,6 +665,7 @@ final class DeliveryLanes {
                 // Both reporting paths failed; the lane resumes without notifying twice.
             }
         }
+        return paused;
     }
 
     /// Caller holds lock; never interrupts an executing application handler.
@@ -517,6 +678,7 @@ final class DeliveryLanes {
         lane.stopped = true;
         while (!lane.queue.isEmpty()) {
             DeliveryView view = lane.queue.removeFirst();
+            view.recipient.queued = false;
             abandonedDeliveries++;
             view.localDone = true;
             ready |= markReady(view);
@@ -537,7 +699,7 @@ final class DeliveryLanes {
         Lane lane = view.lane;
         RetainedDelivery delivery = view.delivery;
         if (lane != null && view.localDone
-                && (delivery.released || (lane.handler == null && view.ready))) {
+                && (view.released || (lane.handler == null && view.recipient.ready))) {
             view.lane = null;
             view.acknowledgement = null;
             lane.retained--;
@@ -546,7 +708,7 @@ final class DeliveryLanes {
             delivery.views.remove(view);
             if (delivery.views.isEmpty()) {
                 retainedBytes -= delivery.bytes;
-                acknowledging.remove(delivery.token.acknowledgement(), delivery);
+                delivery.message = null;
             }
         }
     }
@@ -596,6 +758,8 @@ final class DeliveryLanes {
                 // Claim, close, and acknowledgement share the lock. No other receiver can
                 // claim this view, and an interrupt cannot discard it after handoff commits.
                 view = lane.queue.removeFirst();
+                view.recipient.queued = false;
+                view.recipient.handed = true;
                 view.localDone = true;
                 ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
                 releaseView(view);
@@ -656,27 +820,30 @@ final class DeliveryLanes {
     private static final class RetainedDelivery {
 
         final DeliveryToken token;
-        final MqttMessage message;
-        final boolean dup;
         final int bytes;
+        // Receipt metadata is bounded by the core's receipt limit and the 256 subscriptions.
+        // Completed pull views leave only these IDs and conditions, without payload or lane.
+        final Map<Long, Recipient> recipients = new LinkedHashMap<>();
         final List<DeliveryView> views = new ArrayList<>(1);
+        @Nullable MqttMessage message;
         int pending;
-        boolean released;
         boolean retired;
 
-        RetainedDelivery(
-                DeliveryToken token,
-                MqttMessage message,
-                boolean dup,
-                int bytes,
-                int recipients
-        ) {
+        RetainedDelivery(DeliveryToken token, int bytes) {
             this.token = token;
-            this.message = message;
-            this.dup = dup;
             this.bytes = bytes;
-            pending = recipients;
-            released = token.acknowledgement() == 0;
+        }
+    }
+
+    private static final class Recipient {
+
+        final long id;
+        boolean handed;
+        boolean ready;
+        boolean queued;
+
+        Recipient(long id) {
+            this.id = id;
         }
     }
 
@@ -685,27 +852,41 @@ final class DeliveryLanes {
     private static final class DeliveryView implements MqttDelivery {
 
         final RetainedDelivery delivery;
+        final Recipient recipient;
+        final MqttMessage message;
+        final boolean dup;
         @Nullable Lane lane;
         volatile @Nullable Runnable acknowledgement;
         boolean localDone;
-        boolean ready;
+        boolean released;
+        boolean valid = true;
         // Admitted while the lane awaited removal; it is not run or received until the lane
         // resumes.
         boolean held;
 
-        DeliveryView(RetainedDelivery delivery, Lane lane) {
+        DeliveryView(
+                RetainedDelivery delivery,
+                Recipient recipient,
+                Lane lane,
+                MqttMessage message,
+                boolean dup
+        ) {
             this.delivery = delivery;
+            this.recipient = recipient;
             this.lane = lane;
+            this.message = message;
+            this.dup = dup;
+            released = delivery.token.acknowledgement() == 0;
         }
 
         @Override
         public MqttMessage message() {
-            return delivery.message;
+            return message;
         }
 
         @Override
         public boolean dup() {
-            return delivery.dup;
+            return dup;
         }
 
         @Override

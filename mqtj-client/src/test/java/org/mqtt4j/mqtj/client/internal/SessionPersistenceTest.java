@@ -81,7 +81,7 @@ class SessionPersistenceTest {
         Publication first = port.accepted.getLast();
         long secondOperation = publish(message("second"));
         Publication second = port.accepted.getLast();
-        requireNonNull(first.transmission()).markAccepted();
+        requireNonNull(first.receipt()).markAccepted();
         if (completedWrite) {
             sut.sent(generation, first.ticket(), 0);
         }
@@ -100,8 +100,8 @@ class SessionPersistenceTest {
                 .extracting(Publication::packetId)
                 .containsExactly(first.packetId(), second.packetId());
         // Each replay carries its original receipt, from which the I/O derives DUP.
-        assertThat(port.accepted.get(start).transmission()).isSameAs(first.transmission());
-        assertThat(port.accepted.get(start + 1).transmission()).isSameAs(second.transmission());
+        assertThat(port.accepted.get(start).receipt()).isSameAs(first.receipt());
+        assertThat(port.accepted.get(start + 1).receipt()).isSameAs(second.receipt());
         assertThat(port.accepted.get(start).message()).isSameAs(first.message());
         assertThat(port.accepted.get(start + 1).message()).isSameAs(second.message());
         acknowledge(first.packetId());
@@ -115,7 +115,7 @@ class SessionPersistenceTest {
         connect(false);
         long original = publish(message("old"));
         Publication old = port.accepted.getLast();
-        requireNonNull(old.transmission()).markAccepted();
+        requireNonNull(old.receipt()).markAccepted();
         sut.failed(generation, new IOException("lost"));
         int start = port.accepted.size();
 
@@ -124,7 +124,7 @@ class SessionPersistenceTest {
         assertThat(port.accepted).hasSize(start);
         long current = publish(message("new"));
         Publication fresh = port.accepted.getLast();
-        assertThat(requireNonNull(fresh.transmission()).accepted()).isFalse();
+        assertThat(requireNonNull(fresh.receipt()).accepted()).isFalse();
         sut.received(
                 old.generation(),
                 new Packet.PubAck(old.packetId(), ReasonCode.SUCCESS, EMPTY),
@@ -239,7 +239,7 @@ class SessionPersistenceTest {
         connect(false);
         publish(message("old"));
         Publication old = port.accepted.getLast();
-        requireNonNull(old.transmission()).markAccepted();
+        requireNonNull(old.receipt()).markAccepted();
         sut.failed(generation, new IOException("lost"));
         port.publishAllowance = 0;
         connect(true);
@@ -311,7 +311,7 @@ class SessionPersistenceTest {
         MqttMessage half = messageWithWireBytes(16 * 1024 * 1024);
         publish(half);
         Publication first = port.accepted.getLast();
-        requireNonNull(first.transmission()).markAccepted();
+        requireNonNull(first.receipt()).markAccepted();
         sut.sent(generation, first.ticket(), 0);
         publish(half);
         assertThat(port.accepted).hasSize(2);
@@ -762,7 +762,7 @@ class SessionPersistenceTest {
                 publish(message("round/" + round + "/" + i));
                 Publication publication = port.accepted.getLast();
                 if (random.nextBoolean()) {
-                    requireNonNull(publication.transmission()).markAccepted();
+                    requireNonNull(publication.receipt()).markAccepted();
                     events.add(i);
                 }
                 pending.add(publication);
@@ -817,12 +817,12 @@ class SessionPersistenceTest {
                                     .map(Publication::packetId).toList()
                     );
             for (int i = 0; i < resumed.size(); i++) {
-                assertThat(resumed.get(i).transmission()).isSameAs(pending.get(i).transmission());
+                assertThat(resumed.get(i).receipt()).isSameAs(pending.get(i).receipt());
             }
             var completions = new ArrayList<>(resumed);
             Collections.shuffle(completions, random);
             for (Publication publication : completions) {
-                requireNonNull(publication.transmission()).markAccepted();
+                requireNonNull(publication.receipt()).markAccepted();
                 if (random.nextBoolean()) {
                     sut.sent(generation, publication.ticket(), 0);
                     acknowledge(publication.packetId());
@@ -963,7 +963,7 @@ class SessionPersistenceTest {
             long ticket,
             MqttMessage message,
             int packetId,
-            @Nullable PublishTransmission transmission
+            @Nullable SendReceipt receipt
     ) {
     }
 
@@ -1023,7 +1023,12 @@ class SessionPersistenceTest {
         }
 
         @Override
-        public SendQueue.OfferResult send(long connection, long id, Packet packet) {
+        public SendQueue.OfferResult send(
+                long connection,
+                long id,
+                Packet packet,
+                @Nullable SendReceipt receipt
+        ) {
             ticket = id;
             sent.add(packet);
             if (packet instanceof Packet.Subscribe subscribe && registering != null) {
@@ -1044,10 +1049,10 @@ class SessionPersistenceTest {
                 long id,
                 MqttMessage message,
                 int packetId,
-                @Nullable PublishTransmission transmission
+                @Nullable SendReceipt receipt
         ) {
             ticket = id;
-            var publication = new Publication(connection, id, message, packetId, transmission);
+            var publication = new Publication(connection, id, message, packetId, receipt);
             offers.add(publication);
             SendQueue.OfferResult result = publishResult;
             if (result == SendQueue.OfferResult.ACCEPTED && publishAllowance == 0) {
@@ -1110,15 +1115,40 @@ class SessionPersistenceTest {
         }
 
         @Override
+        public void forgetDelivery(long token) {
+        }
+
+        @Override
+        public Map<Long, Boolean> receiveState() {
+            return Map.of();
+        }
+
+        @Override
+        public boolean readyDelivery(long token) {
+            return false;
+        }
+
+        @Override
+        public void sessionChanged(long session) {
+        }
+
+        @Override
         public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
             assertThat(handles.get(id)).isSameAs(handle);
             removed.add(id);
         }
 
         @Override
-        public void end(long connection, boolean connected, Disconnection disconnection) {
+        public Map<Long, Boolean> end(
+                long connection,
+                boolean connected,
+                Disconnection disconnection,
+                boolean preserveSession,
+                boolean stopped
+        ) {
             established.add(connected);
             ends.add(disconnection);
+            return Map.of();
         }
     }
 }

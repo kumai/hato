@@ -12,9 +12,12 @@ import java.util.concurrent.CompletableFuture;
 /// Cancelling or completing a returned future does not cancel the underlying operation.
 ///
 /// Within one connection, a QoS 1 retransmission marked DUP joins the original delivery while
-/// that delivery's PUBACK is still pending. Any other publication, including one without DUP
-/// that reuses a pending packet identifier, starts a new delivery. A retransmission after
-/// reconnection starts a new delivery. This does not guarantee exactly-once processing.
+/// that delivery's PUBACK is still pending. Any other publication on that connection, including
+/// one without DUP that reuses a pending packet identifier, starts a new delivery. After
+/// reconnection, a DUP-marked retransmission continues the earlier delivery only when a
+/// persistent session resumes, a subscription still holds that delivery, and its PUBACK had
+/// not reached the transport; otherwise it starts a new delivery. See [MqttSubscriber].
+/// This does not guarantee exactly-once processing.
 ///
 /// The client completes operations independently of I/O and listener callbacks. One blocked
 /// continuation does not prevent another operation from completing. Slow continuations and
@@ -45,8 +48,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// same identifier and the default [MqttClientBuilder#cleanStart(boolean)] discards it.
     ///
     /// The future fails with [MqttConnectException] if establishment fails, the broker refuses
-    /// the connection, or the connection deadline expires. Connecting while already connected
-    /// or while another attempt is pending fails with [IllegalStateException].
+    /// the connection, the connection deadline expires, or a handler of a continued session
+    /// fails during the attempt; see [MqttSubscriber]. Connecting while already connected or
+    /// while another attempt is pending fails with [IllegalStateException].
     /// If [#close] wins before the attempt starts, it also fails with [IllegalStateException].
     CompletableFuture<ConnAck> connect();
 

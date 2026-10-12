@@ -42,9 +42,9 @@ Subscription subscription = client.subscribe(
 subscription.unsubscribe().join();
 ```
 
-- By default, each handler runs one message at a time on its own virtual
-  thread. The handler can block, for example to write to a database or to publish
-  and wait for the result.
+- Each subscription's handler runs one message at a time, independently of I/O
+  and operation completion. The handler can block, for example to write to a
+  database or to publish and wait for the result.
 - QoS 1 messages are acknowledged after the handler returns. Choose `AckMode.ON_RECEIVE`
   to acknowledge before the handler runs, or `AckMode.MANUAL` to call `delivery.ack()`
   yourself for every message: `Subscribe.of(filter, Qos.AT_LEAST_ONCE).withAckMode(AckMode.MANUAL)`.
@@ -109,11 +109,17 @@ The `connectionListener` is called whenever a connection ends, whether you
 disconnected or not. Besides broker and network failures, the client itself ends
 the connection when:
 
-- a handler throws, by default. Catch exceptions inside the handler to keep the
-  connection.
+- a handler throws, including one still running from before a reconnection in a
+  persistent session. Catch exceptions inside the handler to keep the connection.
 - a subscription's queue fills up, for example with messages waiting for
   `delivery.ack()`, or too many QoS 1 messages wait behind one that is not yet
   acknowledged, rather than buffering without limit.
+
+For a transient error, catch it and retry inside the handler with a bounded retry
+policy. To skip a message, record the error and return normally with
+`AFTER_HANDLER`, or call `delivery.ack()` with `MANUAL`. Returning normally or
+acknowledging records completion even when the application chose not to process
+the message. An exception that escapes ends the connection instead.
 
 ## Passing the client to your code
 

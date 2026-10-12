@@ -64,16 +64,21 @@ final class SessionCore {
         void open(long generation, long operation);
 
         /// Reports queue admission, not write completion. The core handles refusal per operation.
-        SendQueue.OfferResult send(long generation, long ticket, Packet packet);
+        SendQueue.OfferResult send(
+                long generation,
+                long ticket,
+                Packet packet,
+                @Nullable SendReceipt receipt
+        );
 
         /// Reports admission at the exact wire size, not write completion. The payload is copied
-        /// only after admission. DUP comes from `transmission` when the packet is encoded.
+        /// only after admission. DUP comes from `receipt` when the packet is encoded.
         SendQueue.OfferResult publish(
                 long generation,
                 long ticket,
                 MqttMessage message,
                 int packetId,
-                @Nullable PublishTransmission transmission
+                @Nullable SendReceipt receipt
         );
 
         void schedule(long generation, Timer timer, Duration delay);
@@ -98,9 +103,28 @@ final class SessionCore {
 
         void releaseDelivery(long token);
 
+        void forgetDelivery(long token);
+
+        /// Maps each reception handed to at least one recipient to whether every recipient has
+        /// met its acknowledgement condition. Receptions handed to no recipient are omitted.
+        Map<Long, Boolean> receiveState();
+
+        boolean readyDelivery(long token);
+
+        /// The numbered session replaced the previous one, whose receptions and failures lapse.
+        void sessionChanged(long session);
+
         void removeSubscription(long id, Subscription handle, @Nullable Throwable cause);
 
-        void end(long generation, boolean established, Disconnection disconnection);
+        /// Returns [#receiveState()] after discarding queued deliveries. Without
+        /// `preserveSession` no reception remains; a stop also invalidates unmet conditions.
+        Map<Long, Boolean> end(
+                long generation,
+                boolean established,
+                Disconnection disconnection,
+                boolean preserveSession,
+                boolean stopped
+        );
     }
 
     private static final Log log = Log.of(SessionCore.class);
@@ -166,9 +190,13 @@ final class SessionCore {
 
     private Session session = new Session();
 
+    // Identifies the current session to delivery and mailbox code, which run outside the actor
+    // and must not reach its state. Every replacement of the session advances it.
+    private long sessionNumber = 1;
+
     private final Map<Long, Long> publications = new HashMap<>();
 
-    private final AckSequencer acknowledgements = new AckSequencer(ACKNOWLEDGEMENT_LIMIT);
+    private final AckSequencer acknowledgements = new AckSequencer();
 
     private long nextDelivery;
 
@@ -208,6 +236,10 @@ final class SessionCore {
 
     State state() {
         return state;
+    }
+
+    long sessionNumber() {
+        return sessionNumber;
     }
 
     void connect(long operation, long now) {
@@ -276,6 +308,7 @@ final class SessionCore {
                         log.info("Started session for {}", clientId);
                     }
                 } else {
+                    reconcileReceptions(port.receiveState());
                     deferred.addAll(session.inflight.values());
                 }
                 state = State.CONNECTED;
@@ -353,7 +386,10 @@ final class SessionCore {
     /// arrive before or after it; the DUP flag decides how a reused identifier is treated.
     void written(long connection, long ticket) {
         if (connection == generation && state == State.CONNECTED) {
-            acknowledgements.written(ticket);
+            acknowledgements.written(ticket).ifPresent(entry -> {
+                session.received.remove(entry);
+                port.forgetDelivery(entry.token());
+            });
             sendCapacityAvailable(connection);
         }
     }
@@ -369,7 +405,7 @@ final class SessionCore {
         }
         long ticket = ++nextTicket;
         int packetId = 0;
-        PublishTransmission transmission = null;
+        SendReceipt receipt = null;
         if (message.qos() == Qos.AT_LEAST_ONCE) {
             if (session.inflight.size() >= INFLIGHT_LIMIT) {
                 capacityFailure(operation, "Publication capacity");
@@ -411,11 +447,11 @@ final class SessionCore {
             );
             session.inflight.put(packetId, publication);
             session.bytes += byteCount;
-            transmission = publication.transmission;
+            receipt = publication.receipt;
         } else {
             publications.put(ticket, operation);
         }
-        if (port.publish(generation, ticket, message, packetId, transmission)
+        if (port.publish(generation, ticket, message, packetId, receipt)
                 == SendQueue.OfferResult.FULL) {
             if (packetId == 0) {
                 publications.remove(ticket);
@@ -473,7 +509,7 @@ final class SessionCore {
         subscriptions.put(operation, local);
         subscribing.put(id, local);
         var packet = subscriptionPacket(local, id);
-        if (port.send(generation, ++nextTicket, packet) == SendQueue.OfferResult.FULL) {
+        if (port.send(generation, ++nextTicket, packet, null) == SendQueue.OfferResult.FULL) {
             subscribing.remove(id);
             subscriptions.remove(operation);
             session.packetIds.release(id);
@@ -568,7 +604,7 @@ final class SessionCore {
         int id = allocated.getAsInt();
         unsubscribing.put(id, removal);
         var packet = new Packet.Unsubscribe(id, List.of(removal.subscription.filter), EMPTY);
-        if (port.send(generation, ++nextTicket, packet) == SendQueue.OfferResult.FULL) {
+        if (port.send(generation, ++nextTicket, packet, null) == SendQueue.OfferResult.FULL) {
             unsubscribing.remove(id);
             session.packetIds.release(id);
             return Optional.of("Send queue capacity");
@@ -609,7 +645,7 @@ final class SessionCore {
                         ++nextTicket,
                         requireNonNull(publication.message),
                         publication.packetId,
-                        requireNonNull(publication.transmission)
+                        requireNonNull(publication.receipt)
                 )
                         != SendQueue.OfferResult.ACCEPTED) {
                     return;
@@ -631,7 +667,7 @@ final class SessionCore {
             }
             int id = allocated.getAsInt();
             subscribing.put(id, local);
-            if (port.send(generation, ++nextTicket, subscriptionPacket(local, id))
+            if (port.send(generation, ++nextTicket, subscriptionPacket(local, id), null)
                     == SendQueue.OfferResult.FULL) {
                 subscribing.remove(id);
                 session.packetIds.release(id);
@@ -729,6 +765,7 @@ final class SessionCore {
                     + "the earlier reception is not acknowledged", packetId, clientId);
         }
         port.releaseDelivery(token);
+        port.forgetDelivery(token);
         sendCapacityAvailable(generation);
     }
 
@@ -797,23 +834,37 @@ final class SessionCore {
             return;
         }
         long token = 0;
+        boolean continued = false;
         if (publish.qos() == Qos.AT_LEAST_ONCE) {
             int packetId = publish.packetId();
-            if (acknowledgements.contains(packetId)) {
+            Optional<ReceiveTable.Entry> existing = session.received.find(packetId);
+            if (existing.isPresent()) {
+                ReceiveTable.Entry earlier = existing.orElseThrow();
                 if (publish.dup()) {
-                    // A retransmission joins the reception that holds this identifier until its
-                    // PUBACK is written, without another delivery or acknowledgement.
+                    if (acknowledgements.contains(earlier)) {
+                        return;
+                    }
+                    // A continued reception joins this connection only when its resend arrives.
+                    token = earlier.token();
+                    continued = true;
+                    acknowledgements.add(earlier);
+                } else {
+                    session.received.supersede(packetId);
+                    if (acknowledgements.remove(earlier)
+                            || !acknowledgements.contains(earlier)) {
+                        session.received.remove(earlier);
+                        withdrawAcknowledgement(packetId, earlier.token());
+                    }
+                }
+            }
+            if (token == 0) {
+                token = ++nextDelivery;
+                Optional<ReceiveTable.Entry> added = session.received.add(token, packetId);
+                if (added.isEmpty()) {
+                    failed(generation, new MqttCapacityException("Acknowledgement capacity"));
                     return;
                 }
-                // Without DUP this is a new publication. Senders reuse an identifier only after
-                // the earlier exchange is acknowledged, so that reception needs no PUBACK.
-                acknowledgements.supersede(packetId)
-                        .ifPresent(earlier -> withdrawAcknowledgement(packetId, earlier));
-            }
-            token = ++nextDelivery;
-            if (!acknowledgements.add(token, packetId)) {
-                failed(generation, new MqttCapacityException("Acknowledgement capacity"));
-                return;
+                acknowledgements.add(added.orElseThrow());
             }
         }
         var matches = new ArrayList<Long>();
@@ -824,7 +875,7 @@ final class SessionCore {
                 matches.add(local.id);
             }
         }
-        if (matches.isEmpty()) {
+        if (matches.isEmpty() && !continued) {
             if (token != 0) {
                 deliveryReady(token);
             } else {
@@ -834,11 +885,22 @@ final class SessionCore {
             return;
         }
         var message = MqttMessage.of(
-                publish.topic(), publish.payload(), publish.qos(), publish.retain()
+                publish.topic(),
+                publish.payload(),
+                publish.qos(),
+                publish.retain()
         );
-        if (!port.deliver(new DeliveryToken(generation, token),
-                matches, message, publish.dup(), bytes)) {
+        if (!port.deliver(
+                new DeliveryToken(sessionNumber, generation, token),
+                matches,
+                message,
+                publish.dup(),
+                bytes
+        )) {
             failed(generation, new MqttCapacityException("Delivery capacity"));
+        } else if (continued) {
+            session.received.ready(token, port.readyDelivery(token));
+            sendCapacityAvailable(generation);
         }
     }
 
@@ -848,15 +910,19 @@ final class SessionCore {
 
     /// QoS 0 and already acknowledged deliveries have no entry in the receive table.
     void deliveryFailed(DeliveryToken token, Throwable cause) {
-        failed(token.connection(), cause);
+        if (token.session() == sessionNumber
+                && state != State.DISCONNECTED
+                && state != State.CLOSED) {
+            end(cause, disconnectOperation != 0, false, true);
+        }
     }
 
     /// Tokens belong to the client lifetime; only entries still in the receive table can advance.
     void deliveriesReady(List<Long> tokens) {
-        if (state != State.CONNECTED || disconnectOperation != 0) {
+        if (state == State.CLOSED) {
             return;
         }
-        tokens.forEach(acknowledgements::ready);
+        tokens.forEach(session.received::ready);
         sendCapacityAvailable(generation);
     }
 
@@ -864,18 +930,24 @@ final class SessionCore {
         if (connection != generation || state != State.CONNECTED || disconnectOperation != 0) {
             return;
         }
-        Optional<AckSequencer.Entry> ready;
+        Optional<ReceiveTable.Entry> ready;
         while (acknowledgements.writingCount() < ACK_WRITE_LIMIT
                 && (ready = acknowledgements.nextReady()).isPresent()) {
-            AckSequencer.Entry entry = ready.orElseThrow();
+            ReceiveTable.Entry entry = ready.orElseThrow();
             long ticket = ++nextTicket;
-            if (port.send(generation, ticket,
-                    new Packet.PubAck(entry.packetId(), ReasonCode.SUCCESS, EMPTY))
+            var receipt = new SendReceipt();
+            if (port.send(
+                    generation,
+                    ticket,
+                    new Packet.PubAck(entry.packetId(), ReasonCode.SUCCESS, EMPTY),
+                    receipt
+            )
                     != SendQueue.OfferResult.ACCEPTED) {
                 // FULL waits for actual budget release; CLOSED waits for the original cause.
                 return;
             }
             acknowledgements.submitted(ticket);
+            entry.submitted(receipt);
             port.releaseDelivery(entry.token());
         }
         drainClosures();
@@ -952,7 +1024,7 @@ final class SessionCore {
     }
 
     private boolean sendRequired(long ticket, Packet packet) {
-        return switch (port.send(generation, ticket, packet)) {
+        return switch (port.send(generation, ticket, packet, null)) {
             case ACCEPTED -> true;
             case FULL -> {
                 failed(generation, new MqttCapacityException("Reserved send queue capacity"));
@@ -974,6 +1046,15 @@ final class SessionCore {
     }
 
     private void end(@Nullable Throwable cause, boolean requested, boolean permanent) {
+        end(cause, requested, permanent, false);
+    }
+
+    private void end(
+            @Nullable Throwable cause,
+            boolean requested,
+            boolean permanent,
+            boolean stopped
+    ) {
         if (state == State.CLOSED) {
             return;
         }
@@ -993,7 +1074,7 @@ final class SessionCore {
             cause = sessionRefusal;
         }
         try {
-            endConnection(cause, requested, permanent);
+            endConnection(cause, requested, permanent, stopped);
             finishOperations(cause, permanent);
         } finally {
             // Shell teardown or a logging backend must not retain a closed client's payloads.
@@ -1003,7 +1084,12 @@ final class SessionCore {
         }
     }
 
-    private void endConnection(@Nullable Throwable cause, boolean requested, boolean permanent) {
+    private void endConnection(
+            @Nullable Throwable cause,
+            boolean requested,
+            boolean permanent,
+            boolean stopped
+    ) {
         boolean established = state == State.CONNECTED;
         boolean active = state != State.DISCONNECTED;
         state = permanent ? State.CLOSED : State.DISCONNECTED;
@@ -1016,11 +1102,36 @@ final class SessionCore {
         sessionRefusal = null;
         sessionPresent = false;
         if (active) {
-            // Retire delivery conditions before removing subscriptions: termination must not
-            // turn thousands of abandoned recipients into fresh readiness notifications.
-            port.end(generation, established, Disconnection.of(cause, requested));
+            // Retire queued recipients before removing subscriptions, without acknowledging
+            // work that never reached the application. Persistent handed work keeps its state.
+            Map<Long, Boolean> handedReadiness = port.end(
+                    generation,
+                    established,
+                    Disconnection.of(cause, requested),
+                    !permanent && !cleanStart,
+                    stopped
+            );
+            reconcileReceptions(handedReadiness);
         }
         acknowledgements.clear();
+        if (permanent || cleanStart) {
+            session.received.clear();
+        }
+    }
+
+    /// `handedReadiness` follows [Port#receiveState()]: receptions it omits reached no recipient.
+    private void reconcileReceptions(Map<Long, Boolean> handedReadiness) {
+        for (ReceiveTable.Entry entry : session.received.entries()) {
+            SendReceipt receipt = entry.receipt();
+            Boolean ready = handedReadiness.get(entry.token());
+            if ((receipt != null && receipt.accepted()) || ready == null
+                    || session.received.find(entry.packetId()).orElse(null) != entry) {
+                session.received.remove(entry);
+                port.forgetDelivery(entry.token());
+            } else {
+                session.received.ready(entry.token(), ready);
+            }
+        }
     }
 
     private void finishOperations(@Nullable Throwable cause, boolean permanent) {
@@ -1110,6 +1221,7 @@ final class SessionCore {
     private void discardSession() {
         boolean established = session.established;
         session = new Session();
+        port.sessionChanged(++sessionNumber);
         // Every clean connection starts and discards a session; only persistent ones are news.
         if (established && !cleanStart) {
             log.info("Discarded session for {}", clientId);
@@ -1161,12 +1273,13 @@ final class SessionCore {
                 && (bytes > 0 || firstLevelFlexible || (leftTail && rightTail));
     }
 
-    // Send state that a persistent session keeps across connections. A CONNACK without Session
-    // Present, permanent closure, or the end of a nonpersistent connection replaces it.
+    // State owned by one session. A CONNACK without Session Present, permanent closure, or
+    // the end of a nonpersistent connection replaces it.
     // SUBSCRIBE and UNSUBSCRIBE borrow its identifiers only until their connection ends.
     private static final class Session {
 
         final PacketIds packetIds = new PacketIds();
+        final ReceiveTable received = new ReceiveTable(ACKNOWLEDGEMENT_LIMIT);
         // Unacknowledged QoS 1 publications in their original send order.
         final Map<Integer, Inflight> inflight = new LinkedHashMap<>();
         // A CONNACK without Session Present started this session; only then can a later
@@ -1184,7 +1297,7 @@ final class SessionCore {
         final int packetId;
         final @Nullable MqttMessage message;
         final int bytes;
-        final @Nullable PublishTransmission transmission;
+        final @Nullable SendReceipt receipt;
         long operation;
 
         Inflight(int packetId, long operation, @Nullable MqttMessage message, int bytes) {
@@ -1192,7 +1305,7 @@ final class SessionCore {
             this.operation = operation;
             this.message = message;
             this.bytes = bytes;
-            transmission = message == null ? null : new PublishTransmission();
+            receipt = message == null ? null : new SendReceipt();
         }
     }
 

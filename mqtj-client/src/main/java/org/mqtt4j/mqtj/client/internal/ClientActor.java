@@ -466,9 +466,9 @@ public final class ClientActor implements MqttClient {
     }
 
     private boolean deliveryFailed(DeliveryToken token, Throwable failure) {
-        // Reject old receipts before they can occupy the current connection's termination slot.
+        // Reject retired sessions before they can occupy the current connection's failure slot.
         // A closing client keeps the failed lane paused until shutdown removes it.
-        return terminate(token.connection(), () -> core.deliveryFailed(token, failure))
+        return mailbox.terminateSession(token.session(), () -> core.deliveryFailed(token, failure))
                 || stopping.get();
     }
 
@@ -608,13 +608,19 @@ public final class ClientActor implements MqttClient {
             // A failed attempt releases it in end(); an established one in notifyListener().
             requireNonNull(operations.get(token)).notificationReserved = false;
             openedGeneration = generation;
+            mailbox.activateSession(core.sessionNumber());
             mailbox.activate(generation);
             io.open(generation);
         }
 
         @Override
-        public SendQueue.OfferResult send(long generation, long ticket, Packet packet) {
-            return io.send(generation, ticket, packet);
+        public SendQueue.OfferResult send(
+                long generation,
+                long ticket,
+                Packet packet,
+                @Nullable SendReceipt receipt
+        ) {
+            return io.send(generation, ticket, packet, receipt);
         }
 
         @Override
@@ -623,9 +629,9 @@ public final class ClientActor implements MqttClient {
                 long ticket,
                 MqttMessage message,
                 int packetId,
-                @Nullable PublishTransmission transmission
+                @Nullable SendReceipt receipt
         ) {
-            return io.publish(generation, ticket, message, packetId, transmission);
+            return io.publish(generation, ticket, message, packetId, receipt);
         }
 
         @Override
@@ -707,6 +713,27 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
+        public void forgetDelivery(long token) {
+            lanes.forget(token);
+        }
+
+        @Override
+        public Map<Long, Boolean> receiveState() {
+            return lanes.receiveState();
+        }
+
+        @Override
+        public boolean readyDelivery(long token) {
+            return lanes.isReady(token);
+        }
+
+        @Override
+        public void sessionChanged(long session) {
+            mailbox.activateSession(session);
+            lanes.sessionDiscarded();
+        }
+
+        @Override
         public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
             retire((ClientSubscription) handle, cause);
         }
@@ -721,7 +748,13 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
-        public void end(long generation, boolean established, Disconnection disconnection) {
+        public Map<Long, Boolean> end(
+                long generation,
+                boolean established,
+                Disconnection disconnection,
+                boolean preserveSession,
+                boolean stopped
+        ) {
             Throwable cause = disconnection.cause().orElse(null);
             synchronized (lifecycleLock) {
                 connectedGeneration = 0;
@@ -735,7 +768,7 @@ public final class ClientActor implements MqttClient {
             mailbox.discard(generation);
             // Reject old failures before releasing their lane pause; otherwise a late failure
             // can pause the lane again with a terminal notification that discard would erase.
-            lanes.connectionEnded();
+            Map<Long, Boolean> handed = lanes.connectionEnded(preserveSession, stopped);
             io.close();
             if (established) {
                 log.info("Disconnected {} from {}", clientId, endpoint, cause);
@@ -756,6 +789,7 @@ public final class ClientActor implements MqttClient {
                         cause
                 );
             }
+            return handed;
         }
     }
 

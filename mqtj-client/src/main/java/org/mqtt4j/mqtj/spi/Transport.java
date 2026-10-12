@@ -53,7 +53,7 @@ public interface Transport extends AutoCloseable {
     @Override
     void close();
 
-    /// Creates a TCP transport whose worker names include the client identifier.
+    /// Creates a TCP transport. The client identifier is used for diagnostics.
     static Transport tcp(String clientId) {
         return new TcpTransport(clientId);
     }

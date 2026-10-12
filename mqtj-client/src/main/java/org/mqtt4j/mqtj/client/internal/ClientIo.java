@@ -207,7 +207,7 @@ final class ClientIo {
             long ticket,
             MqttMessage message,
             int packetId,
-            @Nullable PublishTransmission transmission
+            @Nullable SendReceipt receipt
     ) {
         synchronized (sending) {
             Connection connection = current;
@@ -237,14 +237,19 @@ final class ClientIo {
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(header, message, false, transmission),
+                new Outbound(header, message, false, receipt),
                 false,
                 "Publish",
                 false
         );
     }
 
-    SendQueue.OfferResult send(long generation, long ticket, Packet packet) {
+    SendQueue.OfferResult send(
+            long generation,
+            long ticket,
+            Packet packet,
+            @Nullable SendReceipt receipt
+    ) {
         byte[] bytes = codec.encode(packet);
         // Reserve capacity for connection progress, not for every MQTT control packet.
         boolean reserved = packet instanceof Packet.Connect
@@ -254,7 +259,7 @@ final class ClientIo {
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(bytes, null, packet instanceof Packet.PubAck, null),
+                new Outbound(bytes, null, packet instanceof Packet.PubAck, receipt),
                 reserved,
                 packet.getClass().getSimpleName(),
                 packet instanceof Packet.PingReq
@@ -357,9 +362,9 @@ final class ClientIo {
                 rejectActive(connection);
                 throw failure;
             }
-            PublishTransmission transmission = send.value().transmission();
-            if (result == Transport.SendResult.ACCEPTED && transmission != null) {
-                transmission.markAccepted();
+            SendReceipt receipt = send.value().receipt();
+            if (result == Transport.SendResult.ACCEPTED && receipt != null) {
+                receipt.markAccepted();
             } else if (result == Transport.SendResult.CLOSED) {
                 rejectActive(connection);
             }
@@ -513,7 +518,7 @@ final class ClientIo {
             byte[] header,
             @Nullable MqttMessage message,
             boolean acknowledgement,
-            @Nullable PublishTransmission transmission
+            @Nullable SendReceipt receipt
     ) {
 
         int size() {
@@ -525,7 +530,7 @@ final class ClientIo {
                 return header;
             }
             byte[] bytes = codec.encodePublish(header, message.payload());
-            if (transmission != null && transmission.accepted()) {
+            if (receipt != null && receipt.accepted()) {
                 // The sole sender has returned from every earlier attempt before encoding this
                 // one, even if its queue admission preceded the old transport's send return.
                 bytes[0] |= 0x08;

@@ -28,9 +28,13 @@ public interface MqttSubscriber {
     ///
     /// Deliveries can reach the handler before the future completes. Each subscription's
     /// handler runs serially, independently of I/O and operation completion. A handler failure
-    /// is logged and ends its connection if still active, notifying [ConnectionListener].
-    /// A failure after that connection ends is logged without another disconnection notification
-    /// or any effect on a later connection. Exhausted receive capacity also ends the connection.
+    /// is logged and ends the active connection of its receiving session, notifying
+    /// [ConnectionListener]. This includes a handler started on an earlier connection when the
+    /// session continues. During a connection attempt, such a failure fails the attempt instead:
+    /// [MqttClient#connect()] fails with [MqttConnectException] caused by it, and the listener is
+    /// not notified. While disconnected, or after that session ends, a failure is logged without
+    /// a disconnection notification.
+    /// Exhausted receive capacity also ends the connection.
     /// On connection termination, queued deliveries are discarded; a running handler can finish.
     /// An established subscription survives termination and resumes on the same handle after
     /// the client's next successful [MqttClient#connect()]. New deliveries wait for a previous
@@ -42,6 +46,8 @@ public interface MqttSubscriber {
     ///
     /// Every matching subscription receives each incoming publication. MQTT 3.1.1 cannot
     /// distinguish broker copies for overlapping subscriptions, so each copy is routed again.
+    /// A retransmission joining a continued QoS 1 reception goes only to its original matching
+    /// subscriptions whose deliveries were discarded; handed-off deliveries keep their state.
     /// Shared subscriptions are matched against the filter after their shared group name.
     /// A shared subscription cannot overlap any other subscription on the same client, including
     /// another shared subscription. Such combinations fail with [IllegalStateException] in

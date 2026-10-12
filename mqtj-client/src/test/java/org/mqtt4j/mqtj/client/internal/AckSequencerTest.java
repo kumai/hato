@@ -1,8 +1,8 @@
 package org.mqtt4j.mqtj.client.internal;
 
-import java.util.OptionalLong;
-
 import org.junit.jupiter.api.Test;
+
+import org.mqtt4j.mqtj.client.internal.ReceiveTable.Entry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -11,20 +11,21 @@ class AckSequencerTest {
     @Test
     void only_the_ready_prefix_can_be_released() {
         // Arrange
-        var sut = new AckSequencer(3);
-        sut.add(1, 7);
-        sut.add(2, 8);
-        sut.add(3, 9);
+        var receptions = new ReceiveTable(3);
+        var sut = new AckSequencer();
+        sut.add(receptions.add(1, 7).orElseThrow());
+        sut.add(receptions.add(2, 8).orElseThrow());
+        sut.add(receptions.add(3, 9).orElseThrow());
 
         // Act
-        sut.ready(3);
-        sut.ready(2);
+        receptions.ready(3);
+        receptions.ready(2);
 
         // Assert
         assertThat(sut.nextReady()).isEmpty();
 
         // Act
-        sut.ready(1);
+        receptions.ready(1);
 
         // Assert
         assertThat(sut.nextReady().orElseThrow().packetId()).isEqualTo(7);
@@ -34,134 +35,83 @@ class AckSequencerTest {
         assertThat(sut.nextReady().orElseThrow().packetId()).isEqualTo(9);
         sut.submitted(12);
         assertThat(sut.nextReady()).isEmpty();
+        assertThat(sut.writingCount()).isEqualTo(3);
     }
 
     @Test
-    void completed_followers_retain_capacity_until_the_head_is_ready() {
+    void removing_an_unqueued_acknowledgement_lets_a_ready_follower_lead() {
         // Arrange
-        var sut = new AckSequencer(2);
-        assertThat(sut.add(1, 7)).isTrue();
-        assertThat(sut.add(2, 8)).isTrue();
+        var receptions = new ReceiveTable(2);
+        var sut = new AckSequencer();
+        Entry earlier = receptions.add(1, 7).orElseThrow();
+        Entry following = receptions.add(2, 8).orElseThrow();
+        sut.add(earlier);
+        sut.add(following);
+        receptions.ready(2);
+        assertThat(sut.contains(earlier)).isTrue();
 
         // Act
-        sut.ready(2);
+        boolean removed = sut.remove(earlier);
 
         // Assert
-        assertThat(sut.add(3, 9)).isFalse();
+        assertThat(removed).isTrue();
+        assertThat(sut.contains(earlier)).isFalse();
+        assertThat(sut.contains(following)).isTrue();
+        assertThat(sut.nextReady()).containsSame(following);
+        assertThat(sut.remove(earlier)).isFalse();
+    }
 
-        // Act
-        sut.ready(1);
+    @Test
+    void a_submitted_acknowledgement_cannot_be_withdrawn() {
+        // Arrange
+        var receptions = new ReceiveTable(1);
+        var sut = new AckSequencer();
+        Entry entry = receptions.add(1, 7).orElseThrow();
+        sut.add(entry);
+        receptions.ready(1);
         sut.submitted(10);
 
-        // Assert: queue admission still occupies the identifier and acknowledgement capacity.
-        assertThat(sut.contains(7)).isTrue();
-        assertThat(sut.add(3, 9)).isFalse();
-
         // Act
-        sut.written(10);
+        boolean removed = sut.remove(entry);
 
         // Assert
-        assertThat(sut.contains(7)).isFalse();
-        assertThat(sut.add(3, 9)).isTrue();
-        assertThat(sut.nextReady().orElseThrow().token()).isEqualTo(2);
-        sut.submitted(11);
+        assertThat(removed).isFalse();
+        assertThat(sut.contains(entry)).isTrue();
         assertThat(sut.nextReady()).isEmpty();
-    }
-
-    @Test
-    void an_identifier_is_occupied_until_written_and_old_tokens_cannot_ack_its_reuse() {
-        // Arrange
-        var sut = new AckSequencer(2);
-        assertThat(sut.add(1, 7)).isTrue();
-        assertThat(sut.add(2, 7)).isFalse();
-        sut.ready(1);
-        sut.submitted(10);
-
-        // Assert
-        assertThat(sut.contains(7)).isTrue();
-        assertThat(sut.add(2, 7)).isFalse();
         assertThat(sut.writingCount()).isEqualTo(1);
-        assertThat(sut.nextReady()).isEmpty();
-
-        // Act
-        sut.written(10);
-        assertThat(sut.add(2, 7)).isTrue();
-        sut.ready(1);
-        sut.written(10);
-
-        // Assert
-        assertThat(sut.contains(7)).isTrue();
-        assertThat(sut.nextReady()).isEmpty();
-
-        // Act
-        sut.ready(2);
-
-        // Assert
-        assertThat(sut.nextReady().orElseThrow().token()).isEqualTo(2);
+        assertThat(sut.written(10)).containsSame(entry);
+        assertThat(sut.contains(entry)).isFalse();
+        assertThat(sut.written(10)).isEmpty();
+        assertThat(sut.writingCount()).isZero();
     }
 
     @Test
-    void superseding_an_unqueued_acknowledgement_lets_a_ready_follower_lead() {
+    void clear_releases_the_whole_sequence_and_ignores_old_tickets() {
         // Arrange
-        var sut = new AckSequencer(2);
-        sut.add(1, 7);
-        sut.add(2, 8);
-        sut.ready(2);
-
-        // Act
-        OptionalLong superseded = sut.supersede(7);
-
-        // Assert
-        assertThat(superseded).hasValue(1);
-        assertThat(sut.contains(7)).isFalse();
-        assertThat(sut.nextReady().orElseThrow().token()).isEqualTo(2);
-        assertThat(sut.add(3, 7)).isTrue();
-    }
-
-    @Test
-    void a_superseded_queued_acknowledgement_keeps_capacity_but_not_the_identifier() {
-        // Arrange
-        var sut = new AckSequencer(2);
-        sut.add(1, 7);
-        sut.ready(1);
-        sut.submitted(10);
-
-        // Act
-        OptionalLong superseded = sut.supersede(7);
-        boolean added = sut.add(2, 7);
-
-        // Assert: the write still counts, but its completion leaves the new reception alone.
-        assertThat(superseded).isEmpty();
-        assertThat(added).isTrue();
-        assertThat(sut.add(3, 9)).isFalse();
-        sut.written(10);
-        assertThat(sut.contains(7)).isTrue();
-        assertThat(sut.add(3, 9)).isTrue();
-    }
-
-    @Test
-    void clear_releases_the_whole_sequence_and_ignores_old_tokens() {
-        // Arrange
-        var sut = new AckSequencer(1);
-        sut.add(1, 7);
-        sut.ready(1);
+        var receptions = new ReceiveTable(3);
+        var sut = new AckSequencer();
+        sut.add(receptions.add(1, 7).orElseThrow());
+        sut.add(receptions.add(2, 8).orElseThrow());
+        receptions.ready(1);
         sut.submitted(10);
 
         // Act
         sut.clear();
-        assertThat(sut.add(2, 7)).isTrue();
-        sut.ready(1);
-        sut.written(10);
+        Entry current = receptions.add(3, 9).orElseThrow();
+        sut.add(current);
+        receptions.ready(2);
 
         // Assert
-        assertThat(sut.contains(7)).isTrue();
+        assertThat(sut.written(10)).isEmpty();
         assertThat(sut.writingCount()).isZero();
         assertThat(sut.nextReady()).isEmpty();
+        assertThat(sut.contains(current)).isTrue();
+        assertThat(sut.contains(receptions.find(8).orElseThrow())).isFalse();
 
         // Act
-        sut.ready(2);
+        receptions.ready(3);
 
         // Assert
-        assertThat(sut.nextReady().orElseThrow().token()).isEqualTo(2);
+        assertThat(sut.nextReady()).containsSame(current);
     }
 }

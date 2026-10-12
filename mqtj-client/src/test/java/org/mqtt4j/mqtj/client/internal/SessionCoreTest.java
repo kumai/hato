@@ -2542,7 +2542,12 @@ class SessionCoreTest {
         }
 
         @Override
-        public SendQueue.OfferResult send(long generation, long id, Packet packet) {
+        public SendQueue.OfferResult send(
+                long generation,
+                long id,
+                Packet packet,
+                @Nullable SendReceipt receipt
+        ) {
             ticket = id;
             if (packet instanceof Packet.Subscribe subscribe && registering != null) {
                 registering.filter = subscribe.subscriptions().getFirst().filter();
@@ -2567,7 +2572,7 @@ class SessionCoreTest {
                 long id,
                 MqttMessage message,
                 int packetId,
-                @Nullable PublishTransmission transmission
+                @Nullable SendReceipt receipt
         ) {
             ticket = id;
             publications.add(message);
@@ -2634,6 +2639,24 @@ class SessionCoreTest {
         }
 
         @Override
+        public void forgetDelivery(long token) {
+        }
+
+        @Override
+        public Map<Long, Boolean> receiveState() {
+            return Map.of();
+        }
+
+        @Override
+        public boolean readyDelivery(long token) {
+            return false;
+        }
+
+        @Override
+        public void sessionChanged(long session) {
+        }
+
+        @Override
         public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
             assertThat(((TestSubscription) handle).id).isEqualTo(id);
             removed.add(id);
@@ -2641,9 +2664,16 @@ class SessionCoreTest {
         }
 
         @Override
-        public void end(long generation, boolean connected, Disconnection end) {
+        public Map<Long, Boolean> end(
+                long generation,
+                boolean connected,
+                Disconnection end,
+                boolean preserveSession,
+                boolean stopped
+        ) {
             established.add(connected);
             ends.add(end);
+            return Map.of();
         }
     }
 }

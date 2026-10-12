@@ -117,7 +117,7 @@ class ClientIoTest {
 
             // Act: DEBUG describes admission, write completion, and decoded input.
             jul.setLevel(Level.FINE);
-            sut.send(1, 1, packet);
+            sut.send(1, 1, packet, null);
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
             requireNonNull(transport.listener).onBytes(bytes);
 
@@ -135,7 +135,7 @@ class ClientIoTest {
             // Act: TRACE additionally records attempted writes and incoming byte chunks.
             records.clear();
             jul.setLevel(Level.FINER);
-            sut.send(1, 2, packet);
+            sut.send(1, 2, packet, null);
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L));
             requireNonNull(transport.listener).onBytes(bytes);
 
@@ -150,7 +150,7 @@ class ClientIoTest {
             // Act & Assert: disabled levels emit neither packet summaries nor bytes.
             records.clear();
             jul.setLevel(Level.OFF);
-            sut.send(1, 3, packet);
+            sut.send(1, 3, packet, null);
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L, 3L));
             requireNonNull(transport.listener).onBytes(bytes);
             assertThat(records).isEmpty();
@@ -170,12 +170,12 @@ class ClientIoTest {
         // Arrange
         SingleWriteTransport transport = open(1);
         for (int i = 1; i <= limit; i++) {
-            assertThat(sut.send(1, i, packet)).isEqualTo(ACCEPTED);
+            assertThat(sut.send(1, i, packet, null)).isEqualTo(ACCEPTED);
         }
         assertThat(events.failures).isEmpty();
 
         // Act
-        SendQueue.OfferResult result = sut.send(1, limit + 1, packet);
+        SendQueue.OfferResult result = sut.send(1, limit + 1, packet, null);
 
         // Assert: the transport receives only one write and has no capacity policy.
         assertThat(result).isEqualTo(FULL);
@@ -187,7 +187,7 @@ class ClientIoTest {
         // Act & Assert: completing one write permits a new send after the refusal.
         transport.complete();
         await().untilAsserted(() -> assertThat(transport.attempts).containsExactly(1L, 2L));
-        assertThat(sut.send(1, limit + 2, packet)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, limit + 2, packet, null)).isEqualTo(ACCEPTED);
     }
 
     @Test
@@ -195,18 +195,18 @@ class ClientIoTest {
         // Arrange
         SingleWriteTransport transport = open(1);
         for (int i = 1; i <= 64; i++) {
-            assertThat(sut.send(1, i, subscribe())).isEqualTo(ACCEPTED);
+            assertThat(sut.send(1, i, subscribe(), null)).isEqualTo(ACCEPTED);
         }
         for (int i = 65; i <= 128; i++) {
-            assertThat(sut.send(1, i, unsubscribe())).isEqualTo(ACCEPTED);
+            assertThat(sut.send(1, i, unsubscribe(), null)).isEqualTo(ACCEPTED);
         }
 
         // Act
-        assertThat(sut.send(1, 129, publish())).isEqualTo(FULL);
-        assertThat(sut.send(1, 130, new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY)))
+        assertThat(sut.send(1, 129, publish(), null)).isEqualTo(FULL);
+        assertThat(sut.send(1, 130, new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY), null))
                 .isEqualTo(ACCEPTED);
-        assertThat(sut.send(1, 131, new Packet.PingReq())).isEqualTo(ACCEPTED);
-        assertThat(sut.send(1, 132, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY)))
+        assertThat(sut.send(1, 131, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 132, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY), null))
                 .isEqualTo(ACCEPTED);
         transport.awaitActive();
         transport.completeInline = true;
@@ -227,15 +227,15 @@ class ClientIoTest {
         SingleWriteTransport transport = open(1);
         var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
         for (int i = 1; i <= 14; i++) {
-            assertThat(sut.send(1, i, acknowledgement)).isEqualTo(ACCEPTED);
+            assertThat(sut.send(1, i, acknowledgement, null)).isEqualTo(ACCEPTED);
         }
 
         // Act
-        assertThat(sut.send(1, 15, acknowledgement)).isEqualTo(FULL);
-        assertThat(sut.send(1, 16, new Packet.PingReq())).isEqualTo(ACCEPTED);
-        assertThat(sut.send(1, 17, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY)))
+        assertThat(sut.send(1, 15, acknowledgement, null)).isEqualTo(FULL);
+        assertThat(sut.send(1, 16, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 17, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY), null))
                 .isEqualTo(ACCEPTED);
-        assertThat(sut.send(1, 18, acknowledgement)).isEqualTo(FULL);
+        assertThat(sut.send(1, 18, acknowledgement, null)).isEqualTo(FULL);
         transport.awaitActive();
         transport.completeInline = true;
         transport.complete();
@@ -257,16 +257,16 @@ class ClientIoTest {
                 "c".repeat(65_535), MqttVersion.V3_1_1, true, 60, null, null, null, EMPTY
         );
         var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
-        assertThat(sut.send(1, 1, connect)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 1, connect, null)).isEqualTo(ACCEPTED);
         transport.awaitActive();
 
         // Act & Assert: PUBACK waits while connection control still has room.
-        assertThat(sut.send(1, 2, acknowledgement)).isEqualTo(FULL);
-        assertThat(sut.send(1, 3, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 2, acknowledgement, null)).isEqualTo(FULL);
+        assertThat(sut.send(1, 3, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         transport.complete();
         await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
         assertThat(events.capacityGenerations).containsExactly(1L);
-        assertThat(sut.send(1, 4, acknowledgement)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 4, acknowledgement, null)).isEqualTo(ACCEPTED);
         assertThat(events.ends).isEmpty();
     }
 
@@ -278,15 +278,15 @@ class ClientIoTest {
         // Arrange: the old connection keeps one active reservation after close.
         var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
         SingleWriteTransport old = open(1);
-        assertThat(sut.send(1, 1, acknowledgement)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 1, acknowledgement, null)).isEqualTo(ACCEPTED);
         old.awaitActive();
         sut.close();
         SingleWriteTransport current = open(2);
         for (int i = 2; i <= 14; i++) {
-            assertThat(sut.send(2, i, acknowledgement)).isEqualTo(ACCEPTED);
+            assertThat(sut.send(2, i, acknowledgement, null)).isEqualTo(ACCEPTED);
         }
         current.awaitActive();
-        assertThat(sut.send(2, 15, acknowledgement)).isEqualTo(FULL);
+        assertThat(sut.send(2, 15, acknowledgement, null)).isEqualTo(FULL);
         assertThat(events.capacityGenerations).isEmpty();
 
         // Act: either completion or final closure can release the old buffer.
@@ -296,10 +296,10 @@ class ClientIoTest {
         assertThat(events.capacityGenerations).containsExactly(2L);
         assertThat(events.written).isEmpty();
         assertThat(events.tickets).isEmpty();
-        assertThat(sut.send(2, 16, acknowledgement)).isEqualTo(ACCEPTED);
-        assertThat(sut.send(2, 17, acknowledgement)).isEqualTo(FULL);
-        assertThat(sut.send(2, 18, new Packet.PingReq())).isEqualTo(ACCEPTED);
-        assertThat(sut.send(2, 19, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY)))
+        assertThat(sut.send(2, 16, acknowledgement, null)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(2, 17, acknowledgement, null)).isEqualTo(FULL);
+        assertThat(sut.send(2, 18, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(2, 19, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY), null))
                 .isEqualTo(ACCEPTED);
         assertThat(events.ends).isEmpty();
     }
@@ -319,8 +319,8 @@ class ClientIoTest {
 
         // Act & Assert
         assertThat(sut.publish(1, 2, message, 0, null)).isEqualTo(FULL);
-        assertThat(sut.send(1, 3, publish())).isEqualTo(ACCEPTED);
-        assertThat(sut.send(1, 4, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 3, publish(), null)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 4, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         transport.awaitActive();
         transport.completeInline = true;
         transport.complete();
@@ -346,7 +346,7 @@ class ClientIoTest {
         transport.awaitActive();
         assertThat(sut.publish(1, 129, message(0), 0, null)).isEqualTo(FULL);
         assertThat(codec.prepared.get()).isEqualTo(1);
-        assertThat(sut.send(1, 130, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 130, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
 
         // Act & Assert: closure takes precedence and keeps the transport's cause.
         var cause = new IOException("Connection ended");
@@ -361,7 +361,7 @@ class ClientIoTest {
         // Arrange
         SingleWriteTransport transport = open(1);
         for (int i = 1; i <= 16; i++) {
-            sut.send(1, i, new Packet.PingReq());
+            sut.send(1, i, new Packet.PingReq(), null);
         }
         transport.awaitActive();
         transport.completeInline = true;
@@ -399,20 +399,20 @@ class ClientIoTest {
     @Test
     void transport_admission_marks_a_retry_even_without_write_completion() throws Exception {
         // Arrange
-        var transmission = new PublishTransmission();
+        var receipt = new SendReceipt();
         var message = MqttMessage.of(new Topic("a"), new byte[] {1}, Qos.AT_LEAST_ONCE, false);
         SingleWriteTransport old = open(1);
         var first = new CompletableFuture<Packet.Publish>();
         old.beforeReturn = bytes -> first.complete((Packet.Publish) codec.decode(bytes));
-        assertThat(sut.publish(1, 1, message, 7, transmission)).isEqualTo(ACCEPTED);
-        await().until(transmission::accepted);
+        assertThat(sut.publish(1, 1, message, 7, receipt)).isEqualTo(ACCEPTED);
+        await().until(receipt::accepted);
 
         // Act: the transport accepted the array, but it has not reported a successful write.
         sut.close();
         SingleWriteTransport current = open(2);
         var retry = new CompletableFuture<Packet.Publish>();
         current.beforeReturn = bytes -> retry.complete((Packet.Publish) codec.decode(bytes));
-        assertThat(sut.publish(2, 2, message, 7, transmission)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(2, 2, message, 7, receipt)).isEqualTo(ACCEPTED);
 
         // Assert
         assertThat(first.get(5, SECONDS).dup()).isFalse();
@@ -433,8 +433,8 @@ class ClientIoTest {
             entered.countDown();
             waitFor(release);
         };
-        var active = new PublishTransmission();
-        var queued = new PublishTransmission();
+        var active = new SendReceipt();
+        var queued = new SendReceipt();
         var message = MqttMessage.of(new Topic("a"), new byte[0], Qos.AT_LEAST_ONCE, false);
         SingleWriteTransport old = open(1);
         try {
@@ -470,7 +470,7 @@ class ClientIoTest {
     void a_rejected_or_throwing_send_does_not_mark_a_retry(boolean throwsFailure)
             throws Exception {
         // Arrange
-        var transmission = new PublishTransmission();
+        var receipt = new SendReceipt();
         var message = MqttMessage.of(new Topic("a"), new byte[0], Qos.AT_LEAST_ONCE, false);
         SingleWriteTransport old = open(1);
         var failure = new IllegalStateException("Send refused");
@@ -484,14 +484,14 @@ class ClientIoTest {
         }
 
         // Act
-        assertThat(sut.publish(1, 1, message, 7, transmission)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, message, 7, receipt)).isEqualTo(ACCEPTED);
         await().untilAsserted(() -> assertThat(events.ends).containsExactly(failure));
-        assertThat(transmission.accepted()).isFalse();
+        assertThat(receipt.accepted()).isFalse();
         sut.close();
         SingleWriteTransport current = open(2);
         var retry = new CompletableFuture<Packet.Publish>();
         current.beforeReturn = bytes -> retry.complete((Packet.Publish) codec.decode(bytes));
-        assertThat(sut.publish(2, 2, message, 7, transmission)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(2, 2, message, 7, receipt)).isEqualTo(ACCEPTED);
 
         // Assert
         assertThat(retry.get(5, SECONDS).dup()).isFalse();
@@ -505,7 +505,7 @@ class ClientIoTest {
         // Arrange
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var transmission = new PublishTransmission();
+        var receipt = new SendReceipt();
         var message = MqttMessage.of(new Topic("a"), new byte[0], Qos.AT_LEAST_ONCE, false);
         SingleWriteTransport old = open(1);
         var failure = new IOException("Inline termination");
@@ -515,24 +515,128 @@ class ClientIoTest {
             waitFor(release);
         };
         try {
-            assertThat(sut.publish(1, 1, message, 7, transmission)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 1, message, 7, receipt)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
             assertThat(events.ends).containsExactly(failure);
-            assertThat(transmission.accepted()).isFalse();
+            assertThat(receipt.accepted()).isFalse();
 
             // Act: the actor can replace the connection before ACCEPTED returns to the sender.
             sut.close();
             SingleWriteTransport current = open(2);
             var retry = new CompletableFuture<Packet.Publish>();
             current.beforeReturn = bytes -> retry.complete((Packet.Publish) codec.decode(bytes));
-            assertThat(sut.publish(2, 2, message, 7, transmission)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(2, 2, message, 7, receipt)).isEqualTo(ACCEPTED);
             assertThat(current.attempts).isEmpty();
             release.countDown();
 
             // Assert: the sole sender records acceptance before encoding the queued retry.
             assertThat(retry.get(5, SECONDS).dup()).isTrue();
-            assertThat(transmission.accepted()).isTrue();
+            assertThat(receipt.accepted()).isTrue();
             assertThat(events.tickets).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void an_acknowledgement_waiting_in_the_send_queue_has_no_transport_receipt() {
+        // Arrange
+        SingleWriteTransport transport = open(1);
+        sut.send(1, 1, new Packet.PingReq(), null);
+        transport.awaitActive();
+        var receipt = new SendReceipt();
+        var packet = new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY);
+
+        // Act
+        assertThat(sut.send(1, 2, packet, receipt)).isEqualTo(ACCEPTED);
+        sut.close();
+        transport.end(new IOException("Connection ended before the queued PUBACK"));
+
+        // Assert
+        assertThat(receipt.accepted()).isFalse();
+        assertThat(transport.attempts).containsExactly(1L);
+        assertThat(events.written).isEmpty();
+    }
+
+    @Test
+    void transport_admission_records_an_acknowledgement_without_write_completion()
+            throws Exception {
+        // Arrange
+        SingleWriteTransport transport = open(1);
+        var observed = new CompletableFuture<Packet>();
+        transport.beforeReturn = bytes -> observed.complete(codec.decode(bytes));
+        var receipt = new SendReceipt();
+        var packet = new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY);
+
+        // Act
+        assertThat(sut.send(1, 1, packet, receipt)).isEqualTo(ACCEPTED);
+        await().until(receipt::accepted);
+        transport.end(new IOException("Accepted without a successful write"));
+
+        // Assert
+        assertThat(receipt.accepted()).isTrue();
+        assertThat(observed.get(5, SECONDS)).isEqualTo(packet);
+        assertThat(events.written).isEmpty();
+    }
+
+    @ParameterizedTest(name = "acknowledgement send throws: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_rejected_or_throwing_acknowledgement_has_no_transport_receipt(boolean throwsFailure) {
+        // Arrange
+        SingleWriteTransport transport = open(1);
+        var failure = new IOException("PUBACK refused");
+        if (throwsFailure) {
+            transport.beforeSend = () -> {
+                throw new IllegalStateException(failure);
+            };
+        } else {
+            transport.rejectSend = true;
+            transport.endInsideSend = failure;
+        }
+        var receipt = new SendReceipt();
+
+        // Act
+        assertThat(sut.send(1, 1, new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY), receipt))
+                .isEqualTo(ACCEPTED);
+        await().untilAsserted(() -> assertThat(events.ends).hasSize(1));
+
+        // Assert
+        assertThat(receipt.accepted()).isFalse();
+        assertThat(events.written).isEmpty();
+    }
+
+    @Test
+    void an_acknowledgement_receipt_can_arrive_after_its_connection_ends() throws Exception {
+        // Arrange
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var receipt = new SendReceipt();
+        SingleWriteTransport old = open(1);
+        var failure = new IOException("Inline PUBACK termination");
+        old.beforeReturn = _ -> {
+            old.end(failure);
+            entered.countDown();
+            waitFor(release);
+        };
+        try {
+            sut.send(1, 1, new Packet.PubAck(7, ReasonCode.SUCCESS, EMPTY), receipt);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            assertThat(events.ends).containsExactly(failure);
+            assertThat(receipt.accepted()).isFalse();
+
+            // Act: this connection's sends wait for the old send call to return.
+            sut.close();
+            SingleWriteTransport current = open(2);
+            var observed = new CompletableFuture<Packet>();
+            current.beforeReturn = bytes -> observed.complete(codec.decode(bytes));
+            sut.send(2, 2, new Packet.PingReq(), null);
+            assertThat(current.attempts).isEmpty();
+            release.countDown();
+
+            // Assert
+            assertThat(observed.get(5, SECONDS)).isInstanceOf(Packet.PingReq.class);
+            assertThat(receipt.accepted()).isTrue();
+            assertThat(events.written).isEmpty();
         } finally {
             release.countDown();
         }
@@ -541,11 +645,11 @@ class ClientIoTest {
     @Test
     void a_rejected_retry_keeps_an_earlier_transport_admission() throws Exception {
         // Arrange
-        var transmission = new PublishTransmission();
+        var receipt = new SendReceipt();
         var message = MqttMessage.of(new Topic("a"), new byte[0], Qos.AT_LEAST_ONCE, false);
         open(1);
-        assertThat(sut.publish(1, 1, message, 7, transmission)).isEqualTo(ACCEPTED);
-        await().until(transmission::accepted);
+        assertThat(sut.publish(1, 1, message, 7, receipt)).isEqualTo(ACCEPTED);
+        await().until(receipt::accepted);
         sut.close();
         SingleWriteTransport rejected = open(2);
         var failure = new IOException("Retry refused");
@@ -553,16 +657,16 @@ class ClientIoTest {
         rejected.endInsideSend = failure;
 
         // Act
-        assertThat(sut.publish(2, 2, message, 7, transmission)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(2, 2, message, 7, receipt)).isEqualTo(ACCEPTED);
         await().untilAsserted(() -> assertThat(events.ends).containsExactly(failure));
         sut.close();
         SingleWriteTransport current = open(3);
         var retry = new CompletableFuture<Packet.Publish>();
         current.beforeReturn = bytes -> retry.complete((Packet.Publish) codec.decode(bytes));
-        assertThat(sut.publish(3, 3, message, 7, transmission)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(3, 3, message, 7, receipt)).isEqualTo(ACCEPTED);
 
         // Assert
-        assertThat(transmission.accepted()).isTrue();
+        assertThat(receipt.accepted()).isTrue();
         assertThat(retry.get(5, SECONDS).dup()).isTrue();
     }
 
@@ -571,9 +675,9 @@ class ClientIoTest {
     void a_closed_send_discards_waiting_writes_and_preserves_the_terminal_cause(boolean inline) {
         // Arrange
         SingleWriteTransport transport = open(1);
-        sut.send(1, 1, new Packet.PingReq());
-        sut.send(1, 2, new Packet.PingReq());
-        sut.send(1, 3, new Packet.PingReq());
+        sut.send(1, 1, new Packet.PingReq(), null);
+        sut.send(1, 2, new Packet.PingReq(), null);
+        sut.send(1, 3, new Packet.PingReq(), null);
         var failure = new IOException("Connection reset");
         transport.awaitActive();
         transport.rejectSend = true;
@@ -603,15 +707,15 @@ class ClientIoTest {
     void close_discards_waiting_writes_and_old_completions_do_not_advance_a_new_connection() {
         // Arrange
         SingleWriteTransport old = open(1);
-        sut.send(1, 1, new Packet.PingReq());
-        sut.send(1, 2, new Packet.PingReq());
+        sut.send(1, 1, new Packet.PingReq(), null);
+        sut.send(1, 2, new Packet.PingReq(), null);
         old.awaitActive();
 
         // Act: transport shutdown is asynchronous and still owns its active buffer.
         sut.close();
         SingleWriteTransport current = open(2);
-        sut.send(2, 1, new Packet.PingReq());
-        sut.send(2, 2, new Packet.PingReq());
+        sut.send(2, 1, new Packet.PingReq(), null);
+        sut.send(2, 2, new Packet.PingReq(), null);
         old.complete();
         old.end(new IOException("Old connection closed"));
         current.complete();
@@ -646,7 +750,7 @@ class ClientIoTest {
             old.end(new IOException("Old connection ended"));
             SingleWriteTransport current = open(2);
             assertThat(sut.publish(2, 3, large, 0, null)).isEqualTo(FULL);
-            assertThat(sut.send(2, 4, new Packet.PingReq())).isEqualTo(ACCEPTED);
+            assertThat(sut.send(2, 4, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
 
             // Assert: input and callbacks remain usable while the sender is occupied.
             requireNonNull(current.listener).onBytes(codec.encode(new Packet.PingResp()));
@@ -685,7 +789,7 @@ class ClientIoTest {
         sut.close();
         SingleWriteTransport current = open(2);
         assertThat(sut.publish(2, 2, large, 0, null)).isEqualTo(FULL);
-        assertThat(sut.send(2, 3, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        assertThat(sut.send(2, 3, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         current.awaitActive();
 
         // Assert: the new connection progresses despite the old outstanding write.
@@ -726,7 +830,7 @@ class ClientIoTest {
             sut.close();
             SingleWriteTransport current = open(2);
             assertThat(sut.publish(2, 2, large, 0, null)).isEqualTo(FULL);
-            assertThat(sut.send(2, 3, new Packet.PingReq())).isEqualTo(ACCEPTED);
+            assertThat(sut.send(2, 3, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
             release.countDown();
             current.awaitActive();
             assertThat(sut.publish(2, 4, large, 0, null)).isEqualTo(ACCEPTED);
@@ -757,7 +861,7 @@ class ClientIoTest {
         var acknowledgement = new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY);
         try {
             // Act
-            assertThat(sut.send(1, 1, acknowledgement)).isEqualTo(ACCEPTED);
+            assertThat(sut.send(1, 1, acknowledgement, null)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
             // Assert: the write is reported at once, but the retained buffer keeps its capacity.
@@ -765,9 +869,9 @@ class ClientIoTest {
             assertThat(events.tickets).isEmpty();
             assertThat(events.capacityGenerations).isEmpty();
             for (int i = 2; i <= 14; i++) {
-                assertThat(sut.send(1, i, acknowledgement)).isEqualTo(ACCEPTED);
+                assertThat(sut.send(1, i, acknowledgement, null)).isEqualTo(ACCEPTED);
             }
-            assertThat(sut.send(1, 15, acknowledgement)).isEqualTo(FULL);
+            assertThat(sut.send(1, 15, acknowledgement, null)).isEqualTo(FULL);
 
             // Act & Assert: release emits the capacity wake and user-visible completion.
             release.countDown();
@@ -815,7 +919,7 @@ class ClientIoTest {
         };
 
         // Act
-        sut.send(1, 1, new Packet.PingReq());
+        sut.send(1, 1, new Packet.PingReq(), null);
 
         // Assert
         await().untilAsserted(() -> assertThat(events.ends).containsExactly(failure));
@@ -827,7 +931,7 @@ class ClientIoTest {
         old.end(failure);
         SingleWriteTransport current = open(2);
         current.completeInline = true;
-        sut.send(2, 2, new Packet.PingReq());
+        sut.send(2, 2, new Packet.PingReq(), null);
 
         // Assert
         await().untilAsserted(() -> assertThat(events.tickets).containsExactly(2L));
@@ -843,7 +947,7 @@ class ClientIoTest {
         };
 
         // Act
-        sut.send(1, 1, new Packet.PingReq());
+        sut.send(1, 1, new Packet.PingReq(), null);
 
         // Assert
         await().untilAsserted(() -> assertThat(events.fatals).containsExactly(failure));
@@ -865,13 +969,13 @@ class ClientIoTest {
         // Arrange: the old connection admits a PINGREQ that is never answered.
         byte[] response = codec.encode(new Packet.PingResp());
         open(1);
-        assertThat(sut.send(1, 1, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 1, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         sut.close();
         Transport.Listener listener = requireNonNull(open(2).listener);
 
         // Act: an unsolicited, an answering, and a repeated response on the new connection.
         listener.onBytes(response);
-        assertThat(sut.send(2, 2, new Packet.PingReq())).isEqualTo(ACCEPTED);
+        assertThat(sut.send(2, 2, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         listener.onBytes(response);
         listener.onBytes(response);
 

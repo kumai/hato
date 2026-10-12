@@ -372,6 +372,93 @@ class MailboxTest {
         assertThat(sut.take(() -> false)).containsSame(current);
     }
 
+    @ParameterizedTest(name = "handler failure first: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_retained_sessions_failure_uses_the_current_generation_and_first_cause(
+            boolean handlerFirst
+    ) throws Exception {
+        // Arrange: every ordinary slot is full after the same session reconnects.
+        var sut = new Mailbox(1, 0, 1, 0, 0);
+        long session = 1;
+        var input = new Mailbox.Event(2, () -> { }, Mailbox.Kind.INCOMING, 0);
+        var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
+        Runnable handler = () -> { };
+        var transport = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
+        sut.activateSession(session);
+        sut.activate(1);
+        sut.discard(1);
+        sut.activate(2);
+        assertThat(sut.offer(input)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+
+        // Act: both valid producers report admission, but only the first owns termination.
+        if (!handlerFirst) {
+            assertThat(sut.terminate(transport)).isTrue();
+        }
+        assertThat(sut.terminateSession(session, handler)).isTrue();
+        if (handlerFirst) {
+            assertThat(sut.terminate(transport)).isTrue();
+        }
+        sut.activateSession(session);
+
+        // Assert: reasserting the same session cannot erase its accepted notification.
+        Mailbox.Event first = sut.take(() -> false).orElseThrow();
+        assertThat(first.generation()).isEqualTo(2);
+        assertThat(first.action()).isSameAs(handlerFirst ? handler : transport.action());
+        assertThat(sut.take(() -> false)).containsSame(input);
+        assertThat(sut.take(() -> false)).containsSame(command);
+        assertThat(sut.size()).isZero();
+    }
+
+    @ParameterizedTest(name = "pending transport failure: {0}")
+    @ValueSource(booleans = {false, true})
+    void replacing_a_session_removes_only_its_handler_notification(boolean transportFirst)
+            throws Exception {
+        // Arrange: CONNACK can replace the session within the same connection generation.
+        var sut = new Mailbox(0, 0, 0, 0, 0);
+        long old = 1;
+        long current = 2;
+        var transport = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
+        sut.activateSession(old);
+        sut.activate(2);
+        if (transportFirst) {
+            assertThat(sut.terminate(transport)).isTrue();
+        }
+        assertThat(sut.terminateSession(old, () -> { })).isTrue();
+        if (!transportFirst) {
+            assertThat(sut.terminate(transport)).isTrue();
+        }
+        var later = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
+        assertThat(sut.terminate(later)).isTrue();
+
+        // Act: both causes arrived before replacement; neither transport callback is repeated.
+        sut.activateSession(current);
+        assertThat(sut.terminateSession(old, () -> { })).isFalse();
+        assertThat(sut.terminateSession(current, () -> { })).isTrue();
+
+        // Assert: a discarded session cannot hide the current transport's cause.
+        assertThat(sut.take(() -> false)).containsSame(transport);
+        assertThat(sut.size()).isZero();
+    }
+
+    @Test
+    void a_session_failure_requires_a_current_connection_and_the_identical_session() {
+        // Arrange
+        var sut = new Mailbox(0, 0, 0, 0, 0);
+        long session = 1;
+        long other = 2;
+        sut.activateSession(session);
+
+        // Act & Assert: a retained session alone has no connection to terminate.
+        assertThat(sut.terminateSession(session, () -> { })).isFalse();
+        sut.activate(1);
+        assertThat(sut.terminateSession(other, () -> { })).isFalse();
+        assertThat(sut.terminateSession(session, () -> { })).isTrue();
+        sut.discard(1);
+        assertThat(sut.terminateSession(session, () -> { })).isFalse();
+        assertThat(sut.size()).isZero();
+    }
+
     @ParameterizedTest(name = "control event: {0}")
     @ValueSource(booleans = {false, true})
     void old_callbacks_cannot_consume_capacity_after_reconnecting(boolean control)

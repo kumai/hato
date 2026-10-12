@@ -13,22 +13,24 @@ import org.mqtt4j.mqtj.broker.internal.BrokerServer;
 /// QoS 1 deliveries, and queued QoS 1 deliveries while disconnected. Reconnecting with the
 /// same identifier resumes it with Session Present true and closes any previous connection
 /// with that identifier; Clean Session true discards its previous session.
-/// Incomplete QoS 1 deliveries resume before queued deliveries. Those handed to the previous
-/// connection's writer use DUP true; those not yet handed to it use DUP false.
+/// Incomplete QoS 1 deliveries resume before queued deliveries. A delivery whose transmission
+/// was attempted but remains unacknowledged uses DUP true; one whose transmission has not
+/// started uses DUP false.
 /// Offline QoS 0 deliveries are discarded. Wills are refused with Server unavailable;
 /// an empty identifier with Clean Session false is refused with Identifier rejected.
 /// Retained publications are forwarded to current subscribers but are not stored.
 /// Credentials are not checked. `$share/` filters are matched literally, without shared routing.
 ///
-/// QoS 1 deliveries wait for acknowledgements when the unacknowledged-delivery window is full.
-/// The session's waiting queue has separate count and byte limits. Exceeding those limits
-/// discards that session and closes its connection, if any; its next connection has Session
-/// Present false. A single encoded delivery that cannot fit the normal send queue or its
-/// applicable QoS 1 window also discards its target session, even an otherwise empty one.
+/// QoS 1 deliveries wait when unacknowledged deliveries reach their count or size limit.
+/// Deliveries also wait while a subscriber's connection is slow to accept data. The number and
+/// total size of waiting deliveries are bounded. Exceeding either limit discards that session
+/// and closes its connection, if any; its next connection has Session Present false. A delivery
+/// too large for the broker's internal size limits also discards its target session, even an
+/// otherwise empty one.
 /// A new persistent session is refused with Server unavailable when the
-/// persistent-session limit is reached. These provisional internal limits are not configuration
-/// contracts. All state is lost when the broker stops. This API is outside the compatibility
-/// promise until broker productization.
+/// persistent-session limit is reached. These limits are provisional and may change.
+/// All state is lost when the broker stops. This experimental API is outside the compatibility
+/// promise.
 public final class MqttBroker implements AutoCloseable {
 
     private final BrokerServer server;

@@ -186,7 +186,7 @@ public final class MqttClientBuilder {
 
     /// Inclusive incoming packet size, including the fixed header. Checked before allocation.
     /// Defaults to 16 MiB. Must be between 2 and 268435460 bytes.
-    /// Increasing this limit can also increase internal buffering budgets.
+    /// Increasing this limit can also increase memory consumption.
     public MqttClientBuilder maxPacketSize(int value) {
         if (value < MIN_PACKET_SIZE || value > MAX_PACKET_SIZE) {
             throw new IllegalArgumentException(

@@ -66,8 +66,8 @@ public interface Subscription extends AutoCloseable {
     /// QoS 1 messages arriving while removal is pending are neither run nor received, while
     /// QoS 0 messages arriving meanwhile are dropped.
     /// Discarded deliveries release this subscription's acknowledgement condition.
-    /// An already delivered MANUAL message still needs [MqttDelivery#ack()] while its connection
-    /// remains active, even if its handler has returned and this subscription has been removed.
+    /// Removing this subscription does not acknowledge already delivered MANUAL messages.
+    /// Their [MqttDelivery#ack()] rules continue to apply after removal or handler return.
     ///
     /// If capacity prevents admitting the removal, the future fails with [MqttCapacityException]
     /// and the removal can be retried. Unless [#close()] was called, delivery then resumes,
@@ -88,11 +88,11 @@ public interface Subscription extends AutoCloseable {
     /// Each call returns an independent future; changing it does not alter the wire request or
     /// later results. Each admitted future belongs to its current connection, including one
     /// observing removal scheduled by [#close()], and does not wait for a later connection.
-    /// The background removal record survives an observer's connection-loss failure.
-    /// Calls during one attempt observe the same wire exchange. Each admitted call uses the
-    /// operation budget until its internal completion processing returns, even if its future
-    /// was completed or cancelled first.
-    /// Retrying after a timeout therefore cannot speed up removal and may exhaust the budget
+    /// Removal scheduled by [#close()] continues even if an observing future fails when the
+    /// connection ends. Calls during one attempt observe the same wire exchange. Each admitted
+    /// call holds operation capacity until the client finishes it, including continuations
+    /// that its completion runs, even if the application completes or cancels the future first.
+    /// Retrying after a timeout therefore cannot speed up removal and may exhaust that capacity
     /// for other operations. Rejection of an additional call leaves the pending removal
     /// unchanged.
     /// A call admitted before permanent client closure can be rejected if it has not started
@@ -107,16 +107,17 @@ public interface Subscription extends AutoCloseable {
 
     /// Permanently stops local delivery, discards queued messages, releases their
     /// acknowledgement conditions, and wakes waiting receivers. Schedules broker removal without
-    /// waiting for the broker or application code. Running handlers may finish; handed-off
-    /// MANUAL deliveries still require [MqttDelivery#ack()] while their connection is active.
+    /// waiting for the broker or application code. Running handlers may finish. Local closure
+    /// does not acknowledge handed-off MANUAL deliveries; their [MqttDelivery#ack()] rules
+    /// continue to apply.
     /// Calling close again has no further effect.
     /// A closed subscription is never re-created, including when closed while disconnected.
     ///
-    /// Removal waits for send capacity and proceeds independently of the operation budget.
-    /// Its background record survives connection termination until removal is confirmed.
-    /// [#unsubscribe()] can observe the pending removal using the operation budget; rejection
+    /// Removal waits for send capacity and does not consume operation capacity. It continues
+    /// across connection termination until removal is confirmed.
+    /// [#unsubscribe()] can observe the pending removal using operation capacity; rejection
     /// or failure of that future neither cancels removal nor resumes local delivery.
-    /// The retained broker registration record counts against subscription capacity and
+    /// The closed subscription continues to count against subscription capacity and
     /// prevents registering the same filter again or, when either filter is shared, an
     /// overlapping one until UNSUBACK or a successful CONNACK with [ConnAck#sessionPresent()]
     /// false confirms its removal. Messages that still arrive for it are discarded, and QoS 1
