@@ -577,27 +577,46 @@ class DeliveryLanesTest {
     }
 
     @Test
-    void removing_a_paused_pull_lane_abandons_held_qos_one_without_handing_it_off()
+    void a_pull_lane_awaiting_removal_drops_new_deliveries_without_holding_back_acknowledgement()
             throws Exception {
         // Arrange: the pull subscription is awaiting removal.
         DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(2));
         sut.pause(1);
+
+        // Act
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
-        // QoS 1 is held without acknowledgement, and QoS 0 is dropped.
-        assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
-        assertThat(ready).isEmpty();
-        assertThat(sut.retainedDeliveries()).isEqualTo(1);
 
-        // Act: UNSUBACK removes the lane.
-        sut.remove(1);
-
-        // Assert
-        assertThat(receiver.receive()).isEqualTo(new ReceiveResult.Ended());
+        // Assert: neither is received, and the QoS 1 delivery is ready for acknowledgement.
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
-        assertThat(sut.abandonedDeliveries()).isEqualTo(1);
-        assertThat(sut.retainedLanes()).isZero();
+        assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
         assertThat(sut.retainedDeliveries()).isZero();
+        assertThat(sut.retainedBytes()).isZero();
+        sut.remove(1);
+        assertThat(receiver.receive()).isEqualTo(new ReceiveResult.Ended());
+        assertThat(sut.retainedLanes()).isZero();
+    }
+
+    @Test
+    void a_retransmission_is_not_handed_to_a_lane_awaiting_removal() throws Exception {
+        // Arrange: of two overlapping lanes, only the first took the delivery before the
+        // connection ended; then the second lane awaits removal.
+        DeliveryLanes.Receiver taken = registerPull(sut, 1, request(AckMode.MANUAL, 2));
+        DeliveryLanes.Receiver removing = registerPull(sut, 2, request(2));
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L), qosOneMessage(), false, 10))
+                .isTrue();
+        MqttDelivery original = received(taken.receive());
+        assertThat(sut.connectionEnded(true, false)).containsExactlyEntriesOf(Map.of(10L, false));
+        sut.pause(2);
+
+        // Act: the continued session retransmits the reception.
+        assertThat(sut.deliver(token(2, 10), List.of(1L, 2L), qosOneMessage(), true, 10)).isTrue();
+
+        // Assert: only the first lane's condition remains.
+        assertThat(removing.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+        assertThat(ready).isEmpty();
+        original.ack();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
     }
 
     @Test
@@ -1357,27 +1376,23 @@ class DeliveryLanesTest {
     }
 
     @Test
-    void removal_abandons_qos_one_held_by_a_paused_lane_without_running_it() throws Exception {
+    void a_push_lane_awaiting_removal_drops_new_deliveries_without_running_them()
+            throws Exception {
         // Arrange: the subscription is awaiting removal.
         var received = new LinkedBlockingQueue<MqttDelivery>();
         assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 2), received::add)).isTrue();
         sut.pause(1);
+
+        // Act
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
-        // QoS 1 keeps its acknowledgement obligation, and QoS 0 is dropped.
-        assertThat(ready).isEmpty();
-        assertThat(sut.retainedDeliveries()).isEqualTo(1);
 
-        // Act: UNSUBACK removes the lane.
-        sut.remove(1);
-
-        // Assert: the abandoned delivery releases its condition, and the worker never ran it.
+        // Assert: the QoS 1 delivery is ready for acknowledgement, and the worker runs neither.
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(sut.retainedDeliveries()).isZero();
+        sut.remove(1);
         await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
         assertThat(received).isEmpty();
-        assertThat(sut.abandonedDeliveries()).isEqualTo(1);
-        sut.release(10);
-        assertThat(sut.retainedDeliveries()).isZero();
     }
 
     @Test

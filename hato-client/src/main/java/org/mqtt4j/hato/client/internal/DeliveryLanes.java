@@ -151,8 +151,8 @@ final class DeliveryLanes {
     }
 
     /// Stops new local delivery while removal is pending. Queued deliveries still run or are
-    /// received; later QoS 0 is dropped, and later QoS 1 and 2 is held until removal stops the
-    /// lane, which releases its acknowledgement condition without running it.
+    /// received; later deliveries are not admitted, so this lane no longer holds back their
+    /// acknowledgement.
     void pause(long id) {
         lock.lock();
         try {
@@ -325,8 +325,9 @@ final class DeliveryLanes {
             if (first) {
                 for (long id : ids) {
                     Lane lane = lanes.get(id);
-                    // A pending removal drops QoS 0 and holds QoS 1/2 until it stops the lane.
-                    if (lane != null && (!lane.paused || token.acknowledgement() != 0)) {
+                    // A lane awaiting removal admits nothing new, so it does not hold back the
+                    // acknowledgement of QoS 1 and 2.
+                    if (lane != null && !lane.paused) {
                         recipients.add(lane);
                         states.add(new Recipient(id));
                     }
@@ -336,7 +337,8 @@ final class DeliveryLanes {
                 for (Recipient recipient : requireNonNull(delivery).recipients.values()) {
                     if (!recipient.handed && !recipient.ready && !recipient.queued) {
                         Lane lane = lanes.get(recipient.id);
-                        if (lane == null) {
+                        // A removed lane, or one awaiting removal, takes no retransmission.
+                        if (lane == null || lane.paused) {
                             abandoned.add(recipient);
                         } else {
                             recipients.add(lane);
@@ -385,7 +387,6 @@ final class DeliveryLanes {
                             requireNonNull(retained.message),
                             dup
                     );
-                    view.held = lane.paused;
                     if (token.acknowledgement() != 0 && lane.ackMode == AckMode.MANUAL) {
                         view.acknowledgement = () -> acknowledge(view);
                     }
@@ -532,7 +533,7 @@ final class DeliveryLanes {
         boolean ready;
         lock.lock();
         try {
-            while (!lane.stopped && (lane.failed || !lane.hasDelivery())) {
+            while (!lane.stopped && (lane.failed || lane.queue.isEmpty())) {
                 // The private worker ends through stop(), which signals this condition.
                 lane.ready.awaitUninterruptibly();
             }
@@ -751,7 +752,7 @@ final class DeliveryLanes {
             boolean ready;
             lock.lockInterruptibly();
             try {
-                while (!lane.stopped && !lane.hasDelivery()) {
+                while (!lane.stopped && lane.queue.isEmpty()) {
                     if (unlimited) {
                         lane.ready.await();
                     } else {
@@ -837,11 +838,6 @@ final class DeliveryLanes {
             this.handler = handler;
             this.ready = ready;
         }
-
-        /// Caller holds lock. Held deliveries wait in both modes until removal stops the lane.
-        boolean hasDelivery() {
-            return !queue.isEmpty() && !(paused && requireNonNull(queue.peekFirst()).held);
-        }
     }
 
     private static final class RetainedDelivery {
@@ -887,9 +883,6 @@ final class DeliveryLanes {
         boolean localDone;
         boolean released;
         boolean valid = true;
-        // Admitted while the lane awaited removal; it is never run or received, and removal
-        // discards it.
-        boolean held;
 
         DeliveryView(
                 RetainedDelivery delivery,

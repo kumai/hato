@@ -101,8 +101,8 @@ public interface Subscription extends AutoCloseable {
     /// Stops new local delivery when called and observes confirmed removal.
     /// Already queued deliveries may run or be received while acknowledgement is pending; any
     /// still queued when it completes are discarded. Handlers already running can finish.
-    /// QoS 1 and 2 messages arriving while removal is pending are neither run nor received, while
-    /// QoS 0 messages arriving meanwhile are dropped.
+    /// Messages arriving while removal is pending are dropped without running or being received,
+    /// and this subscription does not hold back the acknowledgement of QoS 1 and 2 among them.
     /// Discarded deliveries release this subscription's acknowledgement condition.
     /// Removing this subscription does not acknowledge already delivered MANUAL messages.
     /// Their [MqttDelivery#ack()] rules continue to apply after removal or handler return.
