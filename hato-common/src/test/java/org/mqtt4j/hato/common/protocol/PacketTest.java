@@ -44,6 +44,24 @@ class PacketTest {
         assertThat(sut.password()).isNull();
     }
 
+    @Test
+    void connect_does_not_include_credentials_in_its_string_representation() {
+        var password = new byte[] {1, 2, 3};
+        var sut = new Packet.Connect(
+                "client",
+                MqttVersion.V3_1_1,
+                true,
+                60,
+                null,
+                "private-user",
+                password,
+                Properties.EMPTY
+        );
+
+        assertThat(sut.toString()).contains("clientId=client", "keepAliveSeconds=60")
+                .doesNotContain("private-user", "username=", "password=", "[B@");
+    }
+
     @ParameterizedTest
     @ValueSource(ints = {0, 65535})
     void keep_alive_accepts_the_unsigned_two_byte_boundaries(int seconds) {

@@ -27,7 +27,8 @@ public sealed interface Packet {
 
     /// CONNECT — connection parameters.
     ///
-    /// Null will, username, or password means the field is absent.
+    /// Null will, username, or password means the field is absent. String representations omit
+    /// username and password.
     ///
     /// `keepAliveSeconds` is 0 (disabled) to 65535. An empty client identifier is representable;
     /// the codec checks its version-specific restrictions. Password bytes transfer ownership.
@@ -101,6 +102,13 @@ public sealed interface Packet {
                     Arrays.hashCode(password),
                     properties
             );
+        }
+
+        @Override
+        public String toString() {
+            return "Connect[clientId=" + clientId + ", version=" + version
+                    + ", cleanStart=" + cleanStart + ", keepAliveSeconds=" + keepAliveSeconds
+                    + ", will=" + will + ", properties=" + properties + "]";
         }
     }
 

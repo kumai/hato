@@ -834,7 +834,7 @@ public final class BrokerServer implements AutoCloseable {
                 case Packet.PubComp ack -> owner.acknowledge(ack.packetId(), true);
                 case Packet.PingReq _ -> send(new Packet.PingResp());
                 case Packet.Disconnect _ -> close("client sent DISCONNECT");
-                // Name only the type; a CONNECT's text would put its username in the INFO end log.
+                // Name only the type; the INFO end log must not carry fields such as AUTH data.
                 case Packet.Connect _,
                      Packet.ConnAck _,
                      Packet.SubAck _,
