@@ -19,9 +19,11 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -46,6 +48,7 @@ import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
+import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
@@ -89,6 +92,267 @@ class ClientActorTest {
     private final LinkedBlockingQueue<ScriptTransport> transports = new LinkedBlockingQueue<>();
 
     private volatile Runnable beforeActorTime = () -> { };
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void invalid_credentials_fail_one_attempt_and_allow_another(boolean returnsNull)
+            throws Exception {
+        // Arrange
+        var calls = new AtomicInteger();
+        var supplierFailure = new IllegalStateException("credentials unavailable");
+        try (MqttClient sut = clientWithCredentials(() -> {
+            assertThat(Thread.currentThread().isVirtual()).isTrue();
+            assertThat(Thread.currentThread().getName()).endsWith("-credentials");
+            if (calls.incrementAndGet() == 1) {
+                if (returnsNull) {
+                    return null;
+                }
+                throw supplierFailure;
+            }
+            return MqttCredentials.of("fresh");
+        })) {
+            // Act & Assert
+            CompletableFuture<ConnAck> first = sut.connect();
+            assertThatThrownBy(() -> first.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class)
+                    .hasRootCauseInstanceOf(
+                            returnsNull ? NullPointerException.class : IllegalStateException.class
+                    );
+            assertThat(transports).isEmpty();
+
+            CompletableFuture<ConnAck> second = sut.connect();
+            ScriptTransport current = requireNonNull(transports.poll(5, SECONDS));
+            assertThat(current.sent.poll(5, SECONDS))
+                    .isInstanceOfSatisfying(
+                            Packet.Connect.class,
+                            packet -> assertThat(packet.username()).isEqualTo("fresh")
+                    );
+            current.accept();
+            assertThat(second.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(calls).hasValue(2);
+        }
+    }
+
+    @Test
+    void an_expired_supplier_cannot_overlap_or_supply_the_next_attempt() throws Exception {
+        // Arrange: the first supplier deliberately ignores cancellation.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var calls = new AtomicInteger();
+        var active = new AtomicInteger();
+        var maximum = new AtomicInteger();
+        try (MqttClient sut = clientWithCredentials(() -> {
+            int running = active.incrementAndGet();
+            maximum.accumulateAndGet(running, Math::max);
+            try {
+                if (calls.incrementAndGet() == 1) {
+                    entered.countDown();
+                    awaitIgnoringInterrupts(release);
+                    return MqttCredentials.of("expired");
+                }
+                assertThat(Thread.currentThread().isInterrupted()).isFalse();
+                return MqttCredentials.of("current");
+            } finally {
+                active.decrementAndGet();
+            }
+        })) {
+            CompletableFuture<ConnAck> first = sut.connect();
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            assertThat(transports).isEmpty();
+            await().pollInterval(Duration.ofMillis(1))
+                    .until(() -> scheduler.pendingTaskCount() == 1);
+
+            // Act: two attempts expire while the first application call still holds its slot.
+            scheduler.advance(Duration.ofSeconds(30));
+            assertThatThrownBy(() -> first.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class)
+                    .hasRootCauseInstanceOf(TimeoutException.class);
+            CompletableFuture<ConnAck> second = sut.connect();
+            await().pollInterval(Duration.ofMillis(1))
+                    .until(() -> scheduler.pendingTaskCount() == 1);
+            scheduler.advance(Duration.ofSeconds(30));
+            assertThatThrownBy(() -> second.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class);
+            CompletableFuture<ConnAck> third = sut.connect();
+            await().pollInterval(Duration.ofMillis(1))
+                    .until(() -> scheduler.pendingTaskCount() == 1);
+            assertThat(calls).hasValue(1);
+            assertThat(transports).isEmpty();
+            release.countDown();
+
+            // Assert
+            ScriptTransport current = requireNonNull(transports.poll(5, SECONDS));
+            assertThat(current.sent.poll(5, SECONDS))
+                    .isInstanceOfSatisfying(
+                            Packet.Connect.class,
+                            packet -> assertThat(packet.username()).isEqualTo("current")
+                    );
+            current.accept();
+            assertThat(third.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(transports).isEmpty();
+            assertThat(calls).hasValue(2);
+            assertThat(maximum).hasValue(1);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Closing while the supplier runs is the behavior under test.
+    void close_finishes_without_waiting_for_a_blocked_credentials_supplier() throws Exception {
+        // Arrange
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var returned = new CountDownLatch(1);
+        var actor = new AtomicReference<@Nullable Thread>();
+        var timer = new TimerScheduler() {
+            @Override
+            public long nanoTime() {
+                return scheduler.nanoTime();
+            }
+
+            @Override
+            public Cancellable schedule(Duration delay, Runnable task) {
+                // The actor schedules the connection deadline itself.
+                actor.compareAndSet(null, Thread.currentThread());
+                return scheduler.schedule(delay, task);
+            }
+        };
+        try (MqttClient sut = clientWithCredentials(() -> {
+            entered.countDown();
+            awaitIgnoringInterrupts(release);
+            returned.countDown();
+            return MqttCredentials.of("late");
+        }, timer)) {
+            CompletableFuture<ConnAck> connection = sut.connect();
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            assertThat(transports).isEmpty();
+
+            // Act
+            sut.close();
+
+            // Assert: the actor finishes its whole shutdown while the supplier is still blocked.
+            assertThatThrownBy(() -> connection.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class);
+            assertThat(requireNonNull(actor.get()).join(Duration.ofSeconds(5))).isTrue();
+            assertThat(returned.getCount()).isEqualTo(1);
+            release.countDown();
+            assertThat(returned.await(5, SECONDS)).isTrue();
+            assertThat(transports).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void credentials_finish_before_transport_opens_with_the_remaining_deadline() throws Exception {
+        // Arrange
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = clientWithCredentials(() -> {
+            entered.countDown();
+            waitFor(release);
+            return MqttCredentials.of("ready");
+        })) {
+            CompletableFuture<ConnAck> connection = sut.connect();
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            assertThat(scheduler.pendingTaskCount()).isEqualTo(1);
+            assertThat(transports).isEmpty();
+
+            // Act
+            scheduler.advance(Duration.ofSeconds(20));
+            release.countDown();
+            ScriptTransport transport = requireNonNull(transports.poll(5, SECONDS));
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Connect.class);
+
+            // Assert: waiting for CONNACK still ends at the original total deadline.
+            assertThat(transport.startTimeout).isEqualTo(Duration.ofSeconds(10));
+            scheduler.advance(Duration.ofSeconds(10));
+            assertThatThrownBy(() -> connection.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class)
+                    .hasRootCauseInstanceOf(TimeoutException.class);
+            await().until(() -> transport.closed);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {30, 31})
+    void expired_credentials_cannot_open_transport_before_the_timer_callback(long elapsed)
+            throws Exception {
+        // Arrange: time advances, but the scheduler has not delivered its callback yet.
+        var now = new AtomicLong();
+        var scheduled = new AtomicInteger();
+        var delayed = new TimerScheduler() {
+            @Override
+            public long nanoTime() {
+                return now.get();
+            }
+
+            @Override
+            public Cancellable schedule(Duration delay, Runnable task) {
+                scheduled.incrementAndGet();
+                return () -> { };
+            }
+        };
+        try (MqttClient sut = clientWithCredentials(() -> {
+            assertThat(scheduled).hasValue(1);
+            now.set(Duration.ofSeconds(elapsed).toNanos());
+            return MqttCredentials.of("expired");
+        }, delayed)) {
+            // Act & Assert
+            assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class)
+                    .hasRootCauseInstanceOf(TimeoutException.class);
+            assertThat(transports).isEmpty();
+        }
+    }
+
+    private MqttClient clientWithCredentials(Supplier<MqttCredentials> supplier) {
+        return clientWithCredentials(supplier, scheduler);
+    }
+
+    private MqttClient clientWithCredentials(
+            Supplier<MqttCredentials> supplier,
+            TimerScheduler timer
+    ) {
+        return MqttClient.builder()
+                .clientId("credentials-test")
+                .server(URI.create("mqtt://localhost:1883"))
+                .version(MqttVersion.V3_1_1)
+                .connectionTimeout(Duration.ofSeconds(30))
+                .timerScheduler(timer)
+                .credentials(supplier)
+                .transportFactory(_ -> {
+                    var transport = new ScriptTransport();
+                    transports.add(transport);
+                    return transport;
+                })
+                .build();
+    }
+
+    /// Waits through interruption like a supplier that ignores cancellation, then returns with
+    /// the interrupt status set, as a supplier restoring it would.
+    private static void awaitIgnoringInterrupts(CountDownLatch latch) {
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try {
+                    if (!latch.await(30, SECONDS)) {
+                        throw new AssertionError("Test failed to release the supplier");
+                    }
+                    return;
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
 
     @Test
     void a_waiting_pull_receiver_survives_disconnect_and_receives_after_resubscribe()
@@ -899,7 +1163,8 @@ class ClientActorTest {
                 .transportFactory(_ -> transport)
                 .build()) {
             CompletableFuture<ConnAck> future = sut.connect();
-            await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
+            await().until(() -> transport.listener != null);
+            assertThat(scheduler.pendingTaskCount()).isEqualTo(1);
 
             // Act: establishing the transport partway through must not restart the deadline.
             scheduler.advance(Duration.ofSeconds(20));
@@ -4546,7 +4811,9 @@ class ClientActorTest {
                     return transport;
                 },
                 packetCodec,
-                cleanStart
+                cleanStart,
+                null,
+                null
         );
     }
 
@@ -4639,6 +4906,7 @@ class ClientActorTest {
         volatile boolean completeSends = true;
         volatile long pendingTicket;
         @Nullable Throwable startFailure;
+        Duration startTimeout = Duration.ZERO;
 
         Listener receiver() {
             return requireNonNull(listener);
@@ -4660,6 +4928,7 @@ class ClientActorTest {
 
         @Override
         public void start(URI endpoint, Duration timeout, Listener receiver) {
+            startTimeout = timeout;
             listener = receiver;
             if (connectOnStart) {
                 receiver.onConnected();

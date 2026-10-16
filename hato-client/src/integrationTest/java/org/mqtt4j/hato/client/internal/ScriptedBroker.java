@@ -20,7 +20,8 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
-/// A raw TCP peer whose replies are chosen by each test.
+/// A raw TCP or TLS peer whose replies are chosen by each test. A TLS peer completes its
+/// handshake on the first read.
 final class ScriptedBroker implements AutoCloseable {
 
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
@@ -57,6 +58,10 @@ final class ScriptedBroker implements AutoCloseable {
         return connect(server, sut, false, _ -> { });
     }
 
+    static ScriptedBroker accept(ServerSocket server) throws IOException {
+        return new ScriptedBroker(server.accept());
+    }
+
     static ScriptedBroker connect(
             ServerSocket server,
             MqttClient sut,
@@ -64,7 +69,7 @@ final class ScriptedBroker implements AutoCloseable {
             Consumer<Packet.Connect> verifyConnect
     ) throws Exception {
         CompletableFuture<ConnAck> connected = sut.connect();
-        var peer = new ScriptedBroker(server.accept());
+        ScriptedBroker peer = accept(server);
         try {
             assertThat(peer.receive()).isInstanceOfSatisfying(Packet.Connect.class, verifyConnect);
             peer.send(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));
@@ -176,6 +181,10 @@ final class ScriptedBroker implements AutoCloseable {
 
     void send(Packet packet) throws IOException {
         writer.write(codec.encode(packet));
+    }
+
+    void send(byte[] bytes) throws IOException {
+        writer.write(bytes);
     }
 
     void expectClosed() throws IOException {

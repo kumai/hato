@@ -8,6 +8,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
@@ -18,10 +19,12 @@ import org.mqtt4j.hato.client.internal.ClientActor;
 import org.mqtt4j.hato.client.internal.DefaultTimerScheduler;
 import org.mqtt4j.hato.client.internal.TcpTransport;
 import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
+import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
+import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// Configures a client without opening a connection. Not thread safe.
 /// Set [#server(URI)] and [#version(MqttVersion)] before calling [#build].
@@ -76,6 +79,10 @@ public final class MqttClientBuilder {
 
     private @Nullable Consumer<SSLParameters> sslParameters;
 
+    private @Nullable Supplier<MqttCredentials> credentials;
+
+    private @Nullable MqttMessage will;
+
     MqttClientBuilder() {
     }
 
@@ -120,8 +127,9 @@ public final class MqttClientBuilder {
         return at < 0 ? text : text.replace(part, "***" + part.substring(at));
     }
 
-    /// Uses this nonempty MQTT UTF-8 identifier. Persistent sessions require an explicit value.
-    /// Otherwise, omission generates 23 ASCII letters/digits.
+    /// Uses this nonempty MQTT UTF-8 identifier of at most 65535 bytes, validated immediately.
+    /// Persistent sessions require an explicit value. Otherwise, omission generates 23 ASCII
+    /// letters/digits.
     public MqttClientBuilder clientId(String value) {
         requireNonNull(value, "clientId");
         MqttString.write(new ByteArrayOutputStream(), value);
@@ -166,6 +174,33 @@ public final class MqttClientBuilder {
         return this;
     }
 
+    /// Supplies credentials once per connection attempt, on a dedicated virtual thread before
+    /// opening the transport. Evaluation consumes the same [#connectionTimeout(Duration)]
+    /// deadline as transport establishment and the broker's CONNACK response.
+    /// The default is no credentials. At most one invocation runs at a time for this client;
+    /// the supplier should respond to interruption when an attempt ends or the client closes.
+    /// An invocation that ignores interruption delays evaluation for a later attempt until it
+    /// returns; the abandoned result is discarded. Closing the client does not wait for it.
+    /// An exception, a null result, or exceeding [#connectionTimeout(Duration)] fails only
+    /// that attempt with [MqttConnectException]. A later attempt evaluates the supplier again.
+    /// The supplier is not evaluated during [#build()].
+    public MqttClientBuilder credentials(Supplier<MqttCredentials> value) {
+        credentials = requireNonNull(value, "credentials");
+        return this;
+    }
+
+    /// Configures the message the broker publishes if the connection ends without receiving
+    /// MQTT DISCONNECT, including [MqttClient#close()] alone. No Will is configured by default.
+    /// Any QoS and retention flag are accepted. [#build()] rejects payloads over 65535 bytes;
+    /// the immutable message already validates its topic and owns a copy of its payload.
+    /// Wait for [MqttClient#disconnect()] to complete successfully before [MqttClient#close()]
+    /// so closing cannot discard the pending DISCONNECT. Completion confirms the write;
+    /// the broker does not acknowledge receipt.
+    public MqttClientBuilder will(MqttMessage value) {
+        will = requireNonNull(value, "will");
+        return this;
+    }
+
     /// Sets the keep-alive interval in whole seconds from 0 (disabled) to 65535; default 60.
     /// Idle time is measured from completed writes. The interval also bounds a PINGREQ write
     /// and the wait for its PINGRESP, together.
@@ -181,8 +216,8 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Total deadline for transport establishment, including any TLS handshake, and CONNACK;
-    /// also bounds the DISCONNECT write.
+    /// Total deadline for credentials, transport establishment (including any TLS handshake),
+    /// and CONNACK; also bounds the DISCONNECT write.
     /// Defaults to 30 seconds. Must be positive and no greater than 2147483647 milliseconds.
     public MqttClientBuilder connectionTimeout(Duration value) {
         requireNonNull(value, "connectionTimeout");
@@ -212,6 +247,9 @@ public final class MqttClientBuilder {
 
     /// Supplies monotonic time and delayed callbacks. Defaults to a shared daemon timer with
     /// [System#nanoTime]. The scheduler is borrowed and is not closed with the client.
+    /// The default TCP and TLS transports use it for the connection and TLS handshake
+    /// deadlines and TLS close-notify grace period. JDK socket connection and name resolution
+    /// waits still use real time. Custom transports manage their own clocks.
     public MqttClientBuilder timerScheduler(TimerScheduler value) {
         scheduler = requireNonNull(value, "timerScheduler");
         return this;
@@ -268,7 +306,7 @@ public final class MqttClientBuilder {
     ///
     /// @throws IllegalStateException if the server or protocol version has not been specified
     /// @throws IllegalArgumentException if session or TLS settings are invalid or incompatible,
-    ///     or a persistent session has no explicit client id
+    ///     a persistent session has no explicit client id, or the Will payload exceeds 65535 bytes
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null || version == null) {
@@ -294,6 +332,14 @@ public final class MqttClientBuilder {
                             + "or false with positive session expiry"
             );
         }
+        // The CONNECT form checks the payload limit here, before the client starts any thread.
+        Packet.Will connectWill = (will == null) ? null : new Packet.Will(
+                will.topic(),
+                will.payload(),
+                will.qos(),
+                will.retain(),
+                EMPTY
+        );
         String id = clientId;
         if (id == null) {
             if (!cleanStart) {
@@ -304,8 +350,9 @@ public final class MqttClientBuilder {
             id = CLIENT_ID_PREFIX + UUID.randomUUID().toString().replace("-", "")
                     .substring(0, GENERATED_CLIENT_ID_LENGTH - CLIENT_ID_PREFIX.length());
         }
+        TimerScheduler timer = scheduler;
         if (factory == null) {
-            factory = tls ? tlsTransportFactory() : Transport::tcp;
+            factory = tls ? tlsTransportFactory(timer) : value -> new TcpTransport(value, timer);
         }
         return new ClientActor(
                 endpoint,
@@ -313,14 +360,16 @@ public final class MqttClientBuilder {
                 keepAlive,
                 connectionTimeout,
                 maxPacketSize,
-                scheduler,
+                timer,
                 listener,
                 factory,
-                cleanStart
+                cleanStart,
+                credentials,
+                connectWill
         );
     }
 
-    private Transport.Factory tlsTransportFactory() {
+    private Transport.Factory tlsTransportFactory(TimerScheduler timer) {
         try {
             SSLContext context = sslContext != null ? sslContext : SSLContext.getDefault();
             SSLParameters parameters = defaultParameters(context);
@@ -333,7 +382,7 @@ public final class MqttClientBuilder {
             try (var socket = (SSLSocket) context.getSocketFactory().createSocket()) {
                 socket.setSSLParameters(parameters);
                 SSLParameters snapshot = socket.getSSLParameters();
-                return id -> new TcpTransport(id, context, snapshot);
+                return id -> new TcpTransport(id, context, snapshot, timer);
             }
         } catch (IOException | NoSuchAlgorithmException failure) {
             throw new IllegalArgumentException("Cannot initialize TLS configuration", failure);

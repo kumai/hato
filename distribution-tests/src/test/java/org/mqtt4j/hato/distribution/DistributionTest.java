@@ -346,6 +346,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.MqttClientBuilder",
                 "org.mqtt4j.hato.MqttConnectException",
                 "org.mqtt4j.hato.MqttConnectionLostException",
+                "org.mqtt4j.hato.MqttCredentials",
                 "org.mqtt4j.hato.MqttDelivery",
                 "org.mqtt4j.hato.MqttException",
                 "org.mqtt4j.hato.MqttMessage",
@@ -381,7 +382,9 @@ class DistributionTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"Disconnection", "ConnAck", "PublishResult", "MqttMessage"})
+    @ValueSource(strings = {
+            "Disconnection", "ConnAck", "PublishResult", "MqttMessage", "MqttCredentials"
+    })
     void evolving_value_types_are_final_classes_with_private_constructors(String type)
             throws Exception {
         try (var archive = new JarFile(CLIENT.toFile())) {

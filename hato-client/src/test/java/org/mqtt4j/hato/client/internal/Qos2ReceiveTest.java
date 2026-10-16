@@ -43,6 +43,8 @@ class Qos2ReceiveTest {
             "client",
             Duration.ofSeconds(30),
             Duration.ZERO,
+            false,
+            null,
             false
     );
     private long nextOperation;

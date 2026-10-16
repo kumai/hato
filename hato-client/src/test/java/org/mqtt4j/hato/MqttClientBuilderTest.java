@@ -137,11 +137,66 @@ class MqttClientBuilderTest {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> sut.clientId(""))
                 .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> sut.clientId("unpaired\uD800"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> sut.clientId("あ".repeat(21_846)))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     void default_clean_sessions_do_not_require_an_explicit_identifier() {
         assertThatCode(() -> configuredBuilder().build().close()).doesNotThrowAnyException();
+    }
+
+    @Test
+    void maximum_connect_fields_are_accepted_before_starting_io() {
+        String text = "あ".repeat(21_845);
+        var credentials = MqttCredentials.of(text, new byte[65_535]);
+        var will = MqttMessage.of(new Topic(text), new byte[65_535], Qos.EXACTLY_ONCE, true);
+        MqttClientBuilder sut = configuredBuilder()
+                .clientId(text)
+                .keepAlive(Duration.ofSeconds(65_535))
+                .credentials(() -> credentials)
+                .will(will);
+
+        assertThatCode(() -> sut.build().close()).doesNotThrowAnyException();
+    }
+
+    @Test
+    void building_does_not_evaluate_credentials() {
+        var calls = new AtomicInteger();
+        MqttClientBuilder sut = configuredBuilder().credentials(() -> {
+            calls.incrementAndGet();
+            return MqttCredentials.of("user");
+        });
+
+        sut.build().close();
+
+        assertThat(calls).hasValue(0);
+    }
+
+    @Test
+    void oversized_will_payloads_are_rejected_at_build() {
+        var will = MqttMessage.of(
+                new Topic("status"),
+                new byte[65_536],
+                Qos.AT_MOST_ONCE,
+                false
+        );
+        MqttClientBuilder sut = configuredBuilder().will(will);
+
+        assertThatThrownBy(sut::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Will payload");
+    }
+
+    @Test
+    @SuppressWarnings("NullAway") // Deliberately violates the setters' non-null contracts.
+    void credentials_and_will_cannot_be_null() {
+        assertThatThrownBy(() -> configuredBuilder().credentials(null))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> configuredBuilder().will(null))
+                .isInstanceOf(NullPointerException.class);
     }
 
     @ParameterizedTest(name = "accepts cleanStart={0}, expiry={1}")

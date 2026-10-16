@@ -63,6 +63,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
 
     /// Sends DISCONNECT and completes after writing it and requesting transport closure.
     /// Completion does not confirm that the broker received DISCONNECT.
+    /// Wait for successful completion before calling [#close()]; closing earlier may discard
+    /// the pending DISCONNECT and cause the broker to publish the Will.
     /// This does not wait for PUBACK or PUBCOMP, although either can complete its publication
     /// before the connection ends. Other pending QoS 1 and QoS 2 publications fail with
     /// [MqttConnectionLostException] when the connection ends; their outcome is unknown.
@@ -80,7 +82,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// or application callbacks. Repeated calls have no effect.
     /// Discards local session state; a persistent session may remain on the broker.
     /// A Will registered with the broker may be published. For a graceful disconnect,
-    /// wait for [#disconnect] to complete before calling this method.
+    /// wait for [#disconnect] to complete successfully before calling this method.
     @Override
     void close();
 }

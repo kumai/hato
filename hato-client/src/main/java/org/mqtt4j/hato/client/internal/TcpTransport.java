@@ -21,6 +21,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.client.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.client.internal.common.io.TcpConnection;
+import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.spi.Transport;
 
@@ -29,6 +30,8 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 /// Socket ownership and named reader/writer threads. Closing never waits for either worker.
 public final class TcpTransport implements Transport {
+
+    private static final Log log = Log.of(TcpTransport.class);
 
     private static final Duration CLOSE_GRACE = Duration.ofSeconds(1);
 
@@ -97,12 +100,14 @@ public final class TcpTransport implements Transport {
     private boolean started;
     private boolean connected;
 
-    public TcpTransport(String clientId) {
+    public TcpTransport(String clientId, TimerScheduler timer) {
         this(
                 clientId,
+                "mqtt",
                 resolving,
                 InetAddress::getByName,
-                (_, address, timeout) -> plain(TcpConnection.connect(address, timeout))
+                (_, address, timeout) -> plain(TcpConnection.connect(address, timeout)),
+                timer
         );
     }
 
@@ -122,14 +127,19 @@ public final class TcpTransport implements Transport {
         );
     }
 
-    public TcpTransport(String clientId, SSLContext context, SSLParameters parameters) {
+    public TcpTransport(
+            String clientId,
+            SSLContext context,
+            SSLParameters parameters,
+            TimerScheduler timer
+    ) {
         this(
                 clientId,
                 "mqtts",
                 resolving,
                 InetAddress::getByName,
                 (host, address, timeout) -> tls(host, address, timeout, context, parameters),
-                DefaultTimerScheduler.instance
+                timer
         );
     }
 
@@ -187,13 +197,12 @@ public final class TcpTransport implements Transport {
                     );
                     Connection socket = connector.connect(host, address, remaining(deadline));
                     synchronized (callbacks) {
-                        if (closed || deadline - timer.nanoTime() <= 0) {
-                            socket.abort();
-                            if (!closed) {
-                                throw new SocketTimeoutException("TCP connection deadline expired");
-                            }
+                        if (closed) {
+                            abort(socket, requireNonNull(terminalCause));
                             return;
                         }
+                        // Own the socket before consulting the injected clock again, so a
+                        // failed time read follows the same cleanup as a failed handshake.
                         connection = socket;
                         ioWorkers++;
                         attached = true;
@@ -219,7 +228,7 @@ public final class TcpTransport implements Transport {
                             connected = true;
                         }
                     } finally {
-                        handshakeDeadline.cancel();
+                        cancel(handshakeDeadline);
                     }
                     synchronized (callbacks) {
                         if (closed) {
@@ -387,17 +396,25 @@ public final class TcpTransport implements Transport {
     private void closeGracefully(Connection socket, Throwable cause) {
         // SSLSocket.close can wait on a peer or TLS I/O lock (JDK-8241239). Never run it
         // under the callback lock; the independent grace timer closes the plain socket.
-        TimerScheduler.Cancellable deadline = timer.schedule(
-                CLOSE_GRACE,
-                () -> abort(socket, cause)
-        );
+        TimerScheduler.Cancellable deadline = null;
         try {
+            deadline = timer.schedule(CLOSE_GRACE, () -> abort(socket, cause));
             socket.close();
-        } catch (IOException failure) {
+        } catch (Throwable failure) {
             cause.addSuppressed(failure);
         } finally {
-            deadline.cancel();
+            if (deadline != null) {
+                cancel(deadline);
+            }
             abort(socket, cause);
+        }
+    }
+
+    private static void cancel(TimerScheduler.Cancellable deadline) {
+        try {
+            deadline.cancel();
+        } catch (Throwable failure) {
+            log.warn("Transport timer cancellation failed", failure);
         }
     }
 

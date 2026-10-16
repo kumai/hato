@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
+import java.util.function.Supplier;
 
 import org.jspecify.annotations.Nullable;
 
@@ -27,6 +28,7 @@ import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
+import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
@@ -88,6 +90,8 @@ public final class ClientActor implements MqttClient {
 
     private final ClientIo io;
 
+    private final @Nullable CredentialsEvaluator credentials;
+
     private final Mailbox mailbox;
 
     private final DeliveryLanes lanes;
@@ -97,7 +101,8 @@ public final class ClientActor implements MqttClient {
 
     private long openedGeneration;
 
-    // The attempt of the latest connection; its reservation supplies both notifications.
+    // The attempt being connected or established, and null once its connection ends. Its
+    // reservation supplies both notifications, and only its credentials results are applied.
     private @Nullable ConnectionAttempt activeAttempt;
 
     // Admission and stopping share this lock so shutdown cannot miss a registered operation.
@@ -127,7 +132,9 @@ public final class ClientActor implements MqttClient {
             TimerScheduler scheduler,
             ConnectionListener listener,
             Transport.Factory transportFactory,
-            boolean cleanStart
+            boolean cleanStart,
+            @Nullable Supplier<MqttCredentials> credentials,
+            Packet.@Nullable Will will
     ) {
         this(
                 endpoint,
@@ -139,7 +146,9 @@ public final class ClientActor implements MqttClient {
                 listener,
                 transportFactory,
                 PacketCodec.of(MqttVersion.V3_1_1),
-                cleanStart
+                cleanStart,
+                credentials,
+                will
         );
     }
 
@@ -153,7 +162,9 @@ public final class ClientActor implements MqttClient {
             ConnectionListener listener,
             Transport.Factory transportFactory,
             PacketCodec codec,
-            boolean cleanStart
+            boolean cleanStart,
+            @Nullable Supplier<MqttCredentials> credentials,
+            Packet.@Nullable Will will
     ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
@@ -169,13 +180,25 @@ public final class ClientActor implements MqttClient {
         io = new ClientIo(
                 endpoint,
                 clientId,
-                timeout,
                 maxPacketSize,
                 transportFactory,
                 new IoEvents(),
                 codec
         );
-        core = new SessionCore(new CorePort(), clientId, timeout, keepAlive, cleanStart);
+        core = new SessionCore(
+                new CorePort(),
+                clientId,
+                timeout,
+                keepAlive,
+                cleanStart,
+                will,
+                credentials != null
+        );
+        this.credentials = credentials == null ? null : new CredentialsEvaluator(
+                threadName("credentials"),
+                credentials,
+                () -> post(0, this::applyCredentials, Mailbox.Kind.CREDENTIALS_READY, 0)
+        );
         Thread.ofVirtual().name(threadName("actor")).start(this::run);
     }
 
@@ -333,6 +356,10 @@ public final class ClientActor implements MqttClient {
                     failure = fatalFailure;
                 }
             }
+            if (credentials != null) {
+                // Drops a waiting result before the remaining cleanup.
+                credentials.close();
+            }
             try {
                 try {
                     if (failure != null) {
@@ -447,7 +474,8 @@ public final class ClientActor implements MqttClient {
                 case COMMAND -> "Command";
                 case INCOMING -> "Incoming";
                 case KEEP_ALIVE -> "Keep-alive";
-                case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE -> "Control";
+                case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE,
+                        CREDENTIALS_READY -> "Control";
             };
             signalFailure(generation, new MqttCapacityException(admission + " mailbox capacity"));
         }
@@ -455,6 +483,20 @@ public final class ClientActor implements MqttClient {
 
     private void signalFailure(long generation, Throwable failure) {
         terminate(generation, () -> core.failed(generation, failure));
+    }
+
+    /// A result belongs to the attempt, which may span more than one connection. One for an
+    /// ended attempt is dropped before it can read the clock on behalf of a later attempt.
+    private void applyCredentials() {
+        CredentialsEvaluator.Result result = requireNonNull(credentials).take();
+        if (result != null && result.attempt() == activeAttempt) {
+            core.credentials(
+                    result.attempt(),
+                    result.value(),
+                    result.failure(),
+                    nanoTime(openedGeneration)
+            );
+        }
     }
 
     private boolean deliveryFailed(DeliveryToken token, Throwable failure) {
@@ -571,12 +613,26 @@ public final class ClientActor implements MqttClient {
         private boolean unsolicitedPingResponseLogged;
 
         @Override
-        public void open(long generation, ConnectionAttempt attempt) {
+        public void beginAttempt(long generation, ConnectionAttempt attempt) {
             activeAttempt = attempt;
             openedGeneration = generation;
             mailbox.activateSession(core.sessionNumber());
             mailbox.activate(generation);
-            io.open(generation);
+        }
+
+        @Override
+        public void evaluateCredentials(ConnectionAttempt attempt) {
+            requireNonNull(credentials).evaluate(attempt);
+        }
+
+        @Override
+        public void cancelCredentials(ConnectionAttempt attempt) {
+            requireNonNull(credentials).cancel(attempt);
+        }
+
+        @Override
+        public void openTransport(long generation, Duration timeout) {
+            io.open(generation, timeout);
         }
 
         @Override
@@ -786,6 +842,7 @@ public final class ClientActor implements MqttClient {
                         cause
                 );
             }
+            activeAttempt = null;
             return handed;
         }
     }

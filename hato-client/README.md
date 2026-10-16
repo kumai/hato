@@ -26,15 +26,43 @@ JDK's default trust and verifies the broker hostname. Supply `sslContext(context
 for your own CA or client certificate, and `sslParameters(parameters -> ...)` for
 SNI, ALPN, or protocol settings.
 
+For username/password authentication, add
+`credentials(() -> MqttCredentials.of(username, passwordBytes))`. The password is
+binary and is copied when the credentials are created. For a username without a
+password, use `MqttCredentials.of(username)`. The supplier runs once per connection
+attempt on a virtual thread before opening the transport, so it can fetch a fresh token.
+Evaluation, transport establishment, and CONNACK share one connection timeout.
+Its exception, a null result, or exceeding the connection timeout fails that attempt with
+`MqttConnectException`. Only one supplier invocation runs at a time per client;
+respond to interruption so an abandoned invocation does not delay the next attempt.
+
+Use `will(MqttMessage.of(topic, payload, qos, retain))` to ask the broker to publish
+a last Will if the connection ends without receiving MQTT DISCONNECT. For normal
+shutdown, wait for `disconnect()` to complete successfully before calling `close()`,
+as shown below. Any QoS and retention flag are supported. A Will payload must fit in
+65,535 bytes; `build()` rejects larger payloads.
+
 To retain a session between connections, use an explicit `clientId` and set
 `cleanStart(false).sessionExpiry(Duration.ofDays(1))`. For MQTT 3.1.1, a positive
 expiry selects a persistent session; the broker determines how long it retains
 the session. The client keeps its own session state in memory.
 
 Connect with `connect()`. After `disconnect()` or a connection failure, the client can
-connect again, and established subscriptions resume on their existing handles. End with
-`disconnect()` rather than just closing the client: `close()`, including leaving a
-try-with-resources block, drops the connection without sending MQTT DISCONNECT.
+connect again, and established subscriptions resume on their existing handles. To shut
+down a connected client, wait for the asynchronous DISCONNECT write before closing:
+
+```java
+try {
+    client.disconnect().join();
+} finally {
+    client.close();
+}
+```
+
+`close()`, including leaving a try-with-resources block, shuts down immediately and can
+discard a pending DISCONNECT. Successful completion of `disconnect()` confirms the write,
+but the broker does not acknowledge receipt. If disconnection fails, the Will may still
+be published.
 
 ## Publishing
 

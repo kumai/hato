@@ -49,6 +49,8 @@ class ReceivePersistenceTest {
             "client",
             Duration.ofSeconds(30),
             Duration.ZERO,
+            false,
+            null,
             false
     );
     private long nextOperation;
@@ -639,8 +641,20 @@ class ReceivePersistenceTest {
         long generation;
 
         @Override
-        public void open(long generation, ConnectionAttempt attempt) {
+        public void beginAttempt(long generation, ConnectionAttempt attempt) {
             this.generation = generation;
+        }
+
+        @Override
+        public void evaluateCredentials(ConnectionAttempt attempt) {
+        }
+
+        @Override
+        public void cancelCredentials(ConnectionAttempt attempt) {
+        }
+
+        @Override
+        public void openTransport(long generation, Duration timeout) {
         }
 
         @Override

@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -274,7 +275,12 @@ class TlsConnectionTest {
         var receiver = new Receiver();
         try (
                 SSLServerSocket server = Tls.serverSocket();
-                var sut = new TcpTransport("trust", context, parameters)
+                var sut = new TcpTransport(
+                        "trust",
+                        context,
+                        parameters,
+                        DefaultTimerScheduler.instance
+                )
         ) {
             // Act
             sut.start(
@@ -355,16 +361,23 @@ class TlsConnectionTest {
 
     @Test
     void the_client_connection_deadline_cancels_an_unfinished_tls_handshake() throws Exception {
-        // Arrange: hold the TLS response while the client's connection clock remains frozen.
+        // Arrange: hold the TLS response. The transport measures its own 60-second deadline in
+        // real time, so only the client's frozen clock can expire during the test.
         var clock = new ManualTimerScheduler();
         var ended = new LinkedBlockingQueue<Disconnection>();
+        SSLContext context = Tls.clientContext();
         try (
                 var server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
                 MqttClient sut = MqttClient.builder()
                         .server(URI.create("mqtts://localhost:" + server.getLocalPort()))
                         .version(MqttVersion.V3_1_1)
-                        .sslContext(Tls.clientContext())
-                        .connectionTimeout(Duration.ofSeconds(5))
+                        .transportFactory(id -> new TcpTransport(
+                                id,
+                                context,
+                                context.getDefaultSSLParameters(),
+                                DefaultTimerScheduler.instance
+                        ))
+                        .connectionTimeout(Duration.ofSeconds(60))
                         .timerScheduler(clock)
                         .connectionListener(ended::add)
                         .build()
@@ -377,12 +390,12 @@ class TlsConnectionTest {
                 await().untilAsserted(() -> assertThat(clock.pendingTaskCount()).isEqualTo(1));
 
                 // Act
-                clock.advance(Duration.ofSeconds(5));
+                clock.advance(Duration.ofSeconds(60));
 
-                // Assert: connect fails and TLS cancellation closes the TCP peer as well.
+                // Assert: the client's deadline fails connect and closes the TCP peer as well.
                 assertThatThrownBy(() -> connected.get(5, SECONDS))
                         .hasCauseInstanceOf(MqttConnectException.class)
-                        .hasStackTraceContaining("TimeoutException");
+                        .hasRootCauseExactlyInstanceOf(TimeoutException.class);
                 assertThat(peer.getInputStream().readAllBytes()).isNotEmpty();
                 assertThat(ended).isEmpty();
                 assertThat(clock.pendingTaskCount()).isZero();
@@ -398,7 +411,12 @@ class TlsConnectionTest {
         var receiver = new Receiver();
         try (
                 var server = new CountingServerSocket();
-                var sut = new TcpTransport("close", context, context.getDefaultSSLParameters())
+                var sut = new TcpTransport(
+                        "close",
+                        context,
+                        context.getDefaultSSLParameters(),
+                        DefaultTimerScheduler.instance
+                )
         ) {
             sut.start(
                     URI.create("mqtts://localhost:" + server.getLocalPort()),

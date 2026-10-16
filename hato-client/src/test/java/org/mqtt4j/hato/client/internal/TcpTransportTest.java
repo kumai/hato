@@ -19,11 +19,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import javax.net.ssl.SSLContext;
 
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
@@ -57,7 +59,12 @@ class TcpTransportTest {
         SSLContext context = SSLContext.getDefault();
         Transport sut = transportScheme.equals("mqtt")
                 ? Transport.tcp("wrong-scheme")
-                : new TcpTransport("wrong-scheme", context, context.getDefaultSSLParameters());
+                : new TcpTransport(
+                        "wrong-scheme",
+                        context,
+                        context.getDefaultSSLParameters(),
+                        DefaultTimerScheduler.instance
+                );
         try (sut) {
             // Act & Assert
             assertThatThrownBy(() -> sut.start(
@@ -581,6 +588,255 @@ class TcpTransportTest {
         }
     }
 
+    @ParameterizedTest(name = "clock failure after handshake: {0}")
+    @ValueSource(booleans = {false, true})
+    void clock_failure_after_creating_a_socket_aborts_it(boolean afterHandshake) throws Exception {
+        // Arrange
+        var failure = new IllegalStateException("Clock failed");
+        var timer = new FailingTimer();
+        var socket = new GracefulConnection();
+        socket.handshakeAction = () -> timer.timeFailure = failure;
+        try (var sut = new TcpTransport(
+                "failed-clock",
+                "mqtt",
+                resolutionSlots,
+                this::resolve,
+                (_, _, _) -> {
+                    if (!afterHandshake) {
+                        timer.timeFailure = failure;
+                    }
+                    return socket;
+                },
+                timer
+        )) {
+            // Act
+            sut.start(SERVER, TIMEOUT, listener);
+
+            // Assert: even the first time read after connecting owns and releases the socket.
+            assertThat(listener.closed.get(5, SECONDS)).isSameAs(failure);
+            assertThat(socket.aborted).isDone();
+            assertThat(socket.closes).hasValue(0);
+            assertThat(listener.endings).hasValue(1);
+        } finally {
+            socket.abort();
+        }
+    }
+
+    @Test
+    void a_rejected_handshake_deadline_aborts_the_socket() throws Exception {
+        // Arrange
+        var failure = new IllegalStateException("Timer stopped");
+        var timer = new FailingTimer();
+        timer.scheduleFailure = failure;
+        var socket = new GracefulConnection();
+        try (TcpTransport sut = transport(socket, timer)) {
+            // Act
+            sut.start(SERVER, TIMEOUT, listener);
+
+            // Assert
+            assertThat(listener.closed.get(5, SECONDS)).isSameAs(failure);
+            assertThat(socket.aborted).isDone();
+            assertThat(socket.closes).hasValue(0);
+            assertThat(listener.endings).hasValue(1);
+        } finally {
+            socket.abort();
+        }
+    }
+
+    @Test
+    void failed_timer_cancellation_does_not_replace_a_handshake_failure() throws Exception {
+        // Arrange
+        var failure = new IOException("Handshake failed");
+        var socket = new GracefulConnection();
+        socket.handshakeFailure = failure;
+        var timer = new FailingTimer();
+        timer.cancellationFailure = new IllegalStateException("Cancellation failed");
+        try (TcpTransport sut = transport(socket, timer)) {
+            // Act
+            sut.start(SERVER, TIMEOUT, listener);
+
+            // Assert
+            assertThat(listener.closed.get(5, SECONDS)).isSameAs(failure);
+            assertThat(socket.aborted).isDone();
+            assertThat(listener.endings).hasValue(1);
+        } finally {
+            socket.abort();
+        }
+    }
+
+    @Test
+    void failed_timer_cancellation_does_not_end_a_successful_connection() throws Exception {
+        // Arrange
+        var socket = new GracefulConnection();
+        var timer = new FailingTimer();
+        timer.cancellationFailure = new IllegalStateException("Cancellation failed");
+        var receiver = new ConnectedListener();
+        try (TcpTransport sut = transport(socket, timer)) {
+            // Act
+            sut.start(SERVER, TIMEOUT, receiver);
+            receiver.connected.get(5, SECONDS);
+            timer.clock.advance(TIMEOUT);
+
+            // Assert: a callback left behind by failed cancellation is harmless after handshake.
+            assertThat(receiver.closed).isNotDone();
+            assertThat(socket.aborted).isNotDone();
+        } finally {
+            socket.abort();
+        }
+        assertThat(receiver.closed.get(5, SECONDS)).hasMessage("Transport closed");
+        assertThat(receiver.endings).hasValue(1);
+    }
+
+    @Test
+    void a_rejected_close_grace_deadline_still_aborts_the_socket() throws Exception {
+        // Arrange
+        var failure = new IllegalStateException("Timer stopped");
+        var socket = new GracefulConnection();
+        var timer = new FailingTimer();
+        var receiver = new ConnectedListener();
+        try (TcpTransport sut = transport(socket, timer)) {
+            sut.start(SERVER, TIMEOUT, receiver);
+            receiver.connected.get(5, SECONDS);
+            timer.scheduleFailure = failure;
+
+            // Act
+            sut.close();
+
+            // Assert: the original closing cause remains primary and cleanup finishes.
+            Throwable ended = receiver.closed.get(5, SECONDS);
+            assertThat(ended).hasMessage("Transport closed");
+            assertThat(ended.getSuppressed()).containsExactly(failure);
+            assertThat(socket.aborted).isDone();
+            assertThat(socket.closes).hasValue(0);
+            assertThat(receiver.endings).hasValue(1);
+        } finally {
+            socket.abort();
+        }
+    }
+
+    @Test
+    void failed_timer_cancellation_cannot_skip_abort_after_a_close_failure() throws Exception {
+        // Arrange
+        var failure = new IOException("TLS close failed");
+        var socket = new GracefulConnection();
+        socket.closeFailure = failure;
+        var timer = new FailingTimer();
+        var receiver = new ConnectedListener();
+        try (TcpTransport sut = transport(socket, timer)) {
+            sut.start(SERVER, TIMEOUT, receiver);
+            receiver.connected.get(5, SECONDS);
+            timer.cancellationFailure = new IllegalStateException("Cancellation failed");
+
+            // Act
+            sut.close();
+
+            // Assert: cancellation only logs; the close failure remains diagnostic information.
+            Throwable ended = receiver.closed.get(5, SECONDS);
+            assertThat(ended).hasMessage("Transport closed");
+            assertThat(ended.getSuppressed()).containsExactly(failure);
+            assertThat(socket.aborted).isDone();
+            assertThat(socket.closes).hasValue(1);
+            assertThat(receiver.endings).hasValue(1);
+        } finally {
+            socket.abort();
+        }
+    }
+
+    private TcpTransport transport(TcpTransport.Connection socket, TimerScheduler timer) {
+        return new TcpTransport(
+                "timer-failure",
+                "mqtt",
+                resolutionSlots,
+                this::resolve,
+                (_, _, _) -> socket,
+                timer
+        );
+    }
+
+    private static final class GracefulConnection implements TcpTransport.Connection {
+
+        final CompletableFuture<Void> aborted = new CompletableFuture<>();
+        final AtomicInteger closes = new AtomicInteger();
+        Runnable handshakeAction = () -> { };
+        @Nullable IOException handshakeFailure;
+        @Nullable IOException closeFailure;
+
+        @Override
+        public void handshake() throws IOException {
+            if (handshakeFailure != null) {
+                throw handshakeFailure;
+            }
+            handshakeAction.run();
+        }
+
+        @Override
+        public InputStream input() {
+            return new InputStream() {
+                @Override
+                public int read() {
+                    aborted.join();
+                    return -1;
+                }
+            };
+        }
+
+        @Override
+        public OutputStream output() {
+            return OutputStream.nullOutputStream();
+        }
+
+        @Override
+        public boolean closesGracefully() {
+            return true;
+        }
+
+        @Override
+        public void close() throws IOException {
+            closes.incrementAndGet();
+            if (closeFailure != null) {
+                throw closeFailure;
+            }
+        }
+
+        @Override
+        public void abort() {
+            aborted.complete(null);
+        }
+    }
+
+    private static final class FailingTimer implements TimerScheduler {
+
+        final ManualTimerScheduler clock = new ManualTimerScheduler();
+        volatile @Nullable RuntimeException timeFailure;
+        volatile @Nullable RuntimeException scheduleFailure;
+        volatile @Nullable RuntimeException cancellationFailure;
+
+        @Override
+        public long nanoTime() {
+            RuntimeException failure = timeFailure;
+            if (failure != null) {
+                throw failure;
+            }
+            return clock.nanoTime();
+        }
+
+        @Override
+        public Cancellable schedule(Duration delay, Runnable task) {
+            RuntimeException failure = scheduleFailure;
+            if (failure != null) {
+                throw failure;
+            }
+            Cancellable scheduled = clock.schedule(delay, task);
+            return () -> {
+                RuntimeException cancellation = cancellationFailure;
+                if (cancellation != null) {
+                    throw cancellation;
+                }
+                scheduled.cancel();
+            };
+        }
+    }
+
     private InetAddress resolve(String host) {
         lookups.incrementAndGet();
         return ADDRESS;
@@ -595,7 +851,7 @@ class TcpTransportTest {
         throw connectFailure;
     }
 
-    private static final class RecordingListener implements Transport.Listener {
+    private static class RecordingListener implements Transport.Listener {
 
         final CompletableFuture<Throwable> closed = new CompletableFuture<>();
         final AtomicInteger endings = new AtomicInteger();
@@ -619,6 +875,16 @@ class TcpTransportTest {
         public void onClosed(Throwable cause) {
             endings.incrementAndGet();
             closed.complete(cause);
+        }
+    }
+
+    private static final class ConnectedListener extends RecordingListener {
+
+        final CompletableFuture<Void> connected = new CompletableFuture<>();
+
+        @Override
+        public void onConnected() {
+            connected.complete(null);
         }
     }
 }

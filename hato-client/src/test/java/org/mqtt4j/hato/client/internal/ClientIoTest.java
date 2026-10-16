@@ -61,7 +61,6 @@ class ClientIoTest {
     private final ClientIo sut = new ClientIo(
             URI.create("mqtt://localhost"),
             "io-test",
-            Duration.ofSeconds(30),
             16 * 1024 * 1024,
             _ -> {
                 var transport = new SingleWriteTransport();
@@ -78,7 +77,7 @@ class ClientIoTest {
     }
 
     @Test
-    void debug_describes_packets_without_payloads_and_trace_contains_wire_bytes() {
+    void debug_summarizes_packets_and_trace_redacts_connect_wire_bytes() {
         // Arrange: capture the same System.Logger backend as applications using JUL.
         var jul = Logger.getLogger(ClientIo.class.getName());
         Level previousLevel = jul.getLevel();
@@ -147,11 +146,33 @@ class ClientIoTest {
                             "Received bytes: " + hex
                     );
 
+            // Act & Assert: CONNECT credentials never appear in attempted-write dumps.
+            records.clear();
+            var connect = new Packet.Connect(
+                    "client",
+                    MqttVersion.V3_1_1,
+                    true,
+                    60,
+                    null,
+                    "private-user",
+                    "private-password".getBytes(StandardCharsets.UTF_8),
+                    EMPTY
+            );
+            sut.send(1, 3, connect, null);
+            await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L, 3L));
+            assertThat(records).isNotEmpty().allSatisfy(record -> assertThat(record.getMessage())
+                    .doesNotContain(
+                            "private-user",
+                            "private-password",
+                            HexFormat.of().formatHex(codec.encode(connect))
+                    ));
+
             // Act & Assert: disabled levels emit neither packet summaries nor bytes.
             records.clear();
             jul.setLevel(Level.OFF);
-            sut.send(1, 3, packet, null);
-            await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L, 3L));
+            sut.send(1, 4, packet, null);
+            await().untilAsserted(() -> assertThat(events.tickets)
+                    .containsExactly(1L, 2L, 3L, 4L));
             requireNonNull(transport.listener).onBytes(bytes);
             assertThat(records).isEmpty();
         } finally {
@@ -251,24 +272,43 @@ class ClientIoTest {
 
     @ParameterizedTest
     @MethodSource("acknowledgements")
-    void acknowledgement_admission_keeps_byte_headroom_while_a_large_connect_is_active(
+    void maximum_connects_fit_the_reserved_budget_and_keep_control_headroom(
             Packet acknowledgement
-    ) {
-        // Arrange: the CONNECT consumes just over half of the reserved byte budget.
+    ) throws Exception {
+        // Arrange: three maximum CONNECTs leave less than the acknowledgement headroom.
         SingleWriteTransport transport = open(1);
+        var observed = new CompletableFuture<Packet>();
+        transport.beforeReturn = bytes -> observed.complete(codec.decode(bytes));
+        var will = new Packet.Will(
+                new Topic("t".repeat(65_535)),
+                new byte[65_535],
+                Qos.EXACTLY_ONCE,
+                true,
+                EMPTY
+        );
         var connect = new Packet.Connect(
-                "c".repeat(65_535), MqttVersion.V3_1_1, true, 60, null, null, null, EMPTY
+                "c".repeat(65_535),
+                MqttVersion.V3_1_1,
+                true,
+                65_535,
+                will,
+                "u".repeat(65_535),
+                new byte[65_535],
+                EMPTY
         );
         assertThat(sut.send(1, 1, connect, null)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 2, connect, null)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 3, connect, null)).isEqualTo(ACCEPTED);
         transport.awaitActive();
 
         // Act & Assert: the acknowledgement waits while connection control still has room.
-        assertThat(sut.send(1, 2, acknowledgement, null)).isEqualTo(FULL);
-        assertThat(sut.send(1, 3, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        assertThat(observed.get(5, SECONDS)).isEqualTo(connect);
+        assertThat(sut.send(1, 4, acknowledgement, null)).isEqualTo(FULL);
+        assertThat(sut.send(1, 5, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         transport.complete();
         await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
         assertThat(events.capacityGenerations).containsExactly(1L);
-        assertThat(sut.send(1, 4, acknowledgement, null)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 6, acknowledgement, null)).isEqualTo(ACCEPTED);
         assertThat(events.ends).isEmpty();
     }
 
@@ -994,7 +1034,7 @@ class ClientIoTest {
     }
 
     private SingleWriteTransport open(long generation) {
-        sut.open(generation);
+        sut.open(generation, Duration.ofSeconds(30));
         return transports.getLast();
     }
 

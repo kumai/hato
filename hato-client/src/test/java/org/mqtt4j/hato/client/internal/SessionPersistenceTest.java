@@ -842,7 +842,15 @@ class SessionPersistenceTest {
     }
 
     private SessionCore core(boolean cleanStart) {
-        return new SessionCore(port, "client", Duration.ofSeconds(30), Duration.ZERO, cleanStart);
+        return new SessionCore(
+                port,
+                "client",
+                Duration.ofSeconds(30),
+                Duration.ZERO,
+                cleanStart,
+                null,
+                false
+        );
     }
 
     private long operation() {
@@ -1027,8 +1035,20 @@ class SessionPersistenceTest {
         @Nullable TestSubscription registering;
 
         @Override
-        public void open(long connection, ConnectionAttempt attempt) {
+        public void beginAttempt(long connection, ConnectionAttempt attempt) {
             generation = connection;
+        }
+
+        @Override
+        public void evaluateCredentials(ConnectionAttempt attempt) {
+        }
+
+        @Override
+        public void cancelCredentials(ConnectionAttempt attempt) {
+        }
+
+        @Override
+        public void openTransport(long generation, Duration timeout) {
         }
 
         @Override

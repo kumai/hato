@@ -461,7 +461,12 @@ class TransportContractTest {
             SSLContext context = Tls.clientContext();
             SSLParameters parameters = context.getDefaultSSLParameters();
             parameters.setEndpointIdentificationAlgorithm("HTTPS");
-            socket = new TcpTransport("contract", context, parameters);
+            socket = new TcpTransport(
+                    "contract",
+                    context,
+                    parameters,
+                    DefaultTimerScheduler.instance
+            );
         } else {
             socket = Transport.tcp("contract");
         }

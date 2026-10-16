@@ -1,11 +1,14 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.util.Arrays;
 import java.util.List;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -97,6 +100,7 @@ class MailboxTest {
         var capacity = new Mailbox.Event(1, () -> { }, Mailbox.Kind.SEND_CAPACITY, 0);
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
         var closing = new Mailbox.Event(1, () -> { }, Mailbox.Kind.SUBSCRIPTION_CLOSE, 0);
+        var credentials = new Mailbox.Event(0, () -> { }, Mailbox.Kind.CREDENTIALS_READY, 0);
         sut.activate(1);
         assertThat(sut.offer(control)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(control)).isEqualTo(FULL);
@@ -106,10 +110,12 @@ class MailboxTest {
         assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(capacity)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(closing)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(credentials)).isEqualTo(ACCEPTED);
         for (int i = 0; i < 300; i++) {
             assertThat(sut.offer(ready)).isEqualTo(ACCEPTED);
             assertThat(sut.offer(capacity)).isEqualTo(ACCEPTED);
             assertThat(sut.offer(closing)).isEqualTo(ACCEPTED);
+            assertThat(sut.offer(credentials)).isEqualTo(ACCEPTED);
         }
         assertThat(sut.offer(control)).isEqualTo(FULL);
 
@@ -119,15 +125,17 @@ class MailboxTest {
         assertThat(sut.take(() -> false)).containsSame(command);
         assertThat(sut.take(() -> false)).containsSame(capacity);
         assertThat(sut.take(() -> false)).containsSame(closing);
+        assertThat(sut.take(() -> false)).containsSame(credentials);
         assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
         assertThat(sut.take(() -> false)).containsSame(command);
     }
 
+    static Stream<Mailbox.Kind> wakes() {
+        return Arrays.stream(Mailbox.Kind.values()).filter(Mailbox.Kind::wake);
+    }
+
     @ParameterizedTest
-    @EnumSource(
-            value = Mailbox.Kind.class,
-            names = {"DELIVERY_READY", "SEND_CAPACITY", "SUBSCRIPTION_CLOSE"}
-    )
+    @MethodSource("wakes")
     void taking_a_wake_rearms_it_before_its_action_runs(Mailbox.Kind kind) throws Exception {
         // Arrange
         var sut = new Mailbox(1, 0, 0, 0, 0);
@@ -153,10 +161,7 @@ class MailboxTest {
     }
 
     @ParameterizedTest
-    @EnumSource(
-            value = Mailbox.Kind.class,
-            names = {"DELIVERY_READY", "SEND_CAPACITY", "SUBSCRIPTION_CLOSE"}
-    )
+    @MethodSource("wakes")
     void discarding_an_old_wake_does_not_clear_the_current_generations_marker(Mailbox.Kind kind)
             throws Exception {
         // Arrange: a new marker is admitted before the old generation is discarded.
@@ -182,10 +187,7 @@ class MailboxTest {
     }
 
     @ParameterizedTest
-    @EnumSource(
-            value = Mailbox.Kind.class,
-            names = {"DELIVERY_READY", "SEND_CAPACITY", "SUBSCRIPTION_CLOSE"}
-    )
+    @MethodSource("wakes")
     void wakes_require_an_active_matching_generation(Mailbox.Kind kind) throws Exception {
         // Arrange
         var sut = new Mailbox(1, 0, 0, 0, 0);
@@ -205,10 +207,7 @@ class MailboxTest {
     }
 
     @ParameterizedTest
-    @EnumSource(
-            value = Mailbox.Kind.class,
-            names = {"DELIVERY_READY", "SEND_CAPACITY", "SUBSCRIPTION_CLOSE"}
-    )
+    @MethodSource("wakes")
     void client_wakes_survive_connection_end_and_rearm_before_their_action(Mailbox.Kind kind)
             throws Exception {
         // Arrange: every ordinary admission class is full, even while disconnected.

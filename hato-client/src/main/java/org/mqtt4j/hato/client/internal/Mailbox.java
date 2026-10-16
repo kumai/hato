@@ -31,7 +31,23 @@ final class Mailbox {
         KEEP_ALIVE,
         DELIVERY_READY,
         SEND_CAPACITY,
-        SUBSCRIPTION_CLOSE
+        CREDENTIALS_READY,
+        SUBSCRIPTION_CLOSE;
+
+        /// A wake keeps at most one queued event per generation and is never full. Admission,
+        /// queueing, and release all ask this, so a new kind is classified in one place.
+        boolean wake() {
+            return switch (this) {
+                case COMMAND,
+                     INCOMING,
+                     CONTROL,
+                     KEEP_ALIVE -> false;
+                case DELIVERY_READY,
+                     SEND_CAPACITY,
+                     CREDENTIALS_READY,
+                     SUBSCRIPTION_CLOSE -> true;
+            };
+        }
     }
 
     record Event(long generation, Runnable action, Kind kind, int bytes) {
@@ -117,8 +133,7 @@ final class Mailbox {
         if (event.generation() != 0 && event.generation() != activeGeneration) {
             return OfferResult.STALE;
         }
-        if (event.kind() == Kind.DELIVERY_READY || event.kind() == Kind.SEND_CAPACITY
-                || event.kind() == Kind.SUBSCRIPTION_CLOSE) {
+        if (event.kind().wake()) {
             Event pending = wakes.get(event.kind());
             if (pending != null && pending.generation() == event.generation()) {
                 return OfferResult.ACCEPTED;
@@ -131,12 +146,15 @@ final class Mailbox {
                     || event.bytes() > incomingByteLimit - incomingBytes;
             case CONTROL -> controlCount >= controlLimit;
             case KEEP_ALIVE -> keepAlive.size() >= KEEP_ALIVE_LIMIT;
-            case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE -> false;
+            case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE, CREDENTIALS_READY -> false;
         };
         if (full) {
             return OfferResult.FULL;
         }
         (event.kind() == Kind.KEEP_ALIVE ? keepAlive : events).addLast(event);
+        if (event.kind().wake()) {
+            wakes.put(event.kind(), event);
+        }
         switch (event.kind()) {
             case COMMAND -> {
                 commandCount++;
@@ -150,8 +168,6 @@ final class Mailbox {
             case KEEP_ALIVE -> {
                 // The keep-alive queue's size is its count.
             }
-            case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE ->
-                    wakes.put(event.kind(), event);
         }
         notifyAll();
         return OfferResult.ACCEPTED;
@@ -250,6 +266,9 @@ final class Mailbox {
     }
 
     private void release(Event event) {
+        if (event.kind().wake()) {
+            wakes.remove(event.kind(), event);
+        }
         switch (event.kind()) {
             case COMMAND -> {
                 commandCount--;
@@ -263,8 +282,6 @@ final class Mailbox {
             case KEEP_ALIVE -> {
                 // Leaving the keep-alive queue releases its slot.
             }
-            case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE ->
-                    wakes.remove(event.kind(), event);
         }
     }
 }

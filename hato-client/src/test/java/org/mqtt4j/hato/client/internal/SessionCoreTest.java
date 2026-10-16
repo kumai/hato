@@ -5,6 +5,7 @@ import java.lang.management.ManagementFactory;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
@@ -30,6 +31,7 @@ import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
+import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
@@ -65,8 +67,228 @@ class SessionCoreTest {
             "client",
             Duration.ofSeconds(30),
             Duration.ofSeconds(10),
-            true
+            true,
+            null,
+            false
     );
+
+    @Test
+    void credentials_precede_transport_creation_and_connect_waits_for_the_transport() {
+        // Arrange
+        SessionCore sut = credentialedCore();
+        ConnectionAttempt attempt = attempt(1);
+        var credentials = MqttCredentials.of("user", new byte[] {1, 2});
+        sut.connect(attempt, 0);
+
+        // Act & Assert
+        assertThat(port.evaluations).containsExactly(attempt);
+        assertThat(port.transportOpenings).isEmpty();
+        assertThat(port.sent).isEmpty();
+        sut.credentials(attempt, credentials, null, 0);
+        sut.credentials(attempt, MqttCredentials.of("replacement"), null, 0);
+        assertThat(port.transportOpenings)
+                .containsExactly(new TransportOpening(1, Duration.ofSeconds(30)));
+        assertThat(port.sent).isEmpty();
+        sut.opened(1);
+        sut.opened(1);
+
+        assertThat(port.sent).singleElement().isInstanceOfSatisfying(
+                Packet.Connect.class,
+                packet -> {
+                    assertThat(packet.username()).isEqualTo("user");
+                    assertThat(packet.password()).containsExactly(1, 2);
+                }
+        );
+    }
+
+    @Test
+    void a_connection_without_a_credentials_supplier_opens_transport_immediately() {
+        // Act
+        sut.connect(attempt(1), 0);
+
+        // Assert
+        assertThat(port.evaluations).isEmpty();
+        assertThat(port.transportOpenings)
+                .containsExactly(new TransportOpening(1, Duration.ofSeconds(30)));
+        assertThat(port.sent).isEmpty();
+        sut.opened(1);
+        assertThat(port.sent).singleElement().isInstanceOf(Packet.Connect.class);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {0, Long.MAX_VALUE - 1})
+    void credentials_use_the_original_deadline_even_when_the_clock_wraps(long started) {
+        // Arrange
+        SessionCore sut = credentialedCore();
+        ConnectionAttempt attempt = attempt(1);
+        sut.connect(attempt, started);
+
+        // Act
+        sut.credentials(attempt, MqttCredentials.of("user"), null, started + seconds(20));
+
+        // Assert: transport gets only the remaining budget and the total timer is unchanged.
+        assertThat(port.transportOpenings)
+                .containsExactly(new TransportOpening(1, Duration.ofSeconds(10)));
+        assertThat(port.timers).containsEntry(CONNECT, Duration.ofSeconds(30));
+        assertThat(port.sent).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {30_000_000_000L, 30_000_000_001L, 45_000_000_000L})
+    void expired_credentials_cannot_open_transport_before_the_timeout_callback(long elapsed) {
+        // Arrange: the scheduled deadline has passed, but its callback has not run yet.
+        SessionCore sut = credentialedCore();
+        ConnectionAttempt attempt = attempt(1);
+        sut.connect(attempt, 0);
+
+        // Act
+        sut.credentials(attempt, MqttCredentials.of("late"), null, elapsed);
+
+        // Assert
+        assertThat(port.transportOpenings).isEmpty();
+        assertThat(port.sent).isEmpty();
+        assertThat(requireNonNull(port.results.get(1L)).failure())
+                .isInstanceOf(MqttConnectException.class)
+                .hasCauseInstanceOf(TimeoutException.class);
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.timers).isEmpty();
+    }
+
+    @Test
+    void a_deadline_during_evaluation_names_the_credentials_phase_and_cancels_it() {
+        // Arrange
+        SessionCore sut = credentialedCore();
+        ConnectionAttempt attempt = attempt(1);
+        sut.connect(attempt, 0);
+
+        // Act
+        sut.timer(1, CONNECT, seconds(30));
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(1L)).failure())
+                .isInstanceOf(MqttConnectException.class)
+                .hasRootCauseMessage("Credentials deadline expired");
+        assertThat(port.cancellations).containsExactly(attempt);
+        assertThat(port.transportOpenings).isEmpty();
+    }
+
+    @Test
+    void a_supplier_failure_ends_only_its_attempt_and_preserves_the_cause() {
+        // Arrange
+        SessionCore sut = credentialedCore();
+        ConnectionAttempt attempt = attempt(1);
+        var failure = new IllegalArgumentException("credentials unavailable");
+        sut.connect(attempt, 0);
+
+        // Act
+        sut.credentials(attempt, null, failure, seconds(20));
+        sut.connect(attempt(2), seconds(20));
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(1L)).failure())
+                .isInstanceOf(MqttConnectException.class).hasCause(failure);
+        assertThat(port.transportOpenings).isEmpty();
+        assertThat(port.sent).isEmpty();
+        assertThat(sut.state()).isEqualTo(CONNECTING);
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void stale_credentials_cannot_cross_attempt_switch_deadline_or_close(int seed) {
+        // Arrange
+        SessionCore sut = credentialedCore();
+        ConnectionAttempt old = attempt(1);
+        ConnectionAttempt current = attempt(2);
+        var credentials = MqttCredentials.of("old");
+        sut.connect(old, 0);
+        var events = new ArrayList<Runnable>(List.of(
+                () -> {
+                    if (port.transportOpenings.stream().anyMatch(open -> open.generation() == 1)) {
+                        sut.opened(1);
+                    }
+                },
+                () -> sut.credentials(old, credentials, null, 0),
+                () -> sut.credentials(old, null, new IOException("old failure"), 0),
+                () -> sut.timer(1, CONNECT, seconds(30)),
+                () -> {
+                    sut.failed(1, new IOException("replace attempt"));
+                    sut.connect(current, 0);
+                },
+                () -> sut.close(null)
+        ));
+        Collections.shuffle(events, new Random(seed));
+
+        // Act
+        events.forEach(Runnable::run);
+        sut.credentials(old, credentials, null, 0);
+        sut.credentials(current, MqttCredentials.of("new"), null, 0);
+
+        // Assert: only the first connection can send before it ends; the second never has
+        // credentials until after close. Every admitted operation has exactly one outcome.
+        assertThat(port.sent).hasSizeLessThanOrEqualTo(1);
+        assertThat(port.transportOpenings).hasSizeLessThanOrEqualTo(1);
+        assertThat(port.transportOpenings).allSatisfy(open -> {
+            assertThat(open.generation()).isEqualTo(1);
+        });
+        assertThat(port.sent).allSatisfy(packet -> assertThat(packet)
+                .isInstanceOfSatisfying(
+                        Packet.Connect.class,
+                        connect -> assertThat(connect.username()).isEqualTo("old")
+                ));
+        assertThat(port.results).containsOnlyKeys(1L, 2L);
+        assertThat(sut.state()).isEqualTo(CLOSED);
+    }
+
+    @Test
+    void old_credentials_and_failures_cannot_change_a_later_attempt() {
+        // Arrange
+        SessionCore sut = credentialedCore();
+        ConnectionAttempt old = attempt(1);
+        ConnectionAttempt current = attempt(2);
+        sut.connect(old, 0);
+        sut.timer(1, CONNECT, seconds(30));
+        sut.connect(current, seconds(30));
+
+        // Act
+        sut.credentials(old, null, new IOException("late failure"), seconds(31));
+        sut.credentials(old, MqttCredentials.of("old"), null, seconds(31));
+
+        // Assert
+        assertThat(port.cancellations).containsExactly(old);
+        assertThat(sut.state()).isEqualTo(CONNECTING);
+        assertThat(port.transportOpenings).isEmpty();
+        assertThat(port.sent).isEmpty();
+        assertThat(port.results).containsOnlyKeys(1L);
+        sut.credentials(current, MqttCredentials.of("current"), null, seconds(32));
+        assertThat(port.transportOpenings)
+                .containsExactly(new TransportOpening(2, Duration.ofSeconds(28)));
+        sut.opened(2);
+        assertThat(port.sent).singleElement().isInstanceOfSatisfying(
+                Packet.Connect.class,
+                packet -> assertThat(packet.username()).isEqualTo("current")
+        );
+    }
+
+    @Test
+    void an_unsolicited_connack_cannot_bypass_credentials_evaluation() {
+        // Arrange
+        SessionCore sut = credentialedCore();
+        ConnectionAttempt attempt = attempt(1);
+        sut.connect(attempt, 0);
+
+        // Act
+        sut.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        sut.credentials(attempt, MqttCredentials.of("late"), null, 0);
+
+        // Assert
+        assertThat(port.sent).isEmpty();
+        assertThat(port.transportOpenings).isEmpty();
+        assertThat(port.connections).isEmpty();
+        assertThat(requireNonNull(port.results.get(1L)).failure())
+                .isInstanceOf(MqttConnectException.class)
+                .hasCauseInstanceOf(MqttProtocolException.class);
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+    }
 
     @Test
     void deferred_removal_waits_for_send_capacity_and_completes_only_after_unsuback() {
@@ -2581,6 +2803,19 @@ class SessionCoreTest {
         return new ConnectionAttempt(operation, null);
     }
 
+    /// The same configuration as `sut`, except that attempts evaluate a credentials supplier.
+    private SessionCore credentialedCore() {
+        return new SessionCore(
+                port,
+                "client",
+                Duration.ofSeconds(30),
+                Duration.ofSeconds(10),
+                true,
+                null,
+                true
+        );
+    }
+
     private void accept() {
         receive(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
     }
@@ -2622,6 +2857,9 @@ class SessionCoreTest {
     }
 
     private record Connection(long generation, ConnAck ack) {
+    }
+
+    private record TransportOpening(long generation, Duration timeout) {
     }
 
     private static final class TestSubscription implements Subscription {
@@ -2666,6 +2904,9 @@ class SessionCoreTest {
         final Map<SessionCore.Timer, Duration> timers = new EnumMap<>(SessionCore.Timer.class);
         final List<Long> opened = new ArrayList<>();
         final List<ConnectionAttempt> attempts = new ArrayList<>();
+        final List<ConnectionAttempt> evaluations = new ArrayList<>();
+        final List<ConnectionAttempt> cancellations = new ArrayList<>();
+        final List<TransportOpening> transportOpenings = new ArrayList<>();
         final List<Connection> connections = new ArrayList<>();
         final List<Long> registered = new ArrayList<>();
         final List<Long> removed = new ArrayList<>();
@@ -2686,9 +2927,26 @@ class SessionCoreTest {
         };
 
         @Override
-        public void open(long generation, ConnectionAttempt attempt) {
+        public void beginAttempt(long generation, ConnectionAttempt attempt) {
             opened.add(generation);
             attempts.add(attempt);
+        }
+
+        @Override
+        public void evaluateCredentials(ConnectionAttempt attempt) {
+            assertThat(timers).containsKey(CONNECT);
+            evaluations.add(attempt);
+        }
+
+        @Override
+        public void cancelCredentials(ConnectionAttempt attempt) {
+            cancellations.add(attempt);
+        }
+
+        @Override
+        public void openTransport(long generation, Duration timeout) {
+            assertThat(timers).containsKey(CONNECT);
+            transportOpenings.add(new TransportOpening(generation, timeout));
         }
 
         @Override

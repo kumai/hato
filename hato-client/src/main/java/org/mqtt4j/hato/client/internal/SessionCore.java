@@ -23,6 +23,7 @@ import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
+import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
@@ -69,7 +70,14 @@ final class SessionCore {
 
     interface Port {
 
-        void open(long generation, ConnectionAttempt attempt);
+        void beginAttempt(long generation, ConnectionAttempt attempt);
+
+        void evaluateCredentials(ConnectionAttempt attempt);
+
+        /// Called when the attempt ends before its credentials arrive.
+        void cancelCredentials(ConnectionAttempt attempt);
+
+        void openTransport(long generation, Duration timeout);
 
         void connected(long generation, ConnAck ack);
 
@@ -179,6 +187,10 @@ final class SessionCore {
 
     private final boolean cleanStart;
 
+    private final Packet.@Nullable Will will;
+
+    private final boolean credentialsRequired;
+
     // Broker registrations can survive even when their last local operation was unconfirmed.
     private boolean sessionPresent;
 
@@ -187,6 +199,12 @@ final class SessionCore {
     private long generation;
 
     private @Nullable ConnectionAttempt connecting;
+
+    // The connecting attempt's credentials. Every connection of the attempt sends the same
+    // value, and the attempt's end drops it.
+    private boolean credentialsReady;
+
+    private @Nullable MqttCredentials attemptCredentials;
 
     private long disconnectOperation;
 
@@ -198,7 +216,11 @@ final class SessionCore {
 
     private long lastSent;
 
+    private long connectionDeadline;
+
     private boolean transportConnected;
+
+    private boolean connectSent;
 
     private boolean awaitingPing;
 
@@ -265,13 +287,17 @@ final class SessionCore {
             String clientId,
             Duration timeout,
             Duration keepAlive,
-            boolean cleanStart
+            boolean cleanStart,
+            Packet.@Nullable Will will,
+            boolean credentialsRequired
     ) {
         this.port = port;
         this.clientId = clientId;
         this.timeout = timeout;
         this.keepAlive = keepAlive;
         this.cleanStart = cleanStart;
+        this.will = will;
+        this.credentialsRequired = credentialsRequired;
     }
 
     State state() {
@@ -296,15 +322,55 @@ final class SessionCore {
         state = State.CONNECTING;
         generation++;
         connecting = attempt;
+        credentialsReady = !credentialsRequired;
+        attemptCredentials = null;
         lastSent = now;
+        connectionDeadline = now + timeout.toNanos();
         transportConnected = false;
-        port.open(generation, connecting);
+        connectSent = false;
+        port.beginAttempt(generation, connecting);
         port.schedule(generation, Timer.CONNECT, timeout);
+        if (credentialsReady) {
+            port.openTransport(generation, timeout);
+        } else {
+            port.evaluateCredentials(attempt);
+        }
     }
 
     void opened(long connection) {
         if (connection == generation && state == State.CONNECTING) {
             transportConnected = true;
+            sendConnect();
+        }
+    }
+
+    void credentials(
+            ConnectionAttempt attempt,
+            @Nullable MqttCredentials value,
+            @Nullable Throwable failure,
+            long now
+    ) {
+        if (connecting != attempt || state != State.CONNECTING || credentialsReady) {
+            return;
+        }
+        if (failure != null) {
+            failed(generation, new MqttConnectException("Cannot obtain credentials", failure));
+            return;
+        }
+        long remaining = connectionDeadline - now;
+        if (remaining <= 0) {
+            failed(generation, new TimeoutException("Credentials deadline expired"));
+            return;
+        }
+        attemptCredentials = requireNonNull(value);
+        credentialsReady = true;
+        port.openTransport(generation, Duration.ofNanos(remaining));
+    }
+
+    private void sendConnect() {
+        if (transportConnected && credentialsReady && !connectSent) {
+            connectSent = true;
+            MqttCredentials credentials = attemptCredentials;
             sendRequired(
                     ++nextTicket,
                     new Packet.Connect(
@@ -312,9 +378,9 @@ final class SessionCore {
                             MqttVersion.V3_1_1,
                             cleanStart,
                             (int) keepAlive.toSeconds(),
-                            null,
-                            null,
-                            null,
+                            will,
+                            credentials == null ? null : credentials.username(),
+                            credentials == null ? null : credentials.password().orElse(null),
                             EMPTY
                     )
             );
@@ -330,7 +396,9 @@ final class SessionCore {
             return;
         }
         if (state == State.CONNECTING) {
-            if (!(packet instanceof Packet.ConnAck ack)) {
+            if (!credentialsReady) {
+                failed(connection, protocolError("Received packet before credentials were ready"));
+            } else if (!(packet instanceof Packet.ConnAck ack)) {
                 failed(connection, protocolError("Expected CONNACK"));
             } else if (ack.reasonCode() != ReasonCode.SUCCESS) {
                 failed(connection, new MqttConnectException(
@@ -363,6 +431,7 @@ final class SessionCore {
                 port.cancel(Timer.CONNECT);
                 long operation = requireNonNull(connecting).operation;
                 connecting = null;
+                attemptCredentials = null;
                 if (operation != 0) {
                     port.complete(operation, result, null);
                 }
@@ -1244,7 +1313,9 @@ final class SessionCore {
         switch (timer) {
             case CONNECT -> {
                 if (state == State.CONNECTING) {
-                    String phase = transportConnected ? "CONNACK" : "Transport connection";
+                    String phase = !credentialsReady
+                            ? "Credentials"
+                            : transportConnected ? "CONNACK" : "Transport connection";
                     failed(connection, new TimeoutException(phase + " deadline expired"));
                 }
             }
@@ -1498,8 +1569,12 @@ final class SessionCore {
                 case MqttConnectException refusal -> refusal;
                 default -> new MqttConnectException("Connection failed", cause);
             };
+            if (!credentialsReady) {
+                port.cancelCredentials(connecting);
+            }
             long operation = connecting.operation;
             connecting = null;
+            attemptCredentials = null;
             if (operation != 0) {
                 port.complete(operation, null, failure);
             }

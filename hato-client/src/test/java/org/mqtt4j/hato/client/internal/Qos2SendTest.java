@@ -921,7 +921,15 @@ class Qos2SendTest {
     }
 
     private SessionCore core(boolean cleanStart) {
-        return new SessionCore(port, "client", Duration.ofSeconds(30), Duration.ZERO, cleanStart);
+        return new SessionCore(
+                port,
+                "client",
+                Duration.ofSeconds(30),
+                Duration.ZERO,
+                cleanStart,
+                null,
+                false
+        );
     }
 
     private void connect(boolean present) {

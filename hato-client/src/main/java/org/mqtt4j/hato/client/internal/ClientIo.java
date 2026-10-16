@@ -59,7 +59,7 @@ final class ClientIo {
     // full and resumes on returned capacity, so a whole inflight window need not fit at once.
     private static final int RESERVED_SEND_LIMIT = 16;
 
-    private static final int RESERVED_SEND_BYTE_LIMIT = 128 * 1024;
+    private static final int RESERVED_SEND_BYTE_LIMIT = 1024 * 1024;
 
     // Acknowledgements leave two slots and byte headroom for lifecycle control (CONNECT,
     // PINGREQ, DISCONNECT) in the same budget and FIFO. Old connections still holding send
@@ -71,8 +71,6 @@ final class ClientIo {
     private final URI endpoint;
 
     private final String clientId;
-
-    private final Duration timeout;
 
     private final int maxPacketSize;
 
@@ -100,7 +98,6 @@ final class ClientIo {
     ClientIo(
             URI endpoint,
             String clientId,
-            Duration timeout,
             int maxPacketSize,
             Transport.Factory factory,
             Events events,
@@ -108,7 +105,6 @@ final class ClientIo {
     ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
-        this.timeout = timeout;
         this.maxPacketSize = maxPacketSize;
         this.factory = factory;
         this.events = events;
@@ -116,7 +112,7 @@ final class ClientIo {
         Thread.ofVirtual().name("hato-" + clientId + "-sender").start(this::run);
     }
 
-    void open(long generation) {
+    void open(long generation, Duration timeout) {
         Transport transport;
         try {
             transport = factory.create(clientId);
@@ -241,7 +237,7 @@ final class ClientIo {
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(header, message, false, receipt),
+                new Outbound(header, message, false, false, receipt),
                 false,
                 false,
                 "Publish",
@@ -272,6 +268,8 @@ final class ClientIo {
                         null,
                         packet instanceof Packet.PubAck || packet instanceof Packet.PubRec
                                 || packet instanceof Packet.PubComp,
+                        // CONNECT carries credentials, so its bytes never reach a log.
+                        packet instanceof Packet.Connect,
                         receipt
                 ),
                 reserved,
@@ -360,7 +358,12 @@ final class ClientIo {
         SendQueue.Send<Outbound> send = write.send();
         try {
             byte[] bytes = send.value().encode(codec);
-            log.trace("Write attempt for ticket {}: {}", send.ticket(), bytes);
+            if (send.value().redacted()) {
+                log.trace("Write attempt for ticket {}: {} bytes (redacted)",
+                        send.ticket(), bytes.length);
+            } else {
+                log.trace("Write attempt for ticket {}: {}", send.ticket(), bytes);
+            }
             synchronized (sending) {
                 if (connection.closed) {
                     return;
@@ -538,6 +541,7 @@ final class ClientIo {
             byte[] header,
             @Nullable MqttMessage message,
             boolean notifyWritten,
+            boolean redacted,
             @Nullable SendReceipt receipt
     ) {
 
