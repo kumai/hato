@@ -5,6 +5,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -79,7 +80,16 @@ final class SessionCore {
 
         void openTransport(long generation, Duration timeout);
 
+        /// Opens admission for the connection a CONNACK established. Continued subscriptions are
+        /// reconciled next, so observers completed there can already use the connection.
+        void admit(long generation);
+
+        /// Announces the admitted connection once continued subscriptions are reconciled.
         void connected(long generation, ConnAck ack);
+
+        /// A requested disconnect is pending; established observations wait for a later
+        /// connection.
+        void disconnecting();
 
         void resubscribeFailed(Subscription handle, MqttSubscribeException failure);
 
@@ -159,8 +169,8 @@ final class SessionCore {
 
     // Broker registrations outlive locally closed handles until UNSUBACK or a CONNACK without
     // Session Present, so they are bounded apart from the delivery lanes that local closure
-    // releases.
-    private static final int REGISTRATION_LIMIT = 256;
+    // releases. The mailbox bounds registrations still queued for the actor by the same limit.
+    static final int REGISTRATION_LIMIT = 256;
 
     // Bound queued completion events even when I/O returns capacity during an actor drain.
     private static final int ACK_WRITE_LIMIT = 16;
@@ -169,13 +179,13 @@ final class SessionCore {
     // the same way. Replayed PUBRELs are already bounded by the session's exchanges.
     private static final int RELEASE_WRITE_LIMIT = 16;
 
-    // Close has no public operation slot. Bound its in-flight exchanges separately, so a
-    // batch of closures cannot flood the actor with send completions and UNSUBACKs.
+    // Removals use no operation slots. Bound their exchanges so a batch of closures cannot
+    // flood the actor with send completions and UNSUBACKs.
     private static final int CLOSE_INFLIGHT_LIMIT = 16;
 
-    // Re-creation after CONNACK has no public operation slot either. Bound its pending SUBACKs
-    // apart from closures, so many retained subscriptions cannot flood the actor.
-    private static final int RESTORE_INFLIGHT_LIMIT = 16;
+    // Registrations use no operation slots either. Bound their pending SUBACKs apart from
+    // removals, so many retained subscriptions cannot flood the actor.
+    private static final int SUBSCRIBE_INFLIGHT_LIMIT = 16;
 
     private final Port port;
 
@@ -278,7 +288,7 @@ final class SessionCore {
     // A repeated PUBREC can leave two answers in flight, and the first must not free the id.
     private final Map<Integer, Integer> unknownReleases = new HashMap<>();
 
-    private int restoringInFlight;
+    private int subscribingInFlight;
 
     private int closingInFlight;
 
@@ -427,19 +437,14 @@ final class SessionCore {
                 }
                 state = State.CONNECTED;
                 var result = ConnAck.of(ack.sessionPresent());
-                port.connected(generation, result);
-                port.cancel(Timer.CONNECT);
-                long operation = requireNonNull(connecting).operation;
-                connecting = null;
-                attemptCredentials = null;
-                if (operation != 0) {
-                    port.complete(operation, result, null);
-                }
+                port.admit(generation);
+                // Reconcile before announcing, so connect() and onConnected already find continued
+                // subscriptions established on this connection.
                 for (LocalSubscription local : List.copyOf(subscriptions.values())) {
-                    if (local.closed) {
+                    if (local.removal != null) {
                         if (ack.sessionPresent()) {
                             local.established = true;
-                            beginRemoval(local.closeOperation, local, true);
+                            queuedClosures.addLast(local.removal);
                         } else {
                             removeSubscription(local, null);
                             finishRemoval(local);
@@ -447,7 +452,17 @@ final class SessionCore {
                     } else if (!ack.sessionPresent() || !local.established) {
                         local.established = false;
                         deferred.addLast(local);
+                    } else {
+                        port.subscribed(local.handle, local.granted);
                     }
+                }
+                port.connected(generation, result);
+                port.cancel(Timer.CONNECT);
+                long operation = requireNonNull(connecting).operation;
+                connecting = null;
+                attemptCredentials = null;
+                if (operation != 0) {
+                    port.complete(operation, result, null);
                 }
                 if (!keepAlive.isZero()) {
                     scheduleKeepAlive(now);
@@ -599,20 +614,24 @@ final class SessionCore {
     }
 
     void subscribe(long operation, Subscribe request) {
-        if (!ready(operation)) {
+        if (state == State.CLOSED) {
+            port.complete(operation, null, new IllegalStateException("Client is closed"));
             return;
         }
         if (subscriptions.values().stream()
-                .anyMatch(local -> local.handle != null && local.filter.equals(request.filter()))) {
+                .anyMatch(local -> local.filter.equals(request.filter()))) {
             port.complete(operation, null, new IllegalStateException(
                     "Subscription already exists: " + request.filter().pattern()
             ));
             return;
         }
-        var local = new LocalSubscription(operation, request);
+        Optional<SharedTopicFilter> sharedFilter = SharedTopicFilter.parse(request.filter());
+        boolean shared = sharedFilter.isPresent();
+        TopicFilter matchingFilter = sharedFilter.map(SharedTopicFilter::filter)
+                .orElse(request.filter());
         Optional<LocalSubscription> conflict = subscriptions.values().stream()
-                .filter(existing -> existing.handle != null && (local.shared || existing.shared)
-                        && filtersOverlap(local.matchingFilter, existing.matchingFilter))
+                .filter(existing -> (shared || existing.shared)
+                        && filtersOverlap(matchingFilter, existing.matchingFilter))
                 .findFirst();
         if (conflict.isPresent()) {
             port.complete(operation, null, new IllegalStateException(
@@ -627,114 +646,67 @@ final class SessionCore {
             return;
         }
 
-        OptionalInt allocated = allocatePacketId();
-        if (allocated.isEmpty()) {
-            capacityFailure(operation, "Packet identifier capacity");
-            return;
-        }
-        int id = allocated.getAsInt();
         // Registration precedes send: a broker may publish before sending SUBACK.
         Optional<Subscription> registered = port.registerSubscription(operation);
         if (registered.isEmpty()) {
-            session.packetIds.release(id);
             capacityFailure(operation, "Subscription capacity");
             return;
         }
-        local.handle = registered.orElseThrow();
+        var local = new LocalSubscription(
+                operation,
+                request,
+                shared,
+                matchingFilter,
+                registered.orElseThrow()
+        );
         subscriptions.put(operation, local);
-        subscribing.put(id, local);
-        var packet = subscriptionPacket(local, id);
-        if (port.send(generation, ++nextTicket, packet, null) == SendQueue.OfferResult.FULL) {
-            subscribing.remove(id);
-            subscriptions.remove(operation);
-            session.packetIds.release(id);
-            port.removeSubscription(operation, requireNonNull(local.handle), null);
-            capacityFailure(operation, "Send queue capacity");
-        } else {
-            // Unsent cleanup of a failed registration must not remove its replacement.
-            // Already admitted UNSUBSCRIBE packets precede this SUBSCRIBE in the send FIFO.
-            for (LocalSubscription abandoned : List.copyOf(subscriptions.values())) {
-                if (abandoned.handle == null && abandoned.filter.equals(local.filter)
-                        && (abandoned.removal == null
-                                || queuedClosures.contains(abandoned.removal))) {
-                    removeSubscription(abandoned, null);
-                    finishRemoval(abandoned);
-                }
-            }
+        if (state == State.CONNECTED && disconnectOperation == 0) {
+            deferred.addLast(local);
+            drainDeferred();
         }
     }
 
     void unsubscribe(long operation, long subscriptionId) {
-        if (!ready(operation)) {
-            return;
-        }
-        LocalSubscription local = subscriptions.get(subscriptionId);
-        if (local == null || local.closed) {
-            port.complete(operation, null, null);
-            return;
-        }
-        if (local.removing) {
-            port.complete(operation, null, new IllegalStateException("Subscription is not active"));
-            return;
-        }
-        local.removing = true;
-        beginRemoval(operation, local, false);
-    }
-
-    /// Local close survives connection loss, including a close while disconnected.
-    void closeSubscription(long operation, long subscriptionId) {
         LocalSubscription local = subscriptions.get(subscriptionId);
         if (local == null) {
             port.complete(operation, null, null);
             return;
         }
-        local.closed = true;
-        local.removing = true;
-        local.closeOperation = operation;
-        if (state != State.CONNECTED || disconnectOperation != 0) {
+        if (local.removal != null) {
+            // The shell starts one durable removal per registration, observed by all its callers.
             return;
         }
-        if (local.removal == null) {
-            beginRemoval(operation, local, true);
-        }
-        drainClosures();
-        drainDeferred();
-    }
-
-    private void beginRemoval(long operation, LocalSubscription local, boolean background) {
+        local.removal = new UnsubscribeOperation(operation, local);
         deferred.remove(local);
+        if (state != State.CONNECTED || disconnectOperation != 0) {
+            if (cleanStart) {
+                removeSubscription(local, null);
+                finishRemoval(local);
+            }
+            return;
+        }
         if (sessionPresent && !subscribing.containsValue(local)) {
             // An unsent restoration cannot prove that a persistent broker has no registration.
             local.established = true;
         }
-        var removal = new UnsubscribeOperation(operation, local, background);
-        local.removal = removal;
         if (!local.established && !subscribing.containsValue(local)) {
-            // Clean Session has no broker registration yet when restoration is still queued.
             removeSubscription(local, null);
             finishRemoval(local);
-        } else if (background || !local.established) {
-            queuedClosures.addLast(removal);
         } else {
-            sendUnsubscribe(removal).ifPresent(refusal -> {
-                local.removing = false;
-                local.removal = null;
-                capacityFailure(operation, refusal);
-            });
+            queuedClosures.addLast(local.removal);
+            drainClosures();
         }
+        drainDeferred();
     }
 
-    /// Returns which capacity refused the packet, or empty once the send queue admits it. A
-    /// refusal releases the packet identifier and leaves no pending UNSUBACK entry. CLOSED
+    /// Returns whether the send queue admitted the packet. A refusal for packet identifier or
+    /// send queue capacity releases the identifier and leaves no pending UNSUBACK entry. CLOSED
     /// counts as admitted and waits for the connection's terminal cause, like other admitted
     /// protocol operations.
-    private Optional<String> sendUnsubscribe(UnsubscribeOperation removal) {
-        if (!removal.subscription.established) {
-            return Optional.of("Subscription acknowledgement pending");
-        }
+    private boolean sendUnsubscribe(UnsubscribeOperation removal) {
         OptionalInt allocated = allocatePacketId();
         if (allocated.isEmpty()) {
-            return Optional.of("Packet identifier capacity");
+            return false;
         }
         int id = allocated.getAsInt();
         unsubscribing.put(id, removal);
@@ -742,9 +714,9 @@ final class SessionCore {
         if (port.send(generation, ++nextTicket, packet, null) == SendQueue.OfferResult.FULL) {
             unsubscribing.remove(id);
             session.packetIds.release(id);
-            return Optional.of("Send queue capacity");
+            return false;
         }
-        return Optional.empty();
+        return true;
     }
 
     private void drainClosures() {
@@ -752,19 +724,24 @@ final class SessionCore {
         if (state != State.CONNECTED || disconnectOperation != 0) {
             return;
         }
-        // A refused closure stays first, so removals keep their close order.
-        while (closingInFlight < CLOSE_INFLIGHT_LIMIT && !queuedClosures.isEmpty()) {
-            if (sendUnsubscribe(queuedClosures.getFirst()).isPresent()) {
+        // A removal waits only for its own SUBACK, so the drain passes over those still awaiting
+        // one; at most 16 SUBACKs are pending, which bounds the scan. A capacity refusal stops
+        // the drain, so the refused removal stays ahead of later ones.
+        Iterator<UnsubscribeOperation> removals = queuedClosures.iterator();
+        while (closingInFlight < CLOSE_INFLIGHT_LIMIT && removals.hasNext()) {
+            UnsubscribeOperation removal = removals.next();
+            if (!removal.subscription.established) {
+                continue;
+            }
+            if (!sendUnsubscribe(removal)) {
                 return;
             }
-            UnsubscribeOperation removal = queuedClosures.removeFirst();
-            if (removal.background) {
-                closingInFlight++;
-            }
+            removals.remove();
+            closingInFlight++;
         }
     }
 
-    /// Restoration uses no application operation slots and resumes when capacity returns.
+    /// Registrations use no application operation slots and resume when capacity returns.
     private void drainDeferred() {
         if (state != State.CONNECTED || disconnectOperation != 0) {
             return;
@@ -803,7 +780,7 @@ final class SessionCore {
             unknownReleases.computeIfPresent(id, (_, admitted) -> admitted + 1);
         }
         while (!deferred.isEmpty()) {
-            if (restoringInFlight >= RESTORE_INFLIGHT_LIMIT) {
+            if (subscribingInFlight >= SUBSCRIBE_INFLIGHT_LIMIT) {
                 return;
             }
             var local = (LocalSubscription) deferred.getFirst();
@@ -824,7 +801,7 @@ final class SessionCore {
                 return;
             }
             deferred.removeFirst();
-            restoringInFlight++;
+            subscribingInFlight++;
         }
     }
 
@@ -850,22 +827,16 @@ final class SessionCore {
     private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
         subscriptions.remove(local.id);
         deferred.remove(local);
-        if (local.handle != null) {
-            port.removeSubscription(local.id, local.handle, cause);
-        }
+        port.removeSubscription(local.id, local.handle, cause);
     }
 
     private void finishRemoval(LocalSubscription local) {
         UnsubscribeOperation removal = local.removal;
         if (removal != null) {
             queuedClosures.remove(removal);
-            if (!removal.background) {
+            if (removal.operation != 0) {
                 port.complete(removal.operation, null, null);
             }
-        }
-        if (local.closeOperation != 0) {
-            port.complete(local.closeOperation, null, null);
-            local.closeOperation = 0;
         }
         local.removal = null;
     }
@@ -1049,41 +1020,59 @@ final class SessionCore {
 
     private void subscribed(Packet.SubAck ack) {
         LocalSubscription local = subscribing.get(ack.packetId());
-        if (local == null || ack.reasonCodes().size() != 1) {
+        if (local == null) {
             failed(generation, protocolError("Unexpected SUBACK"));
+            return;
+        }
+        if (ack.reasonCodes().size() != 1) {
+            abandon(local, "Unexpected SUBACK for " + local.filter.pattern());
             return;
         }
         ReasonCode reason = ack.reasonCodes().getFirst();
         if (reason != ReasonCode.UNSPECIFIED_ERROR
                 && reason.value() > local.requestedQos.level()) {
-            failed(generation, protocolError("SUBACK grants an unsupported QoS or reason"));
+            abandon(local, "SUBACK grants an unsupported QoS or reason for "
+                    + local.filter.pattern());
             return;
         }
         subscribing.remove(ack.packetId());
         session.packetIds.release(ack.packetId());
         boolean restoring = local.confirmed;
-        if (restoring) {
-            restoringInFlight--;
-        }
+        subscribingInFlight--;
         if (reason == ReasonCode.UNSPECIFIED_ERROR) {
             var refusal = new MqttSubscribeException(reason);
             if (!restoring) {
                 removeSubscription(local, refusal);
-                port.complete(local.id, null, refusal);
             } else {
                 subscriptions.remove(local.id);
-                port.resubscribeFailed(requireNonNull(local.handle), refusal);
-                finishRemoval(local);
+                port.resubscribeFailed(local.handle, refusal);
             }
+            finishRemoval(local);
         } else {
             local.confirmed = true;
             local.established = true;
-            Subscription handle = requireNonNull(local.handle);
-            port.subscribed(handle, Qos.of(reason.value()));
-            if (!restoring) {
-                port.complete(local.id, handle, null);
+            local.granted = Qos.of(reason.value());
+            port.subscribed(local.handle, local.granted);
+        }
+    }
+
+    /// A SUBACK that violates the protocol ends its registration as well as the connection, so
+    /// a later connection does not repeat the same SUBSCRIBE. A persistent broker may still hold
+    /// the subscription, so its removal stays pending, as after a local close.
+    private void abandon(LocalSubscription local, String message) {
+        var violation = new MqttProtocolException(message, ReasonCode.PROTOCOL_ERROR);
+        if (cleanStart) {
+            // Ending this connection also ends its nonpersistent session.
+            removeSubscription(local, violation);
+            finishRemoval(local);
+        } else {
+            port.removeSubscription(local.id, local.handle, violation);
+            if (local.removal == null) {
+                // No caller observes this removal; it only keeps the filter until confirmed.
+                local.removal = new UnsubscribeOperation(0, local);
             }
         }
+        failed(generation, protocolError(message));
     }
 
     private void unsubscribed(Packet.UnsubAck ack) {
@@ -1094,9 +1083,7 @@ final class SessionCore {
         }
         unsubscribing.remove(ack.packetId());
         session.packetIds.release(ack.packetId());
-        if (pending.background) {
-            closingInFlight--;
-        }
+        closingInFlight--;
         removeSubscription(pending.subscription, null);
         finishRemoval(pending.subscription);
     }
@@ -1163,7 +1150,7 @@ final class SessionCore {
         // Matching is O(subscriptions). Replace with a topic tree if 0.4 measurements show
         // this scan dominates, keeping TopicFilter.matches as the reference implementation.
         for (var local : subscriptions.values()) {
-            if (!local.removing && local.matchingFilter.matches(publish.topic())) {
+            if (local.removal == null && local.matchingFilter.matches(publish.topic())) {
                 matches.add(local.id);
             }
         }
@@ -1365,6 +1352,7 @@ final class SessionCore {
             port.complete(operation, null, new MqttNotConnectedException());
         } else {
             disconnectOperation = operation;
+            port.disconnecting();
             port.cancel(Timer.KEEP_ALIVE);
             port.cancel(Timer.PING);
             awaitingPing = false;
@@ -1504,28 +1492,17 @@ final class SessionCore {
                 ? new MqttConnectionLostException()
                 : new MqttConnectionLostException(cause);
         for (LocalSubscription local : List.copyOf(subscriptions.values())) {
-            if (permanent || (cleanStart && !local.confirmed)) {
-                removeSubscription(local, permanent ? cause : null);
-                if (permanent && local.closeOperation != 0) {
-                    port.complete(local.closeOperation, null, pendingFailure);
-                    local.closeOperation = 0;
+            if (permanent) {
+                // The shell completes pending removals after shutdown, because only it can tell
+                // an ordinary close from an internal failure.
+                removeSubscription(local, cause);
+            } else if (cleanStart) {
+                local.established = false;
+                if (local.removal != null) {
+                    removeSubscription(local, null);
+                    finishRemoval(local);
                 }
-            } else if (!local.confirmed) {
-                // A failed initial SUBSCRIBE can still have reached a persistent broker.
-                // Keep only its bounded cleanup intent, without a handle or delivery lane.
-                if (local.handle != null) {
-                    port.removeSubscription(local.id, local.handle, null);
-                    local.handle = null;
-                }
-                local.closed = true;
-                local.removing = true;
-            } else {
-                if (cleanStart || (local.removing && !local.closed)) {
-                    local.established = false;
-                }
-                local.removing = local.closed;
             }
-            local.removal = null;
         }
         for (long operation : publications.values()) {
             port.complete(operation, null, pendingFailure);
@@ -1537,31 +1514,16 @@ final class SessionCore {
                 inflight.operation = 0;
             }
         }
-        for (var local : subscribing.values()) {
-            if (!local.confirmed) {
-                port.complete(local.id, null, pendingFailure);
-            }
-        }
         subscribing.keySet().forEach(session.packetIds::release);
         subscribing.clear();
-        for (var pending : unsubscribing.values()) {
-            if (!pending.background) {
-                port.complete(pending.operation, null, pendingFailure);
-            }
-        }
         unsubscribing.keySet().forEach(session.packetIds::release);
         unsubscribing.clear();
-        for (var pending : queuedClosures) {
-            if (!pending.background) {
-                port.complete(pending.operation, null, pendingFailure);
-            }
-        }
         queuedClosures.clear();
         deferred.clear();
         releases.clear();
         releaseWrites.clear();
         unknownReleases.clear();
-        restoringInFlight = 0;
+        subscribingInFlight = 0;
         closingInFlight = 0;
         if (connecting != null) {
             Throwable failure = switch (cause) {
@@ -1709,34 +1671,38 @@ final class SessionCore {
 
     private static final class LocalSubscription implements Deferred {
 
-        // The subscribe operation's token; the shell and its delivery lanes use the same id.
+        // A client-lifetime registration id shared with the shell and its delivery lane.
         final long id;
         final TopicFilter filter;
         final TopicFilter matchingFilter;
         final Qos requestedQos;
         final boolean shared;
-        @Nullable Subscription handle;
+        final Subscription handle;
         boolean confirmed;
         boolean established;
-        boolean removing;
-        boolean closed;
-        long closeOperation;
+        Qos granted = Qos.AT_MOST_ONCE;
         @Nullable UnsubscribeOperation removal;
 
-        LocalSubscription(long id, Subscribe request) {
+        LocalSubscription(
+                long id,
+                Subscribe request,
+                boolean shared,
+                TopicFilter matchingFilter,
+                Subscription handle
+        ) {
             this.id = id;
             filter = request.filter();
             requestedQos = request.qos();
-            Optional<SharedTopicFilter> sharedFilter = SharedTopicFilter.parse(filter);
-            shared = sharedFilter.isPresent();
-            matchingFilter = sharedFilter.map(SharedTopicFilter::filter).orElse(filter);
+            this.shared = shared;
+            this.matchingFilter = matchingFilter;
+            this.handle = handle;
         }
     }
 
+    /// `operation` is zero when no caller observes the removal.
     private record UnsubscribeOperation(
             long operation,
-            LocalSubscription subscription,
-            boolean background
+            LocalSubscription subscription
     ) {
     }
 }

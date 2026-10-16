@@ -614,6 +614,11 @@ class ReceivePersistenceTest {
         }
 
         @Override
+        public CompletableFuture<Qos> established() {
+            return CompletableFuture.completedFuture(grantedQos());
+        }
+
+        @Override
         public CompletableFuture<Void> unsubscribe() {
             throw new UnsupportedOperationException();
         }
@@ -658,7 +663,15 @@ class ReceivePersistenceTest {
         }
 
         @Override
+        public void admit(long generation) {
+        }
+
+        @Override
         public void connected(long generation, ConnAck ack) {
+        }
+
+        @Override
+        public void disconnecting() {
         }
 
         @Override

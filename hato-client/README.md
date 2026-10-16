@@ -75,7 +75,8 @@ to publish at QoS 2.
 Subscription subscription = client.subscribe(
         Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.EXACTLY_ONCE),
         delivery -> repository.save(delivery.message())
-).join();
+);
+subscription.established().join();
 
 subscription.unsubscribe().join();
 ```
@@ -94,8 +95,16 @@ subscription.unsubscribe().join();
   waiting for the broker. Use `unsubscribe()` when you need to know that the broker
   has removed the subscription. The same filter can be registered again after removal
   completes.
-- Subscriptions survive connection failures, `disconnect()`, and handler failures.
-  After the next `connect()`, messages arrive again without another `subscribe()`.
+- `subscribe()` returns a handle immediately, even before `connect()`. Use
+  `subscription.established()` to wait for broker acceptance and obtain the granted QoS; it
+  also tells you when the broker refuses the subscription. Registrations survive connection
+  failures, `disconnect()`, failed connection attempts, and handler failures. After the next
+  `connect()`, messages arrive without another `subscribe()`.
+- `unsubscribe()` also works while disconnected. It completes locally for a nonpersistent
+  session; a persistent session waits for the next connection to confirm removal. Connection
+  loss does not fail a pending removal.
+- To replace a handler without waiting to reuse its filter, keep the subscription and switch
+  its delegate through an application-owned atomic reference.
 - The client and its subscriptions are safe to use from any thread.
 
 ## Receiving on your own threads
@@ -107,7 +116,8 @@ application threads:
 Subscription subscription = client.subscribe(
         Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_LEAST_ONCE)
                 .withAckMode(AckMode.MANUAL)
-).join();
+);
+subscription.established().join();
 
 while (subscription.receive() instanceof ReceiveResult.Received(var delivery)) {
     repository.save(delivery.message());
@@ -132,8 +142,10 @@ while (subscription.receive() instanceof ReceiveResult.Received(var delivery)) {
 
 ## Handling failures
 
-Operations report failures through their futures. With `join()`, the exception
-arrives as the cause of a `CompletionException`.
+Operations and observations report failures through their futures. With `join()`, the exception
+arrives as the cause of a `CompletionException`. Invalid subscription arguments and calls to
+`subscribe()` after client closure throw synchronously. Duplicate filters, shared-filter overlap,
+and registration capacity fail `established()` and end only the returned handle.
 
 | Exception | Meaning |
 | --- | --- |

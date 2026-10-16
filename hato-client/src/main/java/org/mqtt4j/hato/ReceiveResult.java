@@ -4,8 +4,8 @@ import static java.util.Objects.requireNonNull;
 
 /// The outcome of one pull receive. A timeout leaves the subscription active; normal
 /// termination ends it permanently. Connection termination leaves receiving subscriptions
-/// waiting for a later connection. A broker refusal during re-creation, an internal failure
-/// that closes the client, and interruption are thrown by [Subscription#receive()].
+/// waiting for a later connection. Failures that end the subscription, and interruption, are
+/// thrown by [Subscription#receive()], which lists them.
 public sealed interface ReceiveResult {
 
     /// One delivery handed to this caller. Its acknowledgement follows the subscription's

@@ -250,46 +250,58 @@ class SubscriptionContinuityTest {
     }
 
     @Test
-    void socket_loss_releases_all_close_observers_so_the_client_can_reconnect() throws Exception {
-        // Arrange: public observers fill the operation budget around one background removal.
+    void removal_observers_survive_socket_loss_without_holding_operation_capacity()
+            throws Exception {
+        // Arrange: observe one persistent removal as often as the ordinary operation limit.
         var ended = new LinkedBlockingQueue<Disconnection>();
         var observers = new ArrayList<CompletableFuture<Void>>();
         try (ServerSocket server = listen(); MqttClient sut = MqttClient.builder()
                 .server(endpoint(server))
                 .version(MqttVersion.V3_1_1)
+                .clientId("pending-removal")
+                .cleanStart(false)
+                .sessionExpiry(Duration.ofMinutes(1))
                 .connectionListener(ended::add)
                 .build()) {
             Subscription subscription;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
-                await().untilAsserted(() -> assertThat(usage(sut).operations()).isZero());
+                // The connect completion thread returns its operation slot after the future.
+                await().pollDelay(Duration.ZERO)
+                        .untilAsserted(() -> assertThat(usage(sut).operations()).isZero());
                 subscription.close();
-                var removal = assertInstanceOf(Packet.Unsubscribe.class, peer.receive());
+                Packet.Unsubscribe removal = assertInstanceOf(
+                        Packet.Unsubscribe.class,
+                        peer.receive()
+                );
                 assertThat(removal.filters()).containsExactly(new TopicFilter("data"));
                 for (int i = 0; i < 64; i++) {
                     observers.add(subscription.unsubscribe());
                 }
                 assertThat(observers).allSatisfy(observer -> assertThat(observer).isNotDone());
-                assertThat(usage(sut).operations()).isEqualTo(64);
+                assertThat(usage(sut).operations()).isZero();
                 await().untilAsserted(() -> assertThat(usage(sut).mailboxEvents()).isZero());
 
                 // Act: leaving this scope closes the socket without acknowledging UNSUBSCRIBE.
             }
 
-            // Assert: each public observation ends, while local close remains permanent.
+            // Assert: local close remains permanent while every observer awaits confirmation.
             assertThat(ended.poll(5, SECONDS)).isNotNull();
-            var failures = new ArrayList<Throwable>();
-            for (CompletableFuture<Void> observer : observers) {
-                Throwable failure = observer.handle((_, cause) -> cause).get(5, SECONDS);
-                assertThat(failure).isInstanceOf(MqttConnectionLostException.class);
-                failures.add(requireNonNull(failure));
-            }
-            await().untilAsserted(() -> assertThat(usage(sut).operations()).isZero());
+            assertThat(observers).allSatisfy(observer -> assertThat(observer).isNotDone());
+            assertThat(usage(sut).operations()).isZero();
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
 
-            // Act: the same client can reconnect without reserved connection capacity.
-            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-                // The barrier must be the first packet: no closed registration is recreated.
+            // Act: the retained broker session requires UNSUBACK before confirming removal.
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut, true, _ -> { })) {
+                Packet.Unsubscribe removal = assertInstanceOf(
+                        Packet.Unsubscribe.class,
+                        peer.receive()
+                );
+                assertThat(removal.filters()).containsExactly(new TopicFilter("data"));
+                peer.send(new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY));
+                for (CompletableFuture<Void> observer : observers) {
+                    observer.get(5, SECONDS);
+                }
                 peer.expectPublicationBarrier(sut);
                 Subscription replacement = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
                 peer.publish("data", 7);
@@ -297,12 +309,7 @@ class SubscriptionContinuityTest {
                         .isInstanceOf(ReceiveResult.Received.class);
                 peer.expectAcknowledgements(7, 1);
 
-                // Assert: reconciliation cannot replace the old observers' failure results.
-                for (int i = 0; i < observers.size(); i++) {
-                    Throwable failure = observers.get(i)
-                            .handle((_, cause) -> cause).get(5, SECONDS);
-                    assertThat(failure).isSameAs(failures.get(i));
-                }
+                assertThat(observers).allSatisfy(observer -> assertThat(observer).isCompleted());
             }
         }
     }
@@ -342,9 +349,9 @@ class SubscriptionContinuityTest {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "closed before unsubscribe: {0}")
     @ValueSource(booleans = {false, true})
-    void resuback_rejection_ends_a_pull_subscription_and_completes_pending_removal(boolean close)
+    void resuback_rejection_confirms_a_requested_removal_of_a_pull_subscription(boolean close)
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
@@ -366,15 +373,8 @@ class SubscriptionContinuityTest {
                         List.of(ReasonCode.UNSPECIFIED_ERROR), EMPTY));
                 removed.get(5, SECONDS);
 
-                // Assert: an earlier close owns the result; otherwise the refusal is terminal.
-                if (close) {
-                    assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
-                } else {
-                    assertThatThrownBy(subscription::receive)
-                            .isInstanceOfSatisfying(MqttSubscribeException.class,
-                                    cause -> assertThat(cause.reasonCode())
-                                            .isEqualTo(ReasonCode.UNSPECIFIED_ERROR));
-                }
+                // Assert: the requested removal owns the result; the refusal only confirms it.
+                assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
                 peer.expectPublicationBarrier(sut);
                 Subscription replacement = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
                 subscription.close();

@@ -2,6 +2,7 @@ package org.mqtt4j.hato.client.internal;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
@@ -187,23 +188,21 @@ class SessionPersistenceTest {
                     subscription,
                     Subscribe.of(new TopicFilter("restored/" + i), Qos.AT_LEAST_ONCE)
             );
-            var request = (Packet.Subscribe) port.sent.getLast();
-            configured.received(
-                    1,
-                    new Packet.SubAck(
-                            request.packetId(),
-                            List.of(ReasonCode.GRANTED_QOS_1),
-                            EMPTY
-                    ),
-                    0,
-                    0
-            );
-            if (present) {
-                // A failed unsubscribe requires restoration even when the session survives.
-                configured.unsubscribe(operation(), subscription);
+            if (!present) {
+                var request = (Packet.Subscribe) port.sent.getLast();
+                configured.received(
+                        1,
+                        new Packet.SubAck(
+                                request.packetId(),
+                                List.of(ReasonCode.GRANTED_QOS_1),
+                                EMPTY
+                        ),
+                        0,
+                        0
+                );
             }
         }
-        configured.failed(1, new IOException("connection lost before removal was confirmed"));
+        configured.failed(1, new IOException("connection lost before restoration"));
         port.sent.clear();
         configured.connect(new ConnectionAttempt(operation(), null), 0);
         configured.received(2, new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY), 0, 0);
@@ -539,7 +538,7 @@ class SessionPersistenceTest {
         connect(false);
         long subscription = subscribe("kept/#");
         establishLastSubscription();
-        Subscription handle = (Subscription) result(subscription).value();
+        var handle = (Subscription) outcome(subscription).value();
         sut.failed(generation, new IOException("lost"));
         port.sent.clear();
 
@@ -558,6 +557,7 @@ class SessionPersistenceTest {
 
         assertThat(port.sent).noneMatch(Packet.Subscribe.class::isInstance);
         assertThat(port.handles.get(subscription)).isSameAs(handle);
+        assertThat(port.grants).containsExactly(Qos.AT_LEAST_ONCE, Qos.AT_LEAST_ONCE);
         assertThat(port.deliveries).containsExactly(List.of(subscription));
         assertThat(port.removed).isEmpty();
     }
@@ -569,7 +569,7 @@ class SessionPersistenceTest {
         long subscription = subscribe("closed/#");
         establishLastSubscription();
         long closing = operation();
-        sut.closeSubscription(closing, subscription);
+        sut.unsubscribe(closing, subscription);
         Packet.Unsubscribe original = (Packet.Unsubscribe) port.sent.getLast();
         sut.failed(generation, new IOException("lost UNSUBACK"));
         port.sent.clear();
@@ -590,63 +590,80 @@ class SessionPersistenceTest {
     }
 
     @Test
-    void failed_unsubscribe_restores_its_intent_even_when_the_broker_session_survives() {
+    void an_unconfirmed_removal_is_retried_when_the_broker_session_survives() {
+        // Arrange
         connect(false);
-        long subscription = subscribe("restored/#");
+        long subscription = subscribe("removed/#");
         establishLastSubscription();
         long removal = operation();
         sut.unsubscribe(removal, subscription);
+        var original = (Packet.Unsubscribe) port.sent.getLast();
         sut.failed(generation, new IOException("lost UNSUBACK"));
-        Result failedRemoval = result(removal);
         port.sent.clear();
 
+        // Act
         connect(true);
 
-        Packet.Subscribe restored = (Packet.Subscribe) port.sent.getLast();
-        assertThat(restored.subscriptions().getFirst().filter())
-                .isEqualTo(new TopicFilter("restored/#"));
-        establishLastSubscription();
-        assertThat(result(removal)).isSameAs(failedRemoval);
-        assertFailure(removal, MqttConnectionLostException.class);
-        assertThat(port.removed).isEmpty();
+        // Assert: the request keeps waiting and the registration never resumes delivery.
+        assertThat(port.results).doesNotContainKey(removal);
+        assertThat(port.sent).filteredOn(Packet.Unsubscribe.class::isInstance).hasSize(1);
+        var retried = (Packet.Unsubscribe) port.sent.getLast();
+        assertThat(retried.filters()).isEqualTo(original.filters());
+        receive(new Packet.UnsubAck(retried.packetId(), List.of(), EMPTY));
+        assertThat(result(removal).failure()).isNull();
+        assertThat(port.removed).containsExactly(subscription);
     }
 
-    @ParameterizedTest(name = "close instead of unsubscribe: {0}")
-    @ValueSource(booleans = {false, true})
-    void removing_a_deferred_restore_cleans_up_the_surviving_broker_subscription(boolean close) {
-        // Arrange: the first UNSUBSCRIBE may not have reached the persistent broker.
+    @Test
+    void an_invalid_suback_ends_a_persistent_registration_and_removes_it_on_reconnection() {
+        // Arrange
+        connect(false);
+        long subscription = subscribe("invalid/#");
+        var request = (Packet.Subscribe) port.sent.getLast();
+
+        // Act: a QoS 2 grant exceeds the QoS 1 request.
+        receive(new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_2), EMPTY));
+
+        // Assert: the handle ends at once, while the filter stays reserved because the broker
+        // may hold the subscription; the next connection removes it instead of subscribing.
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(outcome(subscription).failure()).isInstanceOf(MqttProtocolException.class);
+        assertFailure(subscribe("invalid/#"), IllegalStateException.class);
+        port.sent.clear();
+        connect(true);
+        assertThat(port.sent).noneMatch(Packet.Subscribe.class::isInstance);
+        var removal = (Packet.Unsubscribe) port.sent.getLast();
+        assertThat(removal.filters()).containsExactly(new TopicFilter("invalid/#"));
+        receive(new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY));
+        long again = subscribe("invalid/#");
+        assertThat(port.results).doesNotContainKey(again);
+        assertThat(port.sent).last().isInstanceOf(Packet.Subscribe.class);
+    }
+
+    @Test
+    void removing_a_deferred_restore_cleans_up_the_surviving_broker_subscription() {
+        // Arrange: the first SUBSCRIBE may have reached the persistent broker without a SUBACK.
         connect(false);
         long subscription = subscribe("still-registered/#");
-        establishLastSubscription();
-        long failedRemoval = operation();
-        sut.unsubscribe(failedRemoval, subscription);
-        sut.failed(generation, new IOException("UNSUBSCRIBE outcome unknown"));
-        Result failure = result(failedRemoval);
-        assertFailure(failedRemoval, MqttConnectionLostException.class);
+        sut.failed(generation, new IOException("SUBSCRIBE outcome unknown"));
         port.subscribeResult = SendQueue.OfferResult.FULL;
         connect(true);
-        assertThat(port.sent.getLast()).isInstanceOf(Packet.Subscribe.class);
         port.sent.clear();
         port.subscribeResult = SendQueue.OfferResult.ACCEPTED;
 
-        // Act: remove the handle before the capacity wake can admit its queued SUBSCRIBE.
+        // Act: remove the handle before its queued SUBSCRIBE can be admitted.
         long removal = operation();
-        if (close) {
-            sut.closeSubscription(removal, subscription);
-        } else {
-            sut.unsubscribe(removal, subscription);
-        }
+        sut.unsubscribe(removal, subscription);
 
         // Assert: Session Present means the broker registration may still need removal.
         assertThat(port.results).doesNotContainKey(removal);
         assertThat(port.removed).isEmpty();
-        assertThat(port.sent).singleElement().isInstanceOf(Packet.Unsubscribe.class);
+        assertThat(port.sent).filteredOn(Packet.Unsubscribe.class::isInstance).hasSize(1);
         var request = (Packet.Unsubscribe) port.sent.getLast();
         assertThat(request.filters()).containsExactly(new TopicFilter("still-registered/#"));
         receive(new Packet.UnsubAck(request.packetId(), List.of(), EMPTY));
         sut.sendCapacityAvailable(generation);
         assertThat(result(removal).failure()).isNull();
-        assertThat(result(failedRemoval)).isSameAs(failure);
         assertThat(port.removed).containsExactly(subscription);
         assertThat(port.sent).hasSize(1);
         assertThat(sut.state()).isEqualTo(CONNECTED);
@@ -654,45 +671,43 @@ class SessionPersistenceTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void failed_initial_subscribe_cleans_up_only_a_surviving_broker_registration(boolean present) {
+    void an_unconfirmed_registration_is_retried_with_or_without_the_broker_session(
+            boolean present
+    ) {
+        // Arrange
         connect(false);
-        long subscription = subscribe("orphan/#");
+        long subscription = subscribe("pending/#");
+        Subscription handle = port.handles.get(subscription);
         sut.failed(generation, new IOException("lost SUBACK"));
         port.sent.clear();
 
+        // Act
         connect(present);
 
-        assertFailure(subscription, MqttConnectionLostException.class);
-        assertThat(port.removed).containsExactly(subscription);
-        assertThat(port.sent).noneMatch(Packet.Subscribe.class::isInstance);
-        if (present) {
-            var cleanup = (Packet.Unsubscribe) port.sent.getLast();
-            assertThat(cleanup.filters()).containsExactly(new TopicFilter("orphan/#"));
-            receive(new Packet.UnsubAck(cleanup.packetId(), List.of(), EMPTY));
-        } else {
-            assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
-        }
-        long replacement = subscribe("orphan/#");
+        // Assert: the original handle and registration wait for the new acknowledgement.
+        assertThat(port.outcomes).doesNotContainKey(subscription);
+        assertThat(port.removed).isEmpty();
+        assertThat(port.sent).filteredOn(Packet.Subscribe.class::isInstance).hasSize(1);
         establishLastSubscription();
-        assertThat(result(replacement).failure()).isNull();
+        assertThat(outcome(subscription).value()).isSameAs(handle);
+        assertThat(outcome(subscription).failure()).isNull();
+        assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
     }
 
     @Test
-    void a_replacement_subscription_supersedes_cleanup_waiting_for_send_capacity() {
+    void an_unconfirmed_registration_keeps_its_filter_reserved_across_connections() {
+        // Arrange
         connect(false);
-        long original = subscribe("replaced/#");
+        long original = subscribe("reserved/#");
         sut.failed(generation, new IOException("lost SUBACK"));
-        port.unsubscribeResult = SendQueue.OfferResult.FULL;
         connect(true);
-        long replacement = subscribe("replaced/#");
-        establishLastSubscription();
-        port.sent.clear();
-        port.unsubscribeResult = SendQueue.OfferResult.ACCEPTED;
 
-        sut.sendCapacityAvailable(generation);
+        // Act
+        long duplicate = subscribe("reserved/#");
+        establishLastSubscription();
         receive(
                 new Packet.Publish(
-                        new Topic("replaced/topic"),
+                        new Topic("reserved/topic"),
                         new byte[] {1},
                         Qos.AT_MOST_ONCE,
                         false,
@@ -702,10 +717,12 @@ class SessionPersistenceTest {
                 )
         );
 
+        // Assert
+        assertFailure(duplicate, IllegalStateException.class);
+        assertThat(port.removed).isEmpty();
+        assertThat(port.deliveries).containsExactly(List.of(original));
+        assertThat(outcome(original).failure()).isNull();
         assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
-        assertThat(port.removed).containsExactly(original);
-        assertThat(port.deliveries).containsExactly(List.of(replacement));
-        assertThat(result(replacement).failure()).isNull();
     }
 
     @Test
@@ -725,7 +742,7 @@ class SessionPersistenceTest {
         var unsubscribe = (Packet.Unsubscribe) port.sent.getLast();
         assertThat(unsubscribe.packetId()).isNotIn(oldId, subscribe.packetId());
         receive(new Packet.SubAck(subscribe.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY));
-        assertThat(result(newSubscription).failure()).isNull();
+        assertThat(outcome(newSubscription).failure()).isNull();
     }
 
     @Test
@@ -841,6 +858,113 @@ class SessionPersistenceTest {
         assertThat(port.timers).isEmpty();
     }
 
+    @Test
+    void offline_removal_is_confirmed_by_a_new_broker_session() {
+        // Arrange
+        connect(false);
+        long subscription = subscribe("offline/#");
+        establishLastSubscription();
+        long removal = removeAfterConnectionLoss(subscription);
+
+        // Act
+        connect(false);
+
+        // Assert: Session Present false proves that the broker holds nothing to remove.
+        assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
+        assertThat(result(removal).failure()).isNull();
+        assertThat(port.removed).containsExactly(subscription);
+        assertThat(port.sent).noneMatch(Packet.Subscribe.class::isInstance);
+    }
+
+    @Test
+    void offline_removal_waits_for_unsuback_when_the_broker_session_continues() {
+        // Arrange
+        connect(false);
+        long subscription = subscribe("offline/#");
+        establishLastSubscription();
+        long removal = removeAfterConnectionLoss(subscription);
+
+        // Act
+        connect(true);
+
+        // Assert
+        assertThat(port.results).doesNotContainKey(removal);
+        var packet = (Packet.Unsubscribe) port.sent.getLast();
+        receive(new Packet.UnsubAck(packet.packetId(), List.of(), EMPTY));
+        assertThat(result(removal).failure()).isNull();
+        assertThat(port.removed).containsExactly(subscription);
+        assertThat(port.sent).noneMatch(Packet.Subscribe.class::isInstance);
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void reordered_registrations_removals_and_reconnection_preserve_each_intent(int seed) {
+        // Arrange: registration and removal can cross both sides of the connection boundary.
+        var random = new SplittableRandom(seed);
+        connect(false);
+        long oldGeneration = generation;
+        long continuing = operation();
+        long removing = operation();
+        long removal = operation();
+        boolean present = (seed & 1) == 0;
+        var connectionStart = new int[1];
+        var chains = new ArrayList<ArrayDeque<Runnable>>();
+        chains.add(new ArrayDeque<>(List.of(
+                () -> {
+                    sut.failed(oldGeneration, new IOException("connection lost"));
+                    connectionStart[0] = port.sent.size();
+                },
+                () -> beginConnect(),
+                () -> receive(new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY))
+        )));
+        chains.add(new ArrayDeque<>(List.of(() -> sut.subscribe(
+                continuing,
+                Subscribe.of(new TopicFilter("continuing/#"), Qos.AT_LEAST_ONCE)
+        ))));
+        chains.add(new ArrayDeque<>(List.of(
+                () -> sut.subscribe(
+                        removing,
+                        Subscribe.of(new TopicFilter("removing/#"), Qos.AT_LEAST_ONCE)
+                ),
+                () -> sut.unsubscribe(removal, removing)
+        )));
+
+        // Act & Assert: old acknowledgements never change the resumed connection's work.
+        while (!chains.isEmpty()) {
+            ArrayDeque<Runnable> chain = chains.get(random.nextInt(chains.size()));
+            chain.removeFirst().run();
+            if (chain.isEmpty()) {
+                chains.remove(chain);
+            }
+            assertThat(port.outcomes).doesNotContainKey(continuing);
+            assertThat(port.removed).doesNotHaveDuplicates();
+            assertThat(port.handles).hasSizeLessThanOrEqualTo(2);
+        }
+        sut.received(oldGeneration, new Packet.SubAck(1, List.of(ReasonCode.SUCCESS), EMPTY), 0, 0);
+        sut.received(oldGeneration, new Packet.UnsubAck(1, List.of(), EMPTY), 0, 0);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+        for (int i = connectionStart[0]; i < port.sent.size(); i++) {
+            switch (port.sent.get(i)) {
+                case Packet.Subscribe packet -> receive(
+                        new Packet.SubAck(
+                                packet.packetId(),
+                                List.of(ReasonCode.GRANTED_QOS_1),
+                                EMPTY
+                        )
+                );
+                case Packet.Unsubscribe packet -> receive(
+                        new Packet.UnsubAck(packet.packetId(), List.of(), EMPTY)
+                );
+                default -> {}
+            }
+        }
+        assertThat(outcome(continuing).failure()).isNull();
+        assertThat(result(removal).failure()).isNull();
+        assertThat(port.removed).containsExactly(removing);
+        assertThat(outcome(continuing).value()).isSameAs(port.handles.get(continuing));
+        assertThat(port.ends).hasSize(1);
+    }
+
     private SessionCore core(boolean cleanStart) {
         return new SessionCore(
                 port,
@@ -892,6 +1016,19 @@ class SessionPersistenceTest {
         return operation;
     }
 
+    /// Requests removal after the connection ends. The request waits, and the filter stays
+    /// reserved until a later connection reconciles it.
+    private long removeAfterConnectionLoss(long subscription) {
+        sut.failed(generation, new IOException("connection lost"));
+        port.sent.clear();
+        long removal = operation();
+        sut.unsubscribe(removal, subscription);
+        assertThat(port.results).doesNotContainKey(removal);
+        assertThat(port.sent).isEmpty();
+        assertFailure(subscribe("offline/#"), IllegalStateException.class);
+        return removal;
+    }
+
     private void establishLastSubscription() {
         var packet = (Packet.Subscribe) port.sent.getLast();
         receive(new Packet.SubAck(packet.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY));
@@ -903,6 +1040,10 @@ class SessionPersistenceTest {
 
     private Result result(long operation) {
         return requireNonNull(port.results.get(operation));
+    }
+
+    private Result outcome(long subscription) {
+        return requireNonNull(port.outcomes.get(subscription));
     }
 
     private void assertFailure(long operation, Class<? extends Throwable> type) {
@@ -981,8 +1122,13 @@ class SessionPersistenceTest {
 
     private static final class TestSubscription implements Subscription {
 
+        final long id;
         @Nullable TopicFilter filter;
         Qos granted = Qos.AT_LEAST_ONCE;
+
+        TestSubscription(long id) {
+            this.id = id;
+        }
 
         @Override
         public TopicFilter filter() {
@@ -992,6 +1138,11 @@ class SessionPersistenceTest {
         @Override
         public Qos grantedQos() {
             return granted;
+        }
+
+        @Override
+        public CompletableFuture<Qos> established() {
+            return CompletableFuture.completedFuture(grantedQos());
         }
 
         @Override
@@ -1015,8 +1166,11 @@ class SessionPersistenceTest {
         final List<Packet.PubAck> acknowledgements = new ArrayList<>();
         final List<Integer> outgoingIds = new ArrayList<>();
         final Map<Long, Result> results = new HashMap<>();
+        // The first outcome each registration reports: its grant or the cause that ended it.
+        final Map<Long, Result> outcomes = new HashMap<>();
         final Map<Long, TestSubscription> handles = new HashMap<>();
         final List<Long> removed = new ArrayList<>();
+        final List<Qos> grants = new ArrayList<>();
         final List<List<Long>> deliveries = new ArrayList<>();
         final List<Disconnection> ends = new ArrayList<>();
         final List<Boolean> established = new ArrayList<>();
@@ -1052,7 +1206,15 @@ class SessionPersistenceTest {
         }
 
         @Override
+        public void admit(long connection) {
+        }
+
+        @Override
         public void connected(long connection, ConnAck ack) {
+        }
+
+        @Override
+        public void disconnecting() {
         }
 
         @Override
@@ -1153,7 +1315,7 @@ class SessionPersistenceTest {
 
         @Override
         public Optional<Subscription> registerSubscription(long id) {
-            var subscription = new TestSubscription();
+            var subscription = new TestSubscription(id);
             assertThat(handles.put(id, subscription)).isNull();
             registering = subscription;
             return Optional.of(subscription);
@@ -1161,7 +1323,10 @@ class SessionPersistenceTest {
 
         @Override
         public void subscribed(Subscription handle, Qos granted) {
-            ((TestSubscription) handle).granted = granted;
+            var subscription = (TestSubscription) handle;
+            subscription.granted = granted;
+            grants.add(granted);
+            outcomes.putIfAbsent(subscription.id, new Result(handle, null));
         }
 
         @Override
@@ -1202,6 +1367,9 @@ class SessionPersistenceTest {
         public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
             assertThat(handles.get(id)).isSameAs(handle);
             removed.add(id);
+            if (cause != null) {
+                outcomes.putIfAbsent(id, new Result(null, cause));
+            }
         }
 
         @Override

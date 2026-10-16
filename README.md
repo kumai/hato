@@ -91,7 +91,7 @@ void main() {
         client.subscribe(
                 Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_MOST_ONCE),
                 delivery -> show(delivery.message())
-        ).join();
+        ).established().join();
 
         IO.println("Waiting for readings. Press Enter to stop.");
         IO.readln();

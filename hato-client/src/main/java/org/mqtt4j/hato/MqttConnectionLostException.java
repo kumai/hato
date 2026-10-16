@@ -10,11 +10,10 @@ import java.io.Serial;
 /// Previously failed futures remain failed; neither Session Present value proves that a
 /// publication was never received. Closing the client discards its local exchanges.
 ///
-/// An initial subscribe awaiting SUBACK or an unsubscribe awaiting removal also fails this way,
-/// including a call observing removal scheduled by [Subscription#close()]. That removal remains
-/// pending after its observer fails. Established subscriptions survive connection termination,
-/// and [Subscription#receive()] keeps waiting. A pull subscription throws it only when an
-/// internal failure closes the client, carrying that failure as its cause.
+/// Subscription registrations and removals survive connection termination: their observations
+/// do not fail when a connection ends, and [Subscription#receive()] keeps waiting.
+/// [Subscription#established()], [Subscription#unsubscribe()], and pull receives report this
+/// exception only when an internal failure closes the client, carrying that failure as its cause.
 /// Locally detected packet failures carry [MqttProtocolException] as their cause.
 public final class MqttConnectionLostException extends MqttException {
 

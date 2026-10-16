@@ -61,7 +61,7 @@ class KeepAliveBacklogTest {
                 writer.write(codec.encode(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY)));
                 connecting.get(5, SECONDS);
                 for (int i = 0; i < SUBSCRIPTIONS; i++) {
-                    CompletableFuture<Subscription> subscribing = sut.subscribe(
+                    Subscription subscription = sut.subscribe(
                             Subscribe.of(new TopicFilter(filter(i)), Qos.AT_MOST_ONCE),
                             _ -> handled.incrementAndGet()
                     );
@@ -69,7 +69,7 @@ class KeepAliveBacklogTest {
                     writer.write(codec.encode(new Packet.SubAck(
                             subscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY
                     )));
-                    subscribing.get(5, SECONDS);
+                    subscription.established().get(5, SECONDS);
                 }
                 var silence = new Silence();
                 // A platform thread keeps the broker's clock independent of virtual threads.

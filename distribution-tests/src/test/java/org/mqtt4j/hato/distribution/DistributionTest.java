@@ -145,13 +145,15 @@ class DistributionTest {
                                 org.mqtt4j.hato.Qos.AT_LEAST_ONCE
                         ),
                         delivery -> handled.add(delivery.message())
-                ).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                );
                 org.mqtt4j.hato.Subscription pull = subscriber.subscribe(
                         org.mqtt4j.hato.Subscribe.of(
                                 new org.mqtt4j.hato.TopicFilter("probe/pull"),
                                 org.mqtt4j.hato.Qos.AT_LEAST_ONCE
                         ).withAckMode(org.mqtt4j.hato.AckMode.MANUAL)
-                ).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                );
+                push.established().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                pull.established().get(5, java.util.concurrent.TimeUnit.SECONDS);
 
                 // Act & Assert: QoS 0 and 1 reach the handler and the receiving thread intact.
                 for (var qos : java.util.List.of(

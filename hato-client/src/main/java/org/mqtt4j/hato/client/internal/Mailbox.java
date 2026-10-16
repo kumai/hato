@@ -26,6 +26,7 @@ final class Mailbox {
 
     enum Kind {
         COMMAND,
+        REGISTRATION,
         INCOMING,
         CONTROL,
         KEEP_ALIVE,
@@ -39,6 +40,7 @@ final class Mailbox {
         boolean wake() {
             return switch (this) {
                 case COMMAND,
+                     REGISTRATION,
                      INCOMING,
                      CONTROL,
                      KEEP_ALIVE -> false;
@@ -80,6 +82,8 @@ final class Mailbox {
     private long activeSession;
 
     private int commandCount;
+
+    private int registrationCount;
 
     private long commandBytes;
 
@@ -142,6 +146,8 @@ final class Mailbox {
         boolean full = switch (event.kind()) {
             case COMMAND -> commandCount >= commandLimit
                     || event.bytes() > commandByteLimit - commandBytes;
+            // One burst can queue the core's whole registration limit without operation capacity.
+            case REGISTRATION -> registrationCount >= SessionCore.REGISTRATION_LIMIT;
             case INCOMING -> incomingCount >= incomingLimit
                     || event.bytes() > incomingByteLimit - incomingBytes;
             case CONTROL -> controlCount >= controlLimit;
@@ -160,6 +166,7 @@ final class Mailbox {
                 commandCount++;
                 commandBytes += event.bytes();
             }
+            case REGISTRATION -> registrationCount++;
             case INCOMING -> {
                 incomingCount++;
                 incomingBytes += event.bytes();
@@ -274,6 +281,7 @@ final class Mailbox {
                 commandCount--;
                 commandBytes -= event.bytes();
             }
+            case REGISTRATION -> registrationCount--;
             case INCOMING -> {
                 incomingCount--;
                 incomingBytes -= event.bytes();

@@ -211,8 +211,11 @@ class MosquittoWillTest {
     }
 
     private static Subscription subscribe(MqttClient subscriber, String topic) throws Exception {
-        return subscriber.subscribe(Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE))
-                .get(5, SECONDS);
+        Subscription subscription = subscriber.subscribe(
+                Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
+        );
+        subscription.established().get(5, SECONDS);
+        return subscription;
     }
 
     private static MqttClient client() {

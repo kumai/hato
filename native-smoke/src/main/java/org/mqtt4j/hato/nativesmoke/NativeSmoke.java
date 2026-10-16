@@ -39,11 +39,13 @@ public final class NativeSmoke {
             Subscription push = client.subscribe(
                     Subscribe.of(new TopicFilter("smoke/push"), Qos.AT_LEAST_ONCE),
                     delivery -> handled.add(delivery.message())
-            ).get(5, SECONDS);
+            );
             Subscription pull = client.subscribe(
                     Subscribe.of(new TopicFilter("smoke/pull"), Qos.AT_LEAST_ONCE)
                             .withAckMode(AckMode.MANUAL)
-            ).get(5, SECONDS);
+            );
+            push.established().get(5, SECONDS);
+            pull.established().get(5, SECONDS);
 
             for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
                 var pushed = MqttMessage.of(new Topic("smoke/push"), new byte[] {42}, qos, false);

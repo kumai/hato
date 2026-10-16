@@ -39,8 +39,52 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 abstract class MessagingTest {
 
     static final ClientActor.Usage NOTHING_HELD = new ClientActor.Usage(
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
     );
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void a_subscription_registered_before_connect_receives_on_its_original_handle(boolean pull)
+            throws Exception {
+        // Arrange: both brokers accept registrations made before any connection exists.
+        String topic = uniqueTopic();
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        var request = Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE);
+        try (MqttClient sut = client()) {
+            Subscription subscription = pull ? sut.subscribe(request)
+                    : sut.subscribe(request, handled::add);
+            CompletableFuture<Qos> established = subscription.established();
+            assertThat(established).isNotDone();
+
+            // Act
+            sut.connect().get(5, SECONDS);
+            assertThat(established.get(5, SECONDS)).isEqualTo(Qos.AT_LEAST_ONCE);
+            MqttMessage message = MqttMessage.of(
+                    new Topic(topic),
+                    new byte[] {7},
+                    Qos.AT_LEAST_ONCE,
+                    false
+            );
+            sut.publish(message).get(5, SECONDS);
+
+            // Assert
+            MqttDelivery delivery = pull ? received(subscription.receive(Duration.ofSeconds(5)))
+                    : requireNonNull(handled.poll(5, SECONDS));
+            assertThat(delivery.message()).isEqualTo(message);
+            subscription.unsubscribe().get(5, SECONDS);
+            sut.disconnect().get(5, SECONDS);
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -56,8 +100,10 @@ abstract class MessagingTest {
             var subscriptions = new ArrayList<Subscription>();
             for (int i = 0; i < 100; i++) {
                 var request = Subscribe.of(new TopicFilter(base + "/" + i), Qos.AT_LEAST_ONCE);
-                subscriptions.add((pull ? sut.subscribe(request) : sut.subscribe(request, _ -> { }))
-                        .get(5, SECONDS));
+                Subscription subscription = pull ? sut.subscribe(request)
+                        : sut.subscribe(request, _ -> { });
+                subscription.established().get(5, SECONDS);
+                subscriptions.add(subscription);
             }
 
             // Act: disposal does not require admission of 100 public operations at once.
@@ -70,7 +116,8 @@ abstract class MessagingTest {
             for (Subscription subscription : subscriptions) {
                 Subscription replacement = sut.subscribe(
                         Subscribe.of(subscription.filter(), Qos.AT_LEAST_ONCE)
-                ).get(5, SECONDS);
+                );
+                replacement.established().get(5, SECONDS);
                 var message = MqttMessage.of(new Topic(subscription.filter().pattern()),
                         new byte[] {7}, Qos.AT_LEAST_ONCE, false);
                 sut.publish(message).get(5, SECONDS);
@@ -92,8 +139,8 @@ abstract class MessagingTest {
         var publication = MqttMessage.of(new Topic(topic), new byte[] {1, 2, 3}, qos, false);
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
-            Subscription subscription = sut.subscribe(Subscribe.of(new TopicFilter(topic), qos))
-                    .get(5, SECONDS);
+            Subscription subscription = sut.subscribe(Subscribe.of(new TopicFilter(topic), qos));
+            subscription.established().get(5, SECONDS);
 
             // Act
             sut.publish(publication).get(5, SECONDS);
@@ -123,7 +170,8 @@ abstract class MessagingTest {
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
                             .withAckMode(mode)
                             .withBufferCapacity(64)
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
             var jobs = new ArrayList<Future<?>>();
             for (int worker = 0; worker < 8; worker++) {
                 jobs.add(workers.submit(() -> {
@@ -177,7 +225,8 @@ abstract class MessagingTest {
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE).withAckMode(ackMode),
                     received::add
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
 
             // Act
             PublishResult result = sut.publish(publication).get(5, SECONDS);
@@ -213,7 +262,8 @@ abstract class MessagingTest {
                             delivery.ack();
                         }
                     }
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
 
             // Act: bound publisher operations while the subscriber continuously handles input.
             for (int i = 0; i < 500; i++) {
@@ -293,7 +343,8 @@ abstract class MessagingTest {
             Subscription first = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     firstDeliveries::add
-            ).get(5, SECONDS);
+            );
+            first.established().get(5, SECONDS);
 
             // Assert
             assertThat(first.filter()).isEqualTo(new TopicFilter(topic));
@@ -312,7 +363,8 @@ abstract class MessagingTest {
             Subscription second = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     secondDeliveries::add
-            ).get(5, SECONDS);
+            );
+            second.established().get(5, SECONDS);
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
 
             // Assert: only the replacement receives the next publication.
@@ -350,7 +402,7 @@ abstract class MessagingTest {
                         }
                         received.add(number);
                     }
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
 
             // Act: later publications arrive while the first handler occupies the lane.
             sut.publish(message(topic, (byte) 0)).get(5, SECONDS);
@@ -384,10 +436,11 @@ abstract class MessagingTest {
             Subscription ordinary = sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE),
                     received::add
-            ).get(5, SECONDS);
+            );
+            ordinary.established().get(5, SECONDS);
 
             // Act & Assert: rejecting the conflicting request leaves ordinary delivery usable.
-            assertThatThrownBy(() -> sut.subscribe(shared, _ -> { }).get(5, SECONDS))
+            assertThatThrownBy(() -> sut.subscribe(shared, _ -> { }).established().get(5, SECONDS))
                     .hasCauseInstanceOf(IllegalStateException.class);
             sut.publish(message(base + "/job", (byte) 1)).get(5, SECONDS);
             assertThat(requireNonNull(received.poll(5, SECONDS)).message())
@@ -395,7 +448,8 @@ abstract class MessagingTest {
 
             // Act & Assert: acknowledged removal permits the previously conflicting filter.
             ordinary.unsubscribe().get(5, SECONDS);
-            Subscription replacement = sut.subscribe(shared, _ -> { }).get(5, SECONDS);
+            Subscription replacement = sut.subscribe(shared, _ -> { });
+            replacement.established().get(5, SECONDS);
             replacement.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
         }
@@ -422,8 +476,9 @@ abstract class MessagingTest {
                 .build()) {
             sut.connect().get(5, SECONDS);
             var request = Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE);
-            Subscription subscription = (pull ? sut.subscribe(request)
-                    : sut.subscribe(request, received::add)).get(5, SECONDS);
+            Subscription subscription = pull ? sut.subscribe(request)
+                    : sut.subscribe(request, received::add);
+            subscription.established().get(5, SECONDS);
             sut.publish(message(topic, (byte) 1)).get(5, SECONDS);
             MqttDelivery first = pull ? received(subscription.receive(Duration.ofSeconds(5)))
                     : requireNonNull(received.poll(5, SECONDS));
@@ -475,7 +530,8 @@ abstract class MessagingTest {
                         }
                         received.add(delivery);
                     }
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
 
             // Act: the subscriber has no pending operation to carry this failure.
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
@@ -514,7 +570,8 @@ abstract class MessagingTest {
                         }
                         received.add(delivery);
                     }
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
             sut.publish(message(topic, (byte) 1)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
             sut.disconnect().get(5, SECONDS);
@@ -564,7 +621,7 @@ abstract class MessagingTest {
                             returned.countDown();
                         }
                     }
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
@@ -597,14 +654,14 @@ abstract class MessagingTest {
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/reply"), Qos.AT_MOST_ONCE),
                     replies::add
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/request"), Qos.AT_MOST_ONCE),
                     delivery -> {
                         sut.publish(message(base + "/reply", delivery.message().payload())).join();
                         handled.complete(null);
                     }
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
 
             // Act
             sut.publish(message(base + "/request", (byte) 7)).get(5, SECONDS);
@@ -635,7 +692,7 @@ abstract class MessagingTest {
                         entered.countDown();
                         waitFor(release);
                     }
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             publisher.publish(message(topic, (byte) 0)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
@@ -662,7 +719,7 @@ abstract class MessagingTest {
                     .containsExactly(0, 0, 0, 0, 1, 1));
             release.countDown();
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 1, 0, 0, 0, 0, 1, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
@@ -686,7 +743,7 @@ abstract class MessagingTest {
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/barrier"), Qos.AT_MOST_ONCE),
                     _ -> barrier.countDown()
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/work"), Qos.AT_MOST_ONCE)
                             .withBufferCapacity(4),
@@ -700,7 +757,7 @@ abstract class MessagingTest {
                         }
                         handled.add(number);
                     }
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             publisher.publish(message(base + "/work", (byte) 0)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
             for (int i = 1; i < 4; i++) {
@@ -720,7 +777,7 @@ abstract class MessagingTest {
             assertThat(ended).isEmpty();
             sut.disconnect().get(5, SECONDS);
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
@@ -759,11 +816,11 @@ abstract class MessagingTest {
             publisher.subscribe(
                     Subscribe.of(new TopicFilter(base + "/reply"), Qos.AT_MOST_ONCE),
                     replies::add
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/barrier"), Qos.AT_MOST_ONCE),
                     _ -> barrier.countDown()
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/work"), Qos.AT_MOST_ONCE)
                             .withBufferCapacity(4),
@@ -780,7 +837,7 @@ abstract class MessagingTest {
                             }
                         }
                     }
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             publisher.publish(message(base + "/work", (byte) 0)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
             for (int i = 1; i < 4; i++) {
@@ -805,7 +862,7 @@ abstract class MessagingTest {
                     .isInstanceOf(MqttConnectionLostException.class)
                     .hasCause(end.cause().orElseThrow());
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {

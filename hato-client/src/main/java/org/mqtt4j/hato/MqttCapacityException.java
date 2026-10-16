@@ -5,7 +5,8 @@ import java.io.Serial;
 /// A bounded resource has no available capacity.
 ///
 /// As an operation's failure, this means the operation was not admitted; the rejection
-/// does not close an existing connection.
+/// does not close an existing connection. An observation that fails this way, such as one
+/// returned by [Subscription#unsubscribe()], leaves the request it observes in place.
 ///
 /// As a [Disconnection#cause], or the cause of [MqttConnectException] or
 /// [MqttConnectionLostException], this means overload ended the affected connection.

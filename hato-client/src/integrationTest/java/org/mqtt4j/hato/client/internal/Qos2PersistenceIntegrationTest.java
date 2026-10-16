@@ -105,7 +105,8 @@ class Qos2PersistenceIntegrationTest {
                 subscriber.connect().get(5, SECONDS);
                 Subscription subscription = subscriber.subscribe(
                         Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
-                ).get(5, SECONDS);
+                );
+                subscription.established().get(5, SECONDS);
                 sut.connect().get(5, SECONDS);
                 FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
                 CompletableFuture<PublishResult> publication = publishUntil(
@@ -165,7 +166,8 @@ class Qos2PersistenceIntegrationTest {
             subscriber.connect().get(5, SECONDS);
             Subscription subscription = subscriber.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
             assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
             FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
             CompletableFuture<PublishResult> publication = publishUntil(

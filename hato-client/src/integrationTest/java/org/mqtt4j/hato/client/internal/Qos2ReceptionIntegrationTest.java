@@ -58,7 +58,8 @@ abstract class Qos2ReceptionIntegrationTest {
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.MANUAL)
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
             MqttDelivery original = received(subscription.receive(Duration.ofSeconds(5)));
             FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
@@ -103,7 +104,7 @@ abstract class Qos2ReceptionIntegrationTest {
                         }
                         delivered.add(delivery);
                     }
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
             assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false));
 
@@ -151,7 +152,7 @@ abstract class Qos2ReceptionIntegrationTest {
                         }
                         delivered.add(delivery);
                     }
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
             transport.sendDelay(DELAY);
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
@@ -193,18 +194,20 @@ abstract class Qos2ReceptionIntegrationTest {
             publisher.connect().get(5, SECONDS);
             Subscription replies = publisher.subscribe(
                     Subscribe.of(new TopicFilter(base + "/reply"), Qos.EXACTLY_ONCE)
-            ).get(5, SECONDS);
+            );
+            replies.established().get(5, SECONDS);
             Subscription manual = sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/head"), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.MANUAL)
-            ).get(5, SECONDS);
+            );
+            manual.established().get(5, SECONDS);
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/work"), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.AFTER_HANDLER),
                     delivery -> handled.complete(sut.publish(
                             message(base + "/reply", delivery.message().payload()[0])
                     ).join())
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             publisher.publish(message(base + "/head", (byte) 1)).get(5, SECONDS);
             MqttDelivery head = received(manual.receive(Duration.ofSeconds(5)));
 
@@ -233,7 +236,8 @@ abstract class Qos2ReceptionIntegrationTest {
             assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
             assertThat(subscription.grantedQos()).isEqualTo(Qos.EXACTLY_ONCE);
             FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
             if (cut == Cut.BEFORE_PUBLISH) {

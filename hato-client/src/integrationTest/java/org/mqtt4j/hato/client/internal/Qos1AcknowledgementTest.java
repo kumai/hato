@@ -69,14 +69,14 @@ class Qos1AcknowledgementTest {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("data"), Qos.AT_LEAST_ONCE)
             );
             var subscribe = (Packet.Subscribe) peer.receive();
             peer.publish("data", 7);
             peer.send(new Packet.SubAck(subscribe.packetId(),
                     List.of(ReasonCode.GRANTED_QOS_1), EMPTY));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            subscription.established().get(5, SECONDS);
 
             // Act & Assert: formatting a failed assertion must leave the queued delivery alone.
             assertThat(subscription).isNotInstanceOf(Iterable.class);

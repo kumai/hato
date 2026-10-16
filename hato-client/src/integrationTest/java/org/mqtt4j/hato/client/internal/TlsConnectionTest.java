@@ -132,7 +132,8 @@ class TlsConnectionTest {
             assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("tls/round-trip"), Qos.AT_LEAST_ONCE)
-            ).get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
 
             // Act
             sut.publish(publication).get(5, SECONDS);

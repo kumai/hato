@@ -56,7 +56,7 @@ class MosquittoMessagingTest extends MessagingTest {
             sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
                     received::add
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
 
             // Assert
             assertThat(requireNonNull(received.poll(5, SECONDS)).message()).isEqualTo(retained);
@@ -80,11 +80,11 @@ class MosquittoMessagingTest extends MessagingTest {
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE),
                     wildcard::add
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
             sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/data"), Qos.AT_MOST_ONCE),
                     exact::add
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
 
             // Act: Mosquitto 2.1's default sends a copy for each matching subscription.
             sut.publish(publication).get(5, SECONDS);
@@ -123,7 +123,7 @@ class MosquittoMessagingTest extends MessagingTest {
                     Subscribe.of(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE)
                             .withBufferCapacity(10_000),
                     _ -> handled.countDown()
-            ).get(5, SECONDS);
+            ).established().get(5, SECONDS);
 
             // Assert: the client holds the burst instead of ending the connection.
             assertThat(handled.await(10, SECONDS)).isTrue();

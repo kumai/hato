@@ -10,6 +10,9 @@ import java.util.concurrent.CompletableFuture;
 /// A publication that exceeds the send capacity on its own always fails with
 /// [MqttCapacityException], whatever maximum incoming packet size is configured.
 /// Cancelling or completing a returned future does not cancel the underlying operation.
+/// Subscription registration returns its handle immediately, including while disconnected;
+/// [Subscription#established()] observes acceptance. See [MqttSubscriber] for synchronous
+/// argument and closure failures, and asynchronous registration rejection.
 ///
 /// Within one connection, a QoS 1 retransmission marked DUP joins the original delivery while
 /// that delivery's PUBACK is still pending. A QoS 1 publication without DUP, including one that
@@ -45,6 +48,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// re-creation refusal ends only the affected subscription and is reported by
     /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscribeException)]. A pull
     /// subscription also reports it through [Subscription#receive()].
+    /// Registrations still awaiting their first SUBACK are sent after CONNACK as well.
+    /// [Subscription#established()] can observe each subscription independently of this future.
     ///
     /// Local session state is held only in this client object's memory. On a persistent
     /// connection, if the broker reports Session Present without matching local state, the
@@ -71,6 +76,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// A persistent session retains their exchanges for a later [#connect()], without changing
     /// those failed futures. A nonpersistent session discards them.
     /// Wait for each publication's future before disconnecting to observe its acknowledgement.
+    /// Subscription registrations and pending establishment observations survive disconnection.
+    /// Pending removals complete when a nonpersistent connection ends; a persistent session's
+    /// removals wait for confirmation on a later connection.
     ///
     /// The future fails with [MqttNotConnectedException] when there is no established connection
     /// or a disconnect is already pending. A connection failure before the write completes is

@@ -308,10 +308,13 @@ class Qos2SendTest {
         // Act
         long operation = ++nextOperation;
         sut.unsubscribe(operation, subscription);
-        var removal = (Packet.Unsubscribe) port.sent.getLast();
 
-        // Assert
-        assertThat(removal.packetId()).isNotEqualTo(2);
+        // Assert: other deferred packets can be offered after the removal in the same drain.
+        assertThat(port.sent).filteredOn(Packet.Unsubscribe.class::isInstance)
+                .singleElement().isInstanceOfSatisfying(
+                        Packet.Unsubscribe.class,
+                        removal -> assertThat(removal.packetId()).isNotEqualTo(2)
+                );
         assertThat(port.results).doesNotContainKey(operation);
         assertThat(port.releases).isEmpty();
         assertThat(sut.state()).isEqualTo(CONNECTED);

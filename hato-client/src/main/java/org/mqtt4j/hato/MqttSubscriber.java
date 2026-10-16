@@ -1,31 +1,33 @@
 package org.mqtt4j.hato;
 
-import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 /// The subscribing role of a client, without access to its connection lifecycle.
 public interface MqttSubscriber {
 
     /// Registers a pull subscription, whose deliveries are consumed by the application's
-    /// receiving threads. Completes after a successful SUBACK. Publications received before
-    /// SUBACK are buffered within the subscription's capacity.
+    /// receiving threads. Returns the handle immediately; [Subscription#established()] observes
+    /// broker acceptance. Publications received before SUBACK are buffered within the
+    /// subscription's capacity.
     ///
-    /// [AckMode#AFTER_HANDLER] fails with [IllegalArgumentException] through the returned
-    /// future. Other registration restrictions and delivery rules, apart from those about the
-    /// handler, are as for [#subscribe(Subscribe, Consumer)].
+    /// [AckMode#AFTER_HANDLER] throws [IllegalArgumentException]. Other registration
+    /// restrictions and delivery rules, apart from those about the handler, are as for
+    /// [#subscribe(Subscribe, Consumer)].
     ///
-    /// The default implementation fails with [UnsupportedOperationException], so implementations
-    /// of the subscribing role that only provide handlers remain source compatible.
-    default CompletableFuture<Subscription> subscribe(Subscribe request) {
-        return CompletableFuture.failedFuture(
-                new UnsupportedOperationException("Pull subscriptions are not supported")
-        );
+    /// The default implementation throws [UnsupportedOperationException], so implementations
+    /// of the subscribing role that only provide handlers need not implement pull delivery.
+    default Subscription subscribe(Subscribe request) {
+        throw new UnsupportedOperationException("Pull subscriptions are not supported");
     }
 
-    /// Registers one subscription and completes after a successful SUBACK.
-    /// Supports QoS 0, QoS 1, and QoS 2.
+    /// Registers one subscription and returns its handle immediately, including while the
+    /// client is disconnected or connecting. Supports QoS 0, QoS 1, and QoS 2.
+    /// [Subscription#established()] observes broker acceptance. Registration does not start a
+    /// connection: SUBSCRIBE is sent on the current connection or after the next successful
+    /// [MqttClient#connect()]. The registration survives connection loss, requested disconnection,
+    /// and failed connection attempts, including when its first SUBACK has not arrived.
     ///
-    /// Deliveries can reach the handler before the future completes. Each subscription's
+    /// Deliveries can reach the handler before establishment completes. Each subscription's
     /// handler runs serially, independently of I/O and operation completion. A handler failure
     /// is logged and ends the active connection of its receiving session, notifying
     /// [ConnectionListener]. This includes a handler started on an earlier connection when the
@@ -35,7 +37,7 @@ public interface MqttSubscriber {
     /// a disconnection notification.
     /// Exhausted receive capacity also ends the connection.
     /// On connection termination, queued deliveries are discarded; a running handler can finish.
-    /// An established subscription survives termination and resumes on the same handle after
+    /// A subscription survives termination and resumes on the same handle after
     /// the client's next successful [MqttClient#connect()]. New deliveries wait for a previous
     /// connection's running handler to finish, preserving serial execution. A handler failure
     /// also retains the subscription for that next connection.
@@ -57,15 +59,23 @@ public interface MqttSubscriber {
     /// Use separate clients when those filters are needed together. Ordinary subscriptions may
     /// overlap each other.
     ///
-    /// The same original filter fails with [IllegalStateException] while it is pending, active,
-    /// or awaiting unsubscribe acknowledgement. A broker refusal fails with
-    /// [MqttSubscribeException]. An unconnected client fails with [MqttNotConnectedException];
-    /// admission failures use [MqttCapacityException].
-    /// If the connection ends before the initial SUBACK, the future fails with
-    /// [MqttConnectionLostException] and the registration is not retained. A broker refusal
-    /// during re-creation ends only that established subscription; other subscriptions and the
-    /// connection continue. The refusal is reported by
-    /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscribeException)]; a pull
-    /// subscription also reports it from its receive methods.
-    CompletableFuture<Subscription> subscribe(Subscribe request, Consumer<MqttDelivery> handler);
+    /// Null arguments throw [NullPointerException], and calls after client closure throw
+    /// [IllegalStateException], synchronously. Duplicate filters, shared-filter overlap, and
+    /// registration capacity are checked asynchronously: the returned handle ends, and
+    /// [Subscription#established()] fails with [IllegalStateException] for duplicates or overlap,
+    /// or [MqttCapacityException] for capacity. Pull receive methods report the same registration
+    /// failure. The client permits 256 registrations, including ones awaiting establishment or
+    /// broker removal. Registration does not consume operation capacity.
+    /// The same original filter remains reserved while pending, active, or awaiting removal.
+    ///
+    /// A broker refusal fails establishment with [MqttSubscribeException] and permanently ends
+    /// that subscription. Other subscriptions and the connection continue. A refusal during
+    /// re-creation is also reported by
+    /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscribeException)]; pull
+    /// receive methods report both initial and re-creation refusals. A refusal that arrives after
+    /// the application closed the subscription or requested its removal only confirms that
+    /// removal. A SUBACK that violates the protocol ends both the subscription, with
+    /// [MqttProtocolException], and the connection, so a later connection does not send the same
+    /// SUBSCRIBE again.
+    Subscription subscribe(Subscribe request, Consumer<MqttDelivery> handler);
 }

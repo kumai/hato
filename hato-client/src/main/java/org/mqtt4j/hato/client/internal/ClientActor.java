@@ -58,6 +58,8 @@ public final class ClientActor implements MqttClient {
 
     private static final int OPERATION_LIMIT = 64;
 
+    private static final int WAITER_LIMIT = 1024;
+
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
     // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
     // each when measured); the byte limit bounds the packets themselves.
@@ -82,6 +84,9 @@ public final class ClientActor implements MqttClient {
 
     private final String clientId;
 
+    // A nonpersistent session ends with the client, which confirms its pending removals.
+    private final boolean cleanStart;
+
     private final TimerScheduler scheduler;
 
     private final ListenerLane listenerLane;
@@ -99,6 +104,11 @@ public final class ClientActor implements MqttClient {
     // Published under lifecycleLock before admitting commands for an established connection.
     private long connectedGeneration;
 
+    // Guarded by lifecycleLock. Set when the core accepts a requested disconnect and cleared when
+    // the connection ends or a new attempt begins; meanwhile, establishment observations wait
+    // for a later connection.
+    private boolean disconnecting;
+
     private long openedGeneration;
 
     // The attempt being connected or established, and null once its connection ends. Its
@@ -108,11 +118,17 @@ public final class ClientActor implements MqttClient {
     // Admission and stopping share this lock so shutdown cannot miss a registered operation.
     private final Object lifecycleLock = new Object();
 
-    // One background removal per registered subscription, guarded by lifecycleLock. These
-    // protocol operations have no public future and consume no public operation/completion slot.
+    // One durable removal per registration, guarded by lifecycleLock. Observations have their
+    // own budget; neither local close nor public unsubscribe needs an operation slot.
     private final Map<Long, UnsubscribeAttempt> closingAttempts = new LinkedHashMap<>();
 
     private final Semaphore operationSlots = new Semaphore(OPERATION_LIMIT);
+
+    private final Semaphore waiterSlots = new Semaphore(WAITER_LIMIT);
+
+    // Handles include registrations still queued for the actor. The core decides admission; the
+    // mailbox refuses only registrations beyond its queue bound.
+    private final Map<Long, ClientSubscription> subscriptions = new ConcurrentHashMap<>();
 
     private final Map<Long, Operation<?>> operations = new ConcurrentHashMap<>();
 
@@ -120,7 +136,9 @@ public final class ClientActor implements MqttClient {
 
     private final AtomicBoolean stopping = new AtomicBoolean();
 
-    // Fatal I/O failures bypass mailbox capacity and survive connection generation changes.
+    // Guarded by lifecycleLock and published with stopping. A fatal I/O failure or the actor's
+    // own failure; it bypasses mailbox capacity, survives connection generation changes, and
+    // decides whether permanent endings report an internal failure.
     private @Nullable Throwable fatalFailure;
 
     public ClientActor(
@@ -169,6 +187,7 @@ public final class ClientActor implements MqttClient {
         this.endpoint = endpoint;
         this.clientId = clientId;
         this.scheduler = scheduler;
+        this.cleanStart = cleanStart;
         listenerLane = new ListenerLane(endpoint, clientId, listener);
         mailbox = createMailbox(maxPacketSize);
         lanes = new DeliveryLanes(
@@ -215,23 +234,23 @@ public final class ClientActor implements MqttClient {
                 return;
             }
             core.connect(requireNonNull(requireNonNull(operations.get(token)).attempt), now);
-        }, null);
+        });
     }
 
     @Override
     public CompletableFuture<Void> disconnect() {
-        return submit(false, false, 0, core::disconnect, null);
+        return submit(false, false, 0, core::disconnect);
     }
 
     @Override
     public CompletableFuture<PublishResult> publish(MqttMessage message) {
         requireNonNull(message, "message");
         return submit(false, true, message.payloadSize(),
-                token -> core.publish(token, message), null);
+                token -> core.publish(token, message));
     }
 
     @Override
-    public CompletableFuture<Subscription> subscribe(
+    public Subscription subscribe(
             Subscribe request,
             Consumer<MqttDelivery> handler
     ) {
@@ -241,34 +260,72 @@ public final class ClientActor implements MqttClient {
     }
 
     @Override
-    public CompletableFuture<Subscription> subscribe(Subscribe request) {
+    public Subscription subscribe(Subscribe request) {
         requireNonNull(request, "request");
         if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
-            return CompletableFuture.failedFuture(new IllegalArgumentException(
+            throw new IllegalArgumentException(
                     "A pull subscription has no handler to acknowledge"
-            ));
+            );
         }
         return subscribeInternal(request, null);
     }
 
-    private CompletableFuture<Subscription> subscribeInternal(
+    private Subscription subscribeInternal(
             Subscribe request,
             @Nullable Consumer<MqttDelivery> handler
     ) {
-        return submit(false, true, 0, token -> {
-            // The operation token is also the subscription id in the core and lanes.
-            requireNonNull(operations.get(token)).subscription =
-                    new ClientSubscription(token, request, handler);
-            core.subscribe(token, request);
-        }, null);
+        ClientSubscription subscription;
+        MqttCapacityException rejection = null;
+        synchronized (lifecycleLock) {
+            if (stopping.get()) {
+                throw new IllegalStateException("Client is closed");
+            }
+            long id = sequence.incrementAndGet();
+            subscription = new ClientSubscription(id, request, handler);
+            subscriptions.put(id, subscription);
+            Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
+                    0,
+                    () -> register(subscription),
+                    Mailbox.Kind.REGISTRATION,
+                    0
+            ));
+            if (admitted == Mailbox.OfferResult.FULL) {
+                rejection = new MqttCapacityException("Registration mailbox capacity");
+                retire(subscription, rejection);
+            }
+        }
+        if (rejection != null) {
+            logEnding(subscription, rejection);
+        }
+        return subscription;
+    }
+
+    private void register(ClientSubscription subscription) {
+        synchronized (lifecycleLock) {
+            subscription.registrationStarted = true;
+            if (subscription.unsubscription != null) {
+                // Removal won before registration reached the broker, so no wire cleanup is due.
+                retire(subscription, null);
+                completeOperation(subscription.unsubscription.token, null, null);
+                return;
+            }
+        }
+        // A removal requested from here on posts its own wake, which starts it after this.
+        core.subscribe(subscription.id, subscription.request);
+    }
+
+    /// Operators see a registration that ends without the application asking, even when nothing
+    /// observes its establishment.
+    private void logEnding(ClientSubscription subscription, Throwable cause) {
+        log.warn("Subscription {} ended for {} at {}",
+                subscription.filter().pattern(), clientId, endpoint, cause);
     }
 
     private <T> CompletableFuture<T> submit(
             boolean connect,
             boolean needsConnection,
             int bytes,
-            LongConsumer command,
-            @Nullable UnsubscribeAttempt unsubscribe
+            LongConsumer command
     ) {
         synchronized (lifecycleLock) {
             Throwable refusal = null;
@@ -287,17 +344,13 @@ public final class ClientActor implements MqttClient {
                 }
             }
             if (refusal != null) {
-                if (unsubscribe != null) {
-                    unsubscribe.finish(refusal);
-                }
                 return CompletableFuture.failedFuture(refusal);
             }
 
             long token = sequence.incrementAndGet();
             long generation = connectedGeneration;
             var operation = new Operation<T>(
-                    (notifications == null) ? null : new ConnectionAttempt(token, notifications),
-                    unsubscribe
+                    (notifications == null) ? null : new ConnectionAttempt(token, notifications)
             );
             operations.put(token, operation);
             Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
@@ -351,10 +404,12 @@ public final class ClientActor implements MqttClient {
             failure = cause;
         } finally {
             synchronized (lifecycleLock) {
-                stopping.set(true);
                 if (fatalFailure != null) {
                     failure = fatalFailure;
+                } else {
+                    fatalFailure = failure;
                 }
+                stopping.set(true);
             }
             if (credentials != null) {
                 // Drops a waiting result before the remaining cleanup.
@@ -372,8 +427,14 @@ public final class ClientActor implements MqttClient {
                 log.error("Shutdown failed for {} at {}", clientId, endpoint, cleanupFailure);
             } finally {
                 try {
+                    synchronized (lifecycleLock) {
+                        Throwable ending = permanentFailure();
+                        for (ClientSubscription subscription : subscriptions.values()) {
+                            retire(subscription, ending);
+                        }
+                        finishClosures(ending);
+                    }
                     lanes.close(failure);
-                    finishClosures(failure);
                     mailbox.discard(0);
                     Throwable cause = failure;
                     // The core has completed started operations; the remainder never started.
@@ -414,52 +475,56 @@ public final class ClientActor implements MqttClient {
         );
     }
 
-    /// Caller holds lifecycleLock. Local closure has its own attempt even during unsubscribe,
-    /// so a failed public removal cannot restore the permanently closed intent.
-    private void requestClose(ClientSubscription subscription) {
-        if (stopping.get() || subscription.retired) {
-            return;
-        }
+    /// Caller holds lifecycleLock. Public removal and local close share one durable request.
+    private UnsubscribeAttempt requestRemoval(ClientSubscription subscription) {
         UnsubscribeAttempt current = subscription.unsubscription;
-        if (current != null && current.background && !current.finished) {
-            return;
+        if (current != null) {
+            return current;
         }
-        var attempt = new UnsubscribeAttempt(subscription.id, true);
+        long token = sequence.incrementAndGet();
+        var attempt = new UnsubscribeAttempt(token, subscription);
         subscription.unsubscription = attempt;
-        closingAttempts.put(sequence.incrementAndGet(), attempt);
+        closingAttempts.put(token, attempt);
+        subscription.endEstablishment(new IllegalStateException("Subscription is being removed"));
         post(0, this::startClosures, Mailbox.Kind.SUBSCRIPTION_CLOSE, 0);
+        return attempt;
     }
 
     private void startClosures() {
-        var starting = new ArrayList<Map.Entry<Long, UnsubscribeAttempt>>();
+        var starting = new ArrayList<UnsubscribeAttempt>();
         synchronized (lifecycleLock) {
             if (stopping.get()) {
                 return;
             }
-            for (var entry : closingAttempts.entrySet()) {
-                UnsubscribeAttempt attempt = entry.getValue();
-                if (!attempt.started) {
+            for (UnsubscribeAttempt attempt : closingAttempts.values()) {
+                if (!attempt.started && attempt.subscription.registrationStarted) {
                     attempt.started = true;
-                    starting.add(Map.entry(entry.getKey(), attempt));
+                    starting.add(attempt);
                 }
             }
         }
-        for (var entry : starting) {
-            core.closeSubscription(entry.getKey(), entry.getValue().subscriptionId);
+        for (UnsubscribeAttempt attempt : starting) {
+            core.unsubscribe(attempt.token, attempt.subscription.id);
         }
         core.sendCapacityAvailable(openedGeneration);
     }
 
-    /// Also covers closures whose coalesced wake has not reached the core before termination.
-    private void finishClosures(@Nullable Throwable cause) {
-        synchronized (lifecycleLock) {
-            var failure = (cause == null)
-                    ? new MqttConnectionLostException()
-                    : new MqttConnectionLostException(cause);
-            for (long token : List.copyOf(closingAttempts.keySet())) {
-                completeOperation(token, null, failure);
-            }
+    /// Caller holds lifecycleLock. Completes every removal still pending at shutdown, including
+    /// ones whose coalesced wake never reached the core. Closing a nonpersistent session confirms
+    /// them; after an ordinary close, a persistent broker may still hold the subscription.
+    private void finishClosures(@Nullable Throwable ending) {
+        Throwable failure = ending != null || cleanStart
+                ? ending
+                : new IllegalStateException("Client is closed");
+        for (long token : List.copyOf(closingAttempts.keySet())) {
+            completeOperation(token, null, failure);
         }
+    }
+
+    /// Caller holds lifecycleLock. An internal failure that closes the client is reported with
+    /// its cause; an ordinary close reports no failure.
+    private @Nullable Throwable permanentFailure() {
+        return fatalFailure == null ? null : new MqttConnectionLostException(fatalFailure);
     }
 
     private void post(long generation, Runnable action, Mailbox.Kind kind, int bytes) {
@@ -472,6 +537,7 @@ public final class ClientActor implements MqttClient {
         if (admitted == Mailbox.OfferResult.FULL) {
             String admission = switch (kind) {
                 case COMMAND -> "Command";
+                case REGISTRATION -> "Registration";
                 case INCOMING -> "Incoming";
                 case KEEP_ALIVE -> "Keep-alive";
                 case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE,
@@ -526,23 +592,23 @@ public final class ClientActor implements MqttClient {
     ) {
         Operation<?> operation = operations.remove(token);
         if (operation == null) {
-            // Background closures have no public operation or future.
+            ClientSubscription rejected = null;
             synchronized (lifecycleLock) {
                 UnsubscribeAttempt closing = closingAttempts.remove(token);
                 if (closing != null) {
                     closing.finish(failure);
+                } else if (failure != null) {
+                    // The core rejected a registration, whose id is the token.
+                    rejected = subscriptions.get(token);
+                    if (rejected != null) {
+                        retire(rejected, failure);
+                    }
                 }
             }
-            return;
-        }
-        if (failure != null) {
-            ClientSubscription subscription = operation.subscription;
-            if (subscription != null) {
-                retire(subscription, null);
+            if (rejected != null) {
+                logEnding(rejected, requireNonNull(failure));
             }
-        }
-        if (operation.unsubscribe != null) {
-            operation.unsubscribe.finish(failure);
+            return;
         }
         if (failure != null && operation.attempt != null) {
             // An attempt that established no connection returns both of its notifications.
@@ -582,12 +648,13 @@ public final class ClientActor implements MqttClient {
                 io.sendBytes(),
                 lanes.retainedLanes(),
                 lanes.retainedDeliveries(),
-                lanes.retainedBytes()
+                lanes.retainedBytes(),
+                WAITER_LIMIT - waiterSlots.availablePermits()
         );
     }
 
     static Mailbox createMailbox(int maxPacketSize) {
-        // Operation slots are taken before admission, so they also bound queued commands.
+        // Registrations have their own admission class within the shared FIFO.
         return new Mailbox(
                 OPERATION_LIMIT,
                 MAILBOX_COMMAND_BYTE_LIMIT,
@@ -614,6 +681,9 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void beginAttempt(long generation, ConnectionAttempt attempt) {
+            synchronized (lifecycleLock) {
+                disconnecting = false;
+            }
             activeAttempt = attempt;
             openedGeneration = generation;
             mailbox.activateSession(core.sessionNumber());
@@ -636,13 +706,24 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
-        public void connected(long generation, ConnAck ack) {
+        public void admit(long generation) {
             // Admission opens before onConnected is queued, so the callback can always use it.
             synchronized (lifecycleLock) {
                 connectedGeneration = generation;
             }
+        }
+
+        @Override
+        public void connected(long generation, ConnAck ack) {
             notifications().connected(ack);
             log.info("Connected {} to {}", clientId, endpoint);
+        }
+
+        @Override
+        public void disconnecting() {
+            synchronized (lifecycleLock) {
+                disconnecting = true;
+            }
         }
 
         private ListenerLane.Reservation notifications() {
@@ -653,8 +734,8 @@ public final class ClientActor implements MqttClient {
         public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
             var subscription = (ClientSubscription) handle;
             synchronized (lifecycleLock) {
-                if (subscription.retired || subscription.locallyClosed) {
-                    // The first ending decides; a local close only waited for this answer.
+                if (subscription.retired || subscription.removalRequested()) {
+                    // The first ending decides; a requested removal only waited for this answer.
                     retire(subscription, null);
                     return;
                 }
@@ -736,25 +817,39 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public Optional<Subscription> registerSubscription(long id) {
-            ClientSubscription subscription = requireNonNull(
-                    requireNonNull(operations.get(id)).subscription
-            );
-            if (!listenerLane.tryReserveSubscription()) {
-                return Optional.empty();
+            synchronized (lifecycleLock) {
+                ClientSubscription subscription = requireNonNull(subscriptions.get(id));
+                if (!listenerLane.tryReserveSubscription()) {
+                    return Optional.empty();
+                }
+                subscription.notificationReserved = true;
+                if (subscription.locallyClosed) {
+                    return Optional.of(subscription);
+                }
+                boolean admitted = subscription.receiver != null
+                        ? lanes.register(subscription.receiver)
+                        : lanes.register(
+                                id,
+                                subscription.request,
+                                requireNonNull(subscription.handler)
+                        );
+                if (subscription.unsubscription != null) {
+                    lanes.pause(id);
+                }
+                return admitted ? Optional.of(subscription) : Optional.empty();
             }
-            // Retirement returns it, also when a failed registration fails the operation.
-            subscription.notificationReserved = true;
-            if (subscription.handler == null) {
-                subscription.receiver = lanes.registerPull(id, subscription.request).orElse(null);
-                return subscription.receiver == null ? Optional.empty() : Optional.of(subscription);
-            }
-            return lanes.register(id, subscription.request, subscription.handler)
-                    ? Optional.of(subscription) : Optional.empty();
         }
 
         @Override
         public void subscribed(Subscription handle, Qos granted) {
-            ((ClientSubscription) handle).granted = granted;
+            var subscription = (ClientSubscription) handle;
+            synchronized (lifecycleLock) {
+                subscription.granted = granted;
+                subscription.establishedGeneration = connectedGeneration;
+                if (!disconnecting && subscription.establishmentFailure == null) {
+                    completeWaiters(subscription.establishmentWaiters, granted, null);
+                }
+            }
         }
 
         @Override
@@ -796,7 +891,26 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
-            retire((ClientSubscription) handle, cause);
+            var subscription = (ClientSubscription) handle;
+            boolean unrequested;
+            synchronized (lifecycleLock) {
+                boolean closed = core.state() == SessionCore.State.CLOSED;
+                Throwable ending;
+                if (closed) {
+                    // The core's cause cannot tell an ordinary close from an internal failure.
+                    ending = permanentFailure();
+                } else if (subscription.removalRequested()) {
+                    // A requested removal decides the ending; a refusal only confirms it.
+                    ending = null;
+                } else {
+                    ending = cause;
+                }
+                unrequested = !closed && ending != null && !subscription.retired;
+                retire(subscription, ending);
+            }
+            if (unrequested) {
+                logEnding(subscription, requireNonNull(cause));
+            }
         }
 
         @Override
@@ -819,12 +933,7 @@ public final class ClientActor implements MqttClient {
             Throwable cause = disconnection.cause().orElse(null);
             synchronized (lifecycleLock) {
                 connectedGeneration = 0;
-                var failure = cause == null
-                        ? new MqttConnectionLostException()
-                        : new MqttConnectionLostException(cause);
-                for (UnsubscribeAttempt closing : closingAttempts.values()) {
-                    closing.completeObservers(failure);
-                }
+                disconnecting = false;
             }
             mailbox.discard(generation);
             // Reject old failures before releasing their lane pause; otherwise a late failure
@@ -951,7 +1060,8 @@ public final class ClientActor implements MqttClient {
             long sendBytes,
             int lanes,
             int deliveries,
-            long deliveryBytes
+            long deliveryBytes,
+            int waiters
     ) {
     }
 
@@ -966,7 +1076,8 @@ public final class ClientActor implements MqttClient {
                 return;
             }
             subscription.retired = true;
-            lanes.remove(subscription.id, cause);
+            subscriptions.remove(subscription.id);
+            subscription.endLocally(cause);
             if (subscription.notificationReserved) {
                 subscription.notificationReserved = false;
                 listenerLane.releaseSubscription();
@@ -982,10 +1093,17 @@ public final class ClientActor implements MqttClient {
 
         private final @Nullable Consumer<MqttDelivery> handler;
 
-        // Assigned before SUBSCRIBE is sent and published with the completed subscription future.
-        private DeliveryLanes.@Nullable Receiver receiver;
+        private final DeliveryLanes.@Nullable Receiver receiver;
 
-        private volatile Qos granted = Qos.AT_MOST_ONCE;
+        private volatile @Nullable Qos granted;
+
+        private long establishedGeneration;
+
+        private final List<CompletableFuture<Qos>> establishmentWaiters = new ArrayList<>();
+
+        private @Nullable Throwable establishmentFailure;
+
+        private boolean registrationStarted;
 
         // Attempt state belongs to the client, never to a caller-mutable future.
         private @Nullable UnsubscribeAttempt unsubscription;
@@ -1001,6 +1119,7 @@ public final class ClientActor implements MqttClient {
             this.id = id;
             this.request = request;
             this.handler = handler;
+            receiver = handler == null ? lanes.receiver(id, request) : null;
         }
 
         @Override
@@ -1010,7 +1129,58 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public Qos grantedQos() {
-            return granted;
+            Qos value = granted;
+            if (value == null) {
+                throw new IllegalStateException("Subscription has not been established");
+            }
+            return value;
+        }
+
+        @Override
+        public CompletableFuture<Qos> established() {
+            synchronized (lifecycleLock) {
+                if (establishmentFailure != null) {
+                    return CompletableFuture.failedFuture(establishmentFailure);
+                }
+                if (stopping.get()) {
+                    Throwable ending = permanentFailure();
+                    endEstablishment(
+                            ending != null ? ending : new IllegalStateException("Client is closed")
+                    );
+                    return CompletableFuture.failedFuture(requireNonNull(establishmentFailure));
+                }
+                if (!disconnecting && connectedGeneration != 0
+                        && establishedGeneration == connectedGeneration) {
+                    return CompletableFuture.completedFuture(requireNonNull(granted));
+                }
+                return observeFuture(establishmentWaiters);
+            }
+        }
+
+        private void endEstablishment(Throwable failure) {
+            if (establishmentFailure == null) {
+                establishmentFailure = failure;
+                completeWaiters(establishmentWaiters, null, failure);
+            }
+        }
+
+        /// Caller holds lifecycleLock. Ends local delivery before establishment, so a caller that
+        /// sees establishment fail also finds receiving ended. Without a cause the ending is
+        /// ordinary.
+        private void endLocally(@Nullable Throwable cause) {
+            if (receiver != null) {
+                receiver.end(cause);
+            } else {
+                lanes.remove(id, cause);
+            }
+            endEstablishment(
+                    cause != null ? cause : new IllegalStateException("Subscription is closed")
+            );
+        }
+
+        /// Caller holds lifecycleLock. A requested removal decides how this subscription ends.
+        private boolean removalRequested() {
+            return locallyClosed || unsubscription != null;
         }
 
         @Override
@@ -1036,21 +1206,12 @@ public final class ClientActor implements MqttClient {
             synchronized (lifecycleLock) {
                 if (stopping.get() || retired) {
                     // Discards deliveries still queued here; a running handler finishes.
-                    lanes.remove(id);
+                    endLocally(permanentFailure());
                     return CompletableFuture.completedFuture(null);
                 }
 
-                UnsubscribeAttempt current = unsubscription;
-                if (current != null && !current.finished) {
-                    // Each observer uses the normal operation/completion budget, but does
-                    // not initiate another wire request or affect its rollback on refusal.
-                    return submit(false, true, 0, current::observe, null);
-                }
-
-                var attempt = new UnsubscribeAttempt(id, false);
-                unsubscription = attempt;
                 lanes.pause(id);
-                return submit(false, true, 0, token -> core.unsubscribe(token, id), attempt);
+                return requestRemoval(this).observe();
             }
         }
 
@@ -1063,62 +1224,76 @@ public final class ClientActor implements MqttClient {
                 locallyClosed = true;
                 // Stop locally before scheduling the independently bounded broker removal.
                 // A handed-off MANUAL delivery retains its own acknowledgement obligation.
-                lanes.remove(id);
-                requestClose(this);
+                endLocally(permanentFailure());
+                if (!stopping.get() && !retired) {
+                    requestRemoval(this);
+                }
             }
         }
     }
 
-    /// One wire exchange, with individually admitted public observers. Guarded by lifecycleLock.
+    /// One durable removal, with independently bounded observations. Guarded by lifecycleLock.
     private final class UnsubscribeAttempt {
 
-        private final long subscriptionId;
-
-        private final boolean background;
-
-        private final List<Long> observers = new ArrayList<>();
-
-        private boolean finished;
-
-        // Set once startClosures hands this background attempt to the core.
+        private final long token;
+        private final ClientSubscription subscription;
+        private final List<CompletableFuture<Void>> observers = new ArrayList<>();
         private boolean started;
 
-        private @Nullable Throwable failure;
-
-        UnsubscribeAttempt(long subscriptionId, boolean background) {
-            this.subscriptionId = subscriptionId;
-            this.background = background;
+        UnsubscribeAttempt(long token, ClientSubscription subscription) {
+            this.token = token;
+            this.subscription = subscription;
         }
 
-        void observe(long token) {
-            synchronized (lifecycleLock) {
-                if (finished) {
-                    completeOperation(token, null, failure);
-                } else {
-                    observers.add(token);
-                }
-            }
+        /// A finished attempt has no new observers: its handle is already retired, and later
+        /// calls complete locally.
+        CompletableFuture<Void> observe() {
+            return observeFuture(observers);
         }
 
         void finish(@Nullable Throwable cause) {
-            synchronized (lifecycleLock) {
-                if (cause != null) {
-                    lanes.resume(subscriptionId);
-                }
-                failure = cause;
-                finished = true;
-                completeObservers(cause);
-            }
+            completeWaiters(observers, null, cause);
         }
+    }
 
-        /// Caller holds lifecycleLock. Public observations end with their connection; the
-        /// background removal itself can survive until a later clean CONNACK confirms it.
-        void completeObservers(@Nullable Throwable cause) {
-            for (long token : observers) {
-                completeOperation(token, null, cause);
-            }
-            observers.clear();
+    /// Caller holds lifecycleLock. The budget includes completion through synchronous callbacks.
+    private <T> CompletableFuture<T> observeFuture(List<CompletableFuture<T>> observers) {
+        if (!waiterSlots.tryAcquire()) {
+            return CompletableFuture.failedFuture(new MqttCapacityException("Waiter capacity"));
         }
+        var future = new CompletableFuture<T>();
+        observers.add(future);
+        return future;
+    }
+
+    /// Caller holds lifecycleLock, but only for one thread start: a starter outside the lock gives
+    /// each observation its own thread, so a slow continuation delays no other observation.
+    private <T> void completeWaiters(
+            List<CompletableFuture<T>> observers,
+            @Nullable T value,
+            @Nullable Throwable failure
+    ) {
+        if (observers.isEmpty()) {
+            return;
+        }
+        List<CompletableFuture<T>> completing = List.copyOf(observers);
+        observers.clear();
+        Thread.ofVirtual().name(threadName("observations")).start(() -> {
+            for (CompletableFuture<T> future : completing) {
+                Thread.ofVirtual().name(threadName("observation-" + sequence.incrementAndGet()))
+                        .start(() -> {
+                            try {
+                                if (failure == null) {
+                                    future.complete(value);
+                                } else {
+                                    future.completeExceptionally(failure);
+                                }
+                            } finally {
+                                waiterSlots.release();
+                            }
+                        });
+            }
+        });
     }
 
     private static final class Operation<T> {
@@ -1128,13 +1303,8 @@ public final class ClientActor implements MqttClient {
         // Present for connect(): the attempt owns the notifications reserved at admission.
         final @Nullable ConnectionAttempt attempt;
 
-        final @Nullable UnsubscribeAttempt unsubscribe;
-
-        @Nullable ClientSubscription subscription;
-
-        Operation(@Nullable ConnectionAttempt attempt, @Nullable UnsubscribeAttempt unsubscribe) {
+        Operation(@Nullable ConnectionAttempt attempt) {
             this.attempt = attempt;
-            this.unsubscribe = unsubscribe;
         }
 
         @SuppressWarnings("unchecked") // Tokens retain their operation's result type in the core.

@@ -8,7 +8,6 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -19,9 +18,11 @@ import java.util.function.Consumer;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscribeException;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.Subscribe;
@@ -87,81 +88,77 @@ final class DeliveryLanes {
     }
 
     boolean register(long id, Subscribe request, Consumer<MqttDelivery> handler) {
-        return registerLane(id, request, handler).isPresent();
+        return registerLane(new Lane(
+                id,
+                request.bufferCapacity(),
+                request.ackMode().orElse(AckMode.AFTER_HANDLER),
+                handler,
+                lock.newCondition()
+        ));
     }
 
-    Optional<Receiver> registerPull(long id, Subscribe request) {
+    /// A pull handle can wait before the actor admits its routing lane.
+    Receiver receiver(long id, Subscribe request) {
         if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
             throw new IllegalArgumentException("A pull subscription has no handler to acknowledge");
         }
-        return registerLane(id, request, null).map(Receiver::new);
+        return new Receiver(new Lane(
+                id,
+                request.bufferCapacity(),
+                request.ackMode().orElse(AckMode.ON_RECEIVE),
+                null,
+                lock.newCondition()
+        ));
     }
 
-    private Optional<Lane> registerLane(
-            long id,
-            Subscribe request,
-            @Nullable Consumer<MqttDelivery> handler
-    ) {
+    boolean register(Receiver receiver) {
+        return registerLane(receiver.lane);
+    }
+
+    /// Returns false only when the lane limit is full.
+    private boolean registerLane(Lane lane) {
         lock.lock();
         try {
+            if (lane.stopped) {
+                // A receiver ended before the actor admitted it stays ended, without a lane slot.
+                return true;
+            }
             if (retainedLanes >= LANE_LIMIT) {
-                return Optional.empty();
+                return false;
             }
-            if (lanes.containsKey(id)) {
-                throw new IllegalStateException("Subscription lane is already registered: " + id);
+            if (lanes.containsKey(lane.id)) {
+                throw new IllegalStateException(
+                        "Subscription lane is already registered: " + lane.id
+                );
             }
-            var lane = new Lane(
-                    id,
-                    request.bufferCapacity(),
-                    request.ackMode().orElse(
-                            handler == null ? AckMode.ON_RECEIVE : AckMode.AFTER_HANDLER
-                    ),
-                    handler,
-                    lock.newCondition()
-            );
-            lanes.put(id, lane);
+            lanes.put(lane.id, lane);
             retainedLanes++;
-            if (handler == null) {
-                return Optional.of(lane);
+            if (lane.handler == null) {
+                return true;
             }
             try {
-                Thread.ofVirtual().name("hato-" + clientId + "-delivery-" + id)
+                Thread.ofVirtual().name("hato-" + clientId + "-delivery-" + lane.id)
                         .start(() -> run(lane));
             } catch (Throwable failure) {
-                lanes.remove(id);
+                lanes.remove(lane.id);
                 retainedLanes--;
                 throw failure;
             }
-            return Optional.of(lane);
+            return true;
         } finally {
             lock.unlock();
         }
     }
 
+    /// Stops new local delivery while removal is pending. Queued deliveries still run or are
+    /// received; later QoS 0 is dropped, and later QoS 1 and 2 is held until removal stops the
+    /// lane, which releases its acknowledgement condition without running it.
     void pause(long id) {
         lock.lock();
         try {
             Lane lane = lanes.get(id);
             if (lane != null) {
                 lane.paused = true;
-            }
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /// A refused removal releases QoS 1 and 2 deliveries held during the attempt, so none is
-    /// acknowledged without reaching the application of a subscription that stays active.
-    void resume(long id) {
-        lock.lock();
-        try {
-            Lane lane = lanes.get(id);
-            if (lane != null) {
-                lane.paused = false;
-                for (DeliveryView view : lane.queue) {
-                    view.held = false;
-                }
-                lane.ready.signalAll();
             }
         } finally {
             lock.unlock();
@@ -283,7 +280,7 @@ final class DeliveryLanes {
         try {
             retireAcknowledgements();
             for (Lane lane : List.copyOf(lanes.values())) {
-                lane.failure = failure;
+                lane.failure = failure == null ? null : new MqttConnectionLostException(failure);
                 stop(lane);
             }
         } finally {
@@ -328,7 +325,7 @@ final class DeliveryLanes {
             if (first) {
                 for (long id : ids) {
                     Lane lane = lanes.get(id);
-                    // Removal holds QoS 1/2 until UNSUBACK or a refused removal resumes it.
+                    // A pending removal drops QoS 0 and holds QoS 1/2 until it stops the lane.
                     if (lane != null && (!lane.paused || token.acknowledgement() != 0)) {
                         recipients.add(lane);
                         states.add(new Recipient(id));
@@ -714,6 +711,27 @@ final class DeliveryLanes {
             this.lane = lane;
         }
 
+        void end(@Nullable Throwable failure) {
+            boolean ready = false;
+            lock.lock();
+            try {
+                if (!lane.stopped) {
+                    lane.failure = failure;
+                    if (lanes.get(lane.id) == lane) {
+                        ready = stop(lane);
+                    } else {
+                        lane.stopped = true;
+                        lane.ready.signalAll();
+                    }
+                }
+            } finally {
+                lock.unlock();
+            }
+            if (ready) {
+                onReady.run();
+            }
+        }
+
         ReceiveResult receive() throws InterruptedException {
             return receiveNanos(-1);
         }
@@ -765,9 +783,26 @@ final class DeliveryLanes {
         }
 
         private void checkFailure() {
+            if (lane.failure instanceof MqttConnectionLostException ending) {
+                Throwable cause = ending.getCause();
+                throw cause == null ? new MqttConnectionLostException()
+                        : new MqttConnectionLostException(cause);
+            }
+            if (lane.failure instanceof IllegalStateException rejection) {
+                throw new IllegalStateException(rejection.getMessage(), rejection);
+            }
+            if (lane.failure instanceof MqttCapacityException rejection) {
+                throw new MqttCapacityException(requireNonNull(rejection.getMessage()));
+            }
             if (lane.failure instanceof MqttSubscribeException rejection) {
                 // Concurrent receivers must not share one throwable's trace and suppressions.
                 throw new MqttSubscribeException(rejection.reasonCode());
+            }
+            if (lane.failure instanceof MqttProtocolException violation) {
+                throw new MqttProtocolException(
+                        requireNonNull(violation.getMessage()),
+                        violation.reasonCode()
+                );
             }
             if (lane.failure != null) {
                 throw new MqttConnectionLostException(lane.failure);
@@ -803,7 +838,7 @@ final class DeliveryLanes {
             this.ready = ready;
         }
 
-        /// Caller holds lock. Held deliveries wait for a resumed lane in both modes.
+        /// Caller holds lock. Held deliveries wait in both modes until removal stops the lane.
         boolean hasDelivery() {
             return !queue.isEmpty() && !(paused && requireNonNull(queue.peekFirst()).held);
         }
@@ -852,8 +887,8 @@ final class DeliveryLanes {
         boolean localDone;
         boolean released;
         boolean valid = true;
-        // Admitted while the lane awaited removal; it is not run or received until the lane
-        // resumes.
+        // Admitted while the lane awaited removal; it is never run or received, and removal
+        // discards it.
         boolean held;
 
         DeliveryView(

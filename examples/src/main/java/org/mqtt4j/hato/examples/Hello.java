@@ -41,11 +41,13 @@ public final class Hello {
                         show("handler", delivery.message());
                         readingShown.countDown();
                     }
-            ).join();
+            );
             Subscription alarms = client.subscribe(
                     Subscribe.of(new TopicFilter("alarms/#"), Qos.AT_LEAST_ONCE)
                             .withAckMode(AckMode.MANUAL)
-            ).join();
+            );
+            readings.established().join();
+            alarms.established().join();
 
             client.publish(message("sensors/kitchen/temperature", "21.5", Qos.AT_MOST_ONCE))
                     .join();

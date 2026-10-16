@@ -650,8 +650,8 @@ class SessionPersistenceIntegrationTest {
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
                             .withAckMode(AckMode.ON_RECEIVE)
-        )
-                .get(5, SECONDS);
+            );
+            subscription.established().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
 
             var first = message(topic, (byte) 1);

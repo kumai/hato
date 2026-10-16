@@ -20,6 +20,56 @@ import static org.mqtt4j.hato.client.internal.Mailbox.OfferResult.STALE;
 class MailboxTest {
 
     @Test
+    void registration_and_operation_capacity_are_independent_in_the_same_fifo() throws Exception {
+        // Arrange: operation admission is already full before the registration burst.
+        var sut = new Mailbox(1, 10, 0, 0, 0);
+        var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var registration = new Mailbox.Event(0, () -> { }, Mailbox.Kind.REGISTRATION, 0);
+        var next = new Mailbox.Event(0, () -> { }, Mailbox.Kind.REGISTRATION, 0);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+
+        // Act & Assert: all subscription slots remain available, and neither class can grow.
+        for (int i = 0; i < 256; i++) {
+            assertThat(sut.offer(registration)).isEqualTo(ACCEPTED);
+        }
+        assertThat(sut.offer(next)).isEqualTo(FULL);
+        assertThat(sut.offer(command)).isEqualTo(FULL);
+        assertThat(sut.take(() -> false)).containsSame(command);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+        assertThat(sut.take(() -> false)).containsSame(registration);
+        assertThat(sut.offer(next)).isEqualTo(ACCEPTED);
+        for (int i = 0; i < 255; i++) {
+            assertThat(sut.take(() -> false)).containsSame(registration);
+        }
+        assertThat(sut.take(() -> false)).containsSame(command);
+        assertThat(sut.take(() -> false)).containsSame(next);
+        assertThat(sut.size()).isZero();
+        assertThat(sut.bytes()).isZero();
+    }
+
+    @Test
+    void queued_registrations_keep_their_slots_across_connections_and_release_them_on_shutdown() {
+        // Arrange
+        var sut = new Mailbox(0, 0, 0, 0, 0);
+        var registration = new Mailbox.Event(0, () -> { }, Mailbox.Kind.REGISTRATION, 0);
+        sut.activate(1);
+        for (int i = 0; i < 256; i++) {
+            assertThat(sut.offer(registration)).isEqualTo(ACCEPTED);
+        }
+
+        // Act & Assert: a connection ending cannot lose accepted registrations or their budget.
+        sut.discard(1);
+        sut.activate(2);
+        assertThat(sut.offer(registration)).isEqualTo(FULL);
+        sut.discard(0);
+        assertThat(sut.size()).isZero();
+        for (int i = 0; i < 256; i++) {
+            assertThat(sut.offer(registration)).isEqualTo(ACCEPTED);
+        }
+        assertThat(sut.offer(registration)).isEqualTo(FULL);
+    }
+
+    @Test
     void commands_incoming_packets_and_control_have_independent_capacity_in_one_fifo()
             throws Exception {
         // Arrange

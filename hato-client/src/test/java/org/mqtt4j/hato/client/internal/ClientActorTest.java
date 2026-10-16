@@ -68,7 +68,6 @@ import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.spi.TimerScheduler;
-import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.Objects.requireNonNull;
@@ -355,6 +354,68 @@ class ClientActorTest {
     }
 
     @Test
+    void a_registration_burst_leaves_connection_and_publication_admission_available()
+            throws Exception {
+        // Arrange: hold the established actor while registrations accumulate.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            holdActor(transport, entered, release);
+            for (int i = 0; i < 256; i++) {
+                sut.subscribe(Subscribe.of(new TopicFilter("burst/" + i), Qos.AT_MOST_ONCE));
+            }
+
+            // Act
+            CompletableFuture<ConnAck> connected = sut.connect();
+            CompletableFuture<PublishResult> published = sut.publish(message(new byte[] {1}));
+            CompletableFuture<Void> disconnected = sut.disconnect();
+
+            // Assert: admission is independent; the core still decides each operation's result.
+            assertThat(connected).isNotDone();
+            assertThat(published).isNotDone();
+            assertThat(disconnected).isNotDone();
+            release.countDown();
+            assertThatThrownBy(() -> connected.get(5, SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+            published.get(5, SECONDS);
+            disconnected.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_refused_disconnect_during_connection_does_not_block_subscription_establishment()
+            throws Exception {
+        // Arrange: the registration waits for the connection already in progress.
+        try (MqttClient sut = client()) {
+            Subscription subscription = sut.subscribe(request());
+            CompletableFuture<Qos> establishing = subscription.established();
+            CompletableFuture<ConnAck> connecting = sut.connect();
+            ScriptTransport transport = nextTransport();
+
+            // Act: disconnect is refused while the MQTT connection is not established.
+            assertThatThrownBy(() -> sut.disconnect().get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttNotConnectedException.class);
+            transport.accept();
+            connecting.get(5, SECONDS);
+            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.SubAck(
+                    subscribe.packetId(),
+                    List.of(ReasonCode.SUCCESS),
+                    EMPTY
+            ));
+
+            // Assert: the refused operation cannot suppress the later successful SUBACK.
+            assertThat(establishing.get(5, SECONDS)).isEqualTo(Qos.AT_MOST_ONCE);
+            assertThat(subscription.established().get(5, SECONDS)).isEqualTo(Qos.AT_MOST_ONCE);
+            assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @Test
     void a_waiting_pull_receiver_survives_disconnect_and_receives_after_resubscribe()
             throws Exception {
         // Arrange: the application is waiting on the original subscription before disconnect.
@@ -410,7 +471,7 @@ class ClientActorTest {
         var currentFailure = new IllegalStateException("current handler failed");
         try (MqttClient sut = client()) {
             ScriptTransport old = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), delivery -> {
+            Subscription subscription = sut.subscribe(request(), delivery -> {
                 maximum.accumulateAndGet(active.incrementAndGet(), Math::max);
                 try {
                     byte payload = delivery.message().payload()[0];
@@ -429,16 +490,13 @@ class ClientActorTest {
                     active.decrementAndGet();
                 }
             });
-            var subscribe = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
-            old.receive(new Packet.SubAck(subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS), EMPTY));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            establish(old, subscription);
             old.receive(publication(new byte[] {1}));
             assertThat(entered.await(5, SECONDS)).isTrue();
             sut.disconnect().get(5, SECONDS);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
             ScriptTransport current = connect(sut);
-            acknowledgeResubscription(current, subscription);
+            acknowledgeSubscription(current, subscription);
 
             // Act: current input reaches the actor while the old invocation still holds its lane.
             current.receive(publication(new byte[] {2}));
@@ -480,7 +538,7 @@ class ClientActorTest {
             sut.disconnect().get(5, SECONDS);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
             CompletableFuture<Void> pending = requireNonNull(removing.get());
-            assertThatThrownBy(pending::join).hasCauseInstanceOf(MqttNotConnectedException.class);
+            pending.get(5, SECONDS);
             ScriptTransport current = connect(sut);
 
             // Assert: a fresh clean session needs neither recreation nor remote removal.
@@ -504,16 +562,13 @@ class ClientActorTest {
         var handled = new AtomicInteger();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), _ -> {
+            Subscription subscription = sut.subscribe(request(), _ -> {
                 worker.set(Thread.currentThread());
                 handled.incrementAndGet();
                 entered.countDown();
                 waitFor(release);
             });
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS), EMPTY));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.receive(publication(new byte[] {1}));
             assertThat(entered.await(5, SECONDS)).isTrue();
             transport.completeSends = false;
@@ -565,7 +620,7 @@ class ClientActorTest {
             // Assert: connection loss clears buffered input without ending this receiver.
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
             ScriptTransport replacement = connect(sut);
-            acknowledgeResubscription(replacement, subscription);
+            acknowledgeSubscription(replacement, subscription);
             replacement.receive(publication(new byte[] {9}));
             assertThat(received(subscription.receive(Duration.ofSeconds(5))).message().payload())
                     .containsExactly((byte) 9);
@@ -679,7 +734,7 @@ class ClientActorTest {
             stalled.get(5, SECONDS);
 
             // Assert: new registrations do not accumulate behind discarded delivery lanes.
-            assertThatThrownBy(() -> sut.subscribe(request()).get(5, SECONDS))
+            assertThatThrownBy(() -> sut.subscribe(request()).established().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class)
                     .hasRootCauseMessage("Subscription capacity");
             var removed = ConcurrentHashMap.<TopicFilter>newKeySet();
@@ -718,11 +773,11 @@ class ClientActorTest {
                 publications.add((Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS)));
             }
 
-            // Act: repeated close and refused observers must not cancel or duplicate cleanup.
+            // Act: repeated close and observations must not cancel or duplicate cleanup.
             subscriptions.forEach(Subscription::close);
             subscriptions.forEach(Subscription::close);
-            assertThatThrownBy(() -> subscriptions.getLast().unsubscribe().get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttCapacityException.class);
+            CompletableFuture<Void> removing = subscriptions.getLast().unsubscribe();
+            assertThat(removing).isNotCompletedExceptionally();
 
             // Assert: all removals progress while all 64 public operations remain pending.
             var removed = ConcurrentHashMap.<TopicFilter>newKeySet();
@@ -731,6 +786,7 @@ class ClientActorTest {
                 assertThat(removed.add(packet.filters().getFirst())).isTrue();
                 transport.receive(new Packet.UnsubAck(packet.packetId(), List.of(), EMPTY));
             }
+            removing.get(5, SECONDS);
             assertThat(publishing).allSatisfy(future -> assertThat(future).isNotDone());
             for (Packet.Publish packet : publications) {
                 transport.receive(new Packet.PubAck(packet.packetId(), ReasonCode.SUCCESS, EMPTY));
@@ -747,8 +803,8 @@ class ClientActorTest {
 
     @Test
     @Timeout(10)
-    void close_retries_an_explicit_removal_refused_after_local_closure() throws Exception {
-        // Arrange: stop the actor before it can refuse the explicit removal for send capacity.
+    void close_preserves_an_explicit_removal_waiting_for_send_capacity() throws Exception {
+        // Arrange: stop the actor before it queues removal behind exhausted send capacity.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
@@ -765,8 +821,7 @@ class ClientActorTest {
             CompletableFuture<Void> explicit = subscription.unsubscribe();
             subscription.close();
             release.countDown();
-            assertThatThrownBy(() -> explicit.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttCapacityException.class);
+            assertThat(explicit).isNotDone();
             transport.completeSends = true;
             transport.completeSend();
 
@@ -776,6 +831,7 @@ class ClientActorTest {
             CompletableFuture<Void> cleanup = subscription.unsubscribe();
             transport.receive(new Packet.UnsubAck(packet.packetId(), List.of(), EMPTY));
             cleanup.get(5, SECONDS);
+            explicit.get(5, SECONDS);
             assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
             assertThat(transport.sent).isEmpty();
             assertThat(ends).isEmpty();
@@ -816,7 +872,7 @@ class ClientActorTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void connection_loss_keeps_background_removal_pending_until_the_next_clean_session(
+    void connection_loss_confirms_background_removal_from_a_clean_session(
             boolean beforeStart
     ) throws Exception {
         // Arrange: optionally hold the close wake until termination takes its priority slot.
@@ -840,15 +896,13 @@ class ClientActorTest {
 
             // Assert
             assertThat(ends.poll(5, SECONDS)).isNotNull();
-            assertThatThrownBy(() -> observer.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+            observer.get(5, SECONDS);
             // The connection failure came after close(), so it does not replace the normal end.
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
             ScriptTransport current = connect(sut);
             subscription.close();
             subscription.unsubscribe().get(5, SECONDS);
-            assertThatThrownBy(observer::join)
-                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+            observer.get(5, SECONDS);
             assertThat(subscribePull(sut, current, request())).isNotNull();
             assertThat(current.sent).isEmpty();
         } finally {
@@ -870,7 +924,7 @@ class ClientActorTest {
             assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
             var observers = new ArrayList<CompletableFuture<Void>>();
 
-            // Act: enough calls to consume the entire operation budget must all refuse locally.
+            // Act: repeated observations of the ended clean session complete locally.
             for (int i = 0; i < 64; i++) {
                 observers.add(subscription.unsubscribe());
             }
@@ -879,8 +933,7 @@ class ClientActorTest {
             // Assert: observing an offline removal cannot prevent its clean-session resolution.
             assertThat(reconnecting).isNotCompletedExceptionally();
             for (CompletableFuture<Void> observer : observers) {
-                assertThatThrownBy(observer::join)
-                        .hasCauseInstanceOf(MqttNotConnectedException.class);
+                observer.get(5, SECONDS);
             }
             ScriptTransport current = nextTransport();
             current.accept();
@@ -896,7 +949,7 @@ class ClientActorTest {
     void connection_loss_releases_every_close_observer_but_preserves_local_disposal(
             int registrations
     ) throws Exception {
-        // Arrange: background removals share the full budget of public observers.
+        // Arrange: background removals have multiple independently observed results.
         var failure = new IOException("connection ended before removal was confirmed");
         try (MqttClient sut = client()) {
             ScriptTransport old = connect(sut);
@@ -908,25 +961,24 @@ class ClientActorTest {
             subscriptions.forEach(Subscription::close);
             // More removals than the send window can wait without ever reaching the transport.
             assertThat(old.sent.poll(5, SECONDS)).isInstanceOf(Packet.Unsubscribe.class);
-            await().until(() -> ((ClientActor) sut).usage().operations() == 0);
+            await().until(() -> ((ClientActor) sut).usage().waiters() == 0);
             var observers = new ArrayList<CompletableFuture<Void>>();
             for (int i = 0; i < 64; i++) {
                 observers.add(subscriptions.get(i % registrations).unsubscribe());
             }
-            assertThat(((ClientActor) sut).usage().operations()).isEqualTo(64);
+            assertThat(((ClientActor) sut).usage().waiters()).isEqualTo(64);
+            assertThat(((ClientActor) sut).usage().operations()).isZero();
             assertThat(observers).allSatisfy(observer -> assertThat(observer).isNotDone());
 
             // Act: FIFO closure follows admission of every observer.
             old.receiver().onClosed(failure);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
 
-            // Assert: public observations end with their connection and return operation slots.
+            // Assert: clean-session termination confirms removal and returns observation slots.
             for (CompletableFuture<Void> observer : observers) {
-                assertThatThrownBy(() -> observer.get(5, SECONDS))
-                        .hasCauseInstanceOf(MqttConnectionLostException.class)
-                        .hasRootCause(failure);
+                observer.get(5, SECONDS);
             }
-            await().until(() -> ((ClientActor) sut).usage().operations() == 0);
+            await().until(() -> ((ClientActor) sut).usage().waiters() == 0);
             ScriptTransport current = connect(sut);
             for (Subscription subscription : subscriptions) {
                 assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
@@ -935,7 +987,7 @@ class ClientActorTest {
             assertThat(current.sent).isEmpty();
             assertThat(subscribePull(sut, current, Subscribe.of(
                     subscriptions.getFirst().filter(), Qos.AT_MOST_ONCE))).isNotNull();
-            assertThatThrownBy(() -> observers.getFirst().join()).hasRootCause(failure);
+            observers.getFirst().get(5, SECONDS);
         }
     }
 
@@ -1035,19 +1087,13 @@ class ClientActorTest {
         var delivered = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client(false)) {
             ScriptTransport old = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL)
                             .withBufferCapacity(1),
                     delivered::add
             );
-            var request = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
-            old.receive(new Packet.SubAck(
-                    request.packetId(),
-                    List.of(ReasonCode.of(qos.level())),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(old, subscription);
             old.receive(acknowledgedPublication("messages", 7, qos, false));
             assertThat(delivered.poll(5, SECONDS)).isNotNull();
             old.receiver().onClosed(new IOException("connection lost"));
@@ -1076,8 +1122,8 @@ class ClientActorTest {
             ScriptTransport transport = connect(sut);
 
             // Act & Assert
-            assertThatThrownBy(() -> sut.subscribe(request().withAckMode(AckMode.AFTER_HANDLER))
-                    .get(5, SECONDS)).hasCauseInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> sut.subscribe(request().withAckMode(AckMode.AFTER_HANDLER)))
+                    .isInstanceOf(IllegalArgumentException.class);
             assertThat(transport.sent).isEmpty();
             assertThat(ends).isEmpty();
         }
@@ -2014,6 +2060,67 @@ class ClientActorTest {
     }
 
     @Test
+    void actor_failure_is_visible_to_subscription_calls_before_cleanup() throws Exception {
+        // Arrange: the diagnostic pauses shutdown after the actor has recorded its failure.
+        var failure = new AssertionError("Actor failed");
+        var cleanupStarted = new CompletableFuture<Thread>();
+        var releaseCleanup = new CountDownLatch(1);
+        var jul = Logger.getLogger(ClientActor.class.getName());
+        Level previousLevel = jul.getLevel();
+        boolean previousParents = jul.getUseParentHandlers();
+        var handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getThrown() == failure) {
+                    cleanupStarted.complete(Thread.currentThread());
+                    waitFor(releaseCleanup);
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        jul.addHandler(handler);
+        jul.setLevel(Level.ALL);
+        jul.setUseParentHandlers(false);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription observed = sut.subscribe(request());
+            Subscription closed = sut.subscribe(
+                    Subscribe.of(new TopicFilter("closed"), Qos.AT_MOST_ONCE)
+            );
+            CompletableFuture<Qos> waiting = observed.established();
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
+            beforeActorTime = () -> {
+                throw failure;
+            };
+            transport.receive(new Packet.PingResp());
+            Thread actor = cleanupStarted.get(5, SECONDS);
+
+            // Act & Assert: callers see the permanent cause before shutdown reaches the core.
+            try {
+                assertThat(waiting).isNotDone();
+                assertInternalFailureBeforeCleanup(observed, closed, failure);
+            } finally {
+                releaseCleanup.countDown();
+            }
+            assertThat(actor.join(Duration.ofSeconds(5))).isTrue();
+            assertInternalFailureAfterCleanup(observed, waiting, failure);
+        } finally {
+            releaseCleanup.countDown();
+            jul.removeHandler(handler);
+            jul.setLevel(previousLevel);
+            jul.setUseParentHandlers(previousParents);
+        }
+    }
+
+    @Test
     void operation_slots_remain_reserved_until_blocked_continuations_return() throws Exception {
         // Arrange
         var release = new CountDownLatch(1);
@@ -2225,7 +2332,7 @@ class ClientActorTest {
                 subscription.close();
             }
             assertThat(sut.usage().subscriptionNotifications()).isEqualTo(256);
-            assertThatThrownBy(() -> sut.subscribe(request()).get(5, SECONDS))
+            assertThatThrownBy(() -> sut.subscribe(request()).established().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class);
             assertThat(current.sent).isEmpty();
             assertThat(failures).hasSize(1);
@@ -2279,6 +2386,44 @@ class ClientActorTest {
                     assertThat(sut.usage().subscriptionNotifications()).isZero());
             assertThat(refused).isEmpty();
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+        }
+    }
+
+    @Test
+    void continued_subscriptions_are_established_before_the_connection_is_announced()
+            throws Exception {
+        // Arrange: a persistent session keeps an established subscription across reconnection.
+        var continuing = new AtomicReference<@Nullable Subscription>();
+        var announced = new LinkedBlockingQueue<Boolean>();
+        var listener = new ConnectionListener() {
+            @Override
+            public void onConnected(ConnAck ack) {
+                Subscription subscription = continuing.get();
+                if (subscription != null) {
+                    announced.add(subscription.established().isDone());
+                }
+            }
+
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                ends.add(disconnection);
+            }
+        };
+        try (MqttClient sut = client("actor-test", listener, 16 * 1024 * 1024, codec, false)) {
+            ScriptTransport first = connect(sut);
+            Subscription subscription = subscribe(sut, first);
+            first.receiver().onClosed(new IOException("connection lost"));
+            assertThat(ends.poll(5, SECONDS)).isNotNull();
+            continuing.set(subscription);
+
+            // Act
+            CompletableFuture<Boolean> completed = sut.connect()
+                    .thenApply(_ -> subscription.established().isDone());
+            nextTransport().receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+
+            // Assert: both connect() and onConnected find the subscription established.
+            assertThat(announced.poll(5, SECONDS)).isTrue();
+            assertThat(completed.get(5, SECONDS)).isTrue();
         }
     }
 
@@ -2360,20 +2505,14 @@ class ClientActorTest {
                         Subscribe.of(new TopicFilter("pull/" + i), Qos.AT_MOST_ONCE)
                 );
             }
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription push = sut.subscribe(
                     Subscribe.of(new TopicFilter("push"), Qos.AT_MOST_ONCE),
                     _ -> {
                         entered.countDown();
                         waitFor(release);
                     }
             );
-            var packet = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    packet.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            Subscription push = subscribing.get(5, SECONDS);
+            establish(transport, push);
             transport.receive(new Packet.Publish(
                     new Topic("push"),
                     new byte[0],
@@ -2392,10 +2531,11 @@ class ClientActorTest {
             assertThat(sut.usage().subscriptionNotifications()).isEqualTo(255);
 
             // Act: the core and the notification reservations have room; only the lanes refuse.
-            CompletableFuture<Subscription> refused = sut.subscribe(request());
+            Subscription refused = sut.subscribe(request());
+            CompletableFuture<Qos> refusedEstablished = refused.established();
 
             // Assert
-            assertThatThrownBy(() -> refused.get(5, SECONDS))
+            assertThatThrownBy(() -> refusedEstablished.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class)
                     .hasRootCauseMessage("Subscription capacity");
             assertThat(transport.sent).isEmpty();
@@ -2410,7 +2550,7 @@ class ClientActorTest {
     }
 
     @Test
-    void disconnected_messaging_operations_fail_before_returning() {
+    void disconnected_publication_fails_while_subscription_registration_is_accepted() {
         // Arrange: no connection has been requested.
         try (MqttClient sut = client()) {
             // Act & Assert
@@ -2418,7 +2558,8 @@ class ClientActorTest {
                     .isCompletedExceptionally();
             assertThatThrownBy(() -> sut.publish(message(new byte[0])).join())
                     .hasCauseInstanceOf(MqttNotConnectedException.class);
-            assertThat(sut.subscribe(request(), _ -> { })).isCompletedExceptionally();
+            Subscription subscription = sut.subscribe(request(), _ -> { });
+            assertThat(subscription.established()).isNotDone();
         }
     }
 
@@ -2593,19 +2734,13 @@ class ClientActorTest {
         var completed = new CompletableFuture<PublishResult>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE),
                     _ -> completed.complete(sut.publish(
                             message(new byte[] {2}).withQos(Qos.EXACTLY_ONCE)
                     ).join())
             );
-            var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    request.packetId(),
-                    List.of(ReasonCode.GRANTED_QOS_2),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
 
             // Act: this receipt cannot be acknowledged while the handler waits for PUBCOMP.
             transport.receive(acknowledgedPublication("messages", 7, Qos.EXACTLY_ONCE, false));
@@ -2638,19 +2773,13 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL)
                             .withBufferCapacity(512),
                     delivered::add
             );
-            var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    request.packetId(),
-                    List.of(ReasonCode.of(qos.level())),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             var deliveries = new ArrayList<MqttDelivery>();
             for (int id = 1; id <= 300; id++) {
                 transport.receive(acknowledgedPublication("messages", id, qos, false));
@@ -2710,7 +2839,7 @@ class ClientActorTest {
         var delivered = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(mode)
                             .withBufferCapacity(128),
@@ -2719,13 +2848,7 @@ class ClientActorTest {
                         delivery.ack();
                     }
             );
-            var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    request.packetId(),
-                    List.of(ReasonCode.of(qos.level())),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.completeSends = false;
             var blocked = sut.publish(message(new byte[] {0}));
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
@@ -2764,18 +2887,12 @@ class ClientActorTest {
         var sentFirstAck = new AtomicBoolean();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL),
                     deliveries::add
             );
-            var request = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    request.packetId(),
-                    List.of(ReasonCode.of(qos.level())),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.afterSend = packet -> {
                 if ((packet instanceof Packet.PubAck || packet instanceof Packet.PubComp)
                         && sentFirstAck.compareAndSet(false, true)) {
@@ -3007,7 +3124,8 @@ class ClientActorTest {
         var received = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), received::add);
+            Subscription subscription = sut.subscribe(request(), received::add);
+            CompletableFuture<Qos> subscribing = subscription.established();
             var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
 
             // Act & Assert: delivery starts before the broker acknowledges the subscription.
@@ -3019,14 +3137,15 @@ class ClientActorTest {
                     List.of(ReasonCode.SUCCESS),
                     EMPTY
             ));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            subscribing.get(5, SECONDS);
             assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
 
             // Act & Assert: new delivery stops before the broker acknowledges removal.
             CompletableFuture<Void> unsubscribing = subscription.unsubscribe();
             var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(publication(new byte[] {2}));
-            assertThatThrownBy(() -> sut.subscribe(request(), received::add).get(5, SECONDS))
+            assertThatThrownBy(() -> sut.subscribe(request(), received::add)
+                    .established().get(5, SECONDS))
                     .hasCauseInstanceOf(IllegalStateException.class);
             transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
             unsubscribing.get(5, SECONDS);
@@ -3036,14 +3155,8 @@ class ClientActorTest {
             repeated.get(5, SECONDS);
 
             // Act & Assert: the filter becomes available again after acknowledged removal.
-            CompletableFuture<Subscription> replacement = sut.subscribe(request(), received::add);
-            var next = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    next.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            replacement.get(5, SECONDS);
+            Subscription replacement = sut.subscribe(request(), received::add);
+            establish(transport, replacement);
         }
     }
 
@@ -3057,7 +3170,7 @@ class ClientActorTest {
         var releaseActor = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
                             .withBufferCapacity(1),
                     _ -> {
@@ -3065,13 +3178,7 @@ class ClientActorTest {
                         waitFor(releaseHandler);
                     }
             );
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.receive(publication(new byte[] {1}));
             assertThat(handlerEntered.await(5, SECONDS)).isTrue();
             holdActor(transport, actorHeld, releaseActor);
@@ -3093,20 +3200,21 @@ class ClientActorTest {
     }
 
     @Test
-    void a_full_regular_byte_budget_rolls_back_subscribe_and_unsubscribe_without_disconnect()
+    void a_full_regular_byte_budget_delays_subscribe_and_unsubscribe_without_losing_them()
             throws Exception {
         // Arrange: one pending write fills the normal send budget.
         var received = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), received::add);
+            Subscription subscription = sut.subscribe(request(), received::add);
+            CompletableFuture<Qos> subscribing = subscription.established();
             var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(new Packet.SubAck(
                     subscribe.packetId(),
                     List.of(ReasonCode.SUCCESS),
                     EMPTY
             ));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            subscribing.get(5, SECONDS);
             transport.completeSends = false;
             // One-byte topic + length prefix + five-byte fixed header fills 16 MiB exactly.
             CompletableFuture<PublishResult> publication = sut.publish(MqttMessage.of(
@@ -3117,79 +3225,79 @@ class ClientActorTest {
             ));
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
 
-            // Act & Assert: failed operations leave the connection and subscription usable.
-            assertThatThrownBy(() -> subscription.unsubscribe().get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttCapacityException.class);
-            var other = Subscribe.of(new TopicFilter("other"), Qos.AT_MOST_ONCE);
-            assertThatThrownBy(() -> sut.subscribe(other, _ -> { }).get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttCapacityException.class);
+            // Act: both requests remain accepted while send capacity is exhausted.
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+            Subscription other = sut.subscribe(
+                    Subscribe.of(new TopicFilter("other"), Qos.AT_MOST_ONCE),
+                    _ -> { }
+            );
+            CompletableFuture<Qos> establishing = other.established();
             transport.receive(publication(new byte[] {3}));
-            assertThat(received.poll(5, SECONDS)).isNotNull();
-            assertThat(ends).isEmpty();
+            assertThat(removing).isNotDone();
+            assertThat(establishing).isNotDone();
 
-            // Act & Assert: returning send capacity permits both operations to be retried.
+            // Assert: returning send capacity sends both requests without another API call.
+            transport.completeSends = true;
             transport.completeSend();
             publication.get(5, SECONDS);
-            transport.completeSends = true;
-            CompletableFuture<Subscription> retry = sut.subscribe(other, _ -> { });
-            var retried = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    retried.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            retry.get(5, SECONDS);
-            CompletableFuture<Void> removing = subscription.unsubscribe();
-            var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
+            for (int i = 0; i < 2; i++) {
+                Packet packet = requireNonNull(transport.sent.poll(5, SECONDS));
+                switch (packet) {
+                    case Packet.Subscribe(var id, _, _) -> transport.receive(
+                            new Packet.SubAck(id, List.of(ReasonCode.SUCCESS), EMPTY)
+                    );
+                    case Packet.Unsubscribe(var id, _, _) -> transport.receive(
+                            new Packet.UnsubAck(id, List.of(), EMPTY)
+                    );
+                    default -> throw new AssertionError("Unexpected packet: " + packet);
+                }
+            }
+            establishing.get(5, SECONDS);
             removing.get(5, SECONDS);
+            assertThat(received).isEmpty();
+            assertThat(ends).isEmpty();
         }
     }
 
     @Test
-    void an_unsubscribe_refused_by_operation_capacity_resumes_delivery() throws Exception {
-        // Arrange: another subscription's pending removal and its observers hold every slot.
+    void a_full_observation_budget_does_not_cancel_a_new_removal() throws Exception {
+        // Arrange: another subscription's pending removal and its observers hold every waiter slot.
         var received = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), received::add);
+            Subscription subscription = sut.subscribe(request(), received::add);
+            CompletableFuture<Qos> subscribing = subscription.established();
             var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(new Packet.SubAck(
                     subscribe.packetId(),
                     List.of(ReasonCode.SUCCESS),
                     EMPTY
             ));
-            Subscription subscription = subscribing.get(5, SECONDS);
-            CompletableFuture<Subscription> subscribingOther = sut.subscribe(
+            subscribing.get(5, SECONDS);
+            Subscription other = sut.subscribe(
                     Subscribe.of(new TopicFilter("other"), Qos.AT_MOST_ONCE),
                     _ -> { }
             );
-            var subscribeOther = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribeOther.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            Subscription other = subscribingOther.get(5, SECONDS);
+            establish(transport, other);
+            await().until(() -> ((ClientActor) sut).usage().waiters() == 0);
             var observers = new ArrayList<CompletableFuture<Void>>();
-            observers.add(other.unsubscribe());
+            for (int i = 0; i < 1024; i++) {
+                observers.add(other.unsubscribe());
+            }
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Unsubscribe.class);
-            // Setup completion threads may still be returning their slots.
-            await().pollInterval(Duration.ofMillis(1)).until(() -> {
-                CompletableFuture<Void> observer = other.unsubscribe();
-                if (!observer.isCompletedExceptionally()) {
-                    observers.add(observer);
-                }
-                return observers.size() == 64;
-            });
+            assertThat(observers).allSatisfy(observer -> assertThat(observer).isNotDone());
 
             // Act
             assertThatThrownBy(() -> subscription.unsubscribe().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class);
             transport.receive(publication(new byte[] {9}));
 
-            // Assert: the refused removal no longer pauses this subscription.
-            assertThat(received.poll(5, SECONDS)).isNotNull();
+            // Assert: refusal limits observation only; the second removal still stops delivery.
+            var removal = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            assertThat(removal.filters()).containsExactly(subscription.filter());
+            transport.receive(new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY));
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+            assertThat(received).isEmpty();
             assertThat(ends).isEmpty();
         }
     }
@@ -3202,7 +3310,7 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
                             .withBufferCapacity(1),
                     _ -> {
@@ -3210,13 +3318,7 @@ class ClientActorTest {
                         waitFor(release);
                     }
             );
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
 
             // Act: a running handler still counts toward the subscription's delivery limit.
             transport.receive(publication(new byte[] {1}));
@@ -3244,7 +3346,7 @@ class ClientActorTest {
         var failure = new IllegalStateException("handler failed after ack");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL),
                     delivery -> {
@@ -3254,13 +3356,7 @@ class ClientActorTest {
                         throw failure;
                     }
             );
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.of(qos.level())),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.receive(acknowledgedPublication("messages", 7, qos, false));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             holdActor(transport, actorHeld, releaseActor);
@@ -3299,7 +3395,7 @@ class ClientActorTest {
             for (int i = 0; i < subscriptions; i++) {
                 boolean failing = i == 0;
                 var request = Subscribe.of(new TopicFilter("a/".repeat(i) + "#"), Qos.AT_MOST_ONCE);
-                CompletableFuture<Subscription> subscribing = sut.subscribe(request, _ -> {
+                Subscription subscription = sut.subscribe(request, _ -> {
                     if (failing) {
                         workers.add(Thread.currentThread());
                     }
@@ -3309,10 +3405,8 @@ class ClientActorTest {
                         throw failure;
                     }
                 });
-                var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-                transport.receive(new Packet.SubAck(subscribe.packetId(),
-                        List.of(ReasonCode.SUCCESS), EMPTY));
-                registered.add(subscribing.get(5, SECONDS));
+                establish(transport, subscription);
+                registered.add(subscription);
             }
             var incoming = new Packet.Publish(new Topic("a/".repeat(subscriptions) + "message"),
                     new byte[] {1}, Qos.AT_MOST_ONCE, false, false, 0, EMPTY);
@@ -3337,10 +3431,10 @@ class ClientActorTest {
             await().until(() -> worker.getState() == Thread.State.WAITING);
             releaseActor.countDown();
 
-            // Assert: termination discards input and rejects the queued command without sending.
+            // Assert: termination discards input and confirms clean-session removal
+            // without sending the queued request.
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
-            assertThatThrownBy(() -> queued.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+            queued.get(5, SECONDS);
             assertThat(List.of(received.get(), encoded.get())).containsExactly(0, 0);
             assertThat(transport.closed).isTrue();
         } finally {
@@ -3361,15 +3455,12 @@ class ClientActorTest {
         var failure = new IllegalStateException("handler failed");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), _ -> {
+            Subscription subscription = sut.subscribe(request(), _ -> {
                 workers.add(Thread.currentThread());
                 waitFor(releaseHandler);
                 throw failure;
             });
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS), EMPTY));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.receive(publication(new byte[] {1}));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             holdActor(transport, actorHeld, releaseActor);
@@ -3410,15 +3501,12 @@ class ClientActorTest {
         var failure = new IllegalStateException("old handler failed");
         try (MqttClient sut = client()) {
             ScriptTransport old = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), _ -> {
+            Subscription subscription = sut.subscribe(request(), _ -> {
                 workers.add(Thread.currentThread());
                 waitFor(releaseHandler);
                 throw failure;
             });
-            var subscribe = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
-            old.receive(new Packet.SubAck(subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS), EMPTY));
-            subscribing.get(5, SECONDS);
+            establish(old, subscription);
             old.receive(publication(new byte[] {1}));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             sut.disconnect().get(5, SECONDS);
@@ -3477,7 +3565,7 @@ class ClientActorTest {
                 )
         ) {
             ScriptTransport old = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.AFTER_HANDLER),
                     _ -> {
@@ -3486,13 +3574,7 @@ class ClientActorTest {
                         throw failure;
                     }
             );
-            var request = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
-            old.receive(new Packet.SubAck(
-                    request.packetId(),
-                    List.of(ReasonCode.of(qos.level())),
-                    EMPTY
-            ));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            establish(old, subscription);
             old.receive(acknowledgedPublication("messages", 7, qos, false));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             old.receiver().onClosed(new IOException("connection lost"));
@@ -3500,8 +3582,11 @@ class ClientActorTest {
             ScriptTransport current = connect(sut, sessionPresent);
             if (sessionPresent) {
                 current.receive(acknowledgedPublication("messages", 7, qos, true));
+                // A round trip settles the retransmission, so the actor is held at the PINGRESP.
+                sut.publish(message(new byte[0])).get(5, SECONDS);
+                assertThat(current.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
             } else {
-                acknowledgeResubscription(current, subscription);
+                acknowledgeSubscription(current, subscription);
             }
             holdActor(current, actorHeld, releaseActor);
             beforeActorTime = handledInput::incrementAndGet;
@@ -3533,8 +3618,7 @@ class ClientActorTest {
             } else {
                 assertProtocolFailure(end.cause().orElseThrow(), ReasonCode.MALFORMED_PACKET);
             }
-            assertThatThrownBy(() -> queued.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+            assertThat(queued).isNotDone();
             assertThat(List.of(handledInput.get(), encodedCommands.get())).containsExactly(0, 0);
             assertThat(current.sent).isEmpty();
             assertThat(current.closed).isTrue();
@@ -3558,7 +3642,7 @@ class ClientActorTest {
         var failure = new IllegalStateException("handler failed during CONNACK");
         try (MqttClient sut = client(false)) {
             ScriptTransport old = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE),
                     _ -> {
                         workers.add(Thread.currentThread());
@@ -3566,11 +3650,7 @@ class ClientActorTest {
                         throw failure;
                     }
             );
-            var request = (Packet.Subscribe) requireNonNull(old.sent.poll(5, SECONDS));
-            old.receive(
-                    new Packet.SubAck(request.packetId(), List.of(ReasonCode.GRANTED_QOS_1), EMPTY)
-            );
-            subscribing.get(5, SECONDS);
+            establish(old, subscription);
             old.receive(qosOnePublication("messages", 7, false));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             old.receiver().onClosed(new IOException("connection lost"));
@@ -3620,7 +3700,7 @@ class ClientActorTest {
         var failure = new IllegalStateException("handler failed with a full lane");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
                             .withBufferCapacity(1),
                     _ -> {
@@ -3629,10 +3709,7 @@ class ClientActorTest {
                         throw failure;
                     }
             );
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(subscribe.packetId(),
-                    List.of(ReasonCode.GRANTED_QOS_1), EMPTY));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
                     Qos.AT_LEAST_ONCE, false, false, 7, EMPTY));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
@@ -3672,7 +3749,7 @@ class ClientActorTest {
         var failure = new IllegalStateException("handler failed during shutdown");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), delivery -> {
+            Subscription subscription = sut.subscribe(request(), delivery -> {
                 byte payload = delivery.message().payload()[0];
                 handled.add(payload);
                 if (payload == 1) {
@@ -3681,10 +3758,7 @@ class ClientActorTest {
                     throw failure;
                 }
             });
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS), EMPTY));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.receive(publication(new byte[] {1}));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             transport.receive(publication(new byte[] {2}));
@@ -3713,7 +3787,7 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
                             .withBufferCapacity(3),
                     _ -> {
@@ -3721,13 +3795,7 @@ class ClientActorTest {
                         waitFor(release);
                     }
             );
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             byte[] payload = new byte[11 * 1024 * 1024];
             transport.receive(publication(payload));
             assertThat(entered.await(5, SECONDS)).isTrue();
@@ -3821,17 +3889,11 @@ class ClientActorTest {
             var actor = (ClientActor) sut;
             ScriptTransport transport = connect(sut);
             for (int i = 0; i < 256; i++) {
-                CompletableFuture<Subscription> subscribing = sut.subscribe(
+                Subscription subscription = sut.subscribe(
                         Subscribe.of(new TopicFilter("backlog/" + i), Qos.AT_MOST_ONCE),
                         _ -> { }
                 );
-                var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-                transport.receive(new Packet.SubAck(
-                        subscribe.packetId(),
-                        List.of(ReasonCode.SUCCESS),
-                        EMPTY
-                ));
-                subscribing.get(5, SECONDS);
+                establish(transport, subscription);
             }
             // The actor encodes each packet it queues, so this records what still waits then.
             encoder.beforeEncode = packet -> {
@@ -3901,7 +3963,7 @@ class ClientActorTest {
                     Qos.AT_LEAST_ONCE, false, false, 1, EMPTY));
             assertThat(manual.receive(Duration.ofSeconds(5)))
                     .isInstanceOf(ReceiveResult.Received.class);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(
+            Subscription subscription = sut.subscribe(
                     request().withBufferCapacity(2),
                     _ -> {
                         try {
@@ -3913,13 +3975,7 @@ class ClientActorTest {
                         waitFor(release);
                     }
             );
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             // Attach the continuation before the write completes, so it blocks a completion
             // thread rather than this one.
             transport.completeSends = false;
@@ -3958,7 +4014,7 @@ class ClientActorTest {
             transport.receiver().onClosed(new IOException("Transport closed"));
 
             // Assert: both subscriptions remain; only the running handler retains a delivery.
-            var held = new ClientActor.Usage(1, 1, 2, 0, 0, 0, 0, 2, 1, 13);
+            var held = new ClientActor.Usage(1, 1, 2, 0, 0, 0, 0, 2, 1, 13, 0);
             await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(held));
 
             // Act
@@ -3966,7 +4022,7 @@ class ClientActorTest {
 
             // Assert
             continuation.get(5, SECONDS);
-            var retained = new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0);
+            var retained = new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0);
             await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(retained));
         } finally {
             release.countDown();
@@ -4017,7 +4073,8 @@ class ClientActorTest {
         var delivered = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), delivered::add);
+            Subscription subscription = sut.subscribe(request(), delivered::add);
+            CompletableFuture<Qos> subscribing = subscription.established();
             var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             holdActor(transport, entered, release);
             var publications = new ArrayList<CompletableFuture<PublishResult>>();
@@ -4118,12 +4175,12 @@ class ClientActorTest {
             // Act: dispose the old handle while disconnected and while reconnecting.
             oldSubscription.close();
             CompletableFuture<Void> removing = oldSubscription.unsubscribe();
-            assertThatThrownBy(removing::join).hasCauseInstanceOf(MqttNotConnectedException.class);
+            removing.get(5, SECONDS);
             CompletableFuture<ConnAck> connection = sut.connect();
             ScriptTransport current = nextTransport();
             oldSubscription.close();
             CompletableFuture<Void> observer = oldSubscription.unsubscribe();
-            assertThatThrownBy(observer::join).hasCauseInstanceOf(MqttNotConnectedException.class);
+            observer.get(5, SECONDS);
 
             // Assert: the new connection sends no UNSUBSCRIBE for the old session.
             assertThat(current.sent).isEmpty();
@@ -4131,14 +4188,8 @@ class ClientActorTest {
             // Arrange: the new session establishes the same filter with another handler.
             current.accept();
             connection.get(5, SECONDS);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), received::add);
-            var subscribe = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
-            current.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            Subscription subscription = sut.subscribe(request(), received::add);
+            establish(current, subscription);
 
             // Act
             CompletableFuture<Void> first = oldSubscription.unsubscribe();
@@ -4158,7 +4209,7 @@ class ClientActorTest {
     }
 
     @Test
-    void connection_loss_rolls_back_explicit_removal_and_preserves_its_failed_observers()
+    void connection_loss_confirms_explicit_removal_from_a_clean_session_for_every_observer()
             throws Exception {
         // Arrange: two calls observe one removal that the broker has not acknowledged.
         var failure = new IOException("Peer reset during unsubscribe");
@@ -4172,32 +4223,17 @@ class ClientActorTest {
             // Act
             transport.receiver().onClosed(failure);
 
-            // Assert: calls accepted before the loss preserve the unfinished exchange's failure.
-            assertThatThrownBy(() -> first.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttConnectionLostException.class)
-                    .hasRootCause(failure);
-            assertThatThrownBy(() -> observer.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttConnectionLostException.class)
-                    .hasRootCause(failure);
+            // Assert: losing the clean session confirms removal for both independent callers.
+            first.get(5, SECONDS);
+            observer.get(5, SECONDS);
+            assertThat(observer).isNotSameAs(first);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
 
-            // Act: the failed attempt restores the subscription for the next connection.
+            // Act & Assert: reconnect does not recreate the removed subscription.
             ScriptTransport current = connect(sut);
-            acknowledgeResubscription(current, subscription);
-            current.receive(publication(new byte[] {9}));
-            assertThat(received(subscription.receive(Duration.ofSeconds(5))).message().payload())
-                    .containsExactly((byte) 9);
-            subscription.close();
-            CompletableFuture<Void> disposed = subscription.unsubscribe();
-            var unsubscribe = (Packet.Unsubscribe) requireNonNull(current.sent.poll(5, SECONDS));
-            current.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
-
-            // Assert: disposal does not rewrite either result from the failed attempt.
-            disposed.get(5, SECONDS);
-            assertThat(disposed).isNotSameAs(first).isNotSameAs(observer);
-            assertThatThrownBy(() -> first.get(5, SECONDS)).hasRootCause(failure);
-            assertThatThrownBy(() -> observer.get(5, SECONDS)).hasRootCause(failure);
-            assertThat(transport.sent).isEmpty();
+            assertThat(current.sent).isEmpty();
+            assertThat(subscribePull(sut, current, request())).isNotNull();
         }
     }
 
@@ -4229,7 +4265,7 @@ class ClientActorTest {
     }
 
     @Test
-    void an_additional_call_queued_behind_a_refused_removal_fails_with_its_cause()
+    void additional_removal_observations_queued_behind_disconnect_complete_with_the_clean_session()
             throws Exception {
         // Arrange: hold the actor so that disconnect is handled before the removal.
         var entered = new CountDownLatch(1);
@@ -4246,10 +4282,8 @@ class ClientActorTest {
             release.countDown();
 
             // Assert
-            assertThatThrownBy(() -> first.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttNotConnectedException.class);
-            assertThatThrownBy(() -> second.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttNotConnectedException.class);
+            first.get(5, SECONDS);
+            second.get(5, SECONDS);
             disconnecting.get(5, SECONDS);
         } finally {
             release.countDown();
@@ -4287,9 +4321,9 @@ class ClientActorTest {
             // Act
             release.countDown();
 
-            // Assert: the original exchange still fails, and no additional removal was sent.
-            assertThatThrownBy(() -> removing.get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+            // Assert: closing the nonpersistent session confirms the pending removal, the
+            // unacknowledged publication fails, and no additional removal was sent.
+            removing.get(5, SECONDS);
             assertThatThrownBy(() -> publication.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
@@ -4297,6 +4331,175 @@ class ClientActorTest {
             assertThat(transport.sent).isEmpty();
         } finally {
             release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Closing with a removal pending is the behavior under test.
+    void closing_a_persistent_client_fails_a_pending_removal_the_broker_may_still_hold()
+            throws Exception {
+        // Arrange: the UNSUBACK has not arrived when the client closes.
+        try (MqttClient sut = client(false)) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribe(sut, transport);
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Unsubscribe.class);
+
+            // Act
+            sut.close();
+
+            // Assert
+            assertThatThrownBy(() -> removing.get(5, SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Closing with a removal pending is the behavior under test.
+    void closing_a_nonpersistent_client_confirms_removals_that_never_reached_the_core()
+            throws Exception {
+        // Arrange: hold the actor in a connection attempt, so neither the registration nor its
+        // removal reaches the core before the client closes.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        beforeActorTime = () -> {
+            entered.countDown();
+            waitFor(release);
+        };
+        try (MqttClient sut = client()) {
+            CompletableFuture<ConnAck> connection = sut.connect();
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            Subscription subscription = sut.subscribe(request());
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+
+            // Act
+            sut.close();
+            release.countDown();
+
+            // Assert: closing the nonpersistent session confirms the removal.
+            removing.get(5, SECONDS);
+            assertThatThrownBy(() -> connection.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_refusal_after_unsubscribe_ends_the_subscription_as_removed() throws Exception {
+        // Arrange: the SUBSCRIBE still awaits its SUBACK when removal is requested.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request());
+            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+
+            // Act
+            transport.receive(new Packet.SubAck(
+                    subscribe.packetId(),
+                    List.of(ReasonCode.UNSPECIFIED_ERROR),
+                    EMPTY
+            ));
+
+            // Assert: the requested removal decides the ending; the refusal only confirms it.
+            removing.get(5, SECONDS);
+            assertThat(subscription.receive(Duration.ofSeconds(5)))
+                    .isEqualTo(new ReceiveResult.Ended());
+            assertThatThrownBy(() -> subscription.established().get(5, SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+            assertThat(transport.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Closing while the refusal's DISCONNECT waits is under test.
+    void closing_during_a_session_refusal_ends_subscriptions_as_an_ordinary_close()
+            throws Exception {
+        // Arrange: a persistent client without local state refuses the broker's session and
+        // keeps that DISCONNECT write outstanding.
+        try (MqttClient sut = client(false)) {
+            Subscription subscription = sut.subscribe(request());
+            CompletableFuture<Qos> establishing = subscription.established();
+            CompletableFuture<ConnAck> connection = sut.connect();
+            ScriptTransport transport = nextTransport();
+            transport.completeSends = false;
+            transport.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
+
+            // Act
+            sut.close();
+
+            // Assert
+            assertThatThrownBy(() -> establishing.get(5, SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+            assertThat(subscription.receive(Duration.ofSeconds(5)))
+                    .isEqualTo(new ReceiveResult.Ended());
+            assertThatThrownBy(() -> connection.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Shutdown starts inside the block while the actor is held.
+    void unsubscribing_during_shutdown_fixes_the_ending_before_a_later_internal_failure()
+            throws Exception {
+        // Arrange: hold the actor in an event that fails once released, then close.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request());
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
+            beforeActorTime = () -> {
+                entered.countDown();
+                waitFor(release);
+                throw new AssertionError("Actor failed");
+            };
+            transport.receive(new Packet.PingResp());
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            sut.close();
+
+            // Act
+            subscription.unsubscribe().get(5, SECONDS);
+            release.countDown();
+
+            // Assert: both observations keep the ordinary ending decided first.
+            assertThat(subscription.receive(Duration.ofSeconds(5)))
+                    .isEqualTo(new ReceiveResult.Ended());
+            assertThatThrownBy(() -> subscription.established().get(5, SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void an_established_subscription_is_observed_without_a_waiter_slot() throws Exception {
+        // Arrange: pending observations of another subscription fill every waiter slot.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription established = subscribe(sut, transport);
+            Subscription pending = sut.subscribe(
+                    Subscribe.of(new TopicFilter("pending"), Qos.AT_MOST_ONCE),
+                    _ -> { }
+            );
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
+            var observers = new ArrayList<CompletableFuture<Qos>>();
+            for (int i = 0; i < 1024; i++) {
+                observers.add(pending.established());
+            }
+            assertThat(pending.established()).isCompletedExceptionally();
+
+            // Act
+            CompletableFuture<Qos> observed = established.established();
+
+            // Assert: an already established result needs no slot and survives local closure.
+            assertThat(observed).isCompletedWithValue(Qos.AT_MOST_ONCE);
+            assertThat(((ClientActor) sut).usage().waiters()).isEqualTo(1024);
+            established.close();
+            assertThat(established.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+            assertThat(observers).allMatch(observer -> !observer.isDone());
         }
     }
 
@@ -4311,18 +4514,12 @@ class ClientActorTest {
         var releaseActor = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), delivery -> {
+            Subscription subscription = sut.subscribe(request(), delivery -> {
                 delivered.add(delivery);
                 handlers.add(Thread.currentThread());
                 waitFor(releaseHandler);
             });
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            establish(transport, subscription);
             transport.receive(publication(new byte[] {1}));
             Thread handler = requireNonNull(handlers.poll(5, SECONDS));
             transport.receive(publication(new byte[] {2}));
@@ -4351,14 +4548,15 @@ class ClientActorTest {
         var received = new LinkedBlockingQueue<MqttDelivery>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), received::add);
+            Subscription subscription = sut.subscribe(request(), received::add);
+            CompletableFuture<Qos> subscribing = subscription.established();
             var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(new Packet.SubAck(
                     subscribe.packetId(),
                     List.of(ReasonCode.SUCCESS),
                     EMPTY
             ));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            subscribing.get(5, SECONDS);
 
             // Act: every call returns before the broker acknowledges removal.
             assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
@@ -4389,21 +4587,15 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), received::add);
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            Subscription subscription = sut.subscribe(request(), received::add);
+            establish(transport, subscription);
             holdActor(transport, entered, release);
             transport.receive(publication(new byte[] {1}));
             CompletableFuture<Void> removing = subscription.unsubscribe();
 
-            // Act: additional calls take the remaining operation slots until one is refused.
+            // Act: additional calls take the remaining observation slots until one is refused.
             CompletableFuture<Void> refused = subscription.unsubscribe();
-            for (int i = 0; i < 64 && !refused.isCompletedExceptionally(); i++) {
+            for (int i = 0; i < 1024 && !refused.isCompletedExceptionally(); i++) {
                 refused = subscription.unsubscribe();
             }
             release.countDown();
@@ -4430,30 +4622,17 @@ class ClientActorTest {
         var continuations = new ArrayList<CompletableFuture<Void>>();
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), _ -> { });
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            Subscription subscription = subscribing.get(5, SECONDS);
+            Subscription subscription = sut.subscribe(request(), _ -> { });
+            establish(transport, subscription);
+            await().until(() -> ((ClientActor) sut).usage().waiters() == 0);
             CompletableFuture<Void> first = subscription.unsubscribe();
             var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             var observers = new ArrayList<CompletableFuture<Void>>();
             observers.add(first);
-            // Setup completion threads may still be returning their slots. Refused observers
-            // can retry without affecting the pending wire attempt.
-            await().pollInterval(Duration.ofMillis(1)).until(() -> {
-                CompletableFuture<Void> observer = subscription.unsubscribe();
-                if (observer.isCompletedExceptionally()) {
-                    assertThatThrownBy(observer::join)
-                            .hasCauseInstanceOf(MqttCapacityException.class);
-                } else {
-                    observers.add(observer);
-                }
-                return observers.size() == 64;
-            });
+            for (int i = 1; i < 1024; i++) {
+                observers.add(subscription.unsubscribe());
+            }
+            assertThat(observers).allSatisfy(observer -> assertThat(observer).isNotDone());
             for (CompletableFuture<Void> observer : observers) {
                 continuations.add(observer.thenRun(() -> {
                     entered.incrementAndGet();
@@ -4461,18 +4640,18 @@ class ClientActorTest {
                 }));
             }
 
-            // Act & Assert: no further call is admitted while all operation slots are reserved.
+            // Act & Assert: no further call is admitted while all observation slots are reserved.
             assertThatThrownBy(() -> subscription.unsubscribe().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class);
 
             // Act: acknowledge removal while every completion callback blocks.
             transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
 
-            // Assert: every callback starts independently and retains its own operation slot.
-            await().untilAtomic(entered, is(64));
-            assertThatThrownBy(() -> sut.publish(message(new byte[0])).join())
-                    .hasCauseInstanceOf(MqttCapacityException.class);
-            assertThat(transport.sent).isEmpty();
+            // Assert: every callback starts independently and retains its own observation slot.
+            await().untilAtomic(entered, is(1024));
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            assertThat(((ClientActor) sut).usage().waiters()).isEqualTo(1024);
             assertThat(ends).isEmpty();
         } finally {
             release.countDown();
@@ -4494,14 +4673,8 @@ class ClientActorTest {
         };
         try (MqttClient sut = client("encoding-test", ends::add, 16 * 1024 * 1024, encoder)) {
             ScriptTransport transport = connect(sut);
-            CompletableFuture<Subscription> subscribing = sut.subscribe(request(), delivered::add);
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
-                    subscribe.packetId(),
-                    List.of(ReasonCode.SUCCESS),
-                    EMPTY
-            ));
-            subscribing.get(5, SECONDS);
+            Subscription subscription = sut.subscribe(request(), delivered::add);
+            establish(transport, subscription);
             CompletableFuture<PublishResult> publication = sut.publish(message(new byte[] {1}));
             assertThat(encoding.await(5, SECONDS)).isTrue();
 
@@ -4527,6 +4700,50 @@ class ClientActorTest {
             assertThat(transport.sent).isEmpty();
         } finally {
             release.countDown();
+        }
+    }
+
+    @Test
+    void establishment_observers_preserve_fatal_failure_before_and_after_actor_cleanup()
+            throws Exception {
+        // Arrange: the actor cannot retire the registration when the encoder reports failure.
+        var failure = new IllegalStateException("Encoder failed");
+        var encoding = new CompletableFuture<Thread>();
+        var releaseEncoding = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        var encoder = new ScriptCodec();
+        encoder.beforePublish = () -> {
+            encoding.complete(Thread.currentThread());
+            waitFor(releaseEncoding);
+            throw failure;
+        };
+        try (MqttClient sut = client("fatal-establishment", ends::add, 16 * 1024 * 1024, encoder)) {
+            ScriptTransport transport = connect(sut);
+            Subscription observed = sut.subscribe(request());
+            Subscription closed = sut.subscribe(
+                    Subscribe.of(new TopicFilter("closed"), Qos.AT_MOST_ONCE)
+            );
+            CompletableFuture<Qos> waiting = observed.established();
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
+            sut.publish(message(new byte[] {1}));
+            Thread sender = encoding.get(5, SECONDS);
+            holdActor(transport, actorHeld, releaseActor);
+
+            // Act & Assert: fatal notification precedes cleanup and has the same public cause.
+            try {
+                releaseEncoding.countDown();
+                assertThat(sender.join(Duration.ofSeconds(5))).isTrue();
+                assertThat(waiting).isNotDone();
+                assertInternalFailureBeforeCleanup(observed, closed, failure);
+            } finally {
+                releaseActor.countDown();
+            }
+            assertInternalFailureAfterCleanup(observed, waiting, failure);
+        } finally {
+            releaseEncoding.countDown();
+            releaseActor.countDown();
         }
     }
 
@@ -4632,14 +4849,9 @@ class ClientActorTest {
 
     private static Subscription subscribe(MqttClient client, ScriptTransport transport)
             throws Exception {
-        CompletableFuture<Subscription> subscribing = client.subscribe(request(), _ -> { });
-        var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-        transport.receive(new Packet.SubAck(
-                subscribe.packetId(),
-                List.of(ReasonCode.SUCCESS),
-                EMPTY
-        ));
-        return subscribing.get(5, SECONDS);
+        Subscription subscription = client.subscribe(request(), _ -> { });
+        establish(transport, subscription);
+        return subscription;
     }
 
     private static Subscription subscribePull(
@@ -4647,14 +4859,56 @@ class ClientActorTest {
             ScriptTransport transport,
             Subscribe request
     ) throws Exception {
-        CompletableFuture<Subscription> subscribing = client.subscribe(request);
-        var packet = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-        transport.receive(new Packet.SubAck(packet.packetId(),
-                List.of(ReasonCode.of(request.qos().level())), EMPTY));
-        return subscribing.get(5, SECONDS);
+        Subscription subscription = client.subscribe(request);
+        establish(transport, subscription);
+        return subscription;
     }
 
-    private static void acknowledgeResubscription(
+    /// Once an internal failure is published, establishment reports it, and a subscription closed
+    /// in that window still ends with it.
+    private static void assertInternalFailureBeforeCleanup(
+            Subscription observed,
+            Subscription closed,
+            Throwable failure
+    ) {
+        closed.close();
+        assertThatThrownBy(() -> closed.receive(Duration.ZERO))
+                .isInstanceOf(MqttConnectionLostException.class)
+                .hasCause(failure);
+        assertInternalFailure(closed.established(), failure);
+        assertInternalFailure(observed.established(), failure);
+    }
+
+    /// After cleanup, the waiting observer, a later observer, and receiving all report the failure.
+    private static void assertInternalFailureAfterCleanup(
+            Subscription subscription,
+            CompletableFuture<Qos> waiting,
+            Throwable failure
+    ) {
+        assertInternalFailure(waiting, failure);
+        assertInternalFailure(subscription.established(), failure);
+        await().untilAsserted(() -> assertThatThrownBy(() -> subscription.receive(Duration.ZERO))
+                .isInstanceOf(MqttConnectionLostException.class)
+                .hasCause(failure));
+    }
+
+    private static void assertInternalFailure(
+            CompletableFuture<Qos> observation,
+            Throwable failure
+    ) {
+        assertThatThrownBy(() -> observation.get(5, SECONDS))
+                .hasCauseInstanceOf(MqttConnectionLostException.class)
+                .hasRootCause(failure);
+    }
+
+    /// Answers the subscription's SUBSCRIBE with its requested QoS and waits for establishment.
+    private static void establish(ScriptTransport transport, Subscription subscription)
+            throws Exception {
+        acknowledgeSubscription(transport, subscription);
+        subscription.established().get(5, SECONDS);
+    }
+
+    private static void acknowledgeSubscription(
             ScriptTransport transport,
             Subscription subscription
     ) throws Exception {
@@ -4890,84 +5144,6 @@ class ClientActorTest {
         public byte[] encodePublish(byte[] header, byte[] payload) {
             beforePublish.run();
             return codec.encodePublish(header, payload);
-        }
-    }
-
-    private static final class ScriptTransport implements Transport {
-
-        final LinkedBlockingQueue<Packet> sent = new LinkedBlockingQueue<>();
-        volatile @Nullable Listener listener;
-        volatile boolean closed;
-        volatile Runnable beforeSend = () -> { };
-        volatile Consumer<Packet> afterSend = _ -> { };
-        Runnable onStart = () -> { };
-        boolean connectOnStart = true;
-        volatile SendResult sendResult = SendResult.ACCEPTED;
-        volatile boolean completeSends = true;
-        volatile long pendingTicket;
-        @Nullable Throwable startFailure;
-        Duration startTimeout = Duration.ZERO;
-
-        Listener receiver() {
-            return requireNonNull(listener);
-        }
-
-        void receive(Packet packet) {
-            receiver().onBytes(codec.encode(packet));
-        }
-
-        void accept() {
-            receiver().onBytes(codec.encode(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY)));
-        }
-
-        void completeSend() {
-            long ticket = pendingTicket;
-            pendingTicket = 0;
-            receiver().onSent(ticket);
-        }
-
-        @Override
-        public void start(URI endpoint, Duration timeout, Listener receiver) {
-            startTimeout = timeout;
-            listener = receiver;
-            if (connectOnStart) {
-                receiver.onConnected();
-            }
-            onStart.run();
-            if (startFailure != null) {
-                closed = true;
-                receiver.onClosed(startFailure);
-            }
-        }
-
-        @Override
-        public SendResult send(long ticket, byte[] bytes) {
-            beforeSend.run();
-            if (closed) {
-                return SendResult.CLOSED;
-            }
-            SendResult result = sendResult;
-            if (result != SendResult.ACCEPTED) {
-                return result;
-            }
-            if (pendingTicket != 0) {
-                throw new IllegalStateException("A send is already outstanding");
-            }
-            pendingTicket = ticket;
-            Packet packet = codec.decode(bytes);
-            // Decide before a test can observe this send and change the flag for later sends.
-            boolean complete = completeSends;
-            sent.add(packet);
-            if (complete) {
-                completeSend();
-            }
-            afterSend.accept(packet);
-            return SendResult.ACCEPTED;
-        }
-
-        @Override
-        public void close() {
-            closed = true;
         }
     }
 
