@@ -70,7 +70,8 @@ final class SessionCore {
         PING,
         DISCONNECT,
         RECONNECT,
-        STABLE
+        STABLE,
+        RESPONSE
     }
 
     private enum EndReason {
@@ -215,6 +216,8 @@ final class SessionCore {
     private final Duration timeout;
 
     private final Duration keepAlive;
+
+    private final ResponseDeadlines responses;
 
     private final boolean cleanStart;
 
@@ -364,10 +367,37 @@ final class SessionCore {
             ReconnectBackoff backoff,
             boolean initialRetry
     ) {
+        this(
+                port,
+                clientId,
+                timeout,
+                keepAlive,
+                cleanStart,
+                will,
+                credentialsRequired,
+                backoff,
+                initialRetry,
+                Duration.ofSeconds(60)
+        );
+    }
+
+    SessionCore(
+            Port port,
+            String clientId,
+            Duration timeout,
+            Duration keepAlive,
+            boolean cleanStart,
+            Packet.@Nullable Will will,
+            boolean credentialsRequired,
+            ReconnectBackoff backoff,
+            boolean initialRetry,
+            Duration responseTimeout
+    ) {
         this.port = port;
         this.clientId = clientId;
         this.timeout = timeout;
         this.keepAlive = keepAlive;
+        this.responses = new ResponseDeadlines(responseTimeout);
         this.cleanStart = cleanStart;
         this.will = will;
         this.credentialsRequired = credentialsRequired;
@@ -605,10 +635,19 @@ final class SessionCore {
     }
 
     void sent(long connection, long ticket, long now) {
+        sent(connection, ticket, now, now);
+    }
+
+    void sent(long connection, long ticket, long writtenAt, long now) {
         if (connection != generation || state != State.CONNECTING && state != State.CONNECTED) {
             return;
         }
-        lastSent = now;
+        lastSent = writtenAt;
+        if (state == State.CONNECTED && disconnectOperation == 0) {
+            responses.written(ticket, writtenAt, now).ifPresent(delay -> {
+                port.schedule(generation, Timer.RESPONSE, delay);
+            });
+        }
         Long publication = publications.remove(ticket);
         if (publication != null) {
             port.complete(publication, PublishResult.of(), null);
@@ -706,8 +745,16 @@ final class SessionCore {
         } else {
             publications.put(ticket, operation);
         }
-        if (port.publish(generation, ticket, message, packetId, receipt)
-                == SendQueue.OfferResult.FULL) {
+        SendQueue.OfferResult result = port.publish(
+                generation,
+                ticket,
+                message,
+                packetId,
+                receipt
+        );
+        if (result == SendQueue.OfferResult.ACCEPTED) {
+            awaitPublication(ticket, message.qos(), packetId);
+        } else if (result == SendQueue.OfferResult.FULL) {
             if (packetId == 0) {
                 publications.remove(ticket);
             } else {
@@ -716,6 +763,15 @@ final class SessionCore {
             capacityFailure(operation, "Send queue capacity");
         }
         // CLOSED waits for the connection's terminal notification, as do SUBSCRIBE/UNSUBSCRIBE.
+    }
+
+    private void awaitPublication(long ticket, Qos qos, int packetId) {
+        switch (qos) {
+            case AT_MOST_ONCE -> {
+            }
+            case AT_LEAST_ONCE -> responses.add(ticket, ResponseDeadlines.Kind.PUBACK, packetId);
+            case EXACTLY_ONCE -> responses.add(ticket, ResponseDeadlines.Kind.PUBREC, packetId);
+        }
     }
 
     void subscribe(long operation, Subscribe request) {
@@ -816,10 +872,15 @@ final class SessionCore {
         int id = allocated.getAsInt();
         unsubscribing.put(id, removal);
         var packet = new Packet.Unsubscribe(id, List.of(removal.subscription.filter), EMPTY);
-        if (port.send(generation, ++nextTicket, packet, null) == SendQueue.OfferResult.FULL) {
+        long ticket = ++nextTicket;
+        SendQueue.OfferResult result = port.send(generation, ticket, packet, null);
+        if (result == SendQueue.OfferResult.FULL) {
             unsubscribing.remove(id);
             session.packetIds.release(id);
             return false;
+        }
+        if (result == SendQueue.OfferResult.ACCEPTED) {
+            responses.add(ticket, ResponseDeadlines.Kind.UNSUBACK, id);
         }
         return true;
     }
@@ -858,18 +919,22 @@ final class SessionCore {
                 deferred.removeFirst();
                 continue;
             }
+            long ticket = ++nextTicket;
             SendQueue.OfferResult result = switch (inflight) {
                 case Publication publication -> port.publish(
                         generation,
-                        ++nextTicket,
+                        ticket,
                         requireNonNull(publication.message),
                         publication.packetId,
                         requireNonNull(publication.receipt)
                 );
-                case Release release -> sendRelease(++nextTicket, release.packetId);
+                case Release release -> sendRelease(ticket, release.packetId);
             };
             if (result != SendQueue.OfferResult.ACCEPTED) {
                 return;
+            }
+            if (inflight instanceof Publication publication) {
+                awaitPublication(ticket, publication.qos, publication.packetId);
             }
             deferred.removeFirst();
         }
@@ -899,11 +964,20 @@ final class SessionCore {
             }
             int id = allocated.getAsInt();
             subscribing.put(id, local);
-            if (port.send(generation, ++nextTicket, subscriptionPacket(local, id), null)
-                    == SendQueue.OfferResult.FULL) {
+            long ticket = ++nextTicket;
+            SendQueue.OfferResult result = port.send(
+                    generation,
+                    ticket,
+                    subscriptionPacket(local, id),
+                    null
+            );
+            if (result == SendQueue.OfferResult.FULL) {
                 subscribing.remove(id);
                 session.packetIds.release(id);
                 return;
+            }
+            if (result == SendQueue.OfferResult.ACCEPTED) {
+                responses.add(ticket, ResponseDeadlines.Kind.SUBACK, id);
             }
             deferred.removeFirst();
             subscribingInFlight++;
@@ -919,6 +993,7 @@ final class SessionCore {
         );
         if (result == SendQueue.OfferResult.ACCEPTED) {
             releasesFirst = false;
+            responses.add(ticket, ResponseDeadlines.Kind.PUBCOMP, packetId);
         }
         return result;
     }
@@ -1029,6 +1104,7 @@ final class SessionCore {
                 // until PUBCOMP. Replacing the entry drops the body and retains PUBREC order.
                 session.bytes -= publication.bytes;
                 deferred.remove(publication);
+                responses.answered(ResponseDeadlines.Kind.PUBREC, packetId);
                 session.inflight.putLast(packetId, new Release(packetId, publication.operation));
             }
             case Release pending -> {
@@ -1067,6 +1143,7 @@ final class SessionCore {
                 // The last answer to a PUBREL for an unknown PUBREC makes its id available.
                 unknownReleases.remove(packetId);
                 releases.remove(packetId);
+                responses.answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
             } else if (!unknownPubCompLogged) {
                 unknownPubCompLogged = true;
                 log.warn("Ignoring PUBCOMP for unknown packet identifier {} on {}",
@@ -1102,6 +1179,14 @@ final class SessionCore {
             session.packetIds.release(packetId);
             if (inflight instanceof Publication publication) {
                 session.bytes -= publication.bytes;
+                responses.answered(
+                        publication.qos == Qos.AT_LEAST_ONCE
+                                ? ResponseDeadlines.Kind.PUBACK
+                                : ResponseDeadlines.Kind.PUBREC,
+                        packetId
+                );
+            } else {
+                responses.answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
             }
             deferred.remove(inflight);
             releases.remove(packetId);
@@ -1141,6 +1226,7 @@ final class SessionCore {
             return;
         }
         subscribing.remove(ack.packetId());
+        responses.answered(ResponseDeadlines.Kind.SUBACK, ack.packetId());
         session.packetIds.release(ack.packetId());
         boolean restoring = local.confirmed;
         subscribingInFlight--;
@@ -1187,6 +1273,7 @@ final class SessionCore {
             return;
         }
         unsubscribing.remove(ack.packetId());
+        responses.answered(ResponseDeadlines.Kind.UNSUBACK, ack.packetId());
         session.packetIds.release(ack.packetId());
         closingInFlight--;
         removeSubscription(pending.subscription, null);
@@ -1453,6 +1540,19 @@ final class SessionCore {
                     }
                 }
             }
+            case RESPONSE -> {
+                if (state == State.CONNECTED && disconnectOperation == 0) {
+                    responses.expired(now).ifPresent(delay -> {
+                        if (delay.isZero()) {
+                            failed(connection, new TimeoutException(
+                                    responses.headKind() + " deadline expired"
+                            ));
+                        } else {
+                            port.schedule(generation, Timer.RESPONSE, delay);
+                        }
+                    });
+                }
+            }
             case RECONNECT -> throw new AssertionError("Reconnect timer handled above");
         }
     }
@@ -1501,6 +1601,8 @@ final class SessionCore {
         port.cancel(Timer.KEEP_ALIVE);
         port.cancel(Timer.PING);
         port.cancel(Timer.STABLE);
+        port.cancel(Timer.RESPONSE);
+        responses.clear();
         awaitingPing = false;
         disconnectTicket = ++nextTicket;
         port.schedule(generation, Timer.DISCONNECT, timeout);
@@ -1590,6 +1692,7 @@ final class SessionCore {
         for (var timer : Timer.values()) {
             port.cancel(timer);
         }
+        responses.clear();
         boolean retry = shouldReconnect(cause, reason, shutdownRequested);
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
         Duration delay = null;

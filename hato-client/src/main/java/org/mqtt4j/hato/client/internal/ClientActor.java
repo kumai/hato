@@ -834,7 +834,7 @@ public final class ClientActor implements MqttClient {
             timers.put(timer, entry);
             Mailbox.Kind kind = switch (timer) {
                 case KEEP_ALIVE, PING -> Mailbox.Kind.KEEP_ALIVE;
-                case CONNECT, DISCONNECT, RECONNECT, STABLE -> Mailbox.Kind.CONTROL;
+                case CONNECT, DISCONNECT, RECONNECT, STABLE, RESPONSE -> Mailbox.Kind.CONTROL;
             };
             try {
                 entry.cancellation = scheduler.schedule(delay, () -> post(
@@ -1052,7 +1052,7 @@ public final class ClientActor implements MqttClient {
             }
             return () -> post(
                     generation,
-                    () -> core.sent(generation, ticket, sentAt),
+                    () -> core.sent(generation, ticket, sentAt, nanoTime(generation)),
                     Mailbox.Kind.CONTROL,
                     0
             );

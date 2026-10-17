@@ -33,6 +33,11 @@ import java.util.concurrent.CompletableFuture;
 /// listeners retain capacity until they return, so further operations may be rejected.
 /// A returned future may already be complete; subsequently attached continuations follow the
 /// usual [CompletableFuture] execution rules and may run on the attaching application thread.
+///
+/// Once a packet requiring SUBACK, UNSUBACK, PUBACK, PUBREC, or PUBCOMP has been written,
+/// its response must arrive within 60 seconds. Each QoS 2 stage is timed separately;
+/// other responses and PINGRESP do not extend the deadline. Expiry ends the connection with
+/// [java.util.concurrent.TimeoutException] as its cause, even when keep-alive is disabled.
 public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable {
 
     /// Starts configuration without opening a connection.

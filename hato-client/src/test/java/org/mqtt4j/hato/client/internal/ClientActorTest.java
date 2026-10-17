@@ -3734,6 +3734,13 @@ class ClientActorTest {
             assertThat(ends.poll(5, SECONDS)).isNotNull();
             CompletableFuture<ConnAck> connected = sut.connect();
             ScriptTransport current = nextTransport();
+            // Settle CONNECT's write notification before holding CONNACK's clock read.
+            await().untilAsserted(() -> assertThat(((ClientActor) sut).usage().sends()).isZero());
+            // Empty input takes the sender's monitor after budget release, so the completion
+            // is posted before the following FIFO barrier without admitting another packet.
+            current.receiver().onBytes(new byte[0]);
+            assertThatThrownBy(() -> sut.subscribe(request()).established().get(5, SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
             beforeActorTime = () -> {
                 actorHeld.countDown();
                 waitFor(releaseActor);
@@ -4760,9 +4767,11 @@ class ClientActorTest {
             assertThat(requireNonNull(delivered.poll(5, SECONDS)).message())
                     .isEqualTo(message(new byte[] {2}));
 
-            // Act: the actor registers the PING deadline and the next keep-alive check.
+            // Act: the PINGREQ joins the blocked PUBLISH after its deadline is armed.
             scheduler.advance(Duration.ofSeconds(10));
-            await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(2));
+            await().untilAsserted(() ->
+                    assertThat(((ClientActor) sut).usage().sends()).isEqualTo(2)
+            );
             scheduler.advance(Duration.ofSeconds(10));
 
             // Assert
