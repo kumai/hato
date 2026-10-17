@@ -1175,6 +1175,18 @@ class SessionPersistenceTest {
         final List<Disconnection> ends = new ArrayList<>();
         final List<Boolean> established = new ArrayList<>();
         final Map<SessionCore.Timer, Duration> timers = new EnumMap<>(SessionCore.Timer.class);
+        final List<Long> attempts = new ArrayList<>();
+        final List<Duration> reconnectDelays = new ArrayList<>();
+        final List<Boolean> requests = new ArrayList<>();
+        final List<ConnectionAttempt> cancellations = new ArrayList<>();
+        final List<ConnectionAttempt> evaluations = new ArrayList<>();
+        final List<String> events = new ArrayList<>();
+        int disconnecting;
+        int stopsDiscarded;
+        SessionCore.@Nullable Timer failingTimer;
+        final IllegalStateException timerFailure = new IllegalStateException("Timer unavailable");
+        long endedAttempt;
+        @Nullable Duration latestReconnectDelay;
         SendQueue.OfferResult publishResult = SendQueue.OfferResult.ACCEPTED;
         SendQueue.OfferResult subscribeResult = SendQueue.OfferResult.ACCEPTED;
         SendQueue.OfferResult unsubscribeResult = SendQueue.OfferResult.ACCEPTED;
@@ -1189,16 +1201,29 @@ class SessionPersistenceTest {
         @Nullable TestSubscription registering;
 
         @Override
-        public void beginAttempt(long connection, ConnectionAttempt attempt) {
+        public void beginAttempt(
+                long connection,
+                ConnectionAttempt attempt,
+                long attemptNumber
+        ) {
             generation = connection;
+            attempts.add(attemptNumber);
+        }
+
+        @Override
+        public void connectionRequested(boolean requested) {
+            requests.add(requested);
+            events.add("request " + requested);
         }
 
         @Override
         public void evaluateCredentials(ConnectionAttempt attempt) {
+            evaluations.add(attempt);
         }
 
         @Override
         public void cancelCredentials(ConnectionAttempt attempt) {
+            cancellations.add(attempt);
         }
 
         @Override
@@ -1215,6 +1240,13 @@ class SessionPersistenceTest {
 
         @Override
         public void disconnecting() {
+            disconnecting++;
+        }
+
+        @Override
+        public void stopDiscarded() {
+            stopsDiscarded++;
+            events.add("stop discarded");
         }
 
         @Override
@@ -1295,12 +1327,17 @@ class SessionPersistenceTest {
 
         @Override
         public void schedule(long connection, SessionCore.Timer timer, Duration delay) {
+            if (timer == failingTimer) {
+                throw SpiException.scheduler(connection, timerFailure);
+            }
             timers.put(timer, delay);
+            events.add("schedule " + timer);
         }
 
         @Override
         public void cancel(SessionCore.Timer timer) {
             timers.remove(timer);
+            events.add("cancel " + timer);
         }
 
         @Override
@@ -1311,6 +1348,7 @@ class SessionPersistenceTest {
         public void complete(long operation, @Nullable Object value, @Nullable Throwable failure) {
             assertThat(operation).isPositive();
             assertThat(results.put(operation, new Result(value, failure))).isNull();
+            events.add("complete " + operation);
         }
 
         @Override
@@ -1378,10 +1416,18 @@ class SessionPersistenceTest {
                 boolean connected,
                 Disconnection disconnection,
                 boolean preserveSession,
-                boolean stopped
+                boolean stopped,
+                long attemptNumber,
+                @Nullable Duration reconnectDelay
         ) {
             established.add(connected);
             ends.add(disconnection);
+            endedAttempt = attemptNumber;
+            latestReconnectDelay = reconnectDelay;
+            if (reconnectDelay != null) {
+                reconnectDelays.add(reconnectDelay);
+            }
+            events.add("end");
             return Map.of();
         }
     }

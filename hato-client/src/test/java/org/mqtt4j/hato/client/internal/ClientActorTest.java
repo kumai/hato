@@ -92,6 +92,79 @@ class ClientActorTest {
 
     private volatile Runnable beforeActorTime = () -> { };
 
+    @Test
+    void joining_connection_requests_return_their_unused_listener_reservations() throws Exception {
+        // Arrange
+        try (MqttClient client = client()) {
+            var sut = (ClientActor) client;
+            CompletableFuture<ConnAck> first = sut.connect();
+            ScriptTransport transport = nextTransport();
+            CompletableFuture<ConnAck> joined = sut.connect();
+
+            // Act
+            transport.accept();
+
+            // Assert: joining an attempt and observing its established result start no new I/O.
+            assertThat(first.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(joined.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            for (int i = 0; i < 64; i++) {
+                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            }
+            await().untilAsserted(() -> assertThat(sut.usage().notifications()).isEqualTo(1));
+            assertThat(transports).isEmpty();
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            await().untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
+        }
+    }
+
+    @Test
+    void a_clock_failure_while_observing_an_established_connection_stops_its_request()
+            throws Exception {
+        // Arrange
+        var failure = new IllegalStateException("Clock unavailable");
+        var reject = new AtomicBoolean();
+        var clock = new TimerScheduler() {
+            @Override
+            public long nanoTime() {
+                if (reject.getAndSet(false)) {
+                    throw failure;
+                }
+                return scheduler.nanoTime();
+            }
+
+            @Override
+            public Cancellable schedule(Duration delay, Runnable task) {
+                return scheduler.schedule(delay, task);
+            }
+        };
+        try (MqttClient sut = MqttClient.builder()
+                .server(URI.create("mqtt://localhost"))
+                .version(MqttVersion.V3_1_1)
+                .timerScheduler(clock)
+                .connectionListener(ends::add)
+                .transportFactory(_ -> {
+                    var transport = new ScriptTransport();
+                    transports.add(transport);
+                    return transport;
+                })
+                .build()) {
+            ScriptTransport transport = connect(sut);
+
+            // Act
+            reject.set(true);
+
+            // Assert: failure is not confined to the additional connect future.
+            assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class)
+                    .hasRootCause(failure);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(transport.closed).isTrue();
+            assertThat(scheduler.pendingTaskCount()).isZero();
+            assertThat(transports).isEmpty();
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void invalid_credentials_fail_one_attempt_and_allow_another(boolean returnsNull)
@@ -376,8 +449,7 @@ class ClientActorTest {
             assertThat(published).isNotDone();
             assertThat(disconnected).isNotDone();
             release.countDown();
-            assertThatThrownBy(() -> connected.get(5, SECONDS))
-                    .hasCauseInstanceOf(IllegalStateException.class);
+            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
             published.get(5, SECONDS);
             disconnected.get(5, SECONDS);
         } finally {
@@ -386,7 +458,7 @@ class ClientActorTest {
     }
 
     @Test
-    void a_refused_disconnect_during_connection_does_not_block_subscription_establishment()
+    void disconnect_during_connection_defers_subscription_establishment_until_the_next_connection()
             throws Exception {
         // Arrange: the registration waits for the connection already in progress.
         try (MqttClient sut = client()) {
@@ -395,19 +467,29 @@ class ClientActorTest {
             CompletableFuture<ConnAck> connecting = sut.connect();
             ScriptTransport transport = nextTransport();
 
-            // Act: disconnect is refused while the MQTT connection is not established.
-            assertThatThrownBy(() -> sut.disconnect().get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttNotConnectedException.class);
+            // Act: withdraw the request, then let the outstanding CONNECT finish gracefully.
+            CompletableFuture<Void> disconnected = sut.disconnect();
             transport.accept();
-            connecting.get(5, SECONDS);
-            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
-            transport.receive(new Packet.SubAck(
+            disconnected.get(5, SECONDS);
+
+            // Assert: the cancelled attempt cannot establish its registered subscriptions.
+            assertThatThrownBy(() -> connecting.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Disconnect.class);
+            assertThat(transport.sent).isEmpty();
+            assertThat(establishing).isNotDone();
+            assertThatThrownBy(subscription::grantedQos).isInstanceOf(IllegalStateException.class);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+
+            ScriptTransport current = connect(sut);
+            var subscribe = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
+            current.receive(new Packet.SubAck(
                     subscribe.packetId(),
                     List.of(ReasonCode.SUCCESS),
                     EMPTY
             ));
 
-            // Assert: the refused operation cannot suppress the later successful SUBACK.
+            // Assert: the durable registration establishes on the next connection instead.
             assertThat(establishing.get(5, SECONDS)).isEqualTo(Qos.AT_MOST_ONCE);
             assertThat(subscription.established().get(5, SECONDS)).isEqualTo(Qos.AT_MOST_ONCE);
             assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
@@ -3445,7 +3527,7 @@ class ClientActorTest {
 
     @ParameterizedTest(name = "handler failure first: {0}")
     @ValueSource(booleans = {false, true})
-    void handler_and_transport_failures_preserve_the_first_notification(boolean handlerFirst)
+    void a_handler_stop_precedes_transport_failure_regardless_of_arrival_order(boolean handlerFirst)
             throws Exception {
         // Arrange: both failures arrive while the actor cannot consume either notification.
         var workers = new LinkedBlockingQueue<Thread>();
@@ -3476,14 +3558,9 @@ class ClientActorTest {
             }
             releaseActor.countDown();
 
-            // Assert: the second failure cannot replace the first admitted cause.
+            // Assert: a handler stop takes precedence over an already pending connection ending.
             Disconnection end = requireNonNull(ends.poll(5, SECONDS));
-            if (handlerFirst) {
-                assertThat(end).isEqualTo(Disconnection.of(failure, false));
-            } else {
-                assertProtocolFailure(end.cause().orElseThrow(), ReasonCode.MALFORMED_PACKET);
-                assertThat(end.userRequested()).isFalse();
-            }
+            assertThat(end).isEqualTo(Disconnection.of(failure, false));
             assertThat(transport.closed).isTrue();
         } finally {
             releaseHandler.countDown();
@@ -3613,7 +3690,7 @@ class ClientActorTest {
 
             // Assert: valid termination overtakes every queued packet and application command.
             Disconnection end = requireNonNull(ends.poll(5, SECONDS));
-            if (sessionPresent && handlerFirst) {
+            if (sessionPresent) {
                 assertThat(end).isEqualTo(Disconnection.of(failure, false));
             } else {
                 assertProtocolFailure(end.cause().orElseThrow(), ReasonCode.MALFORMED_PACKET);
@@ -3631,7 +3708,7 @@ class ClientActorTest {
 
     @ParameterizedTest(name = "session present: {0}")
     @ValueSource(booleans = {false, true})
-    void connack_keeps_the_first_applicable_failure_when_handler_and_io_both_arrive_during_it(
+    void connack_keeps_a_stop_only_for_its_current_session_when_io_also_fails(
             boolean sessionPresent
     ) throws Exception {
         // Arrange: CONNACK is taken, but its clock read precedes the session identity decision.

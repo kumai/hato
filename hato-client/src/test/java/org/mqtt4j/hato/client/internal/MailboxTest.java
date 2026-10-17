@@ -423,7 +423,7 @@ class MailboxTest {
 
     @ParameterizedTest(name = "handler failure first: {0}")
     @ValueSource(booleans = {false, true})
-    void a_retained_sessions_failure_uses_the_current_generation_and_first_cause(
+    void a_retained_sessions_stop_precedes_transport_failure_regardless_of_arrival_order(
             boolean handlerFirst
     ) throws Exception {
         // Arrange: every ordinary slot is full after the same session reconnects.
@@ -437,14 +437,15 @@ class MailboxTest {
         sut.activate(1);
         sut.discard(1);
         sut.activate(2);
+        sut.connectionRequested(true);
         assertThat(sut.offer(input)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
 
-        // Act: both valid producers report admission, but only the first owns termination.
+        // Act: a stop and a connection ending have independent priority slots.
         if (!handlerFirst) {
             assertThat(sut.terminate(transport)).isTrue();
         }
-        assertThat(sut.terminateSession(session, handler)).isTrue();
+        assertThat(sut.stopSession(session, handler)).isTrue();
         if (handlerFirst) {
             assertThat(sut.terminate(transport)).isTrue();
         }
@@ -452,8 +453,8 @@ class MailboxTest {
 
         // Assert: reasserting the same session cannot erase its accepted notification.
         Mailbox.Event first = sut.take(() -> false).orElseThrow();
-        assertThat(first.generation()).isEqualTo(2);
-        assertThat(first.action()).isSameAs(handlerFirst ? handler : transport.action());
+        assertThat(first.generation()).isZero();
+        assertThat(first.action()).isSameAs(handler);
         assertThat(sut.take(() -> false)).containsSame(input);
         assertThat(sut.take(() -> false)).containsSame(command);
         assertThat(sut.size()).isZero();
@@ -470,10 +471,11 @@ class MailboxTest {
         var transport = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
         sut.activateSession(old);
         sut.activate(2);
+        sut.connectionRequested(true);
         if (transportFirst) {
             assertThat(sut.terminate(transport)).isTrue();
         }
-        assertThat(sut.terminateSession(old, () -> { })).isTrue();
+        assertThat(sut.stopSession(old, () -> { })).isTrue();
         if (!transportFirst) {
             assertThat(sut.terminate(transport)).isTrue();
         }
@@ -482,8 +484,7 @@ class MailboxTest {
 
         // Act: both causes arrived before replacement; neither transport callback is repeated.
         sut.activateSession(current);
-        assertThat(sut.terminateSession(old, () -> { })).isFalse();
-        assertThat(sut.terminateSession(current, () -> { })).isTrue();
+        assertThat(sut.stopSession(old, () -> { })).isFalse();
 
         // Assert: a discarded session cannot hide the current transport's cause.
         assertThat(sut.take(() -> false)).containsSame(transport);
@@ -491,21 +492,44 @@ class MailboxTest {
     }
 
     @Test
-    void a_session_failure_requires_a_current_connection_and_the_identical_session() {
+    void a_session_stop_requires_a_connection_request_and_the_current_session() throws Exception {
         // Arrange
         var sut = new Mailbox(0, 0, 0, 0, 0);
         long session = 1;
         long other = 2;
         sut.activateSession(session);
 
-        // Act & Assert: a retained session alone has no connection to terminate.
-        assertThat(sut.terminateSession(session, () -> { })).isFalse();
+        // Act & Assert: a retained session alone has no connection request to stop.
+        assertThat(sut.stopSession(session, () -> { })).isFalse();
+        sut.connectionRequested(true);
         sut.activate(1);
-        assertThat(sut.terminateSession(other, () -> { })).isFalse();
-        assertThat(sut.terminateSession(session, () -> { })).isTrue();
+        assertThat(sut.stopSession(other, () -> { })).isFalse();
+        Runnable first = () -> { };
+        assertThat(sut.stopSession(session, first)).isTrue();
         sut.discard(1);
-        assertThat(sut.terminateSession(session, () -> { })).isFalse();
+        assertThat(sut.stopSession(session, () -> { })).isTrue();
+        assertThat(sut.take(() -> false).orElseThrow().action()).isSameAs(first);
+        sut.connectionRequested(false);
+        assertThat(sut.stopSession(session, () -> { })).isFalse();
         assertThat(sut.size()).isZero();
+    }
+
+    @Test
+    void closing_stop_admission_removes_a_pending_stop_before_lanes_resume() throws Exception {
+        // Arrange: no connection generation exists while waiting to reconnect.
+        var sut = new Mailbox(1, 0, 0, 0, 0);
+        sut.activateSession(1);
+        sut.connectionRequested(true);
+        assertThat(sut.stopSession(1, () -> { })).isTrue();
+        var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
+        assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
+
+        // Act
+        sut.connectionRequested(false);
+
+        // Assert
+        assertThat(sut.stopSession(1, () -> { })).isFalse();
+        assertThat(sut.take(() -> false)).containsSame(command);
     }
 
     @ParameterizedTest(name = "control event: {0}")

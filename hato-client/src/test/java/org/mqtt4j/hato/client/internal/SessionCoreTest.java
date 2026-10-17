@@ -681,7 +681,7 @@ class SessionCoreTest {
     }
 
     @Test
-    void connect_waits_for_connack_and_rejects_a_second_attempt() {
+    void connect_waits_for_connack_and_another_request_joins_the_attempt() {
         // Arrange
         sut.connect(attempt(1), 0);
 
@@ -691,15 +691,14 @@ class SessionCoreTest {
 
         // Assert
         assertThat(sut.state()).isEqualTo(CONNECTING);
-        assertThat(port.results).doesNotContainKey(1L);
-        assertThat(requireNonNull(port.results.get(2L)).failure())
-                .isInstanceOf(IllegalStateException.class);
+        assertThat(port.results).doesNotContainKeys(1L, 2L);
         assertThat(port.sent).singleElement().isInstanceOf(Packet.Connect.class);
         assertThat(port.opened).containsExactly(1L);
 
         accept();
         assertThat(sut.state()).isEqualTo(CONNECTED);
         assertThat(requireNonNull(port.results.get(1L)).value()).isEqualTo(ConnAck.of(false));
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(ConnAck.of(false));
         assertThat(port.timers).doesNotContainKey(CONNECT);
     }
 
@@ -1117,13 +1116,13 @@ class SessionCoreTest {
         // Assert
         assertThat(port.results).doesNotContainKey(2L);
         sut.disconnect(3);
-        assertThat(requireNonNull(port.results.get(3L)).failure())
-                .isInstanceOf(MqttNotConnectedException.class);
+        assertThat(port.results).doesNotContainKey(3L);
         sut.timer(1, KEEP_ALIVE, seconds(10));
         assertThat(port.sent).singleElement().isInstanceOf(Packet.Disconnect.class);
         sut.sent(1, ticket, seconds(1));
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(requireNonNull(port.results.get(2L)).failure()).isNull();
+        assertThat(requireNonNull(port.results.get(3L)).failure()).isNull();
         assertThat(port.ends).containsExactly(Disconnection.of(null, true));
     }
 
@@ -3085,9 +3084,17 @@ class SessionCoreTest {
         };
 
         @Override
-        public void beginAttempt(long generation, ConnectionAttempt attempt) {
+        public void beginAttempt(
+                long generation,
+                ConnectionAttempt attempt,
+                long attemptNumber
+        ) {
             opened.add(generation);
             attempts.add(attempt);
+        }
+
+        @Override
+        public void connectionRequested(boolean requested) {
         }
 
         @Override
@@ -3119,6 +3126,10 @@ class SessionCoreTest {
 
         @Override
         public void disconnecting() {
+        }
+
+        @Override
+        public void stopDiscarded() {
         }
 
         @Override
@@ -3262,7 +3273,9 @@ class SessionCoreTest {
                 boolean connected,
                 Disconnection end,
                 boolean preserveSession,
-                boolean stopped
+                boolean stopped,
+                long attemptNumber,
+                @Nullable Duration reconnectDelay
         ) {
             established.add(connected);
             ends.add(end);

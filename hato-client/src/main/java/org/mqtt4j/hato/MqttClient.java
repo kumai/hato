@@ -61,8 +61,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     ///
     /// The future fails with [MqttConnectException] if establishment fails, the broker refuses
     /// the connection, the connection deadline expires, or a handler of a continued session
-    /// fails during the attempt; see [MqttSubscriber]. Connecting while already connected or
-    /// while another attempt is pending fails with [IllegalStateException].
+    /// fails during the attempt; see [MqttSubscriber]. Calls during an attempt join its result.
+    /// While connected, returns the current successful CONNACK without opening another connection.
+    /// Calls while a disconnect is pending fail with [IllegalStateException].
     /// If [#close] wins before the attempt starts, it also fails with [IllegalStateException].
     CompletableFuture<ConnAck> connect();
 
@@ -80,9 +81,12 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// Pending removals complete when a nonpersistent connection ends; a persistent session's
     /// removals wait for confirmation on a later connection.
     ///
-    /// The future fails with [MqttNotConnectedException] when there is no established connection
-    /// or a disconnect is already pending. A connection failure before the write completes is
-    /// reported as [MqttConnectionLostException]. The write is bounded by the configured
+    /// With no connection or attempt, completes locally. During an attempt, waits for CONNACK
+    /// and, on success, sends DISCONNECT before closing; the pending connect requests fail.
+    /// If the attempt ends without a connection, for example because the broker refuses it,
+    /// this completes normally. Concurrent calls observe the same disconnection. A failure of
+    /// an established connection before write completion is reported as
+    /// [MqttConnectionLostException]. Its write deadline is the configured
     /// [connection timeout][MqttClientBuilder#connectionTimeout(java.time.Duration)].
     CompletableFuture<Void> disconnect();
 

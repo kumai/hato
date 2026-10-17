@@ -201,6 +201,30 @@ final class DeliveryLanes {
         }
     }
 
+    /// A withdrawn connection request discards a stop admitted while waiting to reconnect, and no
+    /// connection end follows to settle it. Its failed views are released as if the failure had
+    /// arrived without a request. Without a connection nothing is queued, so resuming the lanes
+    /// hands over no delivery that the stop would have discarded.
+    void stopDiscarded() {
+        lock.lock();
+        try {
+            for (RetainedDelivery delivery : acknowledging.values()) {
+                for (DeliveryView view : List.copyOf(delivery.views)) {
+                    if (!view.valid) {
+                        view.released = true;
+                        releaseView(view);
+                    }
+                }
+            }
+            for (Lane lane : lanes.values()) {
+                lane.failed = false;
+                lane.ready.signalAll();
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /// Pending views are discarded; a continuing session keeps handed-off receipt conditions.
     Map<Long, Boolean> connectionEnded(boolean preserveSession, boolean stopped) {
         lock.lock();

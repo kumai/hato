@@ -252,6 +252,43 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void a_discarded_stop_releases_its_failed_delivery_and_resumes_the_lane() throws Exception {
+        // Arrange: a handed-off handler fails after its connection ended, while a reconnect
+        // waits, and the accepted failure pauses the lane.
+        DeliveryLanes sut = lanes(BYTE_LIMIT, () -> { }, (token, cause) -> {
+            failures.add(new Failure(token, cause));
+            return true;
+        });
+        var started = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        var cause = new IllegalStateException("handler failed while waiting");
+        var first = new AtomicBoolean(true);
+        assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 1), delivery -> {
+            if (first.getAndSet(false)) {
+                started.countDown();
+                waitFor(release);
+                throw cause;
+            }
+            handled.add(delivery);
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(started.await(5, SECONDS)).isTrue();
+        assertThat(sut.connectionEnded(true, false)).containsExactlyEntriesOf(Map.of(10L, false));
+        release.countDown();
+        assertThat(failures.poll(5, SECONDS)).isEqualTo(new Failure(token(1, 10), cause));
+        assertThat(sut.retainedDeliveries()).isEqualTo(1);
+
+        // Act: withdrawing the request discards the stop, and no connection end follows.
+        sut.stopDiscarded();
+
+        // Assert: the failed delivery no longer holds the lane's only slot.
+        assertThat(sut.retainedDeliveries()).isZero();
+        assertThat(sut.deliver(token(2, 11), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(handled.poll(5, SECONDS)).isNotNull();
+    }
+
+    @Test
     void stopping_invalidates_unready_handed_views_and_keeps_completed_recipient_conditions()
             throws Exception {
         DeliveryLanes.Receiver manual = registerPull(

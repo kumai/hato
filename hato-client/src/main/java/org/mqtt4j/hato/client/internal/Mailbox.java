@@ -14,8 +14,8 @@ import org.jspecify.annotations.Nullable;
 /// interval requires [MQTT-3.1.2-23]. They are the keep-alive and PINGRESP deadline timers and the
 /// PINGRESPs that answer admitted PINGREQs. Their outcome does not depend on the events they
 /// overtake, except that a send time not yet recorded can bring a PINGREQ forward. Termination has
-/// its own slot ahead of both. Generation changes and admission share the monitor so old callbacks
-/// cannot consume capacity.
+/// its own slot ahead of both, and a session's stop request precedes termination. Generation and
+/// session changes share the admission monitor so old callbacks cannot consume capacity.
 final class Mailbox {
 
     enum OfferResult {
@@ -81,6 +81,8 @@ final class Mailbox {
     // Session numbers start at one; zero means none.
     private long activeSession;
 
+    private boolean connectionRequested;
+
     private int commandCount;
 
     private int registrationCount;
@@ -95,12 +97,10 @@ final class Mailbox {
 
     private @Nullable Event termination;
 
-    // The session whose handler failure owns the termination slot, or zero for other causes.
-    private long terminationSession;
+    // A stop belongs to the session and connection request, so it survives connection changes.
+    private @Nullable Event stop;
 
-    // A handler may be retired by a CONNACK already executing. Keep the first I/O failure
-    // behind it so replacing that session cannot erase the connection's terminal cause.
-    private @Nullable Event connectionTermination;
+    private long stopSession;
 
     Mailbox(
             int commandLimit,
@@ -121,14 +121,22 @@ final class Mailbox {
         activeGeneration = generation;
     }
 
-    /// Session replacement and failure admission share the monitor. An admitted old handler
-    /// must not occupy the new session's failure slot while its CONNACK is being processed.
+    /// Session replacement and stop admission share the monitor. An admitted old handler
+    /// must not occupy the new session's stop slot while its CONNACK is being processed.
     synchronized void activateSession(long session) {
         activeSession = session;
-        if (terminationSession != 0 && terminationSession != session) {
-            termination = connectionTermination;
-            connectionTermination = null;
-            terminationSession = 0;
+        if (stopSession != session) {
+            stop = null;
+            stopSession = 0;
+        }
+    }
+
+    /// Closes stop admission before the actor releases failed lanes at the end of a request.
+    synchronized void connectionRequested(boolean requested) {
+        connectionRequested = requested;
+        if (!requested) {
+            stop = null;
+            stopSession = 0;
         }
     }
 
@@ -180,29 +188,28 @@ final class Mailbox {
         return OfferResult.ACCEPTED;
     }
 
-    /// Returns whether the receipt belongs to the active connection, including when an earlier
-    /// valid termination already owns the slot. A rejected receipt must not keep its lane paused.
+    /// Returns whether the ending belongs to the active connection, including when an earlier
+    /// valid termination already owns the slot.
     synchronized boolean terminate(Event event) {
         if (event.generation() == 0 || event.generation() != activeGeneration) {
             return false;
         }
         if (termination == null) {
             termination = event;
-        } else if (terminationSession != 0 && connectionTermination == null) {
-            connectionTermination = event;
         }
         notifyAll();
         return true;
     }
 
-    /// Admits a handler failure for the active connection only while its session is current.
-    synchronized boolean terminateSession(long session, Runnable action) {
-        if (session != activeSession || activeGeneration == 0) {
+    /// Admits a current session's stop while connecting, connected, or awaiting reconnection.
+    /// Later failures share the first stop and keep their lanes paused until it is processed.
+    synchronized boolean stopSession(long session, Runnable action) {
+        if (session != activeSession || !connectionRequested) {
             return false;
         }
-        if (termination == null) {
-            termination = new Event(activeGeneration, action, Kind.CONTROL, 0);
-            terminationSession = session;
+        if (stop == null) {
+            stop = new Event(0, action, Kind.CONTROL, 0);
+            stopSession = session;
         }
         notifyAll();
         return true;
@@ -217,18 +224,23 @@ final class Mailbox {
 
     /// Waits for the next event; returns empty when the actor is stopping.
     synchronized Optional<Event> take(BooleanSupplier stopping) throws InterruptedException {
-        while (events.isEmpty() && keepAlive.isEmpty() && termination == null
+        while (events.isEmpty() && keepAlive.isEmpty() && termination == null && stop == null
                 && !stopping.getAsBoolean()) {
             wait();
         }
         if (stopping.getAsBoolean()) {
             return Optional.empty();
         }
+        Event request = stop;
+        if (request != null) {
+            stop = null;
+            stopSession = 0;
+            termination = null;
+            return Optional.of(request);
+        }
         Event end = termination;
         if (end != null) {
             termination = null;
-            terminationSession = 0;
-            connectionTermination = null;
             return Optional.of(end);
         }
         Event event = keepAlive.isEmpty() ? events.removeFirst() : keepAlive.removeFirst();
@@ -244,8 +256,9 @@ final class Mailbox {
         }
         if (termination != null && (generation == 0 || termination.generation() == generation)) {
             termination = null;
-            terminationSession = 0;
-            connectionTermination = null;
+        }
+        if (generation == 0) {
+            connectionRequested(false);
         }
         for (ArrayDeque<Event> queue : List.of(keepAlive, events)) {
             queue.removeIf(event -> {
@@ -262,7 +275,7 @@ final class Mailbox {
         notifyAll();
     }
 
-    /// Queued events, excluding a pending termination.
+    /// Queued events, excluding pending stop and termination requests.
     synchronized int size() {
         return keepAlive.size() + events.size();
     }

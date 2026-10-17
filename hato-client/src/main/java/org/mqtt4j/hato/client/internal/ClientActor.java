@@ -8,6 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.SplittableRandom;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
@@ -17,6 +18,7 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.Supplier;
+import java.util.random.RandomGenerator;
 
 import org.jspecify.annotations.Nullable;
 
@@ -184,6 +186,38 @@ public final class ClientActor implements MqttClient {
             @Nullable Supplier<MqttCredentials> credentials,
             Packet.@Nullable Will will
     ) {
+        this(
+                endpoint,
+                clientId,
+                keepAlive,
+                timeout,
+                maxPacketSize,
+                scheduler,
+                listener,
+                transportFactory,
+                codec,
+                cleanStart,
+                credentials,
+                will,
+                new SplittableRandom()
+        );
+    }
+
+    ClientActor(
+            URI endpoint,
+            String clientId,
+            Duration keepAlive,
+            Duration timeout,
+            int maxPacketSize,
+            TimerScheduler scheduler,
+            ConnectionListener listener,
+            Transport.Factory transportFactory,
+            PacketCodec codec,
+            boolean cleanStart,
+            @Nullable Supplier<MqttCredentials> credentials,
+            Packet.@Nullable Will will,
+            RandomGenerator random
+    ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
         this.scheduler = scheduler;
@@ -211,7 +245,9 @@ public final class ClientActor implements MqttClient {
                 keepAlive,
                 cleanStart,
                 will,
-                credentials != null
+                credentials != null,
+                ReconnectBackoff.disabled(random),
+                false
         );
         this.credentials = credentials == null ? null : new CredentialsEvaluator(
                 threadName("credentials"),
@@ -228,6 +264,7 @@ public final class ClientActor implements MqttClient {
             try {
                 now = scheduler.nanoTime();
             } catch (RuntimeException failure) {
+                core.schedulerFailed(openedGeneration, failure);
                 completeOperation(token, null, new MqttConnectException(
                         "Cannot read connection start time", failure
                 ));
@@ -382,6 +419,7 @@ public final class ClientActor implements MqttClient {
     public void close() {
         synchronized (lifecycleLock) {
             stopping.set(true);
+            mailbox.connectionRequested(false);
             mailbox.wake();
         }
     }
@@ -396,7 +434,11 @@ public final class ClientActor implements MqttClient {
                 try {
                     event.action().run();
                 } catch (SpiException cause) {
-                    core.failed(cause.generation(), requireNonNull(cause.getCause()));
+                    if (cause.schedulerFailure()) {
+                        core.schedulerFailed(cause.generation(), requireNonNull(cause.getCause()));
+                    } else {
+                        core.failed(cause.generation(), requireNonNull(cause.getCause()));
+                    }
                 }
                 busySince = shareCarrier(busySince);
             }
@@ -410,6 +452,7 @@ public final class ClientActor implements MqttClient {
                     fatalFailure = failure;
                 }
                 stopping.set(true);
+                mailbox.connectionRequested(false);
             }
             if (credentials != null) {
                 // Drops a waiting result before the remaining cleanup.
@@ -566,9 +609,9 @@ public final class ClientActor implements MqttClient {
     }
 
     private boolean deliveryFailed(DeliveryToken token, Throwable failure) {
-        // Reject retired sessions before they can occupy the current connection's failure slot.
+        // Reject retired sessions before they can occupy the current request's stop slot.
         // A closing client keeps the failed lane paused until shutdown removes it.
-        return mailbox.terminateSession(token.session(), () -> core.deliveryFailed(token, failure))
+        return mailbox.stopSession(token.session(), () -> core.deliveryFailed(token, failure))
                 || stopping.get();
     }
 
@@ -610,8 +653,9 @@ public final class ClientActor implements MqttClient {
             }
             return;
         }
-        if (failure != null && operation.attempt != null) {
-            // An attempt that established no connection returns both of its notifications.
+        if (operation.attempt != null
+                && (failure != null || operation.attempt != activeAttempt)) {
+            // Failed attempts and requests joining another attempt return unused reservations.
             requireNonNull(operation.attempt.notifications).close();
         }
         Thread.ofVirtual().name(threadName("complete-" + token)).start(() -> {
@@ -631,7 +675,7 @@ public final class ClientActor implements MqttClient {
         try {
             return scheduler.nanoTime();
         } catch (RuntimeException failure) {
-            throw new SpiException(generation, failure);
+            throw SpiException.scheduler(generation, failure);
         }
     }
 
@@ -680,7 +724,7 @@ public final class ClientActor implements MqttClient {
         private boolean unsolicitedPingResponseLogged;
 
         @Override
-        public void beginAttempt(long generation, ConnectionAttempt attempt) {
+        public void beginAttempt(long generation, ConnectionAttempt attempt, long attemptNumber) {
             synchronized (lifecycleLock) {
                 disconnecting = false;
             }
@@ -688,6 +732,13 @@ public final class ClientActor implements MqttClient {
             openedGeneration = generation;
             mailbox.activateSession(core.sessionNumber());
             mailbox.activate(generation);
+        }
+
+        @Override
+        public void connectionRequested(boolean requested) {
+            synchronized (lifecycleLock) {
+                mailbox.connectionRequested(requested && !stopping.get());
+            }
         }
 
         @Override
@@ -724,6 +775,11 @@ public final class ClientActor implements MqttClient {
             synchronized (lifecycleLock) {
                 disconnecting = true;
             }
+        }
+
+        @Override
+        public void stopDiscarded() {
+            lanes.stopDiscarded();
         }
 
         private ListenerLane.Reservation notifications() {
@@ -778,7 +834,7 @@ public final class ClientActor implements MqttClient {
             timers.put(timer, entry);
             Mailbox.Kind kind = switch (timer) {
                 case KEEP_ALIVE, PING -> Mailbox.Kind.KEEP_ALIVE;
-                case CONNECT, DISCONNECT -> Mailbox.Kind.CONTROL;
+                case CONNECT, DISCONNECT, RECONNECT, STABLE -> Mailbox.Kind.CONTROL;
             };
             try {
                 entry.cancellation = scheduler.schedule(delay, () -> post(
@@ -794,7 +850,7 @@ public final class ClientActor implements MqttClient {
                 ));
             } catch (RuntimeException failure) {
                 timers.remove(timer);
-                throw new SpiException(generation, failure);
+                throw SpiException.scheduler(generation, failure);
             }
         }
 
@@ -928,7 +984,9 @@ public final class ClientActor implements MqttClient {
                 boolean established,
                 Disconnection disconnection,
                 boolean preserveSession,
-                boolean stopped
+                boolean stopped,
+                long attemptNumber,
+                @Nullable Duration reconnectDelay
         ) {
             Throwable cause = disconnection.cause().orElse(null);
             synchronized (lifecycleLock) {
@@ -990,7 +1048,7 @@ public final class ClientActor implements MqttClient {
             try {
                 sentAt = scheduler.nanoTime();
             } catch (RuntimeException failure) {
-                return () -> signalFailure(generation, failure);
+                return () -> terminate(generation, () -> core.schedulerFailed(generation, failure));
             }
             return () -> post(
                     generation,
@@ -1041,6 +1099,7 @@ public final class ClientActor implements MqttClient {
                     fatalFailure = failure;
                 }
                 stopping.set(true);
+                mailbox.connectionRequested(false);
                 mailbox.wake();
             }
         }

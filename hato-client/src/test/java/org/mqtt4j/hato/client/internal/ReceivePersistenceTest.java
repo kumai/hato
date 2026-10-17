@@ -646,8 +646,16 @@ class ReceivePersistenceTest {
         long generation;
 
         @Override
-        public void beginAttempt(long generation, ConnectionAttempt attempt) {
+        public void beginAttempt(
+                long generation,
+                ConnectionAttempt attempt,
+                long attemptNumber
+        ) {
             this.generation = generation;
+        }
+
+        @Override
+        public void connectionRequested(boolean requested) {
         }
 
         @Override
@@ -672,6 +680,10 @@ class ReceivePersistenceTest {
 
         @Override
         public void disconnecting() {
+        }
+
+        @Override
+        public void stopDiscarded() {
         }
 
         @Override
@@ -786,7 +798,9 @@ class ReceivePersistenceTest {
                 boolean established,
                 Disconnection disconnection,
                 boolean preserveSession,
-                boolean stopped
+                boolean stopped,
+                long attemptNumber,
+                @Nullable Duration reconnectDelay
         ) {
             ends.add(disconnection);
             if (!preserveSession) {
