@@ -1083,7 +1083,7 @@ class DeliveryLanesTest {
 
         // Act: the failure arrives after admission ends but before connection cleanup.
         release.countDown();
-        await().until(() -> worker.getState() == Thread.State.WAITING);
+        await().until(() -> sut.reportedFailures() == 1);
         sut.connectionEnded(false, false);
 
         // Assert: the callback retains the receipt's origin without retaining its resources.

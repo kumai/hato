@@ -3386,7 +3386,7 @@ class ClientActorTest {
         var failure = new RejectedExecutionException("Second send failed");
         var actorHeld = new CountDownLatch(1);
         var releaseActor = new CountDownLatch(1);
-        var sending = new CompletableFuture<Thread>();
+        var sending = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             await().untilAsserted(() -> assertThat(transport.pendingTicket).isZero());
@@ -3396,16 +3396,15 @@ class ClientActorTest {
             CompletableFuture<PublishResult> second = sut.publish(message(new byte[] {2}));
             holdActor(transport, actorHeld, releaseActor);
             transport.beforeSend = () -> {
-                sending.complete(Thread.currentThread());
+                sending.countDown();
                 throw failure;
             };
 
             // Act: notify the successful write, then let the next send fail before resuming.
             transport.completeSend();
-            Thread sender = sending.get(5, SECONDS);
-            // Waiting again proves the sender has posted the failure, not merely entered send.
-            await().untilAsserted(() -> assertThat(sender.getState())
-                    .isEqualTo(Thread.State.WAITING));
+            assertThat(sending.await(5, SECONDS)).isTrue();
+            // The posted end proves the sender has reported the failure, not merely entered send.
+            await().until(() -> ((ClientActor) sut).postedConnectionEnds() == 1);
             releaseActor.countDown();
 
             // Assert: FIFO notification preserves success and only the later operation fails.
@@ -3648,7 +3647,7 @@ class ClientActorTest {
     void a_queued_handler_failure_is_processed_before_its_acknowledgement(Qos qos)
             throws Exception {
         // Arrange: both the explicit ack and failure arrive while the actor is held.
-        var workers = new LinkedBlockingQueue<Thread>();
+        var entered = new CountDownLatch(1);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
         var releaseActor = new CountDownLatch(1);
@@ -3659,7 +3658,7 @@ class ClientActorTest {
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL),
                     delivery -> {
-                        workers.add(Thread.currentThread());
+                        entered.countDown();
                         waitFor(releaseHandler);
                         delivery.ack();
                         throw failure;
@@ -3667,12 +3666,12 @@ class ClientActorTest {
             );
             establish(transport, subscription);
             transport.receive(acknowledgedPublication("messages", 7, qos, false));
-            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            assertThat(entered.await(5, SECONDS)).isTrue();
             holdActor(transport, actorHeld, releaseActor);
 
-            // Act: the worker waits after notifying failure and coalescing acknowledgement.
+            // Act: the acknowledgement wake and the failure report both reach the held actor.
             releaseHandler.countDown();
-            await().until(() -> worker.getState() == Thread.State.WAITING);
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             releaseActor.countDown();
 
             // Assert: processing the failure retires the queued ACK and preserves its cause.
@@ -3689,7 +3688,6 @@ class ClientActorTest {
     @ValueSource(ints = {1, 256})
     void handler_failure_overtakes_queued_input_and_commands(int subscriptions) throws Exception {
         // Arrange: a publication reaches every lane before input and a command wait in the actor.
-        var workers = new LinkedBlockingQueue<Thread>();
         var delivered = new CountDownLatch(subscriptions);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
@@ -3705,9 +3703,6 @@ class ClientActorTest {
                 boolean failing = i == 0;
                 var request = Subscribe.of(new TopicFilter("a/".repeat(i) + "#"), Qos.AT_MOST_ONCE);
                 Subscription subscription = sut.subscribe(request, _ -> {
-                    if (failing) {
-                        workers.add(Thread.currentThread());
-                    }
                     delivered.countDown();
                     waitFor(releaseHandler);
                     if (failing) {
@@ -3721,7 +3716,6 @@ class ClientActorTest {
                     new byte[] {1}, Qos.AT_MOST_ONCE, false, false, 0, EMPTY);
             transport.receive(incoming);
             assertThat(delivered.await(5, SECONDS)).isTrue();
-            Thread worker = requireNonNull(workers.poll(5, SECONDS));
             holdActor(transport, actorHeld, releaseActor);
             // The held clock call keeps its original callback. Later calls count input handling.
             beforeActorTime = received::incrementAndGet;
@@ -3735,9 +3729,9 @@ class ClientActorTest {
             }
             CompletableFuture<Void> queued = registered.getLast().unsubscribe();
 
-            // Act: the untimed lane wait follows notification, unlike the handler's timed wait.
+            // Act: the failure report reaches the held actor behind the queued input and command.
             releaseHandler.countDown();
-            await().until(() -> worker.getState() == Thread.State.WAITING);
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             releaseActor.countDown();
 
             // Assert: termination discards input and confirms clean-session removal
@@ -3757,7 +3751,7 @@ class ClientActorTest {
     void a_handler_stop_precedes_transport_failure_regardless_of_arrival_order(boolean handlerFirst)
             throws Exception {
         // Arrange: both failures arrive while the actor cannot consume either notification.
-        var workers = new LinkedBlockingQueue<Thread>();
+        var entered = new CountDownLatch(1);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
         var releaseActor = new CountDownLatch(1);
@@ -3765,21 +3759,21 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             Subscription subscription = sut.subscribe(request(), _ -> {
-                workers.add(Thread.currentThread());
+                entered.countDown();
                 waitFor(releaseHandler);
                 throw failure;
             });
             establish(transport, subscription);
             transport.receive(publication(new byte[] {1}));
-            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            assertThat(entered.await(5, SECONDS)).isTrue();
             holdActor(transport, actorHeld, releaseActor);
 
-            // Act: invalid input uses the termination slot; the lane wait follows notification.
+            // Act: invalid input uses the termination slot before or after the failure report.
             if (!handlerFirst) {
                 transport.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             }
             releaseHandler.countDown();
-            await().until(() -> worker.getState() == Thread.State.WAITING);
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             if (handlerFirst) {
                 transport.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             }
@@ -3798,7 +3792,7 @@ class ClientActorTest {
     @Test
     void old_handler_failure_cannot_hide_the_current_transport_failure() throws Exception {
         // Arrange: the old handler is still running after a new connection is established.
-        var workers = new LinkedBlockingQueue<Thread>();
+        var entered = new CountDownLatch(1);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
         var releaseActor = new CountDownLatch(1);
@@ -3806,13 +3800,13 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport old = connect(sut);
             Subscription subscription = sut.subscribe(request(), _ -> {
-                workers.add(Thread.currentThread());
+                entered.countDown();
                 waitFor(releaseHandler);
                 throw failure;
             });
             establish(old, subscription);
             old.receive(publication(new byte[] {1}));
-            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            assertThat(entered.await(5, SECONDS)).isTrue();
             sut.disconnect().get(5, SECONDS);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             ScriptTransport current = connect(sut);
@@ -3823,7 +3817,7 @@ class ClientActorTest {
 
             // Act: the stale failure arrives first but cannot reserve current termination.
             releaseHandler.countDown();
-            await().until(() -> worker.getState() == Thread.State.WAITING);
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             releaseActor.countDown();
 
@@ -3851,7 +3845,7 @@ class ClientActorTest {
             boolean handlerFirst
     ) throws Exception {
         // Arrange: the old handler remains active while a new connection's actor is held.
-        var workers = new LinkedBlockingQueue<Thread>();
+        var entered = new CountDownLatch(1);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
         var releaseActor = new CountDownLatch(1);
@@ -3873,14 +3867,14 @@ class ClientActorTest {
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.AFTER_HANDLER),
                     _ -> {
-                        workers.add(Thread.currentThread());
+                        entered.countDown();
                         waitFor(releaseHandler);
                         throw failure;
                     }
             );
             establish(old, subscription);
             old.receive(acknowledgedPublication("messages", 7, qos, false));
-            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            assertThat(entered.await(5, SECONDS)).isTrue();
             old.receiver().onClosed(new IOException("connection lost"));
             assertThat(ends.poll(5, SECONDS)).isNotNull();
             ScriptTransport current = connect(sut, sessionPresent);
@@ -3904,12 +3898,12 @@ class ClientActorTest {
             }
             CompletableFuture<Void> queued = subscription.unsubscribe();
 
-            // Act: the lane's untimed wait follows notification; the actor cannot consume it yet.
+            // Act: the failure report and invalid input both reach the held actor, in either order.
             if (!handlerFirst) {
                 current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             }
             releaseHandler.countDown();
-            await().until(() -> worker.getState() == Thread.State.WAITING);
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             if (handlerFirst) {
                 current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             }
@@ -3939,7 +3933,7 @@ class ClientActorTest {
             boolean sessionPresent
     ) throws Exception {
         // Arrange: CONNACK is taken, but its clock read precedes the session identity decision.
-        var workers = new LinkedBlockingQueue<Thread>();
+        var entered = new CountDownLatch(1);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
         var releaseActor = new CountDownLatch(1);
@@ -3949,14 +3943,14 @@ class ClientActorTest {
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE),
                     _ -> {
-                        workers.add(Thread.currentThread());
+                        entered.countDown();
                         waitFor(releaseHandler);
                         throw failure;
                     }
             );
             establish(old, subscription);
             old.receive(qosOnePublication("messages", 7, false));
-            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            assertThat(entered.await(5, SECONDS)).isTrue();
             old.receiver().onClosed(new IOException("connection lost"));
             assertThat(ends.poll(5, SECONDS)).isNotNull();
             CompletableFuture<ConnAck> connected = sut.connect();
@@ -3977,7 +3971,7 @@ class ClientActorTest {
 
             // Act: I/O failure follows an admitted handler failure before CONNACK resumes.
             releaseHandler.countDown();
-            await().until(() -> worker.getState() == Thread.State.WAITING);
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             releaseActor.countDown();
 
@@ -4004,7 +3998,7 @@ class ClientActorTest {
             throws Exception {
         // Arrange: the failing QoS 1 delivery keeps the lane's only slot, and the actor is held
         // just before the next publication for that lane reaches the session.
-        var workers = new LinkedBlockingQueue<Thread>();
+        var entered = new CountDownLatch(1);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
         var releaseActor = new CountDownLatch(1);
@@ -4015,7 +4009,7 @@ class ClientActorTest {
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
                             .withBufferCapacity(1),
                     _ -> {
-                        workers.add(Thread.currentThread());
+                        entered.countDown();
                         waitFor(releaseHandler);
                         throw failure;
                     }
@@ -4023,7 +4017,7 @@ class ClientActorTest {
             establish(transport, subscription);
             transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {1},
                     Qos.AT_LEAST_ONCE, false, false, 7, EMPTY));
-            Thread worker = requireNonNull(workers.poll(5, SECONDS));
+            assertThat(entered.await(5, SECONDS)).isTrue();
             beforeActorTime = () -> {
                 actorHeld.countDown();
                 waitFor(releaseActor);
@@ -4034,7 +4028,7 @@ class ClientActorTest {
 
             // Act: the failure is accepted while that publication is still in progress.
             releaseHandler.countDown();
-            await().until(() -> worker.getState() == Thread.State.WAITING);
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             releaseActor.countDown();
 
             // Assert: the full lane neither replaces the accepted cause nor releases a PUBACK.
@@ -4079,7 +4073,7 @@ class ClientActorTest {
             // Act: shutdown is requested before the handler fails.
             sut.close();
             releaseHandler.countDown();
-            await().until(() -> worker.getState() == Thread.State.WAITING);
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             releaseActor.countDown();
 
             // Assert: the failed lane stays paused until shutdown stops its worker.

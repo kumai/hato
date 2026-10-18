@@ -733,6 +733,18 @@ public final class ClientActor implements MqttClient {
         return listenerLane.dropped();
     }
 
+    /// Handler failures whose report has returned, for tests that order later events after a
+    /// stop request until applications get statistics.
+    long reportedHandlerFailures() {
+        return lanes.reportedFailures();
+    }
+
+    /// Connection ends that I/O has posted to the actor, for tests that order later events after
+    /// an end until applications get statistics.
+    long postedConnectionEnds() {
+        return io.postedEnds();
+    }
+
     static Mailbox createMailbox(int maxPacketSize) {
         // Registrations have their own admission class within the shared FIFO.
         return new Mailbox(

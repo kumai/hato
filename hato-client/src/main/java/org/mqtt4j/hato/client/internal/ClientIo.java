@@ -95,6 +95,8 @@ final class ClientIo {
 
     private boolean shutdown;
 
+    private long postedEnds;
+
     ClientIo(
             URI endpoint,
             String clientId,
@@ -440,6 +442,7 @@ final class ClientIo {
             Throwable cause = connection.pendingEnd;
             connection.pendingEnd = null;
             events.ended(connection.generation, cause);
+            postedEnds++;
         }
     }
 
@@ -510,6 +513,14 @@ final class ClientIo {
 
     long sendBytes() {
         return budget.bytes();
+    }
+
+    /// Counts connection ends posted to the actor. The count changes under the send monitor
+    /// after the post returns, so a caller that sees it can order later events after the end.
+    long postedEnds() {
+        synchronized (sending) {
+            return postedEnds;
+        }
     }
 
     /// activeTicket names the queue's active send, or 0; its capacity returns only after neither

@@ -77,6 +77,8 @@ final class DeliveryLanes {
 
     private long handledDeliveries;
 
+    private long reportedFailures;
+
     DeliveryLanes(
             String clientId,
             long byteLimit,
@@ -551,6 +553,18 @@ final class DeliveryLanes {
         }
     }
 
+    /// Counts handler failures whose report has returned. The count changes after the report has
+    /// offered its termination and the lane has paused or released the failed delivery, so a
+    /// caller that sees it can order later events after the report.
+    long reportedFailures() {
+        lock.lock();
+        try {
+            return reportedFailures;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void run(Lane lane) {
         try {
             while (runNext(lane)) {
@@ -616,14 +630,16 @@ final class DeliveryLanes {
                 lock.unlock();
             }
             Thread.interrupted();
-            if (!reportFailure(lane, view.delivery.token, failure)) {
-                lock.lock();
-                try {
+            boolean paused = reportFailure(lane, view.delivery.token, failure);
+            lock.lock();
+            try {
+                if (!paused) {
                     view.released = true;
                     releaseView(view);
-                } finally {
-                    lock.unlock();
                 }
+                reportedFailures++;
+            } finally {
+                lock.unlock();
             }
             return true;
         }

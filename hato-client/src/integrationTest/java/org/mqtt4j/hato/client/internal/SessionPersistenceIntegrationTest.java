@@ -256,25 +256,24 @@ class SessionPersistenceIntegrationTest {
     ) throws Exception {
         // Arrange: the first handler outlives the connection on which its delivery arrived.
         var ended = new LinkedBlockingQueue<Disconnection>();
-        var workers = new LinkedBlockingQueue<Thread>();
+        var entered = new CountDownLatch(1);
         var retried = new LinkedBlockingQueue<MqttDelivery>();
         var calls = new AtomicInteger();
         var release = new CountDownLatch(1);
         var failure = new IllegalStateException("old handler failed");
         try (ServerSocket server = listen();
                 MqttClient sut = persistentClient(endpoint(server), ended::add)) {
-            Thread worker;
             try (ScriptedBroker peer = connect(server, sut, false)) {
                 peer.subscribe(sut, "data", AckMode.AFTER_HANDLER, delivery -> {
                     if (calls.incrementAndGet() == 1) {
-                        workers.add(Thread.currentThread());
+                        entered.countDown();
                         waitFor(release);
                         throw failure;
                     }
                     retried.add(delivery);
                 });
                 peer.publishBurst("data", 7, 1, false);
-                worker = requireNonNull(workers.poll(5, SECONDS));
+                assertThat(entered.await(5, SECONDS)).isTrue();
             }
             assertThat(ended.poll(5, SECONDS)).isNotNull();
 
@@ -290,7 +289,7 @@ class SessionPersistenceIntegrationTest {
                 }
             } else {
                 release.countDown();
-                await().until(() -> worker.getState() == Thread.State.WAITING);
+                await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
                 assertThat(ended).isEmpty();
             }
 
