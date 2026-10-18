@@ -48,7 +48,7 @@ class ReconnectionTest {
     })
     void broker_refusals_follow_the_retry_classification(String reason, boolean retry) {
         var failure = new MqttConnectException("Refused", ReasonCode.valueOf(reason));
-        assertThat(SessionCore.reconnectable(failure)).isEqualTo(retry);
+        assertThat(ConnectionRequest.reconnectable(failure)).isEqualTo(retry);
     }
 
     @ParameterizedTest
@@ -77,7 +77,7 @@ class ReconnectionTest {
     @ParameterizedTest
     @MethodSource("retryableFailures")
     void local_connection_failures_allow_retry(Throwable failure) {
-        assertThat(SessionCore.reconnectable(failure)).isTrue();
+        assertThat(ConnectionRequest.reconnectable(failure)).isTrue();
     }
 
     private static Stream<Throwable> retryableFailures() {

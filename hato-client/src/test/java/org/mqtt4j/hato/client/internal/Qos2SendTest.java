@@ -33,6 +33,7 @@ import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.CONNECTED;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.DISCONNECTED;
+import static org.mqtt4j.hato.client.internal.SessionCore.State.DISCONNECTING;
 import static org.mqtt4j.hato.client.internal.SessionPersistenceTest.messageWithWireBytes;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
@@ -421,7 +422,7 @@ class Qos2SendTest {
         assertThat(result(downgraded).failure())
                 .isInstanceOfSatisfying(MqttProtocolException.class, failure ->
                         assertThat(failure.reasonCode()).isEqualTo(ReasonCode.PROTOCOL_ERROR));
-        assertThat(sut.state()).isEqualTo(CONNECTED);
+        assertThat(sut.state()).isEqualTo(disconnecting ? DISCONNECTING : CONNECTED);
         assertThat(port.ends).isEmpty();
         assertThat(port.results).doesNotContainKey(other);
 

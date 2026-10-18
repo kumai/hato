@@ -56,10 +56,13 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// Operation tokens belong to the shell, which alone owns and completes futures.
 final class SessionCore {
 
+    /// DISCONNECTING follows an accepted disconnect(), both while its attempt still waits for
+    /// CONNACK and while the established connection writes DISCONNECT.
     enum State {
         DISCONNECTED,
         CONNECTING,
         CONNECTED,
+        DISCONNECTING,
         RECONNECT_WAIT,
         CLOSED
     }
@@ -225,9 +228,7 @@ final class SessionCore {
 
     private final boolean credentialsRequired;
 
-    private final ReconnectBackoff backoff;
-
-    private final boolean initialRetry;
+    private final ConnectionRequest request;
 
     // Broker registrations can survive even when their last local operation was unconfirmed.
     private boolean sessionPresent;
@@ -236,20 +237,13 @@ final class SessionCore {
 
     private long generation;
 
-    private long attemptNumber;
-
-    private boolean connectionRequested;
-
-    private boolean requestEstablished;
-
-    private final List<Long> connectionOperations = new ArrayList<>();
-
-    private final List<Long> disconnectOperations = new ArrayList<>();
-
+    // Present once a successful CONNACK has established the current connection.
     private @Nullable ConnAck currentAck;
 
     private long stableDeadline;
 
+    // The attempt waiting for its CONNACK, and null once a CONNACK establishes its connection
+    // or the attempt ends.
     private @Nullable ConnectionAttempt connecting;
 
     // The connecting attempt's credentials. Every connection of the attempt sends the same
@@ -257,8 +251,6 @@ final class SessionCore {
     private boolean credentialsReady;
 
     private @Nullable MqttCredentials attemptCredentials;
-
-    private long disconnectOperation;
 
     private long nextTicket;
 
@@ -401,12 +393,29 @@ final class SessionCore {
         this.cleanStart = cleanStart;
         this.will = will;
         this.credentialsRequired = credentialsRequired;
-        this.backoff = backoff;
-        this.initialRetry = initialRetry;
+        request = new ConnectionRequest(backoff, initialRetry);
     }
 
     State state() {
         return state;
+    }
+
+    /// Whether an attempt waits for its CONNACK, possibly with a requested disconnect pending.
+    private boolean attempting() {
+        return connecting != null;
+    }
+
+    /// Whether a successful CONNACK established the current connection, which may be
+    /// disconnecting.
+    private boolean established() {
+        return currentAck != null;
+    }
+
+    /// Whether the current generation has an attempt or connection that input can still reach.
+    private boolean connectionActive() {
+        return state == State.CONNECTING
+                || state == State.CONNECTED
+                || state == State.DISCONNECTING;
     }
 
     long sessionNumber() {
@@ -414,7 +423,7 @@ final class SessionCore {
     }
 
     void connect(ConnectionAttempt attempt, long now) {
-        if (state == State.CLOSED || disconnectOperation != 0) {
+        if (state == State.CLOSED || state == State.DISCONNECTING) {
             if (attempt.operation != 0) {
                 port.complete(
                         attempt.operation,
@@ -433,24 +442,23 @@ final class SessionCore {
             return;
         }
         if (attempt.operation != 0) {
-            connectionOperations.add(attempt.operation);
+            request.awaitConnection(attempt.operation);
         }
         if (state == State.CONNECTING) {
             return;
         }
         if (state == State.RECONNECT_WAIT) {
             port.cancel(Timer.RECONNECT);
-        } else {
-            requestEstablished = false;
         }
-        requestConnection(true);
+        request.raise();
+        port.connectionRequested(true);
         startAttempt(attempt, now);
     }
 
     private void startAttempt(ConnectionAttempt attempt, long now) {
         state = State.CONNECTING;
         generation++;
-        attemptNumber++;
+        long number = request.nextAttempt();
         connecting = attempt;
         credentialsReady = !credentialsRequired;
         attemptCredentials = null;
@@ -458,7 +466,7 @@ final class SessionCore {
         connectionDeadline = now + timeout.toNanos();
         transportConnected = false;
         connectSent = false;
-        port.beginAttempt(generation, connecting, attemptNumber);
+        port.beginAttempt(generation, attempt, number);
         port.schedule(generation, Timer.CONNECT, timeout);
         if (credentialsReady) {
             port.openTransport(generation, timeout);
@@ -467,13 +475,8 @@ final class SessionCore {
         }
     }
 
-    private void requestConnection(boolean requested) {
-        connectionRequested = requested;
-        port.connectionRequested(requested);
-    }
-
     void opened(long connection) {
-        if (connection == generation && state == State.CONNECTING) {
+        if (connection == generation && attempting()) {
             transportConnected = true;
             sendConnect();
         }
@@ -485,7 +488,7 @@ final class SessionCore {
             @Nullable Throwable failure,
             long now
     ) {
-        if (connecting != attempt || state != State.CONNECTING || credentialsReady) {
+        if (connecting != attempt || credentialsReady) {
             return;
         }
         if (failure != null) {
@@ -523,14 +526,14 @@ final class SessionCore {
     }
 
     void received(long connection, Packet packet, long now, int bytes) {
-        if (connection != generation || state != State.CONNECTING && state != State.CONNECTED) {
+        if (connection != generation || !connectionActive()) {
             return;
         }
         if (sessionRefusal != null) {
             // This broker session has no local counterpart; only its DISCONNECT may progress.
             return;
         }
-        if (state == State.CONNECTING) {
+        if (attempting()) {
             if (!credentialsReady) {
                 failed(connection, protocolError("Received packet before credentials were ready"));
             } else if (!(packet instanceof Packet.ConnAck ack)) {
@@ -560,10 +563,12 @@ final class SessionCore {
                     reconcileReceptions(port.receiveState(), false);
                     deferred.addAll(session.inflight.values());
                 }
-                state = State.CONNECTED;
+                if (state == State.CONNECTING) {
+                    state = State.CONNECTED;
+                }
                 var result = ConnAck.of(ack.sessionPresent());
                 currentAck = result;
-                requestEstablished = true;
+                request.establish();
                 port.admit(generation);
                 // Reconcile before announcing, so connect() and onConnected already find continued
                 // subscriptions established on this connection.
@@ -587,14 +592,14 @@ final class SessionCore {
                 port.cancel(Timer.CONNECT);
                 connecting = null;
                 attemptCredentials = null;
-                if (disconnectOperation != 0) {
+                if (state == State.DISCONNECTING) {
                     beginDisconnect();
                 } else {
                     completeConnections(result, null);
                     if (!keepAlive.isZero()) {
                         scheduleKeepAlive(now);
                     }
-                    if (backoff.enabled()) {
+                    if (request.reconnects()) {
                         stableDeadline = now + STABLE_CONNECTION.toNanos();
                         port.schedule(generation, Timer.STABLE, STABLE_CONNECTION);
                     }
@@ -608,7 +613,7 @@ final class SessionCore {
             release(ack.packetId());
         } else if (packet instanceof Packet.PubComp ack) {
             completed(ack.packetId());
-        } else if (disconnectOperation != 0) {
+        } else if (state == State.DISCONNECTING) {
             // Other input already in flight cannot change a local shutdown's write/close sequence.
             return;
         } else if (packet instanceof Packet.PingResp) {
@@ -639,11 +644,11 @@ final class SessionCore {
     }
 
     void sent(long connection, long ticket, long writtenAt, long now) {
-        if (connection != generation || state != State.CONNECTING && state != State.CONNECTED) {
+        if (connection != generation || !connectionActive()) {
             return;
         }
         lastSent = writtenAt;
-        if (state == State.CONNECTED && disconnectOperation == 0) {
+        if (state == State.CONNECTED) {
             responses.written(ticket, writtenAt, now).ifPresent(delay -> {
                 port.schedule(generation, Timer.RESPONSE, delay);
             });
@@ -660,9 +665,7 @@ final class SessionCore {
                 end(sessionRefusal, EndReason.DISCONNECT_WRITTEN);
                 return;
             }
-            List<Long> operations = List.copyOf(disconnectOperations);
-            disconnectOperations.clear();
-            disconnectOperation = 0;
+            List<Long> operations = request.takeDisconnections();
             end(null, EndReason.DISCONNECT_WRITTEN);
             for (long operation : operations) {
                 port.complete(operation, null, null);
@@ -673,7 +676,7 @@ final class SessionCore {
     /// Write completion retires PUBACK/PUBCOMP, while PUBREC retains the id for PUBREL.
     /// The immutable acknowledgement kind keeps an old PUBREC write from retiring a later stage.
     void written(long connection, long ticket) {
-        if (connection == generation && state == State.CONNECTED) {
+        if (connection == generation && established()) {
             acknowledgements.written(ticket).ifPresent(acknowledgement -> {
                 ReceiveTable.Entry entry = acknowledgement.entry();
                 if (acknowledgement.kind() == Kind.PUBREC) {
@@ -821,7 +824,7 @@ final class SessionCore {
                 registered.orElseThrow()
         );
         subscriptions.put(operation, local);
-        if (state == State.CONNECTED && disconnectOperation == 0) {
+        if (state == State.CONNECTED) {
             deferred.addLast(local);
             drainDeferred();
         }
@@ -839,7 +842,7 @@ final class SessionCore {
         }
         local.removal = new UnsubscribeOperation(operation, local);
         deferred.remove(local);
-        if (state != State.CONNECTED || disconnectOperation != 0) {
+        if (state != State.CONNECTED) {
             if (cleanStart) {
                 removeSubscription(local, null);
                 finishRemoval(local);
@@ -887,7 +890,7 @@ final class SessionCore {
 
     private void drainClosures() {
         // DISCONNECT stays last, even when a PUBACK arrives while it is pending.
-        if (state != State.CONNECTED || disconnectOperation != 0) {
+        if (state != State.CONNECTED) {
             return;
         }
         // A removal waits only for its own SUBACK, so the drain passes over those still awaiting
@@ -909,7 +912,7 @@ final class SessionCore {
 
     /// Registrations use no application operation slots and resume when capacity returns.
     private void drainDeferred() {
-        if (state != State.CONNECTED || disconnectOperation != 0) {
+        if (state != State.CONNECTED) {
             return;
         }
         // Replay the single session order before fresh PUBREC responses. A duplicate PUBREC
@@ -1024,7 +1027,7 @@ final class SessionCore {
     private boolean ready(long operation) {
         if (state == State.CLOSED) {
             port.complete(operation, null, new IllegalStateException("Client is closed"));
-        } else if (state != State.CONNECTED || disconnectOperation != 0) {
+        } else if (state != State.CONNECTED) {
             port.complete(operation, null, new MqttNotConnectedException());
         } else {
             return true;
@@ -1126,7 +1129,7 @@ final class SessionCore {
         }
         // DISCONNECT remains last. A persistent session still records the new stage so the
         // next connection continues with PUBREL, even though this one cannot send it.
-        if (disconnectOperation != 0) {
+        if (state == State.DISCONNECTING) {
             return;
         }
         releases.add(packetId);
@@ -1161,7 +1164,7 @@ final class SessionCore {
     private void stageMismatch(String message) {
         // A pending DISCONNECT keeps its write and close sequence. The entry keeps its stage,
         // and the connection end fails its future.
-        if (disconnectOperation == 0) {
+        if (state != State.DISCONNECTING) {
             failed(generation, protocolError(message));
         }
     }
@@ -1424,7 +1427,9 @@ final class SessionCore {
 
     /// QoS 0 deliveries and receptions whose PUBACK or PUBCOMP was written have no table entry.
     void deliveryFailed(DeliveryToken token, Throwable cause) {
-        if (token.session() == sessionNumber && (connectionRequested || disconnectOperation != 0)) {
+        // A stop also reaches a pending disconnect, whose request is already withdrawn.
+        boolean admitted = request.requested() || state == State.DISCONNECTING;
+        if (token.session() == sessionNumber && admitted) {
             end(cause, EndReason.HANDLER_FAILURE);
         }
     }
@@ -1439,7 +1444,7 @@ final class SessionCore {
     }
 
     void sendCapacityAvailable(long connection) {
-        if (connection != generation || state != State.CONNECTED || disconnectOperation != 0) {
+        if (connection != generation || state != State.CONNECTED) {
             return;
         }
         if (releasesFirst) {
@@ -1485,7 +1490,7 @@ final class SessionCore {
 
     void timer(long connection, Timer timer, long now) {
         if (timer == Timer.RECONNECT) {
-            if (connection == 0 && state == State.RECONNECT_WAIT && connectionRequested) {
+            if (connection == 0 && state == State.RECONNECT_WAIT && request.requested()) {
                 startAttempt(new ConnectionAttempt(0, null), now);
             }
             return;
@@ -1495,7 +1500,7 @@ final class SessionCore {
         }
         switch (timer) {
             case CONNECT -> {
-                if (state == State.CONNECTING) {
+                if (attempting()) {
                     String phase = !credentialsReady
                             ? "Credentials"
                             : transportConnected ? "CONNACK" : "Transport connection";
@@ -1503,7 +1508,7 @@ final class SessionCore {
                 }
             }
             case KEEP_ALIVE -> {
-                if (state == State.CONNECTED && disconnectOperation == 0) {
+                if (state == State.CONNECTED) {
                     long remaining = keepAlive.toNanos() - (now - lastSent);
                     if (awaitingPing) {
                         port.schedule(generation, Timer.KEEP_ALIVE, keepAlive);
@@ -1526,22 +1531,22 @@ final class SessionCore {
                 }
             }
             case DISCONNECT -> {
-                if (disconnectOperation != 0 || sessionRefusal != null) {
+                if (state == State.DISCONNECTING || sessionRefusal != null) {
                     failed(connection, new TimeoutException("DISCONNECT write deadline expired"));
                 }
             }
             case STABLE -> {
-                if (state == State.CONNECTED && disconnectOperation == 0) {
+                if (state == State.CONNECTED) {
                     long remaining = stableDeadline - now;
                     if (remaining > 0) {
                         port.schedule(generation, Timer.STABLE, Duration.ofNanos(remaining));
                     } else {
-                        backoff.reset();
+                        request.stable();
                     }
                 }
             }
             case RESPONSE -> {
-                if (state == State.CONNECTED && disconnectOperation == 0) {
+                if (state == State.CONNECTED) {
                     responses.expired(now).ifPresent(delay -> {
                         if (delay.isZero()) {
                             failed(connection, new TimeoutException(
@@ -1571,7 +1576,7 @@ final class SessionCore {
         } else {
             // Withdrawal prevents retry immediately; stop admission stays open until the
             // outstanding attempt or graceful disconnect has ended.
-            connectionRequested = false;
+            request.withdraw();
             if (state == State.DISCONNECTED || state == State.RECONNECT_WAIT) {
                 port.connectionRequested(false);
                 if (state == State.RECONNECT_WAIT) {
@@ -1585,13 +1590,14 @@ final class SessionCore {
                 port.complete(operation, null, null);
                 return;
             }
-            disconnectOperations.add(operation);
-            if (disconnectOperation != 0) {
+            request.awaitDisconnection(operation);
+            if (state == State.DISCONNECTING) {
                 return;
             }
-            disconnectOperation = operation;
+            boolean connected = state == State.CONNECTED;
+            state = State.DISCONNECTING;
             port.disconnecting();
-            if (state == State.CONNECTED) {
+            if (connected) {
                 beginDisconnect();
             }
         }
@@ -1622,7 +1628,7 @@ final class SessionCore {
     }
 
     void failed(long connection, Throwable cause) {
-        if (connection == generation && (state == State.CONNECTING || state == State.CONNECTED)) {
+        if (connection == generation && connectionActive()) {
             end(cause, EndReason.CONNECTION_FAILURE);
         }
     }
@@ -1645,11 +1651,12 @@ final class SessionCore {
         // Decide before replacing the cause with a session refusal below.
         boolean shutdownRequested = switch (reason) {
             case DISCONNECT_WRITTEN -> true;
-            case CLIENT_CLOSE -> cause == null || disconnectOperation != 0;
-            case CONNECTION_FAILURE, HANDLER_FAILURE, SCHEDULER_FAILURE -> disconnectOperation != 0;
+            case CLIENT_CLOSE -> cause == null || state == State.DISCONNECTING;
+            case CONNECTION_FAILURE, HANDLER_FAILURE, SCHEDULER_FAILURE ->
+                    state == State.DISCONNECTING;
         };
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
-        boolean established = state == State.CONNECTED;
+        boolean established = established();
         if (cause instanceof PacketDecodeException failure) {
             // Both listener notifications and pending operations expose the same public cause.
             cause = new MqttProtocolException(
@@ -1681,10 +1688,10 @@ final class SessionCore {
             EndReason reason,
             boolean shutdownRequested
     ) {
-        boolean established = state == State.CONNECTED;
+        boolean established = established();
         boolean waiting = state == State.RECONNECT_WAIT;
         boolean notifyEnd = switch (state) {
-            case CONNECTING, CONNECTED -> true;
+            case CONNECTING, CONNECTED, DISCONNECTING -> true;
             case RECONNECT_WAIT -> reason == EndReason.HANDLER_FAILURE
                     || reason == EndReason.SCHEDULER_FAILURE;
             case DISCONNECTED, CLOSED -> false;
@@ -1697,7 +1704,7 @@ final class SessionCore {
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
         Duration delay = null;
         if (retry) {
-            delay = backoff.next();
+            delay = request.nextDelay();
             try {
                 // Reserve before announcing the end, so the reported delay is a scheduled attempt.
                 port.schedule(0, Timer.RECONNECT, delay);
@@ -1713,7 +1720,8 @@ final class SessionCore {
             state = State.RECONNECT_WAIT;
         } else {
             state = permanent ? State.CLOSED : State.DISCONNECTED;
-            requestConnection(false);
+            request.withdraw();
+            port.connectionRequested(false);
         }
         awaitingPing = false;
         pingTicket = 0;
@@ -1724,7 +1732,7 @@ final class SessionCore {
         if (notifyEnd) {
             if (waiting) {
                 // The stopped wait reports and consumes the reserved next attempt number.
-                attemptNumber++;
+                request.nextAttempt();
             }
             // Retire queued recipients before removing subscriptions, without acknowledging
             // work that never reached the application. Persistent handed work keeps its state.
@@ -1734,7 +1742,7 @@ final class SessionCore {
                     Disconnection.of(cause, shutdownRequested),
                     !permanent && !cleanStart,
                     reason == EndReason.HANDLER_FAILURE,
-                    attemptNumber,
+                    request.attempt(),
                     delay
             );
             reconcileReceptions(handedReadiness, true);
@@ -1758,29 +1766,7 @@ final class SessionCore {
         if (sessionRefusal != null) {
             return false;
         }
-        if (!connectionRequested || !backoff.enabled()) {
-            return false;
-        }
-        // Before the request's first successful connection, retry requires explicit opt-in.
-        if (!requestEstablished && !initialRetry) {
-            return false;
-        }
-        return reconnectable(cause);
-    }
-
-    static boolean reconnectable(@Nullable Throwable cause) {
-        if (cause == null) {
-            return false;
-        }
-        if (cause instanceof MqttConnectException failure) {
-            return failure.reasonCode()
-                    .map(reason ->
-                            (reason != ReasonCode.UNSUPPORTED_PROTOCOL_VERSION)
-                                    && (reason != ReasonCode.CLIENT_IDENTIFIER_NOT_VALID)
-                    )
-                    .orElse(true);
-        }
-        return true;
+        return request.retries(cause);
     }
 
     /// `handedReadiness` follows [Port#receiveState()]: receptions it omits reached no recipient.
@@ -1868,20 +1854,17 @@ final class SessionCore {
             };
             completeConnections(null, failure);
         }
-        disconnectOperation = 0;
         // A disconnect requested during an attempt that established no connection is satisfied.
         @Nullable Throwable disconnectFailure = established || permanent ? pendingFailure : null;
-        for (long operation : disconnectOperations) {
+        for (long operation : request.takeDisconnections()) {
             port.complete(operation, null, disconnectFailure);
         }
-        disconnectOperations.clear();
     }
 
     private void completeConnections(@Nullable ConnAck ack, @Nullable Throwable failure) {
-        for (long operation : connectionOperations) {
+        for (long operation : request.takeConnections()) {
             port.complete(operation, ack, failure);
         }
-        connectionOperations.clear();
     }
 
     private void discardSession() {

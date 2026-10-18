@@ -27,6 +27,7 @@ import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.CONNECTED;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.DISCONNECTED;
+import static org.mqtt4j.hato.client.internal.SessionCore.State.DISCONNECTING;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.RECONNECT_WAIT;
 import static org.mqtt4j.hato.client.internal.SessionCore.Timer.RECONNECT;
 import static org.mqtt4j.hato.client.internal.SessionCore.Timer.RESPONSE;
@@ -248,7 +249,7 @@ class CoreResponseDeadlineTest {
         sut.timer(1, RESPONSE, 110);
 
         // Assert
-        assertThat(sut.state()).isEqualTo(CONNECTED);
+        assertThat(sut.state()).isEqualTo(DISCONNECTING);
         assertThat(port.timers).doesNotContainKey(RESPONSE);
         sut.sent(1, disconnectTicket, 120);
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
