@@ -4,7 +4,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
 import java.security.GeneralSecurityException;
+import java.security.Key;
 import java.security.KeyStore;
+import java.security.cert.Certificate;
+import java.util.Base64;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -66,6 +69,24 @@ public final class Tls {
         SSLContext context = SSLContext.getInstance("TLS");
         context.init(keyManagers, trust.getTrustManagers(), null);
         return context;
+    }
+
+    /// The PEM form of an identity's certificate, for a broker that cannot read PKCS12.
+    static String certificatePem(String identity) throws IOException, GeneralSecurityException {
+        Certificate certificate = requireNonNull(keyStore(identity).getCertificate(identity));
+        return pem("CERTIFICATE", certificate.getEncoded());
+    }
+
+    /// The unencrypted PKCS #8 PEM form of an identity's private key. It is exported only at run
+    /// time, so the repository keeps no PEM keys.
+    static String privateKeyPem(String identity) throws IOException, GeneralSecurityException {
+        Key key = requireNonNull(keyStore(identity).getKey(identity, PASSWORD.toCharArray()));
+        return pem("PRIVATE KEY", key.getEncoded());
+    }
+
+    private static String pem(String label, byte[] encoded) {
+        String body = Base64.getMimeEncoder(64, new byte[] {'\n'}).encodeToString(encoded);
+        return "-----BEGIN " + label + "-----\n" + body + "\n-----END " + label + "-----\n";
     }
 
     private static KeyStore keyStore(String identity) throws IOException, GeneralSecurityException {
