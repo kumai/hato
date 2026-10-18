@@ -141,7 +141,9 @@ public final class MqttClientBuilder {
     /// letters/digits. Give each running client its own identifier: a broker closes the older
     /// connection of two that share one, so two clients that reconnect automatically keep
     /// taking over each other's connection. Reconnection delays slow this down but do not
-    /// stop it.
+    /// stop it. With a persistent session, a client that connects while another one runs with
+    /// the same identifier also discards that client's session and the messages stored for it;
+    /// see [MqttClient#connect()].
     public MqttClientBuilder clientId(String value) {
         requireNonNull(value, "clientId");
         MqttString.write(new ByteArrayOutputStream(), value);
@@ -161,14 +163,17 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Selects whether a connection without local session state starts a new session; default
-    /// true. With false, even the first connection asks the broker to resume an existing session,
-    /// and [MqttClient#connect()] fails when the client has no state for it. A client gains local
-    /// state when one of its persistent connections succeeds, and its later connections request
-    /// resumption of that state.
+    /// Selects whether each connection starts a new session; default true. With false, the
+    /// session persists across this client's connections: the client gains local state when a
+    /// connection starts a session, and its later connections ask the broker to resume it. A
+    /// session that the broker kept for the identifier without local state in this client
+    /// object, for example from before the application restarted, is not resumed: the attempt
+    /// that finds it discards it and starts a new session, so messages that the broker stored
+    /// for it are not received; see [MqttClient#connect()].
     /// MQTT 3.1.1 supports only true with zero [#sessionExpiry(Duration)], or false with a
     /// positive expiry. [#build()] rejects other combinations. These map to Clean Session 1
-    /// and Clean Session 0, respectively. The broker determines the persistent session's lifetime.
+    /// and Clean Session 0, respectively, apart from the connection that discards a broker
+    /// session. The broker determines the persistent session's lifetime.
     public MqttClientBuilder cleanStart(boolean value) {
         cleanStart = value;
         return this;
@@ -187,8 +192,11 @@ public final class MqttClientBuilder {
     }
 
     /// Supplies credentials once per connection attempt, on a dedicated virtual thread before
-    /// opening the transport. Evaluation consumes the same [#connectionTimeout(Duration)]
-    /// deadline as transport establishment and the broker's CONNACK response.
+    /// opening the attempt's first transport. Evaluation consumes the same
+    /// [#connectionTimeout(Duration)] deadline as that transport's establishment and the
+    /// broker's CONNACK response. Every connection of the attempt, including those with which
+    /// it replaces a broker session (see [MqttClient#connect()]), sends the same credentials,
+    /// so the value must stay valid for several connections.
     /// The default is no credentials. At most one invocation runs at a time for this client;
     /// the supplier should respond to interruption when an attempt ends or the client closes.
     /// An invocation that ignores interruption delays evaluation for a later attempt until it
@@ -228,8 +236,11 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Total deadline for credentials, transport establishment (including any TLS handshake),
-    /// and CONNACK; also bounds the DISCONNECT write.
+    /// Deadline for establishing each connection: credentials, which an attempt evaluates before
+    /// its first connection, transport establishment (including any TLS handshake), and
+    /// CONNACK. Also bounds each DISCONNECT write. An attempt that replaces a broker session,
+    /// as [MqttClient#connect()] describes, applies it to each of its connections and
+    /// DISCONNECT writes, so it can take several times this duration.
     /// Defaults to 30 seconds. Must be positive and no greater than 2147483647 milliseconds.
     public MqttClientBuilder connectionTimeout(Duration value) {
         requireNonNull(value, "connectionTimeout");
@@ -306,7 +317,7 @@ public final class MqttClientBuilder {
     /// defaults and endpoint identification set to `"HTTPS"` for hostname verification.
     /// Setting the endpoint identification algorithm to `null` explicitly disables verification.
     /// The parameters are validated during [#build()], and a detached snapshot is used
-    /// for every connection attempt. Custom algorithm constraints and SNI matchers remain shared;
+    /// for every connection. Custom algorithm constraints and SNI matchers remain shared;
     /// do not mutate those objects while the client is in use.
     /// A later call replaces the customizer.
     /// Explicit TLS settings require `mqtts` and cannot be combined with
@@ -323,7 +334,8 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Supplies a fresh transport for each connection attempt. Defaults to TCP for `mqtt`
+    /// Supplies a fresh transport for each connection; an attempt that replaces a broker
+    /// session, as [MqttClient#connect()] describes, opens several. Defaults to TCP for `mqtt`
     /// and TLS over TCP for `mqtts`. The client owns and closes the returned transports.
     /// An explicit factory cannot be combined with [#sslContext(SSLContext)] or
     /// [#sslParameters(Consumer)]. The factory's transports must reject unsupported URI schemes.

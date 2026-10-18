@@ -12,7 +12,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.SplittableRandom;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeoutException;
 import java.util.stream.IntStream;
 
 import org.jspecify.annotations.Nullable;
@@ -21,7 +20,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.ConnAck;
@@ -48,7 +46,6 @@ import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.CLOSED;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.CONNECTED;
-import static org.mqtt4j.hato.client.internal.SessionCore.State.CONNECTING;
 import static org.mqtt4j.hato.client.internal.SessionCore.State.DISCONNECTED;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
@@ -389,140 +386,6 @@ class SessionPersistenceTest {
 
         assertThat(sut.state()).isEqualTo(CONNECTED);
         assertThat(port.accepted).isEmpty();
-    }
-
-    @Test
-    void first_session_present_is_disconnected_without_delivering_or_acknowledging() {
-        long operation = beginConnect();
-        receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
-        Packet packet = port.sent.getLast();
-        assertThat(packet).isInstanceOf(Packet.Disconnect.class);
-        long disconnectTicket = port.ticket;
-        int sent = port.sent.size();
-        assertThat(sut.state()).isEqualTo(CONNECTING);
-        assertThat(port.results).doesNotContainKey(operation);
-        assertThat(port.timers).containsOnlyKeys(SessionCore.Timer.DISCONNECT);
-
-        receive(
-                new Packet.Publish(
-                        new Topic("unowned"),
-                        new byte[] {1},
-                        Qos.AT_LEAST_ONCE,
-                        false,
-                        true,
-                        7,
-                        EMPTY
-                )
-        );
-        sut.sent(generation, disconnectTicket, 0);
-
-        assertThat(port.sent).hasSize(sent);
-        assertThat(port.deliveries).isEmpty();
-        Throwable failure = assertSessionRefusal(operation, DISCONNECTED);
-        assertThat(failure.getSuppressed()).isEmpty();
-        // The refusing DISCONNECT is the client's own; the application requested none.
-        assertThat(port.ends.getLast().userRequested()).isFalse();
-    }
-
-    @Test
-    void a_disconnect_deadline_preserves_the_session_refusal() {
-        // Arrange
-        long operation = beginConnect();
-        receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
-
-        // Act
-        sut.timer(generation, SessionCore.Timer.DISCONNECT, Duration.ofSeconds(30).toNanos());
-
-        // Assert
-        Throwable failure = assertSessionRefusal(operation, DISCONNECTED);
-        assertThat(failure.getSuppressed()).singleElement()
-                .satisfies(cause -> assertThat(cause).isInstanceOf(TimeoutException.class)
-                        .hasMessage("DISCONNECT write deadline expired"));
-    }
-
-    @Test
-    void a_full_disconnect_queue_preserves_the_session_refusal() {
-        // Arrange
-        long operation = beginConnect();
-        port.disconnectResult = SendQueue.OfferResult.FULL;
-
-        // Act
-        receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
-
-        // Assert
-        Throwable failure = assertSessionRefusal(operation, DISCONNECTED);
-        assertThat(failure.getSuppressed()).singleElement()
-                .satisfies(cause -> assertThat(cause).isInstanceOf(MqttCapacityException.class)
-                        .hasMessage("Reserved send queue capacity"));
-    }
-
-    @Test
-    void a_transport_failure_preserves_the_session_refusal_and_ignores_late_events() {
-        // Arrange
-        long operation = beginConnect();
-        receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
-        long disconnectTicket = port.ticket;
-        var transportFailure = new IOException("closed before DISCONNECT completed");
-
-        // Act
-        sut.failed(generation, transportFailure);
-
-        // Assert
-        Throwable failure = assertSessionRefusal(operation, DISCONNECTED);
-        assertThat(failure.getSuppressed()).containsExactly(transportFailure);
-
-        // Late transport events cannot complete the attempt again or alter its diagnosis.
-        sut.sent(generation, disconnectTicket, 0);
-        sut.failed(generation, new IOException("late termination"));
-        assertThat(result(operation).failure()).isSameAs(failure);
-        assertThat(failure.getSuppressed()).containsExactly(transportFailure);
-        assertThat(port.ends).hasSize(1);
-    }
-
-    @ParameterizedTest
-    @NullSource
-    @MethodSource("closeFailures")
-    void explicit_close_preserves_the_session_refusal(@Nullable Throwable cause) {
-        // Arrange
-        long operation = beginConnect();
-        receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
-
-        // Act
-        sut.close(cause);
-        sut.close(null);
-
-        // Assert
-        Throwable failure = assertSessionRefusal(operation, CLOSED);
-        assertThat(failure.getSuppressed())
-                .containsExactlyElementsOf(Optional.ofNullable(cause).stream().toList());
-        assertThat(port.ends).hasSize(1);
-    }
-
-    @Test
-    void a_session_refusal_does_not_replace_a_later_connection_attempts_failure() {
-        // Arrange
-        long refusedOperation = beginConnect();
-        receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
-        var cleanupFailure = new IOException("refused connection closed");
-        sut.failed(generation, cleanupFailure);
-        Throwable refusal = requireNonNull(result(refusedOperation).failure());
-        long nextAttempt = beginConnect();
-        var connectionFailure = new IOException("next connection failed");
-
-        // Act: the new attempt fails before receiving any CONNACK.
-        sut.failed(generation, connectionFailure);
-
-        // Assert
-        Throwable failure = requireNonNull(result(nextAttempt).failure());
-        assertThat(failure).isInstanceOf(MqttConnectException.class)
-                .hasMessage("Connection failed").hasCause(connectionFailure).isNotSameAs(refusal);
-        assertThat(failure.getSuppressed()).isEmpty();
-        assertThat(refusal).hasMessage("Broker session has no local state");
-        assertThat(refusal.getSuppressed()).containsExactly(cleanupFailure);
-        // The failed attempt reports the same failure as its connect().
-        assertThat(port.ends.getLast().cause()).containsSame(failure);
-        assertThat(sut.state()).isEqualTo(DISCONNECTED);
-        assertThat(port.timers).isEmpty();
     }
 
     @Test
@@ -1057,17 +920,6 @@ class SessionPersistenceTest {
         assertThat(result(operation).failure()).isInstanceOf(type);
     }
 
-    private Throwable assertSessionRefusal(long operation, SessionCore.State state) {
-        Throwable failure = requireNonNull(result(operation).failure());
-        assertThat(failure).isInstanceOf(MqttConnectException.class)
-                .hasMessage("Broker session has no local state").hasNoCause();
-        assertThat(port.ends.getLast().cause()).containsSame(failure);
-        assertThat(port.established).containsExactly(false);
-        assertThat(sut.state()).isEqualTo(state);
-        assertThat(port.timers).isEmpty();
-        return failure;
-    }
-
     private static MqttMessage message(String topic) {
         return MqttMessage.of(new Topic(topic), new byte[] {1}, Qos.AT_LEAST_ONCE, false);
     }
@@ -1109,10 +961,6 @@ class SessionPersistenceTest {
 
     private static IntStream seeds() {
         return IntStream.range(0, 100);
-    }
-
-    private static List<Throwable> closeFailures() {
-        return List.of(new IOException("client shutdown failed"));
     }
 
     record Publication(
@@ -1181,8 +1029,15 @@ class SessionPersistenceTest {
         final List<List<Long>> deliveries = new ArrayList<>();
         final List<Disconnection> ends = new ArrayList<>();
         final List<Boolean> established = new ArrayList<>();
+        final List<ConnAck> announcements = new ArrayList<>();
         final Map<SessionCore.Timer, Duration> timers = new EnumMap<>(SessionCore.Timer.class);
+        // The connection each scheduled timer belongs to.
+        final Map<SessionCore.Timer, Long> timerGenerations =
+                new EnumMap<>(SessionCore.Timer.class);
         final List<Long> attempts = new ArrayList<>();
+        // The generation of each connection that continued an attempt.
+        final List<Long> continuations = new ArrayList<>();
+        final List<Duration> transportTimeouts = new ArrayList<>();
         final List<Duration> reconnectDelays = new ArrayList<>();
         final List<Boolean> requests = new ArrayList<>();
         final List<ConnectionAttempt> cancellations = new ArrayList<>();
@@ -1218,6 +1073,12 @@ class SessionPersistenceTest {
         }
 
         @Override
+        public void continueAttempt(long connection) {
+            generation = connection;
+            continuations.add(connection);
+        }
+
+        @Override
         public void connectionRequested(boolean requested) {
             requests.add(requested);
             events.add("request " + requested);
@@ -1235,6 +1096,7 @@ class SessionPersistenceTest {
 
         @Override
         public void openTransport(long generation, Duration timeout) {
+            transportTimeouts.add(timeout);
         }
 
         @Override
@@ -1243,6 +1105,7 @@ class SessionPersistenceTest {
 
         @Override
         public void connected(long connection, ConnAck ack) {
+            announcements.add(ack);
         }
 
         @Override
@@ -1338,12 +1201,14 @@ class SessionPersistenceTest {
                 throw SpiException.scheduler(connection, timerFailure);
             }
             timers.put(timer, delay);
+            timerGenerations.put(timer, connection);
             events.add("schedule " + timer);
         }
 
         @Override
         public void cancel(SessionCore.Timer timer) {
             timers.remove(timer);
+            timerGenerations.remove(timer);
             events.add("cancel " + timer);
         }
 

@@ -10,8 +10,12 @@ import static java.util.Objects.requireNonNull;
 /// A connection attempt failed. A broker refusal carries its reason code; transport failures
 /// and deadline expiry carry a cause instead. Locally detected packet failures carry
 /// [MqttProtocolException] as their cause, leaving [#reasonCode] empty.
-/// When a broker session has no matching local state, the message describes that refusal.
-/// A failure while closing the refused connection is attached as a suppressed exception.
+/// An attempt that discarded a broker session without local state and then finds a session
+/// again, as [MqttClient#connect()] describes, fails with neither a reason code nor a cause;
+/// its message tells this case apart. A failure while closing the connection that found the
+/// session is attached as a suppressed exception. If the client's
+/// [org.mqtt4j.hato.spi.TimerScheduler] fails meanwhile, that failure is the cause instead,
+/// and the refusal is attached as a suppressed exception.
 public final class MqttConnectException extends MqttException {
 
     @Serial

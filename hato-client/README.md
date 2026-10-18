@@ -30,7 +30,8 @@ For username/password authentication, add
 `credentials(() -> MqttCredentials.of(username, passwordBytes))`. The password is
 binary and is copied when the credentials are created. For a username without a
 password, use `MqttCredentials.of(username)`. The supplier runs once per connection
-attempt on a virtual thread before opening the transport, so it can fetch a fresh token.
+attempt on a virtual thread before opening the transport, so it can fetch a fresh token;
+all connections of one attempt use the same token.
 Evaluation, transport establishment, and CONNACK share one connection timeout.
 Its exception, a null result, or exceeding the connection timeout fails that attempt with
 `MqttConnectException`. Only one supplier invocation runs at a time per client;
@@ -45,7 +46,10 @@ as shown below. Any QoS and retention flag are supported. A Will payload must fi
 To retain a session between connections, use an explicit `clientId` and set
 `cleanStart(false).sessionExpiry(Duration.ofDays(1))`. For MQTT 3.1.1, a positive
 expiry selects a persistent session; the broker determines how long it retains
-the session. The client keeps its own session state in memory.
+the session. The client keeps its own session state in memory. When a new client object
+connects, for example after your application restarts, it therefore replaces the session that
+the broker kept with a new one: messages that the broker stored for the old session, including
+those published while your application was stopped, are not received.
 
 ## Staying connected
 
@@ -75,7 +79,8 @@ To check repeatedly, keep the returned future and call `whenConnected()` again o
 completes.
 
 Give every running client its own `clientId`: two clients with the same identifier keep
-taking over each other's connection.
+taking over each other's connection, and with a persistent session, one that connects later
+also discards the other's session.
 
 To shut down a connected client, wait for the asynchronous DISCONNECT write before closing:
 
@@ -178,7 +183,7 @@ and registration capacity fail `established()` and end only the returned handle.
 
 | Exception | Meaning |
 | --- | --- |
-| `MqttConnectException` | `connect()` gave up: the broker could not be reached, refused the connection, or did not answer in time, or `disconnect()`, `close()`, or a failing handler withdrew the request first. |
+| `MqttConnectException` | `connect()` gave up: the broker could not be reached, refused the connection, did not answer in time, or still reported a session after the client discarded it, or `disconnect()`, `close()`, or a failing handler withdrew the request first. |
 | `MqttNotConnectedException` | The client was not connected, for example while it was reconnecting. |
 | `MqttConnectionLostException` | The connection ended before the result was known. A publication may or may not have reached the broker. |
 | `MqttCapacityException` | The client reached an admission limit. The connection stays up; let outstanding work drain before retrying. |

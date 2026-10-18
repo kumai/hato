@@ -5,6 +5,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.AfterAll;
@@ -26,7 +27,6 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
-import static org.mqtt4j.hato.client.internal.SessionPersistenceIntegrationTest.failureOf;
 
 @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
 @SuppressWarnings("try") // Explicit close is the abnormal MQTT termination under test.
@@ -148,10 +148,13 @@ class MosquittoWillTest {
     }
 
     @Test
-    void refusing_an_unknown_broker_session_suppresses_the_will() throws Exception {
-        // Arrange: leave a broker session behind, then connect without its local state.
+    void replacing_an_unknown_broker_session_publishes_no_will() throws Exception {
+        // Arrange: leave a broker session with a subscription behind, then connect without its
+        // local state.
         String topic = uniqueTopic();
+        String storedTopic = uniqueTopic();
         String clientId = clientId();
+        var connections = new AtomicInteger();
         try (MqttClient previous = MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
@@ -161,6 +164,7 @@ class MosquittoWillTest {
                 .sessionExpiry(Duration.ofMinutes(1))
                 .build()) {
             previous.connect().get(5, SECONDS);
+            subscribe(previous, storedTopic);
             previous.disconnect().get(5, SECONDS);
         }
         try (MqttClient subscriber = client();
@@ -172,12 +176,26 @@ class MosquittoWillTest {
                         .cleanStart(false)
                         .sessionExpiry(Duration.ofMinutes(1))
                         .will(message(topic, (byte) 1))
+                        .transportFactory(id -> {
+                            connections.incrementAndGet();
+                            return Transport.tcp(id);
+                        })
                         .build()) {
             subscriber.connect().get(5, SECONDS);
             Subscription subscription = subscribe(subscriber, topic);
+            // The broker sends these right after the first CONNACK, more than its inflight
+            // window at once, so the client closes that connection with unread input.
+            for (int value = 0; value < 25; value++) {
+                subscriber.publish(message(storedTopic, (byte) value)).get(5, SECONDS);
+            }
 
-            // Act & Assert: refusing Session Present must still send DISCONNECT to the broker.
-            assertThat(failureOf(sut.connect())).isInstanceOf(MqttConnectException.class);
+            // Act
+            ConnAck connAck = sut.connect().get(5, SECONDS);
+            sut.disconnect().get(5, SECONDS);
+
+            // Assert: the connections before the new session ended with DISCONNECT.
+            assertThat(connAck).isEqualTo(ConnAck.of(false, 1));
+            assertThat(connections).hasValue(3);
             assertNoWillAfterReplacement(clientId, topic, subscription);
         }
     }

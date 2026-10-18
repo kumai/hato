@@ -661,6 +661,11 @@ class ReceivePersistenceTest {
         }
 
         @Override
+        public void continueAttempt(long generation) {
+            this.generation = generation;
+        }
+
+        @Override
         public void connectionRequested(boolean requested) {
         }
 

@@ -1750,6 +1750,111 @@ class ClientActorTest {
     }
 
     @Test
+    void replacing_a_broker_session_announces_one_connection_and_closes_the_replaced_ones()
+            throws Exception {
+        // Arrange
+        var notifications = new LinkedBlockingQueue<Object>();
+        try (MqttClient sut = client(
+                "actor-test",
+                recording(notifications),
+                16 * 1024 * 1024,
+                codec,
+                false
+        )) {
+            CompletableFuture<ConnAck> connection = sut.connect();
+            CompletableFuture<ConnAck> observed = sut.whenConnected();
+            var disconnect = new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY);
+            ScriptTransport first = nextTransport();
+            first.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+            assertThat(first.sent.poll(5, SECONDS)).isEqualTo(disconnect);
+            ScriptTransport discarding = nextTransport();
+            discarding.receive(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
+            assertThat(discarding.sent.poll(5, SECONDS)).isEqualTo(disconnect);
+            ScriptTransport last = nextTransport();
+            // Only the CONNACK that establishes a connection completes observations.
+            assertThat(observed).isNotDone();
+
+            // Act: late callbacks of the replaced transports, then a write on the last one.
+            last.receive(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
+            ConnAck connAck = connection.get(5, SECONDS);
+            first.receiver().onClosed(new IOException("late end of the first connection"));
+            discarding.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+            discarding.receiver().onClosed(new IOException("late end of the discarding one"));
+            sut.publish(message(new byte[] {1})).get(5, SECONDS);
+            Packet published = last.sent.poll(5, SECONDS);
+
+            // Assert
+            assertThat(connAck).isEqualTo(ConnAck.of(false, 1));
+            assertThat(observed.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            assertThat(first.closed).isTrue();
+            assertThat(discarding.closed).isTrue();
+            assertThat(last.closed).isFalse();
+            assertThat(published).isInstanceOf(Packet.Publish.class);
+            assertThat(notifications.poll(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            assertThat(notifications).isEmpty();
+            assertThat(transports).isEmpty();
+            // Replacing the connections without ending them leaves nothing held.
+            await().untilAsserted(() -> {
+                ClientActor.Usage usage = ((ClientActor) sut).usage();
+                assertThat(usage.operations()).isZero();
+                assertThat(usage.mailboxEvents()).isZero();
+                assertThat(usage.sends()).isZero();
+                assertThat(usage.notifications()).isZero();
+            });
+        }
+    }
+
+    @Test
+    void a_transport_that_cannot_start_for_the_next_connection_fails_the_attempt_once()
+            throws Exception {
+        // Arrange: the transport for the discarding connection throws when started.
+        var notifications = new LinkedBlockingQueue<Object>();
+        var startFailure = new IllegalStateException("cannot start");
+        var created = new AtomicInteger();
+        try (MqttClient sut = MqttClient.builder()
+                .server(URI.create("mqtt://localhost"))
+                .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .clientId("actor-test")
+                .cleanStart(false)
+                .sessionExpiry(Duration.ofSeconds(30))
+                .timerScheduler(scheduler)
+                .connectionListener(recording(notifications))
+                .transportFactory(_ -> {
+                    var transport = new ScriptTransport();
+                    if (created.incrementAndGet() == 2) {
+                        transport.onStart = () -> {
+                            throw startFailure;
+                        };
+                    }
+                    transports.add(transport);
+                    return transport;
+                })
+                .build()) {
+            CompletableFuture<ConnAck> connection = sut.connect();
+            ScriptTransport first = nextTransport();
+
+            // Act
+            first.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+
+            // Assert
+            assertThatThrownBy(() -> connection.get(5, SECONDS)).cause()
+                    .isInstanceOf(MqttConnectException.class)
+                    .hasCause(startFailure);
+            assertThat(notifications.poll(5, SECONDS)).isInstanceOfSatisfying(
+                    Disconnection.class,
+                    failure -> assertThat(failure.cause()).hasValueSatisfying(cause ->
+                            assertThat(cause).hasCause(startFailure)
+                    )
+            );
+            assertThat(first.closed).isTrue();
+            assertThat(created).hasValue(2);
+            await().until(() -> ((ClientActor) sut).usage().operations() == 0);
+            assertThat(notifications).isEmpty();
+        }
+    }
+
+    @Test
     void a_session_refusal_survives_a_priority_packet_failure_during_disconnect()
             throws Exception {
         // Arrange: keep the refused session's DISCONNECT write outstanding.
@@ -1769,7 +1874,7 @@ class ClientActorTest {
                 })
                 .build()) {
             CompletableFuture<ConnAck> connection = sut.connect();
-            ScriptTransport transport = nextTransport();
+            ScriptTransport transport = discardBrokerSession(nextTransport());
             transport.completeSends = false;
             transport.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
             assertThat(transport.sent.poll(5, SECONDS))
@@ -1779,11 +1884,12 @@ class ClientActorTest {
             // Act: decoding fails through the priority termination slot.
             transport.receiver().onBytes(HexFormat.of().parseHex("d100"));
 
-            // Assert: cleanup failure supplements the original local-state refusal.
+            // Assert: cleanup failure supplements the original refusal.
             assertThatThrownBy(() -> connection.get(5, SECONDS)).cause().isInstanceOfSatisfying(
                     MqttConnectException.class,
                     failure -> {
-                        assertThat(failure).hasMessage("Broker session has no local state")
+                        assertThat(failure)
+                                .hasMessage("Broker session present after discarding it")
                                 .hasNoCause();
                         assertThat(failure.reasonCode()).isEmpty();
                         assertThat(failure.getSuppressed()).singleElement().satisfies(
@@ -4547,13 +4653,13 @@ class ClientActorTest {
     @SuppressWarnings("try") // Closing while the refusal's DISCONNECT waits is under test.
     void closing_during_a_session_refusal_ends_subscriptions_as_an_ordinary_close()
             throws Exception {
-        // Arrange: a persistent client without local state refuses the broker's session and
-        // keeps that DISCONNECT write outstanding.
+        // Arrange: a persistent client finds the broker's session again after discarding it,
+        // and keeps the refusing DISCONNECT write outstanding.
         try (MqttClient sut = client(false)) {
             Subscription subscription = sut.subscribe(request());
             CompletableFuture<Qos> establishing = subscription.established();
             CompletableFuture<ConnAck> connection = sut.connect();
-            ScriptTransport transport = nextTransport();
+            ScriptTransport transport = discardBrokerSession(nextTransport());
             transport.completeSends = false;
             transport.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
             assertThat(transport.sent.poll(5, SECONDS))
@@ -5226,6 +5332,38 @@ class ClientActorTest {
         ScriptTransport transport = requireNonNull(transports.poll(5, SECONDS));
         assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Connect.class);
         return transport;
+    }
+
+    /// Records every connection notification in order.
+    private static ConnectionListener recording(LinkedBlockingQueue<Object> notifications) {
+        return new ConnectionListener() {
+            @Override
+            public void onConnected(ConnAck connAck) {
+                notifications.add(connAck);
+            }
+
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                notifications.add(disconnection);
+            }
+
+            @Override
+            public void onConnectFailed(Disconnection failure) {
+                notifications.add(failure);
+            }
+        };
+    }
+
+    /// Answers the first connection with Session Present and lets the client discard that
+    /// broker session. Returns the transport of the connection that starts a new session.
+    private ScriptTransport discardBrokerSession(ScriptTransport first) throws Exception {
+        var disconnect = new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY);
+        first.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+        assertThat(first.sent.poll(5, SECONDS)).isEqualTo(disconnect);
+        ScriptTransport discarding = nextTransport();
+        discarding.receive(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
+        assertThat(discarding.sent.poll(5, SECONDS)).isEqualTo(disconnect);
+        return nextTransport();
     }
 
     private static void waitFor(CountDownLatch latch) {

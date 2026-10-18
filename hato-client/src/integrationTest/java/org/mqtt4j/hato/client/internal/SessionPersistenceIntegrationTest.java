@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.time.Duration;
@@ -11,6 +12,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIf;
@@ -40,6 +42,8 @@ import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.Objects.requireNonNull;
@@ -55,6 +59,8 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// Raw peers expose replay order; real brokers verify the same client's persistent session.
 @Timeout(30)
 class SessionPersistenceIntegrationTest {
+
+    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
 
     private final String clientId = "hato" + UUID.randomUUID().toString().replace("-", "")
             .substring(0, 19);
@@ -615,6 +621,98 @@ class SessionPersistenceIntegrationTest {
     }
 
     @Test
+    void a_broker_session_without_local_state_is_discarded_before_a_new_session_starts()
+            throws Exception {
+        // Arrange
+        var notifications = new LinkedBlockingQueue<Object>();
+        MqttMessage will = message("will", (byte) 9);
+        var disconnect = new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY);
+        try (ServerSocket server = listen();
+                MqttClient sut = MqttClient.builder()
+                        .server(endpoint(server))
+                        .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
+                        .clientId(clientId)
+                        .cleanStart(false)
+                        .sessionExpiry(Duration.ofSeconds(30))
+                        .will(will)
+                        .connectionListener(recording(notifications))
+                        .build()) {
+            Subscription stored = sut.subscribe(
+                    Subscribe.of(new TopicFilter("stored"), Qos.AT_LEAST_ONCE)
+            );
+
+            // Act
+            CompletableFuture<ConnAck> connected = sut.connect();
+
+            // Assert: the first connection finds a session that this client does not know, and
+            // neither delivers nor acknowledges what the broker sends from it. One write keeps
+            // that input from arriving after the client closes the connection.
+            try (ScriptedBroker first = ScriptedBroker.accept(server)) {
+                assertConnect(first.receive(), false, will);
+                byte[] storedState = encode(
+                        new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY),
+                        new Packet.Publish(
+                                new Topic("stored"),
+                                new byte[] {1},
+                                Qos.AT_LEAST_ONCE,
+                                false,
+                                true,
+                                7,
+                                EMPTY
+                        ),
+                        new Packet.PubRel(8, ReasonCode.SUCCESS, EMPTY)
+                );
+                first.send(storedState);
+                assertThat(first.receive()).isEqualTo(disconnect);
+                first.expectClosed();
+            }
+            try (ScriptedBroker discarding = ScriptedBroker.accept(server)) {
+                assertConnect(discarding.receive(), true, null);
+                discarding.send(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
+                assertThat(discarding.receive()).isEqualTo(disconnect);
+                discarding.expectClosed();
+            }
+            try (ScriptedBroker peer = ScriptedBroker.accept(server)) {
+                assertConnect(peer.receive(), false, will);
+                peer.send(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
+                assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+                assertThat(peer.receive()).isInstanceOf(Packet.Subscribe.class);
+                CompletableFuture<Void> disconnected = sut.disconnect();
+                assertThat(peer.receive()).isEqualTo(disconnect);
+                disconnected.get(5, SECONDS);
+            }
+            assertThat(stored.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+            // The replaced connections produced no notification of their own.
+            assertThat(notifications.poll(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            assertThat(notifications.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(notifications).isEmpty();
+        }
+    }
+
+    @Test
+    void the_embedded_broker_lets_a_restarted_client_start_a_new_session() throws Exception {
+        try (MqttBroker broker = MqttBroker.start()) {
+            restartedClientRoundTrip(URI.create("mqtt://localhost:" + broker.port()));
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
+    void mosquitto_lets_a_restarted_client_start_a_new_session() throws Exception {
+        try (GenericContainer<?> broker = Mosquitto.container()) {
+            Mosquitto.start(broker);
+            restartedClientRoundTrip(
+                    URI.create(
+                            "mqtt://" + broker.getHost() + ":"
+                                    + broker.getMappedPort(Mosquitto.MQTT_PORT)
+                    )
+            );
+        }
+    }
+
+    @Test
     void the_embedded_broker_continues_delivery_on_the_same_persistent_client() throws Exception {
         try (MqttBroker broker = MqttBroker.start()) {
             persistentDeliveryRoundTrip(URI.create("mqtt://localhost:" + broker.port()));
@@ -676,6 +774,115 @@ class SessionPersistenceIntegrationTest {
             subscription.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
             publisher.disconnect().get(5, SECONDS);
+        }
+    }
+
+    /// A client object created after another one with the same identifier was closed, as after
+    /// a process restart, has no local state for the session that the broker kept.
+    private void restartedClientRoundTrip(URI endpoint) throws Exception {
+        // Arrange: a closed client leaves its session and a stored publication behind.
+        String topic = uniqueTopic();
+        var notifications = new LinkedBlockingQueue<Object>();
+        var connections = new AtomicInteger();
+        try (MqttClient publisher = MqttClient.builder()
+                .server(endpoint)
+                .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .build()) {
+            publisher.connect().get(5, SECONDS);
+            try (MqttClient previous = persistentClient(endpoint, _ -> { })) {
+                previous.connect().get(5, SECONDS);
+                previous.subscribe(Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE))
+                        .established()
+                        .get(5, SECONDS);
+            }
+            // The broker keeps this for the closed client's session.
+            publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
+            try (MqttClient sut = MqttClient.builder()
+                    .server(endpoint)
+                    .version(MqttVersion.V3_1_1)
+                    .reconnectPolicy(ReconnectPolicy.disabled())
+                    .clientId(clientId)
+                    .cleanStart(false)
+                    .sessionExpiry(Duration.ofSeconds(30))
+                    .connectionListener(recording(notifications))
+                    .transportFactory(id -> {
+                        connections.incrementAndGet();
+                        return Transport.tcp(id);
+                    })
+                    .build()) {
+                Subscription subscription = sut.subscribe(
+                        Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
+                );
+
+                // Act: replace the session, then leave and resume the new one.
+                ConnAck connAck = sut.connect().get(5, SECONDS);
+                int replacing = connections.get();
+                subscription.established().get(5, SECONDS);
+                MqttMessage marker = message(topic, (byte) 2);
+                publisher.publish(marker).get(5, SECONDS);
+                ReceiveResult first = subscription.receive(Duration.ofSeconds(5));
+                ReceiveResult rest = subscription.receive(Duration.ZERO);
+                sut.disconnect().get(5, SECONDS);
+                MqttMessage kept = message(topic, (byte) 3);
+                publisher.publish(kept).get(5, SECONDS);
+                ConnAck resumed = sut.connect().get(5, SECONDS);
+                ReceiveResult after = subscription.receive(Duration.ofSeconds(5));
+
+                // Assert: only publications after the new session arrive, and it persists.
+                assertThat(replacing).isEqualTo(3);
+                assertThat(connAck).isEqualTo(ConnAck.of(false, 1));
+                assertThat(received(first).message()).isEqualTo(marker);
+                assertThat(rest).isEqualTo(new ReceiveResult.TimedOut());
+                assertThat(resumed).isEqualTo(ConnAck.of(true, 2));
+                assertThat(received(after).message()).isEqualTo(kept);
+                assertThat(notifications.poll(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+                assertThat(notifications.poll(5, SECONDS))
+                        .isEqualTo(Disconnection.of(null, true, 1));
+                assertThat(notifications.poll(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
+                sut.disconnect().get(5, SECONDS);
+            }
+            publisher.disconnect().get(5, SECONDS);
+        }
+    }
+
+    private static byte[] encode(Packet... packets) {
+        var bytes = new ByteArrayOutputStream();
+        for (Packet packet : packets) {
+            bytes.writeBytes(codec.encode(packet));
+        }
+        return bytes.toByteArray();
+    }
+
+    private static ConnectionListener recording(LinkedBlockingQueue<Object> notifications) {
+        return new ConnectionListener() {
+            @Override
+            public void onConnected(ConnAck connAck) {
+                notifications.add(connAck);
+            }
+
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                notifications.add(disconnection);
+            }
+
+            @Override
+            public void onConnectFailed(Disconnection failure) {
+                notifications.add(failure);
+            }
+        };
+    }
+
+    private void assertConnect(Packet packet, boolean cleanSession, @Nullable MqttMessage will) {
+        Packet.Connect connect = assertInstanceOf(Packet.Connect.class, packet);
+        assertThat(connect.clientId()).isEqualTo(clientId);
+        assertThat(connect.cleanStart()).isEqualTo(cleanSession);
+        if (will == null) {
+            assertThat(connect.will()).isNull();
+        } else {
+            Packet.Will sent = requireNonNull(connect.will());
+            assertThat(sent.topic()).isEqualTo(will.topic());
+            assertThat(sent.payload()).isEqualTo(will.payload());
         }
     }
 

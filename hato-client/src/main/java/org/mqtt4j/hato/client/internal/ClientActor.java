@@ -771,6 +771,15 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
+        public void continueAttempt(long generation) {
+            // The previous connection wrote its DISCONNECT and ends without a notification.
+            mailbox.discard(openedGeneration);
+            io.close();
+            openedGeneration = generation;
+            mailbox.activate(generation);
+        }
+
+        @Override
         public void connectionRequested(boolean requested) {
             synchronized (lifecycleLock) {
                 mailbox.connectionRequested(requested && !stopping.get());

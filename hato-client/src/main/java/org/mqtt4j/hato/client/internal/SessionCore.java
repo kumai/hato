@@ -43,7 +43,8 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 final class SessionCore {
 
     /// DISCONNECTING follows an accepted disconnect(), both while its attempt still waits for
-    /// CONNACK and while the established connection writes DISCONNECT.
+    /// CONNACK or for the DISCONNECT of a connection that it abandoned, and while the
+    /// established connection writes DISCONNECT.
     enum State {
         DISCONNECTED,
         CONNECTING,
@@ -71,9 +72,28 @@ final class SessionCore {
         CLIENT_CLOSE
     }
 
+    /// The connections of one attempt. A broker session without local state cannot continue,
+    /// so an attempt that finds one replaces it, using up to three connections. As MQTT 3.1.1
+    /// describes for discarding session state on both sides, it disconnects, connects with Clean
+    /// Session 1, and disconnects again; then it starts a new persistent session.
+    private enum Step {
+        /// The attempt's first connection, which may find a broker session without local state.
+        FIRST,
+        /// A Clean Session 1 connection without a Will, which discards that session.
+        DISCARD,
+        /// The connection that starts a new persistent session once the old one is discarded.
+        NEW_SESSION
+    }
+
     interface Port {
 
         void beginAttempt(long generation, ConnectionAttempt attempt, long attemptNumber);
+
+        /// Moves the current attempt to its next connection, numbered `generation`, without
+        /// announcing the end of the previous one. The previous connection's queued and late
+        /// events no longer reach the core. It started no session and handed nothing to the
+        /// application, so none of the cleanup that [#end] performs is due.
+        void continueAttempt(long generation);
 
         void connectionRequested(boolean requested);
 
@@ -240,12 +260,13 @@ final class SessionCore {
 
     // The core's state of the current connection, including one that its attempt is still
     // opening. Ending the connection replaces it, so the next one starts from fresh values; the
-    // parts replace their own. The attempt's credentials and deadline stay outside, because an
-    // attempt can outlive a connection.
+    // parts replace their own. The attempt's credentials stay outside, because an attempt can
+    // outlive a connection.
     private Connection current;
 
-    // The attempt waiting for its CONNACK, and null once a CONNACK establishes its connection
-    // or the attempt ends.
+    // The attempt that has not established a connection yet, including while it closes a
+    // connection that it abandoned, and null once a CONNACK establishes its connection or the
+    // attempt ends.
     private @Nullable ConnectionAttempt connecting;
 
     // The connecting attempt's credentials. Every connection of the attempt sends the same
@@ -289,7 +310,7 @@ final class SessionCore {
         this.will = will;
         this.credentialsRequired = credentialsRequired;
         request = new ConnectionRequest(backoff, initialRetry);
-        current = new Connection(responseTimeout);
+        current = new Connection(responseTimeout, Step.FIRST);
         var context = new PartContext();
         receptions = new Receptions(port, context, clientId);
         subscriptions = new Subscriptions(port, context, cleanStart);
@@ -300,7 +321,8 @@ final class SessionCore {
         return state;
     }
 
-    /// Whether an attempt waits for its CONNACK, possibly with a requested disconnect pending.
+    /// Whether an attempt has not established its connection yet, possibly with a requested
+    /// disconnect pending.
     private boolean attempting() {
         return connecting != null;
     }
@@ -373,6 +395,22 @@ final class SessionCore {
         }
     }
 
+    /// Opens the attempt's next connection after the previous one wrote its DISCONNECT. The
+    /// attempt keeps its number, credentials, and waiting calls, and neither the application nor
+    /// the listener sees the replaced connection. The parts keep no state of a connection before
+    /// a CONNACK establishes it, so the replaced connection leaves them nothing to settle.
+    private void openNextConnection(long now) {
+        Step next = (current.step == Step.FIRST) ? Step.DISCARD : Step.NEW_SESSION;
+        port.cancel(Timer.DISCONNECT);
+        current = new Connection(responseTimeout, next);
+        current.lastSent = now;
+        generation++;
+        port.continueAttempt(generation);
+        // Each connection of the attempt has the whole connection timeout.
+        port.schedule(generation, Timer.CONNECT, timeout);
+        port.openTransport(generation, timeout);
+    }
+
     void opened(long connection) {
         if (connection == generation && attempting()) {
             current.transportConnected = true;
@@ -407,14 +445,17 @@ final class SessionCore {
         if (current.transportConnected && credentialsReady && !current.connectSent) {
             current.connectSent = true;
             MqttCredentials credentials = attemptCredentials;
+            // The connection that discards a broker session carries no Will, so losing it before
+            // its DISCONNECT publishes nothing.
+            boolean discarding = current.step == Step.DISCARD;
             sendRequired(
                     ++nextTicket,
                     new Packet.Connect(
                             clientId,
                             MqttVersion.V3_1_1,
-                            cleanStart,
+                            cleanStart || discarding,
                             (int) keepAlive.toSeconds(),
-                            will,
+                            discarding ? null : will,
                             credentials == null ? null : credentials.username(),
                             credentials == null ? null : credentials.password().orElse(null),
                             EMPTY
@@ -427,8 +468,9 @@ final class SessionCore {
         if (connection != generation || !connectionActive()) {
             return;
         }
-        if (current.sessionRefusal != null) {
-            // This broker session has no local counterpart; only its DISCONNECT may progress.
+        if (current.abandoned) {
+            // The attempt has given this connection up; only its DISCONNECT may progress, so
+            // nothing it receives is delivered or acknowledged.
             return;
         }
         if (attempting()) {
@@ -441,19 +483,18 @@ final class SessionCore {
                         "Broker refused connection",
                         ack.reasonCode()
                 ));
-            } else if (ack.sessionPresent() && cleanStart) {
+            } else if (ack.sessionPresent() && (cleanStart || current.step == Step.DISCARD)) {
                 failed(connection, protocolError("Session Present with Clean Session"));
+            } else if (current.step == Step.DISCARD) {
+                log.info("Discarded broker session without local state for {}", clientId);
+                abandon(null);
+            } else if (ack.sessionPresent() && !session.established
+                    && current.step == Step.FIRST) {
+                // The attempt goes on to discard the broker's session.
+                abandon(null);
             } else if (ack.sessionPresent() && !session.established) {
-                current.sessionRefusal = new MqttConnectException(
-                        "Broker session has no local state"
-                );
-                port.cancel(Timer.CONNECT);
-                port.schedule(generation, Timer.DISCONNECT, timeout);
-                current.disconnectTicket = ++nextTicket;
-                sendRequired(
-                        current.disconnectTicket,
-                        new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY)
-                );
+                // Only one discard per attempt: a session found again fails the attempt.
+                abandon(new MqttConnectException("Broker session present after discarding it"));
             } else {
                 if (!ack.sessionPresent()) {
                     discardSession();
@@ -544,12 +585,20 @@ final class SessionCore {
             drainDeferred();
         }
         if (ticket == current.disconnectTicket) {
-            if (current.sessionRefusal != null) {
-                end(current.sessionRefusal, EndReason.DISCONNECT_WRITTEN);
+            MqttConnectException refusal = current.sessionRefusal;
+            // Unless a disconnect() was requested meanwhile, the attempt goes on.
+            if (current.abandoned && refusal == null && state == State.CONNECTING) {
+                openNextConnection(now);
                 return;
             }
+            // The written DISCONNECT satisfies a pending disconnect(), even with a refusal.
             List<Long> operations = request.takeDisconnections();
-            end(null, EndReason.DISCONNECT_WRITTEN);
+            if (refusal != null) {
+                // The refusal fails the attempt, which the policy may retry like other failures.
+                end(refusal, EndReason.CONNECTION_FAILURE);
+            } else {
+                end(null, EndReason.DISCONNECT_WRITTEN);
+            }
             for (long operation : operations) {
                 port.complete(operation, null, null);
             }
@@ -683,7 +732,7 @@ final class SessionCore {
                 }
             }
             case DISCONNECT -> {
-                if (state == State.DISCONNECTING || current.sessionRefusal != null) {
+                if (state == State.DISCONNECTING || current.abandoned) {
                     failed(connection, new TimeoutException("DISCONNECT write deadline expired"));
                 }
             }
@@ -758,6 +807,16 @@ final class SessionCore {
         }
     }
 
+    /// Gives up the attempt's connection after its successful CONNACK, closing it with
+    /// DISCONNECT so that the broker discards its Will. Without `refusal`, the attempt continues
+    /// on its next connection once DISCONNECT is written; with it, the attempt fails then.
+    private void abandon(@Nullable MqttConnectException refusal) {
+        current.abandoned = true;
+        current.sessionRefusal = refusal;
+        port.cancel(Timer.CONNECT);
+        beginDisconnect();
+    }
+
     private void beginDisconnect() {
         port.cancel(Timer.KEEP_ALIVE);
         port.cancel(Timer.PING);
@@ -804,7 +863,8 @@ final class SessionCore {
         // Decide before replacing the cause with a session refusal below.
         boolean shutdownRequested = switch (reason) {
             case CLIENT_CLOSE -> cause == null || state == State.DISCONNECTING;
-            // The DISCONNECT that refuses a broker session without local state is not requested.
+            // Only a pending disconnect() makes an ending requested; the DISCONNECT with which an
+            // attempt abandons a connection is the client's own.
             case DISCONNECT_WRITTEN, CONNECTION_FAILURE, HANDLER_FAILURE, SCHEDULER_FAILURE ->
                     state == State.DISCONNECTING;
         };
@@ -812,7 +872,7 @@ final class SessionCore {
         // The ended connection keeps only what this end still settles; the core sees fresh
         // connection state from here on, and the parts replace theirs as they settle it below.
         Connection ended = current;
-        current = new Connection(responseTimeout);
+        current = new Connection(responseTimeout, Step.FIRST);
         if (cause instanceof PacketDecodeException failure) {
             // Both listener notifications and pending operations expose the same public cause.
             cause = new MqttProtocolException(
@@ -822,7 +882,10 @@ final class SessionCore {
             );
         }
         MqttConnectException refusal = ended.sessionRefusal;
-        if (refusal != null) {
+        // A clock or handler failure stops the request with its own cause, while the policy
+        // would retry the refusal; the refusal then only accompanies the attempt's failure.
+        boolean stop = reason == EndReason.SCHEDULER_FAILURE || reason == EndReason.HANDLER_FAILURE;
+        if (refusal != null && !stop) {
             // A failed DISCONNECT must not replace the reason this session was refused.
             if (cause != null && cause != refusal) {
                 refusal.addSuppressed(cause);
@@ -837,6 +900,9 @@ final class SessionCore {
             case MqttConnectException failure -> failure;
             default -> new MqttConnectException("Connection failed", cause);
         };
+        if (refusal != null && stop) {
+            attemptFailure.addSuppressed(refusal);
+        }
         try {
             boolean retry = endConnection(ended, cause, attemptFailure, reason, shutdownRequested);
             finishOperations(ended, cause, attemptFailure, permanent, retry);
@@ -869,7 +935,9 @@ final class SessionCore {
         for (var timer : Timer.values()) {
             port.cancel(timer);
         }
-        boolean retry = shouldReconnect(ended, cause, reason, shutdownRequested);
+        boolean retry = reason == EndReason.CONNECTION_FAILURE
+                && !shutdownRequested
+                && request.retries(cause);
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
         Duration delay = null;
         if (retry) {
@@ -921,22 +989,6 @@ final class SessionCore {
         return retry;
     }
 
-    private boolean shouldReconnect(
-            Connection ended,
-            @Nullable Throwable cause,
-            EndReason reason,
-            boolean shutdownRequested
-    ) {
-        if (reason != EndReason.CONNECTION_FAILURE || shutdownRequested) {
-            return false;
-        }
-        // A retry would meet the same broker session, which the client cannot discard yet.
-        if (ended.sessionRefusal != null) {
-            return false;
-        }
-        return request.retries(cause);
-    }
-
     private void finishOperations(
             Connection ended,
             @Nullable Throwable cause,
@@ -963,9 +1015,11 @@ final class SessionCore {
         if (!retry) {
             completeConnections(null, attemptFailure);
         }
-        // A disconnect requested during an attempt that established no connection is satisfied.
+        // A disconnect requested during an attempt that established no connection is satisfied,
+        // unless the broker accepted the connection and its DISCONNECT was not written: the
+        // broker may then publish the connection's Will.
         @Nullable Throwable disconnectFailure =
-                ended.ack != null || permanent ? pendingFailure : null;
+                ended.ack != null || ended.abandoned || permanent ? pendingFailure : null;
         for (long operation : request.takeDisconnections()) {
             port.complete(operation, null, disconnectFailure);
         }
@@ -1074,22 +1128,32 @@ final class SessionCore {
         boolean transportConnected;
         boolean connectSent;
         boolean awaitingPing;
+        // Set when the attempt gives this connection up after its CONNACK. Once DISCONNECT is
+        // written, the refusal, if any, fails the attempt; otherwise the attempt continues on
+        // its next connection unless a disconnect() is pending. Only an abandoned connection
+        // has a refusal.
+        boolean abandoned;
         @Nullable MqttConnectException sessionRefusal;
         final ResponseDeadlines responses;
+        // This connection's place in its attempt. Ending a connection replaces it with a first
+        // connection, so every attempt starts with one.
+        final Step step;
 
-        Connection(Duration responseTimeout) {
+        Connection(Duration responseTimeout, Step step) {
             responses = new ResponseDeadlines(responseTimeout);
+            this.step = step;
         }
     }
 
-    // State owned by one session. A CONNACK without Session Present, permanent closure, or
-    // the end of a nonpersistent connection replaces it. SUBSCRIBE and UNSUBSCRIBE borrow its
-    // identifiers only until their connection ends.
+    // State owned by one session. A CONNACK that starts a session without Session Present,
+    // permanent closure, or the end of a nonpersistent connection replaces it. SUBSCRIBE and
+    // UNSUBSCRIBE borrow its identifiers only until their connection ends.
     private static final class Session {
 
         final PacketIds packetIds = new PacketIds();
-        // A CONNACK without Session Present started this session; only then can a later
-        // Session Present continue it.
+        // A CONNACK without Session Present started this session, except the one that answers
+        // the connection discarding a broker session; only then can a later Session Present
+        // continue it.
         boolean established;
     }
 }

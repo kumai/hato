@@ -38,9 +38,10 @@ public interface Transport extends AutoCloseable {
         CLOSED
     }
 
-    /// Starts one attempt. The timeout bounds connection establishment, including any TLS
-    /// handshake, not subsequent reads. Implementations must reject unsupported URI schemes
-    /// here with [IllegalArgumentException], rather than silently use a different transport.
+    /// Starts this transport's only connection. The timeout bounds its establishment, including
+    /// any TLS handshake, not subsequent reads. Implementations must reject unsupported URI
+    /// schemes here with [IllegalArgumentException], rather than silently use a different
+    /// transport.
     void start(URI endpoint, Duration timeout, Listener listener);
 
     /// Starts one write without waiting. Call after [Listener#onConnected] has been invoked

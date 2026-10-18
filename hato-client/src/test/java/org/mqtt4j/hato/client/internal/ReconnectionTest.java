@@ -288,43 +288,6 @@ class ReconnectionTest {
     }
 
     @Test
-    void disconnect_during_a_stale_session_refusal_completes_when_its_disconnect_is_written() {
-        // Arrange: the broker keeps a session for which this client has no local state.
-        SessionCore sut = core(false);
-        sut.connect(attempt(1), 0);
-        sut.opened(1);
-        sut.received(1, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 4);
-        sut.disconnect(2);
-
-        // Act
-        sut.sent(1, port.ticket, 1);
-
-        // Assert
-        assertThat(requireNonNull(port.results.get(1L)).failure())
-                .hasMessage("Broker session has no local state");
-        assertThat(requireNonNull(port.results.get(2L)).failure()).isNull();
-        assertThat(port.ends.getLast().userRequested()).isTrue();
-    }
-
-    @Test
-    void an_initial_retry_request_does_not_retry_a_stale_broker_session() {
-        // Arrange
-        SessionCore sut = core(true);
-        sut.connect(attempt(1), 0);
-        sut.opened(1);
-        sut.received(1, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 4);
-
-        // Act: the connection fails before the refusing DISCONNECT is written.
-        sut.failed(1, new IOException("lost during DISCONNECT"));
-
-        // Assert: another attempt would meet the same broker session.
-        assertThat(sut.state()).isEqualTo(DISCONNECTED);
-        assertThat(port.timers).doesNotContainKey(RECONNECT);
-        assertThat(requireNonNull(port.results.get(1L)).failure())
-                .hasMessage("Broker session has no local state");
-    }
-
-    @Test
     void a_failed_retry_reservation_stops_within_the_same_ending() {
         // Arrange: a nonpersistent session, which is discarded when the connection ends.
         var sut = new SessionCore(

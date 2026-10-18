@@ -20,8 +20,7 @@ import static java.util.Objects.requireNonNull;
 /// that stays established for a while resets the sequence; a successful CONNACK alone does not,
 /// so two clients that share a client identifier and keep taking over each other's connection
 /// slow down. Reconnecting stops at a refusal that the same CONNECT would meet again
-/// (unsupported protocol version or identifier rejected), at a broker session without local
-/// state (see [MqttClient#connect()]), and when the client's
+/// (unsupported protocol version or identifier rejected), and when the client's
 /// [timer scheduler][org.mqtt4j.hato.spi.TimerScheduler] fails. Other refusals and failures,
 /// including bad credentials or missing authorization, are retried.
 /// [ConnectionListener#onConnectFailed(Disconnection)] reports each failed attempt, so an
