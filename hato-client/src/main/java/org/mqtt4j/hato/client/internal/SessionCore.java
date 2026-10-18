@@ -220,7 +220,7 @@ final class SessionCore {
 
     private final Duration keepAlive;
 
-    private final ResponseDeadlines responses;
+    private final Duration responseTimeout;
 
     private final boolean cleanStart;
 
@@ -230,17 +230,13 @@ final class SessionCore {
 
     private final ConnectionRequest request;
 
-    // Broker registrations can survive even when their last local operation was unconfirmed.
-    private boolean sessionPresent;
-
     private State state = State.DISCONNECTED;
 
     private long generation;
 
-    // Present once a successful CONNACK has established the current connection.
-    private @Nullable ConnAck currentAck;
-
-    private long stableDeadline;
+    // The state that the current attempt or connection owns. Ending one replaces it, so the next
+    // connection starts from fresh values.
+    private Connection current;
 
     // The attempt waiting for its CONNACK, and null once a CONNACK establishes its connection
     // or the attempt ends.
@@ -254,31 +250,13 @@ final class SessionCore {
 
     private long nextTicket;
 
-    private long pingTicket;
-
-    private long disconnectTicket;
-
-    private long lastSent;
-
     private long connectionDeadline;
-
-    private boolean transportConnected;
-
-    private boolean connectSent;
-
-    private boolean awaitingPing;
-
-    private @Nullable MqttConnectException sessionRefusal;
 
     private Session session = new Session();
 
     // Identifies the current session to delivery and mailbox code, which run outside the actor
     // and must not reach its state. Every replacement of the session advances it.
     private long sessionNumber = 1;
-
-    private final Map<Long, Long> publications = new HashMap<>();
-
-    private final AckSequencer acknowledgements = new AckSequencer();
 
     private long nextDelivery;
 
@@ -294,37 +272,9 @@ final class SessionCore {
 
     private final Map<Long, LocalSubscription> subscriptions = new LinkedHashMap<>();
 
-    private final Map<Integer, LocalSubscription> subscribing = new HashMap<>();
-
-    private final Map<Integer, UnsubscribeOperation> unsubscribing = new HashMap<>();
-
-    // At most one removal per registered subscription; the registry supplies the total bound.
-    private final ArrayDeque<UnsubscribeOperation> queuedClosures = new ArrayDeque<>();
-
-    // At most 64 retained publications and 256 broker registrations await queue admission.
-    private final ArrayDeque<Deferred> deferred = new ArrayDeque<>();
-
-    // PUBREC responses have their own FIFO: an application's unready incoming acknowledgement
-    // must not block its outgoing publication. Coalescing by id bounds even unknown responses
-    // to the protocol's 65,535 identifiers.
-    private final SequencedSet<Integer> releases = new LinkedHashSet<>();
-
-    // Tickets of PUBREC responses admitted to I/O whose write notification is still pending.
-    private final Set<Long> releaseWrites = new HashSet<>();
-
     // Incoming acknowledgements and outgoing PUBREL share the reserved send quota. Returned
     // room goes first to the side that did not take the last slot, so neither can starve.
     private boolean releasesFirst;
-
-    // Unknown exchanges have no future or persistent state, but their PUBCOMP must not land
-    // on a new publication using the same id. Each id stays aside until disconnect, or until
-    // PUBCOMP has answered every PUBREL admitted for it; the value counts those PUBRELs.
-    // A repeated PUBREC can leave two answers in flight, and the first must not free the id.
-    private final Map<Integer, Integer> unknownReleases = new HashMap<>();
-
-    private int subscribingInFlight;
-
-    private int closingInFlight;
 
     SessionCore(
             Port port,
@@ -389,11 +339,12 @@ final class SessionCore {
         this.clientId = clientId;
         this.timeout = timeout;
         this.keepAlive = keepAlive;
-        this.responses = new ResponseDeadlines(responseTimeout);
+        this.responseTimeout = responseTimeout;
         this.cleanStart = cleanStart;
         this.will = will;
         this.credentialsRequired = credentialsRequired;
         request = new ConnectionRequest(backoff, initialRetry);
+        current = new Connection(responseTimeout);
     }
 
     State state() {
@@ -408,7 +359,7 @@ final class SessionCore {
     /// Whether a successful CONNACK established the current connection, which may be
     /// disconnecting.
     private boolean established() {
-        return currentAck != null;
+        return current.ack != null;
     }
 
     /// Whether the current generation has an attempt or connection that input can still reach.
@@ -437,7 +388,7 @@ final class SessionCore {
         }
         if (state == State.CONNECTED) {
             if (attempt.operation != 0) {
-                port.complete(attempt.operation, requireNonNull(currentAck), null);
+                port.complete(attempt.operation, requireNonNull(current.ack), null);
             }
             return;
         }
@@ -462,10 +413,8 @@ final class SessionCore {
         connecting = attempt;
         credentialsReady = !credentialsRequired;
         attemptCredentials = null;
-        lastSent = now;
+        current.lastSent = now;
         connectionDeadline = now + timeout.toNanos();
-        transportConnected = false;
-        connectSent = false;
         port.beginAttempt(generation, attempt, number);
         port.schedule(generation, Timer.CONNECT, timeout);
         if (credentialsReady) {
@@ -477,7 +426,7 @@ final class SessionCore {
 
     void opened(long connection) {
         if (connection == generation && attempting()) {
-            transportConnected = true;
+            current.transportConnected = true;
             sendConnect();
         }
     }
@@ -506,8 +455,8 @@ final class SessionCore {
     }
 
     private void sendConnect() {
-        if (transportConnected && credentialsReady && !connectSent) {
-            connectSent = true;
+        if (current.transportConnected && credentialsReady && !current.connectSent) {
+            current.connectSent = true;
             MqttCredentials credentials = attemptCredentials;
             sendRequired(
                     ++nextTicket,
@@ -529,7 +478,7 @@ final class SessionCore {
         if (connection != generation || !connectionActive()) {
             return;
         }
-        if (sessionRefusal != null) {
+        if (current.sessionRefusal != null) {
             // This broker session has no local counterpart; only its DISCONNECT may progress.
             return;
         }
@@ -546,13 +495,18 @@ final class SessionCore {
             } else if (ack.sessionPresent() && cleanStart) {
                 failed(connection, protocolError("Session Present with Clean Session"));
             } else if (ack.sessionPresent() && !session.established) {
-                sessionRefusal = new MqttConnectException("Broker session has no local state");
+                current.sessionRefusal = new MqttConnectException(
+                        "Broker session has no local state"
+                );
                 port.cancel(Timer.CONNECT);
                 port.schedule(generation, Timer.DISCONNECT, timeout);
-                disconnectTicket = ++nextTicket;
-                sendRequired(disconnectTicket, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
+                current.disconnectTicket = ++nextTicket;
+                sendRequired(
+                        current.disconnectTicket,
+                        new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY)
+                );
             } else {
-                sessionPresent = ack.sessionPresent();
+                current.sessionPresent = ack.sessionPresent();
                 if (!ack.sessionPresent()) {
                     discardSession();
                     session.established = true;
@@ -561,13 +515,13 @@ final class SessionCore {
                     }
                 } else {
                     reconcileReceptions(port.receiveState(), false);
-                    deferred.addAll(session.inflight.values());
+                    current.deferred.addAll(session.inflight.values());
                 }
                 if (state == State.CONNECTING) {
                     state = State.CONNECTED;
                 }
                 var result = ConnAck.of(ack.sessionPresent());
-                currentAck = result;
+                current.ack = result;
                 request.establish();
                 port.admit(generation);
                 // Reconcile before announcing, so connect() and onConnected already find continued
@@ -576,14 +530,14 @@ final class SessionCore {
                     if (local.removal != null) {
                         if (ack.sessionPresent()) {
                             local.established = true;
-                            queuedClosures.addLast(local.removal);
+                            current.queuedClosures.addLast(local.removal);
                         } else {
                             removeSubscription(local, null);
                             finishRemoval(local);
                         }
                     } else if (!ack.sessionPresent() || !local.established) {
                         local.established = false;
-                        deferred.addLast(local);
+                        current.deferred.addLast(local);
                     } else {
                         port.subscribed(local.handle, local.granted);
                     }
@@ -600,7 +554,7 @@ final class SessionCore {
                         scheduleKeepAlive(now);
                     }
                     if (request.reconnects()) {
-                        stableDeadline = now + STABLE_CONNECTION.toNanos();
+                        current.stableDeadline = now + STABLE_CONNECTION.toNanos();
                         port.schedule(generation, Timer.STABLE, STABLE_CONNECTION);
                     }
                 }
@@ -617,8 +571,8 @@ final class SessionCore {
             // Other input already in flight cannot change a local shutdown's write/close sequence.
             return;
         } else if (packet instanceof Packet.PingResp) {
-            if (awaitingPing) {
-                awaitingPing = false;
+            if (current.awaitingPing) {
+                current.awaitingPing = false;
                 port.cancel(Timer.PING);
             } else {
                 port.ignoredPingResponse();
@@ -647,22 +601,22 @@ final class SessionCore {
         if (connection != generation || !connectionActive()) {
             return;
         }
-        lastSent = writtenAt;
+        current.lastSent = writtenAt;
         if (state == State.CONNECTED) {
-            responses.written(ticket, writtenAt, now).ifPresent(delay -> {
+            current.responses.written(ticket, writtenAt, now).ifPresent(delay -> {
                 port.schedule(generation, Timer.RESPONSE, delay);
             });
         }
-        Long publication = publications.remove(ticket);
+        Long publication = current.publications.remove(ticket);
         if (publication != null) {
             port.complete(publication, PublishResult.of(), null);
         }
-        if (releaseWrites.remove(ticket)) {
+        if (current.releaseWrites.remove(ticket)) {
             drainDeferred();
         }
-        if (ticket == disconnectTicket) {
-            if (sessionRefusal != null) {
-                end(sessionRefusal, EndReason.DISCONNECT_WRITTEN);
+        if (ticket == current.disconnectTicket) {
+            if (current.sessionRefusal != null) {
+                end(current.sessionRefusal, EndReason.DISCONNECT_WRITTEN);
                 return;
             }
             List<Long> operations = request.takeDisconnections();
@@ -677,7 +631,7 @@ final class SessionCore {
     /// The immutable acknowledgement kind keeps an old PUBREC write from retiring a later stage.
     void written(long connection, long ticket) {
         if (connection == generation && established()) {
-            acknowledgements.written(ticket).ifPresent(acknowledgement -> {
+            current.acknowledgements.written(ticket).ifPresent(acknowledgement -> {
                 ReceiveTable.Entry entry = acknowledgement.entry();
                 if (acknowledgement.kind() == Kind.PUBREC) {
                     entry.pubrecAccepted();
@@ -695,7 +649,7 @@ final class SessionCore {
             return;
         }
         // Replays precede subscription restoration; SUBACK waiting does not block publication.
-        if (deferred.peekFirst() instanceof Inflight) {
+        if (current.deferred.peekFirst() instanceof Inflight) {
             capacityFailure(operation, "Publication replay pending");
             return;
         }
@@ -746,7 +700,7 @@ final class SessionCore {
             session.bytes += byteCount;
             receipt = publication.receipt;
         } else {
-            publications.put(ticket, operation);
+            current.publications.put(ticket, operation);
         }
         SendQueue.OfferResult result = port.publish(
                 generation,
@@ -759,7 +713,7 @@ final class SessionCore {
             awaitPublication(ticket, message.qos(), packetId);
         } else if (result == SendQueue.OfferResult.FULL) {
             if (packetId == 0) {
-                publications.remove(ticket);
+                current.publications.remove(ticket);
             } else {
                 removeInflight(packetId);
             }
@@ -769,6 +723,7 @@ final class SessionCore {
     }
 
     private void awaitPublication(long ticket, Qos qos, int packetId) {
+        ResponseDeadlines responses = current.responses;
         switch (qos) {
             case AT_MOST_ONCE -> {
             }
@@ -825,7 +780,7 @@ final class SessionCore {
         );
         subscriptions.put(operation, local);
         if (state == State.CONNECTED) {
-            deferred.addLast(local);
+            current.deferred.addLast(local);
             drainDeferred();
         }
     }
@@ -841,7 +796,7 @@ final class SessionCore {
             return;
         }
         local.removal = new UnsubscribeOperation(operation, local);
-        deferred.remove(local);
+        current.deferred.remove(local);
         if (state != State.CONNECTED) {
             if (cleanStart) {
                 removeSubscription(local, null);
@@ -849,15 +804,15 @@ final class SessionCore {
             }
             return;
         }
-        if (sessionPresent && !subscribing.containsValue(local)) {
+        if (current.sessionPresent && !current.subscribing.containsValue(local)) {
             // An unsent restoration cannot prove that a persistent broker has no registration.
             local.established = true;
         }
-        if (!local.established && !subscribing.containsValue(local)) {
+        if (!local.established && !current.subscribing.containsValue(local)) {
             removeSubscription(local, null);
             finishRemoval(local);
         } else {
-            queuedClosures.addLast(local.removal);
+            current.queuedClosures.addLast(local.removal);
             drainClosures();
         }
         drainDeferred();
@@ -873,17 +828,17 @@ final class SessionCore {
             return false;
         }
         int id = allocated.getAsInt();
-        unsubscribing.put(id, removal);
+        current.unsubscribing.put(id, removal);
         var packet = new Packet.Unsubscribe(id, List.of(removal.subscription.filter), EMPTY);
         long ticket = ++nextTicket;
         SendQueue.OfferResult result = port.send(generation, ticket, packet, null);
         if (result == SendQueue.OfferResult.FULL) {
-            unsubscribing.remove(id);
+            current.unsubscribing.remove(id);
             session.packetIds.release(id);
             return false;
         }
         if (result == SendQueue.OfferResult.ACCEPTED) {
-            responses.add(ticket, ResponseDeadlines.Kind.UNSUBACK, id);
+            current.responses.add(ticket, ResponseDeadlines.Kind.UNSUBACK, id);
         }
         return true;
     }
@@ -896,8 +851,8 @@ final class SessionCore {
         // A removal waits only for its own SUBACK, so the drain passes over those still awaiting
         // one; at most 16 SUBACKs are pending, which bounds the scan. A capacity refusal stops
         // the drain, so the refused removal stays ahead of later ones.
-        Iterator<UnsubscribeOperation> removals = queuedClosures.iterator();
-        while (closingInFlight < CLOSE_INFLIGHT_LIMIT && removals.hasNext()) {
+        Iterator<UnsubscribeOperation> removals = current.queuedClosures.iterator();
+        while (current.closingInFlight < CLOSE_INFLIGHT_LIMIT && removals.hasNext()) {
             UnsubscribeOperation removal = removals.next();
             if (!removal.subscription.established) {
                 continue;
@@ -906,7 +861,7 @@ final class SessionCore {
                 return;
             }
             removals.remove();
-            closingInFlight++;
+            current.closingInFlight++;
         }
     }
 
@@ -917,9 +872,9 @@ final class SessionCore {
         }
         // Replay the single session order before fresh PUBREC responses. A duplicate PUBREC
         // shares a PUBREL replay still waiting here instead of adding another response.
-        while (deferred.peekFirst() instanceof Inflight inflight) {
+        while (current.deferred.peekFirst() instanceof Inflight inflight) {
             if (session.inflight.get(inflight.packetId) != inflight) {
-                deferred.removeFirst();
+                current.deferred.removeFirst();
                 continue;
             }
             long ticket = ++nextTicket;
@@ -939,26 +894,26 @@ final class SessionCore {
             if (inflight instanceof Publication publication) {
                 awaitPublication(ticket, publication.qos, publication.packetId);
             }
-            deferred.removeFirst();
+            current.deferred.removeFirst();
         }
-        while (!releases.isEmpty() && releaseWrites.size() < RELEASE_WRITE_LIMIT) {
-            int id = releases.getFirst();
+        while (!current.releases.isEmpty() && current.releaseWrites.size() < RELEASE_WRITE_LIMIT) {
+            int id = current.releases.getFirst();
             long ticket = ++nextTicket;
             if (sendRelease(ticket, id) != SendQueue.OfferResult.ACCEPTED) {
                 // Re-creation uses the regular quota; it must not wait for acknowledgement room.
                 break;
             }
-            releases.removeFirst();
-            releaseWrites.add(ticket);
-            unknownReleases.computeIfPresent(id, (_, admitted) -> admitted + 1);
+            current.releases.removeFirst();
+            current.releaseWrites.add(ticket);
+            current.unknownReleases.computeIfPresent(id, (_, admitted) -> admitted + 1);
         }
-        while (!deferred.isEmpty()) {
-            if (subscribingInFlight >= SUBSCRIBE_INFLIGHT_LIMIT) {
+        while (!current.deferred.isEmpty()) {
+            if (current.subscribingInFlight >= SUBSCRIBE_INFLIGHT_LIMIT) {
                 return;
             }
-            var local = (LocalSubscription) deferred.getFirst();
+            var local = (LocalSubscription) current.deferred.getFirst();
             if (!subscriptions.containsKey(local.id)) {
-                deferred.removeFirst();
+                current.deferred.removeFirst();
                 continue;
             }
             OptionalInt allocated = allocatePacketId();
@@ -966,7 +921,7 @@ final class SessionCore {
                 return;
             }
             int id = allocated.getAsInt();
-            subscribing.put(id, local);
+            current.subscribing.put(id, local);
             long ticket = ++nextTicket;
             SendQueue.OfferResult result = port.send(
                     generation,
@@ -975,15 +930,15 @@ final class SessionCore {
                     null
             );
             if (result == SendQueue.OfferResult.FULL) {
-                subscribing.remove(id);
+                current.subscribing.remove(id);
                 session.packetIds.release(id);
                 return;
             }
             if (result == SendQueue.OfferResult.ACCEPTED) {
-                responses.add(ticket, ResponseDeadlines.Kind.SUBACK, id);
+                current.responses.add(ticket, ResponseDeadlines.Kind.SUBACK, id);
             }
-            deferred.removeFirst();
-            subscribingInFlight++;
+            current.deferred.removeFirst();
+            current.subscribingInFlight++;
         }
     }
 
@@ -996,7 +951,7 @@ final class SessionCore {
         );
         if (result == SendQueue.OfferResult.ACCEPTED) {
             releasesFirst = false;
-            responses.add(ticket, ResponseDeadlines.Kind.PUBCOMP, packetId);
+            current.responses.add(ticket, ResponseDeadlines.Kind.PUBCOMP, packetId);
         }
         return result;
     }
@@ -1009,14 +964,14 @@ final class SessionCore {
 
     private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
         subscriptions.remove(local.id);
-        deferred.remove(local);
+        current.deferred.remove(local);
         port.removeSubscription(local.id, local.handle, cause);
     }
 
     private void finishRemoval(LocalSubscription local) {
         UnsubscribeOperation removal = local.removal;
         if (removal != null) {
-            queuedClosures.remove(removal);
+            current.queuedClosures.remove(removal);
             if (removal.operation != 0) {
                 port.complete(removal.operation, null, null);
             }
@@ -1046,7 +1001,7 @@ final class SessionCore {
         // exclusions into PacketIds if that adversarial bound becomes a throughput concern.
         for (int remaining = 65_535; remaining > 0; remaining--) {
             OptionalInt allocated = session.packetIds.allocate();
-            if (allocated.isEmpty() || !unknownReleases.containsKey(allocated.getAsInt())) {
+            if (allocated.isEmpty() || !current.unknownReleases.containsKey(allocated.getAsInt())) {
                 return allocated;
             }
             session.packetIds.release(allocated.getAsInt());
@@ -1106,15 +1061,15 @@ final class SessionCore {
                 // The receiver owns the body after PUBREC, but the id and count stay reserved
                 // until PUBCOMP. Replacing the entry drops the body and retains PUBREC order.
                 session.bytes -= publication.bytes;
-                deferred.remove(publication);
-                responses.answered(ResponseDeadlines.Kind.PUBREC, packetId);
+                current.deferred.remove(publication);
+                current.responses.answered(ResponseDeadlines.Kind.PUBREC, packetId);
                 session.inflight.putLast(packetId, new Release(packetId, publication.operation));
             }
             case Release pending -> {
                 // A PUBREL replay still waiting for capacity also answers this duplicate. The
                 // scan is bounded by 64 exchanges and 256 subscriptions; index it only if those
                 // limits grow.
-                if (deferred.contains(pending)) {
+                if (current.deferred.contains(pending)) {
                     return;
                 }
             }
@@ -1124,7 +1079,7 @@ final class SessionCore {
                     log.warn("Received PUBREC for unknown packet identifier {} on {}",
                             packetId, clientId);
                 }
-                unknownReleases.putIfAbsent(packetId, 0);
+                current.unknownReleases.putIfAbsent(packetId, 0);
             }
         }
         // DISCONNECT remains last. A persistent session still records the new stage so the
@@ -1132,21 +1087,21 @@ final class SessionCore {
         if (state == State.DISCONNECTING) {
             return;
         }
-        releases.add(packetId);
+        current.releases.add(packetId);
     }
 
     private void completed(int packetId) {
         Inflight inflight = session.inflight.get(packetId);
         if (inflight == null) {
-            Integer admitted = unknownReleases.get(packetId);
+            Integer admitted = current.unknownReleases.get(packetId);
             if (admitted != null && admitted > 1) {
                 // The answer to one of several PUBRELs for an unknown PUBREC.
-                unknownReleases.put(packetId, admitted - 1);
+                current.unknownReleases.put(packetId, admitted - 1);
             } else if (admitted != null) {
                 // The last answer to a PUBREL for an unknown PUBREC makes its id available.
-                unknownReleases.remove(packetId);
-                releases.remove(packetId);
-                responses.answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
+                current.unknownReleases.remove(packetId);
+                current.releases.remove(packetId);
+                current.responses.answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
             } else if (!unknownPubCompLogged) {
                 unknownPubCompLogged = true;
                 log.warn("Ignoring PUBCOMP for unknown packet identifier {} on {}",
@@ -1182,17 +1137,17 @@ final class SessionCore {
             session.packetIds.release(packetId);
             if (inflight instanceof Publication publication) {
                 session.bytes -= publication.bytes;
-                responses.answered(
+                current.responses.answered(
                         publication.qos == Qos.AT_LEAST_ONCE
                                 ? ResponseDeadlines.Kind.PUBACK
                                 : ResponseDeadlines.Kind.PUBREC,
                         packetId
                 );
             } else {
-                responses.answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
+                current.responses.answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
             }
-            deferred.remove(inflight);
-            releases.remove(packetId);
+            current.deferred.remove(inflight);
+            current.releases.remove(packetId);
         }
     }
 
@@ -1212,7 +1167,7 @@ final class SessionCore {
     }
 
     private void subscribed(Packet.SubAck ack) {
-        LocalSubscription local = subscribing.get(ack.packetId());
+        LocalSubscription local = current.subscribing.get(ack.packetId());
         if (local == null) {
             failed(generation, protocolError("Unexpected SUBACK"));
             return;
@@ -1228,11 +1183,11 @@ final class SessionCore {
                     + local.filter.pattern());
             return;
         }
-        subscribing.remove(ack.packetId());
-        responses.answered(ResponseDeadlines.Kind.SUBACK, ack.packetId());
+        current.subscribing.remove(ack.packetId());
+        current.responses.answered(ResponseDeadlines.Kind.SUBACK, ack.packetId());
         session.packetIds.release(ack.packetId());
         boolean restoring = local.confirmed;
-        subscribingInFlight--;
+        current.subscribingInFlight--;
         if (reason == ReasonCode.UNSPECIFIED_ERROR) {
             var refusal = new MqttSubscribeException(reason);
             if (!restoring) {
@@ -1270,15 +1225,15 @@ final class SessionCore {
     }
 
     private void unsubscribed(Packet.UnsubAck ack) {
-        UnsubscribeOperation pending = unsubscribing.get(ack.packetId());
+        UnsubscribeOperation pending = current.unsubscribing.get(ack.packetId());
         if (pending == null || !ack.reasonCodes().isEmpty()) {
             failed(generation, protocolError("Unexpected UNSUBACK"));
             return;
         }
-        unsubscribing.remove(ack.packetId());
-        responses.answered(ResponseDeadlines.Kind.UNSUBACK, ack.packetId());
+        current.unsubscribing.remove(ack.packetId());
+        current.responses.answered(ResponseDeadlines.Kind.UNSUBACK, ack.packetId());
         session.packetIds.release(ack.packetId());
-        closingInFlight--;
+        current.closingInFlight--;
         removeSubscription(pending.subscription, null);
         finishRemoval(pending.subscription);
     }
@@ -1307,21 +1262,21 @@ final class SessionCore {
                     if (earlier.stage() == Stage.WAITING_PUBREL) {
                         // A repeated PUBLISH is answered by a new or still pending PUBREC, but
                         // is never delivered again.
-                        acknowledgements.add(earlier, Kind.PUBREC);
+                        current.acknowledgements.add(earlier, Kind.PUBREC);
                         sendCapacityAvailable(generation);
                         return;
                     }
-                    if (acknowledgements.contains(earlier, kind)) {
+                    if (current.acknowledgements.contains(earlier, kind)) {
                         return;
                     }
                     // A continued reception joins this connection only when its resend arrives.
                     token = earlier.token();
                     continued = true;
-                    acknowledgements.add(earlier, kind);
+                    current.acknowledgements.add(earlier, kind);
                 } else {
                     session.received.supersede(packetId);
-                    if (acknowledgements.remove(earlier, Kind.PUBACK)
-                            || !acknowledgements.contains(earlier, Kind.PUBACK)) {
+                    if (current.acknowledgements.remove(earlier, Kind.PUBACK)
+                            || !current.acknowledgements.contains(earlier, Kind.PUBACK)) {
                         session.received.remove(earlier);
                         withdrawAcknowledgement(packetId, earlier.token());
                     }
@@ -1338,7 +1293,7 @@ final class SessionCore {
                     failed(generation, new MqttCapacityException("Acknowledgement capacity"));
                     return;
                 }
-                acknowledgements.add(added.orElseThrow(), kind);
+                current.acknowledgements.add(added.orElseThrow(), kind);
             }
         }
         var matches = new ArrayList<Long>();
@@ -1399,9 +1354,9 @@ final class SessionCore {
             }
             // A PUBREL makes queued duplicate PUBRECs obsolete. Writes already admitted keep
             // their immutable kind and capacity until their own completion notification.
-            acknowledgements.remove(entry, Kind.PUBREC);
+            current.acknowledgements.remove(entry, Kind.PUBREC);
             port.forgetDelivery(entry.token());
-        } else if (acknowledgements.completing(packetId)) {
+        } else if (current.acknowledgements.completing(packetId)) {
             return;
         } else {
             // An unknown PUBREL owns response capacity without occupying its packet identifier.
@@ -1417,7 +1372,7 @@ final class SessionCore {
             entry = added.orElseThrow();
         }
         session.received.complete(entry);
-        acknowledgements.add(entry, Kind.PUBCOMP);
+        current.acknowledgements.add(entry, Kind.PUBCOMP);
         sendCapacityAvailable(generation);
     }
 
@@ -1457,8 +1412,8 @@ final class SessionCore {
 
     private void sendAcknowledgements() {
         Optional<Acknowledgement> ready;
-        while (acknowledgements.writingCount() < ACK_WRITE_LIMIT
-                && (ready = acknowledgements.nextReady()).isPresent()) {
+        while (current.acknowledgements.writingCount() < ACK_WRITE_LIMIT
+                && (ready = current.acknowledgements.nextReady()).isPresent()) {
             Acknowledgement acknowledgement = ready.orElseThrow();
             ReceiveTable.Entry entry = acknowledgement.entry();
             long ticket = ++nextTicket;
@@ -1480,7 +1435,7 @@ final class SessionCore {
                 return;
             }
             releasesFirst = true;
-            acknowledgements.submitted(ticket);
+            current.acknowledgements.submitted(ticket);
             entry.submitted(receipt);
             if (entry.stage() == Stage.RECEIVING) {
                 port.releaseDelivery(entry.token());
@@ -1503,41 +1458,41 @@ final class SessionCore {
                 if (attempting()) {
                     String phase = !credentialsReady
                             ? "Credentials"
-                            : transportConnected ? "CONNACK" : "Transport connection";
+                            : current.transportConnected ? "CONNACK" : "Transport connection";
                     failed(connection, new TimeoutException(phase + " deadline expired"));
                 }
             }
             case KEEP_ALIVE -> {
                 if (state == State.CONNECTED) {
-                    long remaining = keepAlive.toNanos() - (now - lastSent);
-                    if (awaitingPing) {
+                    long remaining = keepAlive.toNanos() - (now - current.lastSent);
+                    if (current.awaitingPing) {
                         port.schedule(generation, Timer.KEEP_ALIVE, keepAlive);
                     } else if (remaining > 0) {
                         port.schedule(generation, Timer.KEEP_ALIVE, Duration.ofNanos(remaining));
                     } else {
-                        awaitingPing = true;
-                        pingTicket = ++nextTicket;
+                        current.awaitingPing = true;
+                        current.pingTicket = ++nextTicket;
                         // Include a stalled write in the deadline; otherwise it can wait forever.
                         port.schedule(generation, Timer.PING, keepAlive);
-                        if (sendRequired(pingTicket, new Packet.PingReq())) {
+                        if (sendRequired(current.pingTicket, new Packet.PingReq())) {
                             port.schedule(generation, Timer.KEEP_ALIVE, keepAlive);
                         }
                     }
                 }
             }
             case PING -> {
-                if (state == State.CONNECTED && awaitingPing) {
+                if (state == State.CONNECTED && current.awaitingPing) {
                     failed(connection, new TimeoutException("PINGRESP deadline expired"));
                 }
             }
             case DISCONNECT -> {
-                if (state == State.DISCONNECTING || sessionRefusal != null) {
+                if (state == State.DISCONNECTING || current.sessionRefusal != null) {
                     failed(connection, new TimeoutException("DISCONNECT write deadline expired"));
                 }
             }
             case STABLE -> {
                 if (state == State.CONNECTED) {
-                    long remaining = stableDeadline - now;
+                    long remaining = current.stableDeadline - now;
                     if (remaining > 0) {
                         port.schedule(generation, Timer.STABLE, Duration.ofNanos(remaining));
                     } else {
@@ -1547,10 +1502,10 @@ final class SessionCore {
             }
             case RESPONSE -> {
                 if (state == State.CONNECTED) {
-                    responses.expired(now).ifPresent(delay -> {
+                    current.responses.expired(now).ifPresent(delay -> {
                         if (delay.isZero()) {
                             failed(connection, new TimeoutException(
-                                    responses.headKind() + " deadline expired"
+                                    current.responses.headKind() + " deadline expired"
                             ));
                         } else {
                             port.schedule(generation, Timer.RESPONSE, delay);
@@ -1566,7 +1521,7 @@ final class SessionCore {
         port.schedule(
                 generation,
                 Timer.KEEP_ALIVE,
-                Duration.ofNanos(Math.max(0, keepAlive.toNanos() - (now - lastSent)))
+                Duration.ofNanos(Math.max(0, keepAlive.toNanos() - (now - current.lastSent)))
         );
     }
 
@@ -1608,11 +1563,11 @@ final class SessionCore {
         port.cancel(Timer.PING);
         port.cancel(Timer.STABLE);
         port.cancel(Timer.RESPONSE);
-        responses.clear();
-        awaitingPing = false;
-        disconnectTicket = ++nextTicket;
+        current.responses.clear();
+        current.awaitingPing = false;
+        current.disconnectTicket = ++nextTicket;
         port.schedule(generation, Timer.DISCONNECT, timeout);
-        sendRequired(disconnectTicket, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
+        sendRequired(current.disconnectTicket, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
     }
 
     private boolean sendRequired(long ticket, Packet packet) {
@@ -1656,7 +1611,11 @@ final class SessionCore {
                     state == State.DISCONNECTING;
         };
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
-        boolean established = established();
+        // The ended attempt or connection keeps only what this end still settles; anything that
+        // runs from here on sees fresh connection state.
+        Connection ended = current;
+        current = new Connection(responseTimeout);
+        boolean established = ended.ack != null;
         if (cause instanceof PacketDecodeException failure) {
             // Both listener notifications and pending operations expose the same public cause.
             cause = new MqttProtocolException(
@@ -1665,16 +1624,17 @@ final class SessionCore {
                     failure
             );
         }
-        if (sessionRefusal != null) {
+        MqttConnectException refusal = ended.sessionRefusal;
+        if (refusal != null) {
             // A failed DISCONNECT must not replace the reason this session was refused.
-            if (cause != null && cause != sessionRefusal) {
-                sessionRefusal.addSuppressed(cause);
+            if (cause != null && cause != refusal) {
+                refusal.addSuppressed(cause);
             }
-            cause = sessionRefusal;
+            cause = refusal;
         }
         try {
-            boolean retry = endConnection(cause, reason, shutdownRequested);
-            finishOperations(cause, permanent, retry, established);
+            boolean retry = endConnection(ended, cause, reason, shutdownRequested);
+            finishOperations(ended, cause, permanent, retry, established);
         } finally {
             // Shell teardown or a logging backend must not retain a closed client's payloads.
             if (permanent || cleanStart) {
@@ -1684,11 +1644,12 @@ final class SessionCore {
     }
 
     private boolean endConnection(
+            Connection ended,
             @Nullable Throwable cause,
             EndReason reason,
             boolean shutdownRequested
     ) {
-        boolean established = established();
+        boolean established = ended.ack != null;
         boolean waiting = state == State.RECONNECT_WAIT;
         boolean notifyEnd = switch (state) {
             case CONNECTING, CONNECTED, DISCONNECTING -> true;
@@ -1699,8 +1660,7 @@ final class SessionCore {
         for (var timer : Timer.values()) {
             port.cancel(timer);
         }
-        responses.clear();
-        boolean retry = shouldReconnect(cause, reason, shutdownRequested);
+        boolean retry = shouldReconnect(ended, cause, reason, shutdownRequested);
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
         Duration delay = null;
         if (retry) {
@@ -1723,12 +1683,6 @@ final class SessionCore {
             request.withdraw();
             port.connectionRequested(false);
         }
-        awaitingPing = false;
-        pingTicket = 0;
-        disconnectTicket = 0;
-        sessionRefusal = null;
-        sessionPresent = false;
-        currentAck = null;
         if (notifyEnd) {
             if (waiting) {
                 // The stopped wait reports and consumes the reserved next attempt number.
@@ -1747,7 +1701,6 @@ final class SessionCore {
             );
             reconcileReceptions(handedReadiness, true);
         }
-        acknowledgements.clear();
         if (permanent || cleanStart) {
             session.received.clear();
         }
@@ -1755,6 +1708,7 @@ final class SessionCore {
     }
 
     private boolean shouldReconnect(
+            Connection ended,
             @Nullable Throwable cause,
             EndReason reason,
             boolean shutdownRequested
@@ -1763,7 +1717,7 @@ final class SessionCore {
             return false;
         }
         // A retry would meet the same broker session, which the client cannot discard yet.
-        if (sessionRefusal != null) {
+        if (ended.sessionRefusal != null) {
             return false;
         }
         return request.retries(cause);
@@ -1796,6 +1750,7 @@ final class SessionCore {
     }
 
     private void finishOperations(
+            Connection ended,
             @Nullable Throwable cause,
             boolean permanent,
             boolean retry,
@@ -1817,27 +1772,19 @@ final class SessionCore {
                 }
             }
         }
-        for (long operation : publications.values()) {
+        for (long operation : ended.publications.values()) {
             port.complete(operation, null, pendingFailure);
         }
-        publications.clear();
         for (Inflight inflight : session.inflight.values()) {
             if (inflight.operation != 0) {
                 port.complete(inflight.operation, null, pendingFailure);
                 inflight.operation = 0;
             }
         }
-        subscribing.keySet().forEach(session.packetIds::release);
-        subscribing.clear();
-        unsubscribing.keySet().forEach(session.packetIds::release);
-        unsubscribing.clear();
-        queuedClosures.clear();
-        deferred.clear();
-        releases.clear();
-        releaseWrites.clear();
-        unknownReleases.clear();
-        subscribingInFlight = 0;
-        closingInFlight = 0;
+        // SUBSCRIBE and UNSUBSCRIBE return their borrowed identifiers. The rest of the ended
+        // connection, such as its queues and windows, goes with it.
+        ended.subscribing.keySet().forEach(session.packetIds::release);
+        ended.unsubscribing.keySet().forEach(session.packetIds::release);
         if (connecting != null) {
             if (!credentialsReady) {
                 port.cancelCredentials(connecting);
@@ -1920,6 +1867,53 @@ final class SessionCore {
         // trailing # wildcards allow adding another empty level to form the topic "/".
         return bytes <= 65535
                 && (bytes > 0 || firstLevelFlexible || (leftTail && rightTail));
+    }
+
+    // State owned by one attempt or connection. The session and the subscription registry outlive
+    // it; SUBSCRIBE and UNSUBSCRIBE borrow identifiers from the session only until it ends.
+    private static final class Connection {
+
+        // Session Present of this connection's CONNACK. Broker registrations can survive even
+        // when their last local operation was unconfirmed.
+        boolean sessionPresent;
+        // Present once a successful CONNACK has established this connection.
+        @Nullable ConnAck ack;
+        long stableDeadline;
+        long pingTicket;
+        long disconnectTicket;
+        long lastSent;
+        boolean transportConnected;
+        boolean connectSent;
+        boolean awaitingPing;
+        @Nullable MqttConnectException sessionRefusal;
+        final ResponseDeadlines responses;
+        // QoS 0 publications by ticket; they complete when their write completes.
+        final Map<Long, Long> publications = new HashMap<>();
+        final AckSequencer acknowledgements = new AckSequencer();
+        final Map<Integer, LocalSubscription> subscribing = new HashMap<>();
+        final Map<Integer, UnsubscribeOperation> unsubscribing = new HashMap<>();
+        // At most one removal per registered subscription; the registry supplies the total
+        // bound.
+        final ArrayDeque<UnsubscribeOperation> queuedClosures = new ArrayDeque<>();
+        // At most 64 retained publications and 256 broker registrations await queue admission.
+        final ArrayDeque<Deferred> deferred = new ArrayDeque<>();
+        // PUBREC responses have their own FIFO: an application's unready incoming
+        // acknowledgement must not block its outgoing publication. Coalescing by id bounds even
+        // unknown responses to the protocol's 65,535 identifiers.
+        final SequencedSet<Integer> releases = new LinkedHashSet<>();
+        // Tickets of PUBREC responses admitted to I/O whose write notification is still pending.
+        final Set<Long> releaseWrites = new HashSet<>();
+        // Unknown exchanges have no future or persistent state, but their PUBCOMP must not land
+        // on a new publication using the same id. Each id stays aside until disconnect, or until
+        // PUBCOMP has answered every PUBREL admitted for it; the value counts those PUBRELs.
+        // A repeated PUBREC can leave two answers in flight, and the first must not free the id.
+        final Map<Integer, Integer> unknownReleases = new HashMap<>();
+        int subscribingInFlight;
+        int closingInFlight;
+
+        Connection(Duration responseTimeout) {
+            responses = new ResponseDeadlines(responseTimeout);
+        }
     }
 
     // State owned by one session. A CONNACK without Session Present, permanent closure, or
