@@ -75,6 +75,10 @@ class SessionCoreTest {
             Duration.ofSeconds(60)
     );
 
+    // The time that interleaved chains pass to the core. Only the keep-alive step advances it,
+    // so the core never sees time run backwards.
+    private long now;
+
     @Test
     void credentials_precede_transport_creation_and_connect_waits_for_the_transport() {
         // Arrange
@@ -2163,7 +2167,8 @@ class SessionCoreTest {
     @MethodSource("seeds")
     void reordered_qos_one_events_complete_once_and_acknowledge_in_receive_order(int seed) {
         // Arrange: each chain keeps its own causal order, and the seed interleaves the chains.
-        // Some runs end the connection at a random point; later events then arrive stale.
+        // A keep-alive exchange always takes part, and some runs hold acknowledgements back for
+        // a while. Some runs end the connection at a random point; later events then arrive stale.
         var random = new Random(seed);
         connected();
         sut.subscribe(2, subscription("a/#"));
@@ -2174,7 +2179,24 @@ class SessionCoreTest {
         }
         var admitted = new ArrayList<Integer>();
         for (int id = 100; id < 104; id++) {
-            chains.add(receptionChain(id, random.nextBoolean() ? "a/b" : "other", admitted));
+            String topic = random.nextBoolean() ? "a/b" : "other";
+            chains.add(receptionChain(id, topic, admitted, random));
+        }
+        chains.add(new ArrayDeque<>(List.of(
+                () -> {
+                    now = seconds(10);
+                    sut.timer(1, KEEP_ALIVE, now);
+                },
+                () -> receive(1, new Packet.PingResp(), now)
+        )));
+        if (random.nextBoolean()) {
+            chains.add(new ArrayDeque<>(List.of(
+                    () -> port.ackSlots = 0,
+                    () -> {
+                        port.ackSlots = Integer.MAX_VALUE;
+                        sut.sendCapacityAvailable(1);
+                    }
+            )));
         }
         boolean terminates = random.nextBoolean();
         if (terminates) {
@@ -2204,10 +2226,18 @@ class SessionCoreTest {
         List<Integer> acknowledged = pubAckIds();
         assertThat(acknowledged).hasSizeLessThanOrEqualTo(admitted.size());
         assertThat(acknowledged).isEqualTo(admitted.subList(0, acknowledged.size()));
+        assertThat(port.forgotten).doesNotHaveDuplicates();
         if (!terminates) {
             assertThat(acknowledged).isEqualTo(admitted);
+            // Each PUBACK's write completion retires its reception.
+            assertThat(port.forgotten).hasSize(admitted.size());
+            // The keep-alive exchange sent one PINGREQ, and its PINGRESP ended the wait.
+            assertThat(port.sent).filteredOn(Packet.PingReq.class::isInstance).hasSize(1);
+            assertThat(port.timers).doesNotContainKey(PING);
         }
         assertThat(port.released).doesNotHaveDuplicates().hasSize(acknowledged.size());
+        // A retransmission joins its reception instead of reaching the handler again.
+        assertThat(port.deliveries).noneMatch(Received::dup);
     }
 
     static IntStream seeds() {
@@ -2863,12 +2893,12 @@ class SessionCoreTest {
         var exchange = new Exchange();
         Runnable written = () -> {
             if (exchange.packetId != 0) {
-                sut.sent(1, exchange.ticket, 0);
+                sut.sent(1, exchange.ticket, now);
             }
         };
         Runnable acknowledged = () -> {
             if (exchange.packetId != 0) {
-                receive(1, new Packet.PubAck(exchange.packetId, ReasonCode.SUCCESS, EMPTY), 0);
+                receive(1, new Packet.PubAck(exchange.packetId, ReasonCode.SUCCESS, EMPTY), now);
             }
         };
         var chain = new ArrayDeque<Runnable>();
@@ -2880,18 +2910,22 @@ class SessionCoreTest {
                 exchange.ticket = port.ticket;
             }
         });
-        chain.addAll(random.nextBoolean()
+        List<Runnable> completion = random.nextBoolean()
                 ? List.of(written, acknowledged)
-                : List.of(acknowledged, written));
+                : List.of(acknowledged, written);
+        chain.addAll(completion);
         return chain;
     }
 
-    /// Receives a QoS 1 publication, then reports its delivery readiness if it was routed.
-    /// Receptions while connected are admitted in this order, which PUBACKs must follow.
+    /// Receives a QoS 1 publication, reports its delivery readiness if it was routed, and then
+    /// completes the write of its PUBACK once it is sent. Some publications are retransmitted with
+    /// DUP before that write; each retransmission joins the original reception. Receptions while
+    /// connected are admitted in this order, which PUBACKs must follow.
     private ArrayDeque<Runnable> receptionChain(
             int packetId,
             String topic,
-            List<Integer> admitted
+            List<Integer> admitted,
+            Random random
     ) {
         var exchange = new Exchange();
         var chain = new ArrayDeque<Runnable>();
@@ -2900,14 +2934,39 @@ class SessionCoreTest {
                 admitted.add(packetId);
             }
             int routed = port.deliveries.size();
-            receive(1, qosOnePublication(packetId, topic, false), 0);
+            receive(1, qosOnePublication(packetId, topic, false), now);
             if (port.deliveries.size() > routed) {
                 exchange.token = port.deliveries.getLast().token();
             }
         });
-        chain.add(() -> {
+        Runnable ready = () -> {
             if (exchange.token != 0) {
                 sut.deliveryReady(exchange.token);
+            }
+        };
+        Runnable retransmission = () -> receive(1, qosOnePublication(packetId, topic, true), now);
+        if (random.nextBoolean()) {
+            List<Runnable> steps = random.nextBoolean()
+                    ? List.of(retransmission, ready)
+                    : List.of(ready, retransmission);
+            chain.addAll(steps);
+        } else {
+            chain.add(ready);
+        }
+        chain.add(new Runnable() {
+            // Bounds the retries, so a PUBACK that is never sent fails the assertions instead of
+            // looping.
+            private int attempts;
+
+            @Override
+            public void run() {
+                int position = pubAckIds().indexOf(packetId);
+                if (position >= 0) {
+                    sut.written(1, port.ackTickets.get(position));
+                } else if (sut.state() == CONNECTED && ++attempts < 1_000) {
+                    // An earlier reception or the full reserved quota still holds the PUBACK.
+                    chain.addFirst(this);
+                }
             }
         });
         return chain;
@@ -3079,6 +3138,7 @@ class SessionCoreTest {
         @Nullable TestSubscription registering;
         final List<Received> deliveries = new ArrayList<>();
         final List<Long> released = new ArrayList<>();
+        final List<Long> forgotten = new ArrayList<>();
         final List<Long> ackTickets = new ArrayList<>();
         int ackSlots = Integer.MAX_VALUE;
         boolean acceptRegistration = true;
@@ -3252,6 +3312,7 @@ class SessionCoreTest {
 
         @Override
         public void forgetDelivery(long token) {
+            forgotten.add(token);
         }
 
         @Override
