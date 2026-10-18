@@ -50,6 +50,8 @@ class DeliveryLanesTest {
 
     private final LinkedBlockingQueue<Long> ready = new LinkedBlockingQueue<>();
 
+    private final LinkedBlockingQueue<Long> terminated = new LinkedBlockingQueue<>();
+
     private final List<DeliveryLanes> managers = new ArrayList<>();
 
     private final List<CountDownLatch> releases = new ArrayList<>();
@@ -671,6 +673,7 @@ class DeliveryLanesTest {
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         sut.close(new IllegalStateException("internal failure"));
         assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+        assertThat(terminated).containsExactly(1L);
     }
 
     @Test
@@ -1640,12 +1643,27 @@ class DeliveryLanesTest {
 
         // Assert: the dispatcher exits after its running handler, receiving ends, and the queued
         // deliveries wait for close() to discard them.
-        await().until(() -> sut.retainedLanes() == 1);
+        assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
         assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
         assertThat(handled).containsExactly(message(1));
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
         sut.close(null);
         assertThat(sut.retainedDeliveries()).isZero();
+        assertThat(terminated.poll(5, SECONDS)).isEqualTo(2L);
+    }
+
+    @Test
+    void a_stopped_receiver_reports_termination_once() {
+        // Arrange
+        DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(4));
+
+        // Act
+        receiver.end(null);
+        receiver.end(null);
+        sut.close(null);
+
+        // Assert
+        assertThat(terminated).containsExactly(1L);
     }
 
     private record Failure(DeliveryToken token, Throwable cause) {
@@ -1686,7 +1704,8 @@ class DeliveryLanesTest {
                 "lane-test",
                 byteLimit,
                 onFailure,
-                onReady
+                onReady,
+                terminated::add
         );
         managers.add(manager);
         return manager;

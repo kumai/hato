@@ -169,7 +169,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// or application callbacks. Repeated calls have no effect. This also stops reconnection
     /// and fails pending connection requests and publications.
     /// No delivery is handed off after this returns: handlers start and receivers return only
-    /// for deliveries taken before. Those handlers may still run.
+    /// for deliveries taken before. Those handlers may still run; [Subscription#terminated()]
+    /// observes their end.
     /// Discards local session state; a persistent session may remain on the broker until a
     /// later client object with the same identifier replaces it on connecting.
     /// A Will registered with the broker may be published. For a graceful disconnect,

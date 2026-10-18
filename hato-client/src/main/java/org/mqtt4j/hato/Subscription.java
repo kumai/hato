@@ -132,11 +132,37 @@ public interface Subscription extends AutoCloseable {
     /// finish.
     CompletableFuture<Void> unsubscribe();
 
+    /// Observes the end of this subscription's local work without requesting it. The future
+    /// completes once no handler of this subscription is running and no delivery remains for it
+    /// to run or to hand to a receiver: after [#close()]; after [#unsubscribe()], once removal is
+    /// confirmed; after any other permanent end, such as a broker refusal; or after the client
+    /// closes. Beyond the removal confirmation that [#unsubscribe()] waits for, it does not wait
+    /// for the broker: after [#close()] it can complete before UNSUBACK, and it also completes
+    /// while disconnected. It does not wait for [MqttDelivery#ack()] of MANUAL deliveries
+    /// already handed off; their rules continue to apply.
+    ///
+    /// Each call returns an independent future; an already terminated subscription returns a
+    /// completed one. Pending observations share the client-wide limit described by
+    /// [#established()], and a full limit returns a future already failed with
+    /// [MqttCapacityException]; the future fails in no other way. A handler that never returns
+    /// keeps it pending.
+    ///
+    /// Start shutdown work for resources the handler uses from a continuation of this future.
+    /// Waiting for it inside this subscription's handler, or on a thread the handler needs in
+    /// order to return, never completes. The default implementation throws
+    /// [UnsupportedOperationException].
+    ///
+    /// @throws UnsupportedOperationException if this implementation cannot observe termination
+    default CompletableFuture<Void> terminated() {
+        throw new UnsupportedOperationException("This subscription does not observe termination");
+    }
+
     /// Permanently stops local delivery, discards queued messages, releases their
     /// acknowledgement conditions, and wakes waiting receivers. No delivery is handed off after
     /// this returns. Schedules broker removal without waiting for the broker or application code.
-    /// Running handlers may finish. Local closure does not acknowledge handed-off MANUAL
-    /// deliveries; their [MqttDelivery#ack()] rules continue to apply.
+    /// Running handlers may finish; [#terminated()] observes their end. Local closure does not
+    /// acknowledge handed-off MANUAL deliveries; their [MqttDelivery#ack()] rules continue to
+    /// apply.
     /// Calling close again has no further effect.
     /// A closed subscription is never re-created, including when closed while disconnected.
     ///

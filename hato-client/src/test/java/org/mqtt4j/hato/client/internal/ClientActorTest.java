@@ -4911,6 +4911,85 @@ class ClientActorTest {
     }
 
     @Test
+    void subscription_termination_waits_for_the_running_handler() throws Exception {
+        // Arrange: the subscription closes while its handler runs.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request(), _ -> {
+                entered.countDown();
+                waitFor(release);
+            });
+            establish(transport, subscription);
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            subscription.close();
+            CompletableFuture<Void> terminated = subscription.terminated();
+            CompletableFuture<Void> cancelled = subscription.terminated();
+            cancelled.cancel(false);
+            assertThat(terminated).isNotDone();
+
+            // Act
+            release.countDown();
+
+            // Assert: each call observes on its own; a later call finds termination complete.
+            terminated.get(5, SECONDS);
+            assertThat(terminated).isNotSameAs(cancelled);
+            assertThat(subscription.terminated()).isCompleted();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void subscriptions_terminate_when_the_client_closes() throws Exception {
+        // Arrange: push and pull subscriptions are established and idle.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription push = subscribe(sut, transport);
+            Subscription pull = subscribePull(
+                    sut,
+                    transport,
+                    Subscribe.of(new TopicFilter("pull"), Qos.AT_MOST_ONCE)
+            );
+            CompletableFuture<Void> pushTerminated = push.terminated();
+            CompletableFuture<Void> pullTerminated = pull.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert
+            pushTerminated.get(5, SECONDS);
+            pullTerminated.get(5, SECONDS);
+        }
+    }
+
+    @Test
+    void termination_observations_share_the_client_wide_waiter_limit() throws Exception {
+        // Arrange: pending establishment observations fill every waiter slot.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request(), _ -> { });
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
+            for (int i = 0; i < 1024; i++) {
+                subscription.established();
+            }
+
+            // Act
+            CompletableFuture<Void> refused = subscription.terminated();
+
+            // Assert: the refusal is immediate, and termination itself still completes later,
+            // once closing has failed the establishment observations and returned their slots.
+            assertThatThrownBy(refused::join).hasCauseInstanceOf(MqttCapacityException.class);
+            subscription.close();
+            await().until(() -> ((ClientActor) sut).usage().waiters() == 0);
+            subscription.terminated().get(5, SECONDS);
+        }
+    }
+
+    @Test
     void close_starts_one_removal_without_waiting_or_retaining_operation_slots()
             throws Exception {
         // Arrange

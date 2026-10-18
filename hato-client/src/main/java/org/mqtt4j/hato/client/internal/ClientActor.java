@@ -4,6 +4,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -150,6 +151,10 @@ public final class ClientActor implements MqttClient {
     // mailbox refuses only registrations beyond its queue bound.
     private final Map<Long, ClientSubscription> subscriptions = new ConcurrentHashMap<>();
 
+    // Handles whose lane may still run, guarded by lifecycleLock. A lane's termination finds its
+    // handle here after retirement has removed it from subscriptions.
+    private final Map<Long, ClientSubscription> unterminated = new HashMap<>();
+
     private final Map<Long, Operation<?>> operations = new ConcurrentHashMap<>();
 
     private final AtomicLong sequence = new AtomicLong();
@@ -224,7 +229,8 @@ public final class ClientActor implements MqttClient {
                 clientId,
                 receiveByteLimit(maxPacketSize),
                 this::deliveryFailed,
-                this::deliveryReady
+                this::deliveryReady,
+                this::laneTerminated
         );
         io = new ClientIo(
                 endpoint,
@@ -334,6 +340,7 @@ public final class ClientActor implements MqttClient {
             long id = sequence.incrementAndGet();
             subscription = new ClientSubscription(id, request, handler);
             subscriptions.put(id, subscription);
+            unterminated.put(id, subscription);
             Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
                     0,
                     () -> register(subscription),
@@ -545,6 +552,18 @@ public final class ClientActor implements MqttClient {
                 Mailbox.Kind.DELIVERY_READY,
                 0
         );
+    }
+
+    /// A lane runs and hands off nothing more. Called without the lanes' lock, from the lane's
+    /// exiting dispatcher or the thread that stopped a pull lane.
+    private void laneTerminated(long id) {
+        synchronized (lifecycleLock) {
+            ClientSubscription subscription = unterminated.get(id);
+            if (subscription != null) {
+                subscription.laneEnded = true;
+                subscription.checkTerminated();
+            }
+        }
     }
 
     /// Caller holds lifecycleLock. Public removal and local close share one durable request.
@@ -964,6 +983,10 @@ public final class ClientActor implements MqttClient {
                                 subscription.request,
                                 requireNonNull(subscription.handler)
                         );
+                if (admitted && subscription.receiver == null) {
+                    // Termination now waits for this push lane's dispatcher.
+                    subscription.laneStarted = true;
+                }
                 if (subscription.unsubscription != null) {
                     lanes.pause(id);
                 }
@@ -1251,11 +1274,24 @@ public final class ClientActor implements MqttClient {
 
         private boolean retired;
 
+        // Termination follows the local end once a started lane has ended: a push lane starts
+        // on admission, while a pull lane exists from creation.
+        private boolean ended;
+
+        private boolean laneStarted;
+
+        private boolean laneEnded;
+
+        private boolean terminated;
+
+        private final List<CompletableFuture<Void>> terminationWaiters = new ArrayList<>();
+
         ClientSubscription(long id, Subscribe request, @Nullable Consumer<MqttDelivery> handler) {
             this.id = id;
             this.request = request;
             this.handler = handler;
             receiver = handler == null ? lanes.receiver(id, request) : null;
+            laneStarted = receiver != null;
         }
 
         @Override
@@ -1301,6 +1337,7 @@ public final class ClientActor implements MqttClient {
         /// sees establishment fail also finds receiving ended. Without a cause the ending is
         /// ordinary.
         private void endLocally(@Nullable Throwable cause) {
+            ended = true;
             if (receiver != null) {
                 receiver.end(cause);
             } else {
@@ -1309,6 +1346,27 @@ public final class ClientActor implements MqttClient {
             endEstablishment(
                     cause != null ? cause : new IllegalStateException("Subscription is closed")
             );
+            checkTerminated();
+        }
+
+        /// Caller holds lifecycleLock. Termination follows the local end once a started lane has
+        /// ended, so no handler of this subscription runs and no delivery remains for it.
+        private void checkTerminated() {
+            if (!terminated && ended && (!laneStarted || laneEnded)) {
+                terminated = true;
+                unterminated.remove(id);
+                completeWaiters(terminationWaiters, null, null);
+            }
+        }
+
+        @Override
+        public CompletableFuture<Void> terminated() {
+            synchronized (lifecycleLock) {
+                if (terminated) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return observeFuture(terminationWaiters);
+            }
         }
 
         /// Caller holds lifecycleLock. A requested removal decides how this subscription ends.

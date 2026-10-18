@@ -14,6 +14,7 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 
 import org.jspecify.annotations.Nullable;
 
@@ -67,6 +68,13 @@ final class DeliveryLanes {
 
     private final Runnable onReady;
 
+    // Called once per lane, without the lock, when the lane can run and hand off nothing more:
+    // a push lane's dispatcher has exited, or a pull lane has stopped.
+    private final LongConsumer onTerminated;
+
+    // Pull lanes that stopped under the lock. Their terminations run after it is released.
+    private final List<Lane> terminatedReceivers = new ArrayList<>();
+
     // Set before the client's close() returns: no lane claims a delivery afterwards.
     private boolean handOffsClosed;
 
@@ -88,12 +96,14 @@ final class DeliveryLanes {
             String clientId,
             long byteLimit,
             BiPredicate<DeliveryToken, Throwable> onFailure,
-            Runnable onReady
+            Runnable onReady,
+            LongConsumer onTerminated
     ) {
         this.clientId = clientId;
         this.byteLimit = byteLimit;
         this.onFailure = onFailure;
         this.onReady = onReady;
+        this.onTerminated = onTerminated;
     }
 
     boolean register(long id, Subscribe request, Consumer<MqttDelivery> handler) {
@@ -208,6 +218,7 @@ final class DeliveryLanes {
         if (ready) {
             onReady.run();
         }
+        runTerminations();
     }
 
     /// The discarded session's receipt conditions end. A lane paused by one of its handler
@@ -334,6 +345,7 @@ final class DeliveryLanes {
         } finally {
             lock.unlock();
         }
+        runTerminations();
     }
 
     /// Caller holds lock. Running handlers retain their payload until they return.
@@ -586,7 +598,8 @@ final class DeliveryLanes {
     }
 
     /// The lane's dispatcher: its internal virtual thread, which takes the lane's deliveries in
-    /// receive order. Serial delivery executes each claim here, in place.
+    /// receive order. Serial delivery executes each claim here, in place. Its exit terminates the
+    /// lane: no handler of the lane runs afterwards.
     private void dispatch(Lane lane) {
         try {
             while (dispatchNext(lane)) {
@@ -599,6 +612,7 @@ final class DeliveryLanes {
             } finally {
                 lock.unlock();
             }
+            onTerminated.accept(lane.id);
         }
     }
 
@@ -767,13 +781,34 @@ final class DeliveryLanes {
             ready |= markReady(view);
             releaseView(view);
         }
-        // Pull lanes have no dispatcher to return this slot when it exits; the stopped guard above
-        // keeps this release single.
+        // Pull lanes have no dispatcher to return this slot or report termination when it exits;
+        // the stopped guard above keeps both single.
         if (lane.handler == null) {
             retainedLanes--;
+            terminatedReceivers.add(lane);
         }
         lane.ready.signalAll();
         return ready;
+    }
+
+    /// Reports the pull lanes that stopped under the lock. Call it without the lock: a report
+    /// completes subscription observations, which take the client's own lock. Callers announce
+    /// acknowledgement readiness first, as a push lane's dispatcher does before it exits.
+    private void runTerminations() {
+        List<Lane> ended;
+        lock.lock();
+        try {
+            if (terminatedReceivers.isEmpty()) {
+                return;
+            }
+            ended = List.copyOf(terminatedReceivers);
+            terminatedReceivers.clear();
+        } finally {
+            lock.unlock();
+        }
+        for (Lane lane : ended) {
+            onTerminated.accept(lane.id);
+        }
     }
 
     /// Pull capacity ends at handoff (or manual ack); the sequencer separately bounds wire ACKs.
@@ -815,6 +850,7 @@ final class DeliveryLanes {
                         ready = stop(lane);
                     } else {
                         lane.stopped = true;
+                        terminatedReceivers.add(lane);
                         lane.ready.signalAll();
                     }
                 }
@@ -824,6 +860,7 @@ final class DeliveryLanes {
             if (ready) {
                 onReady.run();
             }
+            runTerminations();
         }
 
         ReceiveResult receive() throws InterruptedException {

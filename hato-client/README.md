@@ -126,8 +126,9 @@ subscription.unsubscribe().join();
   `Subscribe.of(filter, qos).withBufferCapacity(4096)`.
 - `subscription.close()` stops delivery at once and drops queued messages without
   waiting for the broker. Use `unsubscribe()` when you need to know that the broker
-  has removed the subscription. The same filter can be registered again after removal
-  completes.
+  has removed the subscription. Either way, `subscription.terminated()` completes once the
+  subscription has ended and its last handler has returned. The same filter can be registered
+  again after removal completes.
 - `subscribe()` returns a handle immediately, even before `connect()`. Use
   `subscription.established()` to wait for broker acceptance and obtain the granted QoS; it
   also tells you when the broker refuses the subscription. Registrations survive connection
