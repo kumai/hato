@@ -275,7 +275,7 @@ final class Receptions {
         acknowledgements = new AckSequencer();
     }
 
-    void sessionReplaced() {
+    void sessionDiscarded() {
         received = new ReceiveTable(ACKNOWLEDGEMENT_LIMIT);
     }
 

@@ -1,18 +1,10 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
-import java.util.ArrayDeque;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
-import java.util.SequencedMap;
-import java.util.SequencedSet;
-import java.util.Set;
 import java.util.concurrent.TimeoutException;
 
 import org.jspecify.annotations.Nullable;
@@ -24,11 +16,9 @@ import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
-import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscribeException;
 import org.mqtt4j.hato.MqttVersion;
-import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
@@ -37,7 +27,6 @@ import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
-import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketIds;
 
@@ -46,6 +35,11 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// A single-owner state machine. Time is input; outputs are nonblocking commands.
 /// Operation tokens belong to the shell, which alone owns and completes futures.
+///
+/// The core keeps the connection's lifecycle and decides the order across three parts:
+/// [Publications] for outgoing exchanges, [Subscriptions] for registrations, and [Receptions]
+/// for incoming publications. The parts never call one another. They reach the core through
+/// [Context], and each replaces its own state of a connection or session that the core ends.
 final class SessionCore {
 
     /// DISCONNECTING follows an accepted disconnect(), both while its attempt still waits for
@@ -196,14 +190,17 @@ final class SessionCore {
 
         void releasePacketId(int packetId);
 
-        /// Sends queued work in the core's order: replays, PUBREC responses, then registrations.
+        /// Sends queued replays, PUBREC responses, and registrations, in that order.
         void drain();
 
-        /// Lets queued work use returned send capacity, in the core's order.
+        /// Lets acknowledgements, removals, and other queued work use returned send capacity.
         void sendCapacityAvailable();
 
         /// An acknowledgement took the reserved send quota, so PUBREL goes first next time.
         void acknowledgementAdmitted();
+
+        /// A PUBREL took the reserved send quota, so acknowledgements go first next time.
+        void releaseAdmitted();
 
         /// The registrations whose filter matches `topic`, except those being removed.
         List<Long> matching(Topic topic);
@@ -211,17 +208,7 @@ final class SessionCore {
 
     private static final Log log = Log.of(SessionCore.class);
 
-    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
-
-    private static final int INFLIGHT_LIMIT = 64;
-
     private static final Duration STABLE_CONNECTION = Duration.ofSeconds(30);
-
-    private static final long INFLIGHT_BYTE_LIMIT = 32L * 1024 * 1024;
-
-    // A broker can repeat PUBREC at will, so PUBREC responses bound their completion events in
-    // the same way. Replayed PUBRELs are already bounded by the session's exchanges.
-    private static final int RELEASE_WRITE_LIMIT = 16;
 
     private final Port port;
 
@@ -245,13 +232,16 @@ final class SessionCore {
 
     private final Subscriptions subscriptions;
 
+    private final Publications publications;
+
     private State state = State.DISCONNECTED;
 
     private long generation;
 
-    // State of the current connection, including one that its attempt is still opening. Ending
-    // the connection replaces it, so the next one starts from fresh values. The attempt's
-    // credentials and deadline stay outside, because an attempt can outlive a connection.
+    // The core's state of the current connection, including one that its attempt is still
+    // opening. Ending the connection replaces it, so the next one starts from fresh values; the
+    // parts replace their own. The attempt's credentials and deadline stay outside, because an
+    // attempt can outlive a connection.
     private Connection current;
 
     // The attempt waiting for its CONNACK, and null once a CONNACK establishes its connection
@@ -273,14 +263,6 @@ final class SessionCore {
     // Identifies the current session to delivery and mailbox code, which run outside the actor
     // and must not reach its state. Every replacement of the session advances it.
     private long sessionNumber = 1;
-
-    private boolean unknownPubAckLogged;
-
-    private boolean downgradedPubAckLogged;
-
-    private boolean unknownPubRecLogged;
-
-    private boolean unknownPubCompLogged;
 
     // Incoming acknowledgements and outgoing PUBREL share the reserved send quota. Returned
     // room goes first to the side that did not take the last slot, so neither can starve.
@@ -311,6 +293,7 @@ final class SessionCore {
         var context = new PartContext();
         receptions = new Receptions(port, context, clientId);
         subscriptions = new Subscriptions(port, context, cleanStart);
+        publications = new Publications(port, context, clientId, cleanStart);
     }
 
     State state() {
@@ -480,7 +463,7 @@ final class SessionCore {
                     }
                 } else {
                     receptions.reconcile(port.receiveState(), false);
-                    current.replays.addAll(session.inflight.values());
+                    publications.resume();
                 }
                 if (state == State.CONNECTING) {
                     state = State.CONNECTED;
@@ -489,6 +472,8 @@ final class SessionCore {
                 current.ack = result;
                 request.establish();
                 port.admit(generation);
+                // Reconcile before announcing, so connect() and onConnected already find continued
+                // subscriptions established on this connection.
                 subscriptions.connectionEstablished(ack.sessionPresent());
                 port.connected(generation, result);
                 port.cancel(Timer.CONNECT);
@@ -510,11 +495,11 @@ final class SessionCore {
         } else if (packet instanceof Packet.PubAck ack) {
             // Publication responses neither send nor close while disconnecting, so they can
             // progress without disturbing a pending shutdown.
-            acknowledged(ack);
+            publications.acknowledged(ack);
         } else if (packet instanceof Packet.PubRec ack) {
-            release(ack.packetId());
+            publications.release(ack.packetId());
         } else if (packet instanceof Packet.PubComp ack) {
-            completed(ack.packetId());
+            publications.completed(ack.packetId());
         } else if (state == State.DISCONNECTING) {
             // Other input already in flight cannot change a local shutdown's write/close sequence.
             return;
@@ -555,11 +540,7 @@ final class SessionCore {
                 port.schedule(generation, Timer.RESPONSE, delay);
             });
         }
-        Long publication = current.publications.remove(ticket);
-        if (publication != null) {
-            port.complete(publication, PublishResult.of(), null);
-        }
-        if (current.releaseWrites.remove(ticket)) {
+        if (publications.written(ticket)) {
             drainDeferred();
         }
         if (ticket == current.disconnectTicket) {
@@ -584,91 +565,7 @@ final class SessionCore {
     }
 
     void publish(long operation, MqttMessage message) {
-        if (!ready(operation)) {
-            return;
-        }
-        // Replays precede subscription restoration; SUBACK waiting does not block publication.
-        if (!current.replays.isEmpty()) {
-            capacityFailure(operation, "Publication replay pending");
-            return;
-        }
-        long ticket = ++nextTicket;
-        int packetId = 0;
-        SendReceipt receipt = null;
-        if (message.qos() != Qos.AT_MOST_ONCE) {
-            if (session.inflight.size() >= INFLIGHT_LIMIT) {
-                capacityFailure(operation, "Publication capacity");
-                return;
-            }
-            int byteCount = 0;
-            if (!cleanStart) {
-                long remaining = INFLIGHT_BYTE_LIMIT - session.bytes;
-                if (message.payloadSize() > remaining) {
-                    capacityFailure(operation, "Publication byte capacity");
-                    return;
-                }
-                byteCount = codec.encodePublishHeader(
-                        message.topic(),
-                        message.qos(),
-                        message.retain(),
-                        false,
-                        1,
-                        EMPTY,
-                        message.payloadSize()
-                )
-                        .length + message.payloadSize();
-                if (byteCount > remaining) {
-                    capacityFailure(operation, "Publication byte capacity");
-                    return;
-                }
-            }
-            OptionalInt allocated = allocatePacketId();
-            if (allocated.isEmpty()) {
-                capacityFailure(operation, "Packet identifier capacity");
-                return;
-            }
-            packetId = allocated.getAsInt();
-            var publication = new Publication(
-                    packetId,
-                    operation,
-                    message.qos(),
-                    cleanStart ? null : message,
-                    byteCount
-            );
-            session.inflight.put(packetId, publication);
-            session.bytes += byteCount;
-            receipt = publication.receipt;
-        } else {
-            current.publications.put(ticket, operation);
-        }
-        SendQueue.OfferResult result = port.publish(
-                generation,
-                ticket,
-                message,
-                packetId,
-                receipt
-        );
-        if (result == SendQueue.OfferResult.ACCEPTED) {
-            awaitPublication(ticket, message.qos(), packetId);
-        } else if (result == SendQueue.OfferResult.FULL) {
-            if (packetId == 0) {
-                current.publications.remove(ticket);
-            } else {
-                removeInflight(packetId);
-            }
-            capacityFailure(operation, "Send queue capacity");
-        }
-        // CLOSED waits for the connection's terminal notification, as do SUBSCRIBE/UNSUBSCRIBE.
-    }
-
-    private void awaitPublication(long ticket, Qos qos, int packetId) {
-        ResponseDeadlines responses = current.responses;
-        switch (qos) {
-            case AT_MOST_ONCE -> {
-            }
-            case AT_LEAST_ONCE -> responses.add(ticket, ResponseDeadlines.Kind.PUBACK, packetId);
-            case EXACTLY_ONCE -> responses.add(ticket, ResponseDeadlines.Kind.PUBREC, packetId);
-        }
+        publications.publish(operation, message);
     }
 
     void subscribe(long operation, Subscribe request) {
@@ -685,230 +582,26 @@ final class SessionCore {
         if (state != State.CONNECTED) {
             return;
         }
-        // Replay the single session order before fresh PUBREC responses. A duplicate PUBREC
-        // shares a PUBREL replay still waiting here instead of adding another response.
-        Inflight inflight;
-        while ((inflight = current.replays.peekFirst()) != null) {
-            if (session.inflight.get(inflight.packetId) != inflight) {
-                current.replays.removeFirst();
-                continue;
-            }
-            long ticket = ++nextTicket;
-            SendQueue.OfferResult result = switch (inflight) {
-                case Publication publication -> port.publish(
-                        generation,
-                        ticket,
-                        requireNonNull(publication.message),
-                        publication.packetId,
-                        requireNonNull(publication.receipt)
-                );
-                case Release release -> sendRelease(ticket, release.packetId);
-            };
-            if (result != SendQueue.OfferResult.ACCEPTED) {
-                return;
-            }
-            if (inflight instanceof Publication publication) {
-                awaitPublication(ticket, publication.qos, publication.packetId);
-            }
-            current.replays.removeFirst();
+        // A replay waiting for capacity holds back everything after it. PUBREC responses use
+        // the reserved quota, so registrations in the regular quota proceed even when they wait.
+        if (publications.replay()) {
+            publications.sendReleases();
+            subscriptions.sendRegistrations();
         }
-        while (!current.releases.isEmpty() && current.releaseWrites.size() < RELEASE_WRITE_LIMIT) {
-            int id = current.releases.getFirst();
-            long ticket = ++nextTicket;
-            if (sendRelease(ticket, id) != SendQueue.OfferResult.ACCEPTED) {
-                // Re-creation uses the regular quota; it must not wait for acknowledgement room.
-                break;
-            }
-            current.releases.removeFirst();
-            current.releaseWrites.add(ticket);
-            current.unknownReleases.computeIfPresent(id, (_, admitted) -> admitted + 1);
-        }
-        subscriptions.sendRegistrations();
-    }
-
-    private SendQueue.OfferResult sendRelease(long ticket, int packetId) {
-        SendQueue.OfferResult result = port.send(
-                generation,
-                ticket,
-                new Packet.PubRel(packetId, ReasonCode.SUCCESS, EMPTY),
-                null
-        );
-        if (result == SendQueue.OfferResult.ACCEPTED) {
-            releasesFirst = false;
-            current.responses.add(ticket, ResponseDeadlines.Kind.PUBCOMP, packetId);
-        }
-        return result;
-    }
-
-    private boolean ready(long operation) {
-        if (state == State.CLOSED) {
-            port.complete(operation, null, new IllegalStateException("Client is closed"));
-        } else if (state != State.CONNECTED) {
-            port.complete(operation, null, new MqttNotConnectedException());
-        } else {
-            return true;
-        }
-        return false;
-    }
-
-    private void capacityFailure(long operation, String message) {
-        port.complete(operation, null, new MqttCapacityException(message));
     }
 
     private OptionalInt allocatePacketId() {
-        // A PUBREL answering an unknown PUBREC has no session entry. Its id stays unavailable
-        // until PUBCOMP, including the time after I/O admitted the response.
-        // The cursor advances on every attempt, so the 65,535-id space bounds the scan; move
-        // exclusions into PacketIds if that adversarial bound becomes a throughput concern.
+        // Skip the ids that an unknown PUBREC holds until its PUBCOMP. The cursor advances on
+        // every attempt, so the 65,535-id space bounds the scan; move exclusions into PacketIds
+        // if that adversarial bound becomes a throughput concern.
         for (int remaining = 65_535; remaining > 0; remaining--) {
             OptionalInt allocated = session.packetIds.allocate();
-            if (allocated.isEmpty() || !current.unknownReleases.containsKey(allocated.getAsInt())) {
+            if (allocated.isEmpty() || !publications.holds(allocated.getAsInt())) {
                 return allocated;
             }
             session.packetIds.release(allocated.getAsInt());
         }
         return OptionalInt.empty();
-    }
-
-    private void acknowledged(Packet.PubAck ack) {
-        Inflight inflight = session.inflight.get(ack.packetId());
-        if (inflight == null) {
-            if (!unknownPubAckLogged) {
-                unknownPubAckLogged = true;
-                log.warn("Ignoring PUBACK for unknown packet identifier {} on {}",
-                        ack.packetId(), clientId);
-            }
-            return;
-        }
-        switch (inflight) {
-            case Release _ -> stageMismatch("PUBACK does not match the outgoing QoS stage");
-            case Publication publication when publication.qos == Qos.EXACTLY_ONCE ->
-                    downgraded(publication);
-            case Publication publication -> completePublication(publication);
-        }
-    }
-
-    /// Brokers without QoS 2, such as RabbitMQ with MQTT 3.1.1, accept a QoS 2 PUBLISH as QoS 1
-    /// and answer PUBACK. That ends the broker's exchange, possibly after delivering the message.
-    /// Only this publication fails: the connection stays, even while disconnecting, and a
-    /// persistent session does not resume the exchange or deliver the message again.
-    private void downgraded(Publication publication) {
-        if (!downgradedPubAckLogged) {
-            downgradedPubAckLogged = true;
-            log.warn("Broker accepted QoS 2 packet identifier {} at QoS 1 with PUBACK on {}",
-                    publication.packetId, clientId);
-        }
-        removeInflight(publication.packetId);
-        if (publication.operation != 0) {
-            port.complete(
-                    publication.operation,
-                    null,
-                    new MqttProtocolException(
-                            "PUBACK accepted a QoS 2 publication at QoS 1",
-                            ReasonCode.PROTOCOL_ERROR
-                    )
-            );
-        }
-    }
-
-    private void release(int packetId) {
-        Inflight inflight = session.inflight.get(packetId);
-        switch (inflight) {
-            case Publication publication -> {
-                if (publication.qos != Qos.EXACTLY_ONCE) {
-                    stageMismatch("PUBREC does not match the outgoing QoS stage");
-                    return;
-                }
-                // The receiver owns the body after PUBREC, but the id and count stay reserved
-                // until PUBCOMP. Replacing the entry drops the body and retains PUBREC order.
-                session.bytes -= publication.bytes;
-                current.replays.remove(publication);
-                current.responses.answered(ResponseDeadlines.Kind.PUBREC, packetId);
-                session.inflight.putLast(packetId, new Release(packetId, publication.operation));
-            }
-            case Release pending -> {
-                // A PUBREL replay still waiting for capacity also answers this duplicate. The
-                // scan is bounded by the 64 exchanges; index it only if that limit grows.
-                if (current.replays.contains(pending)) {
-                    return;
-                }
-            }
-            case null -> {
-                if (!unknownPubRecLogged) {
-                    unknownPubRecLogged = true;
-                    log.warn("Received PUBREC for unknown packet identifier {} on {}",
-                            packetId, clientId);
-                }
-                current.unknownReleases.putIfAbsent(packetId, 0);
-            }
-        }
-        // DISCONNECT remains last. A persistent session still records the new stage so the
-        // next connection continues with PUBREL, even though this one cannot send it.
-        if (state == State.DISCONNECTING) {
-            return;
-        }
-        current.releases.add(packetId);
-    }
-
-    private void completed(int packetId) {
-        Inflight inflight = session.inflight.get(packetId);
-        if (inflight == null) {
-            Integer admitted = current.unknownReleases.get(packetId);
-            if (admitted != null && admitted > 1) {
-                // The answer to one of several PUBRELs for an unknown PUBREC.
-                current.unknownReleases.put(packetId, admitted - 1);
-            } else if (admitted != null) {
-                // The last answer to a PUBREL for an unknown PUBREC makes its id available.
-                current.unknownReleases.remove(packetId);
-                current.releases.remove(packetId);
-                current.responses.answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
-            } else if (!unknownPubCompLogged) {
-                unknownPubCompLogged = true;
-                log.warn("Ignoring PUBCOMP for unknown packet identifier {} on {}",
-                        packetId, clientId);
-            }
-            return;
-        }
-        if (!(inflight instanceof Release)) {
-            stageMismatch("PUBCOMP does not match the outgoing QoS stage");
-            return;
-        }
-        completePublication(inflight);
-    }
-
-    private void stageMismatch(String message) {
-        // A pending DISCONNECT keeps its write and close sequence. The entry keeps its stage,
-        // and the connection end fails its future.
-        if (state != State.DISCONNECTING) {
-            failed(generation, protocolError(message));
-        }
-    }
-
-    private void completePublication(Inflight inflight) {
-        removeInflight(inflight.packetId);
-        if (inflight.operation != 0) {
-            port.complete(inflight.operation, PublishResult.of(), null);
-        }
-    }
-
-    private void removeInflight(int packetId) {
-        Inflight inflight = session.inflight.remove(packetId);
-        if (inflight != null) {
-            session.packetIds.release(packetId);
-            if (inflight instanceof Publication publication) {
-                session.bytes -= publication.bytes;
-                current.responses.answered(
-                        publication.qos == Qos.AT_LEAST_ONCE
-                                ? ResponseDeadlines.Kind.PUBACK
-                                : ResponseDeadlines.Kind.PUBREC,
-                        packetId
-                );
-            } else {
-                current.responses.answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
-            }
-            current.replays.remove(inflight);
-            current.releases.remove(packetId);
-        }
     }
 
     void deliveryReady(long token) {
@@ -937,6 +630,8 @@ final class SessionCore {
         if (connection != generation || state != State.CONNECTED) {
             return;
         }
+        // Incoming acknowledgements and PUBREL take turns at returned room in the reserved quota.
+        // Removals and the rest of the queued work use the regular quota.
         if (releasesFirst) {
             drainDeferred();
         }
@@ -1046,7 +741,7 @@ final class SessionCore {
                 completeConnections(null, new MqttConnectException("Connection request withdrawn"));
                 // Publications held for the withdrawn reconnection keep an unknown outcome; a
                 // persistent session retains their exchanges.
-                failPublications(new MqttConnectionLostException());
+                publications.failPublications(new MqttConnectionLostException());
                 port.complete(operation, null, null);
                 return;
             }
@@ -1114,8 +809,8 @@ final class SessionCore {
                     state == State.DISCONNECTING;
         };
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
-        // The ended connection keeps only what this end still settles; anything that runs from
-        // here on sees fresh connection state.
+        // The ended connection keeps only what this end still settles; the core sees fresh
+        // connection state from here on, and the parts replace theirs as they settle it below.
         Connection ended = current;
         current = new Connection(responseTimeout);
         if (cause instanceof PacketDecodeException failure) {
@@ -1252,17 +947,11 @@ final class SessionCore {
         var pendingFailure = (cause == null)
                 ? new MqttConnectionLostException()
                 : new MqttConnectionLostException(cause);
+        // Each part settles its state of the ended connection: registrations first, then
+        // publications, which a scheduled reconnection of a persistent session holds instead of
+        // failing.
         subscriptions.connectionEnded(permanent, cause);
-        // QoS 0 publications belong to the ended connection and are never replayed.
-        for (long operation : ended.publications.values()) {
-            port.complete(operation, null, pendingFailure);
-        }
-        // A scheduled reconnection keeps a persistent session's publications pending, and the
-        // next connection decides them: continuing completes their exchanges, and losing the
-        // session fails them. Otherwise their outcome stays unknown now.
-        if (!retry || cleanStart) {
-            failPublications(pendingFailure);
-        }
+        publications.connectionEnded(retry && !cleanStart, pendingFailure);
         receptions.connectionEnded();
         if (connecting != null) {
             if (!credentialsReady) {
@@ -1288,23 +977,11 @@ final class SessionCore {
         }
     }
 
-    /// Fails the futures of the session's QoS 1 and QoS 2 publications with an unknown outcome.
-    /// Their exchanges stay for a later connection unless the session goes too.
-    private void failPublications(Throwable failure) {
-        for (Inflight inflight : session.inflight.values()) {
-            if (inflight.operation != 0) {
-                port.complete(inflight.operation, null, failure);
-                inflight.operation = 0;
-            }
-        }
-    }
-
     private void discardSession() {
-        // Publications still waiting for the discarded exchanges have an unknown outcome.
-        failPublications(new MqttConnectionLostException());
+        publications.sessionDiscarded();
+        receptions.sessionDiscarded();
         boolean established = session.established;
         session = new Session();
-        receptions.sessionReplaced();
         port.sessionChanged(++sessionNumber);
         // Every clean connection starts and discards a session; only persistent ones are news.
         if (established && !cleanStart) {
@@ -1374,6 +1051,11 @@ final class SessionCore {
         }
 
         @Override
+        public void releaseAdmitted() {
+            releasesFirst = false;
+        }
+
+        @Override
         public List<Long> matching(Topic topic) {
             return subscriptions.matching(topic);
         }
@@ -1394,21 +1076,6 @@ final class SessionCore {
         boolean awaitingPing;
         @Nullable MqttConnectException sessionRefusal;
         final ResponseDeadlines responses;
-        // QoS 0 publications by ticket; they complete when their write completes.
-        final Map<Long, Long> publications = new HashMap<>();
-        // At most 64 retained publications await queue admission, in the session's order.
-        final ArrayDeque<Inflight> replays = new ArrayDeque<>();
-        // PUBREC responses have their own FIFO: an application's unready incoming
-        // acknowledgement must not block its outgoing publication. Coalescing by id bounds even
-        // unknown responses to the protocol's 65,535 identifiers.
-        final SequencedSet<Integer> releases = new LinkedHashSet<>();
-        // Tickets of PUBREC responses admitted to I/O whose write notification is still pending.
-        final Set<Long> releaseWrites = new HashSet<>();
-        // Unknown exchanges have no future or persistent state, but their PUBCOMP must not land
-        // on a new publication using the same id. Each id stays aside until disconnect, or until
-        // PUBCOMP has answered every PUBREL admitted for it; the value counts those PUBRELs.
-        // A repeated PUBREC can leave two answers in flight, and the first must not free the id.
-        final Map<Integer, Integer> unknownReleases = new HashMap<>();
 
         Connection(Duration responseTimeout) {
             responses = new ResponseDeadlines(responseTimeout);
@@ -1421,53 +1088,8 @@ final class SessionCore {
     private static final class Session {
 
         final PacketIds packetIds = new PacketIds();
-        // PUBLISH entries retain send order; replacing one with PUBREL moves it to the end in
-        // PUBREC order. Both stages share the identifier and count window across connections.
-        final SequencedMap<Integer, Inflight> inflight = new LinkedHashMap<>();
         // A CONNACK without Session Present started this session; only then can a later
         // Session Present continue it.
         boolean established;
-        // Retained PUBLISH wire sizes, counted only for a persistent session until PUBACK/REC.
-        long bytes;
-    }
-
-    private abstract static sealed class Inflight {
-
-        final int packetId;
-        long operation;
-
-        Inflight(int packetId, long operation) {
-            this.packetId = packetId;
-            this.operation = operation;
-        }
-    }
-
-    private static final class Publication extends Inflight {
-
-        final Qos qos;
-        final @Nullable MqttMessage message;
-        final int bytes;
-        final @Nullable SendReceipt receipt;
-
-        Publication(
-                int packetId,
-                long operation,
-                Qos qos,
-                @Nullable MqttMessage message,
-                int bytes
-        ) {
-            super(packetId, operation);
-            this.qos = qos;
-            this.message = message;
-            this.bytes = bytes;
-            receipt = message == null ? null : new SendReceipt();
-        }
-    }
-
-    private static final class Release extends Inflight {
-
-        Release(int packetId, long operation) {
-            super(packetId, operation);
-        }
     }
 }
