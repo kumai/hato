@@ -75,6 +75,8 @@ final class DeliveryLanes {
 
     private long discardedDeliveries;
 
+    private long handledDeliveries;
+
     DeliveryLanes(
             String clientId,
             long byteLimit,
@@ -537,6 +539,18 @@ final class DeliveryLanes {
         }
     }
 
+    /// Counts handler runs that returned normally, including MANUAL deliveries not yet acked.
+    /// The count changes under the same lock as the acknowledgement condition and capacity that
+    /// the return updates, so a caller that sees it sees them too; `onReady` may still follow.
+    long handledDeliveries() {
+        lock.lock();
+        try {
+            return handledDeliveries;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void run(Lane lane) {
         try {
             while (runNext(lane)) {
@@ -584,6 +598,7 @@ final class DeliveryLanes {
                 view.localDone = true;
                 ready = lane.ackMode == AckMode.AFTER_HANDLER && markReady(view);
                 releaseView(view);
+                handledDeliveries++;
             } finally {
                 lock.unlock();
             }

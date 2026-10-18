@@ -1189,20 +1189,17 @@ class DeliveryLanesTest {
     @Test
     void manual_ack_is_once_only_and_keeps_capacity_until_the_sequencer_releases_it()
             throws Exception {
-        // Arrange: the handler returns without acknowledging its delivery.
+        // Arrange: the handler returns without acknowledging its delivery, and the lane has
+        // updated the acknowledgement condition and capacity for that return.
         var received = new LinkedBlockingQueue<MqttDelivery>();
-        var workers = new LinkedBlockingQueue<Thread>();
-        assertThat(sut.register(1, request(AckMode.MANUAL, 1), delivery -> {
-            workers.add(Thread.currentThread());
-            received.add(delivery);
-        })).isTrue();
+        assertThat(sut.register(1, request(AckMode.MANUAL, 1), received::add)).isTrue();
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), true, 10)).isTrue();
         MqttDelivery delivery = requireNonNull(received.poll(5, SECONDS));
-        Thread worker = requireNonNull(workers.poll(5, SECONDS));
-        await().until(() -> worker.getState() == Thread.State.WAITING);
+        await().until(() -> sut.handledDeliveries() == 1);
 
         // Assert: normal return neither acknowledges nor releases MANUAL delivery capacity.
         assertThat(delivery.dup()).isTrue();
+        assertThat(sut.isReady(10)).isFalse();
         assertThat(ready).isEmpty();
         assertThat(sut.retainedBytes()).isEqualTo(10);
         assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 10)).isFalse();
@@ -1368,21 +1365,16 @@ class DeliveryLanesTest {
             throws Exception {
         // Arrange: the first handler returns without ack; the second still owns its payload.
         var completed = new LinkedBlockingQueue<MqttDelivery>();
-        var workers = new LinkedBlockingQueue<Thread>();
         var running = new LinkedBlockingQueue<MqttDelivery>();
         CountDownLatch release = release();
-        assertThat(sut.register(1, request(AckMode.MANUAL, 1), delivery -> {
-            workers.add(Thread.currentThread());
-            completed.add(delivery);
-        })).isTrue();
+        assertThat(sut.register(1, request(AckMode.MANUAL, 1), completed::add)).isTrue();
         assertThat(sut.register(2, request(AckMode.MANUAL, 1), delivery -> {
             running.add(delivery);
             waitFor(release);
         })).isTrue();
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
         MqttDelivery finished = requireNonNull(completed.poll(5, SECONDS));
-        Thread worker = requireNonNull(workers.poll(5, SECONDS));
-        await().until(() -> worker.getState() == Thread.State.WAITING);
+        await().until(() -> sut.handledDeliveries() == 1);
         assertThat(sut.deliver(token(1, 11), List.of(2L), qosOneMessage(), false, 20)).isTrue();
         MqttDelivery executing = requireNonNull(running.poll(5, SECONDS));
 
