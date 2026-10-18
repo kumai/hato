@@ -135,10 +135,13 @@ class DistributionTest {
             }
             """;
     private static final String CONNECTION_PROBE = """
+            var ended =
+                    new java.util.concurrent.LinkedBlockingQueue<org.mqtt4j.hato.Disconnection>();
             try (var broker = org.mqtt4j.hato.broker.MqttBroker.start();
                     org.mqtt4j.hato.MqttClient sut = org.mqtt4j.hato.MqttClient.builder()
                             .server(java.net.URI.create("mqtt://localhost:" + broker.port()))
                             .version(org.mqtt4j.hato.MqttVersion.V3_1_1)
+                            .connectionListener(ended::add)
                             .build()) {
                 org.mqtt4j.hato.ConnAck connAck = sut.connect()
                         .get(5, java.util.concurrent.TimeUnit.SECONDS);
@@ -155,24 +158,23 @@ class DistributionTest {
                 org.mqtt4j.hato.Subscription push = subscriber.subscribe(
                         org.mqtt4j.hato.Subscribe.of(
                                 new org.mqtt4j.hato.TopicFilter("probe/push"),
-                                org.mqtt4j.hato.Qos.AT_LEAST_ONCE
+                                org.mqtt4j.hato.Qos.EXACTLY_ONCE
                         ),
                         delivery -> handled.add(delivery.message())
                 );
                 org.mqtt4j.hato.Subscription pull = subscriber.subscribe(
                         org.mqtt4j.hato.Subscribe.of(
                                 new org.mqtt4j.hato.TopicFilter("probe/pull"),
-                                org.mqtt4j.hato.Qos.AT_LEAST_ONCE
+                                org.mqtt4j.hato.Qos.EXACTLY_ONCE
                         ).withAckMode(org.mqtt4j.hato.AckMode.MANUAL)
                 );
                 push.established().get(5, java.util.concurrent.TimeUnit.SECONDS);
                 pull.established().get(5, java.util.concurrent.TimeUnit.SECONDS);
 
-                // Act & Assert: QoS 0 and 1 reach the handler and the receiving thread intact.
-                for (var qos : java.util.List.of(
-                        org.mqtt4j.hato.Qos.AT_MOST_ONCE,
-                        org.mqtt4j.hato.Qos.AT_LEAST_ONCE
-                )) {
+                // Act & Assert: every QoS level reaches the handler and the receiving thread
+                // intact, QoS included, because the subscriptions request QoS 2 and the broker
+                // grants it.
+                for (var qos : org.mqtt4j.hato.Qos.values()) {
                     var pushed = org.mqtt4j.hato.MqttMessage.of(
                             new org.mqtt4j.hato.Topic("probe/push"),
                             new byte[] {42},
@@ -205,6 +207,12 @@ class DistributionTest {
                     throw new AssertionError("A removed subscription kept receiving");
                 }
                 sut.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                // Removal and disconnect also complete without a connection, so only the
+                // listener shows that the connection lasted until the requested disconnect.
+                if (!org.mqtt4j.hato.Disconnection.of(null, true, 1)
+                        .equals(ended.poll(5, java.util.concurrent.TimeUnit.SECONDS))) {
+                    throw new AssertionError("The connection ended before the disconnect");
+                }
             }
             """;
 

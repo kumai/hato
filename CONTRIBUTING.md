@@ -102,7 +102,7 @@ before merge. Run the ones that match what you changed.
 | Anything | `./gradlew build` |
 | One module | `./gradlew :hato-client:check` (substitute the module name) |
 | `build-logic/`, `settings.gradle.kts`, or `gradle/libs.versions.toml` | `./gradlew build :build-logic:check` |
-| Anything that could affect native-image compatibility | `./gradlew :native-smoke:nativeCompile` (needs a GraalVM JDK 25) |
+| Anything that could affect native-image compatibility | `./gradlew :native-smoke:nativeRun` (needs a GraalVM JDK 25) |
 
 `./gradlew build` compiles with every javac lint on, `-Werror`, and NullAway,
 checks the sources with Checkstyle, and runs the unit tests, the integration

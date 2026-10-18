@@ -45,4 +45,9 @@ jobs:
         with:
           validate-wrappers: true
       - run: ./gradlew :native-smoke:nativeCompile
-      - run: ./native-smoke/build/native/nativeCompile/hato-native-smoke
+      # The smoke reads the public test identities for its TLS round trip at run time. It takes
+      # seconds; the limit stops a hang in the image long before the job's default timeout.
+      - timeout-minutes: 5
+        run: |
+          ./native-smoke/build/native/nativeCompile/hato-native-smoke \
+            test-support/src/main/resources/tls
