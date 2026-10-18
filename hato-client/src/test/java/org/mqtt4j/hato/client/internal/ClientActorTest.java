@@ -4282,8 +4282,10 @@ class ClientActorTest {
             );
             establish(transport, subscription);
             // Attach the continuation before the write completes, so it blocks a completion
-            // thread rather than this one.
+            // thread rather than this one. The transport is slow to close, so it keeps owning
+            // a stalled write after the connection ends.
             transport.completeSends = false;
+            transport.deferCloseReport = true;
             CompletableFuture<Void> continuation = sut.publish(message(new byte[] {3}))
                     .thenRun(() -> waitFor(release));
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
@@ -4316,7 +4318,7 @@ class ClientActorTest {
             assertThat(actor.usage().sends()).isEqualTo(1);
 
             // Act: the transport's final callback releases the stalled write.
-            transport.receiver().onClosed(new IOException("Transport closed"));
+            transport.finishClose();
 
             // Assert: both subscriptions remain; only the running handler retains a delivery.
             var held = new ClientActor.Usage(1, 1, 0, 0, 0, 0, 2, 1, 13, 0);

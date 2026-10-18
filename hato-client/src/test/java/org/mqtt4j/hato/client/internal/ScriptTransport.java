@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -17,7 +18,9 @@ import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// A scripted transport for client tests: it records decoded sends, completes them unless told
-/// not to, and lets a test feed packets and connection events to the client.
+/// not to, and lets a test feed packets and connection events to the client. Like a real
+/// transport, a started one reports its close once; received bytes and that report are
+/// serialized.
 final class ScriptTransport implements Transport {
 
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
@@ -34,17 +37,23 @@ final class ScriptTransport implements Transport {
     volatile long pendingTicket;
     @Nullable Throwable startFailure;
     Duration startTimeout = Duration.ZERO;
+    // When set, close() leaves its report to finishClose(), as a transport still closing would.
+    volatile boolean deferCloseReport;
 
     Listener receiver() {
         return requireNonNull(listener);
     }
 
-    void receive(Packet packet) {
+    synchronized void receive(Packet packet) {
         receiver().onBytes(codec.encode(packet));
     }
 
-    void accept() {
+    synchronized void accept() {
         receiver().onBytes(codec.encode(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY)));
+    }
+
+    synchronized void finishClose() {
+        receiver().onClosed(new IOException("Transport closed"));
     }
 
     void completeSend() {
@@ -93,7 +102,14 @@ final class ScriptTransport implements Transport {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
+        if (closed) {
+            return;
+        }
         closed = true;
+        Listener current = listener;
+        if (current != null && !deferCloseReport) {
+            current.onClosed(new IOException("Transport closed"));
+        }
     }
 }
