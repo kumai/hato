@@ -157,7 +157,7 @@ final class Mailbox {
             case COMMAND -> commandCount >= commandLimit
                     || event.bytes() > commandByteLimit - commandBytes;
             // One burst can queue the core's whole registration limit without operation capacity.
-            case REGISTRATION -> registrationCount >= SessionCore.REGISTRATION_LIMIT;
+            case REGISTRATION -> registrationCount >= Subscriptions.REGISTRATION_LIMIT;
             case INCOMING -> incomingCount >= incomingLimit
                     || event.bytes() > incomingByteLimit - incomingBytes;
             case CONTROL -> controlCount >= controlLimit;
