@@ -21,9 +21,9 @@ public sealed interface ReceiveResult {
     record TimedOut() implements ReceiveResult {
     }
 
-    /// The subscription ended through its close, successful unsubscribe, or [MqttClient#close()].
-    /// No subsequent receive on this handle can deliver a message, including after the client
-    /// reconnects.
+    /// The subscription ended through its close, a successful unsubscribe once the deliveries it
+    /// accepted have been received, or [MqttClient#close()]. No subsequent receive on this handle
+    /// can deliver a message, including after the client reconnects.
     record Ended() implements ReceiveResult {
     }
 }

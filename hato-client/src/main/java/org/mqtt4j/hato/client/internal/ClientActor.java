@@ -873,7 +873,7 @@ public final class ClientActor implements MqttClient {
             synchronized (lifecycleLock) {
                 if (subscription.retired || subscription.removalRequested()) {
                     // The first ending decides; a requested removal only waited for this answer.
-                    retire(subscription, null);
+                    retire(subscription, null, !subscription.locallyClosed);
                     return;
                 }
                 retire(subscription, failure);
@@ -1060,7 +1060,10 @@ public final class ClientActor implements MqttClient {
                     ending = cause;
                 }
                 unrequested = !closed && ending != null && !subscription.retired;
-                retire(subscription, ending);
+                // Confirming unsubscribe() lets the deliveries it accepted finish; local closure
+                // has already discarded them.
+                boolean drain = !closed && ending == null && !subscription.locallyClosed;
+                retire(subscription, ending, drain);
             }
             if (unrequested) {
                 logEnding(subscription, requireNonNull(cause));
@@ -1237,13 +1240,19 @@ public final class ClientActor implements MqttClient {
     }
 
     private void retire(ClientSubscription subscription, @Nullable Throwable cause) {
+        retire(subscription, cause, false);
+    }
+
+    /// With `drain`, deliveries the subscription had already accepted still run or can still be
+    /// received; otherwise they are discarded.
+    private void retire(ClientSubscription subscription, @Nullable Throwable cause, boolean drain) {
         synchronized (lifecycleLock) {
             if (subscription.retired) {
                 return;
             }
             subscription.retired = true;
             subscriptions.remove(subscription.id);
-            subscription.endLocally(cause);
+            subscription.endLocally(cause, drain);
         }
     }
 
@@ -1334,12 +1343,19 @@ public final class ClientActor implements MqttClient {
         }
 
         /// Caller holds lifecycleLock. Ends local delivery before establishment, so a caller that
-        /// sees establishment fail also finds receiving ended. Without a cause the ending is
-        /// ordinary.
-        private void endLocally(@Nullable Throwable cause) {
+        /// sees establishment fail finds no further delivery admitted. Without `drain`, receiving
+        /// also has ended; with it, the deliveries accepted before the end still run or can still
+        /// be received. Without a cause the ending is ordinary.
+        private void endLocally(@Nullable Throwable cause, boolean drain) {
             ended = true;
             if (receiver != null) {
-                receiver.end(cause);
+                if (drain) {
+                    receiver.finish();
+                } else {
+                    receiver.end(cause);
+                }
+            } else if (drain) {
+                lanes.finish(id);
             } else {
                 lanes.remove(id, cause);
             }
@@ -1395,9 +1411,13 @@ public final class ClientActor implements MqttClient {
         @Override
         public CompletableFuture<Void> unsubscribe() {
             synchronized (lifecycleLock) {
-                if (stopping.get() || retired) {
+                if (stopping.get()) {
                     // Discards deliveries still queued here; a running handler finishes.
-                    endLocally(permanentFailure());
+                    endLocally(permanentFailure(), false);
+                    return CompletableFuture.completedFuture(null);
+                }
+                if (retired) {
+                    // Deliveries an earlier confirmed removal accepted may still be finishing.
                     return CompletableFuture.completedFuture(null);
                 }
 
@@ -1415,7 +1435,7 @@ public final class ClientActor implements MqttClient {
                 locallyClosed = true;
                 // Stop locally before scheduling the independently bounded broker removal.
                 // A handed-off MANUAL delivery retains its own acknowledgement obligation.
-                endLocally(permanentFailure());
+                endLocally(permanentFailure(), false);
                 if (!stopping.get() && !retired) {
                     requestRemoval(this);
                 }

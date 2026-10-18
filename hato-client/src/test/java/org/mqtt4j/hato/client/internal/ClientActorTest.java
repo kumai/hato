@@ -4717,6 +4717,78 @@ class ClientActorTest {
     }
 
     @Test
+    void a_refusal_after_unsubscribe_leaves_the_accepted_delivery_receivable() throws Exception {
+        // Arrange: a delivery arrives before SUBACK, and removal is requested while it waits.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request());
+            var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(publication(new byte[] {1}));
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 1);
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+
+            // Act
+            transport.receive(new Packet.SubAck(
+                    subscribe.packetId(),
+                    List.of(ReasonCode.UNSPECIFIED_ERROR),
+                    EMPTY
+            ));
+
+            // Assert: the refusal confirms removal without discarding the accepted delivery.
+            removing.get(5, SECONDS);
+            assertThat(received(subscription.receive(Duration.ZERO)).message())
+                    .isEqualTo(message(new byte[] {1}));
+            subscription.terminated().get(5, SECONDS);
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+        }
+    }
+
+    @Test
+    void a_recreation_refused_after_unsubscribe_leaves_the_accepted_delivery_receivable()
+            throws Exception {
+        // Arrange: re-creation awaits its SUBACK when a delivery arrives and removal is requested.
+        var refused = new LinkedBlockingQueue<Subscription>();
+        var listener = new ConnectionListener() {
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                ends.add(disconnection);
+            }
+
+            @Override
+            public void onResubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+                refused.add(handle);
+            }
+        };
+        try (MqttClient client = client(listener)) {
+            var sut = (ClientActor) client;
+            ScriptTransport first = connect(sut);
+            Subscription subscription = subscribePull(sut, first, request());
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            ScriptTransport current = connect(sut);
+            var packet = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
+            current.receive(publication(new byte[] {1}));
+            await().until(() -> sut.usage().deliveries() == 1);
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+
+            // Act
+            current.receive(new Packet.SubAck(
+                    packet.packetId(),
+                    List.of(ReasonCode.UNSPECIFIED_ERROR),
+                    EMPTY
+            ));
+
+            // Assert: the requested removal decides the ending and keeps the accepted delivery.
+            removing.get(5, SECONDS);
+            assertThat(received(subscription.receive(Duration.ZERO)).message())
+                    .isEqualTo(message(new byte[] {1}));
+            subscription.terminated().get(5, SECONDS);
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+            assertThat(refused).isEmpty();
+        }
+    }
+
+    @Test
     @SuppressWarnings("try") // Closing while the refusal's DISCONNECT waits is under test.
     void closing_during_a_session_refusal_ends_subscriptions_as_an_ordinary_close()
             throws Exception {
@@ -4937,6 +5009,110 @@ class ClientActorTest {
             terminated.get(5, SECONDS);
             assertThat(terminated).isNotSameAs(cancelled);
             assertThat(subscription.terminated()).isCompleted();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void unsubscribe_runs_the_deliveries_it_accepted_after_removal_is_confirmed()
+            throws Exception {
+        // Arrange: one delivery runs and another waits when removal is requested.
+        var handled = new LinkedBlockingQueue<Byte>();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request(), delivery -> {
+                handled.add(delivery.message().payload()[0]);
+                entered.countDown();
+                waitFor(release);
+            });
+            establish(transport, subscription);
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            transport.receive(publication(new byte[] {2}));
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 2);
+
+            // Act: a later publication arrives, and UNSUBACK confirms removal while the first
+            // handler still runs.
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+            var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(publication(new byte[] {3}));
+            transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
+            removing.get(5, SECONDS);
+            CompletableFuture<Void> terminated = subscription.terminated();
+            assertThat(terminated).isNotDone();
+            release.countDown();
+
+            // Assert: the accepted delivery still runs; the later one never reaches the handler.
+            terminated.get(5, SECONDS);
+            assertThat(handled).containsExactly((byte) 1, (byte) 2);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void unsubscribe_leaves_accepted_deliveries_receivable_after_removal_is_confirmed()
+            throws Exception {
+        // Arrange: two deliveries wait in a pull subscription when removal is requested.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribePull(sut, transport, request());
+            transport.receive(publication(new byte[] {1}));
+            transport.receive(publication(new byte[] {2}));
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 2);
+
+            // Act: removal is confirmed before either delivery is received.
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+            var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
+            removing.get(5, SECONDS);
+            CompletableFuture<Void> terminated = subscription.terminated();
+
+            // Assert: both stay receivable; receiving the last one ends the subscription.
+            assertThat(received(subscription.receive(Duration.ZERO)).message())
+                    .isEqualTo(message(new byte[] {1}));
+            assertThat(terminated).isNotDone();
+            assertThat(received(subscription.receive(Duration.ZERO)).message())
+                    .isEqualTo(message(new byte[] {2}));
+            terminated.get(5, SECONDS);
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+        }
+    }
+
+    @Test
+    void close_discards_the_deliveries_an_unsubscribe_accepted() throws Exception {
+        // Arrange: removal is confirmed while one delivery runs and another waits.
+        var handled = new LinkedBlockingQueue<Byte>();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request(), delivery -> {
+                handled.add(delivery.message().payload()[0]);
+                entered.countDown();
+                waitFor(release);
+            });
+            establish(transport, subscription);
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            transport.receive(publication(new byte[] {2}));
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 2);
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+            var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
+            removing.get(5, SECONDS);
+
+            // Act
+            subscription.close();
+            release.countDown();
+
+            // Assert: only the delivery handed off before the close runs.
+            subscription.terminated().get(5, SECONDS);
+            assertThat(handled).containsExactly((byte) 1);
+            assertThat(((ClientActor) sut).usage().deliveries()).isZero();
         } finally {
             release.countDown();
         }

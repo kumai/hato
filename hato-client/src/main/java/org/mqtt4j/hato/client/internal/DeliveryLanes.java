@@ -184,6 +184,23 @@ final class DeliveryLanes {
         }
     }
 
+    /// Ends a push lane whose removal is confirmed once the deliveries it accepted have run: those
+    /// queued before removal was requested, because a paused lane admits nothing new. A later
+    /// [#remove] still discards what remains.
+    void finish(long id) {
+        lock.lock();
+        try {
+            Lane lane = lanes.get(id);
+            if (lane != null) {
+                lane.paused = true;
+                lane.finishing = true;
+                lane.ready.signalAll();
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /// Closes hand-off for every lane before the client's close() returns. No dispatcher or
     /// receiver claims a delivery afterwards. Queued deliveries wait for [#close] to discard
     /// them, and handlers that already claimed one may finish.
@@ -262,12 +279,14 @@ final class DeliveryLanes {
 
     /// Pending views are discarded; a continuing session keeps handed-off receipt conditions.
     Map<Long, Boolean> connectionEnded(boolean preserveSession, boolean stopped) {
+        Map<Long, Boolean> result;
         lock.lock();
         try {
             if (!preserveSession) {
                 retireAcknowledgements();
             }
-            for (Lane lane : lanes.values()) {
+            // A finishing pull lane can stop here, which removes it from the map.
+            for (Lane lane : List.copyOf(lanes.values())) {
                 while (!lane.queue.isEmpty()) {
                     DeliveryView view = lane.queue.removeFirst();
                     view.recipient.queued = false;
@@ -277,6 +296,7 @@ final class DeliveryLanes {
                     invalidate(view);
                 }
                 lane.failed = false;
+                settle(lane);
                 lane.ready.signalAll();
             }
             if (preserveSession) {
@@ -289,17 +309,18 @@ final class DeliveryLanes {
                     }
                 }
             }
-            Map<Long, Boolean> result = receiveStateLocked();
+            result = receiveStateLocked();
             for (long token : List.copyOf(acknowledging.keySet())) {
                 if (!result.containsKey(token)) {
                     retire(requireNonNull(acknowledging.remove(token)));
                 }
             }
             readyTokens.clear();
-            return result;
         } finally {
             lock.unlock();
         }
+        runTerminations();
+        return result;
     }
 
     /// Includes authoritative readiness after handlers may have finished while disconnected.
@@ -617,13 +638,18 @@ final class DeliveryLanes {
     }
 
     /// Waits for the next delivery, claims it, and executes it. Returns false once the lane has
-    /// stopped or the client's close has ended hand-off.
+    /// stopped, its accepted deliveries have run after a confirmed removal, or the client's close
+    /// has ended hand-off.
     private boolean dispatchNext(Lane lane) {
         Claim claim;
         lock.lock();
         try {
             while (!lane.stopped && !handOffsClosed && (lane.failed || lane.queue.isEmpty())) {
-                // stop() and closeHandOffs() signal this condition.
+                if (lane.finishing && lane.queue.isEmpty()) {
+                    stop(lane);
+                    return false;
+                }
+                // stop(), finish(), and closeHandOffs() signal this condition.
                 lane.ready.awaitUninterruptibly();
             }
             if (lane.stopped || handOffsClosed) {
@@ -791,6 +817,15 @@ final class DeliveryLanes {
         return ready;
     }
 
+    /// Caller holds lock. A finishing pull lane stops once its accepted deliveries have been
+    /// received; a finishing push lane's dispatcher stops itself. Every operation that can empty
+    /// a finishing pull lane calls this, so such a lane never waits empty.
+    private void settle(Lane lane) {
+        if (lane.finishing && lane.handler == null && lane.queue.isEmpty()) {
+            stop(lane);
+        }
+    }
+
     /// Reports the pull lanes that stopped under the lock. Call it without the lock: a report
     /// completes subscription observations, which take the client's own lock. Callers announce
     /// acknowledgement readiness first, as a push lane's dispatcher does before it exits.
@@ -863,6 +898,29 @@ final class DeliveryLanes {
             runTerminations();
         }
 
+        /// Ends this pull subscription after a confirmed removal, once every delivery it
+        /// accepted has been received. A receiver the actor never admitted holds none and ends
+        /// at once.
+        void finish() {
+            lock.lock();
+            try {
+                if (!lane.stopped) {
+                    if (lanes.get(lane.id) == lane) {
+                        lane.paused = true;
+                        lane.finishing = true;
+                        settle(lane);
+                    } else {
+                        lane.stopped = true;
+                        terminatedReceivers.add(lane);
+                    }
+                    lane.ready.signalAll();
+                }
+            } finally {
+                lock.unlock();
+            }
+            runTerminations();
+        }
+
         ReceiveResult receive() throws InterruptedException {
             return receiveNanos(-1);
         }
@@ -878,8 +936,8 @@ final class DeliveryLanes {
 
         private ReceiveResult receiveNanos(long remaining) throws InterruptedException {
             boolean unlimited = remaining < 0;
-            DeliveryView view;
-            boolean ready;
+            ReceiveResult result;
+            boolean ready = false;
             lock.lockInterruptibly();
             try {
                 while (!lane.stopped && !handOffsClosed && lane.queue.isEmpty()) {
@@ -894,23 +952,28 @@ final class DeliveryLanes {
                 }
                 if (lane.stopped || handOffsClosed) {
                     checkFailure();
-                    return new ReceiveResult.Ended();
+                    result = new ReceiveResult.Ended();
+                } else {
+                    // Claim, close, and acknowledgement share the lock. No other receiver can
+                    // claim this view, and an interrupt cannot discard it after handoff commits.
+                    DeliveryView view = lane.queue.removeFirst();
+                    view.recipient.queued = false;
+                    view.recipient.handed = true;
+                    view.localDone = true;
+                    ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
+                    releaseView(view);
+                    // Receiving the last delivery accepted before a confirmed removal ends it.
+                    settle(lane);
+                    result = new ReceiveResult.Received(view);
                 }
-                // Claim, close, and acknowledgement share the lock. No other receiver can
-                // claim this view, and an interrupt cannot discard it after handoff commits.
-                view = lane.queue.removeFirst();
-                view.recipient.queued = false;
-                view.recipient.handed = true;
-                view.localDone = true;
-                ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
-                releaseView(view);
             } finally {
                 lock.unlock();
             }
             if (ready) {
                 onReady.run();
             }
-            return new ReceiveResult.Received(view);
+            runTerminations();
+            return result;
         }
 
         private void checkFailure() {
@@ -951,6 +1014,8 @@ final class DeliveryLanes {
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
         int retained;
         boolean paused;
+        // A confirmed removal: the lane stops once its accepted deliveries are done.
+        boolean finishing;
         boolean stopped;
         boolean failed;
         @Nullable Throwable failure;

@@ -283,7 +283,7 @@ class Qos1AcknowledgementTest {
     }
 
     @Test
-    void unsubscribing_a_deep_queue_releases_acknowledgements_without_mailbox_overflow()
+    void closing_after_removal_releases_a_deep_accepted_queue_without_mailbox_overflow()
             throws Exception {
         // Arrange: retain one running handler while 320 more deliveries queue behind it.
         var entered = new CountDownLatch(1);
@@ -306,11 +306,15 @@ class Qos1AcknowledgementTest {
                     peer.roundTripBarrier(sut);
                 }
 
-                // Act: one UNSUBACK discards every queued recipient in the same actor turn.
+                // The confirmed removal keeps its accepted deliveries; their PUBACKs wait.
                 CompletableFuture<Void> removed = subscription.unsubscribe();
                 var unsubscribe = (Packet.Unsubscribe) peer.receive();
                 peer.send(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
                 removed.get(5, SECONDS);
+                peer.expectPublicationBarrier(sut);
+
+                // Act: one close discards every accepted recipient at once.
+                subscription.close();
 
                 // Assert: readiness coalescing and send admission both drain the full queue.
                 peer.expectAcknowledgements(2, 320);

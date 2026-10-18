@@ -1622,6 +1622,98 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void a_finishing_push_lane_runs_its_accepted_deliveries_then_terminates() throws Exception {
+        // Arrange: the first handler runs while a second delivery waits.
+        var handled = new LinkedBlockingQueue<MqttMessage>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(4), delivery -> {
+            handled.add(delivery.message());
+            entered.countDown();
+            waitFor(release);
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(entered.await(5, SECONDS)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 10)).isTrue();
+
+        // Act: removal is confirmed; a later delivery is not admitted.
+        sut.finish(1);
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(3), false, 10)).isTrue();
+        release.countDown();
+
+        // Assert: the accepted delivery runs, then the dispatcher stops and reports once.
+        assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
+        assertThat(handled).containsExactly(message(1), message(2));
+        assertThat(sut.retainedLanes()).isZero();
+        assertThat(sut.abandonedDeliveries()).isZero();
+        assertThat(terminated).isEmpty();
+    }
+
+    @Test
+    void a_finishing_receiver_stops_when_its_last_accepted_delivery_is_received()
+            throws Exception {
+        // Arrange
+        DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(4));
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 10)).isTrue();
+
+        // Act
+        receiver.finish();
+
+        // Assert: both deliveries stay receivable; taking the last one ends the lane.
+        assertThat(received(receiver.receive(Duration.ZERO)).message()).isEqualTo(message(1));
+        assertThat(terminated).isEmpty();
+        assertThat(received(receiver.receive(Duration.ZERO)).message()).isEqualTo(message(2));
+        assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
+        assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+        assertThat(sut.retainedLanes()).isZero();
+    }
+
+    @Test
+    void a_finishing_receiver_without_deliveries_stops_at_once() {
+        // Arrange
+        DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(4));
+
+        // Act
+        receiver.finish();
+
+        // Assert
+        assertThat(terminated).containsExactly(1L);
+        assertThat(sut.retainedLanes()).isZero();
+    }
+
+    @Test
+    void a_receiver_finished_before_admission_ends_at_once() throws Exception {
+        // Arrange
+        DeliveryLanes.Receiver receiver = sut.receiver(1, request(1));
+
+        // Act
+        receiver.finish();
+
+        // Assert: it holds no delivery to wait for, and admission takes no lane slot.
+        assertThat(terminated).containsExactly(1L);
+        assertThat(sut.register(receiver)).isTrue();
+        assertThat(sut.retainedLanes()).isZero();
+        assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+    }
+
+    @Test
+    void a_connection_end_stops_a_finishing_receiver_by_discarding_its_queue() throws Exception {
+        // Arrange: a receiver finishes with one accepted delivery left.
+        DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(4));
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        receiver.finish();
+
+        // Act
+        sut.connectionEnded(false, false);
+
+        // Assert: nothing remains to receive, so the lane stops without another receive call.
+        assertThat(terminated).containsExactly(1L);
+        assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+        assertThat(sut.discardedDeliveries()).isEqualTo(1);
+    }
+
+    @Test
     void closed_hand_off_lets_no_lane_take_a_queued_delivery() throws Exception {
         // Arrange: a push handler runs with one delivery queued, and a receiver has one waiting.
         var handled = new LinkedBlockingQueue<MqttMessage>();
@@ -1660,6 +1752,7 @@ class DeliveryLanesTest {
         // Act
         receiver.end(null);
         receiver.end(null);
+        receiver.finish();
         sut.close(null);
 
         // Assert

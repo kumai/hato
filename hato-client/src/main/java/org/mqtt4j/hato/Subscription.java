@@ -54,12 +54,13 @@ public interface Subscription extends AutoCloseable {
     /// [AckMode#ON_RECEIVE] permits acknowledgement at handoff; [AckMode#MANUAL] waits for
     /// [MqttDelivery#ack()]. PUBACK and PUBREC still follow receive order; see [AckMode].
     /// Returns [ReceiveResult.Received] at handoff, or [ReceiveResult.Ended] after [#close()],
-    /// a completed [#unsubscribe()], or [MqttClient#close()]. Connection termination
+    /// after [#unsubscribe()] once removal is confirmed and every delivery it accepted has been
+    /// received, or once [MqttClient#close()] has been called. Connection termination
     /// discards buffered deliveries but leaves this call waiting for delivery after the next
     /// connection. This applies to both requested disconnection and connection failure.
     /// A broker refusal ends this subscription and throws [MqttSubscribeException]; a refusal
-    /// after local closure or a requested removal only confirms that removal, which returns
-    /// [ReceiveResult.Ended]. A SUBACK that violates the protocol throws
+    /// after local closure or a requested removal only confirms that removal, so this call ends
+    /// with [ReceiveResult.Ended] as described above. A SUBACK that violates the protocol throws
     /// [MqttProtocolException]. Rejected registration throws its original exception, including
     /// [IllegalStateException] for duplicate or overlapping shared filters and
     /// [MqttCapacityException] for capacity. An internal failure that closes the client throws
@@ -98,12 +99,14 @@ public interface Subscription extends AutoCloseable {
         throw new UnsupportedOperationException("This subscription does not support receiving");
     }
 
-    /// Stops new local delivery when called and observes confirmed removal.
-    /// Already queued deliveries may run or be received while acknowledgement is pending; any
-    /// still queued when it completes are discarded. Handlers already running can finish.
-    /// Messages arriving while removal is pending are dropped without running or being received,
-    /// and this subscription does not hold back the acknowledgement of QoS 1 and 2 among them.
-    /// Discarded deliveries release this subscription's acknowledgement condition.
+    /// Stops new local delivery when called and observes confirmed removal. Deliveries already
+    /// queued when this is called are accepted: they still run or can still be received, also
+    /// after removal is confirmed, and the subscription ends once removal is confirmed and they
+    /// are done, which [#terminated()] observes. Call [#close()] to discard them instead. A
+    /// connection end discards them as it does for every subscription. Handlers already running
+    /// can finish. Messages arriving after this call are dropped without running or being
+    /// received, and this subscription does not hold back the acknowledgement of QoS 1 and 2
+    /// among them. Discarded deliveries release this subscription's acknowledgement condition.
     /// Removing this subscription does not acknowledge already delivered MANUAL messages.
     /// Their [MqttDelivery#ack()] rules continue to apply after removal or handler return.
     ///
@@ -127,19 +130,21 @@ public interface Subscription extends AutoCloseable {
     /// A repeated request after successful removal is harmless. The same filter can be
     /// registered again after removal completes.
     ///
-    /// Calls after removal has completed, registration was refused, or client shutdown has been
-    /// requested complete locally and discard queued deliveries. Handlers already running can
-    /// finish.
+    /// Calls after removal has completed or registration was refused complete locally and change
+    /// nothing; deliveries an earlier call accepted still finish. Calls after client shutdown
+    /// has been requested complete locally and discard queued deliveries. Handlers already
+    /// running can finish.
     CompletableFuture<Void> unsubscribe();
 
     /// Observes the end of this subscription's local work without requesting it. The future
     /// completes once no handler of this subscription is running and no delivery remains for it
     /// to run or to hand to a receiver: after [#close()]; after [#unsubscribe()], once removal is
-    /// confirmed; after any other permanent end, such as a broker refusal; or after the client
-    /// closes. Beyond the removal confirmation that [#unsubscribe()] waits for, it does not wait
-    /// for the broker: after [#close()] it can complete before UNSUBACK, and it also completes
-    /// while disconnected. It does not wait for [MqttDelivery#ack()] of MANUAL deliveries
-    /// already handed off; their rules continue to apply.
+    /// confirmed and the deliveries it accepted have run or been received; after any other
+    /// permanent end, such as a broker refusal; or after the client closes. Beyond the removal
+    /// confirmation that [#unsubscribe()] waits for, it does not wait for the broker: after
+    /// [#close()] it can complete before UNSUBACK, and it also completes while disconnected. It
+    /// does not wait for [MqttDelivery#ack()] of MANUAL deliveries already handed off; their
+    /// rules continue to apply.
     ///
     /// Each call returns an independent future; an already terminated subscription returns a
     /// completed one. Pending observations share the client-wide limit described by
@@ -157,12 +162,12 @@ public interface Subscription extends AutoCloseable {
         throw new UnsupportedOperationException("This subscription does not observe termination");
     }
 
-    /// Permanently stops local delivery, discards queued messages, releases their
-    /// acknowledgement conditions, and wakes waiting receivers. No delivery is handed off after
-    /// this returns. Schedules broker removal without waiting for the broker or application code.
-    /// Running handlers may finish; [#terminated()] observes their end. Local closure does not
-    /// acknowledge handed-off MANUAL deliveries; their [MqttDelivery#ack()] rules continue to
-    /// apply.
+    /// Permanently stops local delivery, discards queued messages, including those an earlier
+    /// [#unsubscribe()] accepted, releases their acknowledgement conditions, and wakes waiting
+    /// receivers. No delivery is handed off after this returns. Schedules broker removal without
+    /// waiting for the broker or application code. Running handlers may finish;
+    /// [#terminated()] observes their end. Local closure does not acknowledge handed-off MANUAL
+    /// deliveries; their [MqttDelivery#ack()] rules continue to apply.
     /// Calling close again has no further effect.
     /// A closed subscription is never re-created, including when closed while disconnected.
     ///

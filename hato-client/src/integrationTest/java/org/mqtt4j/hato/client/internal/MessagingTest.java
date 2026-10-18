@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -418,6 +419,71 @@ abstract class MessagingTest {
             }
         } finally {
             releaseFirst.countDown();
+        }
+    }
+
+    @Test
+    void unsubscribe_runs_the_deliveries_it_accepted_after_the_broker_confirms_removal()
+            throws Exception {
+        // Arrange: a handler holds the first of four queued publications.
+        String topic = uniqueTopic();
+        var release = new CountDownLatch(1);
+        var handled = new LinkedBlockingQueue<MqttMessage>();
+        try (MqttClient sut = client()) {
+            sut.connect().get(5, SECONDS);
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE),
+                    delivery -> {
+                        handled.add(delivery.message());
+                        waitFor(release);
+                    }
+            );
+            subscription.established().get(5, SECONDS);
+            List<MqttMessage> published = publishAndWaitUntilHeld(sut, topic, 4);
+
+            // Act: UNSUBACK confirms removal while the first handler still runs.
+            subscription.unsubscribe().get(5, SECONDS);
+            CompletableFuture<Void> terminated = subscription.terminated();
+            assertThat(terminated).isNotDone();
+            release.countDown();
+
+            // Assert: every accepted delivery runs in order, and termination follows the last.
+            terminated.get(5, SECONDS);
+            assertThat(handled).containsExactlyElementsOf(published);
+            await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
+            sut.disconnect().get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void unsubscribe_leaves_accepted_deliveries_receivable_after_the_broker_confirms_removal()
+            throws Exception {
+        // Arrange: four publications wait in a pull subscription.
+        String topic = uniqueTopic();
+        try (MqttClient sut = client()) {
+            sut.connect().get(5, SECONDS);
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
+            );
+            subscription.established().get(5, SECONDS);
+            List<MqttMessage> published = publishAndWaitUntilHeld(sut, topic, 4);
+
+            // Act: UNSUBACK confirms removal before any of them is received.
+            subscription.unsubscribe().get(5, SECONDS);
+            CompletableFuture<Void> terminated = subscription.terminated();
+
+            // Assert: all stay receivable in order; receiving the last one ends the subscription.
+            for (MqttMessage message : published) {
+                assertThat(terminated).isNotDone();
+                assertThat(received(subscription.receive(Duration.ZERO)).message())
+                        .isEqualTo(message);
+            }
+            terminated.get(5, SECONDS);
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+            await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
+            sut.disconnect().get(5, SECONDS);
         }
     }
 
@@ -948,6 +1014,28 @@ abstract class MessagingTest {
     }
 
     abstract URI endpoint();
+
+    /// Publishes `count` QoS 1 messages that the client's own subscription on `topic` receives,
+    /// and returns once the client holds every one of their deliveries.
+    private static List<MqttMessage> publishAndWaitUntilHeld(
+            MqttClient client,
+            String topic,
+            int count
+    ) throws Exception {
+        var published = new ArrayList<MqttMessage>();
+        for (int i = 0; i < count; i++) {
+            var message = MqttMessage.of(
+                    new Topic(topic),
+                    new byte[] {(byte) i},
+                    Qos.AT_LEAST_ONCE,
+                    false
+            );
+            client.publish(message).get(5, SECONDS);
+            published.add(message);
+        }
+        await().untilAsserted(() -> assertThat(usage(client).deliveries()).isEqualTo(count));
+        return published;
+    }
 
     static ClientActor.Usage usage(MqttClient client) {
         return ((ClientActor) client).usage();
