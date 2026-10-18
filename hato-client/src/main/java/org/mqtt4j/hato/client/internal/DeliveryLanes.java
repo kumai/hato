@@ -67,6 +67,9 @@ final class DeliveryLanes {
 
     private final Runnable onReady;
 
+    // Set before the client's close() returns: no lane claims a delivery afterwards.
+    private boolean handOffsClosed;
+
     private int retainedLanes;
 
     private int retainedDeliveries;
@@ -165,6 +168,21 @@ final class DeliveryLanes {
             Lane lane = lanes.get(id);
             if (lane != null) {
                 lane.paused = true;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Closes hand-off for every lane before the client's close() returns. No dispatcher or
+    /// receiver claims a delivery afterwards. Queued deliveries wait for [#close] to discard
+    /// them, and handlers that already claimed one may finish.
+    void closeHandOffs() {
+        lock.lock();
+        try {
+            handOffsClosed = true;
+            for (Lane lane : lanes.values()) {
+                lane.ready.signalAll();
             }
         } finally {
             lock.unlock();
@@ -585,16 +603,16 @@ final class DeliveryLanes {
     }
 
     /// Waits for the next delivery, claims it, and executes it. Returns false once the lane has
-    /// stopped.
+    /// stopped or the client's close has ended hand-off.
     private boolean dispatchNext(Lane lane) {
         Claim claim;
         lock.lock();
         try {
-            while (!lane.stopped && (lane.failed || lane.queue.isEmpty())) {
-                // The dispatcher ends through stop(), which signals this condition.
+            while (!lane.stopped && !handOffsClosed && (lane.failed || lane.queue.isEmpty())) {
+                // stop() and closeHandOffs() signal this condition.
                 lane.ready.awaitUninterruptibly();
             }
-            if (lane.stopped) {
+            if (lane.stopped || handOffsClosed) {
                 return false;
             }
             claim = claim(lane);
@@ -827,7 +845,7 @@ final class DeliveryLanes {
             boolean ready;
             lock.lockInterruptibly();
             try {
-                while (!lane.stopped && lane.queue.isEmpty()) {
+                while (!lane.stopped && !handOffsClosed && lane.queue.isEmpty()) {
                     if (unlimited) {
                         lane.ready.await();
                     } else {
@@ -837,7 +855,7 @@ final class DeliveryLanes {
                         remaining = lane.ready.awaitNanos(remaining);
                     }
                 }
-                if (lane.stopped) {
+                if (lane.stopped || handOffsClosed) {
                     checkFailure();
                     return new ReceiveResult.Ended();
                 }

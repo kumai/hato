@@ -1618,6 +1618,36 @@ class DeliveryLanesTest {
         assertThat(sut.retainedBytes()).isZero();
     }
 
+    @Test
+    void closed_hand_off_lets_no_lane_take_a_queued_delivery() throws Exception {
+        // Arrange: a push handler runs with one delivery queued, and a receiver has one waiting.
+        var handled = new LinkedBlockingQueue<MqttMessage>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(4), delivery -> {
+            handled.add(delivery.message());
+            entered.countDown();
+            waitFor(release);
+        })).isTrue();
+        DeliveryLanes.Receiver receiver = registerPull(sut, 2, request(4));
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(entered.await(5, SECONDS)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L, 2L), message(2), false, 10)).isTrue();
+
+        // Act
+        sut.closeHandOffs();
+        release.countDown();
+
+        // Assert: the dispatcher exits after its running handler, receiving ends, and the queued
+        // deliveries wait for close() to discard them.
+        await().until(() -> sut.retainedLanes() == 1);
+        assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+        assertThat(handled).containsExactly(message(1));
+        assertThat(sut.retainedDeliveries()).isEqualTo(2);
+        sut.close(null);
+        assertThat(sut.retainedDeliveries()).isZero();
+    }
+
     private record Failure(DeliveryToken token, Throwable cause) {
     }
 

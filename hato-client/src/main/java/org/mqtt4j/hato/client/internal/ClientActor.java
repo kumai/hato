@@ -448,6 +448,8 @@ public final class ClientActor implements MqttClient {
             mailbox.connectionRequested(false);
             mailbox.wake();
         }
+        // No delivery is handed off after this returns, even while the actor is still busy.
+        lanes.closeHandOffs();
     }
 
     private void run() {

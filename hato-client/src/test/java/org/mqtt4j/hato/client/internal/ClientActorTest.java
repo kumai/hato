@@ -4847,6 +4847,70 @@ class ClientActorTest {
     }
 
     @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_close_hands_off_no_queued_delivery_after_it_returns() throws Exception {
+        // Arrange: one delivery runs and another waits in its lane. The held actor cannot run
+        // the shutdown cleanup that stops the lane.
+        var delivered = new LinkedBlockingQueue<MqttDelivery>();
+        var entered = new CountDownLatch(1);
+        var releaseHandler = new CountDownLatch(1);
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request(), delivery -> {
+                delivered.add(delivery);
+                entered.countDown();
+                waitFor(releaseHandler);
+            });
+            establish(transport, subscription);
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            transport.receive(publication(new byte[] {2}));
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 2);
+            holdActor(transport, actorHeld, releaseActor);
+
+            // Act
+            sut.close();
+            releaseHandler.countDown();
+
+            // Assert: the dispatcher exits after the running handler without taking the queued
+            // delivery.
+            await().until(() -> ((ClientActor) sut).usage().lanes() == 0);
+            assertThat(delivered).singleElement()
+                    .satisfies(delivery -> assertThat(delivery.message())
+                            .isEqualTo(message(new byte[] {1})));
+        } finally {
+            releaseHandler.countDown();
+            releaseActor.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_close_ends_receiving_without_handing_off_a_queued_delivery() throws Exception {
+        // Arrange: a delivery waits in a pull subscription, and the actor is held.
+        var actorHeld = new CountDownLatch(1);
+        var releaseActor = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribePull(sut, transport, request());
+            transport.receive(publication(new byte[] {1}));
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 1);
+            holdActor(transport, actorHeld, releaseActor);
+
+            // Act
+            sut.close();
+
+            // Assert: receiving ends at once, and the delivery waits for the actor to discard it.
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
+            assertThat(((ClientActor) sut).usage().deliveries()).isEqualTo(1);
+        } finally {
+            releaseActor.countDown();
+        }
+    }
+
+    @Test
     void close_starts_one_removal_without_waiting_or_retaining_operation_slots()
             throws Exception {
         // Arrange
