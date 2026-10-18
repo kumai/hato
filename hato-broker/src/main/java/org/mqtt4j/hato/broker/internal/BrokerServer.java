@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -45,6 +46,8 @@ public final class BrokerServer implements AutoCloseable {
     private static final Log log = Log.of(BrokerServer.class);
 
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
+
+    private static final Set<MqttVersion> SUPPORTED_VERSIONS = EnumSet.of(MqttVersion.V3_1_1);
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
 
@@ -627,7 +630,10 @@ public final class BrokerServer implements AutoCloseable {
                 }
                 received();
                 try {
-                    Packet.Connect request = PacketCodec.decodeConnect(first.get());
+                    Packet.Connect request = PacketCodec.decodeConnect(
+                            first.get(),
+                            SUPPORTED_VERSIONS
+                    );
                     beforeProcess.accept(request);
                     writerCloses = !connect(request);
                 } catch (UnsupportedProtocolVersionException unsupported) {
@@ -840,7 +846,8 @@ public final class BrokerServer implements AutoCloseable {
                      Packet.SubAck _,
                      Packet.UnsubAck _,
                      Packet.PingResp _,
-                     Packet.Auth _ -> throw new IOException(
+                     Packet.Auth _,
+                     Packet.AliasPublish _ -> throw new IOException(
                              "Unexpected " + packet.getClass().getSimpleName() + " packet"
                      );
             }

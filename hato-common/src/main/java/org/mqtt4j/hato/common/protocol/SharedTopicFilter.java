@@ -22,7 +22,7 @@ import static java.util.Objects.requireNonNull;
 /// - The broker treats `$share/` filters as ordinary topic filters in MQTT 3.1.1 until it
 ///   supports shared subscriptions. [TopicFilter] and the MQTT 3.1.1 codec therefore keep the
 ///   filter exactly as written.
-/// - The MQTT 5.0 codec will use this type to reject No Local on a shared subscription
+/// - The MQTT 5.0 codec uses this type to reject No Local on a shared subscription
 ///   (`MQTT-3.8.3-4`).
 ///
 /// See [MQTT 5.0, section 4.8.2: Shared Subscriptions](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html).

@@ -39,6 +39,7 @@ class RemainingLengthTest {
 
         assertThat(RemainingLength.read(input)).isEqualTo(value);
         assertThat(input.hasRemaining()).isFalse();
+        assertThat(RemainingLength.readMinimal(ByteBuffer.wrap(expected))).isEqualTo(value);
         RemainingLength.write(output, value);
         assertThat(output.toByteArray()).isEqualTo(expected);
         assertThat(RemainingLength.encodedSize(value)).isEqualTo(expected.length);
@@ -61,6 +62,17 @@ class RemainingLengthTest {
     void mqtt_3_1_1_accepts_non_minimal_encodings_within_four_bytes(String hex, int expected) {
         assertThat(RemainingLength.read(ByteBuffer.wrap(HexFormat.of().parseHex(hex))))
                 .isEqualTo(expected);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"8000", "ff00", "808000", "80808000"})
+    void mqtt_5_rejects_non_minimal_variable_byte_integers(String hex) {
+        var input = ByteBuffer.wrap(HexFormat.of().parseHex(hex));
+
+        assertThatExceptionOfType(PacketDecodeException.class)
+                .isThrownBy(() -> RemainingLength.readMinimal(input))
+                .satisfies(error -> assertThat(error.reasonCode())
+                        .isSameAs(ReasonCode.MALFORMED_PACKET));
     }
 
     @Test

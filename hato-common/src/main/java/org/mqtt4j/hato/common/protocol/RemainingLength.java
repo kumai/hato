@@ -10,8 +10,8 @@ import static org.mqtt4j.hato.common.value.ReasonCode.MALFORMED_PACKET;
 ///
 /// Reading advances the buffer's position past this field only. On malformed input, its
 /// position may have advanced. The decoder follows MQTT 3.1.1 and accepts non-minimal encodings
-/// of at most four bytes; writing always uses the minimum number of bytes. A future MQTT 5.0
-/// codec must additionally verify the minimum-length rule `MQTT-1.5.5-1`.
+/// of at most four bytes. [#readMinimal] additionally enforces the MQTT 5.0 minimum-length
+/// rule; writing always uses the minimum number of bytes.
 ///
 /// See [MQTT 3.1.1 Plus Errata 01, section 2.2.3: Remaining Length](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os-complete.html).
 public final class RemainingLength {
@@ -37,6 +37,19 @@ public final class RemainingLength {
             }
         }
         throw new PacketDecodeException(MALFORMED_PACKET, "Remaining Length exceeds four bytes");
+    }
+
+    /// Reads a minimally encoded variable byte integer, as required by MQTT 5.0.
+    ///
+    /// @throws PacketDecodeException if truncated, over four bytes, or not minimally encoded
+    public static int readMinimal(ByteBuffer input) {
+        requireNonNull(input, "input must not be null");
+        int start = input.position();
+        int value = read(input);
+        if (input.position() - start != encodedSize(value)) {
+            throw new PacketDecodeException(MALFORMED_PACKET, "Non-minimal variable byte integer");
+        }
+        return value;
     }
 
     /// Appends the shortest encoding of `value`, validating it before writing any bytes.

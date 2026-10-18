@@ -161,8 +161,8 @@ public sealed interface Packet {
     /// The payload may be empty and, unlike a Will payload, has no two-byte length limit.
     /// The codec checks the total packet size.
     ///
-    /// This model currently requires a full topic name. Topic Alias support will need to
-    /// represent an omitted wire topic when the MQTT 5.0 alias properties are introduced.
+    /// This variant always has a full topic name. [AliasPublish] represents an MQTT 5.0
+    /// PUBLISH whose topic name is omitted on the wire.
     record Publish(
             Topic topic,
             byte[] payload,
@@ -173,23 +173,9 @@ public sealed interface Packet {
             Properties properties
     ) implements Packet {
 
-        // TODO: MQTT 5.0: Support a zero-length wire Topic Name with Topic Alias (3.3.2.3.4).
-        //       Define its wire representation and resolution to a non-empty Topic before relaxing
-        //       this model. Alias mappings belong to each network connection and direction,
-        //       not the shared stateless codec, and must be discarded on disconnect [MQTT-3.3.2-7].
         public Publish {
             requireNonNull(topic, "Topic must not be null");
-            requireNonNull(payload, "Payload must not be null");
-            requireNonNull(qos, "QoS must not be null");
-            requireNonNull(properties, "Properties must not be null");
-            if (qos == Qos.AT_MOST_ONCE) {
-                // MQTT 3.1.1 [MQTT-2.3.1-5] and [MQTT-3.3.1-2].
-                if (packetId != 0 || dup) {
-                    throw new IllegalArgumentException("QoS 0 requires packet id 0 and DUP false");
-                }
-            } else {
-                checkPacketId(packetId);
-            }
+            checkPublishFields(payload, qos, dup, packetId, properties);
         }
 
         @Override
@@ -208,6 +194,50 @@ public sealed interface Packet {
         public int hashCode() {
             return Objects.hash(
                     topic,
+                    Arrays.hashCode(payload),
+                    qos,
+                    retain,
+                    dup,
+                    packetId,
+                    properties
+            );
+        }
+    }
+
+    /// PUBLISH with an omitted wire topic name, available only in MQTT 5.0.
+    ///
+    /// The codec requires a Topic Alias property. The connection owner must resolve that alias
+    /// to a [Publish] before delivery, using its mapping for the receiving direction. The codec
+    /// does not retain mappings; each connection discards them when it closes.
+    ///
+    /// Payload ownership and packet identifier rules are the same as for [Publish].
+    record AliasPublish(
+            byte[] payload,
+            Qos qos,
+            boolean retain,
+            boolean dup,
+            int packetId,
+            Properties properties
+    ) implements Packet {
+
+        public AliasPublish {
+            checkPublishFields(payload, qos, dup, packetId, properties);
+        }
+
+        @Override
+        public boolean equals(@Nullable Object other) {
+            return other instanceof AliasPublish that
+                    && Arrays.equals(payload, that.payload)
+                    && qos == that.qos
+                    && retain == that.retain
+                    && dup == that.dup
+                    && packetId == that.packetId
+                    && properties.equals(that.properties);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(
                     Arrays.hashCode(payload),
                     qos,
                     retain,
@@ -277,7 +307,8 @@ public sealed interface Packet {
     /// Retain Handling is 0 (send retained messages), 1 (send only for a new subscription),
     /// or 2 (do not send). MQTT 3.1.1 uses false, false, and 0 for the three options.
     /// The filter is kept as written, including a `$share/` prefix; [SharedTopicFilter]
-    /// interprets shared subscriptions and states which distribution applies it.
+    /// interprets shared subscriptions and states which distribution applies it. The MQTT 5.0
+    /// codec rejects No Local on a shared subscription.
     record Subscription(
             TopicFilter filter,
             Qos qos,
@@ -286,9 +317,6 @@ public sealed interface Packet {
             int retainHandling
     ) {
 
-        // TODO: MQTT 5.0: Reject No Local on a shared subscription [MQTT-3.8.3-4] in the 5.0
-        //       codec, recognizing it with SharedTopicFilter.parse. The model does not parse
-        //       $share/ itself because the MQTT 3.1.1 broker keeps such filters as written.
         public Subscription {
             requireNonNull(filter, "Topic filter must not be null");
             requireNonNull(qos, "QoS must not be null");
@@ -357,6 +385,26 @@ public sealed interface Packet {
         public Auth {
             requireNonNull(reasonCode, "Reason code must not be null");
             requireNonNull(properties, "Properties must not be null");
+        }
+    }
+
+    private static void checkPublishFields(
+            byte[] payload,
+            Qos qos,
+            boolean dup,
+            int packetId,
+            Properties properties
+    ) {
+        requireNonNull(payload, "Payload must not be null");
+        requireNonNull(qos, "QoS must not be null");
+        requireNonNull(properties, "Properties must not be null");
+        if (qos == Qos.AT_MOST_ONCE) {
+            // MQTT 3.1.1 [MQTT-2.3.1-5] and [MQTT-3.3.1-2] in both specifications.
+            if (packetId != 0 || dup) {
+                throw new IllegalArgumentException("QoS 0 requires packet id 0 and DUP false");
+            }
+        } else {
+            checkPacketId(packetId);
         }
     }
 

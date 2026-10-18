@@ -23,22 +23,24 @@ public final class MqttProtocolException extends MqttException {
     private final ReasonCode reasonCode;
 
     /// @throws IllegalArgumentException if the reason is not `MALFORMED_PACKET`,
-    ///         `PROTOCOL_ERROR`, or `PACKET_TOO_LARGE`
+    ///         `PROTOCOL_ERROR`, `PACKET_TOO_LARGE`, or `TOPIC_ALIAS_INVALID`
     public MqttProtocolException(String message, ReasonCode reasonCode) {
         super(requireNonNull(message, "message must not be null"));
         this.reasonCode = requireNonNull(reasonCode, "reasonCode must not be null");
         if (reasonCode != ReasonCode.MALFORMED_PACKET
                 && reasonCode != ReasonCode.PROTOCOL_ERROR
                 && reasonCode != ReasonCode.PACKET_TOO_LARGE
+                && reasonCode != ReasonCode.TOPIC_ALIAS_INVALID
         ) {
             throw new IllegalArgumentException(
-                    "Expected MALFORMED_PACKET, PROTOCOL_ERROR, or PACKET_TOO_LARGE"
+                    "Expected MALFORMED_PACKET, PROTOCOL_ERROR, PACKET_TOO_LARGE, "
+                            + "or TOPIC_ALIAS_INVALID"
             );
         }
     }
 
     /// @throws IllegalArgumentException if the reason is not `MALFORMED_PACKET`,
-    ///         `PROTOCOL_ERROR`, or `PACKET_TOO_LARGE`
+    ///         `PROTOCOL_ERROR`, `PACKET_TOO_LARGE`, or `TOPIC_ALIAS_INVALID`
     public MqttProtocolException(
             String message,
             ReasonCode reasonCode,

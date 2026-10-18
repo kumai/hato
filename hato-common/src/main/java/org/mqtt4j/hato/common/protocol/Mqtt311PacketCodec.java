@@ -124,6 +124,9 @@ final class Mqtt311PacketCodec implements PacketCodec {
                 type = PacketType.DISCONNECT;
             }
             case Packet.Auth _ -> throw new IllegalArgumentException("MQTT 3.1.1 has no AUTH");
+            case Packet.AliasPublish _ -> throw new IllegalArgumentException(
+                    "MQTT 3.1.1 requires a PUBLISH topic name"
+            );
         }
 
         // Other packet types still build their body first. PUBLISH appends its large payload
@@ -179,18 +182,9 @@ final class Mqtt311PacketCodec implements PacketCodec {
     /// does not itself authorize or accept the connection.
     ///
     /// @throws PacketDecodeException if the packet is malformed or violates a checked rule
-    /// @throws UnsupportedProtocolVersionException if CONNECT requests an unimplemented level
+    /// @throws UnsupportedProtocolVersionException if CONNECT requests a level other than 4
     @Override
     public Packet decode(byte[] packet) {
-        return decodePacket(packet, false);
-    }
-
-    /// Parses CONNECT's common prelude and rejects levels other than 4 before reading the body.
-    static Packet.Connect decodeConnect(byte[] packet) {
-        return (Packet.Connect) decodePacket(packet, true);
-    }
-
-    private static Packet decodePacket(byte[] packet, boolean connectOnly) {
         requireNonNull(packet, "packet must not be null");
         var input = ByteBuffer.wrap(packet);
         try {
@@ -204,9 +198,6 @@ final class Mqtt311PacketCodec implements PacketCodec {
             // [MQTT-2.2.2-2]: validate fixed flags before reading the body.
             if (type != PacketType.PUBLISH && flags != type.fixedFlags().orElseThrow()) {
                 throw new PacketDecodeException(MALFORMED_PACKET, "Invalid fixed-header flags");
-            }
-            if (connectOnly && type != PacketType.CONNECT) {
-                throw new PacketDecodeException(PROTOCOL_ERROR, "Expected CONNECT");
             }
             int remainingLength = RemainingLength.read(input);
             if (remainingLength != input.remaining()) {

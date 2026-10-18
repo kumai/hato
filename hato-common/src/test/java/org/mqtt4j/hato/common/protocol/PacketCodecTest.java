@@ -1,8 +1,10 @@
 package org.mqtt4j.hato.common.protocol;
 
 import java.lang.management.ManagementFactory;
+import java.util.EnumSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import com.sun.management.ThreadMXBean;
@@ -28,12 +30,12 @@ import static org.mqtt4j.hato.common.value.ReasonCode.SUCCESS;
 
 class PacketCodecTest {
 
+    private static final Set<MqttVersion> ALL_VERSIONS = EnumSet.allOf(MqttVersion.class);
+
     private final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
 
     @Test
     void mqtt_5_is_not_silently_encoded_as_mqtt_3_1_1() {
-        assertThatThrownBy(() -> PacketCodec.of(MqttVersion.V5))
-                .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> codec.encode(new Packet.Connect(
                 "c", MqttVersion.V5, true, 0, null, null, null, EMPTY
         ))).isInstanceOf(IllegalArgumentException.class);
@@ -190,14 +192,14 @@ class PacketCodecTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {0, 3, 5, 6, 255})
+    @ValueSource(ints = {0, 3, 6, 255})
     void unsupported_connect_levels_are_preserved_before_parsing_the_body(int level) {
         // [MQTT-3.1.2-2]: only the common prelude is interpreted for an unsupported level.
         byte[] wire = HexFormat.of().parseHex("100700044d51545404");
         wire[8] = (byte) level;
 
         assertThatExceptionOfType(UnsupportedProtocolVersionException.class)
-                .isThrownBy(() -> PacketCodec.decodeConnect(wire))
+                .isThrownBy(() -> PacketCodec.decodeConnect(wire, ALL_VERSIONS))
                 .satisfies(error -> assertThat(error.protocolLevel()).isEqualTo(level));
         assertThatExceptionOfType(UnsupportedProtocolVersionException.class)
                 .isThrownBy(() -> codec.decode(wire))
@@ -207,9 +209,67 @@ class PacketCodecTest {
     @Test
     void decode_connect_returns_a_typed_packet_and_rejects_other_packet_types() {
         byte[] wire = HexFormat.of().parseHex("100d00044d5154540402003c000163");
-        assertThat(PacketCodec.decodeConnect(wire)).isEqualTo(codec.decode(wire));
-        assertThatThrownBy(() -> PacketCodec.decodeConnect(new byte[]{(byte) 0xC0, 0}))
-                .isInstanceOf(PacketDecodeException.class);
+        assertThat(PacketCodec.decodeConnect(wire, ALL_VERSIONS)).isEqualTo(codec.decode(wire));
+        assertThatThrownBy(() -> PacketCodec.decodeConnect(
+                new byte[]{(byte) 0xC0, 0},
+                ALL_VERSIONS
+        )).isInstanceOf(PacketDecodeException.class);
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void the_first_connect_selects_its_own_wire_version(MqttVersion version) {
+        PacketCodec sut = PacketCodec.of(version);
+        var connect = new Packet.Connect("c", version, true, 60, null, null, null, EMPTY);
+
+        byte[] wire = sut.encode(connect);
+
+        assertThat(PacketCodec.decodeConnect(wire, ALL_VERSIONS)).isEqualTo(connect);
+    }
+
+    @Test
+    void selecting_mqtt_5_does_not_enable_it_in_the_mqtt_3_1_1_decoder() {
+        byte[] wire = HexFormat.of().parseHex("100e00044d5154540502003c00000163");
+
+        assertThat(PacketCodec.decodeConnect(wire, ALL_VERSIONS).version())
+                .isEqualTo(MqttVersion.V5);
+        assertThatExceptionOfType(UnsupportedProtocolVersionException.class)
+                .isThrownBy(() -> codec.decode(wire))
+                .satisfies(error -> assertThat(error.protocolLevel()).isEqualTo(5));
+    }
+
+    @Test
+    void a_server_without_mqtt_5_refuses_level_5_before_reading_the_body() {
+        // [MQTT-3.1.2-2]: the refusal does not depend on the body, here a Remaining Length that
+        // only the MQTT 5.0 codec rejects for not being minimally encoded.
+        byte[] wire = HexFormat.of().parseHex("108e0000044d5154540502003c00000163");
+
+        assertThatExceptionOfType(UnsupportedProtocolVersionException.class)
+                .isThrownBy(() -> PacketCodec.decodeConnect(
+                        wire,
+                        EnumSet.of(MqttVersion.V3_1_1)
+                ))
+                .satisfies(error -> assertThat(error.protocolLevel()).isEqualTo(5));
+        assertThatExceptionOfType(PacketDecodeException.class)
+                .isThrownBy(() -> PacketCodec.decodeConnect(wire, ALL_VERSIONS))
+                .satisfies(error -> assertThat(error.reasonCode()).isEqualTo(MALFORMED_PACKET));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "0000, MALFORMED_PACKET", "f000, MALFORMED_PACKET", "c100, MALFORMED_PACKET",
+            "1100, MALFORMED_PACKET", "c000, PROTOCOL_ERROR", "3000, PROTOCOL_ERROR"
+    })
+    void the_first_packet_keeps_its_existing_header_error_classification(
+            String hex,
+            ReasonCode reason
+    ) {
+        assertThatExceptionOfType(PacketDecodeException.class)
+                .isThrownBy(() -> PacketCodec.decodeConnect(
+                        HexFormat.of().parseHex(hex),
+                        ALL_VERSIONS
+                ))
+                .satisfies(error -> assertThat(error.reasonCode()).isEqualTo(reason));
     }
 
     @Test
@@ -220,7 +280,7 @@ class PacketCodecTest {
         );
         byte[] wire = HexFormat.of().parseHex("100c00044d515454040000000000");
 
-        assertThat(PacketCodec.decodeConnect(wire)).isEqualTo(packet);
+        assertThat(PacketCodec.decodeConnect(wire, ALL_VERSIONS)).isEqualTo(packet);
         assertThat(codec.decode(wire)).isEqualTo(packet);
         assertThatThrownBy(() -> codec.encode(packet)).isInstanceOf(IllegalArgumentException.class);
     }
@@ -372,7 +432,7 @@ class PacketCodecTest {
         byte[] connectWire = HexFormat.of().parseHex(
                 "101700044d51545404c60000000000016100010000000001ff"
         );
-        Packet.Connect connect = PacketCodec.decodeConnect(connectWire);
+        Packet.Connect connect = PacketCodec.decodeConnect(connectWire, ALL_VERSIONS);
         connectWire[19] = 1;
         connectWire[24] = 1;
         assertThat(connect.will()).isEqualTo(new Packet.Will(

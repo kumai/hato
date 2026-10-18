@@ -36,7 +36,9 @@ class FrameReaderTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"c000", "4002000a", "c08000", "c0808000", "c080808000"})
+    @ValueSource(strings = {
+            "c000", "4002000a", "c08000", "c0808000", "c080808000", "200900000621001422000a"
+    })
     void packets_at_the_size_limit_keep_their_original_header(String hex) throws IOException {
         byte[] packet = HexFormat.of().parseHex(hex);
         var sut = new FrameReader(new ByteArrayInputStream(packet), packet.length);
@@ -166,6 +168,7 @@ class FrameReaderTest {
     @ParameterizedTest
     @CsvSource({
             "c000, 1, 2",
+            "2009, 10, 11",
             "3002, 3, 4",
             "308100, 3, 4",
             "308000, 2, 3",
