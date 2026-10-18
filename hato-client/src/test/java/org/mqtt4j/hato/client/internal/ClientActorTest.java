@@ -28,6 +28,7 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import org.jspecify.annotations.Nullable;
@@ -1975,6 +1976,78 @@ class ClientActorTest {
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, true, 1));
             assertThat(transport.closed).isTrue();
             assertThat(ends).isEmpty();
+        }
+    }
+
+    @Test
+    void replaying_a_full_window_of_releases_still_sends_acknowledgements_and_pings()
+            throws Exception {
+        // Arrange: a persistent session keeps a full window of QoS 2 exchanges awaiting PUBCOMP.
+        try (MqttClient sut = client(false)) {
+            ScriptTransport first = connect(sut);
+            for (int value = 0; value < 64; value++) {
+                sut.publish(MqttMessage.of(
+                        new Topic("window"),
+                        new byte[] {(byte) value},
+                        Qos.EXACTLY_ONCE,
+                        false
+                ));
+            }
+            var published = new ArrayList<Integer>();
+            for (int i = 0; i < 64; i++) {
+                var publication = (Packet.Publish) requireNonNull(first.sent.poll(5, SECONDS));
+                published.add(publication.packetId());
+            }
+            // PUBRECs arrive in reverse PUBLISH order, so the replayed releases show PUBREC order.
+            List<Integer> released = published.reversed();
+            for (int packetId : released) {
+                first.receive(new Packet.PubRec(packetId, ReasonCode.SUCCESS, EMPTY));
+            }
+            for (int i = 0; i < 64; i++) {
+                assertThat(first.sent.poll(5, SECONDS)).isInstanceOf(Packet.PubRel.class);
+            }
+            first.receiver().onClosed(new IOException("lost before PUBCOMP"));
+            assertThat(ends.poll(5, SECONDS)).isNotNull();
+            CompletableFuture<ConnAck> reconnection = sut.connect();
+            ScriptTransport second = nextTransport();
+            // Settle CONNECT's write notification, so the reserved queue holds only the replay.
+            await().untilAsserted(() -> assertThat(((ClientActor) sut).usage().sends()).isZero());
+            // Writes now wait for the test, so the replay fills the reserved queue.
+            second.completeSends = false;
+            second.receive(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+            reconnection.get(5, SECONDS);
+
+            // Act: PUBACKs for incoming publications and a keep-alive PINGREQ need the same queue.
+            for (int id = 1; id <= 20; id++) {
+                second.receive(qosOnePublication("incoming", id, false));
+            }
+            await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
+            scheduler.advance(Duration.ofSeconds(10));
+            // No write has completed yet: the replay holds the 14 acknowledgement slots of the
+            // reserved queue (16 less the 2 kept for control packets), so the PINGREQ must fit
+            // in those 2.
+            await().until(() -> ((ClientActor) sut).usage().sends() == 14 + 1 || !ends.isEmpty());
+            assertThat(ends).isEmpty();
+            var written = new ArrayList<Packet>();
+            while (written.size() < 64 + 20 + 1) {
+                Packet packet = requireNonNull(second.sent.poll(5, SECONDS));
+                written.add(packet);
+                second.completeSend();
+                if (packet instanceof Packet.PingReq) {
+                    second.receive(new Packet.PingResp());
+                }
+            }
+
+            // Assert: everything is written in its order, and the connection continues.
+            assertThat(written).filteredOn(Packet.PubRel.class::isInstance)
+                    .map(packet -> ((Packet.PubRel) packet).packetId())
+                    .containsExactlyElementsOf(released);
+            assertThat(written).filteredOn(Packet.PubAck.class::isInstance)
+                    .map(packet -> ((Packet.PubAck) packet).packetId())
+                    .containsExactlyElementsOf(IntStream.rangeClosed(1, 20).boxed().toList());
+            assertThat(written).filteredOn(Packet.PingReq.class::isInstance).hasSize(1);
+            assertThat(ends).isEmpty();
+            assertThat(second.closed).isFalse();
         }
     }
 
