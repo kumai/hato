@@ -28,6 +28,9 @@ final class ListenerLane {
 
     private final ConnectionListener listener;
 
+    // Called without the lock each time the lane runs out of notifications.
+    private final Runnable onIdle;
+
     private final ArrayDeque<Event> events = new ArrayDeque<>();
 
     private boolean running;
@@ -37,10 +40,11 @@ final class ListenerLane {
 
     private long dropped;
 
-    ListenerLane(URI endpoint, String clientId, ConnectionListener listener) {
+    ListenerLane(URI endpoint, String clientId, ConnectionListener listener, Runnable onIdle) {
         this.endpoint = endpoint;
         this.clientId = clientId;
         this.listener = listener;
+        this.onIdle = onIdle;
     }
 
     void connected(ConnAck connAck) {
@@ -92,6 +96,13 @@ final class ListenerLane {
         }
     }
 
+    /// No notification is queued or running.
+    boolean idle() {
+        synchronized (events) {
+            return !running;
+        }
+    }
+
     private void run() {
         while (true) {
             Event event;
@@ -100,9 +111,13 @@ final class ListenerLane {
                 event = events.pollFirst();
                 if (event == null) {
                     running = false;
-                    return;
+                } else {
+                    delivering = true;
                 }
-                delivering = true;
+            }
+            if (event == null) {
+                onIdle.run();
+                return;
             }
             try {
                 switch (event) {

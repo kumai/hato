@@ -97,6 +97,10 @@ discard a pending DISCONNECT. Successful completion of `disconnect()` confirms t
 but the broker does not acknowledge receipt. If disconnection fails, the Will may still
 be published.
 
+`close()` does not wait for handlers or other callbacks that are already running. Once
+`client.terminated()` completes, none of them runs or will start, so you can release what
+they use, such as a database connection or an injected `TimerScheduler`.
+
 ## Publishing
 
 Use `Qos.EXACTLY_ONCE` in the [publishing example](../README.md#publishing)

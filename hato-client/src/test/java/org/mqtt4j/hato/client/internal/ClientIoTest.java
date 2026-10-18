@@ -11,6 +11,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.logging.Handler;
 import java.util.logging.Level;
@@ -44,6 +45,7 @@ import org.mqtt4j.hato.spi.Transport;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.client.internal.common.io.SendQueue.OfferResult.ACCEPTED;
 import static org.mqtt4j.hato.client.internal.common.io.SendQueue.OfferResult.CLOSED;
@@ -58,12 +60,17 @@ class ClientIoTest {
 
     private final RecordingCodec codec = new RecordingCodec();
 
+    // The next created transport throws this from start.
+    private volatile @Nullable RuntimeException nextStartFailure;
+
     private final ClientIo sut = new ClientIo(
             URI.create("mqtt://localhost"),
             "io-test",
             16 * 1024 * 1024,
             _ -> {
                 var transport = new SingleWriteTransport();
+                transport.startFailure = nextStartFailure;
+                nextStartFailure = null;
                 transports.add(transport);
                 return transport;
             },
@@ -1033,6 +1040,35 @@ class ClientIoTest {
         assertThat(events.received).containsExactly(new Packet.PingResp(), new Packet.PingResp());
     }
 
+    @Test
+    void shutdown_reports_the_end_of_io_once_every_started_transport_has_closed()
+            throws Exception {
+        // Arrange: an ended connection's transport is still closing, the next transport fails
+        // to start, and the one after it is current. A send there reveals the sender's thread.
+        SingleWriteTransport earlier = open(1);
+        sut.close();
+        nextStartFailure = new IllegalArgumentException("Unsupported endpoint");
+        assertThatThrownBy(() -> sut.open(2, Duration.ofSeconds(30)))
+                .isInstanceOf(SpiException.class);
+        SingleWriteTransport current = open(3);
+        var sender = new AtomicReference<@Nullable Thread>();
+        current.beforeSend = () -> sender.set(Thread.currentThread());
+        current.completeInline = true;
+        assertThat(sut.send(3, 1, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        await().until(() -> sender.get() != null);
+
+        // Act: once shutdown has ended the sender, only the transports remain.
+        sut.shutdown();
+        assertThat(requireNonNull(sender.get()).join(Duration.ofSeconds(5))).isTrue();
+
+        // Assert: the report waits for both started transports, however often one reports.
+        current.end(new IOException("Transport closed"));
+        current.end(new IOException("Transport closed again"));
+        assertThat(events.closures).hasValue(0);
+        earlier.end(new IOException("Transport closed"));
+        assertThat(events.closures).hasValue(1);
+    }
+
     private SingleWriteTransport open(long generation) {
         sut.open(generation, Duration.ofSeconds(30));
         return transports.getLast();
@@ -1135,11 +1171,16 @@ class ClientIoTest {
         volatile boolean completeInline;
         volatile boolean rejectSend;
         volatile @Nullable Throwable endInsideSend;
+        volatile @Nullable RuntimeException startFailure;
         int sendDepth;
         int maximumSendDepth;
 
         @Override
         public void start(URI endpoint, Duration timeout, Listener receiver) {
+            RuntimeException failure = startFailure;
+            if (failure != null) {
+                throw failure;
+            }
             listener = receiver;
             receiver.onConnected();
         }
@@ -1258,6 +1299,7 @@ class ClientIoTest {
         final List<Packet> pingResponses = new CopyOnWriteArrayList<>();
         final List<Long> written = new CopyOnWriteArrayList<>();
         final List<Long> capacityGenerations = new CopyOnWriteArrayList<>();
+        final AtomicInteger closures = new AtomicInteger();
         volatile Runnable beforeSent = () -> { };
 
         @Override
@@ -1306,6 +1348,11 @@ class ClientIoTest {
         @Override
         public void fatal(Throwable cause) {
             fatals.add(cause);
+        }
+
+        @Override
+        public void closed() {
+            closures.incrementAndGet();
         }
     }
 }

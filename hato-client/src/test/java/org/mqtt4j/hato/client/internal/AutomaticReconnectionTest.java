@@ -14,6 +14,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.jspecify.annotations.Nullable;
@@ -258,6 +259,53 @@ class AutomaticReconnectionTest {
             assertThat(failureOf(observation)).isInstanceOf(IllegalStateException.class);
             assertThat(failureOf(sut.whenConnected())).isInstanceOf(IllegalStateException.class);
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isZero());
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Closing during the wait is the behavior under test.
+    void a_terminated_client_calls_no_application_code_when_its_late_timer_fires()
+            throws Exception {
+        // Arrange: the clock counts its calls, and its cancellation of the waiting reconnection
+        // comes too late, so that timer can still fire after termination.
+        var calls = new AtomicInteger();
+        var late = new AtomicReference<@Nullable Runnable>();
+        var clock = new TimerScheduler() {
+            @Override
+            public long nanoTime() {
+                calls.incrementAndGet();
+                return scheduler.nanoTime();
+            }
+
+            @Override
+            public Cancellable schedule(Duration delay, Runnable task) {
+                calls.incrementAndGet();
+                Cancellable cancellation = scheduler.schedule(delay, task);
+                if (!delay.equals(FIRST_DELAY)) {
+                    return cancellation;
+                }
+                return () -> {
+                    calls.incrementAndGet();
+                    cancellation.cancel();
+                    late.set(task);
+                };
+            }
+        };
+        try (MqttClient sut = client(listener, true, false, Duration.ofSeconds(60), clock)) {
+            lose(connect(sut));
+            listener.next();
+            listener.next();
+
+            // Act: closing ends the wait without a notification, and the client terminates.
+            sut.close();
+            sut.terminated().get(5, SECONDS);
+            int before = calls.get();
+            requireNonNull(late.get()).run();
+
+            // Assert: the late timer starts no attempt, and the client calls nothing more.
+            assertThat(transports).isEmpty();
+            assertThat(calls).hasValue(before);
+            assertThat(listener.notifications).isEmpty();
         }
     }
 

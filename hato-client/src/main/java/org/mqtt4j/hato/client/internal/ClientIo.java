@@ -46,6 +46,11 @@ final class ClientIo {
         void failed(long generation, Throwable cause);
 
         void fatal(Throwable cause);
+
+        /// Called once, without the send monitor, after [#shutdown()] once every started
+        /// transport has reported its close and the sender has exited. I/O calls no Transport
+        /// method afterwards.
+        void closed();
     }
 
     private static final Log log = Log.of(ClientIo.class);
@@ -97,6 +102,14 @@ final class ClientIo {
 
     private long postedEnds;
 
+    // Started transports that have not reported their close, including those of ended
+    // connections that are still closing.
+    private int openTransports;
+
+    private boolean senderEnded;
+
+    private boolean closeReported;
+
     ClientIo(
             URI endpoint,
             String clientId,
@@ -136,6 +149,7 @@ final class ClientIo {
         );
         synchronized (sending) {
             current = connection;
+            openTransports++;
         }
         var receiver = new Transport.Listener() {
             @Override
@@ -195,12 +209,18 @@ final class ClientIo {
             public void onClosed(Throwable cause) {
                 frames.clear();
                 ended(connection, cause);
+                released(connection);
             }
         };
         try {
             transport.start(endpoint, timeout, receiver);
         } catch (RuntimeException failure) {
+            // A transport that failed to start reports no close to wait for.
+            released(connection);
             throw new SpiException(generation, failure);
+        } catch (Error failure) {
+            released(connection);
+            throw failure;
         }
     }
 
@@ -323,6 +343,15 @@ final class ClientIo {
             }
         } catch (Throwable failure) {
             events.fatal(failure);
+        } finally {
+            boolean closed;
+            synchronized (sending) {
+                senderEnded = true;
+                closed = closedLocked();
+            }
+            if (closed) {
+                events.closed();
+            }
         }
     }
 
@@ -504,6 +533,39 @@ final class ClientIo {
             shutdown = true;
         }
         close();
+        boolean closed;
+        synchronized (sending) {
+            closed = closedLocked();
+        }
+        if (closed) {
+            events.closed();
+        }
+    }
+
+    /// A transport reported its close or failed to start; each counts once, even if a transport
+    /// reports again.
+    private void released(Connection connection) {
+        boolean closed;
+        synchronized (sending) {
+            if (connection.released) {
+                return;
+            }
+            connection.released = true;
+            openTransports--;
+            closed = closedLocked();
+        }
+        if (closed) {
+            events.closed();
+        }
+    }
+
+    /// Caller holds sending. True once, when shutdown has left nothing that calls a transport.
+    private boolean closedLocked() {
+        if (shutdown && openTransports == 0 && senderEnded && !closeReported) {
+            closeReported = true;
+            return true;
+        }
+        return false;
     }
 
     /// Sends holding the client-wide budget, including those an ended connection still owns.
@@ -539,6 +601,8 @@ final class ClientIo {
         @Nullable Throwable pendingEnd;
         // Admitted PINGREQs that no PINGRESP has answered yet.
         int pings;
+        // The transport has reported its close or failed to start.
+        boolean released;
 
         Connection(long generation, Transport transport, SendQueue<Outbound> queue) {
             this.generation = generation;

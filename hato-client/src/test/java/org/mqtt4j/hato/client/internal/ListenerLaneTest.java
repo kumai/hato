@@ -64,7 +64,12 @@ class ListenerLaneTest {
         logger.setUseParentHandlers(false);
         logger.addHandler(handler);
         try {
-            var sut = new ListenerLane(URI.create("mqtt://localhost"), "listener-test", listener);
+            var sut = new ListenerLane(
+                    URI.create("mqtt://localhost"),
+                    "listener-test",
+                    listener,
+                    () -> { }
+            );
             var ending = Disconnection.of(null, true, 1);
 
             // Act
@@ -114,7 +119,12 @@ class ListenerLaneTest {
                 throw new IllegalStateException("Listener failed");
             }
         };
-        var sut = new ListenerLane(URI.create("mqtt://localhost"), "listener-test", listener);
+        var sut = new ListenerLane(
+                URI.create("mqtt://localhost"),
+                "listener-test",
+                listener,
+                () -> { }
+        );
         sut.connected(ConnAck.of(false, 1));
         assertThat(entered.await(5, SECONDS)).isTrue();
         sut.disconnected(Disconnection.of(null, true, 1));
@@ -159,7 +169,12 @@ class ListenerLaneTest {
                 attempts.add(failure.attempt());
             }
         };
-        var sut = new ListenerLane(URI.create("mqtt://localhost"), "listener-test", listener);
+        var sut = new ListenerLane(
+                URI.create("mqtt://localhost"),
+                "listener-test",
+                listener,
+                () -> { }
+        );
         sut.connected(ConnAck.of(false, 1));
         assertThat(entered.await(5, SECONDS)).isTrue();
 

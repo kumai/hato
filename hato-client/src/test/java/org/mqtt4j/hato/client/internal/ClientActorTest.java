@@ -8,10 +8,12 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -5168,6 +5170,220 @@ class ClientActorTest {
     }
 
     @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_a_running_handler() throws Exception {
+        // Arrange: a handler still runs when the client closes.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request(), _ -> {
+                entered.countDown();
+                waitFor(release);
+            });
+            establish(transport, subscription);
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the handler alone keeps termination pending.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+            assertThat(actor.terminationPending()).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_the_disconnection_notice_that_closing_produces()
+            throws Exception {
+        // Arrange: the listener blocks in the notice of the connection that closing ends.
+        var notices = new LinkedBlockingQueue<String>();
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client(blockingListener(notices, release))) {
+            var actor = (ClientActor) sut;
+            connect(sut);
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert
+            assertThat(notices.poll(5, SECONDS)).isEqualTo("disconnected");
+            awaitTerminationPending(actor, ClientTermination.Pending.LISTENER);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_the_attempt_failure_notice_that_closing_produces()
+            throws Exception {
+        // Arrange: the listener blocks in the notice of the attempt that closing ends.
+        var notices = new LinkedBlockingQueue<String>();
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client(blockingListener(notices, release))) {
+            var actor = (ClientActor) sut;
+            CompletableFuture<ConnAck> connection = sut.connect();
+            nextTransport();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert
+            assertThatThrownBy(() -> connection.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class);
+            assertThat(notices.poll(5, SECONDS)).isEqualTo("connect failed");
+            awaitTerminationPending(actor, ClientTermination.Pending.LISTENER);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_a_supplier_that_ignores_interruption() throws Exception {
+        // Arrange: the supplier is still evaluating when the client closes.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = clientWithCredentials(() -> {
+            entered.countDown();
+            awaitIgnoringInterrupts(release);
+            return MqttCredentials.of("late");
+        })) {
+            var actor = (ClientActor) sut;
+            CompletableFuture<ConnAck> connection = sut.connect();
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act: closing interrupts the supplier, which keeps waiting.
+            sut.close();
+
+            // Assert
+            assertThatThrownBy(() -> connection.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectException.class);
+            awaitTerminationPending(actor, ClientTermination.Pending.CREDENTIALS);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @ParameterizedTest(name = "operation returns last: {0}")
+    @ValueSource(booleans = {false, true})
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_continuations_of_the_futures_it_completes(
+            boolean operationLast
+    ) throws Exception {
+        // Arrange: a connection attempt and a connection observation each carry a continuation
+        // that blocks once closing completes them.
+        var releaseOperation = new CountDownLatch(1);
+        var releaseObservation = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            CompletableFuture<ConnAck> operation = sut.connect()
+                    .whenComplete((_, _) -> waitFor(releaseOperation));
+            nextTransport();
+            CompletableFuture<ConnAck> observation = sut.whenConnected()
+                    .whenComplete((_, _) -> waitFor(releaseObservation));
+            CompletableFuture<Void> terminated = sut.terminated();
+            CountDownLatch first = operationLast ? releaseObservation : releaseOperation;
+            CompletableFuture<ConnAck> firstCompleted = operationLast ? observation : operation;
+            CountDownLatch last = operationLast ? releaseOperation : releaseObservation;
+
+            // Act
+            sut.close();
+
+            // Assert: either continuation alone keeps termination pending, and whichever returns
+            // last completes it.
+            awaitTerminationPending(actor, ClientTermination.Pending.COMPLETIONS);
+            first.countDown();
+            assertThatThrownBy(() -> firstCompleted.get(5, SECONDS))
+                    .isInstanceOf(ExecutionException.class);
+            assertThat(actor.terminationPending())
+                    .containsExactly(ClientTermination.Pending.COMPLETIONS);
+            assertThat(terminated).isNotDone();
+            last.countDown();
+            terminated.get(5, SECONDS);
+        } finally {
+            releaseOperation.countDown();
+            releaseObservation.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_the_transport_to_finish_closing() throws Exception {
+        // Arrange: the connection's transport is slow to close.
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            transport.deferCloseReport = true;
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert
+            awaitTerminationPending(actor, ClientTermination.Pending.TRANSPORTS);
+            assertThat(terminated).isNotDone();
+            transport.finishClose();
+            terminated.get(5, SECONDS);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_observations_are_independent_and_share_the_waiter_limit()
+            throws Exception {
+        // Arrange: pending establishment observations fill every waiter slot.
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request(), _ -> { });
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
+            for (int i = 0; i < 1024; i++) {
+                subscription.established();
+            }
+
+            // Act
+            CompletableFuture<Void> refused = sut.terminated();
+
+            // Assert: the refusal is immediate. Observations made before close are independent,
+            // and once the client has terminated a later call finds it complete.
+            assertThatThrownBy(refused::join).hasCauseInstanceOf(MqttCapacityException.class);
+            subscription.close();
+            await().until(() -> actor.usage().waiters() == 0);
+            CompletableFuture<Void> first = sut.terminated();
+            CompletableFuture<Void> cancelled = sut.terminated();
+            cancelled.cancel(false);
+            sut.close();
+            first.get(5, SECONDS);
+            assertThat(first).isNotSameAs(cancelled);
+            assertThat(sut.terminated()).isCompleted();
+            await().until(() -> actor.usage().waiters() == 0);
+        }
+    }
+
+    @Test
     void close_starts_one_removal_without_waiting_or_retaining_operation_slots()
             throws Exception {
         // Arrange
@@ -5714,6 +5930,35 @@ class ClientActorTest {
         // The actor reads the clock for each received packet; the session ignores this PINGRESP.
         transport.receive(new Packet.PingResp());
         assertThat(entered.await(5, SECONDS)).isTrue();
+    }
+
+    /// Waits until the client's termination waits for `pending` alone, every other part having
+    /// ended.
+    private static void awaitTerminationPending(
+            ClientActor client,
+            ClientTermination.Pending pending
+    ) {
+        await().until(() -> client.terminationPending().equals(Set.of(pending)));
+    }
+
+    /// Blocks in either ending notification until `release`, recording which one arrived.
+    private static ConnectionListener blockingListener(
+            LinkedBlockingQueue<String> notices,
+            CountDownLatch release
+    ) {
+        return new ConnectionListener() {
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                notices.add("disconnected");
+                waitFor(release);
+            }
+
+            @Override
+            public void onConnectFailed(Disconnection failure) {
+                notices.add("connect failed");
+                waitFor(release);
+            }
+        };
     }
 
     private ScriptTransport nextTransport() throws Exception {

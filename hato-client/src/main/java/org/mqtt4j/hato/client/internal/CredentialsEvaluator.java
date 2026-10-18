@@ -15,6 +15,8 @@ import static java.util.Objects.requireNonNull;
 ///
 /// The latest current result waits here until the actor takes it. Closing drops the result
 /// and every reference to the client, so a call that never returns cannot keep it reachable.
+/// The worker's exit is still reported to the client's termination, which holds no reference to
+/// the client itself.
 final class CredentialsEvaluator implements AutoCloseable {
 
     record Result(
@@ -31,6 +33,9 @@ final class CredentialsEvaluator implements AutoCloseable {
     // Wakes the actor to take the result; null once closed.
     private @Nullable Runnable ready;
 
+    // Called without the monitor once the worker has exited, even after close.
+    private final Runnable onIdle;
+
     private @Nullable ConnectionAttempt requested;
 
     // Held here rather than on the worker's stack, so closing also releases it.
@@ -40,10 +45,16 @@ final class CredentialsEvaluator implements AutoCloseable {
 
     private @Nullable Thread worker;
 
-    CredentialsEvaluator(String threadName, Supplier<MqttCredentials> supplier, Runnable ready) {
+    CredentialsEvaluator(
+            String threadName,
+            Supplier<MqttCredentials> supplier,
+            Runnable ready,
+            Runnable onIdle
+    ) {
         this.threadName = threadName;
         this.supplier = supplier;
         this.ready = ready;
+        this.onIdle = onIdle;
     }
 
     synchronized void evaluate(ConnectionAttempt attempt) {
@@ -83,12 +94,17 @@ final class CredentialsEvaluator implements AutoCloseable {
         }
     }
 
+    /// No supplier call is running.
+    synchronized boolean idle() {
+        return worker == null;
+    }
+
     private void run() {
         while (true) {
             synchronized (this) {
                 if (requested == null) {
                     worker = null;
-                    return;
+                    break;
                 }
                 evaluating = requested;
                 // Interrupt status left by an abandoned call must not reach the next one.
@@ -103,6 +119,7 @@ final class CredentialsEvaluator implements AutoCloseable {
             }
             complete(value, failure);
         }
+        onIdle.run();
     }
 
     /// Keeps the result of a call whose attempt is still requested and wakes the actor. A

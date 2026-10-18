@@ -169,12 +169,41 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// or application callbacks. Repeated calls have no effect. This also stops reconnection
     /// and fails pending connection requests and publications.
     /// No delivery is handed off after this returns: handlers start and receivers return only
-    /// for deliveries taken before. Those handlers may still run; [Subscription#terminated()]
-    /// observes their end.
+    /// for deliveries taken before. Those handlers, and other application code that the client
+    /// is already running, may still run; [#terminated()] observes the end of all of it.
     /// Discards local session state; a persistent session may remain on the broker until a
     /// later client object with the same identifier replaces it on connecting.
     /// A Will registered with the broker may be published. For a graceful disconnect,
     /// wait for [#disconnect] to complete successfully before calling this method.
     @Override
     void close();
+
+    /// Observes the end of this client's work without requesting it; it completes only after
+    /// [#close()]. The future completes once the client runs no application code and calls
+    /// none later: every subscription has terminated, as [Subscription#terminated()] observes,
+    /// so no handler runs; the [ConnectionListener] has returned from every notification it
+    /// receives, including the last one that closing produces, while notifications dropped
+    /// because it fell behind never arrive; a credentials supplier call, which closing
+    /// interrupts, has returned; every transport has finished closing; and the synchronous
+    /// continuations of the futures that the client completes have returned, except those of
+    /// this method. Afterwards the client calls no handler, listener, supplier,
+    /// [org.mqtt4j.hato.spi.TimerScheduler], [org.mqtt4j.hato.spi.Transport], or continuation,
+    /// and a reconnection timer that fires late does nothing.
+    ///
+    /// It does not wait for work that application code started, such as tasks submitted to the
+    /// application's own executors, nor for the application's own calls into the client, such as
+    /// a waiting [Subscription#receive()], which closing ends promptly. Code that never returns
+    /// keeps the future pending; it never completes on a timeout.
+    ///
+    /// Each call returns an independent future; after termination, a completed one. Pending
+    /// observations, including those made before [#close()], share the client-wide limit
+    /// described by [Subscription#established()], and a full limit returns a future already
+    /// failed with [MqttCapacityException]; the future fails in no other way.
+    ///
+    /// Release what the client's callbacks use, such as an injected
+    /// [org.mqtt4j.hato.spi.TimerScheduler] or the resources of a custom transport, from a
+    /// continuation of this future or after it completes. Waiting for it inside a handler,
+    /// listener, supplier, or continuation that the client runs, or on a thread that such code
+    /// needs in order to return, never completes.
+    CompletableFuture<Void> terminated();
 }

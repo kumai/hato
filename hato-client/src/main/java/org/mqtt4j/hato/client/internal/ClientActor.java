@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
@@ -97,6 +98,8 @@ public final class ClientActor implements MqttClient {
 
     private final TimerScheduler scheduler;
 
+    private final ClientTermination termination;
+
     private final ListenerLane listenerLane;
 
     private final SessionCore core;
@@ -154,6 +157,9 @@ public final class ClientActor implements MqttClient {
     // Handles whose lane may still run, guarded by lifecycleLock. A lane's termination finds its
     // handle here after retirement has removed it from subscriptions.
     private final Map<Long, ClientSubscription> unterminated = new HashMap<>();
+
+    // Guarded by lifecycleLock. Set once the actor's cleanup has retired every subscription.
+    private boolean cleanedUp;
 
     private final Map<Long, Operation<?>> operations = new ConcurrentHashMap<>();
 
@@ -223,7 +229,14 @@ public final class ClientActor implements MqttClient {
         this.scheduler = scheduler;
         this.cleanStart = cleanStart;
         reconnects = backoff.enabled();
-        listenerLane = new ListenerLane(endpoint, clientId, listener);
+        termination = new ClientTermination(
+                threadName("terminated"),
+                waiterSlots,
+                WAITER_LIMIT,
+                List.of(operationSlots, connectSlot, disconnectSlot),
+                COMMAND_LIMIT
+        );
+        listenerLane = new ListenerLane(endpoint, clientId, listener, termination::check);
         mailbox = createMailbox(maxPacketSize);
         lanes = new DeliveryLanes(
                 clientId,
@@ -255,8 +268,10 @@ public final class ClientActor implements MqttClient {
         this.credentials = credentials == null ? null : new CredentialsEvaluator(
                 threadName("credentials"),
                 credentials,
-                () -> post(0, this::applyCredentials, Mailbox.Kind.CREDENTIALS_READY, 0)
+                () -> post(0, this::applyCredentials, Mailbox.Kind.CREDENTIALS_READY, 0),
+                termination::check
         );
+        termination.watch(listenerLane, this.credentials);
         Thread.ofVirtual().name(threadName("actor")).start(this::run);
     }
 
@@ -459,6 +474,11 @@ public final class ClientActor implements MqttClient {
         lanes.closeHandOffs();
     }
 
+    @Override
+    public CompletableFuture<Void> terminated() {
+        return termination.observe();
+    }
+
     private void run() {
         Throwable failure = null;
         try {
@@ -525,7 +545,16 @@ public final class ClientActor implements MqttClient {
                                     : new IllegalStateException("Client is closed", cause)
                     ));
                 } finally {
-                    io.shutdown();
+                    try {
+                        io.shutdown();
+                    } finally {
+                        synchronized (lifecycleLock) {
+                            cleanedUp = true;
+                            checkLanesEnded();
+                        }
+                        // The actor calls no application code from here on.
+                        termination.actorEnded();
+                    }
                 }
             }
         }
@@ -562,7 +591,16 @@ public final class ClientActor implements MqttClient {
             if (subscription != null) {
                 subscription.laneEnded = true;
                 subscription.checkTerminated();
+                checkLanesEnded();
             }
+        }
+    }
+
+    /// Caller holds lifecycleLock. Once the cleanup has retired every subscription, the last one
+    /// to terminate ends the lanes for the client's termination.
+    private void checkLanesEnded() {
+        if (cleanedUp && unterminated.isEmpty()) {
+            termination.lanesEnded();
         }
     }
 
@@ -712,6 +750,7 @@ public final class ClientActor implements MqttClient {
                 operation.finish(result, failure);
             } finally {
                 operation.slot.release();
+                termination.check();
             }
         });
     }
@@ -764,6 +803,12 @@ public final class ClientActor implements MqttClient {
     /// an end until applications get statistics.
     long postedConnectionEnds() {
         return io.postedEnds();
+    }
+
+    /// What the client's termination still waits for, for tests that hold one part until
+    /// applications get statistics.
+    Set<ClientTermination.Pending> terminationPending() {
+        return termination.pending();
     }
 
     static Mailbox createMailbox(int maxPacketSize) {
@@ -1212,6 +1257,11 @@ public final class ClientActor implements MqttClient {
                 mailbox.wake();
             }
         }
+
+        @Override
+        public void closed() {
+            termination.transportsClosed();
+        }
     }
 
     /// Operation slots, including those of connect() and disconnect(), stay held until application
@@ -1501,6 +1551,7 @@ public final class ClientActor implements MqttClient {
                                 }
                             } finally {
                                 waiterSlots.release();
+                                termination.check();
                             }
                         });
             }

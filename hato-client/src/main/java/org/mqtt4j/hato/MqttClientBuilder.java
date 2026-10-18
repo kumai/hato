@@ -200,7 +200,9 @@ public final class MqttClientBuilder {
     /// The default is no credentials. At most one invocation runs at a time for this client;
     /// the supplier should respond to interruption when an attempt ends or the client closes.
     /// An invocation that ignores interruption delays evaluation for a later attempt until it
-    /// returns; the abandoned result is discarded. Closing the client does not wait for it.
+    /// returns; the abandoned result is discarded. Closing the client does not wait for it, but
+    /// [MqttClient#terminated()] completes only after it returns, so such an invocation should
+    /// bound its own wait.
     /// An exception, a null result, or exceeding [#connectionTimeout(Duration)] fails only
     /// that attempt with [MqttConnectException]. A later attempt evaluates the supplier again.
     /// The supplier is not evaluated during [#build()].
