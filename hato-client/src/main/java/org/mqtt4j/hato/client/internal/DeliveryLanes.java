@@ -30,8 +30,10 @@ import org.mqtt4j.hato.client.internal.common.log.Log;
 
 import static java.util.Objects.requireNonNull;
 
-/// Push subscriptions have one SERIAL worker; pull subscriptions use their callers' threads.
-/// Reservations include executing handlers and survive connection changes until they return.
+/// Each push subscription has a dispatcher, an internal virtual thread that takes its deliveries
+/// in receive order and, for serial delivery, executes each handler in place. Pull subscriptions
+/// use their callers' threads. Reservations include executing handlers and survive connection
+/// changes until they return.
 final class DeliveryLanes {
 
     private static final Log log = Log.of(DeliveryLanes.class);
@@ -44,7 +46,7 @@ final class DeliveryLanes {
     private static final int DELIVERY_LIMIT = 65_536;
 
     // One lock keeps fan-out reservations atomic; each lane's condition wakes only that lane's
-    // worker or receivers.
+    // dispatcher or receivers.
     private final ReentrantLock lock = new ReentrantLock();
 
     private final Map<Long, Lane> lanes = new HashMap<>();
@@ -142,7 +144,7 @@ final class DeliveryLanes {
             }
             try {
                 Thread.ofVirtual().name("hato-" + clientId + "-delivery-" + lane.id)
-                        .start(() -> run(lane));
+                        .start(() -> dispatch(lane));
             } catch (Throwable failure) {
                 lanes.remove(lane.id);
                 retainedLanes--;
@@ -565,9 +567,11 @@ final class DeliveryLanes {
         }
     }
 
-    private void run(Lane lane) {
+    /// The lane's dispatcher: its internal virtual thread, which takes the lane's deliveries in
+    /// receive order. Serial delivery executes each claim here, in place.
+    private void dispatch(Lane lane) {
         try {
-            while (runNext(lane)) {
+            while (dispatchNext(lane)) {
                 // Each call drops its delivery reference before the next wait.
             }
         } finally {
@@ -580,33 +584,51 @@ final class DeliveryLanes {
         }
     }
 
-    private boolean runNext(Lane lane) {
-        DeliveryView view;
-        boolean ready;
+    /// Waits for the next delivery, claims it, and executes it. Returns false once the lane has
+    /// stopped.
+    private boolean dispatchNext(Lane lane) {
+        Claim claim;
         lock.lock();
         try {
             while (!lane.stopped && (lane.failed || lane.queue.isEmpty())) {
-                // The private worker ends through stop(), which signals this condition.
+                // The dispatcher ends through stop(), which signals this condition.
                 lane.ready.awaitUninterruptibly();
             }
             if (lane.stopped) {
                 return false;
             }
-            // Claiming and stopping share the lock. A claimed handler may finish.
-            view = lane.queue.removeFirst();
-            view.recipient.queued = false;
-            view.recipient.handed = true;
-            ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
+            claim = claim(lane);
         } finally {
             lock.unlock();
         }
+        execute(lane, claim);
+        return true;
+    }
+
+    /// Caller holds lock; the lane is not stopped, no failure holds it, and its queue is not
+    /// empty. Taking the head fixes its hand-off. Claiming and stopping share the lock, so a stop
+    /// either discards the delivery first or leaves its handler to run, possibly after the stop
+    /// returns.
+    private Claim claim(Lane lane) {
+        DeliveryView view = lane.queue.removeFirst();
+        view.recipient.queued = false;
+        view.recipient.handed = true;
+        return new Claim(view, lane.ackMode == AckMode.ON_RECEIVE && markReady(view));
+    }
+
+    /// Runs a claimed delivery's handler without the lock, then settles the delivery. A normal
+    /// return ends its local processing; a failure invalidates its acknowledgement condition and
+    /// is reported. Either way the handler's interrupt state is cleared.
+    private void execute(Lane lane, Claim claim) {
+        DeliveryView view = claim.view();
         try {
-            if (ready) {
+            if (claim.ready()) {
                 onReady.run();
             }
             requireNonNull(lane.handler).accept(view);
             // Clear handler-owned interrupt state before the next delivery or queue wait.
             Thread.interrupted();
+            boolean ready;
             lock.lock();
             try {
                 view.localDone = true;
@@ -619,7 +641,6 @@ final class DeliveryLanes {
             if (ready) {
                 onReady.run();
             }
-            return true;
         } catch (Throwable failure) {
             lock.lock();
             try {
@@ -641,7 +662,6 @@ final class DeliveryLanes {
             } finally {
                 lock.unlock();
             }
-            return true;
         }
     }
 
@@ -729,7 +749,7 @@ final class DeliveryLanes {
             ready |= markReady(view);
             releaseView(view);
         }
-        // Pull lanes have no worker to return this slot when it exits; the stopped guard above
+        // Pull lanes have no dispatcher to return this slot when it exits; the stopped guard above
         // keeps this release single.
         if (lane.handler == null) {
             retainedLanes--;
@@ -894,6 +914,10 @@ final class DeliveryLanes {
             this.ready = ready;
         }
     }
+
+    /// A delivery taken from its lane's queue. `ready` says whether taking it met the last
+    /// acknowledgement condition of its receipt, which `execute` announces without the lock.
+    private record Claim(DeliveryView view, boolean ready) {}
 
     private static final class RetainedDelivery {
 
