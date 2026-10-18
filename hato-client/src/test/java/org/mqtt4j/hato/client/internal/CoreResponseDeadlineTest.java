@@ -211,11 +211,15 @@ class CoreResponseDeadlineTest {
         // Act
         sut.timer(1, RESPONSE, 110);
 
-        // Assert
+        // Assert: only a persistent session keeps the publication for the reconnection.
         assertThat(sut.state()).isEqualTo(RECONNECT_WAIT);
         assertThat(port.timers).containsOnlyKeys(RECONNECT);
-        assertThat(result(2).failure()).hasCauseInstanceOf(TimeoutException.class);
-        sut.connect(new ConnectionAttempt(3, null), 200);
+        if (cleanStart) {
+            assertThat(result(2).failure()).hasCauseInstanceOf(TimeoutException.class);
+        } else {
+            assertThat(port.results).doesNotContainKey(2L);
+        }
+        sut.connect(new ConnectionAttempt(3), 200);
         sut.opened(2);
         sut.received(2, new Packet.ConnAck(!cleanStart, ReasonCode.SUCCESS, EMPTY), 200, 0);
         assertThat(sut.state()).isEqualTo(CONNECTED);
@@ -233,6 +237,7 @@ class CoreResponseDeadlineTest {
             assertThat(port.timers).containsEntry(RESPONSE, RESPONSE_TIMEOUT);
             sut.timer(2, RESPONSE, 1100);
             assertThat(sut.state()).isEqualTo(RECONNECT_WAIT);
+            assertThat(port.results).doesNotContainKey(2L);
         }
     }
 
@@ -263,7 +268,7 @@ class CoreResponseDeadlineTest {
                         Duration.ofSeconds(120),
                         new Random(1)
                 )
-                : ReconnectBackoff.disabled(new Random(1));
+                : ReconnectBackoff.disabled();
         var core = new SessionCore(
                 port,
                 "client",
@@ -276,7 +281,7 @@ class CoreResponseDeadlineTest {
                 false,
                 RESPONSE_TIMEOUT
         );
-        core.connect(new ConnectionAttempt(1, null), 0);
+        core.connect(new ConnectionAttempt(1), 0);
         core.opened(1);
         receive(core, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
         return core;

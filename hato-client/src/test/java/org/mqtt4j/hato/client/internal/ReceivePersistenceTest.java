@@ -51,7 +51,10 @@ class ReceivePersistenceTest {
             Duration.ZERO,
             false,
             null,
-            false
+            false,
+            ReconnectBackoff.disabled(),
+            false,
+            Duration.ofSeconds(60)
     );
     private long nextOperation;
     private long generation;
@@ -497,7 +500,7 @@ class ReceivePersistenceTest {
         var handlerFailure = new IOException("late handler failure for seed " + seed);
         var expectedEnds = new ArrayList<>(port.ends);
         if (present) {
-            expectedEnds.add(Disconnection.of(handlerFailure, false));
+            expectedEnds.add(Disconnection.of(handlerFailure, false, port.attempt));
         }
         var completions = new ArrayList<Runnable>();
         for (int i = 0; i < originals.size(); i++) {
@@ -526,11 +529,12 @@ class ReceivePersistenceTest {
 
     private void connect(boolean present) {
         long operation = ++nextOperation;
-        sut.connect(new ConnectionAttempt(operation, null), 0);
+        sut.connect(new ConnectionAttempt(operation), 0);
         generation = port.generation;
         sut.opened(generation);
         sut.received(generation, new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY), 0, 0);
-        assertThat(port.results.get(operation)).isEqualTo(new Result(ConnAck.of(present), null));
+        assertThat(port.results.get(operation))
+                .isEqualTo(new Result(ConnAck.of(present, port.attempt), null));
     }
 
     private void subscribe(String filter) {
@@ -644,6 +648,7 @@ class ReceivePersistenceTest {
         };
         long session;
         long generation;
+        long attempt;
 
         @Override
         public void beginAttempt(
@@ -652,6 +657,7 @@ class ReceivePersistenceTest {
                 long attemptNumber
         ) {
             this.generation = generation;
+            this.attempt = attemptNumber;
         }
 
         @Override
@@ -798,9 +804,7 @@ class ReceivePersistenceTest {
                 boolean established,
                 Disconnection disconnection,
                 boolean preserveSession,
-                boolean stopped,
-                long attemptNumber,
-                @Nullable Duration reconnectDelay
+                boolean stopped
         ) {
             ends.add(disconnection);
             if (!preserveSession) {

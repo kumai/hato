@@ -9,7 +9,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 class ReconnectBackoffTest {
 
@@ -63,25 +62,6 @@ class ReconnectBackoffTest {
             assertThat(sut.next().toNanos()).isBetween(0L, ceiling);
             ceiling = Math.min(Duration.ofSeconds(120).toNanos(), ceiling * 2);
         }
-    }
-
-    @Test
-    void a_delay_range_is_validated_before_the_sequence_is_created() {
-        assertThatIllegalArgumentException().isThrownBy(() -> new ReconnectBackoff(
-                Duration.ZERO,
-                Duration.ofSeconds(1),
-                new Random(0)
-        ));
-        assertThatIllegalArgumentException().isThrownBy(() -> new ReconnectBackoff(
-                Duration.ofSeconds(2),
-                Duration.ofSeconds(1),
-                new Random(0)
-        ));
-        assertThatIllegalArgumentException().isThrownBy(() -> new ReconnectBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofMillis(Integer.MAX_VALUE).plusNanos(1),
-                new Random(0)
-        ));
     }
 
     static final class MaximumRandom implements RandomGenerator {

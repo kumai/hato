@@ -3,11 +3,13 @@ package org.mqtt4j.hato.client.internal;
 import java.io.IOException;
 import java.net.UnknownHostException;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.TimeoutException;
+import java.util.function.BiConsumer;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import javax.net.ssl.SSLHandshakeException;
@@ -25,6 +27,7 @@ import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Topic;
+import org.mqtt4j.hato.client.internal.SessionPersistenceTest.Result;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 
 import static java.util.Objects.requireNonNull;
@@ -300,6 +303,7 @@ class ReconnectionTest {
         assertThat(requireNonNull(port.results.get(1L)).failure())
                 .hasMessage("Broker session has no local state");
         assertThat(requireNonNull(port.results.get(2L)).failure()).isNull();
+        assertThat(port.ends.getLast().userRequested()).isTrue();
     }
 
     @Test
@@ -336,7 +340,8 @@ class ReconnectionTest {
                         Duration.ofNanos(20),
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
-                false
+                false,
+                Duration.ofSeconds(60)
         );
         sut.connect(attempt(1), 0);
         connected(sut, 1, 0);
@@ -406,10 +411,11 @@ class ReconnectionTest {
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).hasSize(2);
-        assertThat(port.ends.getLast().cause()).containsSame(failure);
+        Throwable connectFailure = requireNonNull(port.results.get(1L)).failure();
+        assertThat(connectFailure).hasCause(failure);
+        assertThat(port.ends.getLast().cause()).containsSame(connectFailure);
         assertThat(port.latestReconnectDelay).isNull();
         assertThat(port.timers).isEmpty();
-        assertThat(requireNonNull(port.results.get(1L)).failure()).hasCause(failure);
     }
 
     @Test
@@ -428,7 +434,8 @@ class ReconnectionTest {
                         Duration.ofNanos(20),
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
-                true
+                true,
+                Duration.ofSeconds(60)
         );
         ConnectionAttempt first = attempt(1);
         sut.connect(first, 0);
@@ -463,9 +470,10 @@ class ReconnectionTest {
 
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
-        assertThat(port.ends.getLast().cause()).containsSame(failure);
+        Throwable connectFailure = requireNonNull(port.results.get(1L)).failure();
+        assertThat(connectFailure).hasCause(failure);
+        assertThat(port.ends.getLast().cause()).containsSame(connectFailure);
         assertThat(port.timers).isEmpty();
-        assertThat(requireNonNull(port.results.get(1L)).failure()).hasCause(failure);
     }
 
     @ParameterizedTest
@@ -500,6 +508,205 @@ class ReconnectionTest {
         assertThat(port.results).containsKeys(1L, 2L);
     }
 
+    @Test
+    void a_scheduled_reconnection_fails_qos_zero_and_continues_qos_one_on_session_present() {
+        // Arrange: a QoS 0 write and a QoS 1 acknowledgement are outstanding.
+        SessionCore sut = core(false);
+        int id = holdBothAcrossReconnection(sut);
+
+        // Act
+        sut.timer(0, RECONNECT, 3);
+        sut.opened(2);
+        sut.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 3, 4);
+
+        // Assert: QoS 0 belonged to the ended connection; QoS 1 waits for its PUBACK.
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class);
+        assertThat(port.accepted.getLast().packetId()).isEqualTo(id);
+        assertThat(port.results).doesNotContainKey(3L);
+        sut.received(2, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 3, 4);
+        assertThat(requireNonNull(port.results.get(3L)).failure()).isNull();
+    }
+
+    @Test
+    void a_reconnection_without_session_present_fails_the_held_qos_one_publication() {
+        // Arrange
+        SessionCore sut = core(false);
+        holdBothAcrossReconnection(sut);
+
+        // Act
+        sut.timer(0, RECONNECT, 3);
+        sut.opened(2);
+        sut.received(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 3, 4);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(3L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class);
+    }
+
+    @Test
+    void a_held_publication_survives_a_failed_automatic_attempt() {
+        // Arrange: the first automatic attempt fails before CONNACK and is retried.
+        SessionCore sut = core(false);
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+        sut.publish(2, message(Qos.AT_LEAST_ONCE));
+        int id = port.accepted.getLast().packetId();
+        sut.failed(1, new IOException("lost"));
+        sut.timer(0, RECONNECT, 3);
+        sut.opened(2);
+        sut.failed(2, new IOException("refused at once"));
+        assertThat(port.results).doesNotContainKey(2L);
+
+        // Act
+        sut.timer(0, RECONNECT, 10);
+        sut.opened(3);
+        sut.received(3, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 10, 4);
+        sut.received(3, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 10, 4);
+
+        // Assert: the recording port rejects a second completion.
+        assertThat(port.accepted.getLast().packetId()).isEqualTo(id);
+        assertThat(requireNonNull(port.results.get(2L)).failure()).isNull();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("waysToGiveUp")
+    void every_way_of_giving_up_a_reconnection_fails_the_held_publication(GiveUp ending) {
+        // Arrange: a persistent session holds a QoS 1 publication while waiting to reconnect.
+        SessionCore sut = core(false);
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+        sut.publish(2, message(Qos.AT_LEAST_ONCE));
+        sut.failed(1, new IOException("lost"));
+        assertThat(port.results).doesNotContainKey(2L);
+
+        // Act
+        ending.action().accept(sut, port);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class);
+        assertThat(port.timers).doesNotContainKey(RECONNECT);
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void a_held_publication_completes_once_across_reconnection_withdrawal_and_late_events(
+            int seed
+    ) {
+        // Arrange: a held QoS 1 publication meets a reconnection, a withdrawal, and late events
+        // of its original connection in a seed-chosen order.
+        var random = new Random(seed);
+        SessionCore sut = core(false);
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+        sut.publish(10, message(Qos.AT_LEAST_ONCE));
+        int id = port.accepted.getLast().packetId();
+        sut.sent(1, port.ticket, 0);
+        sut.failed(1, new IOException("lost"));
+        var acknowledgedOnNext = new boolean[1];
+        var chains = new ArrayList<ArrayDeque<Runnable>>();
+        chains.add(new ArrayDeque<>(List.of(
+                () -> sut.timer(0, RECONNECT, 3),
+                () -> sut.opened(2),
+                () -> sut.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 3, 4),
+                () -> {
+                    boolean before = port.results.containsKey(10L);
+                    sut.received(2, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 3, 4);
+                    acknowledgedOnNext[0] = !before && port.results.containsKey(10L);
+                }
+        )));
+        chains.add(new ArrayDeque<>(List.of(
+                random.nextBoolean() ? () -> sut.disconnect(20) : () -> sut.close(null)
+        )));
+        chains.add(new ArrayDeque<>(List.of(
+                () -> {
+                    boolean before = port.results.containsKey(10L);
+                    sut.received(1, new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY), 0, 4);
+                    assertThat(port.results.containsKey(10L)).isEqualTo(before);
+                },
+                () -> sut.failed(1, new IOException("late"))
+        )));
+
+        // Act
+        while (!chains.isEmpty()) {
+            ArrayDeque<Runnable> chain = chains.get(random.nextInt(chains.size()));
+            chain.removeFirst().run();
+            if (chain.isEmpty()) {
+                chains.remove(chain);
+            }
+        }
+        sut.close(null);
+
+        // Assert: the recording port rejects a second completion, and only the next connection's
+        // PUBACK can complete the publication.
+        Result outcome = requireNonNull(port.results.get(10L));
+        if (outcome.failure() == null) {
+            assertThat(acknowledgedOnNext[0]).isTrue();
+        } else {
+            assertThat(outcome.failure()).isInstanceOf(MqttConnectionLostException.class);
+        }
+        assertThat(sut.state()).isEqualTo(CLOSED);
+        assertThat(port.timers).isEmpty();
+    }
+
+    // Leaves a QoS 0 write (operation 2) and a QoS 1 acknowledgement (operation 3) outstanding
+    // when the connection is lost, and returns the QoS 1 packet identifier.
+    private int holdBothAcrossReconnection(SessionCore sut) {
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+        sut.publish(2, message(Qos.AT_MOST_ONCE));
+        sut.publish(3, message(Qos.AT_LEAST_ONCE));
+        int id = port.accepted.getLast().packetId();
+        sut.failed(1, new IOException("lost"));
+        return id;
+    }
+
+    private static MqttMessage message(Qos qos) {
+        return MqttMessage.of(new Topic("held"), new byte[] {1}, qos, false);
+    }
+
+    private static Stream<GiveUp> waysToGiveUp() {
+        return Stream.of(
+                new GiveUp("disconnect while waiting", (sut, _) -> sut.disconnect(3)),
+                new GiveUp("close while waiting", (sut, _) -> sut.close(null)),
+                new GiveUp("handler failure while waiting", (sut, _) -> failHandler(sut)),
+                new GiveUp(
+                        "scheduler failure while waiting",
+                        (sut, _) -> sut.schedulerFailed(0, new IllegalStateException("clock"))
+                ),
+                new GiveUp("refusal of the automatic attempt", (sut, _) -> {
+                    var refusal = new Packet.ConnAck(
+                            false,
+                            ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,
+                            EMPTY
+                    );
+                    sut.timer(0, RECONNECT, 3);
+                    sut.opened(2);
+                    sut.received(2, refusal, 3, 4);
+                }),
+                new GiveUp("disconnect during the automatic attempt", (sut, port) -> {
+                    sut.timer(0, RECONNECT, 3);
+                    sut.opened(2);
+                    sut.disconnect(3);
+                    sut.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 3, 4);
+                    sut.sent(2, port.ticket, 4);
+                }),
+                new GiveUp("handler failure during the automatic attempt", (sut, _) -> {
+                    sut.timer(0, RECONNECT, 3);
+                    sut.opened(2);
+                    failHandler(sut);
+                })
+        );
+    }
+
+    private static void failHandler(SessionCore sut) {
+        sut.deliveryFailed(
+                new DeliveryToken(sut.sessionNumber(), 1, 0),
+                new IllegalStateException("handler")
+        );
+    }
+
     private static IntStream seeds() {
         return IntStream.range(0, 100);
     }
@@ -518,16 +725,29 @@ class ReconnectionTest {
                         Duration.ofNanos(20),
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
-                initialRetry
+                initialRetry,
+                Duration.ofSeconds(60)
         );
     }
 
     private static ConnectionAttempt attempt(long operation) {
-        return new ConnectionAttempt(operation, null);
+        return new ConnectionAttempt(operation);
     }
 
     private static void connected(SessionCore sut, long generation, long now) {
         sut.opened(generation);
         sut.received(generation, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), now, 4);
+    }
+
+    /// One way to give up a waiting reconnection, named for the test display.
+    record GiveUp(
+            String name,
+            BiConsumer<SessionCore, SessionPersistenceTest.RecordingPort> action
+    ) {
+
+        @Override
+        public String toString() {
+            return name;
+        }
     }
 }

@@ -421,6 +421,7 @@ class Qos1AcknowledgementTest {
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint(server))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .connectionListener(ended::add)
                         .build()
         ) {
@@ -434,7 +435,7 @@ class Qos1AcknowledgementTest {
 
                 // Assert: EOF is the first response to the failed delivery.
                 peer.expectClosed();
-                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             }
         }
     }

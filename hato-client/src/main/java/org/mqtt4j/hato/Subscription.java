@@ -4,8 +4,8 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
 /// One subscription registration, which can await its first connection or SUBACK.
-/// The same handle survives connection termination. The client's next successful
-/// [MqttClient#connect()] resumes an established subscription when the broker retained the
+/// The same handle survives connection termination. The client's next connection, including an
+/// automatic reconnection, resumes an established subscription when the broker retained the
 /// session; otherwise, including before the first successful SUBACK, it sends SUBSCRIBE again.
 /// Removal, local closure, permanent client closure, registration rejection, a broker refusal,
 /// or a SUBACK that violates the protocol ends the subscription permanently.
@@ -38,13 +38,13 @@ public interface Subscription extends AutoCloseable {
     /// first permanent ending decides every later result.
     ///
     /// Pending observations share a limit of 1,024 per client, independent of operation capacity.
-    /// This includes [#unsubscribe()] observations. A full limit returns a future already failed
-    /// with [MqttCapacityException], which is done, without changing the subscription. A slot
-    /// remains held through completion and any synchronous continuations run by the client. An
-    /// already completed result needs no slot. Application completion or cancellation does not
-    /// release a pending slot before the client resolves the observation, so each call made while
-    /// the subscription is not established holds one: a periodic check keeps one pending future
-    /// and calls again only after it completes.
+    /// This includes [#unsubscribe()] and [MqttClient#whenConnected()] observations. A full limit
+    /// returns a future already failed with [MqttCapacityException], which is done, without
+    /// changing the subscription. A slot remains held through completion and any synchronous
+    /// continuations run by the client. An already completed result needs no slot. Application
+    /// completion or cancellation does not release a pending slot before the client resolves the
+    /// observation, so each call made while the subscription is not established holds one: a
+    /// periodic check keeps one pending future and calls again only after it completes.
     CompletableFuture<Qos> established();
 
     /// Waits interruptibly for the next delivery of a pull subscription. Multiple receiving

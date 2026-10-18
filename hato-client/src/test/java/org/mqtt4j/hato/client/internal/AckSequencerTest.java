@@ -89,36 +89,6 @@ class AckSequencerTest {
     }
 
     @Test
-    void clear_releases_the_whole_sequence_and_ignores_old_tickets() {
-        // Arrange
-        var receptions = new ReceiveTable(3);
-        var sut = new AckSequencer();
-        sut.add(receptions.add(1, 7, Qos.AT_LEAST_ONCE).orElseThrow(), Kind.PUBACK);
-        sut.add(receptions.add(2, 8, Qos.AT_LEAST_ONCE).orElseThrow(), Kind.PUBACK);
-        receptions.ready(1);
-        sut.submitted(10);
-
-        // Act
-        sut.clear();
-        Entry current = receptions.add(3, 9, Qos.AT_LEAST_ONCE).orElseThrow();
-        sut.add(current, Kind.PUBACK);
-        receptions.ready(2);
-
-        // Assert
-        assertThat(sut.written(10)).isEmpty();
-        assertThat(sut.writingCount()).isZero();
-        assertThat(sut.nextReady()).isEmpty();
-        assertThat(sut.contains(current, Kind.PUBACK)).isTrue();
-        assertThat(sut.contains(receptions.find(8).orElseThrow(), Kind.PUBACK)).isFalse();
-
-        // Act
-        receptions.ready(3);
-
-        // Assert
-        assertThat(sut.nextReady().map(Acknowledgement::entry)).containsSame(current);
-    }
-
-    @Test
     void an_unready_puback_holds_back_a_later_pubrec_but_not_pubcomp() {
         // Arrange
         var receptions = new ReceiveTable(3);

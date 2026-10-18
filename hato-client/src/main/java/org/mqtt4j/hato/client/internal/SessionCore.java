@@ -15,7 +15,6 @@ import java.util.OptionalInt;
 import java.util.SequencedMap;
 import java.util.SequencedSet;
 import java.util.Set;
-import java.util.SplittableRandom;
 import java.util.concurrent.TimeoutException;
 
 import org.jspecify.annotations.Nullable;
@@ -169,14 +168,14 @@ final class SessionCore {
 
         /// Returns [#receiveState()] after discarding queued deliveries. Without
         /// `preserveSession` no reception remains; a stop also invalidates unmet conditions.
+        /// `disconnection` describes the ended connection when `established`, and otherwise the
+        /// failed attempt, or the attempt that a stop while waiting to reconnect cancelled.
         Map<Long, Boolean> end(
                 long generation,
                 boolean established,
                 Disconnection disconnection,
                 boolean preserveSession,
-                boolean stopped,
-                long attemptNumber,
-                @Nullable Duration reconnectDelay
+                boolean stopped
         );
     }
 
@@ -234,8 +233,9 @@ final class SessionCore {
 
     private long generation;
 
-    // The state that the current attempt or connection owns. Ending one replaces it, so the next
-    // connection starts from fresh values.
+    // State of the current connection, including one that its attempt is still opening. Ending
+    // the connection replaces it, so the next one starts from fresh values. The attempt's
+    // credentials and deadline stay outside, because an attempt can outlive a connection.
     private Connection current;
 
     // The attempt waiting for its CONNACK, and null once a CONNACK establishes its connection
@@ -275,53 +275,6 @@ final class SessionCore {
     // Incoming acknowledgements and outgoing PUBREL share the reserved send quota. Returned
     // room goes first to the side that did not take the last slot, so neither can starve.
     private boolean releasesFirst;
-
-    SessionCore(
-            Port port,
-            String clientId,
-            Duration timeout,
-            Duration keepAlive,
-            boolean cleanStart,
-            Packet.@Nullable Will will,
-            boolean credentialsRequired
-    ) {
-        this(
-                port,
-                clientId,
-                timeout,
-                keepAlive,
-                cleanStart,
-                will,
-                credentialsRequired,
-                ReconnectBackoff.disabled(new SplittableRandom()),
-                false
-        );
-    }
-
-    SessionCore(
-            Port port,
-            String clientId,
-            Duration timeout,
-            Duration keepAlive,
-            boolean cleanStart,
-            Packet.@Nullable Will will,
-            boolean credentialsRequired,
-            ReconnectBackoff backoff,
-            boolean initialRetry
-    ) {
-        this(
-                port,
-                clientId,
-                timeout,
-                keepAlive,
-                cleanStart,
-                will,
-                credentialsRequired,
-                backoff,
-                initialRetry,
-                Duration.ofSeconds(60)
-        );
-    }
 
     SessionCore(
             Port port,
@@ -520,7 +473,7 @@ final class SessionCore {
                 if (state == State.CONNECTING) {
                     state = State.CONNECTED;
                 }
-                var result = ConnAck.of(ack.sessionPresent());
+                var result = ConnAck.of(ack.sessionPresent(), request.attempt());
                 current.ack = result;
                 request.establish();
                 port.admit(generation);
@@ -1446,7 +1399,7 @@ final class SessionCore {
     void timer(long connection, Timer timer, long now) {
         if (timer == Timer.RECONNECT) {
             if (connection == 0 && state == State.RECONNECT_WAIT && request.requested()) {
-                startAttempt(new ConnectionAttempt(0, null), now);
+                startAttempt(new ConnectionAttempt(0), now);
             }
             return;
         }
@@ -1542,6 +1495,9 @@ final class SessionCore {
                 port.cancel(Timer.RECONNECT);
                 state = State.DISCONNECTED;
                 completeConnections(null, new MqttConnectException("Connection request withdrawn"));
+                // Publications held for the withdrawn reconnection keep an unknown outcome; a
+                // persistent session retains their exchanges.
+                failPublications(new MqttConnectionLostException());
                 port.complete(operation, null, null);
                 return;
             }
@@ -1563,8 +1519,6 @@ final class SessionCore {
         port.cancel(Timer.PING);
         port.cancel(Timer.STABLE);
         port.cancel(Timer.RESPONSE);
-        current.responses.clear();
-        current.awaitingPing = false;
         current.disconnectTicket = ++nextTicket;
         port.schedule(generation, Timer.DISCONNECT, timeout);
         sendRequired(current.disconnectTicket, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
@@ -1605,17 +1559,16 @@ final class SessionCore {
         // A failure during a pending disconnect still belongs to that shutdown request.
         // Decide before replacing the cause with a session refusal below.
         boolean shutdownRequested = switch (reason) {
-            case DISCONNECT_WRITTEN -> true;
             case CLIENT_CLOSE -> cause == null || state == State.DISCONNECTING;
-            case CONNECTION_FAILURE, HANDLER_FAILURE, SCHEDULER_FAILURE ->
+            // The DISCONNECT that refuses a broker session without local state is not requested.
+            case DISCONNECT_WRITTEN, CONNECTION_FAILURE, HANDLER_FAILURE, SCHEDULER_FAILURE ->
                     state == State.DISCONNECTING;
         };
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
-        // The ended attempt or connection keeps only what this end still settles; anything that
-        // runs from here on sees fresh connection state.
+        // The ended connection keeps only what this end still settles; anything that runs from
+        // here on sees fresh connection state.
         Connection ended = current;
         current = new Connection(responseTimeout);
-        boolean established = ended.ack != null;
         if (cause instanceof PacketDecodeException failure) {
             // Both listener notifications and pending operations expose the same public cause.
             cause = new MqttProtocolException(
@@ -1632,9 +1585,17 @@ final class SessionCore {
             }
             cause = refusal;
         }
+        // Pending connect() calls that this end gives up fail with this exception, and a failed
+        // attempt reports the same instance to the listener.
+        MqttConnectException attemptFailure = switch (cause) {
+            // Only a requested disconnect or close ends without a cause.
+            case null -> new MqttConnectException("Connection request withdrawn");
+            case MqttConnectException failure -> failure;
+            default -> new MqttConnectException("Connection failed", cause);
+        };
         try {
-            boolean retry = endConnection(ended, cause, reason, shutdownRequested);
-            finishOperations(ended, cause, permanent, retry, established);
+            boolean retry = endConnection(ended, cause, attemptFailure, reason, shutdownRequested);
+            finishOperations(ended, cause, attemptFailure, permanent, retry);
         } finally {
             // Shell teardown or a logging backend must not retain a closed client's payloads.
             if (permanent || cleanStart) {
@@ -1646,15 +1607,19 @@ final class SessionCore {
     private boolean endConnection(
             Connection ended,
             @Nullable Throwable cause,
+            MqttConnectException attemptFailure,
             EndReason reason,
             boolean shutdownRequested
     ) {
         boolean established = ended.ack != null;
         boolean waiting = state == State.RECONNECT_WAIT;
+        // A wait ends silently only when the application withdraws the request. A stop, a clock
+        // failure, or an internal failure that closes the client reports the cancelled attempt.
         boolean notifyEnd = switch (state) {
             case CONNECTING, CONNECTED, DISCONNECTING -> true;
             case RECONNECT_WAIT -> reason == EndReason.HANDLER_FAILURE
-                    || reason == EndReason.SCHEDULER_FAILURE;
+                    || reason == EndReason.SCHEDULER_FAILURE
+                    || reason == EndReason.CLIENT_CLOSE && cause != null;
             case DISCONNECTED, CLOSED -> false;
         };
         for (var timer : Timer.values()) {
@@ -1688,16 +1653,21 @@ final class SessionCore {
                 // The stopped wait reports and consumes the reserved next attempt number.
                 request.nextAttempt();
             }
+            // A connection reports its own cause, and so does a stop by a handler failure. Other
+            // failed attempts report the exception that fails their connect() calls.
+            boolean stopped = reason == EndReason.HANDLER_FAILURE;
+            @Nullable Throwable reported = established || stopped ? cause : attemptFailure;
+            Disconnection disconnection = (delay == null)
+                    ? Disconnection.of(reported, shutdownRequested, request.attempt())
+                    : Disconnection.of(reported, shutdownRequested, request.attempt(), delay);
             // Retire queued recipients before removing subscriptions, without acknowledging
             // work that never reached the application. Persistent handed work keeps its state.
             Map<Long, Boolean> handedReadiness = port.end(
                     generation,
                     established,
-                    Disconnection.of(cause, shutdownRequested),
+                    disconnection,
                     !permanent && !cleanStart,
-                    reason == EndReason.HANDLER_FAILURE,
-                    request.attempt(),
-                    delay
+                    stopped
             );
             reconcileReceptions(handedReadiness, true);
         }
@@ -1752,9 +1722,9 @@ final class SessionCore {
     private void finishOperations(
             Connection ended,
             @Nullable Throwable cause,
+            MqttConnectException attemptFailure,
             boolean permanent,
-            boolean retry,
-            boolean established
+            boolean retry
     ) {
         var pendingFailure = (cause == null)
                 ? new MqttConnectionLostException()
@@ -1772,14 +1742,15 @@ final class SessionCore {
                 }
             }
         }
+        // QoS 0 publications belong to the ended connection and are never replayed.
         for (long operation : ended.publications.values()) {
             port.complete(operation, null, pendingFailure);
         }
-        for (Inflight inflight : session.inflight.values()) {
-            if (inflight.operation != 0) {
-                port.complete(inflight.operation, null, pendingFailure);
-                inflight.operation = 0;
-            }
+        // A scheduled reconnection keeps a persistent session's publications pending, and the
+        // next connection decides them: continuing completes their exchanges, and losing the
+        // session fails them. Otherwise their outcome stays unknown now.
+        if (!retry || cleanStart) {
+            failPublications(pendingFailure);
         }
         // SUBSCRIBE and UNSUBSCRIBE return their borrowed identifiers. The rest of the ended
         // connection, such as its queues and windows, goes with it.
@@ -1793,16 +1764,11 @@ final class SessionCore {
             attemptCredentials = null;
         }
         if (!retry) {
-            Throwable failure = switch (cause) {
-                // Only a requested disconnect or close ends without a cause.
-                case null -> new MqttConnectException("Connection request withdrawn");
-                case MqttConnectException refusal -> refusal;
-                default -> new MqttConnectException("Connection failed", cause);
-            };
-            completeConnections(null, failure);
+            completeConnections(null, attemptFailure);
         }
         // A disconnect requested during an attempt that established no connection is satisfied.
-        @Nullable Throwable disconnectFailure = established || permanent ? pendingFailure : null;
+        @Nullable Throwable disconnectFailure =
+                ended.ack != null || permanent ? pendingFailure : null;
         for (long operation : request.takeDisconnections()) {
             port.complete(operation, null, disconnectFailure);
         }
@@ -1814,7 +1780,20 @@ final class SessionCore {
         }
     }
 
+    /// Fails the futures of the session's QoS 1 and QoS 2 publications with an unknown outcome.
+    /// Their exchanges stay for a later connection unless the session goes too.
+    private void failPublications(Throwable failure) {
+        for (Inflight inflight : session.inflight.values()) {
+            if (inflight.operation != 0) {
+                port.complete(inflight.operation, null, failure);
+                inflight.operation = 0;
+            }
+        }
+    }
+
     private void discardSession() {
+        // Publications still waiting for the discarded exchanges have an unknown outcome.
+        failPublications(new MqttConnectionLostException());
         boolean established = session.established;
         session = new Session();
         port.sessionChanged(++sessionNumber);
@@ -1869,8 +1848,8 @@ final class SessionCore {
                 && (bytes > 0 || firstLevelFlexible || (leftTail && rightTail));
     }
 
-    // State owned by one attempt or connection. The session and the subscription registry outlive
-    // it; SUBSCRIBE and UNSUBSCRIBE borrow identifiers from the session only until it ends.
+    // State owned by one connection. Its attempt, the session, and the subscription registry can
+    // outlive it; SUBSCRIBE and UNSUBSCRIBE borrow identifiers from the session only until it ends.
     private static final class Connection {
 
         // Session Present of this connection's CONNACK. Broker registrations can survive even
@@ -1892,8 +1871,7 @@ final class SessionCore {
         final AckSequencer acknowledgements = new AckSequencer();
         final Map<Integer, LocalSubscription> subscribing = new HashMap<>();
         final Map<Integer, UnsubscribeOperation> unsubscribing = new HashMap<>();
-        // At most one removal per registered subscription; the registry supplies the total
-        // bound.
+        // At most one removal per registered subscription; the registry supplies the total bound.
         final ArrayDeque<UnsubscribeOperation> queuedClosures = new ArrayDeque<>();
         // At most 64 retained publications and 256 broker registrations await queue admission.
         final ArrayDeque<Deferred> deferred = new ArrayDeque<>();

@@ -144,6 +144,32 @@ class MqttClientBuilderTest {
     }
 
     @Test
+    void response_timeouts_are_positive_and_at_most_the_largest_supported_delay() {
+        // Arrange
+        MqttClientBuilder sut = MqttClient.builder();
+        var largest = Duration.ofMillis(Integer.MAX_VALUE);
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.responseTimeout(Duration.ZERO))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> sut.responseTimeout(Duration.ofNanos(-1)))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> sut.responseTimeout(largest.plusNanos(1)))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatCode(() -> sut.responseTimeout(largest).responseTimeout(Duration.ofNanos(1)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @SuppressWarnings("NullAway") // Deliberately violates the setters' non-null contracts.
+    void reconnection_settings_cannot_be_null() {
+        assertThatThrownBy(() -> configuredBuilder().reconnectPolicy(null))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> configuredBuilder().responseTimeout(null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
     void default_clean_sessions_do_not_require_an_explicit_identifier() {
         assertThatCode(() -> configuredBuilder().build().close()).doesNotThrowAnyException();
     }

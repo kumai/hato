@@ -2,6 +2,8 @@ package org.mqtt4j.hato.client.internal;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -9,6 +11,7 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import java.util.stream.LongStream;
 
 import org.junit.jupiter.api.Test;
 
@@ -16,7 +19,6 @@ import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.Disconnection;
 
-import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -63,22 +65,18 @@ class ListenerLaneTest {
         logger.addHandler(handler);
         try {
             var sut = new ListenerLane(URI.create("mqtt://localhost"), "listener-test", listener);
-            ListenerLane.Reservation reservation = requireNonNull(sut.tryReserveConnection());
-            var ending = Disconnection.of(null, true);
+            var ending = Disconnection.of(null, true, 1);
 
             // Act
-            reservation.connected(ConnAck.of(false));
-            reservation.disconnected(ending);
+            sut.connected(ConnAck.of(false, 1));
+            sut.disconnected(ending);
 
-            // Assert: the second callback still runs and both reservations return.
+            // Assert: the second callback still runs, and nothing remains pending.
             assertThat(endings.poll(5, SECONDS)).isSameAs(ending);
             await().pollInterval(Duration.ofMillis(1))
                     .untilAsserted(() -> assertThat(sut.usage()).isZero());
             assertThat(calls.get()).isEqualTo(1);
-            for (int i = 0; i < 32; i++) {
-                assertThat(sut.tryReserveConnection()).isNotNull();
-            }
-            assertThat(sut.tryReserveConnection()).isNull();
+            assertThat(sut.dropped()).isZero();
         } finally {
             logger.removeHandler(handler);
             logger.setLevel(previousLevel);
@@ -117,21 +115,73 @@ class ListenerLaneTest {
             }
         };
         var sut = new ListenerLane(URI.create("mqtt://localhost"), "listener-test", listener);
-        ListenerLane.Reservation first = requireNonNull(sut.tryReserveConnection());
-        ListenerLane.Reservation second = requireNonNull(sut.tryReserveConnection());
-        first.connected(ConnAck.of(false));
+        sut.connected(ConnAck.of(false, 1));
         assertThat(entered.await(5, SECONDS)).isTrue();
-        first.disconnected(Disconnection.of(null, true));
-        second.connected(ConnAck.of(true));
+        sut.disconnected(Disconnection.of(null, true, 1));
+        sut.connected(ConnAck.of(true, 2));
 
         // Act: returning the first callback runs the queued ones on the same thread.
         release.countDown();
 
-        // Assert: only the second attempt's unsent disconnection stays reserved.
+        // Assert
         assertThat(interruptStates.poll(5, SECONDS)).isFalse();
         assertThat(interruptStates.poll(5, SECONDS)).isFalse();
         assertThat(interruptStates.poll(5, SECONDS)).isFalse();
         await().pollInterval(Duration.ofMillis(1))
-                .untilAsserted(() -> assertThat(sut.usage()).isEqualTo(1));
+                .untilAsserted(() -> assertThat(sut.usage()).isZero());
+    }
+
+    @Test
+    void a_full_queue_drops_its_oldest_undelivered_notifications_and_counts_them()
+            throws Exception {
+        // Arrange: the first callback blocks while 70 more notifications arrive.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var attempts = new LinkedBlockingQueue<Long>();
+        var listener = new ConnectionListener() {
+            @Override
+            public void onConnected(ConnAck ack) {
+                attempts.add(ack.attempt());
+                entered.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException failure) {
+                    throw new AssertionError(failure);
+                }
+            }
+
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+            }
+
+            @Override
+            public void onConnectFailed(Disconnection failure) {
+                attempts.add(failure.attempt());
+            }
+        };
+        var sut = new ListenerLane(URI.create("mqtt://localhost"), "listener-test", listener);
+        sut.connected(ConnAck.of(false, 1));
+        assertThat(entered.await(5, SECONDS)).isTrue();
+
+        // Act
+        for (long attempt = 2; attempt <= 71; attempt++) {
+            var refusal = new IllegalStateException("refused");
+            sut.connectFailed(Disconnection.of(refusal, false, attempt));
+        }
+
+        // Assert: 64 notifications wait behind the running one; the 6 oldest were dropped.
+        assertThat(sut.usage()).isEqualTo(65);
+        assertThat(sut.dropped()).isEqualTo(6);
+        release.countDown();
+        var delivered = new ArrayList<Long>();
+        for (int i = 0; i < 65; i++) {
+            delivered.add(attempts.poll(5, SECONDS));
+        }
+        var expected = new ArrayList<>(List.of(1L));
+        LongStream.rangeClosed(8, 71).forEach(expected::add);
+        assertThat(delivered).containsExactlyElementsOf(expected);
+        await().pollInterval(Duration.ofMillis(1))
+                .untilAsserted(() -> assertThat(sut.usage()).isZero());
+        assertThat(attempts).isEmpty();
     }
 }

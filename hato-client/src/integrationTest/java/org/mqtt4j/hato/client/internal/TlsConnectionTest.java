@@ -37,6 +37,7 @@ import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReceiveResult;
+import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
@@ -71,6 +72,7 @@ class TlsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(URI.create("mqtts://127.0.0.1:" + relay.uri().getPort()))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .sslContext(Tls.clientContext())
                         .sslParameters(parameters -> {
                             if (disable) {
@@ -81,7 +83,7 @@ class TlsConnectionTest {
         ) {
             // Act & Assert
             if (disable) {
-                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
                 sut.disconnect().get(5, SECONDS);
             } else {
                 assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
@@ -100,6 +102,7 @@ class TlsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(relay.uri())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .build()
         ) {
             // Act & Assert
@@ -125,11 +128,12 @@ class TlsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(relay.uri())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .sslContext(Tls.clientContext())
                         .connectionListener(ended::add)
                         .build()
         ) {
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("tls/round-trip"), Qos.AT_LEAST_ONCE)
             );
@@ -146,7 +150,7 @@ class TlsConnectionTest {
             assertThat(received.delivery().message()).isEqualTo(publication);
             subscription.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             assertThat(ended).isEmpty();
         }
     }
@@ -210,6 +214,7 @@ class TlsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(relay.uri())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .sslContext(Tls.clientContext())
                         .sslParameters(parameters -> {
                             customized.set(parameters);
@@ -220,8 +225,8 @@ class TlsConnectionTest {
             requireNonNull(customized.get()).setProtocols(new String[] {"invalid-protocol"});
 
             // Act & Assert: each connection keeps the validated snapshot, without another callback.
-            for (int attempt = 0; attempt < 2; attempt++) {
-                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            for (int attempt = 1; attempt <= 2; attempt++) {
+                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, attempt));
                 sut.disconnect().get(5, SECONDS);
             }
             assertThat(calls).hasValue(1);
@@ -238,6 +243,7 @@ class TlsConnectionTest {
             try (MqttClient sut = MqttClient.builder()
                     .server(URI.create("mqtts://localhost:" + server.getLocalPort()))
                     .version(MqttVersion.V3_1_1)
+                    .reconnectPolicy(ReconnectPolicy.disabled())
                     .sslContext(Tls.clientContext())
                     .sslParameters(clientParameters -> {
                         clientParameters.setServerNames(
@@ -258,7 +264,7 @@ class TlsConnectionTest {
                     var reader = new FrameReader(peer.getInputStream(), 1024);
                     assertThat(reader.read().orElseThrow()[0]).isEqualTo((byte) 0x10);
                     new FrameWriter(peer.getOutputStream()).write(new byte[] {0x20, 2, 0, 0});
-                    assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+                    assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
                     CompletableFuture<Void> disconnected = sut.disconnect();
                     assertThat(reader.read().orElseThrow()).containsExactly((byte) 0xE0, (byte) 0);
                     disconnected.get(5, SECONDS);
@@ -372,6 +378,7 @@ class TlsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(URI.create("mqtts://localhost:" + server.getLocalPort()))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .transportFactory(id -> new TcpTransport(
                                 id,
                                 context,

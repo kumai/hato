@@ -45,7 +45,10 @@ class Qos2ReceiveTest {
             Duration.ZERO,
             false,
             null,
-            false
+            false,
+            ReconnectBackoff.disabled(),
+            false,
+            Duration.ofSeconds(60)
     );
     private long nextOperation;
     private long generation;
@@ -725,12 +728,12 @@ class Qos2ReceiveTest {
 
     private void connect(boolean present) {
         long operation = ++nextOperation;
-        sut.connect(new ConnectionAttempt(operation, null), 0);
+        sut.connect(new ConnectionAttempt(operation), 0);
         generation = port.generation;
         sut.opened(generation);
         receive(new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY));
         assertThat(requireNonNull(port.results.get(operation)).value())
-                .isEqualTo(ConnAck.of(present));
+                .isEqualTo(ConnAck.of(present, port.attempt));
         if (!present) {
             if (!subscribed) {
                 long subscription = ++nextOperation;

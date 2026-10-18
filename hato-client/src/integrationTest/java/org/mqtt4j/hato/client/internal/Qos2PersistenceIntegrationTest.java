@@ -76,6 +76,51 @@ class Qos2PersistenceIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(Cut.class)
+    void the_embedded_broker_completes_a_held_exchange_after_automatic_reconnection(Cut cut)
+            throws Exception {
+        try (MqttBroker broker = MqttBroker.start()) {
+            heldExchangeAcrossReconnection(
+                    URI.create("mqtt://localhost:" + broker.port()),
+                    cut,
+                    true
+            );
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(Cut.class)
+    void a_missing_embedded_session_fails_a_held_exchange_after_automatic_reconnection(Cut cut)
+            throws Exception {
+        try (MqttBroker broker = MqttBroker.start()) {
+            heldExchangeAcrossReconnection(
+                    URI.create("mqtt://localhost:" + broker.port()),
+                    cut,
+                    false
+            );
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(Cut.class)
+    @Timeout(60)
+    @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
+    void mosquitto_completes_a_held_exchange_after_automatic_reconnection(Cut cut)
+            throws Exception {
+        try (GenericContainer<?> broker = Mosquitto.container()) {
+            Mosquitto.start(broker);
+            heldExchangeAcrossReconnection(
+                    URI.create(
+                            "mqtt://" + broker.getHost() + ":"
+                                    + broker.getMappedPort(Mosquitto.MQTT_PORT)
+                    ),
+                    cut,
+                    true
+            );
+        }
+    }
+
     @Test
     @Timeout(60)
     @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
@@ -95,6 +140,7 @@ class Qos2PersistenceIntegrationTest {
                     MqttClient sut = MqttClient.builder()
                             .server(endpoint)
                             .version(MqttVersion.V3_1_1)
+                            .reconnectPolicy(ReconnectPolicy.disabled())
                             .connectionListener(ended::add)
                             .transportFactory(id -> {
                                 var transport = new FaultyTransport(Transport.tcp(id), scheduler);
@@ -122,7 +168,7 @@ class Qos2PersistenceIntegrationTest {
                 assertThat(ended.poll(5, SECONDS)).isNotNull();
                 Throwable failure = failureOf(publication);
                 assertThat(failure).isInstanceOf(MqttConnectionLostException.class);
-                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 2));
                 sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
 
                 // Assert: the same publisher, topic and QoS put the marker after any old delivery.
@@ -153,6 +199,7 @@ class Qos2PersistenceIntegrationTest {
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint)
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(clientId)
                         .cleanStart(false)
                         .sessionExpiry(Duration.ofSeconds(30))
@@ -168,7 +215,7 @@ class Qos2PersistenceIntegrationTest {
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
             );
             subscription.established().get(5, SECONDS);
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
             CompletableFuture<PublishResult> publication = publishUntil(
                     sut,
@@ -181,7 +228,7 @@ class Qos2PersistenceIntegrationTest {
             // Act: the first connection fails even if the retained exchange later completes.
             var cause = new IOException("cut " + cut);
             transport.disconnect(cause);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
             Throwable failure = failureOf(publication);
             assertThat(failure).isInstanceOf(MqttConnectionLostException.class).hasCause(cause);
             assertThat(scheduler.pendingTaskCount()).isZero();
@@ -189,13 +236,14 @@ class Qos2PersistenceIntegrationTest {
                 try (MqttClient replacement = MqttClient.builder()
                         .server(endpoint)
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(clientId)
                         .build()) {
                     replacement.connect().get(5, SECONDS);
                     replacement.disconnect().get(5, SECONDS);
                 }
             }
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent, 2));
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
 
             // Assert: the embedded broker forwards on PUBLISH; both brokers resume exactly once.
@@ -206,6 +254,92 @@ class Qos2PersistenceIntegrationTest {
             assertPayload(subscription, (byte) 2);
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
             assertThat(failureOf(publication)).isSameAs(failure);
+            sut.disconnect().get(5, SECONDS);
+        }
+    }
+
+    /// Like [#exchangeAcrossDisconnection], but the client reconnects by itself, which holds the
+    /// publication's future for the next connection to decide.
+    private static void heldExchangeAcrossReconnection(
+            URI endpoint,
+            Cut cut,
+            boolean sessionPresent
+    ) throws Exception {
+        // Arrange: the client reconnects on its own manual clock, apart from fault injection.
+        String clientId = "hato" + UUID.randomUUID().toString().replace("-", "").substring(0, 19);
+        String topic = uniqueTopic();
+        var scheduler = new ManualTimerScheduler();
+        var clock = new ManualTimerScheduler();
+        var transports = new LinkedBlockingQueue<FaultyTransport>();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (MqttClient subscriber = client(endpoint);
+                MqttClient sut = MqttClient.builder()
+                        .server(endpoint)
+                        .version(MqttVersion.V3_1_1)
+                        .clientId(clientId)
+                        .cleanStart(false)
+                        .sessionExpiry(Duration.ofSeconds(30))
+                        .timerScheduler(clock)
+                        .reconnectPolicy(ReconnectPolicy.exponentialBackoff(
+                                Duration.ofSeconds(1),
+                                Duration.ofSeconds(1)
+                        ))
+                        .connectionListener(ended::add)
+                        .transportFactory(id -> {
+                            var transport = new FaultyTransport(Transport.tcp(id), scheduler);
+                            transports.add(transport);
+                            return transport;
+                        })
+                        .build()) {
+            subscriber.connect().get(5, SECONDS);
+            Subscription subscription = subscriber.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
+            );
+            subscription.established().get(5, SECONDS);
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
+            CompletableFuture<PublishResult> publication = publishUntil(
+                    sut,
+                    transport,
+                    scheduler,
+                    topic,
+                    cut
+            );
+
+            // Act: the cut schedules a reconnection, and the next connection decides the future.
+            var cause = new IOException("cut " + cut);
+            transport.disconnect(cause);
+            Disconnection end = requireNonNull(ended.poll(5, SECONDS));
+            assertThat(end.cause()).containsSame(cause);
+            assertThat(end.reconnectDelay()).isPresent();
+            assertThat(publication).isNotDone();
+            if (!sessionPresent) {
+                try (MqttClient replacement = MqttClient.builder()
+                        .server(endpoint)
+                        .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
+                        .clientId(clientId)
+                        .build()) {
+                    replacement.connect().get(5, SECONDS);
+                    replacement.disconnect().get(5, SECONDS);
+                }
+            }
+            clock.advance(Duration.ofSeconds(1));
+            assertThat(sut.whenConnected().get(5, SECONDS))
+                    .isEqualTo(ConnAck.of(sessionPresent, 2));
+            sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
+
+            // Assert: a continued exchange succeeds once at PUBCOMP; a lost one stays unknown.
+            if (sessionPresent || cut != Cut.BEFORE_PUBLISH) {
+                assertPayload(subscription, (byte) 1);
+            }
+            assertPayload(subscription, (byte) 2);
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+            if (sessionPresent) {
+                assertThat(publication.get(5, SECONDS)).isEqualTo(PublishResult.of());
+            } else {
+                assertThat(failureOf(publication)).isInstanceOf(MqttConnectionLostException.class);
+            }
             sut.disconnect().get(5, SECONDS);
         }
     }
@@ -240,7 +374,11 @@ class Qos2PersistenceIntegrationTest {
     }
 
     private static MqttClient client(URI endpoint) {
-        return MqttClient.builder().server(endpoint).version(MqttVersion.V3_1_1).build();
+        return MqttClient.builder()
+                .server(endpoint)
+                .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .build();
     }
 
     private static MqttMessage message(String topic, byte value) {

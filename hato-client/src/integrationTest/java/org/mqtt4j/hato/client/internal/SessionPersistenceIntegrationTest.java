@@ -33,6 +33,7 @@ import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReceiveResult;
+import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
@@ -279,7 +280,7 @@ class SessionPersistenceIntegrationTest {
                     release.countDown();
                     peer.expectClosed();
                     assertThat(ended.poll(5, SECONDS))
-                            .isEqualTo(Disconnection.of(failure, false));
+                            .isEqualTo(Disconnection.of(failure, false, 2));
                 }
             } else {
                 release.countDown();
@@ -367,7 +368,7 @@ class SessionPersistenceIntegrationTest {
                 old = requireNonNull(failed.poll(5, SECONDS));
                 release.countDown();
                 peer.expectClosed();
-                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             }
 
             // Act
@@ -485,6 +486,7 @@ class SessionPersistenceIntegrationTest {
         try (ServerSocket server = listen(); MqttClient sut = MqttClient.builder()
                 .server(endpoint(server))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
                 .cleanStart(cleanStart)
                 .sessionExpiry(cleanStart ? Duration.ZERO : Duration.ofSeconds(30))
@@ -644,8 +646,9 @@ class SessionPersistenceIntegrationTest {
                 MqttClient publisher = MqttClient.builder()
                         .server(endpoint)
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .build()) {
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             publisher.connect().get(5, SECONDS);
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
@@ -658,7 +661,7 @@ class SessionPersistenceIntegrationTest {
             var second = message(topic, (byte) 2);
             publisher.publish(first).get(5, SECONDS);
             publisher.publish(second).get(5, SECONDS);
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
             var marker = message(topic, (byte) 3);
             publisher.publish(marker).get(5, SECONDS);
 
@@ -680,6 +683,7 @@ class SessionPersistenceIntegrationTest {
         return MqttClient.builder()
                 .server(endpoint)
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
                 .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))

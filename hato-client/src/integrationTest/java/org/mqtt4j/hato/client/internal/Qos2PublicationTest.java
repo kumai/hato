@@ -73,6 +73,7 @@ class Qos2PublicationTest {
         try (ServerSocket server = listen(); MqttClient sut = MqttClient.builder()
                 .server(endpoint(server))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
                 .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))

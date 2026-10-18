@@ -23,24 +23,32 @@ public interface MqttSubscriber {
     /// Registers one subscription and returns its handle immediately, including while the
     /// client is disconnected or connecting. Supports QoS 0, QoS 1, and QoS 2.
     /// [Subscription#established()] observes broker acceptance. Registration does not start a
-    /// connection: SUBSCRIBE is sent on the current connection or after the next successful
-    /// [MqttClient#connect()]. The registration survives connection loss, requested disconnection,
-    /// and failed connection attempts, including when its first SUBACK has not arrived.
+    /// connection: SUBSCRIBE is sent on the current connection or on the next established one,
+    /// including an automatic reconnection. The registration survives connection loss, requested
+    /// disconnection, and failed connection attempts, including when its first SUBACK has not
+    /// arrived.
     ///
     /// Deliveries can reach the handler before establishment completes. Each subscription's
     /// handler runs serially, independently of I/O and operation completion. A handler failure
-    /// is logged and ends the active connection of its receiving session, notifying
-    /// [ConnectionListener]. This includes a handler started on an earlier connection when the
-    /// session continues. During a connection attempt, such a failure fails the attempt instead:
-    /// [MqttClient#connect()] fails with [MqttConnectException] caused by it, and the listener is
-    /// not notified. While disconnected, or after that session ends, a failure is logged without
-    /// a disconnection notification.
+    /// is logged and stops the client: it withdraws the connection request, so the client does
+    /// not reconnect until the application calls [MqttClient#connect()] again. The failure ends
+    /// the active connection of its receiving session, reported by
+    /// [ConnectionListener#onDisconnected(Disconnection)], or a connection attempt or a wait to
+    /// reconnect, reported by [ConnectionListener#onConnectFailed(Disconnection)]. Either way the
+    /// failure is the cause, no reconnection delay is announced, and a pending
+    /// [MqttClient#connect()] fails with [MqttConnectException] caused by it. This includes a
+    /// handler started on an earlier connection when the session continues. Without a connection
+    /// request, or after that session ends, a failure is only logged.
+    /// To retry a transient failure, repeat the work inside the handler, which keeps the
+    /// subscription's order and holds back its acknowledgement meanwhile. To give up a message,
+    /// catch the failure and return normally, or call [MqttDelivery#ack()] with
+    /// [AckMode#MANUAL]; the message then counts as handled.
     /// Exhausted receive capacity also ends the connection.
     /// On connection termination, queued deliveries are discarded; a running handler can finish.
     /// A subscription survives termination and resumes on the same handle after
-    /// the client's next successful [MqttClient#connect()]. New deliveries wait for a previous
-    /// connection's running handler to finish, preserving serial execution. A handler failure
-    /// also retains the subscription for that next connection.
+    /// the client's next connection, including an automatic reconnection. New deliveries wait
+    /// for a previous connection's running handler to finish, preserving serial execution. A
+    /// handler failure also retains the subscription for that next connection.
     /// Interrupt status left by a normally returning handler is cleared before the next delivery.
     /// QoS 1 and QoS 2 acknowledgement follows the request's [AckMode]. QoS 1 messages can be
     /// delivered more than once. Within a session, a QoS 2 message reaches each subscription at

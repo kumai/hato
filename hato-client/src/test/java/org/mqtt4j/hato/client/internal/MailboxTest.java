@@ -151,6 +151,7 @@ class MailboxTest {
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
         var closing = new Mailbox.Event(1, () -> { }, Mailbox.Kind.SUBSCRIPTION_CLOSE, 0);
         var credentials = new Mailbox.Event(0, () -> { }, Mailbox.Kind.CREDENTIALS_READY, 0);
+        var reconnect = new Mailbox.Event(0, () -> { }, Mailbox.Kind.RECONNECT, 0);
         sut.activate(1);
         assertThat(sut.offer(control)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(control)).isEqualTo(FULL);
@@ -161,11 +162,13 @@ class MailboxTest {
         assertThat(sut.offer(capacity)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(closing)).isEqualTo(ACCEPTED);
         assertThat(sut.offer(credentials)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(reconnect)).isEqualTo(ACCEPTED);
         for (int i = 0; i < 300; i++) {
             assertThat(sut.offer(ready)).isEqualTo(ACCEPTED);
             assertThat(sut.offer(capacity)).isEqualTo(ACCEPTED);
             assertThat(sut.offer(closing)).isEqualTo(ACCEPTED);
             assertThat(sut.offer(credentials)).isEqualTo(ACCEPTED);
+            assertThat(sut.offer(reconnect)).isEqualTo(ACCEPTED);
         }
         assertThat(sut.offer(control)).isEqualTo(FULL);
 
@@ -176,6 +179,7 @@ class MailboxTest {
         assertThat(sut.take(() -> false)).containsSame(capacity);
         assertThat(sut.take(() -> false)).containsSame(closing);
         assertThat(sut.take(() -> false)).containsSame(credentials);
+        assertThat(sut.take(() -> false)).containsSame(reconnect);
         assertThat(sut.offer(command)).isEqualTo(ACCEPTED);
         assertThat(sut.take(() -> false)).containsSame(command);
     }

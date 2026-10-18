@@ -49,6 +49,7 @@ class KeepAliveBacklogTest {
                 MqttClient sut = MqttClient.builder()
                         .server(URI.create("mqtt://127.0.0.1:" + server.getLocalPort()))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .keepAlive(Duration.ofSeconds(1))
                         .connectionListener(ended::add)
                         .build()

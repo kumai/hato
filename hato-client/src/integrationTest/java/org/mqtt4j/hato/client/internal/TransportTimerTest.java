@@ -15,6 +15,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttClientBuilder;
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 import org.mqtt4j.hato.testsupport.Tls;
@@ -39,6 +40,7 @@ class TransportTimerTest {
             MqttClientBuilder builder = MqttClient.builder()
                     .server(URI.create(scheme + "://localhost:" + server.getLocalPort()))
                     .version(MqttVersion.V3_1_1)
+                    .reconnectPolicy(ReconnectPolicy.disabled())
                     .keepAlive(Duration.ZERO)
                     .connectionTimeout(timeout)
                     .timerScheduler(clock);
@@ -65,6 +67,7 @@ class TransportTimerTest {
                 MqttClient sut = MqttClient.builder()
                         .server(URI.create("mqtts://localhost:" + server.getLocalPort()))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .sslContext(Tls.clientContext())
                         .keepAlive(Duration.ZERO)
                         .timerScheduler(clock)
@@ -110,6 +113,7 @@ class TransportTimerTest {
             try (MqttClient sut = MqttClient.builder()
                     .server(URI.create("mqtts://localhost:" + server.getLocalPort()))
                     .version(MqttVersion.V3_1_1)
+                    .reconnectPolicy(ReconnectPolicy.disabled())
                     .sslContext(Tls.clientContext())
                     .keepAlive(Duration.ZERO)
                     .timerScheduler(clock)

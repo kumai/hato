@@ -5,8 +5,10 @@ import java.time.Duration;
 /// Monotonic time and delayed execution. Methods must not block. Callbacks may run inline;
 /// they must be short and must not run application code. Cancellation is best effort, so an
 /// already dispatched callback may still run. The client does not own or close this scheduler.
-/// Runtime exceptions from time reads or scheduling fail the affected operation or connection;
-/// the client remains reusable. Cancellation failures are logged and cleanup continues.
+/// Runtime exceptions from time reads or scheduling fail the affected operation or connection
+/// and stop automatic reconnection; the client remains reusable through a later
+/// [org.mqtt4j.hato.MqttClient#connect()]. Cancellation failures are logged and cleanup
+/// continues.
 public interface TimerScheduler {
 
     /// A monotonic nanosecond counter, compared using differences, like System.nanoTime().

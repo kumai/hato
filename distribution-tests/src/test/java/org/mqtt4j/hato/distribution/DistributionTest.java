@@ -89,7 +89,7 @@ class DistributionTest {
                     || cause.getCause() != null) {
                 throw new AssertionError("Public protocol failure is not usable");
             }
-            var disconnection = org.mqtt4j.hato.Disconnection.of(cause, false);
+            var disconnection = org.mqtt4j.hato.Disconnection.of(cause, false, 1);
             var message = org.mqtt4j.hato.MqttMessage.of(
                     new org.mqtt4j.hato.Topic("a/b"),
                     new byte[0],
@@ -101,8 +101,21 @@ class DistributionTest {
                     .withRetain(true);
             if (disconnection.cause().orElseThrow() != cause
                     || disconnection.userRequested()
-                    || org.mqtt4j.hato.Disconnection.of(null, true).cause().isPresent()
-                    || !org.mqtt4j.hato.ConnAck.of(true).sessionPresent()
+                    || org.mqtt4j.hato.Disconnection.of(null, true, 1).cause().isPresent()
+                    || !org.mqtt4j.hato.Disconnection.of(
+                            null,
+                            false,
+                            2,
+                            java.time.Duration.ofSeconds(1)
+                    ).reconnectDelay().isPresent()
+                    || !org.mqtt4j.hato.ConnAck.of(true, 1).sessionPresent()
+                    || !org.mqtt4j.hato.ReconnectPolicy.exponentialBackoff(
+                            java.time.Duration.ofSeconds(1),
+                            java.time.Duration.ofSeconds(2)
+                    ).withInitialRetry().equals(org.mqtt4j.hato.ReconnectPolicy.exponentialBackoff(
+                            java.time.Duration.ofSeconds(1),
+                            java.time.Duration.ofSeconds(2)
+                    ).withInitialRetry())
                     || !org.mqtt4j.hato.PublishResult.of()
                             .equals(org.mqtt4j.hato.PublishResult.of())
                     || !message.equals(org.mqtt4j.hato.MqttMessage.of(
@@ -361,6 +374,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.PublishResult",
                 "org.mqtt4j.hato.Qos",
                 "org.mqtt4j.hato.ReasonCode",
+                "org.mqtt4j.hato.ReconnectPolicy",
                 "org.mqtt4j.hato.ReceiveResult",
                 "org.mqtt4j.hato.ReceiveResult$Ended",
                 "org.mqtt4j.hato.ReceiveResult$Received",

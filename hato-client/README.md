@@ -47,9 +47,37 @@ To retain a session between connections, use an explicit `clientId` and set
 expiry selects a persistent session; the broker determines how long it retains
 the session. The client keeps its own session state in memory.
 
-Connect with `connect()`. After `disconnect()` or a connection failure, the client can
-connect again, and established subscriptions resume on their existing handles. To shut
-down a connected client, wait for the asynchronous DISCONNECT write before closing:
+## Staying connected
+
+`connect()` asks the client to stay connected. When the connection drops, the client
+reconnects by itself, waiting longer after each failed attempt, and established
+subscriptions and a persistent session's unfinished QoS 1 and 2 publications resume.
+`disconnect()` and `close()` stop it.
+
+By default, `connect()` fails if its first attempt fails, for example because the broker
+cannot be reached or refuses the credentials, so a configuration error shows up at startup.
+To keep trying instead, or to change the delays, set a policy on the builder:
+
+```java
+ReconnectPolicy policy = ReconnectPolicy
+        .exponentialBackoff(Duration.ofSeconds(1), Duration.ofSeconds(30))
+        .withInitialRetry();
+MqttClient client = MqttClient.builder()
+        .server(URI.create("mqtt://broker.example.com:1883"))
+        .version(MqttVersion.V3_1_1)
+        .reconnectPolicy(policy)
+        .build();
+```
+
+`ReconnectPolicy.disabled()` reconnects only when you call `connect()` again.
+`whenConnected()` completes when the client is connected, without starting a connection.
+To check repeatedly, keep the returned future and call `whenConnected()` again only after it
+completes.
+
+Give every running client its own `clientId`: two clients with the same identifier keep
+taking over each other's connection.
+
+To shut down a connected client, wait for the asynchronous DISCONNECT write before closing:
 
 ```java
 try {
@@ -99,7 +127,8 @@ subscription.unsubscribe().join();
   `subscription.established()` to wait for broker acceptance and obtain the granted QoS; it
   also tells you when the broker refuses the subscription. Registrations survive connection
   failures, `disconnect()`, failed connection attempts, and handler failures. After the next
-  `connect()`, messages arrive without another `subscribe()`.
+  connection, including an automatic reconnection, messages arrive without another
+  `subscribe()`.
 - `unsubscribe()` also works while disconnected. It completes locally for a nonpersistent
   session; a persistent session waits for the next connection to confirm removal. Connection
   loss does not fail a pending removal.
@@ -149,8 +178,8 @@ and registration capacity fail `established()` and end only the returned handle.
 
 | Exception | Meaning |
 | --- | --- |
-| `MqttConnectException` | The broker could not be reached, refused the connection, or did not answer in time. |
-| `MqttNotConnectedException` | The client was not connected. |
+| `MqttConnectException` | `connect()` gave up: the broker could not be reached, refused the connection, or did not answer in time, or `disconnect()`, `close()`, or a failing handler withdrew the request first. |
+| `MqttNotConnectedException` | The client was not connected, for example while it was reconnecting. |
 | `MqttConnectionLostException` | The connection ended before the result was known. A publication may or may not have reached the broker. |
 | `MqttCapacityException` | The client reached an admission limit. The connection stays up; let outstanding work drain before retrying. |
 | `MqttProtocolException` | The broker accepted a QoS 2 publication only at QoS 1, so it may be delivered more than once. The connection stays up. |
@@ -159,7 +188,8 @@ and registration capacity fail `established()` and end only the returned handle.
 The `connectionListener` is called whenever a connection ends, whether you
 disconnected or not. A lambda, as in the configuration example, handles just
 these endings; override the other listener methods to observe successful
-connections and subscriptions that the broker refuses to re-create:
+connections, failed connection attempts, and subscriptions that the broker refuses
+to re-create:
 
 ```java
 ConnectionListener listener = new ConnectionListener() {
@@ -174,21 +204,32 @@ ConnectionListener listener = new ConnectionListener() {
     }
 
     @Override
+    public void onConnectFailed(Disconnection failure) {
+        System.err.println("Connection attempt failed: " + failure);
+    }
+
+    @Override
     public void onResubscribeFailed(Subscription subscription, MqttSubscribeException failure) {
         System.err.println("Subscription ended: " + subscription.filter() + ": " + failure);
     }
 };
 ```
 
-Pass it with `connectionListener(listener)` when building the client. A refused
-subscription ends; the connection and its other subscriptions continue. See
-[ConnectionListener](src/main/java/org/mqtt4j/hato/ConnectionListener.java) for
-callback ordering and threading.
+Pass it with `connectionListener(listener)` when building the client. Connection
+notifications carry the attempt's number, and endings tell when the client reconnects. Once
+connected, or with `withInitialRetry()`, the client keeps retrying after refusals such as bad
+credentials; to stop, call `disconnect()` from `onConnectFailed`. A refused subscription
+ends; the connection and its other subscriptions continue. A listener that falls far behind
+loses its oldest notifications instead of slowing the client down, so release resources when
+the futures that own them complete, not only in `onDisconnected`. See
+[ConnectionListener](src/main/java/org/mqtt4j/hato/ConnectionListener.java) for callback
+ordering and threading.
 
 Besides broker and network failures, the client itself ends the connection when:
 
 - a handler throws, including one still running from before a reconnection in a
-  persistent session. Catch exceptions inside the handler to keep the connection.
+  persistent session. The client then stops reconnecting until you call `connect()`
+  again. Catch exceptions inside the handler to keep the connection.
 - a subscription's queue fills up, for example with messages waiting for
   `delivery.ack()`, or too many QoS 1 and 2 messages wait behind one that is not yet
   acknowledged, rather than buffering without limit.

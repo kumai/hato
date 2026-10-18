@@ -83,10 +83,4 @@ final class AckSequencer {
     Optional<Acknowledgement> written(long ticket) {
         return Optional.ofNullable(writing.remove(ticket));
     }
-
-    void clear() {
-        pending.clear();
-        completions.clear();
-        writing.clear();
-    }
 }

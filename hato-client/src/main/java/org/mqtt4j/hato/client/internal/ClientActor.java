@@ -8,7 +8,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.SplittableRandom;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
@@ -18,7 +17,6 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.Supplier;
-import java.util.random.RandomGenerator;
 
 import org.jspecify.annotations.Nullable;
 
@@ -60,6 +58,10 @@ public final class ClientActor implements MqttClient {
 
     private static final int OPERATION_LIMIT = 64;
 
+    // The shared operation slots plus the connect and disconnect slots. Every admitted operation
+    // holds one of them and posts one command, so the command count never refuses one.
+    private static final int COMMAND_LIMIT = OPERATION_LIMIT + 2;
+
     private static final int WAITER_LIMIT = 1024;
 
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
@@ -89,6 +91,9 @@ public final class ClientActor implements MqttClient {
     // A nonpersistent session ends with the client, which confirms its pending removals.
     private final boolean cleanStart;
 
+    // Whether the policy reconnects at all; the log then says when an ending gives up.
+    private final boolean reconnects;
+
     private final TimerScheduler scheduler;
 
     private final ListenerLane listenerLane;
@@ -106,6 +111,13 @@ public final class ClientActor implements MqttClient {
     // Published under lifecycleLock before admitting commands for an established connection.
     private long connectedGeneration;
 
+    // Guarded by lifecycleLock. The established connection's CONNACK, published once continued
+    // subscriptions are reconciled, and null after the connection ends.
+    private @Nullable ConnAck connectedAck;
+
+    // Guarded by lifecycleLock. whenConnected() observations waiting for a connection.
+    private final List<CompletableFuture<ConnAck>> connectionWaiters = new ArrayList<>();
+
     // Guarded by lifecycleLock. Set when the core accepts a requested disconnect and cleared when
     // the connection ends or a new attempt begins; meanwhile, establishment observations wait
     // for a later connection.
@@ -113,8 +125,8 @@ public final class ClientActor implements MqttClient {
 
     private long openedGeneration;
 
-    // The attempt being connected or established, and null once its connection ends. Its
-    // reservation supplies both notifications, and only its credentials results are applied.
+    // The attempt being connected or established, and null once its connection ends. Only its
+    // credentials results are applied.
     private @Nullable ConnectionAttempt activeAttempt;
 
     // Admission and stopping share this lock so shutdown cannot miss a registered operation.
@@ -125,6 +137,12 @@ public final class ClientActor implements MqttClient {
     private final Map<Long, UnsubscribeAttempt> closingAttempts = new LinkedHashMap<>();
 
     private final Semaphore operationSlots = new Semaphore(OPERATION_LIMIT);
+
+    // connect() and disconnect() keep one slot each, so publications holding every operation
+    // slot while they wait for a reconnection cannot refuse the call that hastens or ends it.
+    private final Semaphore connectSlot = new Semaphore(1);
+
+    private final Semaphore disconnectSlot = new Semaphore(1);
 
     private final Semaphore waiterSlots = new Semaphore(WAITER_LIMIT);
 
@@ -154,7 +172,10 @@ public final class ClientActor implements MqttClient {
             Transport.Factory transportFactory,
             boolean cleanStart,
             @Nullable Supplier<MqttCredentials> credentials,
-            Packet.@Nullable Will will
+            Packet.@Nullable Will will,
+            ReconnectBackoff backoff,
+            boolean initialRetry,
+            Duration responseTimeout
     ) {
         this(
                 endpoint,
@@ -168,38 +189,10 @@ public final class ClientActor implements MqttClient {
                 PacketCodec.of(MqttVersion.V3_1_1),
                 cleanStart,
                 credentials,
-                will
-        );
-    }
-
-    ClientActor(
-            URI endpoint,
-            String clientId,
-            Duration keepAlive,
-            Duration timeout,
-            int maxPacketSize,
-            TimerScheduler scheduler,
-            ConnectionListener listener,
-            Transport.Factory transportFactory,
-            PacketCodec codec,
-            boolean cleanStart,
-            @Nullable Supplier<MqttCredentials> credentials,
-            Packet.@Nullable Will will
-    ) {
-        this(
-                endpoint,
-                clientId,
-                keepAlive,
-                timeout,
-                maxPacketSize,
-                scheduler,
-                listener,
-                transportFactory,
-                codec,
-                cleanStart,
-                credentials,
                 will,
-                new SplittableRandom()
+                backoff,
+                initialRetry,
+                responseTimeout
         );
     }
 
@@ -216,12 +209,15 @@ public final class ClientActor implements MqttClient {
             boolean cleanStart,
             @Nullable Supplier<MqttCredentials> credentials,
             Packet.@Nullable Will will,
-            RandomGenerator random
+            ReconnectBackoff backoff,
+            boolean initialRetry,
+            Duration responseTimeout
     ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
         this.scheduler = scheduler;
         this.cleanStart = cleanStart;
+        reconnects = backoff.enabled();
         listenerLane = new ListenerLane(endpoint, clientId, listener);
         mailbox = createMailbox(maxPacketSize);
         lanes = new DeliveryLanes(
@@ -246,8 +242,9 @@ public final class ClientActor implements MqttClient {
                 cleanStart,
                 will,
                 credentials != null,
-                ReconnectBackoff.disabled(random),
-                false
+                backoff,
+                initialRetry,
+                responseTimeout
         );
         this.credentials = credentials == null ? null : new CredentialsEvaluator(
                 threadName("credentials"),
@@ -259,7 +256,7 @@ public final class ClientActor implements MqttClient {
 
     @Override
     public CompletableFuture<ConnAck> connect() {
-        return submit(true, false, 0, token -> {
+        return submit(Command.CONNECT, 0, token -> {
             long now;
             try {
                 now = scheduler.nanoTime();
@@ -275,15 +272,32 @@ public final class ClientActor implements MqttClient {
     }
 
     @Override
+    public CompletableFuture<ConnAck> whenConnected() {
+        synchronized (lifecycleLock) {
+            if (stopping.get()) {
+                return CompletableFuture.failedFuture(closedFailure());
+            }
+            ConnAck current = connectedAck;
+            if (current != null && !disconnecting) {
+                return CompletableFuture.completedFuture(current);
+            }
+            return observeFuture(connectionWaiters);
+        }
+    }
+
+    @Override
     public CompletableFuture<Void> disconnect() {
-        return submit(false, false, 0, core::disconnect);
+        return submit(Command.DISCONNECT, 0, core::disconnect);
     }
 
     @Override
     public CompletableFuture<PublishResult> publish(MqttMessage message) {
         requireNonNull(message, "message");
-        return submit(false, true, message.payloadSize(),
-                token -> core.publish(token, message));
+        return submit(
+                Command.PUBLISH,
+                message.payloadSize(),
+                token -> core.publish(token, message)
+        );
     }
 
     @Override
@@ -359,25 +373,22 @@ public final class ClientActor implements MqttClient {
     }
 
     private <T> CompletableFuture<T> submit(
-            boolean connect,
-            boolean needsConnection,
+            Command kind,
             int bytes,
             LongConsumer command
     ) {
+        boolean needsConnection = kind == Command.PUBLISH;
         synchronized (lifecycleLock) {
             Throwable refusal = null;
-            ListenerLane.Reservation notifications = null;
+            Semaphore slot = null;
             if (stopping.get()) {
                 refusal = new IllegalStateException("Client is closed");
             } else if (needsConnection && connectedGeneration == 0) {
                 refusal = new MqttNotConnectedException();
-            } else if (!operationSlots.tryAcquire()) {
-                refusal = new MqttCapacityException("Operation capacity");
-            } else if (connect) {
-                notifications = listenerLane.tryReserveConnection();
-                if (notifications == null) {
-                    operationSlots.release();
-                    refusal = new MqttCapacityException("Listener capacity");
+            } else {
+                slot = acquireSlot(kind);
+                if (slot == null) {
+                    refusal = new MqttCapacityException("Operation capacity");
                 }
             }
             if (refusal != null) {
@@ -387,7 +398,8 @@ public final class ClientActor implements MqttClient {
             long token = sequence.incrementAndGet();
             long generation = connectedGeneration;
             var operation = new Operation<T>(
-                    (notifications == null) ? null : new ConnectionAttempt(token, notifications)
+                    requireNonNull(slot),
+                    (kind == Command.CONNECT) ? new ConnectionAttempt(token) : null
             );
             operations.put(token, operation);
             Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
@@ -413,6 +425,20 @@ public final class ClientActor implements MqttClient {
             }
             return operation.future;
         }
+    }
+
+    /// connect() and disconnect() first take their own slot; a concurrent second call shares the
+    /// operation slots.
+    private @Nullable Semaphore acquireSlot(Command kind) {
+        Semaphore reserved = switch (kind) {
+            case CONNECT -> connectSlot;
+            case DISCONNECT -> disconnectSlot;
+            case PUBLISH -> null;
+        };
+        if (reserved != null && reserved.tryAcquire()) {
+            return reserved;
+        }
+        return operationSlots.tryAcquire() ? operationSlots : null;
     }
 
     @Override
@@ -476,6 +502,7 @@ public final class ClientActor implements MqttClient {
                             retire(subscription, ending);
                         }
                         finishClosures(ending);
+                        completeWaiters(connectionWaiters, null, closedFailure());
                     }
                     lanes.close(failure);
                     mailbox.discard(0);
@@ -570,6 +597,12 @@ public final class ClientActor implements MqttClient {
         return fatalFailure == null ? null : new MqttConnectionLostException(fatalFailure);
     }
 
+    /// The failure of an observation after stopping: the permanent cause, or an ordinary close.
+    private Throwable closedFailure() {
+        Throwable ending = permanentFailure();
+        return ending != null ? ending : new IllegalStateException("Client is closed");
+    }
+
     private void post(long generation, Runnable action, Mailbox.Kind kind, int bytes) {
         if (stopping.get()) {
             return;
@@ -584,7 +617,7 @@ public final class ClientActor implements MqttClient {
                 case INCOMING -> "Incoming";
                 case KEEP_ALIVE -> "Keep-alive";
                 case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE,
-                        CREDENTIALS_READY -> "Control";
+                        CREDENTIALS_READY, RECONNECT -> "Control";
             };
             signalFailure(generation, new MqttCapacityException(admission + " mailbox capacity"));
         }
@@ -653,16 +686,11 @@ public final class ClientActor implements MqttClient {
             }
             return;
         }
-        if (operation.attempt != null
-                && (failure != null || operation.attempt != activeAttempt)) {
-            // Failed attempts and requests joining another attempt return unused reservations.
-            requireNonNull(operation.attempt.notifications).close();
-        }
         Thread.ofVirtual().name(threadName("complete-" + token)).start(() -> {
             try {
                 operation.finish(result, failure);
             } finally {
-                operationSlots.release();
+                operation.slot.release();
             }
         });
     }
@@ -683,9 +711,11 @@ public final class ClientActor implements MqttClient {
     /// until applications get statistics. The parts are read one after another, not atomically.
     Usage usage() {
         return new Usage(
-                OPERATION_LIMIT - operationSlots.availablePermits(),
+                COMMAND_LIMIT
+                        - operationSlots.availablePermits()
+                        - connectSlot.availablePermits()
+                        - disconnectSlot.availablePermits(),
                 listenerLane.usage(),
-                listenerLane.subscriptionUsage(),
                 mailbox.size(),
                 mailbox.bytes(),
                 io.sends(),
@@ -697,10 +727,16 @@ public final class ClientActor implements MqttClient {
         );
     }
 
+    /// Listener notifications dropped because the listener fell behind, for tests until
+    /// applications get statistics.
+    long droppedNotifications() {
+        return listenerLane.dropped();
+    }
+
     static Mailbox createMailbox(int maxPacketSize) {
         // Registrations have their own admission class within the shared FIFO.
         return new Mailbox(
-                OPERATION_LIMIT,
+                COMMAND_LIMIT,
                 MAILBOX_COMMAND_BYTE_LIMIT,
                 MAILBOX_INCOMING_LIMIT,
                 receiveByteLimit(maxPacketSize),
@@ -766,7 +802,14 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void connected(long generation, ConnAck ack) {
-            notifications().connected(ack);
+            synchronized (lifecycleLock) {
+                connectedAck = ack;
+                // A requested disconnect lets observers wait for a later connection.
+                if (!disconnecting) {
+                    completeWaiters(connectionWaiters, ack, null);
+                }
+            }
+            listenerLane.connected(ack);
             log.info("Connected {} to {}", clientId, endpoint);
         }
 
@@ -782,10 +825,6 @@ public final class ClientActor implements MqttClient {
             lanes.stopDiscarded();
         }
 
-        private ListenerLane.Reservation notifications() {
-            return requireNonNull(requireNonNull(activeAttempt).notifications);
-        }
-
         @Override
         public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
             var subscription = (ClientSubscription) handle;
@@ -795,12 +834,9 @@ public final class ClientActor implements MqttClient {
                     retire(subscription, null);
                     return;
                 }
-                // Transfer its existing reservation to the callback; normal retirement then
-                // removes the lane without returning the reservation ahead of that callback.
-                subscription.notificationReserved = false;
                 retire(subscription, failure);
             }
-            listenerLane.submitResubscribeFailure(subscription, failure);
+            listenerLane.resubscribeFailed(subscription, failure);
             // Operators see the refusal even when the listener does not override the callback.
             log.warn("Broker refused re-creation of subscription {} for {} at {}",
                     subscription.filter().pattern(), clientId, endpoint, failure);
@@ -834,23 +870,43 @@ public final class ClientActor implements MqttClient {
             timers.put(timer, entry);
             Mailbox.Kind kind = switch (timer) {
                 case KEEP_ALIVE, PING -> Mailbox.Kind.KEEP_ALIVE;
-                case CONNECT, DISCONNECT, RECONNECT, STABLE, RESPONSE -> Mailbox.Kind.CONTROL;
+                case CONNECT, DISCONNECT, STABLE, RESPONSE -> Mailbox.Kind.CONTROL;
+                case RECONNECT -> Mailbox.Kind.RECONNECT;
             };
+            Runnable fired = (timer == SessionCore.Timer.RECONNECT)
+                    ? () -> {
+                        // The only way back to a connection must survive a full control queue,
+                        // such as the one that just ended the connection when the delay is
+                        // zero and the scheduler runs the task at once. A wake is never refused.
+                        entry.due = true;
+                        post(0, this::reconnect, kind, 0);
+                    }
+                    : () -> post(
+                            generation,
+                            () -> {
+                                if (timers.get(timer) == entry) {
+                                    timers.remove(timer);
+                                    core.timer(generation, timer, nanoTime(generation));
+                                }
+                            },
+                            kind,
+                            0
+                    );
             try {
-                entry.cancellation = scheduler.schedule(delay, () -> post(
-                        generation,
-                        () -> {
-                            if (timers.get(timer) == entry) {
-                                timers.remove(timer);
-                                core.timer(generation, timer, nanoTime(generation));
-                            }
-                        },
-                        kind,
-                        0
-                ));
+                entry.cancellation = scheduler.schedule(delay, fired);
             } catch (RuntimeException failure) {
                 timers.remove(timer);
                 throw SpiException.scheduler(generation, failure);
+            }
+        }
+
+        // Wakes are coalesced, so the actor checks the current timer. A late callback of a
+        // timer that the actor has replaced marks only its own entry.
+        private void reconnect() {
+            TimerEntry entry = timers.get(SessionCore.Timer.RECONNECT);
+            if (entry != null && entry.due) {
+                timers.remove(SessionCore.Timer.RECONNECT);
+                core.timer(0, SessionCore.Timer.RECONNECT, nanoTime(0));
             }
         }
 
@@ -875,10 +931,6 @@ public final class ClientActor implements MqttClient {
         public Optional<Subscription> registerSubscription(long id) {
             synchronized (lifecycleLock) {
                 ClientSubscription subscription = requireNonNull(subscriptions.get(id));
-                if (!listenerLane.tryReserveSubscription()) {
-                    return Optional.empty();
-                }
-                subscription.notificationReserved = true;
                 if (subscription.locallyClosed) {
                     return Optional.of(subscription);
                 }
@@ -984,13 +1036,12 @@ public final class ClientActor implements MqttClient {
                 boolean established,
                 Disconnection disconnection,
                 boolean preserveSession,
-                boolean stopped,
-                long attemptNumber,
-                @Nullable Duration reconnectDelay
+                boolean stopped
         ) {
             Throwable cause = disconnection.cause().orElse(null);
             synchronized (lifecycleLock) {
                 connectedGeneration = 0;
+                connectedAck = null;
                 disconnecting = false;
             }
             mailbox.discard(generation);
@@ -999,15 +1050,24 @@ public final class ClientActor implements MqttClient {
             Map<Long, Boolean> handed = lanes.connectionEnded(preserveSession, stopped);
             io.close();
             if (established) {
-                // A failed attempt instead returns both notifications when its operation fails.
-                notifications().disconnected(disconnection);
+                listenerLane.disconnected(disconnection);
                 log.info("Disconnected {} from {}", clientId, endpoint, cause);
             } else {
-                log.info(
-                        "Connection failed for {} at {}",
-                        clientId, endpoint,
-                        cause
-                );
+                listenerLane.connectFailed(disconnection);
+                if (activeAttempt != null) {
+                    log.info("Connection failed for {} at {}", clientId, endpoint, cause);
+                } else {
+                    // A handler, clock, or internal failure ends a wait that has no attempt.
+                    log.info("Stopped reconnecting {} to {}", clientId, endpoint, cause);
+                }
+            }
+            Duration delay = disconnection.reconnectDelay().orElse(null);
+            if (delay != null) {
+                log.info("Reconnecting {} to {} in {}", clientId, endpoint, delay);
+            } else if (reconnects && (established || activeAttempt != null)
+                    && !disconnection.userRequested()) {
+                // The policy reconnects, but this ending gives the connection request up.
+                log.info("Stopped reconnecting {} to {}", clientId, endpoint);
             }
             activeAttempt = null;
             return handed;
@@ -1105,14 +1165,12 @@ public final class ClientActor implements MqttClient {
         }
     }
 
-    /// Operation and notification slots stay held until application continuations and listeners
-    /// return; lanes and deliveries until handlers return and acknowledgements are released.
-    /// A subscription notification slot stays held from registration until retirement, or until
-    /// the refusal callback for that subscription returns.
+    /// Operation slots, including those of connect() and disconnect(), stay held until application
+    /// continuations return, and notifications until the listener returns or the lane drops them;
+    /// lanes and deliveries until handlers return and acknowledgements are released.
     record Usage(
             int operations,
             int notifications,
-            int subscriptionNotifications,
             int mailboxEvents,
             long mailboxBytes,
             int sends,
@@ -1127,6 +1185,9 @@ public final class ClientActor implements MqttClient {
     private static final class TimerEntry {
 
         TimerScheduler.@Nullable Cancellable cancellation;
+
+        // Set by the scheduler when a reconnect timer fires; the actor reads it.
+        volatile boolean due;
     }
 
     private void retire(ClientSubscription subscription, @Nullable Throwable cause) {
@@ -1137,10 +1198,6 @@ public final class ClientActor implements MqttClient {
             subscription.retired = true;
             subscriptions.remove(subscription.id);
             subscription.endLocally(cause);
-            if (subscription.notificationReserved) {
-                subscription.notificationReserved = false;
-                listenerLane.releaseSubscription();
-            }
         }
     }
 
@@ -1171,9 +1228,6 @@ public final class ClientActor implements MqttClient {
 
         private boolean retired;
 
-        // The subscription owns its failure-notification reservation until retirement or handoff.
-        private boolean notificationReserved;
-
         ClientSubscription(long id, Subscribe request, @Nullable Consumer<MqttDelivery> handler) {
             this.id = id;
             this.request = request;
@@ -1202,10 +1256,7 @@ public final class ClientActor implements MqttClient {
                     return CompletableFuture.failedFuture(establishmentFailure);
                 }
                 if (stopping.get()) {
-                    Throwable ending = permanentFailure();
-                    endEstablishment(
-                            ending != null ? ending : new IllegalStateException("Client is closed")
-                    );
+                    endEstablishment(closedFailure());
                     return CompletableFuture.failedFuture(requireNonNull(establishmentFailure));
                 }
                 if (!disconnecting && connectedGeneration != 0
@@ -1355,14 +1406,25 @@ public final class ClientActor implements MqttClient {
         });
     }
 
+    private enum Command {
+        CONNECT,
+        DISCONNECT,
+        PUBLISH
+    }
+
     private static final class Operation<T> {
 
         final CompletableFuture<T> future = new CompletableFuture<>();
 
-        // Present for connect(): the attempt owns the notifications reserved at admission.
+        // Returned once the future's synchronous continuations have run.
+        final Semaphore slot;
+
+        // Present for connect(). The core starts it unless the call joins the current attempt or
+        // completes at once.
         final @Nullable ConnectionAttempt attempt;
 
-        Operation(@Nullable ConnectionAttempt attempt) {
+        Operation(Semaphore slot, @Nullable ConnectionAttempt attempt) {
+            this.slot = slot;
             this.attempt = attempt;
         }
 

@@ -30,6 +30,7 @@ final class ScriptedBroker implements AutoCloseable {
         return MqttClient.builder()
                 .server(endpoint(server))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .build();
     }
 
@@ -73,7 +74,7 @@ final class ScriptedBroker implements AutoCloseable {
         try {
             assertThat(peer.receive()).isInstanceOfSatisfying(Packet.Connect.class, verifyConnect);
             peer.send(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));
-            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent));
+            assertThat(connected.get(5, SECONDS).sessionPresent()).isEqualTo(sessionPresent);
             return peer;
         } catch (Exception | AssertionError failure) {
             peer.close();

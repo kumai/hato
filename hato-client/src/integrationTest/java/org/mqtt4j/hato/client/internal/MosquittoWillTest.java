@@ -59,6 +59,7 @@ class MosquittoWillTest {
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .will(will)
                         .build()) {
             subscriber.connect().get(5, SECONDS);
@@ -98,6 +99,7 @@ class MosquittoWillTest {
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .will(will)
                         .connectionListener(ended::add)
                         .transportFactory(id -> {
@@ -115,7 +117,7 @@ class MosquittoWillTest {
             requireNonNull(transport.get()).disconnect(cause);
 
             // Assert
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
             assertThat(receive(subscription)).isEqualTo(will);
         }
     }
@@ -129,6 +131,7 @@ class MosquittoWillTest {
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(clientId)
                         .will(message(topic, (byte) 1))
                         .build()) {
@@ -152,6 +155,7 @@ class MosquittoWillTest {
         try (MqttClient previous = MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
                 .cleanStart(false)
                 .sessionExpiry(Duration.ofMinutes(1))
@@ -163,6 +167,7 @@ class MosquittoWillTest {
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(clientId)
                         .cleanStart(false)
                         .sessionExpiry(Duration.ofMinutes(1))
@@ -187,6 +192,7 @@ class MosquittoWillTest {
         try (MqttClient replacement = MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
                 .build()) {
             replacement.connect().get(5, SECONDS);
@@ -219,7 +225,11 @@ class MosquittoWillTest {
     }
 
     private static MqttClient client() {
-        return MqttClient.builder().server(endpoint()).version(MqttVersion.V3_1_1).build();
+        return MqttClient.builder()
+                .server(endpoint())
+                .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .build();
     }
 
     private static String clientId() {

@@ -59,6 +59,7 @@ class SubscriptionContinuityTest {
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint(server))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .connectionListener(listener)
                         .build()) {
             Subscription rejected;
@@ -68,7 +69,7 @@ class SubscriptionContinuityTest {
                 survivor = peer.subscribePull(sut, "survivor", AckMode.ON_RECEIVE, 4);
                 sut.disconnect().get(5, SECONDS);
             }
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             var receiving = new CountDownLatch(1);
             var received = new CompletableFuture<ReceiveResult>();
             executor.submit(() -> {
@@ -123,7 +124,7 @@ class SubscriptionContinuityTest {
                 peer.expectAcknowledgements(7, 1);
                 peer.roundTripBarrier(sut);
                 sut.disconnect().get(5, SECONDS);
-                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
                 assertThat(refused).isEmpty();
             }
         }
@@ -140,6 +141,7 @@ class SubscriptionContinuityTest {
                 MqttClient sut = MqttClient.builder()
                 .server(endpoint(server))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(ended::add)
                 .build()) {
             Subscription subscription;
@@ -258,6 +260,7 @@ class SubscriptionContinuityTest {
         try (ServerSocket server = listen(); MqttClient sut = MqttClient.builder()
                 .server(endpoint(server))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId("pending-removal")
                 .cleanStart(false)
                 .sessionExpiry(Duration.ofMinutes(1))

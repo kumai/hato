@@ -48,7 +48,6 @@ abstract class MessagingTest {
             0,
             0,
             0,
-            0,
             0
     );
 
@@ -300,6 +299,7 @@ abstract class MessagingTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(ended::add)
                 .transportFactory(id -> {
                     var faulty = new FaultyTransport(Transport.tcp(id), scheduler);
@@ -323,7 +323,7 @@ abstract class MessagingTest {
             assertThatThrownBy(() -> publication.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class)
                     .hasRootCause(failure);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(scheduler.pendingTaskCount()).isZero();
             scheduler.advance(Duration.ofSeconds(30));
             assertThat(ended).isEmpty();
@@ -467,6 +467,7 @@ abstract class MessagingTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(ended::add)
                 .transportFactory(id -> {
                     var faulty = new FaultyTransport(Transport.tcp(id), new ManualTimerScheduler());
@@ -492,7 +493,7 @@ abstract class MessagingTest {
                 sut.disconnect().get(5, SECONDS);
             }
             assertThat(ended.poll(5, SECONDS))
-                    .isEqualTo(Disconnection.of(failure ? cause : null, !failure));
+                    .isEqualTo(Disconnection.of(failure ? cause : null, !failure, 1));
             sut.connect().get(5, SECONDS);
             var next = MqttMessage.of(new Topic(topic), new byte[] {2}, Qos.AT_LEAST_ONCE, false);
             // One restoration fits the send capacity, before this same connection's PUBLISH.
@@ -535,7 +536,7 @@ abstract class MessagingTest {
 
             // Act: the subscriber has no pending operation to carry this failure.
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             sut.connect().get(5, SECONDS);
             // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -575,7 +576,7 @@ abstract class MessagingTest {
             sut.publish(message(topic, (byte) 1)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             sut.connect().get(5, SECONDS);
             // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -590,7 +591,7 @@ abstract class MessagingTest {
                     .containsExactly((byte) 2);
             subscription.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
             assertThat(ended).isEmpty();
         } finally {
             release.countDown();
@@ -638,6 +639,60 @@ abstract class MessagingTest {
             // Act & Assert: the handler can return normally after connection termination.
             release.countDown();
             assertThat(returned.await(5, SECONDS)).isTrue();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void receive_overload_reconnects_and_the_subscription_continues() throws Exception {
+        // Arrange: a client on manual time whose handler blocks with room for one delivery.
+        String topic = uniqueTopic();
+        var clock = new ManualTimerScheduler();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        var payloads = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = MqttClient.builder()
+                        .server(endpoint())
+                        .version(MqttVersion.V3_1_1)
+                        .timerScheduler(clock)
+                        .reconnectPolicy(ReconnectPolicy.exponentialBackoff(
+                                Duration.ofSeconds(1),
+                                Duration.ofSeconds(1)
+                        ))
+                        .connectionListener(ended::add)
+                        .build();
+                MqttClient publisher = client()) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE).withBufferCapacity(1),
+                    delivery -> {
+                        payloads.add(delivery.message().payload()[0]);
+                        if (entered.getCount() > 0) {
+                            entered.countDown();
+                            waitFor(release);
+                        }
+                    }
+            );
+            subscription.established().get(5, SECONDS);
+            publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+
+            // Act: the second delivery overloads the subscription, and the delay passes.
+            publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
+            Disconnection end = requireNonNull(ended.poll(5, SECONDS));
+            release.countDown();
+            clock.advance(Duration.ofSeconds(1));
+
+            // Assert: the overload announces a reconnection, which keeps the subscription.
+            assertThat(end.cause().orElseThrow()).isInstanceOf(MqttCapacityException.class);
+            assertThat(end.reconnectDelay()).isPresent();
+            assertThat(sut.whenConnected().get(5, SECONDS).attempt()).isEqualTo(2);
+            subscription.established().get(5, SECONDS);
+            publisher.publish(message(topic, (byte) 3)).get(5, SECONDS);
+            await().untilAsserted(() -> assertThat(payloads).contains((byte) 3));
         } finally {
             release.countDown();
         }
@@ -719,7 +774,7 @@ abstract class MessagingTest {
                     .containsExactly(0, 0, 0, 0, 1, 1));
             release.countDown();
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 1, 0, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
@@ -777,7 +832,7 @@ abstract class MessagingTest {
             assertThat(ended).isEmpty();
             sut.disconnect().get(5, SECONDS);
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
@@ -802,6 +857,7 @@ abstract class MessagingTest {
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .connectionListener(ended::add)
                         .transportFactory(id -> {
                             var faulty = new FaultyTransport(Transport.tcp(id), scheduler);
@@ -862,7 +918,7 @@ abstract class MessagingTest {
                     .isInstanceOf(MqttConnectionLostException.class)
                     .hasCause(end.cause().orElseThrow());
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0, 0)));
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
@@ -878,6 +934,7 @@ abstract class MessagingTest {
         return MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(listener)
                 .build();
     }

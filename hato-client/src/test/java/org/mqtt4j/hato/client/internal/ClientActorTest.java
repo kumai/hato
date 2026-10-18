@@ -59,6 +59,7 @@ import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReceiveResult;
+import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
@@ -93,9 +94,21 @@ class ClientActorTest {
     private volatile Runnable beforeActorTime = () -> { };
 
     @Test
-    void joining_connection_requests_return_their_unused_listener_reservations() throws Exception {
-        // Arrange
-        try (MqttClient client = client()) {
+    void joining_connection_requests_start_no_new_attempt_or_notification() throws Exception {
+        // Arrange: the listener records connections as well as their endings.
+        var connections = new LinkedBlockingQueue<ConnAck>();
+        var listener = new ConnectionListener() {
+            @Override
+            public void onConnected(ConnAck ack) {
+                connections.add(ack);
+            }
+
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                ends.add(disconnection);
+            }
+        };
+        try (MqttClient client = client(listener)) {
             var sut = (ClientActor) client;
             CompletableFuture<ConnAck> first = sut.connect();
             ScriptTransport transport = nextTransport();
@@ -105,16 +118,18 @@ class ClientActorTest {
             transport.accept();
 
             // Assert: joining an attempt and observing its established result start no new I/O.
-            assertThat(first.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
-            assertThat(joined.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(first.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            assertThat(joined.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             for (int i = 0; i < 64; i++) {
-                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+                assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             }
-            await().untilAsserted(() -> assertThat(sut.usage().notifications()).isEqualTo(1));
             assertThat(transports).isEmpty();
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            // The ending follows every earlier notification, so one connection was announced.
+            assertThat(connections).containsExactly(ConnAck.of(false, 1));
             await().untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
+            assertThat(ends).isEmpty();
         }
     }
 
@@ -125,9 +140,16 @@ class ClientActorTest {
         var failure = new IllegalStateException("Clock unavailable");
         var reject = new AtomicBoolean();
         var clock = new TimerScheduler() {
+            private volatile @Nullable Thread actor;
+
             @Override
             public long nanoTime() {
-                if (reject.getAndSet(false)) {
+                // The first read starts connect on the actor. A write completion read by the
+                // sender must not take the failure meant for the next connect.
+                if (actor == null) {
+                    actor = Thread.currentThread();
+                }
+                if (actor == Thread.currentThread() && reject.getAndSet(false)) {
                     throw failure;
                 }
                 return scheduler.nanoTime();
@@ -141,6 +163,7 @@ class ClientActorTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .timerScheduler(clock)
                 .connectionListener(ends::add)
                 .transportFactory(_ -> {
@@ -158,7 +181,7 @@ class ClientActorTest {
             assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectException.class)
                     .hasRootCause(failure);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.closed).isTrue();
             assertThat(scheduler.pendingTaskCount()).isZero();
             assertThat(transports).isEmpty();
@@ -200,7 +223,7 @@ class ClientActorTest {
                             packet -> assertThat(packet.username()).isEqualTo("fresh")
                     );
             current.accept();
-            assertThat(second.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(second.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 2));
             assertThat(calls).hasValue(2);
         }
     }
@@ -260,7 +283,7 @@ class ClientActorTest {
                             packet -> assertThat(packet.username()).isEqualTo("current")
                     );
             current.accept();
-            assertThat(third.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(third.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 3));
             assertThat(transports).isEmpty();
             assertThat(calls).hasValue(2);
             assertThat(maximum).hasValue(1);
@@ -393,6 +416,7 @@ class ClientActorTest {
                 .clientId("credentials-test")
                 .server(URI.create("mqtt://localhost:1883"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionTimeout(Duration.ofSeconds(30))
                 .timerScheduler(timer)
                 .credentials(supplier)
@@ -449,7 +473,7 @@ class ClientActorTest {
             assertThat(published).isNotDone();
             assertThat(disconnected).isNotDone();
             release.countDown();
-            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             published.get(5, SECONDS);
             disconnected.get(5, SECONDS);
         } finally {
@@ -479,7 +503,7 @@ class ClientActorTest {
             assertThat(transport.sent).isEmpty();
             assertThat(establishing).isNotDone();
             assertThatThrownBy(subscription::grantedQos).isInstanceOf(IllegalStateException.class);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
 
             ScriptTransport current = connect(sut);
             var subscribe = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
@@ -516,7 +540,7 @@ class ClientActorTest {
 
                 // Act: the clean session ends but the subscription and its waiting caller stay.
                 sut.disconnect().get(5, SECONDS);
-                assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+                assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
                 assertThat(subscription.receive(Duration.ZERO))
                         .isEqualTo(new ReceiveResult.TimedOut());
                 assertThat(waiting).isNotDone();
@@ -576,7 +600,7 @@ class ClientActorTest {
             old.receive(publication(new byte[] {1}));
             assertThat(entered.await(5, SECONDS)).isTrue();
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             ScriptTransport current = connect(sut);
             acknowledgeSubscription(current, subscription);
 
@@ -595,7 +619,7 @@ class ClientActorTest {
 
             // Act & Assert: a failure of a delivery from this connection still stops it.
             current.receive(publication(new byte[] {3}));
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(currentFailure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(currentFailure, false, 2));
         } finally {
             release.countDown();
         }
@@ -618,7 +642,7 @@ class ClientActorTest {
 
             // Act
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             CompletableFuture<Void> pending = requireNonNull(removing.get());
             pending.get(5, SECONDS);
             ScriptTransport current = connect(sut);
@@ -780,7 +804,7 @@ class ClientActorTest {
             sut.disconnect().get(5, SECONDS);
 
             // Assert
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
             subscription.close();
             assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
@@ -830,7 +854,6 @@ class ClientActorTest {
             // This observer also provides an actor barrier after the last UNSUBACK.
             subscriptions.getLast().unsubscribe().get(5, SECONDS);
             assertThat(removed).hasSize(256);
-            assertThat(((ClientActor) sut).usage().subscriptionNotifications()).isZero();
             assertThat(subscribePull(sut, transport, request())).isNotNull();
             assertThat(transport.sent).isEmpty();
             assertThat(ends).isEmpty();
@@ -1000,7 +1023,7 @@ class ClientActorTest {
             ScriptTransport old = connect(sut);
             Subscription subscription = subscribePull(sut, old, request());
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             await().until(() -> ((ClientActor) sut).usage().operations() == 0);
             subscription.close();
             assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
@@ -1054,7 +1077,7 @@ class ClientActorTest {
 
             // Act: FIFO closure follows admission of every observer.
             old.receiver().onClosed(failure);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
 
             // Assert: clean-session termination confirms removal and returns observation slots.
             for (CompletableFuture<Void> observer : observers) {
@@ -1285,6 +1308,7 @@ class ClientActorTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionTimeout(Duration.ofSeconds(30))
                 .timerScheduler(scheduler)
                 .connectionListener(ends::add)
@@ -1317,10 +1341,9 @@ class ClientActorTest {
 
     @ParameterizedTest(name = "failure in {0}")
     @EnumSource(SpiCall.class)
-    void spi_failures_preserve_the_cause_release_notification_slots_and_allow_another_attempt(
-            SpiCall call
-    ) throws Exception {
-        // Arrange: exceed the notification capacity with failed attempts before succeeding.
+    void spi_failures_preserve_the_cause_and_allow_another_attempt(SpiCall call)
+            throws Exception {
+        // Arrange: fail more attempts than the listener queue holds before succeeding.
         var failure = new RejectedExecutionException("SPI rejected this attempt");
         var remaining = new AtomicInteger(65);
         Runnable reject = () -> {
@@ -1349,6 +1372,7 @@ class ClientActorTest {
         try (MqttClient client = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .timerScheduler(timers)
                 .connectionListener(ends::add)
                 .transportFactory(_ -> {
@@ -1374,7 +1398,6 @@ class ClientActorTest {
                         .hasCauseInstanceOf(MqttConnectException.class)
                         .hasRootCause(failure);
                 assertThat(scheduler.pendingTaskCount()).isZero();
-                assertThat(sut.usage().notifications()).isZero();
             }
             assertThat(created).allSatisfy(transport -> assertThat(transport.closed).isTrue());
             assertThat(ends).isEmpty();
@@ -1384,10 +1407,11 @@ class ClientActorTest {
             CompletableFuture<ConnAck> connection = sut.connect();
             nextTransport().accept();
 
-            // Assert
-            assertThat(connection.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            // Assert: a clock failure precedes every attempt, so it numbers none.
+            long attempt = (call == SpiCall.CLOCK) ? 1 : 66;
+            assertThat(connection.get(5, SECONDS)).isEqualTo(ConnAck.of(false, attempt));
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, attempt));
             await().pollInterval(Duration.ofMillis(1))
                     .untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
         }
@@ -1440,6 +1464,7 @@ class ClientActorTest {
         try (MqttClient client = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .timerScheduler(timers)
                 .connectionListener(ends::add)
                 .transportFactory(_ -> {
@@ -1450,7 +1475,7 @@ class ClientActorTest {
                 .build()) {
             var sut = (ClientActor) client;
 
-            // Act: a refused attempt preserves its own failure and releases both reservations.
+            // Act: a refused attempt preserves its own failure.
             CompletableFuture<ConnAck> refused = sut.connect();
             nextTransport().receive(new Packet.ConnAck(
                     false,
@@ -1464,7 +1489,8 @@ class ClientActorTest {
                     failure -> assertThat(failure.reasonCode())
                             .contains(ReasonCode.SERVER_UNAVAILABLE)
             );
-            assertThat(sut.usage().notifications()).isZero();
+            await().pollInterval(Duration.ofMillis(1))
+                    .untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
             assertThat(ends).isEmpty();
 
             // Act: successful establishment and peer closure also complete normally.
@@ -1483,14 +1509,14 @@ class ClientActorTest {
             assertThatThrownBy(() -> pending.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class)
                     .hasRootCause(peerFailure);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(peerFailure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(peerFailure, false, 2));
             await().pollInterval(Duration.ofMillis(1))
                     .untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
 
             // Act & Assert: a later explicit disconnect retains its successful result too.
             connect(sut);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 3));
             await().pollInterval(Duration.ofMillis(1))
                     .untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
             assertThat(scheduler.pendingTaskCount()).isZero();
@@ -1517,6 +1543,7 @@ class ClientActorTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .timerScheduler(scheduler)
                 .transportFactory(_ -> transport)
                 .build()) {
@@ -1569,6 +1596,7 @@ class ClientActorTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .keepAlive(Duration.ofSeconds(10))
                 .timerScheduler(timers)
                 .connectionListener(ends::add)
@@ -1589,13 +1617,13 @@ class ClientActorTest {
             scheduler.advance(Duration.ofSeconds(10));
 
             // Assert: schedule failure unwinds the core command before it can send PINGREQ.
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.sent).isEmpty();
             assertThat(transport.closed).isTrue();
             assertThat(scheduler.pendingTaskCount()).isZero();
             CompletableFuture<ConnAck> next = sut.connect();
             nextTransport().accept();
-            assertThat(next.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(next.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 2));
         }
     }
 
@@ -1615,11 +1643,11 @@ class ClientActorTest {
 
             // Act & Assert
             assertThatThrownBy(() -> sut.disconnect().get(5, SECONDS)).hasRootCause(failure);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, true, 1));
             assertThat(transport.closed).isTrue();
             CompletableFuture<ConnAck> next = sut.connect();
             nextTransport().accept();
-            assertThat(next.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(next.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 2));
             assertThat(ends).isEmpty();
         }
     }
@@ -1638,7 +1666,7 @@ class ClientActorTest {
             sut.disconnect().get(5, SECONDS);
 
             // Assert
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             assertThat(ends).isEmpty();
         }
     }
@@ -1728,6 +1756,7 @@ class ClientActorTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId("actor-test")
                 .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))
@@ -1802,6 +1831,7 @@ class ClientActorTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .timerScheduler(scheduler)
                 .transportFactory(_ -> transport)
                 .build()) {
@@ -1836,7 +1866,7 @@ class ClientActorTest {
 
             // Assert
             assertThatThrownBy(() -> disconnection.get(5, SECONDS)).hasRootCause(failure);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, true, 1));
             assertThat(transport.closed).isTrue();
             assertThat(ends).isEmpty();
         }
@@ -1866,7 +1896,7 @@ class ClientActorTest {
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Disconnect.class);
             transport.completeSend();
             disconnection.get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             assertThat(transport.closed).isTrue();
         }
     }
@@ -1890,7 +1920,7 @@ class ClientActorTest {
             sut.disconnect().get(5, SECONDS);
 
             // Assert
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             assertThat(continuation).isNotDone();
             assertThat(transport.closed).isTrue();
         } finally {
@@ -1912,7 +1942,7 @@ class ClientActorTest {
             // Assert: cancellation leaves the connection and its notifications intact.
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             assertThat(future).isCancelled();
         }
     }
@@ -1973,9 +2003,9 @@ class ClientActorTest {
             current.accept();
 
             // Assert
-            assertThat(second.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(second.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 2));
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
         }
     }
 
@@ -1997,6 +2027,7 @@ class ClientActorTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .timerScheduler(inline)
                 .transportFactory(_ -> new ScriptTransport())
                 .build()) {
@@ -2023,7 +2054,7 @@ class ClientActorTest {
                 caller.submit(sut::close).get(5, SECONDS);
 
                 // Assert
-                assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+                assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
                 assertThat(transport.closed).isTrue();
                 assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
                         .hasCauseInstanceOf(IllegalStateException.class);
@@ -2068,7 +2099,7 @@ class ClientActorTest {
             synchronized (sut) {
                 // Act & Assert: abnormal shutdown must also ignore the application monitor.
                 assertThatThrownBy(() -> sut.disconnect().get(5, SECONDS)).hasRootCause(failure);
-                assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, true));
+                assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, true, 1));
                 assertThat(transport.closed).isTrue();
                 assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
                         .hasCauseInstanceOf(IllegalStateException.class);
@@ -2127,7 +2158,7 @@ class ClientActorTest {
             assertThatThrownBy(() -> pending.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class)
                     .hasRootCause(failure);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.closed).isTrue();
             assertThat(sender.get(5, SECONDS).join(Duration.ofSeconds(5))).isTrue();
             assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
@@ -2203,15 +2234,17 @@ class ClientActorTest {
     }
 
     @Test
-    void operation_slots_remain_reserved_until_blocked_continuations_return() throws Exception {
+    void blocked_continuations_hold_their_slots_but_disconnect_keeps_its_own()
+            throws Exception {
         // Arrange
         var release = new CountDownLatch(1);
         var entered = new AtomicInteger();
         var continuations = new ArrayList<CompletableFuture<Void>>();
         try (MqttClient sut = client()) {
-            // Act: retain each operation slot with a blocked continuation. The previous
-            // operation's completion thread may still be returning its slot, so retry refusals.
-            for (int i = 0; i < 64; i++) {
+            // Act: retain the connect slot and every operation slot with blocked continuations.
+            // The previous operation's completion thread may still be returning its slot, so
+            // retry refusals.
+            for (int i = 0; i < 65; i++) {
                 CompletableFuture<ConnAck> connection = await()
                         .pollInterval(Duration.ofMillis(1))
                         .until(sut::connect, attempt -> !attempt.isCompletedExceptionally());
@@ -2223,7 +2256,7 @@ class ClientActorTest {
                 transport.accept();
                 int expected = i + 1;
                 await().pollInterval(Duration.ofMillis(1)).untilAtomic(entered, is(expected));
-                if (i < 63) {
+                if (i < 64) {
                     await().pollInterval(Duration.ofMillis(1))
                             .until(sut::disconnect, attempt -> !attempt.isCompletedExceptionally())
                             .get(5, SECONDS);
@@ -2231,121 +2264,145 @@ class ClientActorTest {
                 }
             }
 
-            // Assert: saturation rejects admission until the continuations return.
-            CompletableFuture<Void> refused = sut.disconnect();
-            assertThat(refused).isCompletedExceptionally();
-            assertThatThrownBy(refused::join).hasCauseInstanceOf(MqttCapacityException.class);
+            // Assert: saturation refuses connect and publish, but not disconnect.
+            CompletableFuture<ConnAck> refusedConnect = sut.connect();
+            assertThat(refusedConnect).isCompletedExceptionally();
+            assertThatThrownBy(refusedConnect::join)
+                    .hasCauseInstanceOf(MqttCapacityException.class);
+            CompletableFuture<PublishResult> refusedPublish = sut.publish(message(new byte[0]));
+            assertThatThrownBy(refusedPublish::join)
+                    .hasCauseInstanceOf(MqttCapacityException.class);
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 65));
             release.countDown();
             CompletableFuture.allOf(continuations.toArray(CompletableFuture[]::new))
                     .get(5, SECONDS);
-            await().untilAsserted(() -> assertThat(sut.disconnect())
-                    .succeedsWithin(Duration.ofSeconds(5)));
+            await().untilAsserted(() -> assertThat(sut.connect().isCompletedExceptionally())
+                    .isFalse());
         } finally {
             release.countDown();
         }
     }
 
     @Test
-    void slow_and_throwing_listeners_are_serial_bounded_and_do_not_stop_connections()
+    void connect_and_disconnect_are_admitted_behind_publications_that_fill_the_command_queue()
             throws Exception {
-        // Arrange
-        var release = new CountDownLatch(1);
-        var calls = new AtomicInteger();
-        try (MqttClient sut = client(_ -> {
-            calls.incrementAndGet();
-            waitFor(release);
-            throw new IllegalStateException("application listener failure");
-        })) {
-            // Act: accumulate notifications behind the first blocked listener call.
-            for (int i = 0; i < 32; i++) {
-                CompletableFuture<ConnAck> connection = sut.connect();
-                nextTransport().accept();
-                connection.get(5, SECONDS);
-                sut.disconnect().get(5, SECONDS);
-            }
-
-            // Assert: no new transport starts until notification capacity returns.
-            assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttCapacityException.class);
-            assertThat(transports).isEmpty();
-            assertThat(calls.get()).isEqualTo(1);
-            release.countDown();
-            await().pollInterval(Duration.ofMillis(1)).untilAtomic(calls, is(32));
-            var actor = (ClientActor) sut;
-            await().pollInterval(Duration.ofMillis(1))
-                    .untilAsserted(() -> assertThat(actor.usage().notifications()).isZero());
-            CompletableFuture<ConnAck> connection = sut.connect();
-            nextTransport().accept();
-            assertThat(connection.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
-        } finally {
-            release.countDown();
-        }
-    }
-
-    @Test
-    void a_blocked_connected_listener_holds_both_notifications_until_their_callbacks_return()
-            throws Exception {
-        // Arrange
+        // Arrange: the actor is held while 64 publications wait for it with every shared slot.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var events = new LinkedBlockingQueue<String>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            holdActor(transport, entered, release);
+            var publications = new ArrayList<CompletableFuture<PublishResult>>();
+            for (int i = 0; i < 64; i++) {
+                publications.add(sut.publish(message(new byte[0])));
+            }
+
+            // Act
+            CompletableFuture<ConnAck> connected = sut.connect();
+            CompletableFuture<Void> disconnected = sut.disconnect();
+            release.countDown();
+
+            // Assert: both wait behind the publications instead of failing on capacity.
+            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            disconnected.get(5, SECONDS);
+            for (CompletableFuture<PublishResult> publication : publications) {
+                publication.get(5, SECONDS);
+            }
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_slow_throwing_listener_delays_no_attempt_and_loses_only_its_oldest_notifications()
+            throws Exception {
+        // Arrange: the first disconnection notification blocks, and every callback throws.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var notifications = new LinkedBlockingQueue<String>();
         var listener = new ConnectionListener() {
             @Override
             public void onConnected(ConnAck ack) {
-                events.add("connected");
-                entered.countDown();
-                waitFor(release);
+                notifications.add("connected " + ack.attempt());
+                throw new IllegalStateException("application listener failure");
             }
 
             @Override
             public void onDisconnected(Disconnection disconnection) {
-                events.add("disconnected");
+                notifications.add("disconnected " + disconnection.attempt());
+                if (entered.getCount() > 0) {
+                    entered.countDown();
+                    waitFor(release);
+                }
+                throw new IllegalStateException("application listener failure");
+            }
+        };
+        try (MqttClient client = client(listener)) {
+            var sut = (ClientActor) client;
+            connect(sut);
+            sut.disconnect().get(5, SECONDS);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+
+            // Act: 39 more connections queue 78 notifications behind the blocked callback.
+            for (int attempt = 2; attempt <= 40; attempt++) {
+                CompletableFuture<ConnAck> connection = sut.connect();
+                nextTransport().accept();
+                assertThat(connection.get(5, SECONDS).attempt()).isEqualTo(attempt);
+                sut.disconnect().get(5, SECONDS);
+            }
+
+            // Assert: the queue keeps the newest 64 behind the running callback.
+            assertThat(sut.usage().notifications()).isEqualTo(65);
+            assertThat(sut.droppedNotifications()).isEqualTo(14);
+            release.countDown();
+            var expected = new ArrayList<>(List.of("connected 1", "disconnected 1"));
+            for (int attempt = 9; attempt <= 40; attempt++) {
+                expected.add("connected " + attempt);
+                expected.add("disconnected " + attempt);
+            }
+            var delivered = new ArrayList<String>();
+            for (int i = 0; i < expected.size(); i++) {
+                delivered.add(notifications.poll(5, SECONDS));
+            }
+            assertThat(delivered).containsExactlyElementsOf(expected);
+            await().pollInterval(Duration.ofMillis(1))
+                    .untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
+            assertThat(notifications).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void refused_connections_are_reported_by_attempt_and_leave_no_capacity_behind()
+            throws Exception {
+        // Arrange
+        var failures = new LinkedBlockingQueue<Disconnection>();
+        var listener = new ConnectionListener() {
+            @Override
+            public void onDisconnected(Disconnection disconnection) {
+                ends.add(disconnection);
+            }
+
+            @Override
+            public void onConnectFailed(Disconnection failure) {
+                failures.add(failure);
             }
         };
         try (MqttClient client = client(listener)) {
             var sut = (ClientActor) client;
 
-            // Act: protocol decisions and futures proceed behind a blocked connected callback.
-            for (int i = 0; i < 32; i++) {
-                connect(sut);
-                sut.disconnect().get(5, SECONDS);
-            }
-
-            // Assert: every attempt reserved its connected and disconnected notification.
-            assertThat(entered.await(5, SECONDS)).isTrue();
-            assertThat(sut.usage().notifications()).isEqualTo(64);
-            assertThat(events).containsExactly("connected");
-            assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttCapacityException.class);
-            assertThat(transports).isEmpty();
-            release.countDown();
-            await().pollInterval(Duration.ofMillis(1))
-                    .untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
-            var expected = new ArrayList<String>();
-            for (int i = 0; i < 32; i++) {
-                expected.add("connected");
-                expected.add("disconnected");
-            }
-            assertThat(events).containsExactlyElementsOf(expected);
-        } finally {
-            release.countDown();
-        }
-    }
-
-    @Test
-    void repeated_refused_connections_return_both_notification_slots() throws Exception {
-        // Arrange
-        try (MqttClient client = client()) {
-            var sut = (ClientActor) client;
-
-            // Act & Assert: more failures than the entire notification capacity.
-            for (int i = 0; i < 80; i++) {
+            // Act & Assert: more refusals than the listener queue holds.
+            for (int attempt = 1; attempt <= 80; attempt++) {
                 CompletableFuture<ConnAck> connection = sut.connect();
                 ScriptTransport transport = nextTransport();
                 transport.receive(new Packet.ConnAck(false, ReasonCode.SERVER_UNAVAILABLE, EMPTY));
-                assertThatThrownBy(() -> connection.get(5, SECONDS))
-                        .hasCauseInstanceOf(MqttConnectException.class);
-                assertThat(sut.usage().notifications()).isZero();
+                Throwable refusal = connection.handle((_, failure) -> failure).get(5, SECONDS);
+                assertThat(refusal).isInstanceOf(MqttConnectException.class);
+                assertThat(failures.poll(5, SECONDS))
+                        .isEqualTo(Disconnection.of(refusal, false, attempt));
             }
             assertThat(ends).isEmpty();
 
@@ -2354,16 +2411,17 @@ class ClientActorTest {
             sut.disconnect().get(5, SECONDS);
 
             // Assert
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 81));
             await().pollInterval(Duration.ofMillis(1))
                     .untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
+            assertThat(sut.droppedNotifications()).isZero();
         }
     }
 
     @Test
-    void refused_resubscriptions_keep_their_registration_capacity_until_the_listener_returns()
+    void refused_resubscriptions_release_their_registrations_before_a_slow_listener_returns()
             throws Exception {
-        // Arrange: the listener blocks after a refused handle has already ended.
+        // Arrange: the listener blocks in its first refusal callback.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         var failures = new LinkedBlockingQueue<Subscription>();
@@ -2393,10 +2451,11 @@ class ClientActorTest {
                 ));
             }
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             ScriptTransport current = connect(sut);
 
-            // Act: retire every handle while its listener notification remains pending.
+            // Act: the broker refuses every re-creation, all but the first while the first
+            // refusal callback blocks.
             for (int i = 0; i < 256; i++) {
                 var packet = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
                 current.receive(new Packet.SubAck(
@@ -2404,27 +2463,24 @@ class ClientActorTest {
                         List.of(ReasonCode.UNSPECIFIED_ERROR),
                         EMPTY
                 ));
+                if (i == 0) {
+                    assertThat(entered.await(5, SECONDS)).isTrue();
+                }
             }
 
-            // Assert: delivery lanes are gone, but queued failures still occupy the bound.
-            assertThat(entered.await(5, SECONDS)).isTrue();
-            await().pollInterval(Duration.ofMillis(1))
-                    .untilAsserted(() -> assertThat(sut.usage().lanes()).isZero());
-            for (Subscription subscription : subscriptions) {
-                subscription.close();
-            }
-            assertThat(sut.usage().subscriptionNotifications()).isEqualTo(256);
-            assertThatThrownBy(() -> sut.subscribe(request()).established().get(5, SECONDS))
-                    .hasCauseInstanceOf(MqttCapacityException.class);
-            assertThat(current.sent).isEmpty();
-            assertThat(failures).hasSize(1);
+            // Assert: the refused registrations are gone, so a new one is sent at once.
+            assertThat(subscribePull(sut, current, request())).isNotNull();
+            assertThat(sut.usage().notifications()).isEqualTo(65);
+            assertThat(sut.droppedNotifications()).isEqualTo(191);
             release.countDown();
-            await().pollInterval(Duration.ofMillis(1))
-                    .untilAsserted(() -> assertThat(failures).hasSize(256));
-            assertThat(failures).containsExactlyInAnyOrderElementsOf(subscriptions);
-            await().pollInterval(Duration.ofMillis(1)).untilAsserted(() ->
-                    assertThat(sut.usage().subscriptionNotifications()).isZero());
-            subscribePull(sut, current, request()).close();
+            var delivered = new ArrayList<Subscription>();
+            for (int i = 0; i < 65; i++) {
+                delivered.add(failures.poll(5, SECONDS));
+            }
+            var expected = new ArrayList<>(List.of(subscriptions.getFirst()));
+            expected.addAll(subscriptions.subList(192, 256));
+            assertThat(delivered).containsExactlyElementsOf(expected);
+            assertThat(failures).isEmpty();
         } finally {
             release.countDown();
         }
@@ -2451,7 +2507,7 @@ class ClientActorTest {
             ScriptTransport first = connect(sut);
             Subscription subscription = subscribePull(sut, first, request());
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             ScriptTransport current = connect(sut);
             var packet = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
 
@@ -2463,9 +2519,10 @@ class ClientActorTest {
                     EMPTY
             ));
 
-            // Assert: the closure stays the first ending, and retirement returns the slot.
-            await().pollInterval(Duration.ofMillis(1)).untilAsserted(() ->
-                    assertThat(sut.usage().subscriptionNotifications()).isZero());
+            // Assert: the closure stays the first ending. The disconnection notification follows
+            // any refusal notification in the listener's order.
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
             assertThat(refused).isEmpty();
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
         }
@@ -2548,6 +2605,7 @@ class ClientActorTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .timerScheduler(timers)
                 .connectionListener(listener)
                 .transportFactory(_ -> {
@@ -2566,12 +2624,12 @@ class ClientActorTest {
 
             // Assert
             assertThat(publication.get(5, SECONDS)).succeedsWithin(Duration.ofSeconds(5));
-            assertThat(connection.get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(connection.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
         }
     }
 
     @Test
-    void a_registration_refused_by_the_lanes_returns_its_notification_reservation()
+    void a_registration_refused_by_the_lanes_leaves_its_filter_available()
             throws Exception {
         // Arrange: an unsubscribed push lane stays retained while its handler runs, so 256 lanes
         // are held while only 255 subscriptions remain registered.
@@ -2610,9 +2668,8 @@ class ClientActorTest {
             transport.receive(new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY));
             unsubscribing.get(5, SECONDS);
             assertThat(sut.usage().lanes()).isEqualTo(256);
-            assertThat(sut.usage().subscriptionNotifications()).isEqualTo(255);
 
-            // Act: the core and the notification reservations have room; only the lanes refuse.
+            // Act: the core has room; only the lanes refuse.
             Subscription refused = sut.subscribe(request());
             CompletableFuture<Qos> refusedEstablished = refused.established();
 
@@ -2621,7 +2678,6 @@ class ClientActorTest {
                     .hasCauseInstanceOf(MqttCapacityException.class)
                     .hasRootCauseMessage("Subscription capacity");
             assertThat(transport.sent).isEmpty();
-            assertThat(sut.usage().subscriptionNotifications()).isEqualTo(255);
             release.countDown();
             await().pollInterval(Duration.ofMillis(1))
                     .untilAsserted(() -> assertThat(sut.usage().lanes()).isEqualTo(255));
@@ -2670,7 +2726,7 @@ class ClientActorTest {
             assertThatThrownBy(() -> failed.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class)
                     .hasRootCause(cause);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
         }
     }
 
@@ -2697,7 +2753,7 @@ class ClientActorTest {
             transport.completeSend();
             transport.completeSends = true;
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
         }
     }
 
@@ -2729,7 +2785,7 @@ class ClientActorTest {
             transport.completeSend();
             transport.completeSends = true;
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
         }
     }
 
@@ -2952,7 +3008,7 @@ class ClientActorTest {
                         .isEqualTo(acknowledgement(qos, id));
             }
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
         }
     }
 
@@ -3032,18 +3088,10 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             transport.completeSends = false;
-            // The connect completion thread may still be returning its slot. Refused
-            // publications can retry because they never reach the wire.
-            await().pollInterval(Duration.ofMillis(1)).until(() -> {
-                CompletableFuture<PublishResult> publication = sut.publish(message);
-                if (publication.isCompletedExceptionally()) {
-                    assertThatThrownBy(publication::join)
-                            .hasCauseInstanceOf(MqttCapacityException.class);
-                } else {
-                    publications.add(publication);
-                }
-                return publications.size() == 64;
-            });
+            // connect() used its own slot, so every shared slot is free.
+            for (int i = 0; i < 64; i++) {
+                publications.add(sut.publish(message));
+            }
             packets.add((Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS)));
 
             // Act: an application changes its observable futures, not the wire operations.
@@ -3144,7 +3192,7 @@ class ClientActorTest {
 
             // Assert
             assertThat(publication.get(5, SECONDS)).isEqualTo(PublishResult.of());
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.closed).isTrue();
             ScriptTransport replacement = connect(sut);
             assertThat(replacement).isNotSameAs(transport);
@@ -3186,7 +3234,7 @@ class ClientActorTest {
             assertThatThrownBy(() -> second.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class)
                     .hasRootCause(failure);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.closed).isTrue();
             assertThat(transport.sent).isEmpty();
 
@@ -3194,7 +3242,7 @@ class ClientActorTest {
             ScriptTransport replacement = connect(sut);
             assertThat(replacement).isNotSameAs(transport);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
         } finally {
             releaseActor.countDown();
         }
@@ -3449,7 +3497,7 @@ class ClientActorTest {
             releaseActor.countDown();
 
             // Assert: processing the failure retires the queued ACK and preserves its cause.
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.sent).isEmpty();
             assertThat(transport.closed).isTrue();
         } finally {
@@ -3515,7 +3563,7 @@ class ClientActorTest {
 
             // Assert: termination discards input and confirms clean-session removal
             // without sending the queued request.
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             queued.get(5, SECONDS);
             assertThat(List.of(received.get(), encoded.get())).containsExactly(0, 0);
             assertThat(transport.closed).isTrue();
@@ -3560,7 +3608,7 @@ class ClientActorTest {
 
             // Assert: a handler stop takes precedence over an already pending connection ending.
             Disconnection end = requireNonNull(ends.poll(5, SECONDS));
-            assertThat(end).isEqualTo(Disconnection.of(failure, false));
+            assertThat(end).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.closed).isTrue();
         } finally {
             releaseHandler.countDown();
@@ -3587,7 +3635,7 @@ class ClientActorTest {
             old.receive(publication(new byte[] {1}));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             ScriptTransport current = connect(sut);
             var resubscribe = (Packet.Subscribe) requireNonNull(current.sent.poll(5, SECONDS));
             current.receive(new Packet.SubAck(resubscribe.packetId(),
@@ -3691,7 +3739,7 @@ class ClientActorTest {
             // Assert: valid termination overtakes every queued packet and application command.
             Disconnection end = requireNonNull(ends.poll(5, SECONDS));
             if (sessionPresent) {
-                assertThat(end).isEqualTo(Disconnection.of(failure, false));
+                assertThat(end).isEqualTo(Disconnection.of(failure, false, 2));
             } else {
                 assertProtocolFailure(end.cause().orElseThrow(), ReasonCode.MALFORMED_PACKET);
             }
@@ -3755,10 +3803,10 @@ class ClientActorTest {
             releaseActor.countDown();
 
             // Assert: SP=0 withdraws only the old handler cause, preserving the waiting I/O cause.
-            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent));
+            assertThat(connected.get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent, 2));
             Disconnection end = requireNonNull(ends.poll(5, SECONDS));
             if (sessionPresent) {
-                assertThat(end).isEqualTo(Disconnection.of(failure, false));
+                assertThat(end).isEqualTo(Disconnection.of(failure, false, 2));
             } else {
                 assertProtocolFailure(end.cause().orElseThrow(), ReasonCode.MALFORMED_PACKET);
                 assertThat(end.userRequested()).isFalse();
@@ -3811,7 +3859,7 @@ class ClientActorTest {
             releaseActor.countDown();
 
             // Assert: the full lane neither replaces the accepted cause nor releases a PUBACK.
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.sent).isEmpty();
         } finally {
             releaseHandler.countDown();
@@ -4098,7 +4146,7 @@ class ClientActorTest {
             transport.receiver().onClosed(new IOException("Transport closed"));
 
             // Assert: both subscriptions remain; only the running handler retains a delivery.
-            var held = new ClientActor.Usage(1, 1, 2, 0, 0, 0, 0, 2, 1, 13, 0);
+            var held = new ClientActor.Usage(1, 1, 0, 0, 0, 0, 2, 1, 13, 0);
             await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(held));
 
             // Act
@@ -4106,7 +4154,7 @@ class ClientActorTest {
 
             // Assert
             continuation.get(5, SECONDS);
-            var retained = new ClientActor.Usage(0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0);
+            var retained = new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0, 0);
             await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(retained));
         } finally {
             release.countDown();
@@ -4254,7 +4302,7 @@ class ClientActorTest {
             ScriptTransport oldTransport = connect(sut);
             Subscription oldSubscription = subscribe(sut, oldTransport);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
 
             // Act: dispose the old handle while disconnected and while reconnecting.
             oldSubscription.close();
@@ -4311,7 +4359,7 @@ class ClientActorTest {
             first.get(5, SECONDS);
             observer.get(5, SECONDS);
             assertThat(observer).isNotSameAs(first);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
 
             // Act & Assert: reconnect does not recreate the removed subscription.
@@ -4410,7 +4458,7 @@ class ClientActorTest {
             removing.get(5, SECONDS);
             assertThatThrownBy(() -> publication.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             subscription.unsubscribe().get(5, SECONDS);
             assertThat(transport.sent).isEmpty();
         } finally {
@@ -4870,7 +4918,7 @@ class ClientActorTest {
             assertThatThrownBy(() -> queued.get(5, SECONDS))
                     .hasCauseInstanceOf(IllegalStateException.class)
                     .hasRootCause(failure);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.closed).isTrue();
             assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
                     .hasCauseInstanceOf(IllegalStateException.class);
@@ -4899,7 +4947,7 @@ class ClientActorTest {
             CompletableFuture<PublishResult> publication = sut.publish(message(new byte[] {1}));
             Thread sender = encoding.get(5, SECONDS);
             transport.receiver().onClosed(connectionLoss);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(connectionLoss, false));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(connectionLoss, false, 1));
             CompletableFuture<ConnAck> reconnecting = sut.connect();
             ScriptTransport replacement = requireNonNull(transports.poll(5, SECONDS));
 
@@ -4929,7 +4977,7 @@ class ClientActorTest {
         CompletableFuture<ConnAck> connection = client.connect();
         ScriptTransport transport = nextTransport();
         transport.receive(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));
-        assertThat(connection.get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent));
+        assertThat(connection.get(5, SECONDS).sessionPresent()).isEqualTo(sessionPresent);
         return transport;
     }
 
@@ -5153,7 +5201,10 @@ class ClientActorTest {
                 packetCodec,
                 cleanStart,
                 null,
-                null
+                null,
+                ReconnectBackoff.disabled(),
+                false,
+                Duration.ofSeconds(60)
         );
     }
 

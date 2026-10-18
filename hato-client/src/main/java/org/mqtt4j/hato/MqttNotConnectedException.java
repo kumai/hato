@@ -2,7 +2,9 @@ package org.mqtt4j.hato;
 
 import java.io.Serial;
 
-/// An operation requires an established connection.
+/// An operation requires an established connection. Publications fail this way while the
+/// client is disconnected, attempting to connect, waiting to reconnect, or completing a
+/// requested disconnect; they are not queued for a later connection.
 public final class MqttNotConnectedException extends MqttException {
 
     @Serial

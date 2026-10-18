@@ -354,6 +354,7 @@ class SubscriptionRegistrationTest {
         return MqttClient.builder()
                 .server(endpoint(server))
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId("registration")
                 .cleanStart(false)
                 .sessionExpiry(Duration.ofMinutes(1))

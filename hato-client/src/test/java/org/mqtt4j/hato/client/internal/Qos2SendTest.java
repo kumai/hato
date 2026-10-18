@@ -680,6 +680,44 @@ class Qos2SendTest {
         assertThat(sut.state()).isEqualTo(CONNECTED);
     }
 
+    @ParameterizedTest(name = "disconnect at {0}")
+    @EnumSource(Stage.class)
+    void a_scheduled_reconnection_holds_a_qos_two_future_until_a_continued_session_completes_it(
+            Stage stage
+    ) {
+        // Arrange
+        long operation = holdAcrossReconnection(stage);
+        int id = port.accepted.getLast().packetId();
+
+        // Act: the broker answers the stages that the cut left open.
+        reconnect(true);
+        if (!stage.afterPubrec()) {
+            receive(pubRec(id));
+        }
+
+        // Assert: the future succeeds once, at PUBCOMP.
+        assertThat(port.results).doesNotContainKey(operation);
+        receive(pubComp(id));
+        assertThat(result(operation).value()).isEqualTo(PublishResult.of());
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @ParameterizedTest(name = "disconnect at {0}")
+    @EnumSource(Stage.class)
+    void a_scheduled_reconnection_that_loses_the_session_fails_the_held_qos_two_future(
+            Stage stage
+    ) {
+        // Arrange
+        long operation = holdAcrossReconnection(stage);
+
+        // Act
+        reconnect(false);
+
+        // Assert
+        assertThat(result(operation).failure()).isInstanceOf(MqttConnectionLostException.class);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
     @Test
     void mixed_replay_keeps_publish_order_and_moves_releases_in_pubrec_order() {
         // Arrange
@@ -925,6 +963,10 @@ class Qos2SendTest {
     }
 
     private SessionCore core(boolean cleanStart) {
+        return core(cleanStart, ReconnectBackoff.disabled());
+    }
+
+    private SessionCore core(boolean cleanStart, ReconnectBackoff backoff) {
         return new SessionCore(
                 port,
                 "client",
@@ -932,16 +974,40 @@ class Qos2SendTest {
                 Duration.ZERO,
                 cleanStart,
                 null,
-                false
+                false,
+                backoff,
+                false,
+                Duration.ofSeconds(60)
         );
+    }
+
+    // Interrupts a QoS 2 publication at `stage` in a persistent session that reconnects
+    // automatically, and returns its operation, which stays pending.
+    private long holdAcrossReconnection(Stage stage) {
+        sut = core(false, new ReconnectBackoff(
+                Duration.ofNanos(3),
+                Duration.ofNanos(3),
+                new ReconnectBackoffTest.MaximumRandom()
+        ));
+        connect(false);
+        long operation = interruptAt(stage);
+        assertThat(port.results).doesNotContainKey(operation);
+        return operation;
+    }
+
+    private void reconnect(boolean present) {
+        sut.timer(0, SessionCore.Timer.RECONNECT, 3);
+        generation = port.generation;
+        receive(new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY));
     }
 
     private void connect(boolean present) {
         long operation = ++nextOperation;
-        sut.connect(new ConnectionAttempt(operation, null), 0);
+        sut.connect(new ConnectionAttempt(operation), 0);
         generation = port.generation;
         receive(new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY));
-        assertThat(result(operation).value()).isEqualTo(ConnAck.of(present));
+        assertThat(result(operation).value())
+                .isEqualTo(ConnAck.of(present, port.attempts.getLast()));
     }
 
     /// Leaves one of 17 subscriptions to re-create behind the 16 SUBSCRIBE requests that await

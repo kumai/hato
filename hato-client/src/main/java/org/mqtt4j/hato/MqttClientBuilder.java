@@ -35,7 +35,12 @@ public final class MqttClientBuilder {
 
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofSeconds(30);
 
-    private static final Duration MAX_CONNECTION_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
+    private static final Duration MAX_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
+
+    private static final Duration DEFAULT_RESPONSE_TIMEOUT = Duration.ofSeconds(60);
+
+    private static final ReconnectPolicy DEFAULT_RECONNECT_POLICY =
+            ReconnectPolicy.exponentialBackoff(Duration.ofSeconds(1), Duration.ofSeconds(120));
 
     private static final Duration MAX_SESSION_EXPIRY = Duration.ofSeconds(0xFFFF_FFFFL);
 
@@ -62,6 +67,10 @@ public final class MqttClientBuilder {
     private Duration keepAlive = DEFAULT_KEEP_ALIVE;
 
     private Duration connectionTimeout = DEFAULT_CONNECTION_TIMEOUT;
+
+    private Duration responseTimeout = DEFAULT_RESPONSE_TIMEOUT;
+
+    private ReconnectPolicy reconnectPolicy = DEFAULT_RECONNECT_POLICY;
 
     private boolean cleanStart = true;
 
@@ -129,7 +138,10 @@ public final class MqttClientBuilder {
 
     /// Uses this nonempty MQTT UTF-8 identifier of at most 65535 bytes, validated immediately.
     /// Persistent sessions require an explicit value. Otherwise, omission generates 23 ASCII
-    /// letters/digits.
+    /// letters/digits. Give each running client its own identifier: a broker closes the older
+    /// connection of two that share one, so two clients that reconnect automatically keep
+    /// taking over each other's connection. Reconnection delays slow this down but do not
+    /// stop it.
     public MqttClientBuilder clientId(String value) {
         requireNonNull(value, "clientId");
         MqttString.write(new ByteArrayOutputStream(), value);
@@ -221,14 +233,32 @@ public final class MqttClientBuilder {
     /// Defaults to 30 seconds. Must be positive and no greater than 2147483647 milliseconds.
     public MqttClientBuilder connectionTimeout(Duration value) {
         requireNonNull(value, "connectionTimeout");
-        if (value.isNegative() || value.isZero()
-                || value.compareTo(MAX_CONNECTION_TIMEOUT) > 0) {
-            throw new IllegalArgumentException(
-                    "Connection timeout must be positive and <= "
-                            + MAX_CONNECTION_TIMEOUT.toMillis() + " milliseconds"
-            );
-        }
-        connectionTimeout = value;
+        connectionTimeout = requireTimeout(value, "Connection timeout");
+        return this;
+    }
+
+    /// How long the broker may take to answer SUBSCRIBE, UNSUBSCRIBE, and each stage of a QoS 1
+    /// or QoS 2 publication, measured from the completed write of the packet that needs the
+    /// answer. Expiry ends the connection with [java.util.concurrent.TimeoutException] as its
+    /// cause, and the reconnect policy applies as after other connection failures. The next
+    /// connection repeats an unanswered publication stage when it resumes a persistent session,
+    /// and an unanswered SUBSCRIBE in either kind of session. Other responses and PINGRESP do
+    /// not extend the deadline, and keep-alive does not change it, even when disabled.
+    /// Defaults to 60 seconds. Must be positive and no greater than 2147483647 milliseconds.
+    public MqttClientBuilder responseTimeout(Duration value) {
+        requireNonNull(value, "responseTimeout");
+        responseTimeout = requireTimeout(value, "Response timeout");
+        return this;
+    }
+
+    /// Decides whether the client reconnects after an established connection ends without a
+    /// request to stop, and how long it waits between attempts. Defaults to
+    /// [ReconnectPolicy#exponentialBackoff(Duration, Duration)] from 1 second up to
+    /// 120 seconds, which does not retry the first failure of a connection request.
+    /// [ReconnectPolicy#disabled()] leaves a client disconnected until the next
+    /// [MqttClient#connect()].
+    public MqttClientBuilder reconnectPolicy(ReconnectPolicy value) {
+        reconnectPolicy = requireNonNull(value, "reconnectPolicy");
         return this;
     }
 
@@ -365,7 +395,10 @@ public final class MqttClientBuilder {
                 factory,
                 cleanStart,
                 credentials,
-                connectWill
+                connectWill,
+                reconnectPolicy.backoff(),
+                reconnectPolicy.initialRetry(),
+                responseTimeout
         );
     }
 
@@ -397,5 +430,15 @@ public final class MqttClientBuilder {
         } catch (IllegalStateException failure) {
             throw new IllegalArgumentException("SSLContext is not initialized", failure);
         }
+    }
+
+    private static Duration requireTimeout(Duration value, String description) {
+        if (!value.isPositive() || value.compareTo(MAX_TIMEOUT) > 0) {
+            throw new IllegalArgumentException(
+                    description + " must be positive and <= "
+                            + MAX_TIMEOUT.toMillis() + " milliseconds"
+            );
+        }
+        return value;
     }
 }

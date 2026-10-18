@@ -41,7 +41,10 @@ If you only need a broker, you can depend on `hato-broker` directly.
   to simulate a connection failure, `receiveDelay(Duration)` to delay incoming
   data, or `sendDelay(Duration)` to delay outgoing writes. Use a long delay in
   either direction to simulate stopped traffic. Disconnect while a send is still
-  delayed to fail it before writing.
+  delayed to fail it before writing. After a simulated failure, the client
+  reconnects once the delay that `Disconnection.reconnectDelay()` reports has
+  passed. On manual time, advance the client's clock by that delay, or build the
+  client with `ReconnectPolicy.disabled()` to keep it disconnected.
 - [ManualTimerScheduler](src/main/java/org/mqtt4j/hato/testkit/ManualTimerScheduler.java)
   lets a test advance time with `advance(Duration)` instead of sleeping. Supply
   it to the client's `timerScheduler` or to `FaultyTransport` to control their

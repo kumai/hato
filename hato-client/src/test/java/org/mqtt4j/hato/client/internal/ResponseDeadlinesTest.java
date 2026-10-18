@@ -140,25 +140,6 @@ class ResponseDeadlinesTest {
     }
 
     @Test
-    void ending_a_connection_drops_deadlines_and_delayed_write_notifications() {
-        // Arrange
-        var sut = new ResponseDeadlines(TIMEOUT);
-        sut.add(1, Kind.PUBACK, 7);
-        sut.add(2, Kind.PUBCOMP, 8);
-        sut.written(1, 10);
-
-        // Act
-        sut.clear();
-        sut.add(3, Kind.PUBACK, 7);
-
-        // Assert
-        assertThat(sut.written(2, 20)).isEmpty();
-        assertThat(sut.expired(110)).isEmpty();
-        assertThat(sut.written(3, 200)).contains(TIMEOUT);
-        assertThat(sut.expired(300)).contains(Duration.ZERO);
-    }
-
-    @Test
     void monotonic_counter_wraparound_preserves_the_deadline() {
         // Arrange
         var sut = new ResponseDeadlines(TIMEOUT);

@@ -228,6 +228,7 @@ class SubscriptionObservationTest {
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
                 .timerScheduler(new ManualTimerScheduler())
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .transportFactory(_ -> {
                     var transport = new ScriptTransport();
                     transport.onStart = onStart;

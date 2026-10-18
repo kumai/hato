@@ -34,6 +34,7 @@ class CredentialsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(ScriptedBroker.endpoint(server))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .credentials(() -> MqttCredentials.of(
                                 "user-" + evaluations.incrementAndGet(),
                                 new byte[] {0, (byte) 0xFF, (byte) evaluations.get()}
@@ -70,6 +71,7 @@ class CredentialsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(ScriptedBroker.endpoint(server))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(text)
                         .keepAlive(Duration.ofSeconds(65_535))
                         .credentials(() -> MqttCredentials.of(text, password))
@@ -95,6 +97,7 @@ class CredentialsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(ScriptedBroker.endpoint(server))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .credentials(() -> MqttCredentials.of("user"))
                         .build()) {
             // Act & Assert
@@ -118,6 +121,7 @@ class CredentialsConnectionTest {
                 MqttClient sut = MqttClient.builder()
                         .server(ScriptedBroker.endpoint(server))
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .credentials(() -> MqttCredentials.of("user", new byte[] {1}))
                         .build()) {
             // Act

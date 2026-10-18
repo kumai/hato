@@ -1,18 +1,13 @@
 package org.mqtt4j.hato.client.internal;
 
-import org.jspecify.annotations.Nullable;
-
-/// Identifies one connection attempt independently of its connections and public operation.
-/// Attempts use object identity; a zero operation denotes an attempt without a public future.
+/// Identifies one connection attempt independently of its connections. Attempts use object
+/// identity. `operation` is the connect() call that started the attempt, or zero for an automatic
+/// reconnection; either kind also completes the connect() calls that joined the request.
 final class ConnectionAttempt {
 
     final long operation;
 
-    // Reserved where the shell decided the attempt; the core only carries it back to the shell.
-    final ListenerLane.@Nullable Reservation notifications;
-
-    ConnectionAttempt(long operation, ListenerLane.@Nullable Reservation notifications) {
+    ConnectionAttempt(long operation) {
         this.operation = operation;
-        this.notifications = notifications;
     }
 }

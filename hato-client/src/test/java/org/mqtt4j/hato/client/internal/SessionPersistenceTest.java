@@ -63,7 +63,7 @@ class SessionPersistenceTest {
     @ValueSource(booleans = {true, false})
     void connect_uses_the_configured_clean_session_flag(boolean cleanStart) {
         SessionCore configured = core(cleanStart);
-        configured.connect(new ConnectionAttempt(1, null), 0);
+        configured.connect(new ConnectionAttempt(1), 0);
         configured.opened(1);
 
         assertThat(port.sent).singleElement().satisfies(packet -> {
@@ -180,7 +180,7 @@ class SessionPersistenceTest {
     ) {
         // Arrange: leave more registrations to restore than the pending SUBACK window permits.
         SessionCore configured = core(cleanStart);
-        configured.connect(new ConnectionAttempt(operation(), null), 0);
+        configured.connect(new ConnectionAttempt(operation()), 0);
         configured.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
         for (int i = 0; i < subscriptions; i++) {
             long subscription = operation();
@@ -204,7 +204,7 @@ class SessionPersistenceTest {
         }
         configured.failed(1, new IOException("connection lost before restoration"));
         port.sent.clear();
-        configured.connect(new ConnectionAttempt(operation(), null), 0);
+        configured.connect(new ConnectionAttempt(operation()), 0);
         configured.received(2, new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY), 0, 0);
         assertThat(port.sent).hasSize(16).allMatch(Packet.Subscribe.class::isInstance);
 
@@ -354,7 +354,7 @@ class SessionPersistenceTest {
     @Test
     void clean_sessions_do_not_retain_the_new_session_byte_budget() {
         SessionCore clean = core(true);
-        clean.connect(new ConnectionAttempt(1, null), 0);
+        clean.connect(new ConnectionAttempt(1), 0);
         clean.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
         MqttMessage half = messageWithWireBytes(16 * 1024 * 1024);
 
@@ -420,6 +420,8 @@ class SessionPersistenceTest {
         assertThat(port.deliveries).isEmpty();
         Throwable failure = assertSessionRefusal(operation, DISCONNECTED);
         assertThat(failure.getSuppressed()).isEmpty();
+        // The refusing DISCONNECT is the client's own; the application requested none.
+        assertThat(port.ends.getLast().userRequested()).isFalse();
     }
 
     @Test
@@ -517,7 +519,8 @@ class SessionPersistenceTest {
         assertThat(failure.getSuppressed()).isEmpty();
         assertThat(refusal).hasMessage("Broker session has no local state");
         assertThat(refusal.getSuppressed()).containsExactly(cleanupFailure);
-        assertThat(port.ends.getLast().cause()).containsSame(connectionFailure);
+        // The failed attempt reports the same failure as its connect().
+        assertThat(port.ends.getLast().cause()).containsSame(failure);
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.timers).isEmpty();
     }
@@ -525,7 +528,7 @@ class SessionPersistenceTest {
     @Test
     void clean_session_present_remains_a_protocol_error() {
         SessionCore clean = core(true);
-        clean.connect(new ConnectionAttempt(1, null), 0);
+        clean.connect(new ConnectionAttempt(1), 0);
         clean.received(1, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 0);
 
         assertThat(result(1L).failure()).isInstanceOf(MqttConnectException.class)
@@ -973,7 +976,10 @@ class SessionPersistenceTest {
                 Duration.ZERO,
                 cleanStart,
                 null,
-                false
+                false,
+                ReconnectBackoff.disabled(),
+                false,
+                Duration.ofSeconds(60)
         );
     }
 
@@ -983,7 +989,7 @@ class SessionPersistenceTest {
 
     private long beginConnect() {
         long operation = operation();
-        sut.connect(new ConnectionAttempt(operation, null), 0);
+        sut.connect(new ConnectionAttempt(operation), 0);
         generation = port.generation;
         sut.opened(generation);
         return operation;
@@ -992,7 +998,8 @@ class SessionPersistenceTest {
     private void connect(boolean present) {
         long operation = beginConnect();
         receive(new Packet.ConnAck(present, ReasonCode.SUCCESS, EMPTY));
-        assertThat(result(operation).value()).isEqualTo(ConnAck.of(present));
+        assertThat(result(operation).value())
+                .isEqualTo(ConnAck.of(present, port.attempts.getLast()));
     }
 
     private void receive(Packet packet) {
@@ -1416,17 +1423,13 @@ class SessionPersistenceTest {
                 boolean connected,
                 Disconnection disconnection,
                 boolean preserveSession,
-                boolean stopped,
-                long attemptNumber,
-                @Nullable Duration reconnectDelay
+                boolean stopped
         ) {
             established.add(connected);
             ends.add(disconnection);
-            endedAttempt = attemptNumber;
-            latestReconnectDelay = reconnectDelay;
-            if (reconnectDelay != null) {
-                reconnectDelays.add(reconnectDelay);
-            }
+            endedAttempt = disconnection.attempt();
+            latestReconnectDelay = disconnection.reconnectDelay().orElse(null);
+            disconnection.reconnectDelay().ifPresent(reconnectDelays::add);
             events.add("end");
             return Map.of();
         }

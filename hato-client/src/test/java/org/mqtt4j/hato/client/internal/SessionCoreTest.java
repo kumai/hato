@@ -69,7 +69,10 @@ class SessionCoreTest {
             Duration.ofSeconds(10),
             true,
             null,
-            false
+            false,
+            ReconnectBackoff.disabled(),
+            false,
+            Duration.ofSeconds(60)
     );
 
     @Test
@@ -430,7 +433,7 @@ class SessionCoreTest {
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Assert: both registrations survive, without replacing their delivery lanes.
-        assertThat(requireNonNull(port.results.get(4L)).value()).isEqualTo(ConnAck.of(false));
+        assertThat(requireNonNull(port.results.get(4L)).value()).isEqualTo(ConnAck.of(false, 2));
         assertThat(port.outcomes).doesNotContainKey(3L);
         assertThat(port.removed).isEmpty();
         assertThat(port.registered).containsExactly(2L, 3L);
@@ -697,8 +700,8 @@ class SessionCoreTest {
 
         accept();
         assertThat(sut.state()).isEqualTo(CONNECTED);
-        assertThat(requireNonNull(port.results.get(1L)).value()).isEqualTo(ConnAck.of(false));
-        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(ConnAck.of(false));
+        assertThat(requireNonNull(port.results.get(1L)).value()).isEqualTo(ConnAck.of(false, 1));
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(ConnAck.of(false, 1));
         assertThat(port.timers).doesNotContainKey(CONNECT);
     }
 
@@ -716,8 +719,8 @@ class SessionCoreTest {
         accept();
 
         // Assert
-        assertThat(port.connections).containsExactly(new Connection(1, ConnAck.of(false)));
-        assertThat(requireNonNull(port.results.get(1L)).value()).isEqualTo(ConnAck.of(false));
+        assertThat(port.connections).containsExactly(new Connection(1, ConnAck.of(false, 1)));
+        assertThat(requireNonNull(port.results.get(1L)).value()).isEqualTo(ConnAck.of(false, 1));
         assertThat(port.attempts).containsExactly(first);
     }
 
@@ -739,8 +742,8 @@ class SessionCoreTest {
         // Assert: each connection opens for its own attempt despite the shared absent token.
         assertThat(port.results).isEmpty();
         assertThat(port.connections).containsExactly(
-                new Connection(1, ConnAck.of(false)),
-                new Connection(2, ConnAck.of(false))
+                new Connection(1, ConnAck.of(false, 1)),
+                new Connection(2, ConnAck.of(false, 2))
         );
         assertThat(port.attempts).containsExactly(first, second);
         assertThat(port.established).containsExactly(true, true);
@@ -774,7 +777,7 @@ class SessionCoreTest {
         // Assert
         assertThat(port.results).containsOnlyKeys(1L);
         assertThat(port.opened).containsExactly(1L);
-        assertThat(port.connections).containsExactly(new Connection(1, ConnAck.of(false)));
+        assertThat(port.connections).containsExactly(new Connection(1, ConnAck.of(false, 1)));
     }
 
     @Test
@@ -792,10 +795,10 @@ class SessionCoreTest {
         receive(2, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0);
 
         // Assert
-        assertThat(port.connections).containsExactly(new Connection(2, ConnAck.of(false)));
+        assertThat(port.connections).containsExactly(new Connection(2, ConnAck.of(false, 2)));
         assertThat(requireNonNull(port.results.get(1L)).failure())
                 .isInstanceOf(MqttConnectException.class);
-        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(ConnAck.of(false));
+        assertThat(requireNonNull(port.results.get(2L)).value()).isEqualTo(ConnAck.of(false, 2));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -831,7 +834,7 @@ class SessionCoreTest {
             assertThat(port.results).containsOnlyKeys(scenario.operation());
             Result result = requireNonNull(port.results.get(scenario.operation()));
             if (accepted) {
-                assertThat(result.value()).isEqualTo(ConnAck.of(false));
+                assertThat(result.value()).isEqualTo(ConnAck.of(false, 1));
                 assertThat(result.failure()).isNull();
             } else {
                 assertThat(result.value()).isNull();
@@ -935,7 +938,7 @@ class SessionCoreTest {
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         Throwable cause = port.ends.getFirst().cause().orElseThrow();
         assertThat(cause).isInstanceOf(MqttCapacityException.class);
-        assertThat(port.ends).containsExactly(Disconnection.of(cause, true));
+        assertThat(port.ends).containsExactly(Disconnection.of(cause, true, 1));
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasCause(cause);
@@ -965,7 +968,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasCause(failure);
-        assertThat(port.ends).containsExactly(Disconnection.of(failure, true));
+        assertThat(port.ends).containsExactly(Disconnection.of(failure, true, 1));
     }
 
     @Test
@@ -1123,7 +1126,7 @@ class SessionCoreTest {
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(requireNonNull(port.results.get(2L)).failure()).isNull();
         assertThat(requireNonNull(port.results.get(3L)).failure()).isNull();
-        assertThat(port.ends).containsExactly(Disconnection.of(null, true));
+        assertThat(port.ends).containsExactly(Disconnection.of(null, true, 1));
     }
 
     @Test
@@ -1185,7 +1188,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasNoCause();
-        assertThat(port.ends).containsExactly(Disconnection.of(null, true));
+        assertThat(port.ends).containsExactly(Disconnection.of(null, true, 1));
     }
 
     @Test
@@ -2322,7 +2325,7 @@ class SessionCoreTest {
                     }
                 },
                 () -> {
-                    expected.add(Disconnection.of(failure, false));
+                    expected.add(Disconnection.of(failure, false, 2));
                     sut.deliveryFailed(port.deliveries.getLast().delivery(), failure);
                 }
         )));
@@ -2852,7 +2855,7 @@ class SessionCoreTest {
         sut.failed(1, failure);
 
         // Assert
-        assertThat(port.ends).containsExactly(Disconnection.of(failure, false));
+        assertThat(port.ends).containsExactly(Disconnection.of(failure, false, 1));
     }
 
     /// Publishes, then reports the write completion and PUBACK in a seed-chosen order.
@@ -2950,7 +2953,7 @@ class SessionCoreTest {
     }
 
     private static ConnectionAttempt attempt(long operation) {
-        return new ConnectionAttempt(operation, null);
+        return new ConnectionAttempt(operation);
     }
 
     /// The same configuration as `sut`, except that attempts evaluate a credentials supplier.
@@ -2962,7 +2965,10 @@ class SessionCoreTest {
                 Duration.ofSeconds(10),
                 true,
                 null,
-                true
+                true,
+                ReconnectBackoff.disabled(),
+                false,
+                Duration.ofSeconds(60)
         );
     }
 
@@ -3273,9 +3279,7 @@ class SessionCoreTest {
                 boolean connected,
                 Disconnection end,
                 boolean preserveSession,
-                boolean stopped,
-                long attemptNumber,
-                @Nullable Duration reconnectDelay
+                boolean stopped
         ) {
             established.add(connected);
             ends.add(end);

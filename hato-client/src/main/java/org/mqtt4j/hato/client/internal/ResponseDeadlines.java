@@ -84,12 +84,6 @@ final class ResponseDeadlines {
         return requireNonNull(waiting.firstEntry()).getKey().kind();
     }
 
-    void clear() {
-        writing.clear();
-        waiting.clear();
-        armed = false;
-    }
-
     private record Response(Kind kind, int packetId) {
     }
 }

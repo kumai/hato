@@ -18,6 +18,7 @@ import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
@@ -70,6 +71,7 @@ abstract class ConnectionTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(listener)
                 .build()) {
             client.set(sut);
@@ -86,10 +88,10 @@ abstract class ConnectionTest {
                 assertThat(events).containsExactly(first);
                 assertThat(events.poll(5, SECONDS)).isEqualTo(first);
                 release.countDown();
-                assertThat(events.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+                assertThat(events.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
                 assertThat(events.poll(5, SECONDS)).isEqualTo(second);
                 sut.disconnect().get(5, SECONDS);
-                assertThat(events.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+                assertThat(events.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
                 assertThat(events).isEmpty();
             } finally {
                 release.countDown();
@@ -105,12 +107,13 @@ abstract class ConnectionTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .keepAlive(Duration.ofSeconds(10))
                 .timerScheduler(scheduler)
                 .connectionListener(ended::add)
                 .build()) {
             // Act & Assert: keep the connection alive across successive ping exchanges.
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
             for (int i = 0; i < 3; i++) {
                 scheduler.advance(Duration.ofSeconds(10));
@@ -118,7 +121,7 @@ abstract class ConnectionTest {
                 await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
             }
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isZero());
         }
     }
@@ -132,6 +135,7 @@ abstract class ConnectionTest {
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .keepAlive(Duration.ofSeconds(10))
                 .timerScheduler(scheduler)
                 .connectionListener(ended::add)

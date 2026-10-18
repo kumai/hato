@@ -67,7 +67,7 @@ abstract class Qos2ReceptionIntegrationTest {
             assertThat(ended.poll(5, SECONDS)).isNotNull();
 
             // Act: the replay reaches the receiver before the original handle acknowledges it.
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
             publicationBarrier(sut);
             original.ack();
             publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -106,10 +106,10 @@ abstract class Qos2ReceptionIntegrationTest {
                     }
             ).established().get(5, SECONDS);
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
 
             // Act
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
             assertThat(requireNonNull(delivered.poll(5, SECONDS)).message())
                     .isEqualTo(message(topic, (byte) 1));
             publicationBarrier(sut);
@@ -166,8 +166,8 @@ abstract class Qos2ReceptionIntegrationTest {
 
             // Act
             release.countDown();
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false));
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
             publicationBarrier(sut);
             publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
 
@@ -233,7 +233,7 @@ abstract class Qos2ReceptionIntegrationTest {
         try (MqttClient publisher = client();
                 MqttClient sut = persistentClient(id, scheduler, transports, ended)) {
             publisher.connect().get(5, SECONDS);
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
             );
@@ -267,19 +267,20 @@ abstract class Qos2ReceptionIntegrationTest {
             // Act
             var cause = new IOException("cut " + cut);
             transport.disconnect(cause);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
             assertThat(scheduler.pendingTaskCount()).isZero();
             if (!sessionPresent) {
                 try (MqttClient replacement = MqttClient.builder()
                         .server(endpoint())
                         .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(id)
                         .build()) {
                     replacement.connect().get(5, SECONDS);
                     replacement.disconnect().get(5, SECONDS);
                 }
             }
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent));
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent, 2));
             // This exchange confirms restoration before a different client sends the marker.
             publicationBarrier(sut);
             publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -311,6 +312,7 @@ abstract class Qos2ReceptionIntegrationTest {
         return MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(id)
                 .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))
@@ -324,13 +326,18 @@ abstract class Qos2ReceptionIntegrationTest {
     }
 
     private MqttClient client() {
-        return MqttClient.builder().server(endpoint()).version(MqttVersion.V3_1_1).build();
+        return MqttClient.builder()
+                .server(endpoint())
+                .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .build();
     }
 
     private MqttClient client(LinkedBlockingQueue<Disconnection> ended) {
         return MqttClient.builder()
                 .server(endpoint())
                 .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(ended::add)
                 .build();
     }
