@@ -186,9 +186,10 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// because it fell behind never arrive; a credentials supplier call, which closing
     /// interrupts, has returned; every transport has finished closing; and the synchronous
     /// continuations of the futures that the client completes have returned, except those of
-    /// this method. Afterwards the client calls no handler, listener, supplier,
-    /// [org.mqtt4j.hato.spi.TimerScheduler], [org.mqtt4j.hato.spi.Transport], or continuation,
-    /// and a reconnection timer that fires late does nothing.
+    /// this method. Afterwards the client calls no handler, executor chosen with
+    /// [DeliveryOptions], listener, supplier, [org.mqtt4j.hato.spi.TimerScheduler],
+    /// [org.mqtt4j.hato.spi.Transport], or continuation, and a reconnection timer that fires
+    /// late does nothing.
     ///
     /// It does not wait for work that application code started, such as tasks submitted to the
     /// application's own executors, nor for the application's own calls into the client, such as

@@ -146,6 +146,30 @@ subscription.unsubscribe().join();
   its delegate through an application-owned atomic reference.
 - The client and its subscriptions are safe to use from any thread.
 
+## Running handlers on your executor
+
+Pass `DeliveryOptions` to run a subscription's handler on an executor that your application
+owns, such as a shared thread pool or the thread of your own event loop:
+
+```java
+ExecutorService pool = Executors.newFixedThreadPool(4);
+
+Subscription subscription = client.subscribe(
+        Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.EXACTLY_ONCE),
+        DeliveryOptions.serial().withExecutor(pool),
+        delivery -> repository.save(delivery.message())
+);
+```
+
+- The handler still runs one message at a time, in arrival order, even on a pool of many
+  threads.
+- Waiting messages stay in the subscription's queue, and the subscription holds none of the
+  executor's threads while no message waits, so a busy subscription cannot flood the executor.
+- Acknowledgement and failures work as on the client's own threads. An executor that refuses a
+  task fails that message as a throwing handler would.
+- The executor stays yours: the client never shuts it down. Shut it down once
+  `client.terminated()` completes; tasks it still holds then do nothing.
+
 ## Receiving on your own threads
 
 Omit the handler to create a pull subscription. Call `receive()` from one or more
@@ -239,8 +263,9 @@ ordering and threading.
 Besides broker and network failures, the client itself ends the connection when:
 
 - a handler throws, including one still running from before a reconnection in a
-  persistent session. The client then stops reconnecting until you call `connect()`
-  again. Catch exceptions inside the handler to keep the connection.
+  persistent session, or the executor that runs it refuses its task. The client then
+  stops reconnecting until you call `connect()` again. Catch exceptions inside the
+  handler to keep the connection.
 - a subscription's queue fills up, for example with messages waiting for
   `delivery.ack()`, or too many QoS 1 and 2 messages wait behind one that is not yet
   acknowledged, rather than buffering without limit.

@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.LongConsumer;
 import java.util.function.Supplier;
 
@@ -25,6 +26,7 @@ import org.jspecify.annotations.Nullable;
 import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
+import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttClient;
@@ -97,6 +99,10 @@ public final class ClientActor implements MqttClient {
     private final boolean reconnects;
 
     private final TimerScheduler scheduler;
+
+    // Delivery options keep their choice out of the public API; the builder passes their
+    // package-private accessor.
+    private final Function<DeliveryOptions, HandlerExecution> executionOf;
 
     private final ClientTermination termination;
 
@@ -186,7 +192,8 @@ public final class ClientActor implements MqttClient {
             Packet.@Nullable Will will,
             ReconnectBackoff backoff,
             boolean initialRetry,
-            Duration responseTimeout
+            Duration responseTimeout,
+            Function<DeliveryOptions, HandlerExecution> executionOf
     ) {
         this(
                 endpoint,
@@ -203,7 +210,8 @@ public final class ClientActor implements MqttClient {
                 will,
                 backoff,
                 initialRetry,
-                responseTimeout
+                responseTimeout,
+                executionOf
         );
     }
 
@@ -222,11 +230,13 @@ public final class ClientActor implements MqttClient {
             Packet.@Nullable Will will,
             ReconnectBackoff backoff,
             boolean initialRetry,
-            Duration responseTimeout
+            Duration responseTimeout,
+            Function<DeliveryOptions, HandlerExecution> executionOf
     ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
         this.scheduler = scheduler;
+        this.executionOf = executionOf;
         this.cleanStart = cleanStart;
         reconnects = backoff.enabled();
         termination = new ClientTermination(
@@ -328,7 +338,19 @@ public final class ClientActor implements MqttClient {
     ) {
         requireNonNull(request, "request");
         requireNonNull(handler, "handler");
-        return subscribeInternal(request, handler);
+        return subscribeInternal(request, new HandlerExecution.Internal(), handler);
+    }
+
+    @Override
+    public Subscription subscribe(
+            Subscribe request,
+            DeliveryOptions options,
+            Consumer<MqttDelivery> handler
+    ) {
+        requireNonNull(request, "request");
+        requireNonNull(options, "options");
+        requireNonNull(handler, "handler");
+        return subscribeInternal(request, executionOf.apply(options), handler);
     }
 
     @Override
@@ -339,11 +361,12 @@ public final class ClientActor implements MqttClient {
                     "A pull subscription has no handler to acknowledge"
             );
         }
-        return subscribeInternal(request, null);
+        return subscribeInternal(request, new HandlerExecution.Internal(), null);
     }
 
     private Subscription subscribeInternal(
             Subscribe request,
+            HandlerExecution execution,
             @Nullable Consumer<MqttDelivery> handler
     ) {
         ClientSubscription subscription;
@@ -353,7 +376,7 @@ public final class ClientActor implements MqttClient {
                 throw new IllegalStateException("Client is closed");
             }
             long id = sequence.incrementAndGet();
-            subscription = new ClientSubscription(id, request, handler);
+            subscription = new ClientSubscription(id, request, execution, handler);
             subscriptions.put(id, subscription);
             unterminated.put(id, subscription);
             Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
@@ -799,6 +822,12 @@ public final class ClientActor implements MqttClient {
         return lanes.reportedFailures();
     }
 
+    /// Deliveries that dispatchers moved to an executor, for tests that order later events after
+    /// the move until applications get statistics.
+    long placedDeliveries() {
+        return lanes.placedDeliveries();
+    }
+
     /// Connection ends that I/O has posted to the actor, for tests that order later events after
     /// an end until applications get statistics.
     long postedConnectionEnds() {
@@ -1026,6 +1055,7 @@ public final class ClientActor implements MqttClient {
                         : lanes.register(
                                 id,
                                 subscription.request,
+                                subscription.execution,
                                 requireNonNull(subscription.handler)
                         );
                 if (admitted && subscription.receiver == null) {
@@ -1312,6 +1342,8 @@ public final class ClientActor implements MqttClient {
 
         private final Subscribe request;
 
+        private final HandlerExecution execution;
+
         private final @Nullable Consumer<MqttDelivery> handler;
 
         private final DeliveryLanes.@Nullable Receiver receiver;
@@ -1345,9 +1377,15 @@ public final class ClientActor implements MqttClient {
 
         private final List<CompletableFuture<Void>> terminationWaiters = new ArrayList<>();
 
-        ClientSubscription(long id, Subscribe request, @Nullable Consumer<MqttDelivery> handler) {
+        ClientSubscription(
+                long id,
+                Subscribe request,
+                HandlerExecution execution,
+                @Nullable Consumer<MqttDelivery> handler
+        ) {
             this.id = id;
             this.request = request;
+            this.execution = execution;
             this.handler = handler;
             receiver = handler == null ? lanes.receiver(id, request) : null;
             laneStarted = receiver != null;

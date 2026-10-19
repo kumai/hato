@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -1757,6 +1758,103 @@ class DeliveryLanesTest {
 
         // Assert
         assertThat(terminated).containsExactly(1L);
+    }
+
+    @Test
+    void a_refusing_executor_fails_each_waiting_delivery_in_turn_while_failures_are_only_logged()
+            throws Exception {
+        // Arrange: failures end no connection. Three deliveries wait behind one accepted task,
+        // and the executor refuses every later request.
+        var reported = new LinkedBlockingQueue<Throwable>();
+        DeliveryLanes sut = lanes(BYTE_LIMIT, () -> { }, (_, cause) -> {
+            reported.add(cause);
+            return false;
+        });
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var execution = new HandlerExecution.OnExecutor(executor);
+        assertThat(sut.register(1, request(3), execution, delivery -> {
+            handled.add(delivery.message().payload()[0]);
+        })).isTrue();
+        for (int value = 1; value <= 3; value++) {
+            assertThat(sut.deliver(token(1, 0), List.of(1L), message(value), false, 10)).isTrue();
+        }
+        await().until(() -> sut.placedDeliveries() == 3);
+        var refusal = new RejectedExecutionException("Executor is saturated");
+        executor.refuse(refusal);
+
+        // Act
+        executor.runNext();
+
+        // Assert: the task ran the first delivery, and each refused request failed the next
+        // one, so no delivery waits for a task and every slot has returned.
+        assertThat(handled).containsExactly((byte) 1);
+        assertThat(reported).containsExactly(refusal, refusal);
+        assertThat(executor.executions()).isEqualTo(3);
+        assertThat(executor.held()).isZero();
+        assertThat(sut.retainedDeliveries()).isZero();
+    }
+
+    @Test
+    void after_a_connection_ends_new_deliveries_wait_for_a_handler_still_running_on_the_executor()
+            throws Exception {
+        // Arrange: the first connection's handler still runs on the executor's thread when that
+        // connection ends.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var execution = new HandlerExecution.OnExecutor(executor);
+        assertThat(sut.register(1, request(2), execution, delivery -> {
+            byte value = delivery.message().payload()[0];
+            handled.add(value);
+            if (value == 1) {
+                entered.countDown();
+                waitFor(release);
+            }
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        Thread.ofVirtual().start(executor::runNext);
+        assertThat(entered.await(5, SECONDS)).isTrue();
+        sut.connectionEnded(false, false);
+
+        // Act: the next connection delivers while that handler runs.
+        assertThat(sut.deliver(token(2, 0), List.of(1L), message(2), false, 10)).isTrue();
+        await().until(() -> sut.placedDeliveries() == 2);
+
+        // Assert: no second task starts beside the running one, which asks for the new
+        // delivery once its handler returns.
+        assertThat(executor.held()).isZero();
+        release.countDown();
+        await().until(() -> executor.held() == 1);
+        executor.runNext();
+        assertThat(handled).containsExactly((byte) 1, (byte) 2);
+    }
+
+    @Test
+    void a_confirmed_removal_ends_an_executor_lane_after_its_waiting_deliveries_run()
+            throws Exception {
+        // Arrange: two deliveries wait for the executor when removal is confirmed.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var execution = new HandlerExecution.OnExecutor(executor);
+        assertThat(sut.register(1, request(2), execution, delivery -> {
+            handled.add(delivery.message().payload()[0]);
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 10)).isTrue();
+        await().until(() -> sut.placedDeliveries() == 2);
+
+        // Act
+        sut.finish(1);
+
+        // Assert: the lane lasts until the executor has run both, and then ends.
+        executor.runNext();
+        assertThat(terminated).isEmpty();
+        executor.runNext();
+        assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
+        assertThat(handled).containsExactly((byte) 1, (byte) 2);
+        assertThat(sut.retainedLanes()).isZero();
     }
 
     private record Failure(DeliveryToken token, Throwable cause) {

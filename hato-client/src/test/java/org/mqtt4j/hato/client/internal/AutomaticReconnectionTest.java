@@ -1215,7 +1215,8 @@ class AutomaticReconnectionTest {
                 null,
                 backoff,
                 initialRetry,
-                responseTimeout
+                responseTimeout,
+                DeliveryOptionsAccess::execution
         );
     }
 

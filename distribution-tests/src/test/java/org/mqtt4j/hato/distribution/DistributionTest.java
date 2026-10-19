@@ -363,6 +363,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.AckMode",
                 "org.mqtt4j.hato.ConnAck",
                 "org.mqtt4j.hato.ConnectionListener",
+                "org.mqtt4j.hato.DeliveryOptions",
                 "org.mqtt4j.hato.Disconnection",
                 "org.mqtt4j.hato.MqttCapacityException",
                 "org.mqtt4j.hato.MqttClient",
@@ -407,7 +408,8 @@ class DistributionTest {
 
     @ParameterizedTest
     @ValueSource(strings = {
-            "Disconnection", "ConnAck", "PublishResult", "MqttMessage", "MqttCredentials"
+            "Disconnection", "ConnAck", "PublishResult", "MqttMessage", "MqttCredentials",
+            "DeliveryOptions"
     })
     void evolving_value_types_are_final_classes_with_private_constructors(String type)
             throws Exception {

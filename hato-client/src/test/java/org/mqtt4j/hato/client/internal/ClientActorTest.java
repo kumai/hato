@@ -14,6 +14,8 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -46,6 +48,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
+import org.mqtt4j.hato.DeliveryOptions;
+import org.mqtt4j.hato.DeliveryOptionsAccess;
 import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttClient;
@@ -5384,6 +5388,411 @@ class ClientActorTest {
     }
 
     @Test
+    void an_executor_runs_each_handler_in_receive_order_with_one_task_at_a_time()
+            throws Exception {
+        // Arrange: three QoS 1 publications wait for an executor that runs tasks only when told.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var threads = new LinkedBlockingQueue<Thread>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOn(sut, transport, qosOneRequest(), executor, delivery -> {
+                handled.add(delivery.message().payload()[0]);
+                threads.add(Thread.currentThread());
+            });
+            for (int packetId = 1; packetId <= 3; packetId++) {
+                transport.receive(qosOnePublication("messages", packetId, false));
+            }
+            await().until(() -> actor.placedDeliveries() == 3);
+            assertThat(transport.sent).isEmpty();
+
+            // Act: run what the executor holds, one task at a time.
+            var held = new ArrayList<Integer>();
+            var acknowledged = new ArrayList<Packet>();
+            for (int i = 0; i < 3; i++) {
+                executor.runNext();
+                held.add(executor.held());
+                acknowledged.add(requireNonNull(transport.sent.poll(5, SECONDS)));
+            }
+
+            // Assert: each task ran one handler on the executor's thread and asked again while
+            // deliveries waited; each PUBACK followed its handler, and no task is left.
+            assertThat(held).containsExactly(1, 1, 0);
+            assertThat(handled).containsExactly((byte) 1, (byte) 2, (byte) 3);
+            assertThat(threads).containsOnly(Thread.currentThread());
+            assertThat(acknowledged).containsExactly(
+                    acknowledgement(Qos.AT_LEAST_ONCE, 1),
+                    acknowledgement(Qos.AT_LEAST_ONCE, 2),
+                    acknowledgement(Qos.AT_LEAST_ONCE, 3)
+            );
+        }
+    }
+
+    @Test
+    void an_executor_that_throws_fails_the_delivery_its_task_would_have_run() throws Exception {
+        // Arrange: the executor throws an exception that is not a rejection.
+        var executor = new ManualExecutor();
+        var failure = new IllegalStateException("Executor is unavailable");
+        executor.refuse(failure);
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeOn(sut, transport, qosOneRequest(), executor, handled::add);
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Assert: as with a failing handler, the failure ends the connection and the message
+            // is not acknowledged.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(transport.closed).isTrue();
+            assertThat(transport.sent).isEmpty();
+            assertThat(handled).isEmpty();
+        }
+    }
+
+    @Test
+    void a_synchronous_executor_keeps_the_order_without_deepening_the_stack() throws Exception {
+        // Arrange: deliveries wait behind one held task; the executor then runs each later task
+        // on the thread that submits it, as a caller-runs policy does when its pool is busy.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var depths = new LinkedBlockingQueue<Long>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOn(sut, transport, qosOneRequest(), executor, delivery -> {
+                handled.add(delivery.message().payload()[0]);
+                depths.add(StackWalker.getInstance().walk(Stream::count));
+            });
+            for (int packetId = 1; packetId <= 50; packetId++) {
+                transport.receive(qosOnePublication("messages", packetId, false));
+            }
+            await().until(() -> actor.placedDeliveries() == 50);
+            executor.runDirectly();
+
+            // Act
+            executor.runNext();
+
+            // Assert: the one task ran every delivery in order at one stack depth, asking the
+            // executor again for each, and each slot returned with its PUBACK.
+            assertThat(handled).containsExactlyElementsOf(
+                    IntStream.rangeClosed(1, 50).mapToObj(value -> (byte) value).toList()
+            );
+            assertThat(Set.copyOf(depths)).hasSize(1);
+            assertThat(executor.executions()).isEqualTo(50);
+            for (int packetId = 1; packetId <= 50; packetId++) {
+                assertThat(transport.sent.poll(5, SECONDS))
+                        .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, packetId));
+            }
+            await().until(() -> actor.usage().deliveries() == 0);
+        }
+    }
+
+    @Test
+    void closing_a_subscription_returns_the_slots_of_deliveries_whose_task_never_runs()
+            throws Exception {
+        // Arrange: three QoS 1 deliveries wait for a task that the executor hands back unrun.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeOn(
+                    sut,
+                    transport,
+                    qosOneRequest(),
+                    executor,
+                    handled::add
+            );
+            for (int packetId = 1; packetId <= 3; packetId++) {
+                transport.receive(qosOnePublication("messages", packetId, false));
+            }
+            await().until(() -> actor.placedDeliveries() == 3);
+            List<Runnable> unrun = executor.shutdownNow();
+
+            // Act
+            subscription.close();
+
+            // Assert: termination does not wait for the task. The discarded deliveries return
+            // their slots and are acknowledged, and the task does nothing when run late.
+            subscription.terminated().get(5, SECONDS);
+            var sent = new ArrayList<Packet>();
+            for (int i = 0; i < 4; i++) {
+                sent.add(requireNonNull(transport.sent.poll(5, SECONDS)));
+            }
+            assertThat(sent).filteredOn(Packet.PubAck.class::isInstance).containsExactly(
+                    acknowledgement(Qos.AT_LEAST_ONCE, 1),
+                    acknowledgement(Qos.AT_LEAST_ONCE, 2),
+                    acknowledgement(Qos.AT_LEAST_ONCE, 3)
+            );
+            assertThat(sent).filteredOn(Packet.Unsubscribe.class::isInstance).hasSize(1);
+            await().until(() -> actor.usage().deliveries() == 0);
+            assertThat(unrun).hasSize(1);
+            unrun.getFirst().run();
+            assertThat(handled).isEmpty();
+            assertThat(executor.executions()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void a_task_held_when_the_client_closes_does_nothing_and_termination_does_not_wait_for_it()
+            throws Exception {
+        // Arrange: a delivery waits for a task that the executor still holds.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeOn(sut, transport, request(), executor, handled::add);
+            transport.receive(publication(new byte[] {1}));
+            await().until(() -> executor.held() == 1);
+
+            // Act
+            sut.close();
+
+            // Assert: the client terminates first; the task run afterwards calls no handler and
+            // asks the executor for nothing.
+            sut.terminated().get(5, SECONDS);
+            executor.runNext();
+            assertThat(handled).isEmpty();
+            assertThat(executor.executions()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void a_handler_failure_on_an_executor_holds_the_rest_of_the_subscription() throws Exception {
+        // Arrange: two QoS 1 deliveries wait, and the first handler fails.
+        var executor = new ManualExecutor();
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOn(sut, transport, qosOneRequest(), executor, delivery -> {
+                handled.add(delivery.message().payload()[0]);
+                throw failure;
+            });
+            transport.receive(qosOnePublication("messages", 1, false));
+            transport.receive(qosOnePublication("messages", 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act
+            executor.runNext();
+
+            // Assert: the task asks for nothing more, the failure ends the connection, and the
+            // waiting delivery reaches neither the handler nor an acknowledgement.
+            assertThat(executor.held()).isZero();
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(handled).containsExactly((byte) 1);
+            assertThat(transport.sent).isEmpty();
+            assertThat(executor.executions()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void on_receive_acknowledges_a_delivery_while_its_handler_runs_on_the_executor()
+            throws Exception {
+        // Arrange: a QoS 1 delivery waits for its task, and its handler waits once started.
+        var executor = new ManualExecutor();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOn(
+                    sut,
+                    transport,
+                    qosOneRequest().withAckMode(AckMode.ON_RECEIVE),
+                    executor,
+                    _ -> {
+                        entered.countDown();
+                        waitFor(release);
+                    }
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+            await().until(() -> actor.placedDeliveries() == 1);
+            assertThat(transport.sent).isEmpty();
+
+            // Act
+            Thread.ofVirtual().start(executor::runNext);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+
+            // Assert: waiting for the executor acknowledged nothing; starting the handler did.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 1));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_manual_delivery_handled_on_an_executor_is_acknowledged_by_the_application()
+            throws Exception {
+        // Arrange: the handler keeps its QoS 1 delivery without acknowledging it.
+        var executor = new ManualExecutor();
+        var kept = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOn(
+                    sut,
+                    transport,
+                    qosOneRequest().withAckMode(AckMode.MANUAL),
+                    executor,
+                    kept::add
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+            await().until(() -> actor.placedDeliveries() == 1);
+            executor.runNext();
+            MqttDelivery delivery = requireNonNull(kept.poll(5, SECONDS));
+            assertThat(transport.sent).isEmpty();
+
+            // Act
+            delivery.ack();
+
+            // Assert
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 1));
+        }
+    }
+
+    @Test
+    void shutdown_work_that_waits_for_the_executor_runs_once_the_subscription_terminates()
+            throws Exception {
+        // Arrange: the subscription closes while its handler runs on a single-thread executor,
+        // and the shutdown work waits for that executor.
+        ExecutorService lane = Executors.newSingleThreadExecutor();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeOn(sut, transport, request(), lane, _ -> {
+                entered.countDown();
+                waitFor(release);
+            });
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> stopped = subscription.terminated()
+                    .thenRun(() -> CompletableFuture.runAsync(() -> { }, lane).join());
+            subscription.close();
+
+            // Act: the handler returns, which ends the subscription on the executor's thread.
+            release.countDown();
+
+            // Assert: the work completes, so the termination did not hold the executor.
+            stopped.get(5, SECONDS);
+        } finally {
+            release.countDown();
+            lane.shutdownNow();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_a_handler_running_on_an_executor() throws Exception {
+        // Arrange: a handler still runs on the executor when the client closes.
+        var executor = new ManualExecutor();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOn(sut, transport, request(), executor, _ -> {
+                entered.countDown();
+                waitFor(release);
+            });
+            transport.receive(publication(new byte[] {1}));
+            Thread.ofVirtual().start(executor::runNext);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the handler alone keeps termination pending.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_an_executor_taking_the_first_task() throws Exception {
+        // Arrange: the executor keeps the subscription's first request inside execute().
+        var executor = new ManualExecutor();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        executor.onExecute = () -> {
+            entered.countDown();
+            waitFor(release);
+        };
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOn(sut, transport, request(), executor, _ -> { });
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the executor call alone keeps termination
+            // pending.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_an_executor_that_a_running_task_asks_again()
+            throws Exception {
+        // Arrange: a task runs the first of two deliveries, and the executor keeps it inside
+        // execute() when it asks again for the second.
+        var executor = new ManualExecutor();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOn(sut, transport, request(), executor, _ -> { });
+            transport.receive(publication(new byte[] {1}));
+            transport.receive(publication(new byte[] {2}));
+            await().until(() -> actor.placedDeliveries() == 2);
+            executor.onExecute = () -> {
+                entered.countDown();
+                waitFor(release);
+            };
+            Thread.ofVirtual().start(executor::runNext);
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the executor call alone keeps termination
+            // pending.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void close_starts_one_removal_without_waiting_or_retaining_operation_slots()
             throws Exception {
         // Arrange
@@ -5708,6 +6117,22 @@ class ClientActorTest {
         return subscription;
     }
 
+    private static Subscription subscribeOn(
+            MqttClient client,
+            ScriptTransport transport,
+            Subscribe request,
+            Executor executor,
+            Consumer<MqttDelivery> handler
+    ) throws Exception {
+        Subscription subscription = client.subscribe(
+                request,
+                DeliveryOptions.serial().withExecutor(executor),
+                handler
+        );
+        establish(transport, subscription);
+        return subscription;
+    }
+
     /// Once an internal failure is published, establishment reports it, and a subscription closed
     /// in that window still ends with it.
     private static void assertInternalFailureBeforeCleanup(
@@ -5765,6 +6190,10 @@ class ClientActorTest {
 
     private static Subscribe request() {
         return Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE);
+    }
+
+    private static Subscribe qosOneRequest() {
+        return Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE);
     }
 
     private static MqttMessage message(byte[] bytes) {
@@ -5914,7 +6343,8 @@ class ClientActorTest {
                 null,
                 ReconnectBackoff.disabled(),
                 false,
-                Duration.ofSeconds(60)
+                Duration.ofSeconds(60),
+                DeliveryOptionsAccess::execution
         );
     }
 

@@ -412,7 +412,8 @@ public final class MqttClientBuilder {
                 connectWill,
                 reconnectPolicy.backoff(),
                 reconnectPolicy.initialRetry(),
-                responseTimeout
+                responseTimeout,
+                DeliveryOptions::execution
         );
     }
 
