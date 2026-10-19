@@ -5,10 +5,10 @@ package org.mqtt4j.hato;
 /// automatic reconnection started it, produces either [#onConnected(ConnAck)] or
 /// [#onConnectFailed(Disconnection)]. An established connection is followed by
 /// [#onDisconnected(Disconnection)] once, even if it ends before the listener runs. Attempt
-/// numbers in [ConnAck#attempt()] and [Disconnection#attempt()] are consecutive. When an
-/// attempt replaces a broker session without local state, as [MqttClient#connect()]
-/// describes, the connections that it closes on the way produce no notifications and take no
-/// attempt number; the attempt reports only its outcome.
+/// numbers in [ConnAck#connectionAttempt()] and [Disconnection#connectionAttempt()] are
+/// consecutive. When an attempt replaces a broker session without local state, as
+/// [MqttClient#connect()] describes, the connections that it closes on the way produce no
+/// notifications and take no attempt number; the attempt reports only its outcome.
 ///
 /// All callbacks share the same serial order. Notifications wait in a bounded queue: when a
 /// slow callback lets it fill, the oldest notification not yet delivered is dropped, so the

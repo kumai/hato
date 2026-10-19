@@ -10,6 +10,12 @@ public interface MqttDelivery {
     /// Whether the broker marked the publication as a duplicate. Always false for QoS 0.
     boolean dup();
 
+    /// The number of the connection attempt that established the connection delivering this
+    /// message, as [ConnAck#connectionAttempt()] reports it. A retransmission on a later
+    /// connection carries the later attempt. An application that keeps deliveries after their
+    /// connection ends can tell them from the current connection's by comparing the two.
+    long connectionAttempt();
+
     /// Acknowledges this subscription's QoS 1 or QoS 2 delivery in [AckMode#MANUAL] mode.
     /// Safe to call from any thread, including before the handler returns. Repeated calls,
     /// QoS 0, other acknowledgement modes, and calls after the receiving session ends have no

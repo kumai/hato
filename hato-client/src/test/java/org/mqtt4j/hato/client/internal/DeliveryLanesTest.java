@@ -171,6 +171,31 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void each_delivered_copy_reports_the_attempt_of_the_connection_that_delivered_it()
+            throws Exception {
+        // Arrange: the first copy arrives on the second connection of attempt 1, as when that
+        // attempt replaced a broker session. One receiver takes it, and the other's copy is
+        // discarded when the connection ends, so the continued session keeps the receipt.
+        var firstCopy = new DeliveryToken(SESSION, 2, 1, 10);
+        var retransmission = new DeliveryToken(SESSION, 3, 2, 10);
+        DeliveryLanes.Receiver taken = registerPull(sut, 1, request(1));
+        DeliveryLanes.Receiver discarded = registerPull(sut, 2, request(1));
+        assertThat(sut.deliver(firstCopy, List.of(1L, 2L), qosOneMessage(), false, 10)).isTrue();
+        MqttDelivery first = received(taken.receive());
+        assertThat(sut.connectionEnded(true, false)).containsKey(10L);
+
+        // Act: the retransmission on the connection of attempt 2 joins that receipt.
+        assertThat(sut.deliver(retransmission, List.of(1L, 2L), qosOneMessage(), true, 10))
+                .isTrue();
+
+        // Assert
+        MqttDelivery second = received(discarded.receive());
+        assertThat(first.connectionAttempt()).isEqualTo(1);
+        assertThat(second.connectionAttempt()).isEqualTo(2);
+        assertThat(second.dup()).isTrue();
+    }
+
+    @Test
     void a_duplicate_of_queued_work_does_not_reserve_or_queue_another_view() throws Exception {
         DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(1));
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
@@ -2106,8 +2131,9 @@ class DeliveryLanesTest {
     private record Failure(DeliveryToken token, Throwable cause) {
     }
 
+    /// A token whose connection was established by an attempt of the same number.
     private DeliveryToken token(long connection, long acknowledgement) {
-        return new DeliveryToken(SESSION, connection, acknowledgement);
+        return new DeliveryToken(SESSION, connection, connection, acknowledgement);
     }
 
     private static Subscribe request(AckMode ackMode, int capacity) {

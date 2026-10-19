@@ -826,6 +826,41 @@ class ClientActorTest {
     }
 
     @Test
+    void deliveries_report_the_attempt_of_the_connection_that_delivered_them() throws Exception {
+        // Arrange: a push and a pull subscription that both match, on the first attempt.
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport first = connect(sut);
+            Subscription push = sut.subscribe(request(), handled::add);
+            establish(first, push);
+            Subscription pull = subscribePull(
+                    sut,
+                    first,
+                    Subscribe.of(new TopicFilter("#"), Qos.AT_MOST_ONCE)
+            );
+
+            // Act: one publication on each of two attempts.
+            first.receive(publication(new byte[] {1}));
+            MqttDelivery pushedFirst = requireNonNull(handled.poll(5, SECONDS));
+            MqttDelivery pulledFirst = received(pull.receive(Duration.ofSeconds(5)));
+            first.receiver().onClosed(new IOException("connection lost"));
+            assertThat(ends.poll(5, SECONDS)).isNotNull();
+            ScriptTransport second = connect(sut);
+            acknowledgeSubscription(second, push);
+            acknowledgeSubscription(second, pull);
+            second.receive(publication(new byte[] {2}));
+
+            // Assert
+            assertThat(pushedFirst.connectionAttempt()).isEqualTo(1);
+            assertThat(pulledFirst.connectionAttempt()).isEqualTo(1);
+            MqttDelivery pushedSecond = requireNonNull(handled.poll(5, SECONDS));
+            MqttDelivery pulledSecond = received(pull.receive(Duration.ofSeconds(5)));
+            assertThat(pushedSecond.connectionAttempt()).isEqualTo(2);
+            assertThat(pulledSecond.connectionAttempt()).isEqualTo(2);
+        }
+    }
+
+    @Test
     @Timeout(10)
     void normal_disconnect_discards_pull_buffers_without_ending_receiving() throws Exception {
         // Arrange
@@ -2543,13 +2578,13 @@ class ClientActorTest {
         var listener = new ConnectionListener() {
             @Override
             public void onConnected(ConnAck ack) {
-                notifications.add("connected " + ack.attempt());
+                notifications.add("connected " + ack.connectionAttempt());
                 throw new IllegalStateException("application listener failure");
             }
 
             @Override
             public void onDisconnected(Disconnection disconnection) {
-                notifications.add("disconnected " + disconnection.attempt());
+                notifications.add("disconnected " + disconnection.connectionAttempt());
                 if (entered.getCount() > 0) {
                     entered.countDown();
                     waitFor(release);
@@ -2567,7 +2602,7 @@ class ClientActorTest {
             for (int attempt = 2; attempt <= 40; attempt++) {
                 CompletableFuture<ConnAck> connection = sut.connect();
                 nextTransport().accept();
-                assertThat(connection.get(5, SECONDS).attempt()).isEqualTo(attempt);
+                assertThat(connection.get(5, SECONDS).connectionAttempt()).isEqualTo(attempt);
                 sut.disconnect().get(5, SECONDS);
             }
 

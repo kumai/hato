@@ -21,50 +21,55 @@ public final class Disconnection {
 
     private final boolean userRequested;
 
-    private final long attempt;
+    private final long connectionAttempt;
 
     private final @Nullable Duration reconnectDelay;
 
     private Disconnection(
             @Nullable Throwable cause,
             boolean userRequested,
-            long attempt,
+            long connectionAttempt,
             @Nullable Duration reconnectDelay
     ) {
-        if (attempt < 1) {
+        if (connectionAttempt < 1) {
             throw new IllegalArgumentException("Attempt numbers start at 1");
         }
         this.cause = cause;
         this.userRequested = userRequested;
-        this.attempt = attempt;
+        this.connectionAttempt = connectionAttempt;
         this.reconnectDelay = reconnectDelay;
     }
 
-    /// Describes an ending of connection attempt number `attempt` after which the client does
-    /// not reconnect, with the original `cause`, or no reported failure when it is null.
-    /// `userRequested` is true when disconnect or close was requested, even if that failed.
+    /// Describes an ending of connection attempt number `connectionAttempt` after which the
+    /// client does not reconnect, with the original `cause`, or no reported failure when it is
+    /// null. `userRequested` is true when disconnect or close was requested, even if that failed.
     ///
-    /// @throws IllegalArgumentException if `attempt` is not positive
+    /// @throws IllegalArgumentException if `connectionAttempt` is not positive
     @SuppressWarnings("exports") // Nullness annotations are compile-time only.
-    public static Disconnection of(@Nullable Throwable cause, boolean userRequested, long attempt) {
-        return new Disconnection(cause, userRequested, attempt, null);
+    public static Disconnection of(
+            @Nullable Throwable cause,
+            boolean userRequested,
+            long connectionAttempt
+    ) {
+        return new Disconnection(cause, userRequested, connectionAttempt, null);
     }
 
     /// Like [#of(Throwable, boolean, long)], but the client attempts to connect again after
     /// `reconnectDelay`.
     ///
-    /// @throws IllegalArgumentException if `attempt` is not positive or the delay is negative
+    /// @throws IllegalArgumentException if `connectionAttempt` is not positive or the delay is
+    /// negative
     @SuppressWarnings("exports") // Nullness annotations are compile-time only.
     public static Disconnection of(
             @Nullable Throwable cause,
             boolean userRequested,
-            long attempt,
+            long connectionAttempt,
             Duration reconnectDelay
     ) {
         if (requireNonNull(reconnectDelay, "reconnectDelay").isNegative()) {
             throw new IllegalArgumentException("Reconnect delay must not be negative");
         }
-        return new Disconnection(cause, userRequested, attempt, reconnectDelay);
+        return new Disconnection(cause, userRequested, connectionAttempt, reconnectDelay);
     }
 
     /// The original failure, or empty when no failure is reported.
@@ -79,9 +84,9 @@ public final class Disconnection {
 
     /// The number of the attempt that established the ended connection or that failed. When a
     /// stop cancels a wait to reconnect, it is the number reserved for the cancelled attempt. See
-    /// [ConnAck#attempt()].
-    public long attempt() {
-        return attempt;
+    /// [ConnAck#connectionAttempt()].
+    public long connectionAttempt() {
+        return connectionAttempt;
     }
 
     /// The delay, counted from when the client handled this ending, until its next connection
@@ -97,18 +102,19 @@ public final class Disconnection {
         return other instanceof Disconnection that
                 && Objects.equals(cause, that.cause)
                 && userRequested == that.userRequested
-                && attempt == that.attempt
+                && connectionAttempt == that.connectionAttempt
                 && Objects.equals(reconnectDelay, that.reconnectDelay);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(cause, userRequested, attempt, reconnectDelay);
+        return Objects.hash(cause, userRequested, connectionAttempt, reconnectDelay);
     }
 
     @Override
     public String toString() {
         return "Disconnection[cause=" + cause + ", userRequested=" + userRequested
-                + ", attempt=" + attempt + ", reconnectDelay=" + reconnectDelay + "]";
+                + ", connectionAttempt=" + connectionAttempt + ", reconnectDelay=" + reconnectDelay
+                + "]";
     }
 }

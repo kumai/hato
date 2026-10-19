@@ -18,12 +18,13 @@ class ConnAckTest {
 
         // Assert
         assertThat(sut.sessionPresent()).isEqualTo(sessionPresent);
-        assertThat(sut.attempt()).isEqualTo(3);
+        assertThat(sut.connectionAttempt()).isEqualTo(3);
         assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same)
                 .isNotEqualTo(ConnAck.of(!sessionPresent, 3))
                 .isNotEqualTo(ConnAck.of(sessionPresent, 4));
         assertThat(same).isEqualTo(sut);
-        assertThat(sut.toString()).contains("sessionPresent=" + sessionPresent, "attempt=3");
+        assertThat(sut.toString())
+                .contains("sessionPresent=" + sessionPresent, "connectionAttempt=3");
     }
 
     @Test

@@ -498,7 +498,8 @@ final class DeliveryLanes {
                             recipient,
                             lane,
                             requireNonNull(retained.message),
-                            dup
+                            dup,
+                            token.attempt()
                     );
                     if (lane.ackMode == AckMode.MANUAL) {
                         view.acknowledgement = () -> acknowledge(view);
@@ -558,7 +559,8 @@ final class DeliveryLanes {
                                 new Recipient(lane.id),
                                 lane,
                                 message,
-                                dup
+                                dup,
+                                token.attempt()
                         );
                         enqueue(lane, view);
                     }
@@ -1679,6 +1681,9 @@ final class DeliveryLanes {
         final Recipient recipient;
         final MqttMessage message;
         final boolean dup;
+        // The attempt of the connection that delivered this copy, which for a retransmission can
+        // be later than the receipt's first.
+        final long attempt;
         @Nullable Lane lane;
         volatile @Nullable Runnable acknowledgement;
         boolean localDone;
@@ -1690,13 +1695,15 @@ final class DeliveryLanes {
                 Recipient recipient,
                 Lane lane,
                 MqttMessage message,
-                boolean dup
+                boolean dup,
+                long attempt
         ) {
             this.delivery = delivery;
             this.recipient = recipient;
             this.lane = lane;
             this.message = message;
             this.dup = dup;
+            this.attempt = attempt;
             released = delivery.token.acknowledgement() == 0;
         }
 
@@ -1708,6 +1715,11 @@ final class DeliveryLanes {
         @Override
         public boolean dup() {
             return dup;
+        }
+
+        @Override
+        public long connectionAttempt() {
+            return attempt;
         }
 
         @Override

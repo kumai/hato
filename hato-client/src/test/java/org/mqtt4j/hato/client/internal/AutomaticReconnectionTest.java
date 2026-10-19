@@ -346,7 +346,7 @@ class AutomaticReconnectionTest {
             // Assert: the refusal ends the request that the disconnect withdrew.
             disconnected.get(5, SECONDS);
             Disconnection failure = listener.ending(listener.next());
-            assertThat(failure.attempt()).isEqualTo(2);
+            assertThat(failure.connectionAttempt()).isEqualTo(2);
             assertThat(failure.userRequested()).isTrue();
             assertThat(failure.reconnectDelay()).isEmpty();
             assertThat(scheduler.pendingTaskCount()).isZero();
@@ -639,7 +639,7 @@ class AutomaticReconnectionTest {
                     .isInstanceOf(MqttConnectionLostException.class)
                     .hasCause(failure);
             Disconnection ending = listener.ending(listener.next());
-            assertThat(ending.attempt()).isEqualTo(2);
+            assertThat(ending.connectionAttempt()).isEqualTo(2);
             assertThat(ending.userRequested()).isFalse();
             assertThat(ending.reconnectDelay()).isEmpty();
             assertThat(ending.cause()).get()
@@ -1039,7 +1039,7 @@ class AutomaticReconnectionTest {
             // Assert: the failure reserves the next delay, and the wake starts nothing; without
             // an attempt, a disconnect completes at once.
             Disconnection failure = listener.ending(listener.next());
-            assertThat(failure.attempt()).isEqualTo(2);
+            assertThat(failure.connectionAttempt()).isEqualTo(2);
             assertThat(failure.reconnectDelay()).contains(Duration.ofSeconds(2));
             sut.disconnect().get(5, SECONDS);
             assertThat(transports).isEmpty();
@@ -1259,7 +1259,7 @@ class AutomaticReconnectionTest {
             @Nullable Duration delay
     ) {
         Disconnection failure = listener.ending(notification);
-        assertThat(failure.attempt()).isEqualTo(attempt);
+        assertThat(failure.connectionAttempt()).isEqualTo(attempt);
         assertThat(failure.userRequested()).isFalse();
         assertThat(failure.reconnectDelay()).isEqualTo(Optional.ofNullable(delay));
         assertThat(failure.cause()).get()

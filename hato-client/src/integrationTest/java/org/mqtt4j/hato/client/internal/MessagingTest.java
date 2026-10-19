@@ -827,7 +827,7 @@ abstract class MessagingTest {
             // Assert: the overload announces a reconnection, which keeps the subscription.
             assertThat(end.cause().orElseThrow()).isInstanceOf(MqttCapacityException.class);
             assertThat(end.reconnectDelay()).isPresent();
-            assertThat(sut.whenConnected().get(5, SECONDS).attempt()).isEqualTo(2);
+            assertThat(sut.whenConnected().get(5, SECONDS).connectionAttempt()).isEqualTo(2);
             subscription.established().get(5, SECONDS);
             publisher.publish(message(topic, (byte) 3)).get(5, SECONDS);
             await().untilAsserted(() -> assertThat(payloads).contains((byte) 3));

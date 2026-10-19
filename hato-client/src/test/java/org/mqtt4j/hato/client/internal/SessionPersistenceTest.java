@@ -1027,6 +1027,7 @@ class SessionPersistenceTest {
         final List<Long> removed = new ArrayList<>();
         final List<Qos> grants = new ArrayList<>();
         final List<List<Long>> deliveries = new ArrayList<>();
+        final List<DeliveryToken> deliveryTokens = new ArrayList<>();
         final List<Disconnection> ends = new ArrayList<>();
         final List<Boolean> established = new ArrayList<>();
         final List<ConnAck> announcements = new ArrayList<>();
@@ -1248,6 +1249,7 @@ class SessionPersistenceTest {
                 int bytes
         ) {
             deliveries.add(List.copyOf(ids));
+            deliveryTokens.add(token);
             return true;
         }
 
@@ -1292,7 +1294,7 @@ class SessionPersistenceTest {
         ) {
             established.add(connected);
             ends.add(disconnection);
-            endedAttempt = disconnection.attempt();
+            endedAttempt = disconnection.connectionAttempt();
             latestReconnectDelay = disconnection.reconnectDelay().orElse(null);
             disconnection.reconnectDelay().ifPresent(reconnectDelays::add);
             events.add("end");

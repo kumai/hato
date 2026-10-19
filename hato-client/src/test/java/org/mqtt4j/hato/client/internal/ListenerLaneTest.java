@@ -151,7 +151,7 @@ class ListenerLaneTest {
         var listener = new ConnectionListener() {
             @Override
             public void onConnected(ConnAck ack) {
-                attempts.add(ack.attempt());
+                attempts.add(ack.connectionAttempt());
                 entered.countDown();
                 try {
                     release.await();
@@ -166,7 +166,7 @@ class ListenerLaneTest {
 
             @Override
             public void onConnectFailed(Disconnection failure) {
-                attempts.add(failure.attempt());
+                attempts.add(failure.connectionAttempt());
             }
         };
         var sut = new ListenerLane(

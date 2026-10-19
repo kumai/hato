@@ -194,6 +194,9 @@ final class SessionCore {
 
         long generation();
 
+        /// The number of the attempt that established the current connection.
+        long attempt();
+
         long sessionNumber();
 
         /// Numbers a write; tickets identify write completions across the client.
@@ -1057,6 +1060,11 @@ final class SessionCore {
         @Override
         public long generation() {
             return generation;
+        }
+
+        @Override
+        public long attempt() {
+            return request.attempt();
         }
 
         @Override

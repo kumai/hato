@@ -139,6 +139,25 @@ class BrokerSessionReplacementTest {
         );
     }
 
+    @Test
+    void a_delivery_on_the_new_session_names_its_attempt_rather_than_its_connection() {
+        // Arrange: the attempt replaces the broker session and keeps its third connection.
+        SessionCore sut = core(false, false);
+        sut.subscribe(operation(), Subscribe.of(new TopicFilter("stored"), Qos.AT_LEAST_ONCE));
+        beginConnect(sut);
+        discardBrokerSession(sut);
+        receive(sut, connAck(false));
+
+        // Act
+        receive(sut, publication(7));
+
+        // Assert
+        assertThat(port.deliveryTokens).singleElement().satisfies(token -> {
+            assertThat(token.attempt()).isEqualTo(1);
+            assertThat(token.connection()).isEqualTo(3);
+        });
+    }
+
     @ParameterizedTest(name = "{0}")
     @EnumSource(Abandoned.class)
     void an_abandoned_connection_waits_only_for_its_disconnect_deadline(Abandoned abandoned) {

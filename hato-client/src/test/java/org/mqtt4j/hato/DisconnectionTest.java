@@ -22,7 +22,7 @@ class DisconnectionTest {
         // Assert
         assertThat(sut.cause()).isEmpty();
         assertThat(sut.userRequested()).isEqualTo(userRequested);
-        assertThat(sut.attempt()).isEqualTo(1);
+        assertThat(sut.connectionAttempt()).isEqualTo(1);
         assertThat(sut.reconnectDelay()).isEmpty();
         assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same)
                 .isNotEqualTo(Disconnection.of(null, !userRequested, 1));
@@ -30,7 +30,7 @@ class DisconnectionTest {
         assertThat(sut.toString()).contains(
                 "cause=null",
                 "userRequested=" + userRequested,
-                "attempt=1",
+                "connectionAttempt=1",
                 "reconnectDelay=null"
         );
     }
@@ -69,7 +69,7 @@ class DisconnectionTest {
 
         // Assert
         assertThat(sut.reconnectDelay()).contains(Duration.ofMillis(1500));
-        assertThat(sut.attempt()).isEqualTo(2);
+        assertThat(sut.connectionAttempt()).isEqualTo(2);
         assertThat(sut).isEqualTo(Disconnection.of(null, false, 2, Duration.ofMillis(1500)))
                 .isNotEqualTo(Disconnection.of(null, false, 2, Duration.ofMillis(1499)))
                 .isNotEqualTo(Disconnection.of(null, false, 2));

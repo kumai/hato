@@ -7,22 +7,22 @@ public final class ConnAck {
 
     private final boolean sessionPresent;
 
-    private final long attempt;
+    private final long connectionAttempt;
 
-    private ConnAck(boolean sessionPresent, long attempt) {
+    private ConnAck(boolean sessionPresent, long connectionAttempt) {
         this.sessionPresent = sessionPresent;
-        this.attempt = attempt;
+        this.connectionAttempt = connectionAttempt;
     }
 
-    /// Describes a successful acknowledgement of connection attempt number `attempt`, and
-    /// whether the broker resumed a session.
+    /// Describes a successful acknowledgement of connection attempt number `connectionAttempt`,
+    /// and whether the broker resumed a session.
     ///
-    /// @throws IllegalArgumentException if `attempt` is not positive
-    public static ConnAck of(boolean sessionPresent, long attempt) {
-        if (attempt < 1) {
+    /// @throws IllegalArgumentException if `connectionAttempt` is not positive
+    public static ConnAck of(boolean sessionPresent, long connectionAttempt) {
+        if (connectionAttempt < 1) {
             throw new IllegalArgumentException("Attempt numbers start at 1");
         }
-        return new ConnAck(sessionPresent, attempt);
+        return new ConnAck(sessionPresent, connectionAttempt);
     }
 
     /// Whether the broker resumed an existing session.
@@ -33,8 +33,8 @@ public final class ConnAck {
     /// The number of the connection attempt that this acknowledgement established. A client
     /// numbers its attempts consecutively from 1, whether the application's
     /// [MqttClient#connect()] or an automatic reconnection started them.
-    public long attempt() {
-        return attempt;
+    public long connectionAttempt() {
+        return connectionAttempt;
     }
 
     @Override
@@ -42,16 +42,17 @@ public final class ConnAck {
     public boolean equals(@Nullable Object other) {
         return other instanceof ConnAck that
                 && sessionPresent == that.sessionPresent
-                && attempt == that.attempt;
+                && connectionAttempt == that.connectionAttempt;
     }
 
     @Override
     public int hashCode() {
-        return 31 * Boolean.hashCode(sessionPresent) + Long.hashCode(attempt);
+        return 31 * Boolean.hashCode(sessionPresent) + Long.hashCode(connectionAttempt);
     }
 
     @Override
     public String toString() {
-        return "ConnAck[sessionPresent=" + sessionPresent + ", attempt=" + attempt + "]";
+        return "ConnAck[sessionPresent=" + sessionPresent + ", connectionAttempt="
+                + connectionAttempt + "]";
     }
 }

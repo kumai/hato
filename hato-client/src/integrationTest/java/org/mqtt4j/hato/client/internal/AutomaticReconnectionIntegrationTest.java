@@ -95,11 +95,11 @@ class AutomaticReconnectionIntegrationTest {
             // Act & Assert: the broker refuses authorization, and then the identifier.
             refuse(server, ReasonCode.NOT_AUTHORIZED);
             Disconnection unauthorized = requireNonNull(failures.poll(5, SECONDS));
-            assertThat(unauthorized.attempt()).isEqualTo(2);
+            assertThat(unauthorized.connectionAttempt()).isEqualTo(2);
             assertThat(unauthorized.reconnectDelay()).isPresent();
             refuse(server, ReasonCode.CLIENT_IDENTIFIER_NOT_VALID);
             Disconnection rejected = requireNonNull(failures.poll(5, SECONDS));
-            assertThat(rejected.attempt()).isEqualTo(3);
+            assertThat(rejected.connectionAttempt()).isEqualTo(3);
             assertThat(rejected.reconnectDelay()).isEmpty();
             assertThat(rejected.cause()).get()
                     .isInstanceOfSatisfying(MqttConnectException.class, refusal ->
@@ -297,8 +297,8 @@ class AutomaticReconnectionIntegrationTest {
             clock.advance(DELAY);
 
             // Assert
-            assertThat(sut.whenConnected().get(5, SECONDS).attempt()).isEqualTo(2);
-            assertThat(sut.connect().get(5, SECONDS).attempt()).isEqualTo(2);
+            assertThat(sut.whenConnected().get(5, SECONDS).connectionAttempt()).isEqualTo(2);
+            assertThat(sut.connect().get(5, SECONDS).connectionAttempt()).isEqualTo(2);
         } finally {
             release.countDown();
         }
@@ -398,12 +398,12 @@ class AutomaticReconnectionIntegrationTest {
 
             // Act & Assert: an explicit connection receives the redelivery and restores
             // automatic reconnection.
-            assertThat(sut.connect().get(5, SECONDS).attempt()).isEqualTo(2);
+            assertThat(sut.connect().get(5, SECONDS).connectionAttempt()).isEqualTo(2);
             await().untilAsserted(() -> assertThat(calls.get()).isGreaterThanOrEqualTo(2));
             requireNonNull(transports.poll(5, SECONDS)).disconnect(new IOException("cut"));
             assertThat(requireNonNull(ends.poll(5, SECONDS)).reconnectDelay()).isPresent();
             clock.advance(DELAY);
-            assertThat(sut.whenConnected().get(5, SECONDS).attempt()).isEqualTo(3);
+            assertThat(sut.whenConnected().get(5, SECONDS).connectionAttempt()).isEqualTo(3);
         }
     }
 

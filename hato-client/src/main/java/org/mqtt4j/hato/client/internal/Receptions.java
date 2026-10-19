@@ -130,7 +130,7 @@ final class Receptions {
                 publish.retain()
         );
         if (!port.deliver(
-                new DeliveryToken(core.sessionNumber(), core.generation(), token),
+                new DeliveryToken(core.sessionNumber(), core.generation(), core.attempt(), token),
                 matches,
                 message,
                 publish.dup(),
