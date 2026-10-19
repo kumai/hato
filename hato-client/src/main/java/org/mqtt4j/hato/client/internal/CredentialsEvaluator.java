@@ -108,7 +108,7 @@ final class CredentialsEvaluator implements AutoCloseable {
                 }
                 evaluating = requested;
                 // Interrupt status left by an abandoned call must not reach the next one.
-                Thread.interrupted();
+                boolean _ = Thread.interrupted();
             }
             MqttCredentials value = null;
             Throwable failure = null;

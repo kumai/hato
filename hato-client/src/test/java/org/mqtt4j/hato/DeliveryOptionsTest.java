@@ -1,6 +1,7 @@
 package org.mqtt4j.hato;
 
 import java.util.concurrent.Executor;
+import java.util.function.Function;
 
 import org.junit.jupiter.api.Test;
 
@@ -34,9 +35,25 @@ class DeliveryOptionsTest {
     }
 
     @Test
-    @SuppressWarnings("NullAway") // Deliberately violates the non-null contract.
-    void an_executor_cannot_be_null() {
+    void lanes_take_their_executors_from_the_selector_and_refuse_another_executor() {
+        // Arrange
+        Function<MqttMessage, Executor> selector = _ -> Runnable::run;
+
+        // Act
+        DeliveryOptions sut = DeliveryOptions.lanes(selector);
+
+        // Assert
+        assertThat(sut.execution()).isEqualTo(new HandlerExecution.Lanes(selector));
+        assertThatThrownBy(() -> sut.withExecutor(Runnable::run))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    @SuppressWarnings("NullAway") // Deliberately violates the non-null contracts.
+    void executors_and_selectors_cannot_be_null() {
         assertThatThrownBy(() -> DeliveryOptions.serial().withExecutor(null))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> DeliveryOptions.lanes(null))
                 .isInstanceOf(NullPointerException.class);
     }
 

@@ -93,7 +93,8 @@ class TcpConnectionTest {
                 assertThat(peer.getInputStream().read()).isEqualTo(-1);
             } finally {
                 sut.close();
-                reader.join(Duration.ofSeconds(5));
+                // The assertion after this block checks that the reader ended.
+                boolean _ = reader.join(Duration.ofSeconds(5));
             }
             assertThat(reader.isAlive()).isFalse();
         }

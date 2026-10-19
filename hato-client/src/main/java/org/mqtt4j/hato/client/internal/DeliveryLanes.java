@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -16,6 +17,7 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.LongConsumer;
 
 import org.jspecify.annotations.Nullable;
@@ -34,8 +36,9 @@ import org.mqtt4j.hato.client.internal.common.log.Log;
 import static java.util.Objects.requireNonNull;
 
 /// Each push subscription has a dispatcher, an internal virtual thread that takes its deliveries
-/// in receive order. For serial delivery it executes each handler in place. For an application
-/// executor it moves each delivery to that executor's sublane, from which one drain task at a
+/// in receive order. For serial delivery it executes each handler in place. For application
+/// executors it moves each delivery to its executor's sublane, asking the application's selector
+/// for the executor when the subscription uses lanes. From each sublane, one drain task at a
 /// time, run by the executor, claims and executes the head and then asks the executor again.
 /// Pull subscriptions use their callers' threads. Reservations include executing handlers and
 /// survive connection changes until they return.
@@ -379,7 +382,8 @@ final class DeliveryLanes {
             retireAcknowledgements();
             for (Lane lane : List.copyOf(lanes.values())) {
                 lane.failure = failure == null ? null : new MqttConnectionLostException(failure);
-                stop(lane);
+                // Retired receipts leave stopping no acknowledgement condition to complete.
+                boolean _ = stop(lane);
             }
         } finally {
             lock.unlock();
@@ -663,7 +667,8 @@ final class DeliveryLanes {
             lock.lock();
             try {
                 if (lane.finishing && lane.queue.isEmpty()) {
-                    stop(lane);
+                    // Nothing waits any more, so stopping completes no acknowledgement condition.
+                    boolean _ = stop(lane);
                 }
                 retainedLanes--;
                 terminatedLanes.add(lane);
@@ -689,39 +694,129 @@ final class DeliveryLanes {
         }
     }
 
-    /// Waits for the next delivery and executes it, or places it on its executor. Returns false
-    /// once the lane has stopped, its queue has emptied after a confirmed removal, or the client's
-    /// close has ended hand-off.
+    /// Waits for the lane's next delivery and hands it on as the lane's handler execution directs.
+    /// Returns false once the lane has stopped, its queue has emptied after a confirmed removal,
+    /// or the client's close has ended hand-off.
     private boolean dispatchNext(Lane lane) {
-        Claim claim = null;
-        Sublane submitting = null;
-        lock.lock();
-        try {
-            while (!lane.stopped && !handOffsClosed && (lane.failed || lane.queue.isEmpty())) {
-                if (lane.finishing && lane.queue.isEmpty()) {
-                    return false;
-                }
-                // stop(), finish(), and closeHandOffs() signal this condition.
-                lane.ready.awaitUninterruptibly();
-            }
-            if (lane.stopped || handOffsClosed) {
+        return switch (lane.execution) {
+            case HandlerExecution.Internal _ ->
+                    executeNext(lane);
+            case HandlerExecution.OnExecutor(Executor executor) ->
+                    placeNext(lane, executor);
+            case HandlerExecution.Lanes(Function<MqttMessage, Executor> selector) ->
+                    placeNextOnLane(lane, selector);
+        };
+    }
+
+    /// Caller holds lock. Waits until the lane has a delivery to hand on, and returns false
+    /// instead once the lane has stopped, its queue has emptied after a confirmed removal, or the
+    /// client's close has ended hand-off.
+    private boolean awaitNext(Lane lane) {
+        while (!lane.stopped && !handOffsClosed && (lane.failed || lane.queue.isEmpty())) {
+            if (lane.finishing && lane.queue.isEmpty()) {
                 return false;
             }
-            switch (lane.execution) {
-                case HandlerExecution.Internal _ -> claim = claim(lane, lane.queue);
-                case HandlerExecution.OnExecutor(Executor executor) ->
-                        submitting = place(lane, lane.queue.removeFirst(), executor);
+            // stop(), finish(), and closeHandOffs() signal this condition.
+            lane.ready.awaitUninterruptibly();
+        }
+        return !lane.stopped && !handOffsClosed;
+    }
+
+    /// Serial delivery: claims the head and executes its handler here, in place.
+    private boolean executeNext(Lane lane) {
+        Claim claim;
+        lock.lock();
+        try {
+            if (!awaitNext(lane)) {
+                return false;
             }
+            claim = claim(lane, lane.queue);
         } finally {
             lock.unlock();
         }
-        if (claim != null) {
-            execute(lane, claim);
-        }
-        if (submitting != null) {
-            submit(lane, submitting);
-        }
+        execute(lane, claim);
         return true;
+    }
+
+    /// An application executor: moves the head to the executor's sublane, then submits a drain
+    /// task unless one is on its way there.
+    private boolean placeNext(Lane lane, Executor executor) {
+        Optional<Sublane> submitting;
+        lock.lock();
+        try {
+            if (!awaitNext(lane)) {
+                return false;
+            }
+            submitting = place(lane, lane.queue.removeFirst(), executor);
+        } finally {
+            lock.unlock();
+        }
+        submitting.ifPresent(sublane -> submit(lane, sublane));
+        return true;
+    }
+
+    /// Lanes: asks the application's selector for the head's lane, without the lock, then places
+    /// the head there as [#placeNext] does. The head stays queued meanwhile, so a stop or a
+    /// connection's end still settles it, and the selector's answer is then dropped. A selector
+    /// that throws or returns null ends the head as a handler failure.
+    private boolean placeNextOnLane(Lane lane, Function<MqttMessage, Executor> selector) {
+        DeliveryView head;
+        lock.lock();
+        try {
+            if (!awaitNext(lane)) {
+                return false;
+            }
+            head = lane.queue.getFirst();
+        } finally {
+            lock.unlock();
+        }
+        Executor executor;
+        try {
+            executor = requireNonNull(selector.apply(head.message), "The selector returned null");
+        } catch (Throwable failure) {
+            boolean _ = Thread.interrupted();
+            failSelected(lane, head, failure);
+            return true;
+        }
+        // Like a handler, the selector leaves no interrupt state on this thread.
+        boolean _ = Thread.interrupted();
+        Optional<Sublane> submitting;
+        lock.lock();
+        try {
+            if (!canTake(lane, head)) {
+                return true;
+            }
+            submitting = place(lane, lane.queue.removeFirst(), executor);
+        } finally {
+            lock.unlock();
+        }
+        submitting.ifPresent(sublane -> submit(lane, sublane));
+        return true;
+    }
+
+    /// Ends the head as a handler failure after the selector failed for it, unless a stop, a
+    /// connection's end, or the client's close has taken it meanwhile. Reporting a delivery that
+    /// one of those settled could stop the client for a subscription that no longer has it.
+    private void failSelected(Lane lane, DeliveryView head, Throwable failure) {
+        lock.lock();
+        try {
+            if (!canTake(lane, head)) {
+                return;
+            }
+            lane.queue.removeFirst();
+            head.recipient.queued = false;
+            head.recipient.handed = true;
+        } finally {
+            lock.unlock();
+        }
+        fail(lane, head, failure);
+    }
+
+    /// Caller holds lock. Whether the dispatcher can still take `head`, which the selector
+    /// answered for: only the dispatcher takes the head, anything else that takes it clears the
+    /// queue, and after the client's close the head stays queued for the close to settle.
+    private boolean canTake(Lane lane, DeliveryView head) {
+        return lane.queue.peekFirst() == head && !handOffsClosed;
     }
 
     /// Caller holds lock; the lane is not stopped, no failure holds it, and the queue is not
@@ -737,16 +832,16 @@ final class DeliveryLanes {
 
     /// Caller holds lock. Moves a delivery, still queued, to its executor's sublane. Returns the
     /// sublane when no drain task is on its way there yet; the caller then submits one.
-    private @Nullable Sublane place(Lane lane, DeliveryView view, Executor executor) {
+    private Optional<Sublane> place(Lane lane, DeliveryView view, Executor executor) {
         Sublane sublane = lane.sublanes.computeIfAbsent(executor, key -> new Sublane(lane, key));
         sublane.queue.addLast(view);
         lane.queuedInSublanes++;
         placedDeliveries++;
         if (sublane.scheduled) {
-            return null;
+            return Optional.empty();
         }
         sublane.scheduled = true;
-        return sublane;
+        return Optional.of(sublane);
     }
 
     /// Hands the sublane's drain task to its executor, without the lock. An executor that throws
@@ -904,7 +999,7 @@ final class DeliveryLanes {
             }
             requireNonNull(lane.handler).accept(view);
             // Clear handler-owned interrupt state before the next delivery or queue wait.
-            Thread.interrupted();
+            boolean _ = Thread.interrupted();
             boolean ready;
             lock.lock();
             try {
@@ -919,7 +1014,7 @@ final class DeliveryLanes {
                 onReady.run();
             }
         } catch (Throwable failure) {
-            Thread.interrupted();
+            boolean _ = Thread.interrupted();
             fail(lane, view, failure);
         }
     }
@@ -1002,8 +1097,12 @@ final class DeliveryLanes {
         try {
             // Admission and connection cleanup see either no decision or the final one. The
             // callback only offers a termination to the mailbox, which never calls these lanes.
-            lane.failed = onFailure.test(token, failure);
-            paused = lane.failed;
+            paused = onFailure.test(token, failure);
+            // A failure that is only logged, such as one on another lane while the first
+            // failure stops the subscription, must not lift that stop.
+            if (paused) {
+                lane.failed = true;
+            }
         } catch (Throwable cause) {
             callbackFailure = cause;
             paused = false;
@@ -1075,7 +1174,8 @@ final class DeliveryLanes {
     /// finishing pull lane calls this, so such a lane never waits empty.
     private void settle(Lane lane) {
         if (lane.finishing && lane.handler == null && lane.queue.isEmpty()) {
-            stop(lane);
+            // An empty lane completes no acknowledgement condition by stopping.
+            boolean _ = stop(lane);
         }
     }
 
@@ -1351,6 +1451,7 @@ final class DeliveryLanes {
     /// A delivery taken from its lane's queue. `ready` says whether taking it met the last
     /// acknowledgement condition of its receipt, which `execute` announces without the lock.
     private record Claim(DeliveryView view, boolean ready) {}
+
 
     private static final class RetainedDelivery {
 

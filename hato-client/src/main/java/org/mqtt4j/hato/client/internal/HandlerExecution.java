@@ -1,6 +1,9 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.util.concurrent.Executor;
+import java.util.function.Function;
+
+import org.mqtt4j.hato.MqttMessage;
 
 import static java.util.Objects.requireNonNull;
 
@@ -15,6 +18,15 @@ public sealed interface HandlerExecution {
 
         public OnExecutor {
             requireNonNull(executor, "executor");
+        }
+    }
+
+    /// Each handler runs on the executor that `selector` returns for its message, one at a time
+    /// in receive order per executor.
+    record Lanes(Function<MqttMessage, Executor> selector) implements HandlerExecution {
+
+        public Lanes {
+            requireNonNull(selector, "selector");
         }
     }
 }

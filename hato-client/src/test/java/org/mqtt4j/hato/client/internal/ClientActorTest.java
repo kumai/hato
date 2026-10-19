@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.logging.Handler;
@@ -1290,7 +1291,7 @@ class ClientActorTest {
                 assertThatThrownBy(subscription::receive)
                         .isInstanceOf(InterruptedException.class);
             } finally {
-                Thread.interrupted();
+                boolean _ = Thread.interrupted();
             }
             transport.receive(publication(new byte[] {7}));
             MqttDelivery delivery = received(subscription.receive(Duration.ofSeconds(5)));
@@ -5793,6 +5794,217 @@ class ClientActorTest {
     }
 
     @Test
+    void lanes_keep_each_lane_in_receive_order_and_let_lanes_run_independently()
+            throws Exception {
+        // Arrange: odd payloads go to lane a and even ones to lane b; four deliveries wait.
+        var a = new ManualExecutor();
+        var b = new ManualExecutor();
+        var selected = new LinkedBlockingQueue<Byte>();
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOnLanes(
+                    sut,
+                    transport,
+                    request(),
+                    message -> {
+                        selected.add(message.payload()[0]);
+                        return message.payload()[0] % 2 == 1 ? a : b;
+                    },
+                    delivery -> handled.add(delivery.message().payload()[0])
+            );
+            for (byte value = 1; value <= 4; value++) {
+                transport.receive(publication(new byte[] {value}));
+            }
+            await().until(() -> actor.placedDeliveries() == 4);
+            assertThat(a.held()).isEqualTo(1);
+            assertThat(b.held()).isEqualTo(1);
+
+            // Act: lane b runs to the end before lane a starts.
+            b.runNext();
+            b.runNext();
+            a.runNext();
+            a.runNext();
+
+            // Assert: the selector saw each delivery once, in receive order. Each lane kept its
+            // own order with one task at a time, independently of the other lane.
+            assertThat(selected).containsExactly((byte) 1, (byte) 2, (byte) 3, (byte) 4);
+            assertThat(handled).containsExactly((byte) 2, (byte) 4, (byte) 1, (byte) 3);
+            assertThat(a.executions()).isEqualTo(2);
+            assertThat(b.executions()).isEqualTo(2);
+            assertThat(a.held()).isZero();
+            assertThat(b.held()).isZero();
+        }
+    }
+
+    @Test
+    void a_lane_selector_that_throws_fails_its_delivery_as_a_handler_failure() throws Exception {
+        // Arrange
+        var lane = new ManualExecutor();
+        var failure = new IllegalStateException("No lane for this message");
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeOnLanes(
+                    sut,
+                    transport,
+                    qosOneRequest(),
+                    _ -> {
+                        throw failure;
+                    },
+                    handled::add
+            );
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Assert: as with a failing handler, the failure ends the connection and the message
+            // is not acknowledged.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(transport.sent).isEmpty();
+            assertThat(handled).isEmpty();
+            assertThat(lane.executions()).isZero();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("NullAway") // Deliberately violates the selector's non-null contract.
+    void a_lane_selector_that_returns_null_fails_its_delivery_as_a_handler_failure()
+            throws Exception {
+        // Arrange
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeOnLanes(sut, transport, qosOneRequest(), _ -> null, handled::add);
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Assert: the null result fails the delivery as an exception would.
+            Disconnection end = requireNonNull(ends.poll(5, SECONDS));
+            assertThat(end.cause().orElseThrow()).isInstanceOf(NullPointerException.class);
+            assertThat(transport.sent).isEmpty();
+            assertThat(handled).isEmpty();
+        }
+    }
+
+    @Test
+    void a_handler_failure_on_one_lane_holds_the_other_lanes() throws Exception {
+        // Arrange: QoS 1 deliveries 1 and 2 wait on lanes a and b; the handler fails for 1.
+        var a = new ManualExecutor();
+        var b = new ManualExecutor();
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOnLanes(
+                    sut,
+                    transport,
+                    qosOneRequest(),
+                    message -> message.payload()[0] == 1 ? a : b,
+                    delivery -> {
+                        handled.add(delivery.message().payload()[0]);
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                    }
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+            transport.receive(qosOnePublication("messages", 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act: lane a fails first, and lane b's task runs afterwards.
+            a.runNext();
+            b.runNext();
+
+            // Assert: the failure ends the connection, and lane b runs nothing.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(handled).containsExactly((byte) 1);
+            assertThat(transport.sent).isEmpty();
+        }
+    }
+
+    @Test
+    void unsubscribe_runs_what_each_lane_accepted_before_the_subscription_terminates()
+            throws Exception {
+        // Arrange: deliveries 1 and 3 wait on lane a and 2 on lane b when removal is confirmed.
+        var a = new ManualExecutor();
+        var b = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeOnLanes(
+                    sut,
+                    transport,
+                    request(),
+                    message -> message.payload()[0] % 2 == 1 ? a : b,
+                    delivery -> handled.add(delivery.message().payload()[0])
+            );
+            for (byte value = 1; value <= 3; value++) {
+                transport.receive(publication(new byte[] {value}));
+            }
+            await().until(() -> actor.placedDeliveries() == 3);
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+            var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
+            removing.get(5, SECONDS);
+            CompletableFuture<Void> terminated = subscription.terminated();
+
+            // Act & Assert: each lane runs what it accepted, in order, and the subscription
+            // terminates only after the last of them.
+            a.runNext();
+            b.runNext();
+            assertThat(terminated).isNotDone();
+            a.runNext();
+            terminated.get(5, SECONDS);
+            assertThat(handled).containsExactly((byte) 1, (byte) 2, (byte) 3);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_a_lane_selector_still_choosing() throws Exception {
+        // Arrange: the selector keeps the dispatcher while it chooses a lane.
+        var lane = new ManualExecutor();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOnLanes(
+                    sut,
+                    transport,
+                    request(),
+                    _ -> {
+                        entered.countDown();
+                        waitFor(release);
+                        return lane;
+                    },
+                    _ -> { }
+            );
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the selector alone keeps termination pending.
+            // Its answer, given after the close, starts nothing on the executor.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+            assertThat(lane.executions()).isZero();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void close_starts_one_removal_without_waiting_or_retaining_operation_slots()
             throws Exception {
         // Arrange
@@ -6127,6 +6339,22 @@ class ClientActorTest {
         Subscription subscription = client.subscribe(
                 request,
                 DeliveryOptions.serial().withExecutor(executor),
+                handler
+        );
+        establish(transport, subscription);
+        return subscription;
+    }
+
+    private static Subscription subscribeOnLanes(
+            MqttClient client,
+            ScriptTransport transport,
+            Subscribe request,
+            Function<MqttMessage, Executor> selector,
+            Consumer<MqttDelivery> handler
+    ) throws Exception {
+        Subscription subscription = client.subscribe(
+                request,
+                DeliveryOptions.lanes(selector),
                 handler
         );
         establish(transport, subscription);

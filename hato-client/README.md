@@ -170,6 +170,24 @@ Subscription subscription = client.subscribe(
 - The executor stays yours: the client never shuts it down. Shut it down once
   `client.terminated()` completes; tasks it still holds then do nothing.
 
+To keep each device's messages in order while different devices run in parallel, pick a lane,
+an executor, for every message:
+
+```java
+Subscription subscription = client.subscribe(
+        Subscribe.of(new TopicFilter("devices/+/events"), Qos.AT_LEAST_ONCE),
+        DeliveryOptions.lanes(message -> laneFor(message.topic())),
+        delivery -> devices.apply(delivery.message())
+);
+```
+
+- Messages on the same lane run one at a time in arrival order, and different lanes run in
+  parallel. Return the same executor object for the same lane, such as one from a fixed set of
+  single-thread executors.
+- A lane function that throws or returns null fails that message as a throwing handler would.
+- Acknowledgements still leave in arrival order, so a slow lane holds back the acknowledgement
+  of later QoS 1 and 2 messages on other lanes.
+
 ## Receiving on your own threads
 
 Omit the handler to create a pull subscription. Call `receive()` from one or more

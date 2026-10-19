@@ -132,7 +132,7 @@ final class ListenerLane {
                 log.warn("Connection listener failed for {} at {}", clientId, endpoint, t);
             } finally {
                 // Interrupt state left by a callback must not reach the next queued callback.
-                Thread.interrupted();
+                boolean _ = Thread.interrupted();
             }
         }
     }

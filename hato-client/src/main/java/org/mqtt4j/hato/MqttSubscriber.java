@@ -88,9 +88,10 @@ public interface MqttSubscriber {
     Subscription subscribe(Subscribe request, Consumer<MqttDelivery> handler);
 
     /// Registers a push subscription like [#subscribe(Subscribe, Consumer)], except that `options`
-    /// decides where and how its handler runs; see [DeliveryOptions]. Every rule of that method
-    /// applies, including registration failures and how a handler failure stops the client, and
-    /// [DeliveryOptions#serial()] behaves exactly as it. Returns the handle immediately.
+    /// decides where and how its handler runs; see [DeliveryOptions]. Every other rule of that
+    /// method applies, including registration failures and how a handler failure stops the
+    /// client, and [DeliveryOptions#serial()] behaves exactly as it. Returns the handle
+    /// immediately.
     ///
     /// The default implementation throws [UnsupportedOperationException], so implementations of
     /// the subscribing role need not place handlers.

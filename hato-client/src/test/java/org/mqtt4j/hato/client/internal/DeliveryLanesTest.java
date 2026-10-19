@@ -23,6 +23,8 @@ import java.util.stream.LongStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.MqttDelivery;
@@ -546,7 +548,7 @@ class DeliveryLanesTest {
         try {
             assertThatThrownBy(receiver::receive).isInstanceOf(InterruptedException.class);
         } finally {
-            Thread.interrupted();
+            boolean _ = Thread.interrupted();
         }
         assertThat(received(receiver.receive(Duration.ofSeconds(Long.MAX_VALUE))).message())
                 .isEqualTo(message(1));
@@ -1855,6 +1857,98 @@ class DeliveryLanesTest {
         assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
         assertThat(handled).containsExactly((byte) 1, (byte) 2);
         assertThat(sut.retainedLanes()).isZero();
+    }
+
+    @Test
+    void a_failure_that_is_only_logged_does_not_lift_the_stop_of_another_lanes_failure()
+            throws Exception {
+        // Arrange: the first failure stops the subscription, and later ones are only logged.
+        // Lane b's first handler waits while lane a's fails; b's second delivery waits behind it.
+        var reported = new LinkedBlockingQueue<Throwable>();
+        var first = new AtomicBoolean(true);
+        DeliveryLanes sut = lanes(BYTE_LIMIT, () -> { }, (_, cause) -> {
+            reported.add(cause);
+            return first.getAndSet(false);
+        });
+        var a = new ManualExecutor();
+        var b = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var stopping = new IllegalStateException("lane a failed");
+        var logged = new IllegalStateException("lane b failed");
+        var execution = new HandlerExecution.Lanes(message -> message.payload()[0] == 1 ? a : b);
+        assertThat(sut.register(1, request(3), execution, delivery -> {
+            byte value = delivery.message().payload()[0];
+            handled.add(value);
+            if (value == 1) {
+                throw stopping;
+            }
+            if (value == 2) {
+                entered.countDown();
+                waitFor(release);
+                throw logged;
+            }
+        })).isTrue();
+        for (int value = 1; value <= 3; value++) {
+            assertThat(sut.deliver(token(1, 0), List.of(1L), message(value), false, 10)).isTrue();
+        }
+        await().until(() -> sut.placedDeliveries() == 3);
+        Thread laneB = Thread.ofVirtual().start(b::runNext);
+        assertThat(entered.await(5, SECONDS)).isTrue();
+        a.runNext();
+
+        // Act: lane b's handler fails after lane a's failure has stopped the subscription.
+        release.countDown();
+        assertThat(laneB.join(Duration.ofSeconds(5))).isTrue();
+
+        // Assert: lane b's task asks for nothing more, so its waiting delivery stays held.
+        assertThat(reported).containsExactly(stopping, logged);
+        assertThat(b.held()).isZero();
+        assertThat(handled).containsExactly((byte) 2, (byte) 1);
+    }
+
+    @ParameterizedTest(name = "selector fails: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_lane_chosen_for_a_delivery_that_the_connection_end_discarded_is_dropped(boolean fails)
+            throws Exception {
+        // Arrange: the selector is still choosing a lane for the first delivery when its
+        // connection ends; it then returns a lane or fails.
+        var lane = new ManualExecutor();
+        var selected = new LinkedBlockingQueue<Byte>();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var execution = new HandlerExecution.Lanes(message -> {
+            byte value = message.payload()[0];
+            selected.add(value);
+            if (value == 1) {
+                entered.countDown();
+                waitFor(release);
+                if (fails) {
+                    throw new IllegalStateException("No lane after the connection ended");
+                }
+            }
+            return lane;
+        });
+        assertThat(sut.register(1, request(2), execution, delivery -> {
+            handled.add(delivery.message().payload()[0]);
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(entered.await(5, SECONDS)).isTrue();
+        sut.connectionEnded(false, false);
+
+        // Act: the selector answers after the connection's end, and the next connection
+        // delivers.
+        release.countDown();
+        assertThat(sut.deliver(token(2, 0), List.of(1L), message(2), false, 10)).isTrue();
+        lane.runNext();
+
+        // Assert: the discarded delivery got no lane and no failure; the next one ran.
+        assertThat(selected).containsExactly((byte) 1, (byte) 2);
+        assertThat(handled).containsExactly((byte) 2);
+        assertThat(sut.discardedDeliveries()).isEqualTo(1);
+        assertThat(sut.reportedFailures()).isZero();
     }
 
     private record Failure(DeliveryToken token, Throwable cause) {
