@@ -3,6 +3,7 @@ package org.mqtt4j.hato.client.internal;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -411,7 +412,11 @@ final class DeliveryLanes {
         }
     }
 
-    /// Reserves every matching lane together so overload cannot deliver only part of a fan-out.
+    /// Admits a received publication to its matching lanes. Returns false when it does not fit
+    /// and overload must end the connection, which only a QoS 1 or 2 publication does: it
+    /// reserves every matching lane together, so overload cannot deliver only part of a fan-out.
+    /// A QoS 0 publication carries no acknowledgement token, and overflow drops it instead; see
+    /// [#deliverAtMostOnce].
     boolean deliver(
             DeliveryToken token,
             List<Long> ids,
@@ -419,6 +424,10 @@ final class DeliveryLanes {
             boolean dup,
             int bytes
     ) {
+        if (token.acknowledgement() == 0) {
+            deliverAtMostOnce(token, ids, message, dup, bytes);
+            return true;
+        }
         boolean ready;
         lock.lock();
         try {
@@ -461,11 +470,10 @@ final class DeliveryLanes {
             RetainedDelivery retained = requireNonNull(delivery);
             long addedBytes = recipients.isEmpty() || !retained.views.isEmpty()
                     ? 0 : retained.bytes;
-            if (recipients.size() > DELIVERY_LIMIT - retainedDeliveries
-                    || addedBytes > byteLimit - retainedBytes) {
+            if (!fits(recipients.size(), addedBytes)) {
                 return false;
             }
-            if (first && token.acknowledgement() != 0) {
+            if (first) {
                 acknowledging.put(token.acknowledgement(), retained);
             }
             for (Recipient recipient : abandoned) {
@@ -481,7 +489,7 @@ final class DeliveryLanes {
                 for (int index = 0; index < recipients.size(); index++) {
                     Lane lane = recipients.get(index);
                     Recipient recipient = states.get(index);
-                    if (first && token.acknowledgement() != 0) {
+                    if (first) {
                         retained.recipients.put(recipient.id, recipient);
                         retained.pending++;
                     }
@@ -492,27 +500,116 @@ final class DeliveryLanes {
                             requireNonNull(retained.message),
                             dup
                     );
-                    if (token.acknowledgement() != 0 && lane.ackMode == AckMode.MANUAL) {
+                    if (lane.ackMode == AckMode.MANUAL) {
                         view.acknowledgement = () -> acknowledge(view);
                     }
-                    retained.views.add(view);
-                    recipient.queued = true;
-                    lane.retained++;
-                    lane.queue.addLast(view);
-                    lane.ready.signal();
+                    enqueue(lane, view);
                 }
             }
             ready = recipients.isEmpty() && retained.pending == 0;
-            if (ready && token.acknowledgement() != 0) {
+            if (ready) {
                 readyTokens.add(token.acknowledgement());
             }
         } finally {
             lock.unlock();
         }
-        if (ready && token.acknowledgement() != 0) {
+        if (ready) {
             onReady.run();
         }
         return true;
+    }
+
+    /// Admits a QoS 0 publication. It holds back no acknowledgement, so overflow drops it rather
+    /// than ending the connection: a full lane misses this arrival while the other lanes take it,
+    /// and an arrival that does not fit the client's limits reaches no lane, rather than only the
+    /// lanes that would fit. Deliveries already waiting are never evicted.
+    private void deliverAtMostOnce(
+            DeliveryToken token,
+            List<Long> ids,
+            MqttMessage message,
+            boolean dup,
+            int bytes
+    ) {
+        var overflows = new ArrayList<Overflow>();
+        lock.lock();
+        try {
+            var recipients = new ArrayList<Lane>();
+            for (long id : ids) {
+                Lane lane = lanes.get(id);
+                // A lane awaiting removal admits nothing new.
+                if (lane == null || lane.paused) {
+                    continue;
+                }
+                if (lane.retained < lane.capacity) {
+                    recipients.add(lane);
+                } else {
+                    overflows.add(overflow(lane, Dropped.SUBSCRIPTION_FULL));
+                }
+            }
+            if (!recipients.isEmpty()) {
+                if (fits(recipients.size(), bytes)) {
+                    var delivery = new RetainedDelivery(token, bytes);
+                    delivery.message = message;
+                    retainedBytes += bytes;
+                    retainedDeliveries += recipients.size();
+                    for (Lane lane : recipients) {
+                        var view = new DeliveryView(
+                                delivery,
+                                new Recipient(lane.id),
+                                lane,
+                                message,
+                                dup
+                        );
+                        enqueue(lane, view);
+                    }
+                } else {
+                    for (Lane lane : recipients) {
+                        overflows.add(overflow(lane, Dropped.CLIENT_FULL));
+                    }
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+        for (Overflow overflow : overflows) {
+            logOverflow(overflow);
+        }
+    }
+
+    /// Caller holds lock. Whether the client's limits leave room for `deliveries` more deliveries
+    /// that add `bytes` more bytes.
+    private boolean fits(int deliveries, long bytes) {
+        return deliveries <= DELIVERY_LIMIT - retainedDeliveries
+                && bytes <= byteLimit - retainedBytes;
+    }
+
+    /// Caller holds lock. Queues a new view on `lane` and wakes the lane's dispatcher or receiver.
+    private void enqueue(Lane lane, DeliveryView view) {
+        view.delivery.views.add(view);
+        view.recipient.queued = true;
+        lane.retained++;
+        lane.queue.addLast(view);
+        lane.ready.signal();
+    }
+
+    /// Caller holds lock. Counts a QoS 0 delivery that overflow kept from `lane`. The lane's first
+    /// one for `reason` is logged at warning level.
+    private Overflow overflow(Lane lane, Dropped reason) {
+        drop(lane, reason);
+        return new Overflow(lane.id, reason, lane.warned.add(reason));
+    }
+
+    private void logOverflow(Overflow overflow) {
+        String cause = overflow.reason() == Dropped.SUBSCRIPTION_FULL
+                ? "the subscription's buffer is full"
+                : "the client's delivery buffers are full";
+        if (overflow.first()) {
+            log.warn("Dropped a QoS 0 delivery for {} (subscription {}): {}; later ones are "
+                    + "logged at debug level", clientId, overflow.id(), cause);
+        } else {
+            log.debug("Dropped a QoS 0 delivery for {} (subscription {}): {}",
+                    clientId, overflow.id(), cause);
+        }
     }
 
     /// Takes one finite snapshot. A concurrent completion belongs to this or the next wake;
@@ -1051,8 +1148,7 @@ final class DeliveryLanes {
             } else {
                 ready = markReady(view);
                 releaseView(view);
-                firstSkip = !lane.skipLogged;
-                lane.skipLogged = true;
+                firstSkip = lane.warned.add(Dropped.FAILED);
             }
         } finally {
             lock.unlock();
@@ -1442,8 +1538,9 @@ final class DeliveryLanes {
         boolean finishing;
         boolean stopped;
         boolean failed;
-        // Set once the first skipped failure has been logged at warning level.
-        boolean skipLogged;
+        // Reasons whose first drop from this lane has been logged at warning level; later drops
+        // for the same reason are logged at debug level.
+        final Set<Dropped> warned = EnumSet.noneOf(Dropped.class);
         @Nullable Throwable failure;
 
         Lane(
@@ -1527,8 +1624,17 @@ final class DeliveryLanes {
         CONNECTION_ENDED,
 
         /// A stop of its subscription discarded it while it waited.
-        SUBSCRIPTION_STOPPED
+        SUBSCRIPTION_STOPPED,
+
+        /// A QoS 0 delivery found its subscription's buffer full.
+        SUBSCRIPTION_FULL,
+
+        /// A QoS 0 delivery did not fit the client's limits on deliveries and bytes.
+        CLIENT_FULL
     }
+
+    /// A QoS 0 delivery that overflow kept from the lane `id`, logged after the lock is released.
+    private record Overflow(long id, Dropped reason, boolean first) {}
 
     /// A delivery taken from its lane's queue. `ready` says whether taking it met the last
     /// acknowledgement condition of its receipt, which `execute` announces without the lock.

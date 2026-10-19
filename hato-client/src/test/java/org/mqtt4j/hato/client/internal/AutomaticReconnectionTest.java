@@ -813,26 +813,26 @@ class AutomaticReconnectionTest {
     @Test
     void overload_reconnects_and_connections_that_end_quickly_keep_growing_the_delay()
             throws Exception {
-        // Arrange: a blocked handler with room for one delivery.
+        // Arrange: a blocked handler with room for one QoS 1 delivery.
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             Subscription slow = sut.subscribe(
-                    Subscribe.of(new TopicFilter("burst"), Qos.AT_MOST_ONCE).withBufferCapacity(1),
+                    Subscribe.of(new TopicFilter("burst"), Qos.AT_LEAST_ONCE).withBufferCapacity(1),
                     _ -> waitFor(release)
             );
             establish(transport, slow);
             listener.next();
 
             // Act: the second delivery overloads the subscription.
-            for (int i = 0; i < 2; i++) {
+            for (int packetId = 1; packetId <= 2; packetId++) {
                 transport.receive(new Packet.Publish(
                         new Topic("burst"),
                         new byte[] {1},
-                        Qos.AT_MOST_ONCE,
+                        Qos.AT_LEAST_ONCE,
                         false,
                         false,
-                        0,
+                        packetId,
                         EMPTY
                 ));
             }

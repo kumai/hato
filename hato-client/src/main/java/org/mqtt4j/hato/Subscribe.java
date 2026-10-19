@@ -101,8 +101,17 @@ public final class Subscribe {
     /// count queued deliveries and QoS 1/2 MANUAL deliveries awaiting ack; ON_RECEIVE and QoS 0
     /// release the slot at handoff. Push subscriptions also count running handlers and deliveries
     /// whose PUBACK or PUBREC is pending; see [AckMode]. The client also bounds deliveries and
-    /// bytes held across all of its subscriptions. A message that exceeds any of these bounds
-    /// ends the connection.
+    /// bytes held across all of its subscriptions.
+    ///
+    /// What happens beyond these bounds depends on the QoS of the received message, which can
+    /// exceed the requested one when another subscription of the client also matches. A QoS 0
+    /// message that finds this subscription full is dropped for this subscription only, and
+    /// other matching subscriptions still receive it. One that does not fit the client's bounds
+    /// is dropped for every subscription. Waiting deliveries are kept, and the connection goes
+    /// on. Drops are logged as a warning the first time for each subscription and bound, and at
+    /// debug level after that. A QoS 1 or 2 message that exceeds any bound ends the connection
+    /// instead. A small capacity for QoS 0 subscriptions leaves room in the client's bounds for
+    /// QoS 1 and 2 messages.
     public int bufferCapacity() {
         return bufferCapacity;
     }

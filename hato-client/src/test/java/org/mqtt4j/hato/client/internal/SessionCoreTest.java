@@ -2012,8 +2012,9 @@ class SessionCoreTest {
         sut.subscribe(2, subscription("a/#"));
         port.acceptDelivery = false;
 
-        // Act: incoming delivery never waits for an application handler to free capacity.
-        receive(1, publication(), 0);
+        // Act: incoming delivery never waits for an application handler to free capacity. Only a
+        // QoS 1 or 2 delivery can find it exhausted; overflow drops QoS 0 instead.
+        receive(1, qosOnePublication(7, "a/b", false), 0);
 
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);

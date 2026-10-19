@@ -127,7 +127,9 @@ subscription.unsubscribe().join();
 - While the handler is busy, new messages for the subscription wait in a queue of
   1,024, which also holds QoS 1 and 2 messages until they are acknowledged. Messages can arrive
   all at once, such as retained messages when you subscribe, so size the queue for them:
-  `Subscribe.of(filter, qos).withBufferCapacity(4096)`.
+  `Subscribe.of(filter, qos).withBufferCapacity(4096)`. A QoS 0 message that finds the queue
+  full is dropped and logged, and the subscription goes on; a QoS 1 or 2 message ends the
+  connection instead, as described below.
 - `unsubscribe()` stops new messages and lets the queued ones finish; its future tells you
   when the broker has removed the subscription. `subscription.close()` instead stops delivery
   at once and drops queued messages without waiting for the broker. Either way,
@@ -285,9 +287,9 @@ Besides broker and network failures, the client itself ends the connection when:
   before a reconnection in a persistent session, or the executor that runs it refuses its
   task. The client then stops reconnecting until you call `connect()` again, and a
   persistent session gets the message again from the broker.
-- a subscription's queue fills up, for example with messages waiting for
-  `delivery.ack()`, or too many QoS 1 and 2 messages wait behind one that is not yet
-  acknowledged, rather than buffering without limit.
+- a QoS 1 or 2 message arrives for a subscription whose queue is full, for example with
+  messages waiting for `delivery.ack()`, or too many QoS 1 and 2 messages wait behind one that
+  is not yet acknowledged, rather than buffering without limit.
 
 A handler failure that holds back nothing, such as one for a QoS 0 message, is skipped: the
 client logs it and the subscription goes on. To skip failed QoS 1 and 2 messages too,

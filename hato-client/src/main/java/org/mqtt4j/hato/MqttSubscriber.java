@@ -47,7 +47,8 @@ public interface MqttSubscriber {
     /// subscription's order and holds back its acknowledgement meanwhile. To give up a message,
     /// catch the failure and return normally, call [MqttDelivery#ack()] with [AckMode#MANUAL], or
     /// use [FailurePolicy#SKIP]; the message then counts as handled.
-    /// Exhausted receive capacity also ends the connection.
+    /// A QoS 1 or 2 message that exhausts receive capacity also ends the connection, while a
+    /// QoS 0 one is dropped; see [Subscribe#bufferCapacity()].
     /// On connection termination, queued deliveries are discarded; a running handler can finish.
     /// A subscription survives termination and resumes on the same handle after
     /// the client's next connection, including an automatic reconnection. New deliveries wait

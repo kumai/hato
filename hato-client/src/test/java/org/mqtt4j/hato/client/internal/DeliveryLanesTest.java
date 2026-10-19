@@ -694,23 +694,26 @@ class DeliveryLanesTest {
         assertThat(sut.deliver(token(1, 0), List.of(1L), first, false, 10)).isTrue();
         assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(first);
         assertThat(sut.deliver(token(1, 0), List.of(1L), second, false, 20)).isTrue();
-        assertThat(sut.deliver(token(1, 0), List.of(1L), message(3), false, 30)).isFalse();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(3), false, 30)).isTrue();
 
-        // Assert: the second handler waits for the first, with both reservations retained.
+        // Assert: the second handler waits for the first, with both reservations retained, and
+        // the third QoS 0 delivery found no slot and was dropped.
         assertThat(virtual.get()).isTrue();
         assertThat(entered).isEmpty();
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
         assertThat(sut.retainedBytes()).isEqualTo(30);
+        assertThat(sut.dropped(1, Dropped.SUBSCRIPTION_FULL)).isEqualTo(1);
 
         // Act: returning the first handler lets the queued delivery run.
         release.countDown();
 
-        // Assert
+        // Assert: the waiting delivery runs, and the dropped one never does.
         MqttDelivery received = requireNonNull(entered.poll(5, SECONDS));
         assertThat(received.message()).isEqualTo(second);
         assertThat(received.dup()).isFalse();
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
         assertThat(sut.retainedBytes()).isZero();
+        assertThat(entered).isEmpty();
     }
 
     @Test
@@ -820,7 +823,32 @@ class DeliveryLanesTest {
     }
 
     @Test
-    void fanout_reserves_all_recipients_or_none() throws Exception {
+    void a_qos_1_fan_out_reserves_all_recipients_or_none() throws Exception {
+        // Arrange: the first lane is full and the second lane is empty.
+        var entered = new LinkedBlockingQueue<Long>();
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(1), _ -> {
+            entered.add(1L);
+            waitFor(release);
+        })).isTrue();
+        assertThat(sut.register(2, request(1), _ -> entered.add(2L))).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(1), false, 10)).isTrue();
+        assertThat(entered.poll(5, SECONDS)).isEqualTo(1L);
+
+        // Act & Assert: discovering the full lane second does not reserve the empty one.
+        assertThat(sut.deliver(token(1, 11), List.of(2L, 1L), qosOneMessage(2), false, 20))
+                .isFalse();
+        assertThat(sut.retainedDeliveries()).isEqualTo(1);
+        assertThat(sut.retainedBytes()).isEqualTo(10);
+        assertThat(entered).isEmpty();
+
+        // Act & Assert: refusing the fan-out leaves the empty lane's capacity available.
+        assertThat(sut.deliver(token(1, 12), List.of(2L), qosOneMessage(3), false, 30)).isTrue();
+        assertThat(entered.poll(5, SECONDS)).isEqualTo(2L);
+    }
+
+    @Test
+    void a_qos_0_fan_out_skips_only_its_full_lane() throws Exception {
         // Arrange: the first lane is full and the second lane is empty.
         var entered = new LinkedBlockingQueue<Long>();
         CountDownLatch release = release();
@@ -832,15 +860,16 @@ class DeliveryLanesTest {
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isEqualTo(1L);
 
-        // Act & Assert: discovering the full lane second does not reserve the empty one.
-        assertThat(sut.deliver(token(1, 0), List.of(2L, 1L), message(2), false, 20)).isFalse();
-        assertThat(sut.retainedDeliveries()).isEqualTo(1);
-        assertThat(sut.retainedBytes()).isEqualTo(10);
-        assertThat(entered).isEmpty();
+        // Act
+        assertThat(sut.deliver(token(1, 0), List.of(2L, 1L), message(2), false, 20)).isTrue();
 
-        // Act & Assert: refusing the fan-out leaves the empty lane's capacity available.
-        assertThat(sut.deliver(token(1, 0), List.of(2L), message(3), false, 30)).isTrue();
+        // Assert: only the full lane misses the publication; the other lane runs it.
         assertThat(entered.poll(5, SECONDS)).isEqualTo(2L);
+        assertThat(sut.dropped(1, Dropped.SUBSCRIPTION_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(2, Dropped.SUBSCRIPTION_FULL)).isZero();
+        release.countDown();
+        await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
+        assertThat(entered).isEmpty();
     }
 
     @Test
@@ -864,16 +893,19 @@ class DeliveryLanesTest {
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
         assertThat(sut.retainedBytes()).isEqualTo(BYTE_LIMIT);
 
-        // Act & Assert: returning only one handler keeps the shared byte reservation.
+        // Act & Assert: returning only one handler keeps the shared byte reservation, so a QoS 0
+        // delivery that needs one more byte is dropped.
         firstRelease.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isEqualTo(1));
         assertThat(sut.retainedBytes()).isEqualTo(BYTE_LIMIT);
-        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 1)).isFalse();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 1)).isTrue();
+        assertThat(sut.dropped(1, Dropped.CLIENT_FULL)).isEqualTo(1);
 
         // Act & Assert: the last handler returns the shared capacity.
         secondRelease.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 1)).isTrue();
+        assertThat(sut.dropped(Dropped.CLIENT_FULL)).isEqualTo(1);
     }
 
     @Test
@@ -884,11 +916,11 @@ class DeliveryLanesTest {
         assertThat(sut.register(1, request(2), _ -> waitFor(release))).isTrue();
 
         // Act & Assert: rejection preserves capacity for a packet at the configured limit.
-        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, BYTE_LIMIT + 2))
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, BYTE_LIMIT + 2))
                 .isFalse();
         assertThat(sut.retainedBytes()).isZero();
         assertThat(sut.retainedDeliveries()).isZero();
-        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, BYTE_LIMIT + 1))
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, BYTE_LIMIT + 1))
                 .isTrue();
     }
 
@@ -958,16 +990,19 @@ class DeliveryLanesTest {
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, BYTE_LIMIT)).isTrue();
         assertThat(entered.await(5, SECONDS)).isTrue();
 
-        // Act & Assert: a new generation cannot reuse the old handler's byte reservation.
+        // Act & Assert: a new generation cannot reuse the old handler's byte reservation, so its
+        // QoS 0 delivery is dropped.
         sut.connectionEnded(false, false);
         assertThat(sut.register(2, request(2), _ -> { })).isTrue();
-        assertThat(sut.deliver(token(2, 0), List.of(2L), message(2), false, 1)).isFalse();
+        assertThat(sut.deliver(token(2, 0), List.of(2L), message(2), false, 1)).isTrue();
+        assertThat(sut.dropped(2, Dropped.CLIENT_FULL)).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(BYTE_LIMIT);
 
         // Act & Assert: returning the old handler permits delivery in the new generation.
         release.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
         assertThat(sut.deliver(token(2, 0), List.of(2L), message(2), false, 1)).isTrue();
+        assertThat(sut.dropped(2, Dropped.CLIENT_FULL)).isEqualTo(1);
     }
 
     @Test
@@ -984,8 +1019,12 @@ class DeliveryLanesTest {
         }
         assertThat(entered.await(5, SECONDS)).isTrue();
 
-        // Act & Assert: the global limit applies even though the lane has spare capacity.
-        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isFalse();
+        // Act & Assert: the global limit applies even though the lane has spare capacity. A QoS 0
+        // delivery is dropped, and a QoS 1 delivery behind the QoS 0 backlog is refused, which
+        // ends the connection.
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
+        assertThat(sut.dropped(1, Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 1)).isFalse();
         assertThat(sut.retainedDeliveries()).isEqualTo(65_536);
 
         // Act
@@ -995,6 +1034,37 @@ class DeliveryLanesTest {
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(1);
         assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isEqualTo(65_535);
+    }
+
+    @Test
+    void a_qos_0_publication_reaches_no_lane_when_the_client_has_room_for_only_some()
+            throws Exception {
+        // Arrange: all but one of the client's delivery budget waits behind a running handler.
+        var entered = new CountDownLatch(1);
+        var handled = new LinkedBlockingQueue<MqttMessage>();
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(70_000), _ -> {
+            entered.countDown();
+            waitFor(release);
+        })).isTrue();
+        assertThat(sut.register(2, request(1), delivery -> handled.add(delivery.message())))
+                .isTrue();
+        for (int i = 0; i < 65_535; i++) {
+            assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
+        }
+        assertThat(entered.await(5, SECONDS)).isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 0), List.of(1L, 2L), message(2), false, 1)).isTrue();
+
+        // Assert: the publication reaches neither lane rather than the one that would fit, and
+        // a later one for the second lane alone fits.
+        assertThat(sut.retainedDeliveries()).isEqualTo(65_535);
+        assertThat(sut.dropped(1, Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(2, Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(3), false, 1)).isTrue();
+        assertThat(handled.poll(5, SECONDS)).isEqualTo(message(3));
+        assertThat(handled).isEmpty();
     }
 
     @Test

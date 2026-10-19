@@ -13,6 +13,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
@@ -736,7 +737,7 @@ abstract class MessagingTest {
 
     @Test
     void receive_overload_closes_without_waiting_for_the_running_handler() throws Exception {
-        // Arrange
+        // Arrange: QoS 1 messages, which overflow cannot drop as it drops QoS 0.
         String topic = uniqueTopic();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -746,7 +747,7 @@ abstract class MessagingTest {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
             sut.subscribe(
-                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE).withBufferCapacity(1),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE).withBufferCapacity(1),
                     _ -> {
                         entered.countDown();
                         try {
@@ -759,11 +760,11 @@ abstract class MessagingTest {
                         }
                     }
             ).established().get(5, SECONDS);
-            publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
+            publisher.publish(message(topic, (byte) 1).withQos(Qos.AT_LEAST_ONCE)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
             // Act: the running handler still owns the only receive slot.
-            publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
+            publisher.publish(message(topic, (byte) 2).withQos(Qos.AT_LEAST_ONCE)).get(5, SECONDS);
             Disconnection disconnection = requireNonNull(ended.poll(5, SECONDS));
 
             // Assert: shutdown progresses while application code is blocked.
@@ -782,7 +783,8 @@ abstract class MessagingTest {
 
     @Test
     void receive_overload_reconnects_and_the_subscription_continues() throws Exception {
-        // Arrange: a client on manual time whose handler blocks with room for one delivery.
+        // Arrange: a client on manual time whose handler blocks with room for one QoS 1
+        // delivery.
         String topic = uniqueTopic();
         var clock = new ManualTimerScheduler();
         var entered = new CountDownLatch(1);
@@ -803,7 +805,7 @@ abstract class MessagingTest {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
             Subscription subscription = sut.subscribe(
-                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE).withBufferCapacity(1),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE).withBufferCapacity(1),
                     delivery -> {
                         payloads.add(delivery.message().payload()[0]);
                         if (entered.getCount() > 0) {
@@ -813,11 +815,11 @@ abstract class MessagingTest {
                     }
             );
             subscription.established().get(5, SECONDS);
-            publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
+            publisher.publish(message(topic, (byte) 1).withQos(Qos.AT_LEAST_ONCE)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
             // Act: the second delivery overloads the subscription, and the delay passes.
-            publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
+            publisher.publish(message(topic, (byte) 2).withQos(Qos.AT_LEAST_ONCE)).get(5, SECONDS);
             Disconnection end = requireNonNull(ended.poll(5, SECONDS));
             release.countDown();
             clock.advance(Duration.ofSeconds(1));
@@ -867,50 +869,55 @@ abstract class MessagingTest {
     @Test
     @Timeout(60)
     @SuppressWarnings("try") // Explicit close verifies final release of the retained subscriptions.
-    void a_blocked_handler_overflows_its_default_queue_and_keeps_its_subscription()
-            throws Exception {
+    void a_blocked_handler_drops_qos_0_messages_beyond_its_default_queue() throws Exception {
         // Arrange: the handler holds the first publication before any other one is sent.
-        String topic = uniqueTopic();
+        String base = uniqueTopic();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
+        var barrier = new CountDownLatch(1);
+        var handled = new AtomicInteger();
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (MqttClient sut = client(ended::add); MqttClient publisher = client()) {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
             sut.subscribe(
-                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(base + "/barrier"), Qos.AT_MOST_ONCE),
+                    _ -> barrier.countDown()
+            ).established().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(base + "/work"), Qos.AT_MOST_ONCE),
                     _ -> {
+                        handled.incrementAndGet();
                         entered.countDown();
                         waitFor(release);
                     }
             ).established().get(5, SECONDS);
-            publisher.publish(message(topic, (byte) 0)).get(5, SECONDS);
+            publisher.publish(message(base + "/work", (byte) 0)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
-            // Act: more publications than the default queue holds arrive behind the handler.
-            // Each QoS 1 publication waits for the broker, so none piles up there instead.
-            var publication = MqttMessage.of(new Topic(topic), new byte[] {1},
+            // Act: more publications than the default queue holds arrive behind the handler, as
+            // QoS 0 for the QoS 0 subscription. Each QoS 1 publication waits for the broker, so
+            // none piles up there instead. The barrier follows them through the broker and the
+            // client.
+            var publication = MqttMessage.of(new Topic(base + "/work"), new byte[] {1},
                     Qos.AT_LEAST_ONCE, false);
-            for (int i = 0; i < 2_000 && ended.isEmpty(); i++) {
+            for (int i = 0; i < 2_000; i++) {
                 publisher.publish(publication).get(5, SECONDS);
             }
+            publisher.publish(message(base + "/barrier", (byte) 0)).get(5, SECONDS);
+            assertThat(barrier.await(5, SECONDS)).isTrue();
 
-            // Assert: overload discards queued work while the running handler keeps its delivery.
-            assertThat(requireNonNull(ended.poll(10, SECONDS)).cause().orElseThrow())
-                    .isInstanceOf(MqttCapacityException.class);
-            await().untilAsserted(() -> assertThat(usage(sut))
-                    .extracting(
-                            ClientActor.Usage::operations,
-                            ClientActor.Usage::notifications,
-                            ClientActor.Usage::mailboxEvents,
-                            ClientActor.Usage::sends,
-                            ClientActor.Usage::lanes,
-                            ClientActor.Usage::deliveries
-                    )
-                    .containsExactly(0, 0, 0, 0, 1, 1));
+            // Assert: the queue holds 1,024 deliveries, the running one included, and drops the
+            // rest without ending the connection. They all run once the handler returns, and a
+            // later message fits again.
+            await().untilAsserted(() -> assertThat(usage(sut).deliveries()).isEqualTo(1_024));
             release.countDown();
+            await().untilAsserted(() -> assertThat(handled).hasValue(1_024));
             await().untilAsserted(() -> assertThat(usage(sut))
-                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 1, 0, 0, 0)));
+                    .isEqualTo(new ClientActor.Usage(0, 0, 0, 0, 0, 0, 2, 0, 0, 0)));
+            publisher.publish(message(base + "/work", (byte) 2)).get(5, SECONDS);
+            await().untilAsserted(() -> assertThat(handled).hasValue(1_025));
+            assertThat(ended).isEmpty();
             sut.close();
             await().untilAsserted(() -> assertThat(usage(sut)).isEqualTo(NOTHING_HELD));
         } finally {
@@ -979,7 +986,8 @@ abstract class MessagingTest {
     @Test
     @SuppressWarnings("try") // Explicit close verifies final release of the retained subscriptions.
     void overload_releases_a_handler_waiting_for_its_own_publication() throws Exception {
-        // Arrange: delayed input lets an overflowing publication precede the handler's PUBACK.
+        // Arrange: delayed input lets an overflowing QoS 1 publication precede the handler's
+        // PUBACK. The work subscription takes QoS 1 so that publication arrives as QoS 1.
         String base = uniqueTopic();
         var scheduler = new ManualTimerScheduler();
         var transport = new AtomicReference<FaultyTransport>();
@@ -1014,7 +1022,7 @@ abstract class MessagingTest {
                     _ -> barrier.countDown()
             ).established().get(5, SECONDS);
             sut.subscribe(
-                    Subscribe.of(new TopicFilter(base + "/work"), Qos.AT_MOST_ONCE)
+                    Subscribe.of(new TopicFilter(base + "/work"), Qos.AT_LEAST_ONCE)
                             .withBufferCapacity(4),
                     delivery -> {
                         if (delivery.message().payload()[0] == 0) {
@@ -1038,7 +1046,8 @@ abstract class MessagingTest {
             publisher.publish(message(base + "/barrier", (byte) 0)).get(5, SECONDS);
             assertThat(barrier.await(5, SECONDS)).isTrue();
             requireNonNull(transport.get()).receiveDelay(Duration.ofSeconds(30));
-            publisher.publish(message(base + "/work", (byte) 4)).get(5, SECONDS);
+            publisher.publish(message(base + "/work", (byte) 4).withQos(Qos.AT_LEAST_ONCE))
+                    .get(5, SECONDS);
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
             release.countDown();
             // The broker has the handler's publication, so the handler now waits for PUBACK.

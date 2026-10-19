@@ -779,7 +779,28 @@ class ClientActorTest {
     @Test
     void pull_buffer_overflow_reports_the_cause_without_ending_receivers()
             throws Exception {
-        // Arrange
+        // Arrange: an unreceived QoS 1 delivery fills the subscription's only slot.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribePull(
+                    sut, transport, qosOneRequest().withBufferCapacity(1)
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Act
+            transport.receive(qosOnePublication("messages", 2, false));
+
+            // Assert: overload goes to the listener while the receiver can resume later.
+            Throwable cause = requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow();
+            assertThat(cause).isInstanceOf(MqttCapacityException.class);
+            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+        }
+    }
+
+    @Test
+    void a_full_qos_0_pull_subscription_drops_new_messages_and_keeps_receiving()
+            throws Exception {
+        // Arrange: an unreceived delivery fills the subscription's only slot.
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             Subscription subscription = subscribePull(
@@ -789,11 +810,18 @@ class ClientActorTest {
 
             // Act
             transport.receive(publication(new byte[] {2}));
+            // This command follows the publication through the mailbox, so it completes after
+            // routing.
+            sut.publish(message(new byte[0])).get(5, SECONDS);
 
-            // Assert: overload goes to the listener while the receiver can resume later.
-            Throwable cause = requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow();
-            assertThat(cause).isInstanceOf(MqttCapacityException.class);
-            assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+            // Assert: the message that found the subscription full was dropped, and the
+            // connection goes on: the waiting message is received, and a later one fits again.
+            assertThat(received(subscription.receive(Duration.ofSeconds(5))).message().payload())
+                    .containsExactly(1);
+            transport.receive(publication(new byte[] {3}));
+            assertThat(received(subscription.receive(Duration.ofSeconds(5))).message().payload())
+                    .containsExactly(3);
+            assertThat(ends).isEmpty();
         }
     }
 
@@ -3482,7 +3510,8 @@ class ClientActorTest {
     @Test
     void unsubscribe_stops_delivery_of_a_publication_queued_before_the_call()
             throws Exception {
-        // Arrange: the handler holds the only delivery slot of its subscription.
+        // Arrange: the handler holds the only delivery slot of its subscription. The messages are
+        // QoS 1, so a full lane would end the connection rather than drop them.
         var handlerEntered = new CountDownLatch(1);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
@@ -3490,7 +3519,7 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             Subscription subscription = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
                             .withBufferCapacity(1),
                     _ -> {
                         handlerEntered.countDown();
@@ -3498,10 +3527,10 @@ class ClientActorTest {
                     }
             );
             establish(transport, subscription);
-            transport.receive(publication(new byte[] {1}));
+            transport.receive(qosOnePublication("messages", 1, false));
             assertThat(handlerEntered.await(5, SECONDS)).isTrue();
             holdActor(transport, actorHeld, releaseActor);
-            transport.receive(publication(new byte[] {2}));
+            transport.receive(qosOnePublication("messages", 2, false));
 
             // Act: the call precedes the actor's handling of the queued publication.
             CompletableFuture<Void> unsubscribing = subscription.unsubscribe();
@@ -3630,7 +3659,7 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             Subscription subscription = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
                             .withBufferCapacity(1),
                     _ -> {
                         entered.countDown();
@@ -3640,14 +3669,85 @@ class ClientActorTest {
             establish(transport, subscription);
 
             // Act: a running handler still counts toward the subscription's delivery limit.
-            transport.receive(publication(new byte[] {1}));
+            transport.receive(qosOnePublication("messages", 1, false));
             assertThat(entered.await(5, SECONDS)).isTrue();
-            transport.receive(publication(new byte[] {2}));
+            transport.receive(qosOnePublication("messages", 2, false));
             Disconnection end = requireNonNull(ends.poll(5, SECONDS));
 
             // Assert
             assertThat(end.cause().orElseThrow()).isInstanceOf(MqttCapacityException.class);
             assertThat(transport.closed).isTrue();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_full_qos_0_subscription_drops_new_messages_and_keeps_the_connection()
+            throws Exception {
+        // Arrange: a blocking handler holds the subscription's only delivery slot.
+        var handled = new LinkedBlockingQueue<Byte>();
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(
+                    request().withBufferCapacity(1),
+                    delivery -> {
+                        handled.add(delivery.message().payload()[0]);
+                        waitFor(release);
+                    }
+            );
+            establish(transport, subscription);
+            transport.receive(publication(new byte[] {1}));
+            assertThat(handled.poll(5, SECONDS)).isEqualTo((byte) 1);
+
+            // Act: two messages arrive while the subscription is full.
+            transport.receive(publication(new byte[] {2}));
+            transport.receive(publication(new byte[] {3}));
+            // This command follows the publications through the mailbox, so it completes after
+            // routing.
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+            release.countDown();
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 0);
+            transport.receive(publication(new byte[] {4}));
+
+            // Assert: only the messages that found the subscription full were dropped, and the
+            // connection goes on.
+            assertThat(handled.poll(5, SECONDS)).isEqualTo((byte) 4);
+            assertThat(handled).isEmpty();
+            assertThat(ends).isEmpty();
+            assertThat(transport.closed).isFalse();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_qos_1_publication_overflowing_a_qos_0_subscription_ends_the_connection()
+            throws Exception {
+        // Arrange: the subscription asked for QoS 0, but a broker can send QoS 1 when another
+        // subscription of the client also matches. A blocking handler holds the only slot.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(
+                    request().withBufferCapacity(1),
+                    _ -> {
+                        entered.countDown();
+                        waitFor(release);
+                    }
+            );
+            establish(transport, subscription);
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+
+            // Act
+            transport.receive(qosOnePublication("messages", 2, false));
+
+            // Assert: overflow follows the QoS of the received publication, not the requested one.
+            Disconnection end = requireNonNull(ends.poll(5, SECONDS));
+            assertThat(end.cause().orElseThrow()).isInstanceOf(MqttCapacityException.class);
         } finally {
             release.countDown();
         }
@@ -4093,13 +4193,13 @@ class ClientActorTest {
 
     @Test
     void received_packet_size_counts_toward_the_delivery_byte_budget() throws Exception {
-        // Arrange: three deliveries fit the subscription's slots but not the 32 MiB budget.
+        // Arrange: three QoS 1 deliveries fit the subscription's slots but not the 32 MiB budget.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             Subscription subscription = sut.subscribe(
-                    Subscribe.of(new TopicFilter("messages"), Qos.AT_MOST_ONCE)
+                    Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
                             .withBufferCapacity(3),
                     _ -> {
                         entered.countDown();
@@ -4108,12 +4208,12 @@ class ClientActorTest {
             );
             establish(transport, subscription);
             byte[] payload = new byte[11 * 1024 * 1024];
-            transport.receive(publication(payload));
+            transport.receive(qosOnePublication(1, payload));
             assertThat(entered.await(5, SECONDS)).isTrue();
 
             // Act
-            transport.receive(publication(payload));
-            transport.receive(publication(payload));
+            transport.receive(qosOnePublication(2, payload));
+            transport.receive(qosOnePublication(3, payload));
 
             // Assert
             Disconnection end = requireNonNull(ends.poll(5, SECONDS));
@@ -4298,17 +4398,17 @@ class ClientActorTest {
             transport.completeSend();
 
             // Act: the handler waits for PUBACK behind a stalled write, another publication
-            // queues behind that write, and a burst of 1,000 overflows the handler's queue.
+            // queues behind that write, and a burst of 1,000 overflows the handler's queue. The
+            // burst is QoS 1, which overflow cannot drop as it drops QoS 0.
             transport.receive(publication(new byte[] {4}));
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOfSatisfying(
                     Packet.Publish.class,
                     reply -> assertThat(reply.topic()).isEqualTo(new Topic("replies"))
             );
             CompletableFuture<PublishResult> queued = sut.publish(message(new byte[] {7}));
-            byte[] packet = codec.encode(publication(new byte[] {5}));
             var burst = new ByteArrayOutputStream();
             for (int i = 0; i < 1000; i++) {
-                burst.writeBytes(packet);
+                burst.writeBytes(codec.encode(qosOnePublication(10 + i, new byte[] {5})));
             }
             transport.receiver().onBytes(burst.toByteArray());
             assertThat(listening.await(5, SECONDS)).isTrue();
@@ -6608,6 +6708,18 @@ class ClientActorTest {
 
     private static Packet.Publish qosOnePublication(String topic, int packetId, boolean duplicate) {
         return acknowledgedPublication(topic, packetId, Qos.AT_LEAST_ONCE, duplicate);
+    }
+
+    private static Packet.Publish qosOnePublication(int packetId, byte[] payload) {
+        return new Packet.Publish(
+                new Topic("messages"),
+                payload,
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                packetId,
+                EMPTY
+        );
     }
 
     private static Packet.Publish acknowledgedPublication(
