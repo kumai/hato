@@ -17,9 +17,8 @@ package org.mqtt4j.hato;
 public enum AckMode {
 
     /// Immediately before invoking the handler, or when a pull receive hands off the delivery.
-    /// The default for a pull subscription. Does not wait for application processing.
-    /// A handler failure withdraws it unless the PUBACK or PUBREC has already reached the
-    /// transport; see [MqttDelivery#ack()].
+    /// The default for a pull subscription. Does not wait for application processing, and a
+    /// handler failure does not withdraw it; see [FailurePolicy].
     ON_RECEIVE,
 
     /// After the handler returns normally. The default for a subscription with a handler;

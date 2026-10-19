@@ -29,17 +29,23 @@ class SubscribeTest {
         var sut = Subscribe.of(filter, Qos.AT_LEAST_ONCE);
 
         // Act
-        Subscribe changed = sut.withAckMode(AckMode.MANUAL).withBufferCapacity(8);
+        Subscribe changed = sut.withAckMode(AckMode.MANUAL)
+                .withBufferCapacity(8)
+                .withFailurePolicy(FailurePolicy.SKIP);
 
         // Assert
         assertThat(sut.ackMode()).isEmpty();
         assertThat(sut.bufferCapacity()).isEqualTo(1024);
+        assertThat(sut.failurePolicy()).isEqualTo(FailurePolicy.STOP);
         assertThat(changed.ackMode()).contains(AckMode.MANUAL);
         assertThat(changed.bufferCapacity()).isEqualTo(8);
+        assertThat(changed.failurePolicy()).isEqualTo(FailurePolicy.SKIP);
         Subscribe same = Subscribe.of(filter, Qos.AT_LEAST_ONCE)
+                .withFailurePolicy(FailurePolicy.SKIP)
                 .withBufferCapacity(8)
                 .withAckMode(AckMode.MANUAL);
         assertThat(changed).isEqualTo(same).hasSameHashCodeAs(same).isNotEqualTo(sut);
+        assertThat(changed).isNotEqualTo(same.withFailurePolicy(FailurePolicy.STOP));
         assertThat(sut)
                 .isNotEqualTo(Subscribe.of(new TopicFilter("events/+"), Qos.AT_LEAST_ONCE))
                 .isNotEqualTo(Subscribe.of(filter, Qos.AT_MOST_ONCE));
@@ -92,7 +98,7 @@ class SubscribeTest {
 
     @Test
     @SuppressWarnings("NullAway") // Deliberately violates the non-null parameter contracts.
-    void requires_filter_qos_and_acknowledgement_mode() {
+    void requires_filter_qos_acknowledgement_mode_and_failure_policy() {
         // Arrange
         var sut = Subscribe.of(new TopicFilter("events/#"), Qos.AT_LEAST_ONCE);
 
@@ -102,6 +108,8 @@ class SubscribeTest {
         assertThatThrownBy(() -> Subscribe.of(new TopicFilter("events/#"), null))
                 .isInstanceOf(NullPointerException.class);
         assertThatThrownBy(() -> sut.withAckMode(null))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> sut.withFailurePolicy(null))
                 .isInstanceOf(NullPointerException.class);
     }
 }

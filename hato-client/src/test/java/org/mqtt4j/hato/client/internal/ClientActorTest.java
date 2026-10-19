@@ -52,6 +52,7 @@ import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.DeliveryOptionsAccess;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.FailurePolicy;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectException;
@@ -585,7 +586,7 @@ class ClientActorTest {
         var currentFailure = new IllegalStateException("current handler failed");
         try (MqttClient sut = client()) {
             ScriptTransport old = connect(sut);
-            Subscription subscription = sut.subscribe(request(), delivery -> {
+            Subscription subscription = sut.subscribe(qosOneRequest(), delivery -> {
                 maximum.accumulateAndGet(active.incrementAndGet(), Math::max);
                 try {
                     byte payload = delivery.message().payload()[0];
@@ -625,8 +626,8 @@ class ClientActorTest {
             assertThat(maximum).hasValue(1);
             assertThat(ends).isEmpty();
 
-            // Act & Assert: a failure of a delivery from this connection still stops it.
-            current.receive(publication(new byte[] {3}));
+            // Act & Assert: a failure of a QoS 1 delivery from this connection still stops it.
+            current.receive(qosOnePublication("messages", 3, false));
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(currentFailure, false, 2));
         } finally {
             release.countDown();
@@ -1229,7 +1230,7 @@ class ClientActorTest {
     }
 
     @Test
-    void pull_subscriptions_reject_after_handler_before_sending_subscribe() throws Exception {
+    void pull_subscriptions_reject_handler_settings_before_sending_subscribe() throws Exception {
         // Arrange
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
@@ -1237,6 +1238,9 @@ class ClientActorTest {
             // Act & Assert
             assertThatThrownBy(() -> sut.subscribe(request().withAckMode(AckMode.AFTER_HANDLER)))
                     .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> sut.subscribe(
+                    request().withFailurePolicy(FailurePolicy.SKIP)
+            )).isInstanceOf(IllegalArgumentException.class);
             assertThat(transport.sent).isEmpty();
             assertThat(ends).isEmpty();
         }
@@ -3651,13 +3655,9 @@ class ClientActorTest {
 
     @ParameterizedTest
     @EnumSource(value = Qos.class, names = {"AT_LEAST_ONCE", "EXACTLY_ONCE"})
-    void a_queued_handler_failure_is_processed_before_its_acknowledgement(Qos qos)
+    void a_handler_that_acknowledges_before_failing_keeps_its_acknowledgement(Qos qos)
             throws Exception {
-        // Arrange: both the explicit ack and failure arrive while the actor is held.
-        var entered = new CountDownLatch(1);
-        var releaseHandler = new CountDownLatch(1);
-        var actorHeld = new CountDownLatch(1);
-        var releaseActor = new CountDownLatch(1);
+        // Arrange: the handler acknowledges its MANUAL delivery and then throws.
         var failure = new IllegalStateException("handler failed after ack");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
@@ -3665,36 +3665,29 @@ class ClientActorTest {
                     Subscribe.of(new TopicFilter("messages"), qos)
                             .withAckMode(AckMode.MANUAL),
                     delivery -> {
-                        entered.countDown();
-                        waitFor(releaseHandler);
                         delivery.ack();
                         throw failure;
                     }
             );
             establish(transport, subscription);
+
+            // Act
             transport.receive(acknowledgedPublication("messages", 7, qos, false));
-            assertThat(entered.await(5, SECONDS)).isTrue();
-            holdActor(transport, actorHeld, releaseActor);
 
-            // Act: the acknowledgement wake and the failure report both reach the held actor.
-            releaseHandler.countDown();
+            // Assert: the delivery held back nothing, so its failure is skipped; the
+            // acknowledgement goes out and the connection stays.
+            assertThat(transport.sent.poll(5, SECONDS)).isEqualTo(acknowledgement(qos, 7));
             await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
-            releaseActor.countDown();
-
-            // Assert: processing the failure retires the queued ACK and preserves its cause.
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
-            assertThat(transport.sent).isEmpty();
-            assertThat(transport.closed).isTrue();
-        } finally {
-            releaseHandler.countDown();
-            releaseActor.countDown();
+            assertThat(ends).isEmpty();
+            assertThat(transport.closed).isFalse();
         }
     }
 
     @ParameterizedTest(name = "subscriptions: {0}")
     @ValueSource(ints = {1, 256})
     void handler_failure_overtakes_queued_input_and_commands(int subscriptions) throws Exception {
-        // Arrange: a publication reaches every lane before input and a command wait in the actor.
+        // Arrange: a QoS 1 publication reaches every lane before input and a command wait in the
+        // actor.
         var delivered = new CountDownLatch(subscriptions);
         var releaseHandler = new CountDownLatch(1);
         var actorHeld = new CountDownLatch(1);
@@ -3708,7 +3701,10 @@ class ClientActorTest {
             var registered = new ArrayList<Subscription>();
             for (int i = 0; i < subscriptions; i++) {
                 boolean failing = i == 0;
-                var request = Subscribe.of(new TopicFilter("a/".repeat(i) + "#"), Qos.AT_MOST_ONCE);
+                var request = Subscribe.of(
+                        new TopicFilter("a/".repeat(i) + "#"),
+                        Qos.AT_LEAST_ONCE
+                );
                 Subscription subscription = sut.subscribe(request, _ -> {
                     delivered.countDown();
                     waitFor(releaseHandler);
@@ -3720,7 +3716,7 @@ class ClientActorTest {
                 registered.add(subscription);
             }
             var incoming = new Packet.Publish(new Topic("a/".repeat(subscriptions) + "message"),
-                    new byte[] {1}, Qos.AT_MOST_ONCE, false, false, 0, EMPTY);
+                    new byte[] {1}, Qos.AT_LEAST_ONCE, false, false, 1, EMPTY);
             transport.receive(incoming);
             assertThat(delivered.await(5, SECONDS)).isTrue();
             holdActor(transport, actorHeld, releaseActor);
@@ -3765,13 +3761,13 @@ class ClientActorTest {
         var failure = new IllegalStateException("handler failed");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = sut.subscribe(request(), _ -> {
+            Subscription subscription = sut.subscribe(qosOneRequest(), _ -> {
                 entered.countDown();
                 waitFor(releaseHandler);
                 throw failure;
             });
             establish(transport, subscription);
-            transport.receive(publication(new byte[] {1}));
+            transport.receive(qosOnePublication("messages", 1, false));
             assertThat(entered.await(5, SECONDS)).isTrue();
             holdActor(transport, actorHeld, releaseActor);
 
@@ -3822,7 +3818,8 @@ class ClientActorTest {
                     List.of(ReasonCode.SUCCESS), EMPTY));
             holdActor(current, actorHeld, releaseActor);
 
-            // Act: the stale failure arrives first but cannot reserve current termination.
+            // Act: the stale failure is handled first, but as a skip it cannot reserve the current
+            // termination.
             releaseHandler.countDown();
             await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
@@ -3905,7 +3902,9 @@ class ClientActorTest {
             }
             CompletableFuture<Void> queued = subscription.unsubscribe();
 
-            // Act: the failure report and invalid input both reach the held actor, in either order.
+            // Act: invalid input reaches the held actor before or after the failure is handled. The
+            // failure is reported for the retained session and skipped once its session was
+            // discarded.
             if (!handlerFirst) {
                 current.receiver().onBytes(new byte[] {(byte) 0xff, 0});
             }
@@ -4061,7 +4060,7 @@ class ClientActorTest {
         var failure = new IllegalStateException("handler failed during shutdown");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = sut.subscribe(request(), delivery -> {
+            Subscription subscription = sut.subscribe(qosOneRequest(), delivery -> {
                 byte payload = delivery.message().payload()[0];
                 handled.add(payload);
                 if (payload == 1) {
@@ -4071,9 +4070,9 @@ class ClientActorTest {
                 }
             });
             establish(transport, subscription);
-            transport.receive(publication(new byte[] {1}));
+            transport.receive(qosOnePublication("messages", 1, false));
             Thread worker = requireNonNull(workers.poll(5, SECONDS));
-            transport.receive(publication(new byte[] {2}));
+            transport.receive(qosOnePublication("messages", 2, false));
             await().until(() -> ((ClientActor) sut).usage().deliveries() == 2);
             holdActor(transport, actorHeld, releaseActor);
 
@@ -6001,6 +6000,173 @@ class ClientActorTest {
             assertThat(lane.executions()).isZero();
         } finally {
             release.countDown();
+        }
+    }
+
+    @Test
+    void a_qos_0_handler_failure_is_skipped_and_the_subscription_continues() throws Exception {
+        // Arrange: the default policy, and a handler that fails for the first delivery.
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(request(), delivery -> {
+                handled.add(delivery.message().payload()[0]);
+                if (delivery.message().payload()[0] == 1) {
+                    throw failure;
+                }
+            });
+            establish(transport, subscription);
+
+            // Act
+            transport.receive(publication(new byte[] {1}));
+            transport.receive(publication(new byte[] {2}));
+
+            // Assert: no acknowledgement is held back for the failure to protect, so the
+            // subscription and the connection go on.
+            await().until(() -> handled.size() == 2);
+            assertThat(handled).containsExactly((byte) 1, (byte) 2);
+            assertThat(((ClientActor) sut).reportedHandlerFailures()).isEqualTo(1);
+            assertThat(ends).isEmpty();
+            assertThat(transport.closed).isFalse();
+        }
+    }
+
+    @Test
+    void an_on_receive_handler_failure_keeps_its_acknowledgement() throws Exception {
+        // Arrange: ON_RECEIVE permits the acknowledgement before the failing handler starts.
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(
+                    qosOneRequest().withAckMode(AckMode.ON_RECEIVE),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                        handled.add(delivery.message().payload()[0]);
+                    }
+            );
+            establish(transport, subscription);
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+            transport.receive(qosOnePublication("messages", 2, false));
+
+            // Assert: the acknowledgement stands, and the next delivery runs on the same
+            // connection.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 1));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 2));
+            assertThat(handled.poll(5, SECONDS)).isEqualTo((byte) 2);
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Qos.class, names = {"AT_LEAST_ONCE", "EXACTLY_ONCE"})
+    void skip_acknowledges_a_failed_delivery_without_processing_and_continues(Qos qos)
+            throws Exception {
+        // Arrange: a skipping subscription whose handler fails for the first delivery.
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter("messages"), qos)
+                            .withFailurePolicy(FailurePolicy.SKIP),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 7) {
+                            throw failure;
+                        }
+                        handled.add(delivery.message().payload()[0]);
+                    }
+            );
+            establish(transport, subscription);
+
+            // Act
+            transport.receive(acknowledgedPublication("messages", 7, qos, false));
+            transport.receive(acknowledgedPublication("messages", 8, qos, false));
+
+            // Assert: the failed delivery is acknowledged as if handled, in receive order, and
+            // the next one runs and is acknowledged on the same connection.
+            assertThat(transport.sent.poll(5, SECONDS)).isEqualTo(acknowledgement(qos, 7));
+            assertThat(transport.sent.poll(5, SECONDS)).isEqualTo(acknowledgement(qos, 8));
+            assertThat(handled).containsExactly((byte) 8);
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @Test
+    void a_refused_task_stops_a_skipping_subscription_instead_of_acknowledging_it()
+            throws Exception {
+        // Arrange: the subscription skips handler failures, but its executor refuses work.
+        var executor = new ManualExecutor();
+        var refusal = new RejectedExecutionException("Executor has shut down");
+        executor.refuse(refusal);
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeOn(
+                    sut,
+                    transport,
+                    qosOneRequest().withFailurePolicy(FailurePolicy.SKIP),
+                    executor,
+                    handled::add
+            );
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Assert: a refusing executor processes nothing, so the delivery is not
+            // acknowledged, and the refusal stops the client as under STOP.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(refusal, false, 1));
+            assertThat(transport.sent).isEmpty();
+            assertThat(handled).isEmpty();
+        }
+    }
+
+    @Test
+    void skip_acknowledges_a_failed_delivery_on_one_lane_while_the_other_lanes_go_on()
+            throws Exception {
+        // Arrange: QoS 1 deliveries 1 and 2 wait on lanes a and b of a skipping subscription,
+        // and the handler fails for 1.
+        var a = new ManualExecutor();
+        var b = new ManualExecutor();
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeOnLanes(
+                    sut,
+                    transport,
+                    qosOneRequest().withFailurePolicy(FailurePolicy.SKIP),
+                    message -> message.payload()[0] == 1 ? a : b,
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                        handled.add(delivery.message().payload()[0]);
+                    }
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+            transport.receive(qosOnePublication("messages", 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act
+            a.runNext();
+            b.runNext();
+
+            // Assert: the failed delivery is acknowledged unprocessed, and the other lane runs.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 1));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 2));
+            assertThat(handled).containsExactly((byte) 2);
+            assertThat(ends).isEmpty();
         }
     }
 

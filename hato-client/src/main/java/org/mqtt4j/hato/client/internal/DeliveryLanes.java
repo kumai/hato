@@ -23,6 +23,7 @@ import java.util.function.LongConsumer;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.FailurePolicy;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttDelivery;
@@ -91,9 +92,8 @@ final class DeliveryLanes {
 
     private long retainedBytes;
 
-    private long abandonedDeliveries;
-
-    private long discardedDeliveries;
+    // Deliveries that left their subscriptions unprocessed, by reason, across all lanes.
+    private final long[] dropped = new long[Dropped.values().length];
 
     private long handledDeliveries;
 
@@ -130,6 +130,7 @@ final class DeliveryLanes {
                 id,
                 request.bufferCapacity(),
                 request.ackMode().orElse(AckMode.AFTER_HANDLER),
+                request.failurePolicy(),
                 execution,
                 handler,
                 lock.newCondition()
@@ -145,6 +146,7 @@ final class DeliveryLanes {
                 id,
                 request.bufferCapacity(),
                 request.ackMode().orElse(AckMode.ON_RECEIVE),
+                FailurePolicy.STOP,
                 new HandlerExecution.Internal(),
                 null,
                 lock.newCondition()
@@ -308,9 +310,9 @@ final class DeliveryLanes {
             }
             // A finishing pull lane can stop here, which removes it from the map.
             for (Lane lane : List.copyOf(lanes.values())) {
-                discard(lane.queue);
+                discard(lane, lane.queue);
                 for (Sublane sublane : lane.sublanes.values()) {
-                    discard(sublane.queue);
+                    discard(lane, sublane.queue);
                 }
                 // A sublane keeps the drain task on its way, so the next connection's deliveries
                 // there wait for a handler still running, as on an internal thread.
@@ -598,19 +600,25 @@ final class DeliveryLanes {
         }
     }
 
-    long abandonedDeliveries() {
+    /// Counts deliveries that left their subscriptions unprocessed for `reason`, for tests until
+    /// applications get statistics. The count changes under the same lock as the delivery's
+    /// acknowledgement condition and capacity.
+    long dropped(Dropped reason) {
         lock.lock();
         try {
-            return abandonedDeliveries;
+            return dropped[reason.ordinal()];
         } finally {
             lock.unlock();
         }
     }
 
-    long discardedDeliveries() {
+    /// Counts deliveries that left the lane `id` unprocessed for `reason`, as [#dropped(Dropped)]
+    /// does for all lanes. A lane that has left the routing map counts nothing.
+    long dropped(long id, Dropped reason) {
         lock.lock();
         try {
-            return discardedDeliveries;
+            Lane lane = lanes.get(id);
+            return lane == null ? 0 : lane.dropped[reason.ordinal()];
         } finally {
             lock.unlock();
         }
@@ -628,9 +636,11 @@ final class DeliveryLanes {
         }
     }
 
-    /// Counts handler failures whose report has returned. The count changes after the report has
-    /// offered its termination and the lane has paused or released the failed delivery, so a
-    /// caller that sees it can order later events after the report.
+    /// Counts handler failures whose report has returned. A failure that stops the subscription
+    /// is reported to the client: the count changes after the report has offered its termination
+    /// and the lane has paused or released the failed delivery. A skipped failure is reported to
+    /// the log: the count changes after its delivery was released and its acknowledgement
+    /// announced. Either way, a caller that sees the count can order later events after it.
     long reportedFailures() {
         lock.lock();
         try {
@@ -809,7 +819,7 @@ final class DeliveryLanes {
         } finally {
             lock.unlock();
         }
-        fail(lane, head, failure);
+        fail(lane, head, failure, false);
     }
 
     /// Caller holds lock. Whether the dispatcher can still take `head`, which the selector
@@ -877,7 +887,7 @@ final class DeliveryLanes {
         } finally {
             lock.unlock();
         }
-        fail(lane, view, failure);
+        fail(lane, view, failure, true);
         lock.lock();
         try {
             if (!canClaim(lane, sublane)) {
@@ -1015,20 +1025,56 @@ final class DeliveryLanes {
             }
         } catch (Throwable failure) {
             boolean _ = Thread.interrupted();
-            fail(lane, view, failure);
+            fail(lane, view, failure, false);
         }
     }
 
-    /// A claimed delivery failed: its handler threw, or its executor refused the task that would
-    /// have run it. The failure invalidates its acknowledgement condition and is reported.
-    private void fail(Lane lane, DeliveryView view, Throwable failure) {
+    /// A claimed delivery failed: its handler threw, the lane selector failed for it, or its
+    /// executor refused the task that would have run it. A delivery that still holds back its
+    /// acknowledgement stops the subscription under [FailurePolicy#STOP], and always when it was
+    /// `refused`, since a refusing executor processes nothing: the failure invalidates its
+    /// acknowledgement condition and is reported. Any other failure is skipped: the delivery
+    /// counts as done, acknowledged unprocessed if it held back its acknowledgement, and the
+    /// subscription goes on.
+    private void fail(Lane lane, DeliveryView view, Throwable failure, boolean refused) {
+        boolean stops;
+        boolean ready = false;
+        boolean firstSkip = false;
         lock.lock();
         try {
-            abandonedDeliveries++;
+            drop(lane, Dropped.FAILED);
             view.localDone = true;
-            invalidate(view);
+            stops = holdsAcknowledgement(view)
+                    && (refused || lane.failurePolicy == FailurePolicy.STOP);
+            if (stops) {
+                invalidate(view);
+            } else {
+                ready = markReady(view);
+                releaseView(view);
+                firstSkip = !lane.skipLogged;
+                lane.skipLogged = true;
+            }
         } finally {
             lock.unlock();
+        }
+        if (!stops) {
+            if (ready) {
+                onReady.run();
+            }
+            if (firstSkip) {
+                log.warn("Skipped a failed delivery for {} (subscription {}); later ones are "
+                        + "logged at debug level", clientId, lane.id, failure);
+            } else {
+                log.debug("Skipped a failed delivery for {} (subscription {})",
+                        clientId, lane.id, failure);
+            }
+            lock.lock();
+            try {
+                reportedFailures++;
+            } finally {
+                lock.unlock();
+            }
+            return;
         }
         boolean paused = reportFailure(lane, view.delivery.token, failure);
         lock.lock();
@@ -1041,6 +1087,21 @@ final class DeliveryLanes {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// Caller holds lock. Whether the view still holds back its receipt's acknowledgement: a QoS 1
+    /// or 2 delivery whose condition is unmet, as with AFTER_HANDLER, or MANUAL before ack(). A
+    /// retired receipt, such as one withdrawn for a reused packet identifier, holds back nothing.
+    private boolean holdsAcknowledgement(DeliveryView view) {
+        return view.delivery.token.acknowledgement() != 0 && !view.delivery.retired
+                && view.valid && !view.recipient.ready;
+    }
+
+    /// Caller holds lock. Counts a delivery that left `lane` unprocessed, for the subscription and
+    /// for the client.
+    private void drop(Lane lane, Dropped reason) {
+        lane.dropped[reason.ordinal()]++;
+        dropped[reason.ordinal()]++;
     }
 
     private void acknowledge(DeliveryView view) {
@@ -1124,9 +1185,9 @@ final class DeliveryLanes {
         }
         lanes.remove(lane.id, lane);
         lane.stopped = true;
-        boolean ready = abandon(lane.queue);
+        boolean ready = abandon(lane, lane.queue);
         for (Sublane sublane : lane.sublanes.values()) {
-            ready |= abandon(sublane.queue);
+            ready |= abandon(lane, sublane.queue);
             sublane.task.detach();
         }
         lane.sublanes.clear();
@@ -1143,12 +1204,12 @@ final class DeliveryLanes {
 
     /// Caller holds lock. A stopped lane's queued deliveries end without their handler, and their
     /// recipients no longer hold back acknowledgement. Returns whether that completed a receipt.
-    private boolean abandon(ArrayDeque<DeliveryView> queue) {
+    private boolean abandon(Lane lane, ArrayDeque<DeliveryView> queue) {
         boolean ready = false;
         while (!queue.isEmpty()) {
             DeliveryView view = queue.removeFirst();
             view.recipient.queued = false;
-            abandonedDeliveries++;
+            drop(lane, Dropped.SUBSCRIPTION_STOPPED);
             view.localDone = true;
             ready |= markReady(view);
             releaseView(view);
@@ -1158,11 +1219,11 @@ final class DeliveryLanes {
 
     /// Caller holds lock. A connection's end discards its queued deliveries; a later delivery
     /// of the same receipt can replace them.
-    private void discard(ArrayDeque<DeliveryView> queue) {
+    private void discard(Lane lane, ArrayDeque<DeliveryView> queue) {
         while (!queue.isEmpty()) {
             DeliveryView view = queue.removeFirst();
             view.recipient.queued = false;
-            discardedDeliveries++;
+            drop(lane, Dropped.CONNECTION_ENDED);
             view.localDone = true;
             view.released = true;
             invalidate(view);
@@ -1362,6 +1423,7 @@ final class DeliveryLanes {
         final long id;
         final int capacity;
         final AckMode ackMode;
+        final FailurePolicy failurePolicy;
         final HandlerExecution execution;
         final @Nullable Consumer<MqttDelivery> handler;
         final Condition ready;
@@ -1369,6 +1431,8 @@ final class DeliveryLanes {
         // An executor's sublane exists while deliveries wait there or a drain task is on its way.
         // Executors are told apart by identity.
         final Map<Executor, Sublane> sublanes = new IdentityHashMap<>();
+        // Deliveries that left this lane unprocessed, by reason.
+        final long[] dropped = new long[Dropped.values().length];
         int retained;
         int queuedInSublanes;
         // Drain tasks running on an executor's thread, from their start until they return.
@@ -1378,12 +1442,15 @@ final class DeliveryLanes {
         boolean finishing;
         boolean stopped;
         boolean failed;
+        // Set once the first skipped failure has been logged at warning level.
+        boolean skipLogged;
         @Nullable Throwable failure;
 
         Lane(
                 long id,
                 int capacity,
                 AckMode ackMode,
+                FailurePolicy failurePolicy,
                 HandlerExecution execution,
                 @Nullable Consumer<MqttDelivery> handler,
                 Condition ready
@@ -1391,6 +1458,7 @@ final class DeliveryLanes {
             this.id = id;
             this.capacity = capacity;
             this.ackMode = ackMode;
+            this.failurePolicy = failurePolicy;
             this.execution = execution;
             this.handler = handler;
             this.ready = ready;
@@ -1446,6 +1514,20 @@ final class DeliveryLanes {
         void detach() {
             sublane = null;
         }
+    }
+
+    /// Why a delivery left its subscription unprocessed. The counts are internal until
+    /// applications get statistics.
+    enum Dropped {
+
+        /// Its handler threw, the lane selector failed for it, or its executor refused it.
+        FAILED,
+
+        /// A connection's end discarded it while it waited.
+        CONNECTION_ENDED,
+
+        /// A stop of its subscription discarded it while it waited.
+        SUBSCRIPTION_STOPPED
     }
 
     /// A delivery taken from its lane's queue. `ready` says whether taking it met the last

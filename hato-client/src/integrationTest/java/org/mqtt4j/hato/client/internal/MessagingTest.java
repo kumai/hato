@@ -590,7 +590,7 @@ abstract class MessagingTest {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
             Subscription subscription = sut.subscribe(
-                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE),
                     delivery -> {
                         if (delivery.message().payload()[0] == 1) {
                             throw failure;
@@ -600,8 +600,10 @@ abstract class MessagingTest {
             );
             subscription.established().get(5, SECONDS);
 
-            // Act: the subscriber has no pending operation to carry this failure.
-            publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
+            // Act: the subscriber has no pending operation to carry this failure. The QoS 1
+            // delivery holds back its acknowledgement until the handler returns, so the
+            // failure stops the client.
+            publisher.publish(message(topic, (byte) 1).withQos(Qos.AT_LEAST_ONCE)).get(5, SECONDS);
             assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             sut.connect().get(5, SECONDS);
             // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
@@ -611,6 +613,74 @@ abstract class MessagingTest {
             assertThat(requireNonNull(received.poll(5, SECONDS)).message().payload())
                     .containsExactly((byte) 2);
             subscription.unsubscribe().get(5, SECONDS);
+            assertThat(ended).isEmpty();
+        }
+    }
+
+    @Test
+    void a_qos_0_handler_failure_is_skipped_and_the_connection_continues() throws Exception {
+        // Arrange: a QoS 0 delivery holds back no acknowledgement for its failure to protect.
+        String topic = uniqueTopic();
+        var failure = new IllegalStateException("handler failed");
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        var received = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client(ended::add); MqttClient publisher = client()) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                        received.add(delivery);
+                    }
+            ).established().get(5, SECONDS);
+
+            // Act
+            publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
+            publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
+
+            // Assert: the default policy skips the failure, so the next message still arrives.
+            assertThat(requireNonNull(received.poll(5, SECONDS)).message().payload())
+                    .containsExactly((byte) 2);
+            assertThat(ended).isEmpty();
+        }
+    }
+
+    @Test
+    void skip_continues_after_a_failed_qos_1_delivery() throws Exception {
+        // Arrange: the subscription skips failures, and the first QoS 1 delivery fails.
+        String topic = uniqueTopic();
+        var failure = new IllegalStateException("handler failed");
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        var received = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client(ended::add); MqttClient publisher = client()) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
+                            .withFailurePolicy(FailurePolicy.SKIP),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                        received.add(delivery);
+                    }
+            ).established().get(5, SECONDS);
+
+            // Act
+            for (byte value = 1; value <= 3; value++) {
+                publisher.publish(message(topic, value).withQos(Qos.AT_LEAST_ONCE))
+                        .get(5, SECONDS);
+            }
+
+            // Assert: the failed delivery is skipped, and the later ones arrive on the same
+            // connection.
+            assertThat(requireNonNull(received.poll(5, SECONDS)).message().payload())
+                    .containsExactly((byte) 2);
+            assertThat(requireNonNull(received.poll(5, SECONDS)).message().payload())
+                    .containsExactly((byte) 3);
             assertThat(ended).isEmpty();
         }
     }

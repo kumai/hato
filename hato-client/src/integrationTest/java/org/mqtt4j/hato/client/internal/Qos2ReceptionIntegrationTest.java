@@ -125,20 +125,17 @@ abstract class Qos2ReceptionIntegrationTest {
     }
 
     @Test
-    void a_handler_failure_after_pubrec_does_not_redeliver_the_continued_reception()
-            throws Exception {
-        // Arrange: ON_RECEIVE admits PUBREC while the first handler is still running.
+    void an_on_receive_failure_is_skipped_and_the_connection_continues() throws Exception {
+        // Arrange: ON_RECEIVE admits PUBREC before the first handler fails, so the failure holds
+        // back no acknowledgement.
         String topic = uniqueTopic();
-        var scheduler = new ManualTimerScheduler();
-        var transports = new LinkedBlockingQueue<FaultyTransport>();
         var ended = new LinkedBlockingQueue<Disconnection>();
         var delivered = new LinkedBlockingQueue<MqttDelivery>();
         var calls = new AtomicInteger();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         var cause = new IllegalStateException("application failed after PUBREC");
-        try (MqttClient publisher = client();
-                MqttClient sut = persistentClient(clientId(), scheduler, transports, ended)) {
+        try (MqttClient publisher = client(); MqttClient sut = client(ended)) {
             publisher.connect().get(5, SECONDS);
             sut.connect().get(5, SECONDS);
             sut.subscribe(
@@ -153,25 +150,17 @@ abstract class Qos2ReceptionIntegrationTest {
                         delivered.add(delivery);
                     }
             ).established().get(5, SECONDS);
-            FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
-            transport.sendDelay(DELAY);
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
-            awaitDelay(scheduler);
-            transport.receiveDelay(DELAY);
-            transport.sendDelay(Duration.ZERO);
-            scheduler.advance(DELAY);
-            // The delayed PUBREL proves the broker received PUBREC before the handler failed.
-            awaitDelay(scheduler);
 
             // Act
             release.countDown();
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
+            await().until(() -> ((ClientActor) sut).reportedHandlerFailures() == 1);
             publicationBarrier(sut);
             publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
 
-            // Assert: the exchange resumes, but only the new marker starts another handler.
+            // Assert: the failure is skipped, so the connection stays and only the new marker
+            // starts another handler.
             assertThat(requireNonNull(delivered.poll(5, SECONDS)).message())
                     .isEqualTo(message(topic, (byte) 2));
             assertThat(delivered).isEmpty();

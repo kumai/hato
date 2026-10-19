@@ -29,7 +29,10 @@ public interface MqttSubscriber {
     /// arrived.
     ///
     /// Deliveries can reach the handler before establishment completes. Each subscription's
-    /// handler runs serially, independently of I/O and operation completion. A handler failure
+    /// handler runs serially, independently of I/O and operation completion. What a handler
+    /// failure does depends on the request's [FailurePolicy]. Under the default
+    /// [FailurePolicy#STOP], a failure of a QoS 1 or 2 delivery that still holds back its
+    /// acknowledgement ([AckMode#AFTER_HANDLER], or [AckMode#MANUAL] before [MqttDelivery#ack()])
     /// is logged and stops the client: it withdraws the connection request, so the client does
     /// not reconnect until the application calls [MqttClient#connect()] again. The failure ends
     /// the active connection of its receiving session, reported by
@@ -38,11 +41,12 @@ public interface MqttSubscriber {
     /// failure is the cause, no reconnection delay is announced, and a pending
     /// [MqttClient#connect()] fails with [MqttConnectException] caused by it. This includes a
     /// handler started on an earlier connection when the session continues. Without a connection
-    /// request, or after that session ends, a failure is only logged.
+    /// request, or after that session ends, such a failure is only logged. Any other failure is
+    /// skipped: the delivery counts as handled, and the subscription and the connection go on.
     /// To retry a transient failure, repeat the work inside the handler, which keeps the
     /// subscription's order and holds back its acknowledgement meanwhile. To give up a message,
-    /// catch the failure and return normally, or call [MqttDelivery#ack()] with
-    /// [AckMode#MANUAL]; the message then counts as handled.
+    /// catch the failure and return normally, call [MqttDelivery#ack()] with [AckMode#MANUAL], or
+    /// use [FailurePolicy#SKIP]; the message then counts as handled.
     /// Exhausted receive capacity also ends the connection.
     /// On connection termination, queued deliveries are discarded; a running handler can finish.
     /// A subscription survives termination and resumes on the same handle after
@@ -52,9 +56,8 @@ public interface MqttSubscriber {
     /// Interrupt status left by a normally returning handler is cleared before the next delivery.
     /// QoS 1 and QoS 2 acknowledgement follows the request's [AckMode]. QoS 1 messages can be
     /// delivered more than once. Within a session, a QoS 2 message reaches each subscription at
-    /// most once, except that a delivery invalidated by a handler failure is delivered again
-    /// from the broker's retransmission unless its PUBREC had reached the transport; see
-    /// [MqttDelivery#ack()].
+    /// most once, except that a delivery whose handler failure stopped the client is delivered
+    /// again from the broker's retransmission; see [MqttDelivery#ack()].
     ///
     /// Every matching subscription receives each incoming publication. MQTT 3.1.1 cannot
     /// distinguish broker copies for overlapping subscriptions, so each copy is routed again.

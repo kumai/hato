@@ -860,7 +860,7 @@ class AutomaticReconnectionTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             Subscription subscription = sut.subscribe(
-                    Subscribe.of(new TopicFilter("events"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(new TopicFilter("events"), Qos.AT_LEAST_ONCE),
                     _ -> {
                         throw failure;
                     }
@@ -872,10 +872,10 @@ class AutomaticReconnectionTest {
             transport.receive(new Packet.Publish(
                     new Topic("events"),
                     new byte[] {1},
-                    Qos.AT_MOST_ONCE,
+                    Qos.AT_LEAST_ONCE,
                     false,
                     false,
-                    0,
+                    1,
                     EMPTY
             ));
 

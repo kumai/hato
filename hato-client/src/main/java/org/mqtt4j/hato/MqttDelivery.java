@@ -15,11 +15,12 @@ public interface MqttDelivery {
     /// QoS 0, other acknowledgement modes, and calls after the receiving session ends have no
     /// effect. In a continued session, a call after connection loss records completion; the
     /// acknowledgement waits for the broker to retransmit that message on the new connection.
-    /// A failure of this delivery's handler, even while disconnected, voids earlier and later
-    /// calls unless its PUBACK or PUBREC has already reached the transport. A failure that ends
-    /// the connection also invalidates other deliveries whose acknowledgement condition is
-    /// unmet. Their old `ack()` calls and handler returns cannot acknowledge a replacement after
-    /// reconnecting.
+    /// A failure of this delivery's handler before this call, even while disconnected, stops
+    /// the client under [FailurePolicy#STOP], which voids later calls, or acknowledges the
+    /// delivery under [FailurePolicy#SKIP]. A failure after this call keeps the acknowledgement.
+    /// A failure that ends the connection also invalidates other deliveries whose
+    /// acknowledgement condition is unmet. Their old `ack()` calls and handler returns cannot
+    /// acknowledge a replacement after reconnecting.
     /// This does not wait for an acknowledgement write or acknowledge another subscription.
     /// A push delivery keeps its subscription capacity until its handler returns and its PUBACK
     /// or PUBREC enters the send queue; a pull delivery releases it at this call. Either way,

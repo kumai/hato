@@ -28,6 +28,7 @@ import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.FailurePolicy;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectException;
@@ -359,6 +360,11 @@ public final class ClientActor implements MqttClient {
         if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
             throw new IllegalArgumentException(
                     "A pull subscription has no handler to acknowledge"
+            );
+        }
+        if (request.failurePolicy() == FailurePolicy.SKIP) {
+            throw new IllegalArgumentException(
+                    "A pull subscription has no handler whose failures to skip"
             );
         }
         return subscribeInternal(request, new HandlerExecution.Internal(), null);
@@ -816,8 +822,8 @@ public final class ClientActor implements MqttClient {
         return listenerLane.dropped();
     }
 
-    /// Handler failures whose report has returned, for tests that order later events after a
-    /// stop request until applications get statistics.
+    /// Handler failures whose report has returned, to the client for a stop or to the log for a
+    /// skip, for tests that order later events after it until applications get statistics.
     long reportedHandlerFailures() {
         return lanes.reportedFailures();
     }

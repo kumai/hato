@@ -280,19 +280,25 @@ ordering and threading.
 
 Besides broker and network failures, the client itself ends the connection when:
 
-- a handler throws, including one still running from before a reconnection in a
-  persistent session, or the executor that runs it refuses its task. The client then
-  stops reconnecting until you call `connect()` again. Catch exceptions inside the
-  handler to keep the connection.
+- a handler throws for a QoS 1 or 2 message whose acknowledgement it still holds back
+  (`AFTER_HANDLER`, or `MANUAL` before `delivery.ack()`), including one still running from
+  before a reconnection in a persistent session, or the executor that runs it refuses its
+  task. The client then stops reconnecting until you call `connect()` again, and a
+  persistent session gets the message again from the broker.
 - a subscription's queue fills up, for example with messages waiting for
   `delivery.ack()`, or too many QoS 1 and 2 messages wait behind one that is not yet
   acknowledged, rather than buffering without limit.
 
+A handler failure that holds back nothing, such as one for a QoS 0 message, is skipped: the
+client logs it and the subscription goes on. To skip failed QoS 1 and 2 messages too,
+acknowledging them unprocessed, choose `FailurePolicy.SKIP`:
+`Subscribe.of(filter, Qos.AT_LEAST_ONCE).withFailurePolicy(FailurePolicy.SKIP)`.
+
 For a transient error, catch it and retry inside the handler with a bounded retry
-policy. To skip a message, record the error and return normally with
+policy. To skip a single message, record the error and return normally with
 `AFTER_HANDLER`, or call `delivery.ack()` with `MANUAL`. Returning normally or
 acknowledging records completion even when the application chose not to process
-the message. An exception that escapes ends the connection instead.
+the message.
 
 ## Passing the client to your code
 

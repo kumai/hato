@@ -24,15 +24,16 @@ import static java.util.Objects.requireNonNull;
 /// lane, and waiting deliveries count against [Subscribe#bufferCapacity()] as with an internal
 /// thread. While no delivery waits, the subscription holds none of the executor's threads. The
 /// executor must run each task it accepts, or throw from [Executor#execute(Runnable)]: an
-/// exception of any type ends the delivery that the task would have run as a handler failure,
-/// with the consequences that [MqttSubscriber#subscribe(Subscribe, java.util.function.Consumer)]
-/// describes. An executor that silently discards a task leaves the subscription waiting until it
-/// closes. An executor that runs tasks on the calling thread, such as a direct executor or one
-/// with a caller-runs policy, keeps the order and the capacity without deepening the stack.
+/// exception of any type ends the delivery that the task would have run as a handler failure
+/// under [FailurePolicy#STOP], whatever the subscription's policy, since a refusing executor has
+/// processed nothing. An executor that silently discards a task leaves the subscription waiting
+/// until it closes. An executor that runs tasks on the calling thread, such as a direct executor
+/// or one with a caller-runs policy, keeps the order and the capacity without deepening the
+/// stack.
 ///
-/// A handler failure on any lane stops the subscription's other lanes too. Failures on other
-/// lanes that were already running are logged, and the first failure remains the cause that the
-/// client reports.
+/// A failure that stops the client, on any lane, stops the subscription's other lanes too.
+/// Failures on other lanes that were already running are logged, and the first failure remains
+/// the cause that the client reports.
 ///
 /// The application owns the executor; the client never shuts it down. Once the subscription or
 /// the client has closed, a task that the executor still holds does nothing when it runs, so the

@@ -365,6 +365,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.ConnectionListener",
                 "org.mqtt4j.hato.DeliveryOptions",
                 "org.mqtt4j.hato.Disconnection",
+                "org.mqtt4j.hato.FailurePolicy",
                 "org.mqtt4j.hato.MqttCapacityException",
                 "org.mqtt4j.hato.MqttClient",
                 "org.mqtt4j.hato.MqttClientBuilder",
