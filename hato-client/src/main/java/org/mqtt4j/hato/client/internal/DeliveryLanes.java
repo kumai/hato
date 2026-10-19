@@ -3,6 +3,7 @@ package org.mqtt4j.hato.client.internal;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
@@ -20,6 +21,7 @@ import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
+import java.util.function.Predicate;
 
 import org.jspecify.annotations.Nullable;
 
@@ -42,8 +44,10 @@ import static java.util.Objects.requireNonNull;
 /// executors it moves each delivery to its executor's sublane, asking the application's selector
 /// for the executor when the subscription uses lanes. From each sublane, one drain task at a
 /// time, run by the executor, claims and executes the head and then asks the executor again.
-/// Pull subscriptions use their callers' threads. Reservations include executing handlers and
-/// survive connection changes until they return.
+/// Pull subscriptions use their callers' threads. Hand-off subscriptions share one hand-off
+/// worker, an internal virtual thread that offers each delivery to its subscription's acceptor,
+/// oldest first across all of them. Reservations include executing handlers and survive
+/// connection changes until they return.
 final class DeliveryLanes {
 
     private static final Log log = Log.of(DeliveryLanes.class);
@@ -75,6 +79,10 @@ final class DeliveryLanes {
     // nothing more until connection cleanup or removal. An old receipt returns false.
     private final BiPredicate<DeliveryToken, Throwable> onFailure;
 
+    // Ends, as overload, the connection that delivered a QoS 1 or 2 delivery whose acceptor
+    // refused it. Called without the lock.
+    private final Consumer<DeliveryToken> onOverload;
+
     private final Runnable onReady;
 
     // Called once per lane, without the lock, when the lane can run and hand off nothing more: a
@@ -86,6 +94,19 @@ final class DeliveryLanes {
 
     // Set before the client's close() returns: no lane claims a delivery afterwards.
     private boolean handOffsClosed;
+
+    // The hand-off worker waits here. Every hand-off lane uses it as its own condition, so
+    // whatever wakes a lane wakes the worker.
+    private final Condition handOffReady = lock.newCondition();
+
+    // Whether the hand-off worker runs. A hand-off lane starts it, and it ends once no hand-off
+    // lane is left or the client's close has ended hand-off; the next hand-off lane starts a
+    // new one.
+    private boolean handOffStarted;
+
+    // Numbers queued deliveries in receive order across all lanes, so the hand-off worker can
+    // take the oldest head.
+    private long enqueued;
 
     private int retainedLanes;
 
@@ -106,12 +127,14 @@ final class DeliveryLanes {
             String clientId,
             long byteLimit,
             BiPredicate<DeliveryToken, Throwable> onFailure,
+            Consumer<DeliveryToken> onOverload,
             Runnable onReady,
             LongConsumer onTerminated
     ) {
         this.clientId = clientId;
         this.byteLimit = byteLimit;
         this.onFailure = onFailure;
+        this.onOverload = onOverload;
         this.onReady = onReady;
         this.onTerminated = onTerminated;
     }
@@ -134,7 +157,22 @@ final class DeliveryLanes {
                 request.failurePolicy(),
                 execution,
                 handler,
+                null,
                 lock.newCondition()
+        ));
+    }
+
+    /// A hand-off lane, whose deliveries the client's hand-off worker offers to `acceptor`.
+    boolean registerHandOff(long id, Subscribe request, Predicate<MqttDelivery> acceptor) {
+        return registerLane(new Lane(
+                id,
+                request.bufferCapacity(),
+                request.ackMode().orElse(AckMode.ON_RECEIVE),
+                request.failurePolicy(),
+                new HandlerExecution.Internal(),
+                null,
+                acceptor,
+                handOffReady
         ));
     }
 
@@ -150,6 +188,7 @@ final class DeliveryLanes {
                 FailurePolicy.STOP,
                 new HandlerExecution.Internal(),
                 null,
+                null,
                 lock.newCondition()
         ));
     }
@@ -158,7 +197,8 @@ final class DeliveryLanes {
         return registerLane(receiver.lane);
     }
 
-    /// Returns false only when the lane limit is full.
+    /// Returns false only when the lane limit is full. A push lane starts its dispatcher, and a
+    /// hand-off lane starts the hand-off worker unless it runs.
     private boolean registerLane(Lane lane) {
         lock.lock();
         try {
@@ -176,12 +216,17 @@ final class DeliveryLanes {
             }
             lanes.put(lane.id, lane);
             retainedLanes++;
-            if (lane.handler == null) {
-                return true;
-            }
             try {
-                Thread.ofVirtual().name("hato-" + clientId + "-delivery-" + lane.id)
-                        .start(() -> dispatch(lane));
+                if (lane.handler != null) {
+                    Thread.ofVirtual()
+                            .name("hato-" + clientId + "-delivery-" + lane.id)
+                            .start(() -> dispatch(lane));
+                } else if (lane.acceptor != null && !handOffStarted) {
+                    Thread.ofVirtual()
+                            .name("hato-" + clientId + "-hand-off")
+                            .start(this::handOff);
+                    handOffStarted = true;
+                }
             } catch (Throwable failure) {
                 lanes.remove(lane.id);
                 retainedLanes--;
@@ -208,9 +253,9 @@ final class DeliveryLanes {
         }
     }
 
-    /// Ends a push lane whose removal is confirmed once the deliveries it accepted have run: those
-    /// queued before removal was requested, because a paused lane admits nothing new. A later
-    /// [#remove] still discards what remains.
+    /// Ends a push or hand-off lane whose removal is confirmed once the deliveries it accepted
+    /// have run or been handed off: those queued before removal was requested, because a paused
+    /// lane admits nothing new. A later [#remove] still discards what remains.
     void finish(long id) {
         lock.lock();
         try {
@@ -218,11 +263,15 @@ final class DeliveryLanes {
             if (lane != null) {
                 lane.paused = true;
                 lane.finishing = true;
+                // A hand-off lane with nothing left to hand off ends here; the worker would not
+                // pick it again.
+                settle(lane);
                 lane.ready.signalAll();
             }
         } finally {
             lock.unlock();
         }
+        runTerminations();
     }
 
     /// Closes hand-off for every lane before the client's close() returns. No dispatcher or
@@ -499,7 +548,7 @@ final class DeliveryLanes {
                             lane,
                             requireNonNull(retained.message),
                             dup,
-                            token.attempt()
+                            token
                     );
                     if (lane.ackMode == AckMode.MANUAL) {
                         view.acknowledgement = () -> acknowledge(view);
@@ -560,7 +609,7 @@ final class DeliveryLanes {
                                 lane,
                                 message,
                                 dup,
-                                token.attempt()
+                                token
                         );
                         enqueue(lane, view);
                     }
@@ -585,8 +634,10 @@ final class DeliveryLanes {
                 && bytes <= byteLimit - retainedBytes;
     }
 
-    /// Caller holds lock. Queues a new view on `lane` and wakes the lane's dispatcher or receiver.
+    /// Caller holds lock. Queues a new view on `lane` and wakes the lane's dispatcher, receiver,
+    /// or the hand-off worker.
     private void enqueue(Lane lane, DeliveryView view) {
+        view.sequence = ++enqueued;
         view.delivery.views.add(view);
         view.recipient.queued = true;
         lane.retained++;
@@ -602,9 +653,13 @@ final class DeliveryLanes {
     }
 
     private void logOverflow(Overflow overflow) {
-        String cause = overflow.reason() == Dropped.SUBSCRIPTION_FULL
-                ? "the subscription's buffer is full"
-                : "the client's delivery buffers are full";
+        String cause = switch (overflow.reason()) {
+            case SUBSCRIPTION_FULL -> "the subscription's buffer is full";
+            case CLIENT_FULL -> "the client's delivery buffers are full";
+            case REFUSED -> "its acceptor refused it";
+            case FAILED, CONNECTION_ENDED, SUBSCRIPTION_STOPPED ->
+                    throw new IllegalArgumentException("Not an overflow: " + overflow.reason());
+        };
         if (overflow.first()) {
             log.warn("Dropped a QoS 0 delivery for {} (subscription {}): {}; later ones are "
                     + "logged at debug level", clientId, overflow.id(), cause);
@@ -1097,6 +1152,159 @@ final class DeliveryLanes {
         }
     }
 
+    /// The client's hand-off worker: one internal virtual thread that offers deliveries to the
+    /// acceptors of every hand-off lane, oldest first across them, so the application sees one
+    /// receive order. It ends once no hand-off lane is left or the client's close has ended
+    /// hand-off, so it never waits for lanes that no longer exist.
+    private void handOff() {
+        while (true) {
+            Lane lane;
+            DeliveryView view;
+            lock.lock();
+            try {
+                Optional<Lane> next = awaitHandOff();
+                if (next.isEmpty()) {
+                    return;
+                }
+                lane = next.orElseThrow();
+                // Taking the head fixes its hand-off; a stop from here on leaves the lane's end
+                // to the worker.
+                view = lane.queue.removeFirst();
+                view.recipient.queued = false;
+                view.recipient.handed = true;
+                lane.accepting = true;
+            } finally {
+                lock.unlock();
+            }
+            offer(lane, view);
+        }
+    }
+
+    /// Caller holds lock. Waits for the hand-off lane whose head arrived first. Returns empty, and
+    /// lets the next hand-off lane start a new worker, once no hand-off lane is left or the
+    /// client's close has ended hand-off.
+    private Optional<Lane> awaitHandOff() {
+        while (!handOffsClosed && hasHandOffLanes()) {
+            Optional<Lane> oldest = oldestHandOff();
+            if (oldest.isPresent()) {
+                return oldest;
+            }
+            // Queuing, a stop, a cleared failure, and closeHandOffs() signal this condition.
+            handOffReady.awaitUninterruptibly();
+        }
+        handOffStarted = false;
+        return Optional.empty();
+    }
+
+    /// Caller holds lock. Stopped lanes have left the routing map.
+    private boolean hasHandOffLanes() {
+        return lanes.values().stream().anyMatch(lane -> lane.acceptor != null);
+    }
+
+    /// Caller holds lock. Among the hand-off lanes that can hand off now, the one whose head
+    /// arrived first. A failure holds its lane until it clears. This scans every lane, O(lanes)
+    /// per delivery with at most 256 lanes; ordering the lanes by their heads' sequence would make
+    /// it O(log lanes) if measurements show the scan.
+    private Optional<Lane> oldestHandOff() {
+        return lanes.values().stream()
+                .filter(lane -> lane.acceptor != null && !lane.failed && !lane.queue.isEmpty())
+                .min(Comparator.comparingLong(lane -> lane.queue.getFirst().sequence));
+    }
+
+    /// Offers a claimed delivery to its lane's acceptor, without the lock. True accepts it, false
+    /// refuses it, and an exception fails it as a handler failure would. Like a handler, the
+    /// acceptor leaves no interrupt state on the worker.
+    private void offer(Lane lane, DeliveryView view) {
+        boolean accepted;
+        try {
+            accepted = requireNonNull(lane.acceptor).test(view);
+        } catch (Throwable failure) {
+            boolean _ = Thread.interrupted();
+            fail(lane, view, failure, false);
+            lock.lock();
+            try {
+                finishAccepting(lane);
+            } finally {
+                lock.unlock();
+            }
+            runTerminations();
+            return;
+        }
+        boolean _ = Thread.interrupted();
+        if (accepted) {
+            accept(lane, view);
+        } else {
+            refuse(lane, view);
+        }
+    }
+
+    /// The acceptor took the delivery, and the application owns it from now on. An ON_RECEIVE
+    /// condition is met, and the delivery's capacity returns; its payload stays counted while
+    /// another subscription still holds the same message.
+    private void accept(Lane lane, DeliveryView view) {
+        boolean ready;
+        lock.lock();
+        try {
+            view.localDone = true;
+            ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
+            releaseView(view);
+            finishAccepting(lane);
+        } finally {
+            lock.unlock();
+        }
+        if (ready) {
+            onReady.run();
+        }
+        runTerminations();
+    }
+
+    /// The acceptor refused the delivery: an overflow of its lane, as when the lane's buffer is
+    /// full, and the acceptor is not asked again. A QoS 0 delivery is dropped for this lane
+    /// only. A QoS 1 or 2 delivery goes back to not handed off, so a continued session's
+    /// retransmission reaches this lane again, and the connection that delivered it ends as
+    /// overloaded.
+    private void refuse(Lane lane, DeliveryView view) {
+        if (view.delivery.token.acknowledgement() == 0) {
+            Overflow overflow;
+            lock.lock();
+            try {
+                view.localDone = true;
+                overflow = overflow(lane, Dropped.REFUSED);
+                releaseView(view);
+                finishAccepting(lane);
+            } finally {
+                lock.unlock();
+            }
+            logOverflow(overflow);
+        } else {
+            lock.lock();
+            try {
+                view.localDone = true;
+                drop(lane, Dropped.REFUSED);
+                view.released = true;
+                invalidate(view);
+                finishAccepting(lane);
+            } finally {
+                lock.unlock();
+            }
+            onOverload.accept(view.arrival);
+        }
+        runTerminations();
+    }
+
+    /// Caller holds lock. The worker has returned from the lane's acceptor. A stop that came
+    /// meanwhile left the lane's end to now, and a finishing lane ends once nothing is left to
+    /// hand off.
+    private void finishAccepting(Lane lane) {
+        lane.accepting = false;
+        if (lane.stopped) {
+            retainedLanes--;
+            terminatedLanes.add(lane);
+        } else {
+            settle(lane);
+        }
+    }
+
     /// Runs a claimed delivery's handler without the lock, then settles the delivery. A normal
     /// return ends its local processing; a failure invalidates its acknowledgement condition and
     /// is reported. Either way the handler's interrupt state is cleared.
@@ -1290,9 +1498,10 @@ final class DeliveryLanes {
         }
         lane.sublanes.clear();
         lane.queuedInSublanes = 0;
-        // Pull lanes have no dispatcher to return this slot or report termination when it exits;
-        // the stopped guard above keeps both single.
-        if (lane.handler == null) {
+        // Pull and hand-off lanes have no dispatcher to return this slot or report termination
+        // when it exits; the stopped guard above keeps both single. A hand-off lane whose
+        // acceptor runs ends when the worker returns from it.
+        if (lane.handler == null && !lane.accepting) {
             retainedLanes--;
             terminatedLanes.add(lane);
         }
@@ -1328,11 +1537,12 @@ final class DeliveryLanes {
         }
     }
 
-    /// Caller holds lock. A finishing pull lane stops once its accepted deliveries have been
-    /// received; a finishing push lane's dispatcher stops it. Every operation that can empty a
-    /// finishing pull lane calls this, so such a lane never waits empty.
+    /// Caller holds lock. A finishing pull or hand-off lane stops once its accepted deliveries
+    /// have been received or handed off; a finishing push lane's dispatcher stops it. Every
+    /// operation that can empty a finishing pull or hand-off lane, or end its acceptor call,
+    /// calls this, so such a lane never waits empty.
     private void settle(Lane lane) {
-        if (lane.finishing && lane.handler == null && lane.queue.isEmpty()) {
+        if (lane.finishing && lane.handler == null && lane.queue.isEmpty() && !lane.accepting) {
             // An empty lane completes no acknowledgement condition by stopping.
             boolean _ = stop(lane);
         }
@@ -1524,6 +1734,9 @@ final class DeliveryLanes {
         final FailurePolicy failurePolicy;
         final HandlerExecution execution;
         final @Nullable Consumer<MqttDelivery> handler;
+        // A hand-off lane's acceptor; push and pull lanes have none.
+        final @Nullable Predicate<MqttDelivery> acceptor;
+        // A hand-off lane shares the hand-off worker's condition.
         final Condition ready;
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
         // An executor's sublane exists while deliveries wait there or a drain task is on its way.
@@ -1540,6 +1753,9 @@ final class DeliveryLanes {
         boolean finishing;
         boolean stopped;
         boolean failed;
+        // The hand-off worker is in this lane's acceptor; a stop then leaves the lane's end to
+        // the worker.
+        boolean accepting;
         // Reasons whose first drop from this lane has been logged at warning level; later drops
         // for the same reason are logged at debug level.
         final Set<Dropped> warned = EnumSet.noneOf(Dropped.class);
@@ -1552,6 +1768,7 @@ final class DeliveryLanes {
                 FailurePolicy failurePolicy,
                 HandlerExecution execution,
                 @Nullable Consumer<MqttDelivery> handler,
+                @Nullable Predicate<MqttDelivery> acceptor,
                 Condition ready
         ) {
             this.id = id;
@@ -1560,6 +1777,7 @@ final class DeliveryLanes {
             this.failurePolicy = failurePolicy;
             this.execution = execution;
             this.handler = handler;
+            this.acceptor = acceptor;
             this.ready = ready;
         }
     }
@@ -1632,7 +1850,10 @@ final class DeliveryLanes {
         SUBSCRIPTION_FULL,
 
         /// A QoS 0 delivery did not fit the client's limits on deliveries and bytes.
-        CLIENT_FULL
+        CLIENT_FULL,
+
+        /// Its hand-off acceptor refused it.
+        REFUSED
     }
 
     /// A QoS 0 delivery that overflow kept from the lane `id`, logged after the lock is released.
@@ -1681,9 +1902,11 @@ final class DeliveryLanes {
         final Recipient recipient;
         final MqttMessage message;
         final boolean dup;
-        // The attempt of the connection that delivered this copy, which for a retransmission can
-        // be later than the receipt's first.
-        final long attempt;
+        // The token of the arrival that delivered this copy. For a retransmission, its
+        // connection and attempt can be later than the receipt's first.
+        final DeliveryToken arrival;
+        // Receive order across lanes, numbered when the copy is queued.
+        long sequence;
         @Nullable Lane lane;
         volatile @Nullable Runnable acknowledgement;
         boolean localDone;
@@ -1696,14 +1919,14 @@ final class DeliveryLanes {
                 Lane lane,
                 MqttMessage message,
                 boolean dup,
-                long attempt
+                DeliveryToken arrival
         ) {
             this.delivery = delivery;
             this.recipient = recipient;
             this.lane = lane;
             this.message = message;
             this.dup = dup;
-            this.attempt = attempt;
+            this.arrival = arrival;
             released = delivery.token.acknowledgement() == 0;
         }
 
@@ -1719,7 +1942,7 @@ final class DeliveryLanes {
 
         @Override
         public long connectionAttempt() {
-            return attempt;
+            return arrival.attempt();
         }
 
         @Override

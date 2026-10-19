@@ -19,6 +19,7 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import org.jspecify.annotations.Nullable;
@@ -253,6 +254,7 @@ public final class ClientActor implements MqttClient {
                 clientId,
                 receiveByteLimit(maxPacketSize),
                 this::deliveryFailed,
+                this::handOffRefused,
                 this::deliveryReady,
                 this::laneTerminated
         );
@@ -339,7 +341,7 @@ public final class ClientActor implements MqttClient {
     ) {
         requireNonNull(request, "request");
         requireNonNull(handler, "handler");
-        return subscribeInternal(request, new HandlerExecution.Internal(), handler);
+        return subscribeInternal(request, new HandlerExecution.Internal(), handler, null);
     }
 
     @Override
@@ -351,7 +353,7 @@ public final class ClientActor implements MqttClient {
         requireNonNull(request, "request");
         requireNonNull(options, "options");
         requireNonNull(handler, "handler");
-        return subscribeInternal(request, executionOf.apply(options), handler);
+        return subscribeInternal(request, executionOf.apply(options), handler, null);
     }
 
     @Override
@@ -367,13 +369,32 @@ public final class ClientActor implements MqttClient {
                     "A pull subscription has no handler whose failures to skip"
             );
         }
-        return subscribeInternal(request, new HandlerExecution.Internal(), null);
+        return subscribeInternal(request, new HandlerExecution.Internal(), null, null);
+    }
+
+    @Override
+    public Subscription handOff(Subscribe request, Predicate<MqttDelivery> acceptor) {
+        requireNonNull(request, "request");
+        requireNonNull(acceptor, "acceptor");
+        AckMode ackMode = request.ackMode().orElse(AckMode.ON_RECEIVE);
+        if (ackMode == AckMode.AFTER_HANDLER) {
+            throw new IllegalArgumentException(
+                    "A hand-off subscription cannot see when its deliveries are processed"
+            );
+        }
+        if (ackMode == AckMode.MANUAL) {
+            throw new IllegalArgumentException(
+                    "A hand-off subscription acknowledges its deliveries when it accepts them"
+            );
+        }
+        return subscribeInternal(request, new HandlerExecution.Internal(), null, acceptor);
     }
 
     private Subscription subscribeInternal(
             Subscribe request,
             HandlerExecution execution,
-            @Nullable Consumer<MqttDelivery> handler
+            @Nullable Consumer<MqttDelivery> handler,
+            @Nullable Predicate<MqttDelivery> acceptor
     ) {
         ClientSubscription subscription;
         MqttCapacityException rejection = null;
@@ -382,7 +403,7 @@ public final class ClientActor implements MqttClient {
                 throw new IllegalStateException("Client is closed");
             }
             long id = sequence.incrementAndGet();
-            subscription = new ClientSubscription(id, request, execution, handler);
+            subscription = new ClientSubscription(id, request, execution, handler, acceptor);
             subscriptions.put(id, subscription);
             unterminated.put(id, subscription);
             Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
@@ -713,6 +734,12 @@ public final class ClientActor implements MqttClient {
 
     private void signalFailure(long generation, Throwable failure) {
         terminate(generation, () -> core.failed(generation, failure));
+    }
+
+    /// An acceptor refused a QoS 1 or 2 delivery, so the connection that delivered it ends as
+    /// overloaded, as with a full buffer. Called by the hand-off worker.
+    private void handOffRefused(DeliveryToken arrival) {
+        signalFailure(arrival.connection(), new MqttCapacityException("Hand-off capacity"));
     }
 
     /// A result belongs to the attempt, which may span more than one connection. One for an
@@ -1056,16 +1083,9 @@ public final class ClientActor implements MqttClient {
                 if (subscription.locallyClosed) {
                     return Optional.of(subscription);
                 }
-                boolean admitted = subscription.receiver != null
-                        ? lanes.register(subscription.receiver)
-                        : lanes.register(
-                                id,
-                                subscription.request,
-                                subscription.execution,
-                                requireNonNull(subscription.handler)
-                        );
+                boolean admitted = subscription.admitLane();
                 if (admitted && subscription.receiver == null) {
-                    // Termination now waits for this push lane's dispatcher.
+                    // Termination now waits for this push or hand-off lane to end.
                     subscription.laneStarted = true;
                 }
                 if (subscription.unsubscription != null) {
@@ -1350,7 +1370,11 @@ public final class ClientActor implements MqttClient {
 
         private final HandlerExecution execution;
 
+        // Exactly one of handler, acceptor, and receiver decides how deliveries reach the
+        // application: a push, hand-off, or pull subscription.
         private final @Nullable Consumer<MqttDelivery> handler;
+
+        private final @Nullable Predicate<MqttDelivery> acceptor;
 
         private final DeliveryLanes.@Nullable Receiver receiver;
 
@@ -1387,14 +1411,28 @@ public final class ClientActor implements MqttClient {
                 long id,
                 Subscribe request,
                 HandlerExecution execution,
-                @Nullable Consumer<MqttDelivery> handler
+                @Nullable Consumer<MqttDelivery> handler,
+                @Nullable Predicate<MqttDelivery> acceptor
         ) {
             this.id = id;
             this.request = request;
             this.execution = execution;
             this.handler = handler;
-            receiver = handler == null ? lanes.receiver(id, request) : null;
+            this.acceptor = acceptor;
+            receiver = handler == null && acceptor == null ? lanes.receiver(id, request) : null;
             laneStarted = receiver != null;
+        }
+
+        /// Caller holds lifecycleLock. Admits this subscription's routing lane, of the kind that
+        /// its registration chose. False when the lane limit is full.
+        private boolean admitLane() {
+            if (receiver != null) {
+                return lanes.register(receiver);
+            }
+            if (acceptor != null) {
+                return lanes.registerHandOff(id, request, acceptor);
+            }
+            return lanes.register(id, request, execution, requireNonNull(handler));
         }
 
         @Override
@@ -1497,7 +1535,7 @@ public final class ClientActor implements MqttClient {
         private DeliveryLanes.Receiver pullReceiver() {
             DeliveryLanes.Receiver receiving = receiver;
             if (receiving == null) {
-                throw new UnsupportedOperationException("This subscription has a handler");
+                throw new UnsupportedOperationException("Only a pull subscription receives");
             }
             return receiving;
         }

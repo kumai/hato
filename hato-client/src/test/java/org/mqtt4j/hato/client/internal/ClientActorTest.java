@@ -6139,6 +6139,236 @@ class ClientActorTest {
     }
 
     @Test
+    void hand_off_rejects_acknowledgement_modes_that_wait_for_processing() throws Exception {
+        // Arrange
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+
+            // Act & Assert: nothing is registered or sent.
+            assertThatThrownBy(() -> sut.handOff(
+                    qosOneRequest().withAckMode(AckMode.AFTER_HANDLER),
+                    _ -> true
+            )).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> sut.handOff(
+                    qosOneRequest().withAckMode(AckMode.MANUAL),
+                    _ -> true
+            )).isInstanceOf(IllegalArgumentException.class);
+            assertThat(transport.sent).isEmpty();
+        }
+    }
+
+    @Test
+    void a_hand_off_acknowledges_a_delivery_when_the_acceptor_takes_it() throws Exception {
+        // Arrange: the application's mailbox takes deliveries, and nothing processes them.
+        var mailbox = new LinkedBlockingQueue<MqttDelivery>();
+        var threads = new LinkedBlockingQueue<Thread>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.handOff(qosOneRequest(), delivery -> {
+                threads.add(Thread.currentThread());
+                return mailbox.offer(delivery);
+            });
+            establish(transport, subscription);
+
+            // Act
+            transport.receive(qosOnePublication("messages", 7, false));
+
+            // Assert: PUBACK follows the acceptance, which runs on the client's hand-off worker
+            // rather than on I/O or the actor.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 7));
+            assertThat(requireNonNull(mailbox.poll(5, SECONDS)).message().payload())
+                    .containsExactly(7);
+            Thread worker = requireNonNull(threads.poll(5, SECONDS));
+            assertThat(worker.getName()).isEqualTo("hato-actor-test-hand-off");
+            assertThat(worker.isVirtual()).isTrue();
+        }
+    }
+
+    @Test
+    void a_refused_qos_1_hand_off_ends_the_connection_as_overloaded() throws Exception {
+        // Arrange
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.handOff(qosOneRequest(), _ -> false);
+            establish(transport, subscription);
+
+            // Act
+            transport.receive(qosOnePublication("messages", 7, false));
+
+            // Assert: the refused delivery is not acknowledged.
+            Throwable cause = requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow();
+            assertThat(cause).isInstanceOf(MqttCapacityException.class)
+                    .hasMessage("Hand-off capacity");
+            assertThat(transport.sent).noneMatch(Packet.PubAck.class::isInstance);
+        }
+    }
+
+    @Test
+    void a_refused_qos_0_hand_off_is_dropped_and_the_connection_goes_on() throws Exception {
+        // Arrange: the acceptor refuses the first delivery.
+        var mailbox = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.handOff(request(), delivery ->
+                    delivery.message().payload()[0] != 1
+                            && mailbox.offer(delivery.message().payload()[0]));
+            establish(transport, subscription);
+
+            // Act
+            transport.receive(publication(new byte[] {1}));
+            transport.receive(publication(new byte[] {2}));
+
+            // Assert
+            assertThat(mailbox.poll(5, SECONDS)).isEqualTo((byte) 2);
+            assertThat(mailbox).isEmpty();
+            assertThat(ends).isEmpty();
+            assertThat(transport.closed).isFalse();
+        }
+    }
+
+    @Test
+    void an_acceptor_failure_on_a_qos_1_delivery_stops_the_client() throws Exception {
+        // Arrange: the default policy, and an acceptor that throws.
+        var failure = new IllegalStateException("acceptor failed");
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.handOff(qosOneRequest(), _ -> {
+                throw failure;
+            });
+            establish(transport, subscription);
+
+            // Act
+            transport.receive(qosOnePublication("messages", 7, false));
+
+            // Assert: nothing accepted the delivery, so it still held back its acknowledgement.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(transport.sent).noneMatch(Packet.PubAck.class::isInstance);
+        }
+    }
+
+    @Test
+    void a_waiting_acceptor_holds_back_other_hand_offs_but_not_keep_alive() throws Exception {
+        // Arrange: subscription a's acceptor waits, and subscription b has room for one delivery.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var taken = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription a = sut.handOff(
+                    Subscribe.of(new TopicFilter("a"), Qos.AT_MOST_ONCE),
+                    _ -> {
+                        entered.countDown();
+                        waitFor(release);
+                        return true;
+                    }
+            );
+            establish(transport, a);
+            Subscription b = sut.handOff(
+                    Subscribe.of(new TopicFilter("b"), Qos.AT_MOST_ONCE).withBufferCapacity(1),
+                    delivery -> taken.add(delivery.message().payload()[0])
+            );
+            establish(transport, b);
+            transport.receive(publication("a", 0));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+
+            // Act: two messages for b arrive behind a's acceptor, and the keep-alive interval
+            // passes. This publication follows them through the mailbox, so it completes after
+            // routing them; keep-alive could overtake them.
+            transport.receive(publication("b", 1));
+            transport.receive(publication("b", 2));
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            scheduler.advance(Duration.ofSeconds(10));
+
+            // Assert: keep-alive goes on while b waits. Its second message found b full and was
+            // dropped, and b takes later messages once a's acceptor returns.
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.PingReq.class);
+            assertThat(taken).isEmpty();
+            release.countDown();
+            assertThat(taken.poll(5, SECONDS)).isEqualTo((byte) 1);
+            transport.receive(publication("b", 3));
+            assertThat(taken.poll(5, SECONDS)).isEqualTo((byte) 3);
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void unsubscribing_hands_off_the_accepted_deliveries_before_the_subscription_terminates()
+            throws Exception {
+        // Arrange: two deliveries wait while the acceptor holds the first.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var taken = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.handOff(request().withBufferCapacity(4), delivery -> {
+                taken.add(delivery.message().payload()[0]);
+                entered.countDown();
+                waitFor(release);
+                return true;
+            });
+            establish(transport, subscription);
+            for (int value = 1; value <= 3; value++) {
+                transport.receive(publication(new byte[] {(byte) value}));
+            }
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            // The removal admits nothing routed after it, so wait until all three are routed.
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 3);
+
+            // Act: the broker confirms the removal while the acceptor still holds the first.
+            CompletableFuture<Void> unsubscribing = subscription.unsubscribe();
+            var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
+            unsubscribing.get(5, SECONDS);
+            release.countDown();
+
+            // Assert
+            subscription.terminated().get(5, SECONDS);
+            assertThat(taken).containsExactly((byte) 1, (byte) 2, (byte) 3);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_an_acceptor_still_running() throws Exception {
+        // Arrange: the acceptor keeps the hand-off worker.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.handOff(request(), _ -> {
+                entered.countDown();
+                waitFor(release);
+                return true;
+            });
+            establish(transport, subscription);
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the running acceptor alone keeps the
+            // subscription and the client from terminating.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(subscription.terminated()).isNotDone();
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            subscription.terminated().get(5, SECONDS);
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void a_qos_0_handler_failure_is_skipped_and_the_subscription_continues() throws Exception {
         // Arrange: the default policy, and a handler that fails for the first delivery.
         var failure = new IllegalStateException("handler failed");
@@ -6743,6 +6973,18 @@ class ClientActorTest {
 
     private static Packet.Publish qosOnePublication(String topic, int packetId, boolean duplicate) {
         return acknowledgedPublication(topic, packetId, Qos.AT_LEAST_ONCE, duplicate);
+    }
+
+    private static Packet.Publish publication(String topic, int value) {
+        return new Packet.Publish(
+                new Topic(topic),
+                new byte[] {(byte) value},
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                EMPTY
+        );
     }
 
     private static Packet.Publish qosOnePublication(int packetId, byte[] payload) {

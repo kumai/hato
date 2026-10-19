@@ -53,6 +53,9 @@ class DeliveryLanesTest {
 
     private final LinkedBlockingQueue<Failure> failures = new LinkedBlockingQueue<>();
 
+    // Arrivals whose connection a refused hand-off ended as overloaded.
+    private final LinkedBlockingQueue<DeliveryToken> overloads = new LinkedBlockingQueue<>();
+
     private final LinkedBlockingQueue<Long> ready = new LinkedBlockingQueue<>();
 
     private final LinkedBlockingQueue<Long> terminated = new LinkedBlockingQueue<>();
@@ -65,6 +68,8 @@ class DeliveryLanesTest {
 
     @AfterEach
     void close() {
+        // The client closes hand-off before its lanes, which also ends the hand-off worker.
+        managers.forEach(DeliveryLanes::closeHandOffs);
         managers.forEach(manager -> manager.close(null));
         releases.forEach(CountDownLatch::countDown);
         await().untilAsserted(() -> managers.forEach(manager -> {
@@ -73,6 +78,7 @@ class DeliveryLanesTest {
             assertThat(manager.retainedBytes()).isZero();
         }));
         assertThat(failures).isEmpty();
+        assertThat(overloads).isEmpty();
     }
 
     @Test
@@ -2128,6 +2134,346 @@ class DeliveryLanesTest {
         assertThat(sut.dropped(Dropped.CONNECTION_ENDED)).isEqualTo(1);
     }
 
+    @Test
+    void the_hand_off_worker_offers_the_oldest_delivery_across_lanes_first() throws Exception {
+        // Arrange: lane 1's acceptor holds the worker on its first delivery while more arrive on
+        // both lanes, one of them matching both.
+        var offered = new LinkedBlockingQueue<String>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        assertThat(sut.registerHandOff(1, request(8), delivery -> {
+            offered.add("1:" + delivery.message().payload()[0]);
+            entered.countDown();
+            waitFor(release);
+            return true;
+        })).isTrue();
+        assertThat(sut.registerHandOff(2, request(8), delivery ->
+                offered.add("2:" + delivery.message().payload()[0]))).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
+        assertThat(entered.await(5, SECONDS)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(2), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(3), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(4), false, 1)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L, 2L), message(5), false, 1)).isTrue();
+
+        // Act
+        release.countDown();
+
+        // Assert: one receive order across the lanes, with a shared message offered in turn.
+        await().until(() -> offered.size() == 6);
+        assertThat(offered).containsExactly("1:1", "2:2", "1:3", "2:4", "1:5", "2:5");
+    }
+
+    @Test
+    void accepting_a_delivery_meets_its_on_receive_condition_and_returns_its_capacity()
+            throws Exception {
+        // Arrange: the application keeps what it accepts, and a push lane also holds the
+        // message, so its payload stays counted.
+        var mailbox = new LinkedBlockingQueue<MqttDelivery>();
+        CountDownLatch release = release();
+        assertThat(sut.registerHandOff(1, request(1), mailbox::offer)).isTrue();
+        assertThat(sut.register(2, request(AckMode.ON_RECEIVE, 1), _ -> waitFor(release)))
+                .isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L), qosOneMessage(1), false, 10))
+                .isTrue();
+
+        // Assert: the accepted delivery holds no slot of its lane, so a later one fits, while
+        // the push lane still holds the payload.
+        assertThat(mailbox.poll(5, SECONDS)).isNotNull();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        await().until(() -> sut.retainedDeliveries() == 1);
+        assertThat(sut.retainedBytes()).isEqualTo(10);
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(2), false, 10)).isTrue();
+        assertThat(mailbox.poll(5, SECONDS)).isNotNull();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
+    }
+
+    @Test
+    void a_refused_qos_0_delivery_is_dropped_for_its_lane_only() throws Exception {
+        // Arrange: lane 1 refuses every delivery, and lane 2 accepts.
+        var offers = new AtomicInteger();
+        var accepted = new LinkedBlockingQueue<MqttDelivery>();
+        assertThat(sut.registerHandOff(1, request(2), _ -> {
+            offers.incrementAndGet();
+            return false;
+        })).isTrue();
+        assertThat(sut.registerHandOff(2, request(2), accepted::offer)).isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 0), List.of(1L, 2L), message(1), false, 10)).isTrue();
+
+        // Assert: the other lane receives it, the refusing acceptor is not asked again, and no
+        // connection ends.
+        assertThat(accepted.poll(5, SECONDS)).isNotNull();
+        assertThat(sut.dropped(1, Dropped.REFUSED)).isEqualTo(1);
+        assertThat(sut.dropped(2, Dropped.REFUSED)).isZero();
+        assertThat(offers).hasValue(1);
+    }
+
+    @Test
+    void a_refused_qos_1_delivery_overloads_its_connection_and_is_not_offered_again()
+            throws Exception {
+        // Arrange
+        var offers = new AtomicInteger();
+        var arrival = new DeliveryToken(SESSION, 3, 2, 10);
+        assertThat(sut.registerHandOff(1, request(AckMode.ON_RECEIVE, 2), _ -> {
+            offers.incrementAndGet();
+            return false;
+        })).isTrue();
+
+        // Act
+        assertThat(sut.deliver(arrival, List.of(1L), qosOneMessage(), false, 10)).isTrue();
+
+        // Assert: the connection that delivered it ends as overloaded. Its acknowledgement is
+        // not met, and it counts as not handed off, so a continued session hands it off again.
+        assertThat(overloads.poll(5, SECONDS)).isEqualTo(arrival);
+        assertThat(sut.dropped(1, Dropped.REFUSED)).isEqualTo(1);
+        assertThat(offers).hasValue(1);
+        assertThat(sut.isReady(10)).isFalse();
+        assertThat(sut.receiveState()).isEmpty();
+        assertThat(sut.retainedDeliveries()).isZero();
+    }
+
+    @Test
+    void a_qos_1_retransmission_reaches_only_the_lane_that_refused_its_first_copy()
+            throws Exception {
+        // Arrange: lane 1 accepts and lane 2 refuses the first copy, which overloads the
+        // connection, and the session continues.
+        var first = new LinkedBlockingQueue<MqttDelivery>();
+        var second = new LinkedBlockingQueue<MqttDelivery>();
+        var refuse = new AtomicBoolean(true);
+        assertThat(sut.registerHandOff(1, request(AckMode.ON_RECEIVE, 2), first::offer)).isTrue();
+        assertThat(sut.registerHandOff(2, request(AckMode.ON_RECEIVE, 2), delivery ->
+                !refuse.getAndSet(false) && second.offer(delivery))).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L), qosOneMessage(), false, 10))
+                .isTrue();
+        assertThat(overloads.poll(5, SECONDS)).isEqualTo(token(1, 10));
+        assertThat(first.poll(5, SECONDS)).isNotNull();
+        assertThat(sut.connectionEnded(true, false)).containsExactlyEntriesOf(Map.of(10L, false));
+
+        // Act
+        assertThat(sut.deliver(token(2, 10), List.of(1L, 2L), qosOneMessage(), true, 10))
+                .isTrue();
+
+        // Assert: the accepted copy is neither taken back nor offered again.
+        assertThat(requireNonNull(second.poll(5, SECONDS)).dup()).isTrue();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(first).isEmpty();
+    }
+
+    @Test
+    void a_refused_retransmission_overloads_the_connection_that_delivered_it() throws Exception {
+        // Arrange: lane 1 accepts the first copy, which keeps the receipt across a continued
+        // session, and lane 2 refuses every copy.
+        var first = new LinkedBlockingQueue<MqttDelivery>();
+        assertThat(sut.registerHandOff(1, request(AckMode.ON_RECEIVE, 2), first::offer)).isTrue();
+        assertThat(sut.registerHandOff(2, request(AckMode.ON_RECEIVE, 2), _ -> false)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L), qosOneMessage(), false, 10))
+                .isTrue();
+        assertThat(overloads.poll(5, SECONDS)).isEqualTo(token(1, 10));
+        assertThat(first.poll(5, SECONDS)).isNotNull();
+        assertThat(sut.connectionEnded(true, false)).containsKey(10L);
+
+        // Act: the retransmission on connection 2 joins that receipt and is refused again.
+        assertThat(sut.deliver(token(2, 10), List.of(1L, 2L), qosOneMessage(), true, 10))
+                .isTrue();
+
+        // Assert: the overload ends connection 2, not the receipt's first connection.
+        assertThat(overloads.poll(5, SECONDS)).isEqualTo(token(2, 10));
+        assertThat(sut.dropped(2, Dropped.REFUSED)).isEqualTo(2);
+    }
+
+    @Test
+    void an_acceptor_failure_on_a_qos_1_delivery_stops_only_its_lane() throws Exception {
+        // Arrange: lane 1's acceptor throws under the default policy, and lane 2 accepts.
+        var cause = new IllegalStateException("acceptor failed");
+        var offers = new AtomicInteger();
+        var accepted = new LinkedBlockingQueue<MqttDelivery>();
+        assertThat(sut.registerHandOff(1, request(AckMode.ON_RECEIVE, 2), _ -> {
+            offers.incrementAndGet();
+            throw cause;
+        })).isTrue();
+        assertThat(sut.registerHandOff(2, request(2), accepted::offer)).isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(1), false, 10)).isTrue();
+        assertThat(failures.poll(5, SECONDS)).isEqualTo(new Failure(token(1, 10), cause));
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(2), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(3), false, 10)).isTrue();
+
+        // Assert: nothing accepted the delivery, so its failure held back the acknowledgement
+        // and stopped lane 1, while lane 2 goes on.
+        assertThat(accepted.poll(5, SECONDS)).isNotNull();
+        assertThat(offers).hasValue(1);
+        assertThat(sut.isReady(10)).isFalse();
+    }
+
+    @Test
+    void an_acceptor_failure_is_skipped_under_skip_and_acknowledges_the_delivery()
+            throws Exception {
+        // Arrange: the acceptor of a skipping lane throws for the first delivery.
+        var offered = new LinkedBlockingQueue<Byte>();
+        Subscribe skipping = request(AckMode.ON_RECEIVE, 2).withFailurePolicy(FailurePolicy.SKIP);
+        assertThat(sut.registerHandOff(1, skipping, delivery -> {
+            offered.add(delivery.message().payload()[0]);
+            if (delivery.message().payload()[0] == 1) {
+                throw new IllegalStateException("acceptor failed");
+            }
+            return true;
+        })).isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(2), false, 10)).isTrue();
+
+        // Assert: the failed delivery is acknowledged unprocessed, and the next one is offered.
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
+        assertThat(offered).containsExactly((byte) 1, (byte) 2);
+        assertThat(sut.dropped(1, Dropped.FAILED)).isEqualTo(1);
+    }
+
+    @Test
+    void a_stopped_hand_off_lane_ends_once_its_running_acceptor_returns() throws Exception {
+        // Arrange: the acceptor runs when the lane stops, and another delivery waits.
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var accepted = new AtomicBoolean();
+        assertThat(sut.registerHandOff(1, request(2), _ -> {
+            entered.countDown();
+            waitFor(release);
+            accepted.set(true);
+            return true;
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 10)).isTrue();
+        assertThat(entered.await(5, SECONDS)).isTrue();
+
+        // Act
+        sut.remove(1);
+
+        // Assert: the waiting delivery is discarded at once, but the lane keeps its slot and
+        // ends only after the acceptor returns, which accepts the offered delivery.
+        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isEqualTo(1);
+        assertThat(terminated).isEmpty();
+        assertThat(sut.retainedLanes()).isEqualTo(1);
+        release.countDown();
+        assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
+        assertThat(accepted).isTrue();
+        assertThat(sut.retainedLanes()).isZero();
+    }
+
+    @Test
+    void a_confirmed_removal_hands_off_the_accepted_deliveries_and_then_ends_the_lane()
+            throws Exception {
+        // Arrange: two deliveries wait while the acceptor holds the first.
+        var offered = new LinkedBlockingQueue<Byte>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        assertThat(sut.registerHandOff(1, request(4), delivery -> {
+            offered.add(delivery.message().payload()[0]);
+            entered.countDown();
+            waitFor(release);
+            return true;
+        })).isTrue();
+        for (int value = 1; value <= 3; value++) {
+            assertThat(sut.deliver(token(1, 0), List.of(1L), message(value), false, 1)).isTrue();
+        }
+        assertThat(entered.await(5, SECONDS)).isTrue();
+
+        // Act: the removal is confirmed, and a later delivery finds the lane closed to it.
+        sut.finish(1);
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(4), false, 1)).isTrue();
+        release.countDown();
+
+        // Assert
+        assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
+        assertThat(offered).containsExactly((byte) 1, (byte) 2, (byte) 3);
+    }
+
+    @Test
+    void a_confirmed_removal_ends_a_hand_off_lane_with_nothing_waiting_at_once() {
+        // Arrange
+        assertThat(sut.registerHandOff(1, request(1), _ -> true)).isTrue();
+
+        // Act
+        sut.finish(1);
+
+        // Assert
+        assertThat(terminated).containsExactly(1L);
+        assertThat(sut.retainedLanes()).isZero();
+    }
+
+    @Test
+    void a_connection_end_discards_the_deliveries_waiting_for_hand_off() throws Exception {
+        // Arrange: two deliveries wait while the acceptor holds the first.
+        var offered = new LinkedBlockingQueue<Byte>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        assertThat(sut.registerHandOff(1, request(4), delivery -> {
+            offered.add(delivery.message().payload()[0]);
+            entered.countDown();
+            waitFor(release);
+            return true;
+        })).isTrue();
+        for (int value = 1; value <= 3; value++) {
+            assertThat(sut.deliver(token(1, 0), List.of(1L), message(value), false, 1)).isTrue();
+        }
+        assertThat(entered.await(5, SECONDS)).isTrue();
+
+        // Act
+        sut.connectionEnded(false, false);
+        release.countDown();
+
+        // Assert
+        await().until(() -> sut.retainedDeliveries() == 0);
+        assertThat(offered).containsExactly((byte) 1);
+        assertThat(sut.dropped(1, Dropped.CONNECTION_ENDED)).isEqualTo(2);
+    }
+
+    @Test
+    void one_hand_off_worker_serves_every_lane_until_the_last_one_ends() throws Exception {
+        // Arrange: lane 1's acceptor holds the worker while a delivery for lane 2 arrives.
+        var workers = new LinkedBlockingQueue<Thread>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        assertThat(sut.registerHandOff(1, request(1), _ -> {
+            workers.add(Thread.currentThread());
+            entered.countDown();
+            waitFor(release);
+            return true;
+        })).isTrue();
+        assertThat(sut.registerHandOff(2, request(1), _ -> workers.add(Thread.currentThread())))
+                .isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
+        assertThat(entered.await(5, SECONDS)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(2), false, 1)).isTrue();
+
+        // Act
+        release.countDown();
+
+        // Assert: lane 2's delivery waited for the same internal thread.
+        Thread worker = requireNonNull(workers.poll(5, SECONDS));
+        assertThat(workers.poll(5, SECONDS)).isSameAs(worker);
+        assertThat(worker.isVirtual()).isTrue();
+        assertThat(worker.getName()).isEqualTo("hato-lane-test-hand-off");
+
+        // Act & Assert: the worker ends with the last hand-off lane, and the next hand-off lane
+        // starts another, which ends when hand-off closes.
+        sut.remove(1);
+        sut.remove(2);
+        assertThat(worker.join(Duration.ofSeconds(5))).isTrue();
+        assertThat(sut.registerHandOff(3, request(1), _ -> workers.add(Thread.currentThread())))
+                .isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(3L), message(3), false, 1)).isTrue();
+        Thread next = requireNonNull(workers.poll(5, SECONDS));
+        assertThat(next).isNotSameAs(worker);
+        sut.closeHandOffs();
+        assertThat(next.join(Duration.ofSeconds(5))).isTrue();
+    }
+
     private record Failure(DeliveryToken token, Throwable cause) {
     }
 
@@ -2171,6 +2517,7 @@ class DeliveryLanesTest {
                 "lane-test",
                 byteLimit,
                 onFailure,
+                overloads::add,
                 onReady,
                 terminated::add
         );

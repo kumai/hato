@@ -1,6 +1,7 @@
 package org.mqtt4j.hato;
 
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 /// The subscribing role of a client, without access to its connection lifecycle.
 public interface MqttSubscriber {
@@ -105,5 +106,44 @@ public interface MqttSubscriber {
             Consumer<MqttDelivery> handler
     ) {
         throw new UnsupportedOperationException("Delivery options are not supported");
+    }
+
+    /// Registers a hand-off subscription, which hands each delivery to `acceptor` for the
+    /// application to process elsewhere, such as in its own mailbox: `mailbox::offer`. Returns
+    /// the handle immediately; registration and its failures are as for
+    /// [#subscribe(Subscribe, Consumer)].
+    ///
+    /// One internal thread of the client calls the acceptors of all its hand-off subscriptions,
+    /// one delivery at a time, in receive order across them; a publication that several of them
+    /// match is offered to each in turn. Deliveries waiting for hand-off count against
+    /// [Subscribe#bufferCapacity()]. The acceptor returns true to accept a delivery: from then on
+    /// the application owns it, and its capacity returns. Returning false leaves it unaccepted
+    /// and counts as an overflow, as when the buffer is full: a QoS 0 delivery is dropped for
+    /// this subscription, and a QoS 1 or 2 delivery ends the connection. The client does not
+    /// offer a refused delivery again. An exception is a handler failure under the request's
+    /// [FailurePolicy]; a QoS 1 or 2 delivery that was not accepted still holds back its
+    /// acknowledgement, so [FailurePolicy#STOP] stops the client. Once it has accepted a
+    /// delivery, the acceptor must neither return false nor throw, because the client cannot
+    /// take the delivery back.
+    ///
+    /// The acceptor must not wait, as `BlockingQueue.put` does; use `offer`. While it waits, the
+    /// client's other hand-off subscriptions wait too, and their deliveries can overflow. Waiting
+    /// there for the termination of this subscription or the client never ends.
+    ///
+    /// [AckMode#ON_RECEIVE], the default, acknowledges a QoS 1 or 2 delivery when it is accepted.
+    /// [AckMode#AFTER_HANDLER] and [AckMode#MANUAL] throw [IllegalArgumentException].
+    ///
+    /// [Subscription#close()], [Subscription#unsubscribe()], and closing the client end new
+    /// hand-offs; `unsubscribe()` first hands off the deliveries it already accepted. A call that
+    /// started before the stop can still return after it. Once [Subscription#terminated()]
+    /// completes, the acceptor is not called again, and the application can drain or discard its
+    /// mailbox. A connection's end discards the deliveries still waiting for hand-off. Each
+    /// delivery reports its [MqttDelivery#connectionAttempt()], so deliveries kept from an
+    /// earlier connection can be told apart.
+    ///
+    /// The default implementation throws [UnsupportedOperationException], so implementations of
+    /// the subscribing role need not hand off deliveries.
+    default Subscription handOff(Subscribe request, Predicate<MqttDelivery> acceptor) {
+        throw new UnsupportedOperationException("Hand-off subscriptions are not supported");
     }
 }
