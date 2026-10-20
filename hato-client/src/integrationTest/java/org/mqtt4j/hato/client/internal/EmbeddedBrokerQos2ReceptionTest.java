@@ -9,6 +9,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.broker.MqttBroker;
 
 import static java.util.Objects.requireNonNull;
@@ -16,6 +17,10 @@ import static java.util.Objects.requireNonNull;
 class EmbeddedBrokerQos2ReceptionTest extends Qos2ReceptionIntegrationTest {
 
     private static @Nullable MqttBroker broker;
+
+    EmbeddedBrokerQos2ReceptionTest(MqttVersion version) {
+        super(version);
+    }
 
     @BeforeAll
     static void start() throws IOException {

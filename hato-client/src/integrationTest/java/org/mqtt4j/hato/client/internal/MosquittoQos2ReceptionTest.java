@@ -7,6 +7,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.testcontainers.containers.GenericContainer;
 
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 @EnabledIf(
@@ -16,6 +17,10 @@ import org.mqtt4j.hato.testsupport.Mosquitto;
 class MosquittoQos2ReceptionTest extends Qos2ReceptionIntegrationTest {
 
     private static final GenericContainer<?> broker = Mosquitto.container();
+
+    MosquittoQos2ReceptionTest(MqttVersion version) {
+        super(version);
+    }
 
     static boolean dockerIsAvailableOrRequired() {
         return Mosquitto.availableOrRequired();

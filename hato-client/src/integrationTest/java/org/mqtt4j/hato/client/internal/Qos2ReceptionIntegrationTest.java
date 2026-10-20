@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedClass;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -27,11 +28,20 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 import static org.mqtt4j.hato.client.internal.MessagingTest.waitFor;
 
-/// Both brokers exercise the same persistent receiver without inspecting broker state.
+/// Both brokers exercise the same persistent receiver without inspecting broker state, in both
+/// protocol versions.
 @Timeout(30)
+@ParameterizedClass(name = "{0}")
+@EnumSource(MqttVersion.class)
 abstract class Qos2ReceptionIntegrationTest {
 
     private static final Duration DELAY = Duration.ofSeconds(30);
+
+    private final MqttVersion version;
+
+    Qos2ReceptionIntegrationTest(MqttVersion version) {
+        this.version = version;
+    }
 
     enum Cut {
         BEFORE_PUBLISH, BEFORE_PUBREC, BEFORE_PUBREL, BEFORE_PUBCOMP
@@ -67,7 +77,7 @@ abstract class Qos2ReceptionIntegrationTest {
             assertThat(ended.poll(5, SECONDS)).isNotNull();
 
             // Act: the replay reaches the receiver before the original handle acknowledges it.
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
+            assertSession(sut.connect().get(5, SECONDS), true, 2);
             publicationBarrier(sut);
             original.ack();
             publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -109,7 +119,7 @@ abstract class Qos2ReceptionIntegrationTest {
             assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
 
             // Act
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
+            assertSession(sut.connect().get(5, SECONDS), true, 2);
             assertThat(requireNonNull(delivered.poll(5, SECONDS)).message())
                     .isEqualTo(message(topic, (byte) 1));
             publicationBarrier(sut);
@@ -222,7 +232,7 @@ abstract class Qos2ReceptionIntegrationTest {
         try (MqttClient publisher = client();
                 MqttClient sut = persistentClient(id, scheduler, transports, ended)) {
             publisher.connect().get(5, SECONDS);
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            assertSession(sut.connect().get(5, SECONDS), false, 1);
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
             );
@@ -261,7 +271,7 @@ abstract class Qos2ReceptionIntegrationTest {
             if (!sessionPresent) {
                 try (MqttClient replacement = MqttClient.builder()
                         .server(endpoint())
-                        .version(MqttVersion.V3_1_1)
+                        .version(version)
                         .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(id)
                         .build()) {
@@ -269,7 +279,7 @@ abstract class Qos2ReceptionIntegrationTest {
                     replacement.disconnect().get(5, SECONDS);
                 }
             }
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(sessionPresent, 2));
+            assertSession(sut.connect().get(5, SECONDS), sessionPresent, 2);
             // This exchange confirms restoration before a different client sends the marker.
             publicationBarrier(sut);
             publisher.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -286,6 +296,12 @@ abstract class Qos2ReceptionIntegrationTest {
         }
     }
 
+    // An MQTT 5.0 broker may announce limits in its CONNACK, so only the session is compared.
+    private static void assertSession(ConnAck connAck, boolean sessionPresent, int attempt) {
+        assertThat(connAck.sessionPresent()).isEqualTo(sessionPresent);
+        assertThat(connAck.connectionAttempt()).isEqualTo(attempt);
+    }
+
     private static void awaitDelay(ManualTimerScheduler scheduler) {
         // These checks observe virtual-time progress; the default 100 ms only adds wall time.
         await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
@@ -300,7 +316,7 @@ abstract class Qos2ReceptionIntegrationTest {
     ) {
         return MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(id)
                 .sessionExpiry(Duration.ofSeconds(30))
@@ -316,7 +332,7 @@ abstract class Qos2ReceptionIntegrationTest {
     private MqttClient client() {
         return MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .build();
     }
@@ -324,7 +340,7 @@ abstract class Qos2ReceptionIntegrationTest {
     private MqttClient client(LinkedBlockingQueue<Disconnection> ended) {
         return MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(ended::add)
                 .build();
