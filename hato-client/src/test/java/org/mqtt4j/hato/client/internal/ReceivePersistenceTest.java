@@ -26,6 +26,7 @@ import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
@@ -49,7 +50,8 @@ class ReceivePersistenceTest {
             "client",
             Duration.ofSeconds(30),
             Duration.ZERO,
-            false,
+            MqttVersion.V3_1_1,
+            Duration.ofHours(1),
             null,
             false,
             ReconnectBackoff.disabled(),

@@ -71,6 +71,18 @@ class SessionPersistenceTest {
     }
 
     @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void connect_uses_the_configured_protocol_version(MqttVersion version) {
+        SessionCore configured = core(version, true);
+        configured.connect(new ConnectionAttempt(1), 0);
+        configured.opened(1);
+
+        assertThat(port.sent).singleElement().satisfies(packet -> {
+            assertThat(((Packet.Connect) packet).version()).isEqualTo(version);
+        });
+    }
+
+    @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void retained_publications_replay_in_order_with_the_original_ids_and_handoff_flags(
             boolean completedWrite
@@ -346,6 +358,25 @@ class SessionPersistenceTest {
         assertThat(port.results).doesNotContainKeys(first, second);
         assertThat(port.accepted).hasSize(2);
         assertThat(port.accepted).extracting(Publication::packetId).doesNotHaveDuplicates();
+    }
+
+    @Test
+    void an_mqtt_5_session_counts_publications_at_their_mqtt_5_wire_size() {
+        // Arrange: a persistent MQTT 5.0 session. Its PUBLISH carries a property length that
+        // MQTT 3.1.1 lacks, so a message that just fills the budget in MQTT 3.1.1 exceeds it.
+        SessionCore mqtt5 = core(MqttVersion.V5, false);
+        mqtt5.connect(new ConnectionAttempt(1), 0);
+        mqtt5.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        int budget = 32 * 1024 * 1024;
+
+        // Act
+        mqtt5.publish(2, messageWithWireBytes(budget, MqttVersion.V3_1_1));
+        mqtt5.publish(3, messageWithWireBytes(budget, MqttVersion.V5));
+
+        // Assert
+        assertFailure(2, MqttCapacityException.class);
+        assertThat(port.results).doesNotContainKey(3L);
+        assertThat(port.accepted).hasSize(1);
     }
 
     @Test
@@ -832,12 +863,17 @@ class SessionPersistenceTest {
     }
 
     private SessionCore core(boolean cleanStart) {
+        return core(MqttVersion.V3_1_1, cleanStart);
+    }
+
+    private SessionCore core(MqttVersion version, boolean cleanStart) {
         return new SessionCore(
                 port,
                 "client",
                 Duration.ofSeconds(30),
                 Duration.ZERO,
-                cleanStart,
+                version,
+                cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 null,
                 false,
                 ReconnectBackoff.disabled(),
@@ -925,7 +961,12 @@ class SessionPersistenceTest {
     }
 
     static MqttMessage messageWithWireBytes(int bytes) {
-        var codec = PacketCodec.of(MqttVersion.V3_1_1);
+        return messageWithWireBytes(bytes, MqttVersion.V3_1_1);
+    }
+
+    /// A QoS 1 message whose PUBLISH takes exactly `bytes` on the wire in `version`.
+    static MqttMessage messageWithWireBytes(int bytes, MqttVersion version) {
+        var codec = PacketCodec.of(version);
         var topic = new Topic("budget");
         int header = codec.encodePublishHeader(
                 topic,

@@ -1210,7 +1210,8 @@ class AutomaticReconnectionTest {
                     return transport;
                 },
                 PacketCodec.of(MqttVersion.V3_1_1),
-                cleanStart,
+                MqttVersion.V3_1_1,
+                cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 null,
                 null,
                 backoff,

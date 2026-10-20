@@ -18,6 +18,7 @@ import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
@@ -28,6 +29,7 @@ import org.mqtt4j.hato.client.internal.ConnectionEstablishment.Step;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketIds;
 
@@ -233,6 +235,7 @@ final class SessionCore {
 
     private final Duration responseTimeout;
 
+    // Zero session expiry starts a new session with every connection.
     private final boolean cleanStart;
 
     private final boolean credentialsRequired;
@@ -287,7 +290,8 @@ final class SessionCore {
             String clientId,
             Duration timeout,
             Duration keepAlive,
-            boolean cleanStart,
+            MqttVersion version,
+            Duration sessionExpiry,
             Packet.@Nullable Will will,
             boolean credentialsRequired,
             ReconnectBackoff backoff,
@@ -299,15 +303,27 @@ final class SessionCore {
         this.timeout = timeout;
         this.keepAlive = keepAlive;
         this.responseTimeout = responseTimeout;
-        this.cleanStart = cleanStart;
+        cleanStart = sessionExpiry.isZero();
         this.credentialsRequired = credentialsRequired;
         request = new ConnectionRequest(backoff, initialRetry);
         current = new Connection(responseTimeout, Step.FIRST);
-        establishment = new ConnectionEstablishment(clientId, keepAlive, cleanStart, will);
+        establishment = new ConnectionEstablishment(
+                clientId,
+                version,
+                keepAlive,
+                sessionExpiry,
+                will
+        );
         var context = new PartContext();
         receptions = new Receptions(port, context, clientId);
         subscriptions = new Subscriptions(port, context, cleanStart);
-        publications = new Publications(port, context, clientId, cleanStart);
+        publications = new Publications(
+                port,
+                context,
+                clientId,
+                cleanStart,
+                PacketCodec.of(version)
+        );
     }
 
     State state() {

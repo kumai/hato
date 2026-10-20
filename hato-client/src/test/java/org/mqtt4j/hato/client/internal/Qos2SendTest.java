@@ -18,6 +18,7 @@ import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -972,7 +973,8 @@ class Qos2SendTest {
                 "client",
                 Duration.ofSeconds(30),
                 Duration.ZERO,
-                cleanStart,
+                MqttVersion.V3_1_1,
+                cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 null,
                 false,
                 backoff,

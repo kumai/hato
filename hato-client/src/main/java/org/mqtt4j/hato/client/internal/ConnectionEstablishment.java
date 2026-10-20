@@ -59,21 +59,26 @@ final class ConnectionEstablishment {
 
     private final String clientId;
 
+    private final MqttVersion version;
+
     private final int keepAliveSeconds;
 
+    // Zero session expiry starts a new session with every connection.
     private final boolean cleanStart;
 
     private final Packet.@Nullable Will will;
 
     ConnectionEstablishment(
             String clientId,
+            MqttVersion version,
             Duration keepAlive,
-            boolean cleanStart,
+            Duration sessionExpiry,
             Packet.@Nullable Will will
     ) {
         this.clientId = clientId;
+        this.version = version;
         keepAliveSeconds = (int) keepAlive.toSeconds();
-        this.cleanStart = cleanStart;
+        cleanStart = sessionExpiry.isZero();
         this.will = will;
     }
 
@@ -84,7 +89,7 @@ final class ConnectionEstablishment {
         boolean discarding = step == Step.DISCARD;
         return new Packet.Connect(
                 clientId,
-                MqttVersion.V3_1_1,
+                version,
                 cleanStart || discarding,
                 keepAliveSeconds,
                 discarding ? null : will,

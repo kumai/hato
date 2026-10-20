@@ -8214,7 +8214,8 @@ class ClientActorTest {
                     return transport;
                 },
                 packetCodec,
-                cleanStart,
+                MqttVersion.V3_1_1,
+                cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 null,
                 null,
                 ReconnectBackoff.disabled(),

@@ -18,7 +18,6 @@ import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -41,8 +40,6 @@ final class Publications {
 
     private static final Log log = Log.of(Publications.class);
 
-    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
-
     private static final int INFLIGHT_LIMIT = 64;
 
     private static final long INFLIGHT_BYTE_LIMIT = 32L * 1024 * 1024;
@@ -58,6 +55,9 @@ final class Publications {
     private final String clientId;
 
     private final boolean cleanStart;
+
+    // The connection's codec, which sizes the retained PUBLISH of a persistent session.
+    private final PacketCodec codec;
 
     // The session's exchanges by packet identifier. PUBLISH entries retain send order; replacing
     // one with PUBREL moves it to the end in PUBREC order. Both stages share the identifier and
@@ -82,12 +82,14 @@ final class Publications {
             SessionCore.Port port,
             SessionCore.Context core,
             String clientId,
-            boolean cleanStart
+            boolean cleanStart,
+            PacketCodec codec
     ) {
         this.port = port;
         this.core = core;
         this.clientId = clientId;
         this.cleanStart = cleanStart;
+        this.codec = codec;
     }
 
     void publish(long operation, MqttMessage message) {

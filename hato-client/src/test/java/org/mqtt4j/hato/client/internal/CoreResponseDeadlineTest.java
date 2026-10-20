@@ -12,6 +12,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
@@ -274,7 +275,8 @@ class CoreResponseDeadlineTest {
                 "client",
                 Duration.ofSeconds(30),
                 Duration.ZERO,
-                cleanStart,
+                MqttVersion.V3_1_1,
+                cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 null,
                 false,
                 backoff,

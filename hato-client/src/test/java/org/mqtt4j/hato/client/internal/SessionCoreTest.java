@@ -36,6 +36,7 @@ import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -67,7 +68,8 @@ class SessionCoreTest {
             "client",
             Duration.ofSeconds(30),
             Duration.ofSeconds(10),
-            true,
+            MqttVersion.V3_1_1,
+            Duration.ZERO,
             null,
             false,
             ReconnectBackoff.disabled(),
@@ -3023,7 +3025,8 @@ class SessionCoreTest {
                 "client",
                 Duration.ofSeconds(30),
                 Duration.ofSeconds(10),
-                true,
+                MqttVersion.V3_1_1,
+                Duration.ZERO,
                 null,
                 true,
                 ReconnectBackoff.disabled(),

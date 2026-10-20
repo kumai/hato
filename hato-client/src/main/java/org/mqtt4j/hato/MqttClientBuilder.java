@@ -342,7 +342,8 @@ public final class MqttClientBuilder {
     ///     payload exceeds 65535 bytes
     public MqttClient build() {
         URI endpoint = server;
-        if (endpoint == null || version == null) {
+        MqttVersion selectedVersion = version;
+        if (endpoint == null || selectedVersion == null) {
             throw new IllegalStateException("Server and MQTT version must be specified");
         }
         boolean tls = "mqtts".equals(endpoint.getScheme());
@@ -390,7 +391,8 @@ public final class MqttClientBuilder {
                 timer,
                 listener,
                 factory,
-                sessionExpiry.isZero(),
+                selectedVersion,
+                sessionExpiry,
                 credentials,
                 connectWill,
                 reconnectPolicy.backoff(),

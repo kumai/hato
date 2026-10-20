@@ -189,7 +189,8 @@ public final class ClientActor implements MqttClient {
             TimerScheduler scheduler,
             ConnectionListener listener,
             Transport.Factory transportFactory,
-            boolean cleanStart,
+            MqttVersion version,
+            Duration sessionExpiry,
             @Nullable Supplier<MqttCredentials> credentials,
             Packet.@Nullable Will will,
             ReconnectBackoff backoff,
@@ -206,8 +207,9 @@ public final class ClientActor implements MqttClient {
                 scheduler,
                 listener,
                 transportFactory,
-                PacketCodec.of(MqttVersion.V3_1_1),
-                cleanStart,
+                PacketCodec.of(version),
+                version,
+                sessionExpiry,
                 credentials,
                 will,
                 backoff,
@@ -227,7 +229,8 @@ public final class ClientActor implements MqttClient {
             ConnectionListener listener,
             Transport.Factory transportFactory,
             PacketCodec codec,
-            boolean cleanStart,
+            MqttVersion version,
+            Duration sessionExpiry,
             @Nullable Supplier<MqttCredentials> credentials,
             Packet.@Nullable Will will,
             ReconnectBackoff backoff,
@@ -239,7 +242,7 @@ public final class ClientActor implements MqttClient {
         this.clientId = clientId;
         this.scheduler = scheduler;
         this.executionOf = executionOf;
-        this.cleanStart = cleanStart;
+        cleanStart = sessionExpiry.isZero();
         reconnects = backoff.enabled();
         termination = new ClientTermination(
                 threadName("terminated"),
@@ -271,7 +274,8 @@ public final class ClientActor implements MqttClient {
                 clientId,
                 timeout,
                 keepAlive,
-                cleanStart,
+                version,
+                sessionExpiry,
                 will,
                 credentials != null,
                 backoff,

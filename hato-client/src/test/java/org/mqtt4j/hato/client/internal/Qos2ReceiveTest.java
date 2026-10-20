@@ -18,6 +18,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttProtocolException;
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
@@ -43,7 +44,8 @@ class Qos2ReceiveTest {
             "client",
             Duration.ofSeconds(30),
             Duration.ZERO,
-            false,
+            MqttVersion.V3_1_1,
+            Duration.ofHours(1),
             null,
             false,
             ReconnectBackoff.disabled(),
