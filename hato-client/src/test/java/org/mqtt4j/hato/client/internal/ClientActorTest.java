@@ -62,7 +62,7 @@ import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
@@ -2683,7 +2683,10 @@ class ClientActorTest {
             }
 
             @Override
-            public void onResubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+            public void onResubscribeFailed(
+                    Subscription handle,
+                    MqttSubscriptionRefusedException failure
+            ) {
                 failures.add(handle);
                 entered.countDown();
                 waitFor(release);
@@ -2749,7 +2752,10 @@ class ClientActorTest {
             }
 
             @Override
-            public void onResubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+            public void onResubscribeFailed(
+                    Subscription handle,
+                    MqttSubscriptionRefusedException failure
+            ) {
                 refused.add(handle);
             }
         };
@@ -4896,7 +4902,10 @@ class ClientActorTest {
             }
 
             @Override
-            public void onResubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+            public void onResubscribeFailed(
+                    Subscription handle,
+                    MqttSubscriptionRefusedException failure
+            ) {
                 refused.add(handle);
             }
         };

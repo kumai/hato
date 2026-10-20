@@ -54,12 +54,15 @@ public interface ConnectionListener {
     default void onConnectFailed(Disconnection failure) {
     }
 
-    /// Called when the broker refuses re-creation of an established subscription, unless
+    /// Called when re-creation of an established subscription is refused, unless
     /// [Subscription#close()] or [Subscription#unsubscribe()] requested its removal first.
     /// `subscription` is the original handle and is permanently ended; other subscriptions and
-    /// the connection continue. Waiting and later pull receives throw [MqttSubscribeException]
-    /// with the same refusal reason. The same filter can be registered again at once, also from
-    /// within this callback.
-    default void onResubscribeFailed(Subscription subscription, MqttSubscribeException failure) {
+    /// the connection continue. Waiting and later pull receives throw
+    /// [MqttSubscriptionRefusedException] with the same refusal reason. The same filter can be
+    /// registered again at once, also from within this callback.
+    default void onResubscribeFailed(
+            Subscription subscription,
+            MqttSubscriptionRefusedException failure
+    ) {
     }
 }

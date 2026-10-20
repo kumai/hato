@@ -107,7 +107,7 @@ class Mqtt5AcknowledgementTest {
             assertThat(subscription.established()).failsWithin(Duration.ofSeconds(5))
                     .withThrowableOfType(ExecutionException.class)
                     .havingCause()
-                    .isInstanceOfSatisfying(MqttSubscribeException.class, refusal ->
+                    .isInstanceOfSatisfying(MqttSubscriptionRefusedException.class, refusal ->
                             assertThat(refusal.reasonCode()).isEqualTo(ReasonCode.NOT_AUTHORIZED));
             peer.roundTripBarrier(sut);
         }
@@ -148,12 +148,14 @@ class Mqtt5AcknowledgementTest {
         return MqttMessage.of(new Topic("data"), new byte[] {1}, qos, false);
     }
 
-    private static MqttPublishException refusal(CompletableFuture<PublishResult> published) {
+    private static MqttPublicationRefusedException refusal(
+            CompletableFuture<PublishResult> published
+    ) {
         Throwable failure = assertThat(published).failsWithin(Duration.ofSeconds(5))
                 .withThrowableOfType(ExecutionException.class)
                 .actual()
                 .getCause();
-        assertThat(failure).isInstanceOf(MqttPublishException.class);
-        return (MqttPublishException) failure;
+        assertThat(failure).isInstanceOf(MqttPublicationRefusedException.class);
+        return (MqttPublicationRefusedException) failure;
     }
 }

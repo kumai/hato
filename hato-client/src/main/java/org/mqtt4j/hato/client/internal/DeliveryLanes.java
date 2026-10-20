@@ -32,7 +32,7 @@ import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.client.internal.common.log.Log;
@@ -1873,9 +1873,9 @@ final class DeliveryLanes {
             if (lane.failure instanceof MqttCapacityException rejection) {
                 throw new MqttCapacityException(requireNonNull(rejection.getMessage()));
             }
-            if (lane.failure instanceof MqttSubscribeException rejection) {
+            if (lane.failure instanceof MqttSubscriptionRefusedException rejection) {
                 // Concurrent receivers must not share one throwable's trace and suppressions.
-                throw new MqttSubscribeException(rejection.reasonCode());
+                throw new MqttSubscriptionRefusedException(rejection.reasonCode());
             }
             if (lane.failure instanceof MqttProtocolException violation) {
                 throw new MqttProtocolException(

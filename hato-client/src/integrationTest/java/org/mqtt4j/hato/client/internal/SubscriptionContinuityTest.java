@@ -49,7 +49,7 @@ class SubscriptionContinuityTest {
             @Override
             public void onResubscribeFailed(
                     Subscription subscription,
-                    MqttSubscribeException failure
+                    MqttSubscriptionRefusedException failure
             ) {
                 refused.add(new ResubscribeFailure(subscription, failure));
             }
@@ -108,13 +108,13 @@ class SubscriptionContinuityTest {
                         .isEqualTo(ReasonCode.UNSPECIFIED_ERROR);
                 assertThat(received.handle((_, failure) -> failure).get(5, SECONDS))
                         .isInstanceOfSatisfying(
-                                MqttSubscribeException.class,
+                                MqttSubscriptionRefusedException.class,
                                 failure -> assertThat(failure.reasonCode())
                                         .isEqualTo(notification.failure().reasonCode())
                         );
                 assertThatThrownBy(() -> rejected.receive(Duration.ZERO))
                         .isInstanceOfSatisfying(
-                                MqttSubscribeException.class,
+                                MqttSubscriptionRefusedException.class,
                                 failure -> assertThat(failure.reasonCode())
                                         .isEqualTo(notification.failure().reasonCode())
                         );
@@ -392,5 +392,8 @@ class SubscriptionContinuityTest {
         return assertInstanceOf(ReceiveResult.Received.class, result).delivery();
     }
 
-    private record ResubscribeFailure(Subscription subscription, MqttSubscribeException failure) {}
+    private record ResubscribeFailure(
+            Subscription subscription,
+            MqttSubscriptionRefusedException failure
+    ) {}
 }

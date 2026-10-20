@@ -18,7 +18,7 @@ import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttPublishException;
+import org.mqtt4j.hato.MqttPublicationRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
@@ -986,7 +986,7 @@ class Qos2SendTest {
 
         // Assert: the publication fails, nothing answers the refusal, and the exchange is over.
         assertThat(result(refused).failure()).isInstanceOfSatisfying(
-                MqttPublishException.class,
+                MqttPublicationRefusedException.class,
                 refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
         );
         assertThat(port.releases).isEmpty();

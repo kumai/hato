@@ -302,11 +302,11 @@ class SubscriptionRegistrationTest {
 
             // Assert
             Throwable failure = failureOf(established);
-            assertThat(failure).isInstanceOf(MqttSubscribeException.class);
+            assertThat(failure).isInstanceOf(MqttSubscriptionRefusedException.class);
             assertThat(failureOf(subscription.established())).isSameAs(failure);
             assertThatThrownBy(() -> subscription.receive(Duration.ZERO))
                     .isInstanceOfSatisfying(
-                            MqttSubscribeException.class,
+                            MqttSubscriptionRefusedException.class,
                             cause -> assertThat(cause.reasonCode())
                                     .isEqualTo(ReasonCode.UNSPECIFIED_ERROR)
                     );

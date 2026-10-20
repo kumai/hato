@@ -7,7 +7,7 @@ import java.util.concurrent.CompletableFuture;
 /// The same handle survives connection termination. The client's next connection, including an
 /// automatic reconnection, resumes an established subscription when the broker retained the
 /// session; otherwise, including before the first successful SUBACK, it sends SUBSCRIBE again.
-/// Removal, local closure, permanent client closure, registration rejection, a broker refusal,
+/// Removal, local closure, permanent client closure, registration rejection, a refusal,
 /// or a SUBACK that violates the protocol ends the subscription permanently.
 public interface Subscription extends AutoCloseable {
 
@@ -29,8 +29,8 @@ public interface Subscription extends AutoCloseable {
     /// connection attempts do not fail the observation.
     ///
     /// Each call returns an independent future. Completing, cancelling, or timing out that future
-    /// changes neither the registration nor another observation. A broker refusal fails it with
-    /// [MqttSubscribeException]. A SUBACK that violates the protocol fails it with
+    /// changes neither the registration nor another observation. A refusal fails it with
+    /// [MqttSubscriptionRefusedException]. A SUBACK that violates the protocol fails it with
     /// [MqttProtocolException] and also ends the connection. Registration rejection reports its
     /// original cause; see [MqttSubscriber]. Requested removal, local closure, or an ordinary
     /// client close fails it with [IllegalStateException]. An internal failure that permanently
@@ -58,7 +58,7 @@ public interface Subscription extends AutoCloseable {
     /// received, or once [MqttClient#close()] has been called. Connection termination
     /// discards buffered deliveries but leaves this call waiting for delivery after the next
     /// connection. This applies to both requested disconnection and connection failure.
-    /// A broker refusal ends this subscription and throws [MqttSubscribeException]; a refusal
+    /// A refusal ends this subscription and throws [MqttSubscriptionRefusedException]; a refusal
     /// after local closure or a requested removal only confirms that removal, so this call ends
     /// with [ReceiveResult.Ended] as described above. A SUBACK that violates the protocol throws
     /// [MqttProtocolException]. Rejected registration throws its original exception, including
@@ -71,7 +71,7 @@ public interface Subscription extends AutoCloseable {
     ///
     /// @throws InterruptedException if interrupted before claiming a delivery
     /// @throws UnsupportedOperationException for a subscription with a handler
-    /// @throws MqttSubscribeException if the broker refused the subscription before its removal
+    /// @throws MqttSubscriptionRefusedException if the subscription was refused before its removal
     ///         was requested
     /// @throws MqttProtocolException if a SUBACK for this subscription violated the protocol
     /// @throws MqttConnectionLostException if an internal failure closed the client first
@@ -84,14 +84,14 @@ public interface Subscription extends AutoCloseable {
     /// duration is rejected. A timeout does not end the subscription. A normally ended
     /// subscription returns [ReceiveResult.Ended] immediately, even for a zero-duration poll.
     /// A disconnected subscription can time out while waiting for the next connection.
-    /// Registration rejection, a broker refusal, a SUBACK that violates the protocol, and an
+    /// Registration rejection, a refusal, a SUBACK that violates the protocol, and an
     /// internal failure that closes the client throw as they do for [#receive()]. The default
     /// implementation throws [UnsupportedOperationException].
     ///
     /// @throws IllegalArgumentException if `timeout` is negative
     /// @throws InterruptedException if interrupted before claiming a delivery
     /// @throws UnsupportedOperationException for a subscription with a handler
-    /// @throws MqttSubscribeException if the broker refused the subscription before its removal
+    /// @throws MqttSubscriptionRefusedException if the subscription was refused before its removal
     ///         was requested
     /// @throws MqttProtocolException if a SUBACK for this subscription violated the protocol
     /// @throws MqttConnectionLostException if an internal failure closed the client first
@@ -140,7 +140,7 @@ public interface Subscription extends AutoCloseable {
     /// completes once no handler of this subscription is running and no delivery remains for it
     /// to run or to hand to a receiver: after [#close()]; after [#unsubscribe()], once removal is
     /// confirmed and the deliveries it accepted have run or been received; after any other
-    /// permanent end, such as a broker refusal; or after the client closes. Beyond the removal
+    /// permanent end, such as a refusal; or after the client closes. Beyond the removal
     /// confirmation that [#unsubscribe()] waits for, it does not wait for the broker: after
     /// [#close()] it can complete before UNSUBACK, and it also completes while disconnected. It
     /// does not wait for [MqttDelivery#ack()] of MANUAL deliveries already handed off; their

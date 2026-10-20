@@ -12,9 +12,10 @@ import java.util.OptionalInt;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
@@ -260,6 +261,12 @@ final class Subscriptions {
                 window.registrations.removeFirst();
                 continue;
             }
+            Optional<ReasonCode> refusal = refusal(local.filter);
+            if (refusal.isPresent()) {
+                window.registrations.removeFirst();
+                refuse(local, refusal.orElseThrow());
+                continue;
+            }
             OptionalInt allocated = core.allocatePacketId();
             if (allocated.isEmpty()) {
                 return;
@@ -305,17 +312,9 @@ final class Subscriptions {
         window.subscribing.remove(ack.packetId());
         core.responses().answered(ResponseDeadlines.Kind.SUBACK, ack.packetId());
         core.releasePacketId(ack.packetId());
-        boolean restoring = local.confirmed;
         window.subscribingInFlight--;
         if (refused) {
-            var refusal = new MqttSubscribeException(reason);
-            if (!restoring) {
-                removeSubscription(local, refusal);
-            } else {
-                registry.remove(local.id);
-                port.resubscribeFailed(local.handle, refusal);
-            }
-            finishRemoval(local);
+            refuse(local, reason);
         } else {
             local.confirmed = true;
             local.established = true;
@@ -345,6 +344,39 @@ final class Subscriptions {
         window.closingInFlight--;
         removeSubscription(pending.subscription, null);
         finishRemoval(pending.subscription);
+    }
+
+    /// Ends a registration that the broker refused, or would refuse by the limits that it
+    /// announced for the connection. A first registration fails with the refusal; one that a
+    /// continued or new session re-creates is reported as a failed re-creation.
+    private void refuse(LocalSubscription local, ReasonCode reason) {
+        var refusal = new MqttSubscriptionRefusedException(reason);
+        if (!local.confirmed) {
+            removeSubscription(local, refusal);
+        } else {
+            registry.remove(local.id);
+            port.resubscribeFailed(local.handle, refusal);
+        }
+        finishRemoval(local);
+    }
+
+    /// The reason code with which the broker would refuse a subscription to `filter`, by the
+    /// limits that it announced for the connection, or empty when it would accept it. A broker
+    /// that receives such a SUBSCRIBE ends the connection with the same reason code (MQTT 5.0
+    /// sections 3.2.2.3.11 and 3.2.2.3.13).
+    private Optional<ReasonCode> refusal(TopicFilter filter) {
+        ConnAck limits = core.limits();
+        Optional<SharedTopicFilter> shared = SharedTopicFilter.parse(filter);
+        if (shared.isPresent() && !limits.sharedSubscriptionAvailable()) {
+            return Optional.of(ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED);
+        }
+        String pattern = shared.map(subscription -> subscription.filter().pattern())
+                .orElse(filter.pattern());
+        if (!limits.wildcardSubscriptionAvailable()
+                && (pattern.contains("+") || pattern.contains("#"))) {
+            return Optional.of(ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED);
+        }
+        return Optional.empty();
     }
 
     /// A SUBACK that violates the protocol ends its registration as well as the connection, so

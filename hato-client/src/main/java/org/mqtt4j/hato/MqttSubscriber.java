@@ -81,12 +81,12 @@ public interface MqttSubscriber {
     /// broker removal. Registration does not consume operation capacity.
     /// The same original filter remains reserved while pending, active, or awaiting removal.
     ///
-    /// A broker refusal fails establishment with [MqttSubscribeException] and permanently ends
+    /// A refusal fails establishment with [MqttSubscriptionRefusedException] and permanently ends
     /// that subscription. Other subscriptions and the connection continue. A refusal during
     /// re-creation is also reported by
-    /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscribeException)]; pull
-    /// receive methods report both initial and re-creation refusals. A refusal that arrives after
-    /// the application closed the subscription or requested its removal only confirms that
+    /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscriptionRefusedException)];
+    /// pull receive methods report both initial and re-creation refusals. A refusal that arrives
+    /// after the application closed the subscription or requested its removal only confirms that
     /// removal. A SUBACK that violates the protocol ends both the subscription, with
     /// [MqttProtocolException], and the connection, so a later connection does not send the same
     /// SUBSCRIBE again.

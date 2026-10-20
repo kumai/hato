@@ -69,7 +69,7 @@ final class ConnectionEstablishment {
 
     // The largest packet that MQTT can carry, including the fixed header. A broker that
     // announces no Maximum Packet Size, or a larger one, accepts packets up to this size.
-    private static final long LARGEST_PACKET_SIZE = 268_435_460;
+    static final int LARGEST_PACKET_SIZE = 268_435_460;
 
     private final String clientId;
 

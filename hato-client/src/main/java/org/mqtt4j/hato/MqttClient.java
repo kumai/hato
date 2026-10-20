@@ -85,8 +85,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// existing handles. Previously failed publication futures remain failed. This future does
     /// not wait for replay or SUBACK; a re-creation refusal ends only the affected subscription
     /// and is reported by
-    /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscribeException)]. A pull
-    /// subscription also reports it through [Subscription#receive()].
+    /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscriptionRefusedException)].
+    /// A pull subscription also reports it through [Subscription#receive()].
     /// Registrations still awaiting their first SUBACK are sent after CONNACK as well.
     /// [Subscription#established()] can observe each subscription independently of this future.
     ///

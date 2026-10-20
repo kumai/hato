@@ -29,7 +29,7 @@ import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
@@ -1163,7 +1163,10 @@ class SessionPersistenceTest {
         }
 
         @Override
-        public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+        public void resubscribeFailed(
+                Subscription handle,
+                MqttSubscriptionRefusedException failure
+        ) {
             long id = handles.entrySet().stream()
                     .filter(entry -> entry.getValue() == handle)
                     .mapToLong(Map.Entry::getKey)

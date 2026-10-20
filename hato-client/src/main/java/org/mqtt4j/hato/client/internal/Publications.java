@@ -6,6 +6,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.SequencedMap;
 import java.util.SequencedSet;
@@ -13,12 +14,13 @@ import java.util.Set;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttPublishException;
+import org.mqtt4j.hato.MqttPublicationRefusedException;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -98,6 +100,15 @@ final class Publications {
         if (!ready(operation)) {
             return;
         }
+        Optional<ReasonCode> refusal = refusal(message);
+        if (refusal.isPresent()) {
+            port.complete(
+                    operation,
+                    null,
+                    new MqttPublicationRefusedException(refusal.orElseThrow())
+            );
+            return;
+        }
         // Replays precede subscription restoration; SUBACK waiting does not block publication.
         if (!window.replays.isEmpty()) {
             capacityFailure(operation, "Publication replay pending");
@@ -118,16 +129,7 @@ final class Publications {
                     capacityFailure(operation, "Publication byte capacity");
                     return;
                 }
-                byteCount = codec.encodePublishHeader(
-                        message.topic(),
-                        message.qos(),
-                        message.retain(),
-                        false,
-                        1,
-                        EMPTY,
-                        message.payloadSize()
-                )
-                        .length + message.payloadSize();
+                byteCount = wireSize(message);
                 if (byteCount > remaining) {
                     capacityFailure(operation, "Publication byte capacity");
                     return;
@@ -276,6 +278,15 @@ final class Publications {
             if (inflight.get(next.packetId) != next) {
                 window.replays.removeFirst();
                 continue;
+            }
+            if (next instanceof Publication publication) {
+                // A continued session can reach a broker with stricter limits. Sending would end
+                // the connection, and every reconnection would replay the same publication.
+                Optional<ReasonCode> refusal = refusal(requireNonNull(publication.message));
+                if (refusal.isPresent()) {
+                    refused(publication, refusal.orElseThrow());
+                    continue;
+                }
             }
             long ticket = core.nextTicket();
             SendQueue.OfferResult result = switch (next) {
@@ -442,12 +453,58 @@ final class Publications {
         }
     }
 
+    /// The reason code with which the broker would refuse `message`, by the limits that it
+    /// announced for the connection, or empty when it would accept the message. MQTT 5.0 forbids
+    /// sending such a publication ([MQTT-3.2.2-11], [MQTT-3.2.2-14], [MQTT-3.2.2-15]), and a
+    /// broker that receives one ends the connection with the same reason code.
+    private Optional<ReasonCode> refusal(MqttMessage message) {
+        ConnAck limits = core.limits();
+        if (message.qos().level() > limits.maximumQos().level()) {
+            return Optional.of(ReasonCode.QOS_NOT_SUPPORTED);
+        }
+        if (message.retain() && !limits.retainAvailable()) {
+            return Optional.of(ReasonCode.RETAIN_NOT_SUPPORTED);
+        }
+        if (exceeds(message, limits.maximumPacketSize())) {
+            return Optional.of(ReasonCode.PACKET_TOO_LARGE);
+        }
+        return Optional.empty();
+    }
+
+    /// Whether the PUBLISH that carries `message` is larger than `limit`. Without a limit below
+    /// what MQTT can carry, the send queue bounds the size, as it does for MQTT 3.1.1.
+    private boolean exceeds(MqttMessage message, int limit) {
+        if (limit >= ConnectionEstablishment.LARGEST_PACKET_SIZE) {
+            return false;
+        }
+        try {
+            return wireSize(message) > limit;
+        } catch (IllegalArgumentException _) {
+            // No Remaining Length can describe the packet, so no limit admits it.
+            return true;
+        }
+    }
+
+    /// The size of the PUBLISH that carries `message`, including its fixed header.
+    private int wireSize(MqttMessage message) {
+        return codec.encodePublishHeader(
+                message.topic(),
+                message.qos(),
+                message.retain(),
+                false,
+                message.qos() == Qos.AT_MOST_ONCE ? 0 : 1,
+                EMPTY,
+                message.payloadSize()
+        )
+                .length + message.payloadSize();
+    }
+
     /// The broker did not accept the publication, which ends its exchange: the packet identifier
     /// is free again, and the session does not resume the exchange.
     private void refused(Publication publication, ReasonCode reason) {
         removeInflight(publication.packetId);
         if (publication.operation != 0) {
-            port.complete(publication.operation, null, new MqttPublishException(reason));
+            port.complete(publication.operation, null, new MqttPublicationRefusedException(reason));
         }
     }
 

@@ -17,7 +17,7 @@ import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -111,7 +111,7 @@ final class SessionCore {
         /// Releases lanes paused by a stop that a withdrawn reconnect wait discarded.
         void stopDiscarded();
 
-        void resubscribeFailed(Subscription handle, MqttSubscribeException failure);
+        void resubscribeFailed(Subscription handle, MqttSubscriptionRefusedException failure);
 
         /// Reports queue admission, not write completion. The core handles refusal per operation.
         SendQueue.OfferResult send(
@@ -220,6 +220,10 @@ final class SessionCore {
 
         /// The registrations whose filter matches `topic`, except those being removed.
         List<Long> matching(Topic topic);
+
+        /// The limits that the broker announced for the established connection. Only valid
+        /// while a connection is established.
+        ConnAck limits();
     }
 
     private static final Log log = Log.of(SessionCore.class);
@@ -1127,6 +1131,11 @@ final class SessionCore {
         @Override
         public List<Long> matching(Topic topic) {
             return subscriptions.matching(topic);
+        }
+
+        @Override
+        public ConnAck limits() {
+            return requireNonNull(current.ack);
         }
     }
 

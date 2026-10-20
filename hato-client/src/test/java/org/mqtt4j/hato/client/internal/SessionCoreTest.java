@@ -22,6 +22,7 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -36,8 +37,8 @@ import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
-import org.mqtt4j.hato.MqttPublishException;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttPublicationRefusedException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
@@ -63,6 +64,7 @@ import static org.mqtt4j.hato.client.internal.SessionCore.State.DISCONNECTED;
 import static org.mqtt4j.hato.client.internal.SessionCore.Timer.CONNECT;
 import static org.mqtt4j.hato.client.internal.SessionCore.Timer.KEEP_ALIVE;
 import static org.mqtt4j.hato.client.internal.SessionCore.Timer.PING;
+import static org.mqtt4j.hato.client.internal.SessionPersistenceTest.messageWithWireBytes;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 class SessionCoreTest {
@@ -538,7 +540,7 @@ class SessionCoreTest {
         assertThat(port.removed).containsExactly(2L);
         assertThat(port.removals).singleElement().satisfies(removal -> {
             assertThat(removal.handle()).isSameAs(refused);
-            assertThat(removal.cause()).isInstanceOf(MqttSubscribeException.class);
+            assertThat(removal.cause()).isInstanceOf(MqttSubscriptionRefusedException.class);
         });
         assertThat(port.resubscriptionFailures).containsExactlyElementsOf(port.removals);
         assertThat(requireNonNull(port.results.get(5L)).failure()).isNull();
@@ -576,7 +578,7 @@ class SessionCoreTest {
         // Arrange
         connected();
         establishSubscriptions(1);
-        var failure = new MqttSubscribeException(ReasonCode.UNSPECIFIED_ERROR);
+        var failure = new MqttSubscriptionRefusedException(ReasonCode.UNSPECIFIED_ERROR);
 
         // Act
         sut.close(failure);
@@ -642,7 +644,8 @@ class SessionCoreTest {
         if (refused) {
             assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
             assertThat(port.removals).singleElement().satisfies(removal ->
-                    assertThat(removal.cause()).isInstanceOf(MqttSubscribeException.class));
+                    assertThat(removal.cause())
+                            .isInstanceOf(MqttSubscriptionRefusedException.class));
         } else {
             var removal = (Packet.Unsubscribe) port.sent.getLast();
             assertThat(port.results).doesNotContainKey(4L);
@@ -1418,7 +1421,7 @@ class SessionCoreTest {
         // Assert
         assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
         assertThat(requireNonNull(port.outcomes.get(2L)).failure())
-                .isInstanceOf(MqttSubscribeException.class);
+                .isInstanceOf(MqttSubscriptionRefusedException.class);
         assertThat(requireNonNull(port.results.get(3L)).failure()).isNull();
         assertThat(port.removed).containsExactly(2L);
     }
@@ -1670,7 +1673,7 @@ class SessionCoreTest {
         // Assert
         assertThat(requireNonNull(port.outcomes.get(2L)).failure())
                 .isInstanceOfSatisfying(
-                        MqttSubscribeException.class,
+                        MqttSubscriptionRefusedException.class,
                         failure -> assertThat(failure.reasonCode())
                                 .isEqualTo(ReasonCode.UNSPECIFIED_ERROR)
                 );
@@ -1951,6 +1954,175 @@ class SessionCoreTest {
         assertThat(port.removed).containsExactly(2L);
     }
 
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("publicationsBeyondLimits")
+    void a_publication_beyond_the_brokers_limits_fails_without_being_sent(
+            Property limit,
+            MqttMessage message,
+            ReasonCode reason
+    ) {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(limit);
+
+        // Act
+        mqtt5.publish(2, message);
+
+        // Assert: the broker would end the connection with the same reason code.
+        assertThat(requireNonNull(port.results.get(2L)).failure()).isInstanceOfSatisfying(
+                MqttPublicationRefusedException.class,
+                refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
+        );
+        assertThat(port.publications).isEmpty();
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
+    }
+
+    static Stream<Arguments> publicationsBeyondLimits() {
+        MqttMessage message = qosOneMessage();
+        return Stream.of(
+                Arguments.of(
+                        Named.of(
+                                "QoS 2 above Maximum QoS 1",
+                                new Property.ByteValue(PropertyId.MAXIMUM_QOS, 1)
+                        ),
+                        message.withQos(Qos.EXACTLY_ONCE),
+                        ReasonCode.QOS_NOT_SUPPORTED
+                ),
+                Arguments.of(
+                        Named.of(
+                                "QoS 1 above Maximum QoS 0",
+                                new Property.ByteValue(PropertyId.MAXIMUM_QOS, 0)
+                        ),
+                        message,
+                        ReasonCode.QOS_NOT_SUPPORTED
+                ),
+                Arguments.of(
+                        Named.of(
+                                "retain without Retain Available",
+                                new Property.ByteValue(PropertyId.RETAIN_AVAILABLE, 0)
+                        ),
+                        message.withRetain(true),
+                        ReasonCode.RETAIN_NOT_SUPPORTED
+                ),
+                Arguments.of(
+                        Named.of(
+                                "one byte beyond Maximum Packet Size",
+                                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 64)
+                        ),
+                        messageWithWireBytes(65, MqttVersion.V5),
+                        ReasonCode.PACKET_TOO_LARGE
+                ),
+                Arguments.of(
+                        Named.of(
+                                "a payload as large as Maximum Packet Size",
+                                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 64)
+                        ),
+                        message.withPayload(new byte[64]),
+                        ReasonCode.PACKET_TOO_LARGE
+                )
+        );
+    }
+
+    @Test
+    void a_publication_within_the_brokers_limits_is_sent() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(
+                new Property.ByteValue(PropertyId.MAXIMUM_QOS, 1),
+                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 64)
+        );
+
+        // Act
+        mqtt5.publish(2, messageWithWireBytes(64, MqttVersion.V5));
+
+        // Assert
+        assertThat(port.publications).hasSize(1);
+        assertThat(port.results).doesNotContainKey(2L);
+    }
+
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("unsupportedSubscriptions")
+    void a_subscription_that_the_broker_does_not_support_fails_without_being_sent(
+            String filter,
+            Property limit,
+            ReasonCode reason
+    ) {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(limit);
+
+        // Act
+        mqtt5.subscribe(2, subscription(filter));
+
+        // Assert
+        assertThat(port.sent).noneMatch(Packet.Subscribe.class::isInstance);
+        assertThat(requireNonNull(port.outcomes.get(2L)).failure()).isInstanceOfSatisfying(
+                MqttSubscriptionRefusedException.class,
+                refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
+        );
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
+    }
+
+    static Stream<Arguments> unsupportedSubscriptions() {
+        Named<Property> noWildcards = Named.of(
+                "without Wildcard Subscription Available",
+                new Property.ByteValue(PropertyId.WILDCARD_SUBSCRIPTION_AVAILABLE, 0)
+        );
+        Named<Property> noSharing = Named.of(
+                "without Shared Subscription Available",
+                new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0)
+        );
+        return Stream.of(
+                Arguments.of("a/#", noWildcards, ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED),
+                Arguments.of("a/+/c", noWildcards, ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED),
+                Arguments.of(
+                        "$share/group/a/#",
+                        noWildcards,
+                        ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED
+                ),
+                Arguments.of(
+                        "$share/group/a/b",
+                        noSharing,
+                        ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED
+                )
+        );
+    }
+
+    @Test
+    void a_subscription_without_wildcards_is_sent_when_the_broker_supports_none() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(
+                new Property.ByteValue(PropertyId.WILDCARD_SUBSCRIPTION_AVAILABLE, 0)
+        );
+
+        // Act
+        mqtt5.subscribe(2, subscription("a/b"));
+
+        // Assert
+        assertThat(port.sent).last().isInstanceOf(Packet.Subscribe.class);
+        assertThat(port.outcomes).doesNotContainKey(2L);
+    }
+
+    @Test
+    void a_continued_publication_beyond_the_new_brokers_limits_is_not_replayed() {
+        // Arrange: a QoS 2 publication waits for PUBREC when the connection ends.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(), 0, 0);
+        mqtt5.publish(2, qosOneMessage().withQos(Qos.EXACTLY_ONCE));
+        mqtt5.failed(1, new IOException("connection lost"));
+        int published = port.publications.size();
+
+        // Act: the session continues on a broker that now allows at most QoS 1.
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, new Properties(List.of(
+                new Property.ByteValue(PropertyId.MAXIMUM_QOS, 1)
+        ))), 0, 0);
+
+        // Assert: replaying it would end every connection that continues the session.
+        assertThat(port.publications).hasSize(published);
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
+    }
+
     @ParameterizedTest(name = "PUBACK {0}")
     @EnumSource(value = ReasonCode.class, names = {"SUCCESS", "NO_MATCHING_SUBSCRIBERS"})
     void an_mqtt_5_puback_below_0x80_completes_the_publication(ReasonCode reason) {
@@ -1987,7 +2159,7 @@ class SessionCoreTest {
 
         // Assert
         assertThat(requireNonNull(port.results.get(2L)).failure()).isInstanceOfSatisfying(
-                MqttPublishException.class,
+                MqttPublicationRefusedException.class,
                 refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
         );
         assertThat(mqtt5.state()).isEqualTo(CONNECTED);
@@ -2017,7 +2189,7 @@ class SessionCoreTest {
         // Assert
         assertThat(mqtt5.state()).isEqualTo(CONNECTED);
         assertThat(requireNonNull(port.outcomes.get(2L)).failure()).isInstanceOfSatisfying(
-                MqttSubscribeException.class,
+                MqttSubscriptionRefusedException.class,
                 refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
         );
         assertThat(port.removed).containsExactly(2L);
@@ -2418,7 +2590,8 @@ class SessionCoreTest {
         assertThat(port.removals).filteredOn(removal -> removal.id() == 4)
                 .singleElement().satisfies(removal -> {
                     if (refused) {
-                        assertThat(removal.cause()).isInstanceOf(MqttSubscribeException.class);
+                        assertThat(removal.cause())
+                                .isInstanceOf(MqttSubscriptionRefusedException.class);
                     } else {
                         assertThat(removal.cause()).isNull();
                     }
@@ -3420,11 +3593,11 @@ class SessionCoreTest {
     }
 
     /// An MQTT 5.0 core like `sut` whose first connection is established.
-    private SessionCore connectedMqtt5() {
+    private SessionCore connectedMqtt5(Property... limits) {
         SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
         mqtt5.connect(attempt(1), 0);
         mqtt5.opened(1);
-        mqtt5.received(1, connAck(), 0, 0);
+        mqtt5.received(1, connAck(limits), 0, 0);
         return mqtt5;
     }
 
@@ -3628,7 +3801,10 @@ class SessionCoreTest {
         }
 
         @Override
-        public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+        public void resubscribeFailed(
+                Subscription handle,
+                MqttSubscriptionRefusedException failure
+        ) {
             var subscription = (TestSubscription) handle;
             removeSubscription(subscription.id, handle, failure);
             resubscriptionFailures.add(new Removal(subscription.id, handle, failure));

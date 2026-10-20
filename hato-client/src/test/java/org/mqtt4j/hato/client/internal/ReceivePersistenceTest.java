@@ -25,7 +25,7 @@ import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -735,7 +735,10 @@ class ReceivePersistenceTest {
         }
 
         @Override
-        public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+        public void resubscribeFailed(
+                Subscription handle,
+                MqttSubscriptionRefusedException failure
+        ) {
         }
 
         @Override

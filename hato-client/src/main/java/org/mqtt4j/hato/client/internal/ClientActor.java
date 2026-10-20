@@ -38,7 +38,7 @@ import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
@@ -974,7 +974,10 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
-        public void resubscribeFailed(Subscription handle, MqttSubscribeException failure) {
+        public void resubscribeFailed(
+                Subscription handle,
+                MqttSubscriptionRefusedException failure
+        ) {
             var subscription = (ClientSubscription) handle;
             synchronized (lifecycleLock) {
                 if (subscription.retired || subscription.removalRequested()) {
@@ -986,7 +989,7 @@ public final class ClientActor implements MqttClient {
             }
             listenerLane.resubscribeFailed(subscription, failure);
             // Operators see the refusal even when the listener does not override the callback.
-            log.warn("Broker refused re-creation of subscription {} for {} at {}",
+            log.warn("Re-creation of subscription {} for {} at {} was refused",
                     subscription.filter().pattern(), clientId, endpoint, failure);
         }
 

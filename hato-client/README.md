@@ -338,7 +338,7 @@ and registration capacity fail `established()` and end only the returned handle.
 | `MqttConnectionLostException` | The connection ended before the result was known. A publication may or may not have reached the broker. |
 | `MqttCapacityException` | The client reached an admission limit. The connection stays up; let outstanding work drain before retrying. |
 | `MqttProtocolException` | The broker accepted a QoS 2 publication only at QoS 1, so it may be delivered more than once. The connection stays up. |
-| `MqttSubscribeException` | The broker refused the subscription. |
+| `MqttSubscriptionRefusedException` | The broker refused the subscription or does not support it. |
 
 The `connectionListener` is called whenever a connection ends, whether you
 disconnected or not. A lambda, as in the configuration example, handles just
@@ -364,7 +364,10 @@ ConnectionListener listener = new ConnectionListener() {
     }
 
     @Override
-    public void onResubscribeFailed(Subscription subscription, MqttSubscribeException failure) {
+    public void onResubscribeFailed(
+            Subscription subscription,
+            MqttSubscriptionRefusedException failure
+    ) {
         System.err.println("Subscription ended: " + subscription.filter() + ": " + failure);
     }
 };

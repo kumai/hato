@@ -6,7 +6,7 @@ import java.util.ArrayDeque;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.Disconnection;
-import org.mqtt4j.hato.MqttSubscribeException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 
@@ -59,7 +59,7 @@ final class ListenerLane {
         submit(new Event.ConnectFailed(failure));
     }
 
-    void resubscribeFailed(Subscription subscription, MqttSubscribeException failure) {
+    void resubscribeFailed(Subscription subscription, MqttSubscriptionRefusedException failure) {
         submit(new Event.ResubscribeFailed(subscription, failure));
     }
 
@@ -147,7 +147,7 @@ final class ListenerLane {
 
         record ResubscribeFailed(
                 Subscription subscription,
-                MqttSubscribeException failure
+                MqttSubscriptionRefusedException failure
         ) implements Event {}
     }
 }
