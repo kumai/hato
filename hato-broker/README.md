@@ -65,7 +65,7 @@ Use the broker in local or trusted environments. It does not check credentials.
 It supports MQTT 3.1.1, MQTT 5.0 as far as client tests need it, and QoS 0/1/2.
 Wills are refused with Server unavailable; retained publications reach current
 subscribers but are not stored. `$share/` filters are matched literally, without
-shared routing.
+shared routing. MQTT 5.0 subscriptions honor No Local and Retain As Published.
 
 With Clean Session false, or a positive session expiry in MQTT 5.0, subscriptions
 and QoS 1/2 deliveries survive a disconnect, and reconnecting with the same client

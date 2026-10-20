@@ -22,16 +22,21 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// reuses such an identifier ends that wait, as a client that lost its session state does.
 /// Offline QoS 0 deliveries are discarded. Wills are refused with Server unavailable;
 /// an empty identifier with Clean Session false is refused with Identifier rejected.
-/// Retained publications are forwarded to current subscribers but are not stored.
-/// Credentials are not checked. `$share/` filters are matched literally, without shared routing.
+/// Retained publications are forwarded to current subscribers with the retain flag cleared,
+/// but are not stored. Overlapping subscriptions of a session receive one copy at their highest
+/// QoS. Credentials are not checked. `$share/` filters are matched literally, without shared
+/// routing.
 ///
 /// MQTT 5.0 support covers what client tests need. A positive Session Expiry Interval makes a
 /// session persistent, as Clean Session false does, but the session never expires; Clean Start
 /// false resumes it. A session resumes only with the protocol version that created it. An empty
 /// client identifier is assigned and returned in CONNACK. Publication properties reach MQTT 5.0
 /// subscribers unchanged and are dropped for MQTT 3.1.1 subscribers; Message Expiry Interval is
-/// not counted down. CONNACK announces no limits, and the broker ignores the client's Receive
-/// Maximum and Maximum Packet Size, subscription options other than QoS, and Subscription
+/// not counted down. A No Local subscription receives no publications from its own client. A
+/// Retain As Published subscription receives the publisher's retain flag; when only some
+/// overlapping subscriptions use it, a retained publication arrives once with each flag. Retain
+/// Handling has no effect, because no publication is stored. CONNACK announces no limits, and
+/// the broker ignores the client's Receive Maximum and Maximum Packet Size and Subscription
 /// Identifiers. An Authentication Method is refused with Bad authentication method. AUTH, or a
 /// PUBLISH with a Topic Alias or a Subscription Identifier, closes the connection. A PUBREC with
 /// a failure reason code ends the QoS 2 delivery without PUBREL. Before it closes an MQTT 5.0

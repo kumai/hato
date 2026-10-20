@@ -144,7 +144,17 @@ final class RawSession implements AutoCloseable {
     }
 
     static Packet.Subscription subscription(String filter, Qos qos) {
-        return new Packet.Subscription(new TopicFilter(filter), qos, false, false, 0);
+        return subscription(filter, qos, false, false);
+    }
+
+    /// A subscription with the MQTT 5.0 options No Local and Retain As Published.
+    static Packet.Subscription subscription(
+            String filter,
+            Qos qos,
+            boolean noLocal,
+            boolean retainAsPublished
+    ) {
+        return new Packet.Subscription(new TopicFilter(filter), qos, noLocal, retainAsPublished, 0);
     }
 
     static Packet.Publish publication(String topic, String payload, Qos qos, int packetId) {
@@ -154,8 +164,13 @@ final class RawSession implements AutoCloseable {
     }
 
     void subscribe(String filter, Qos qos) throws Exception {
-        send(new Packet.Subscribe(1, List.of(subscription(filter, qos)), EMPTY));
-        ReasonCode granted = switch (qos) {
+        subscribe(subscription(filter, qos));
+    }
+
+    /// Subscribes with packet identifier 1 and checks that the broker grants the requested QoS.
+    void subscribe(Packet.Subscription subscription) throws Exception {
+        send(new Packet.Subscribe(1, List.of(subscription), EMPTY));
+        ReasonCode granted = switch (subscription.qos()) {
             case AT_MOST_ONCE -> SUCCESS;
             case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
             case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
