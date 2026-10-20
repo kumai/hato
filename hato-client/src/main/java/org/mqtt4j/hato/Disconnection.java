@@ -12,7 +12,8 @@ import static java.util.Objects.requireNonNull;
 /// An empty cause means no failure is reported; it does not indicate a graceful MQTT
 /// disconnect. `userRequested` identifies disconnect or close, including a failed DISCONNECT
 /// write. These fields do not distinguish a successful disconnect from an immediate close.
-/// Locally detected packet failures use [MqttProtocolException] as the cause.
+/// Locally detected packet failures use [MqttProtocolException] as the cause, and a DISCONNECT
+/// from an MQTT 5.0 broker uses [MqttBrokerDisconnectException].
 /// [#reconnectDelay()] tells whether the client scheduled another attempt.
 /// Equality compares the cause by identity, because exceptions have no value equality.
 public final class Disconnection {

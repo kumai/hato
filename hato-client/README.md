@@ -379,8 +379,12 @@ ConnectionListener listener = new ConnectionListener() {
 Pass it with `connectionListener(listener)` when building the client. Connection
 notifications carry the attempt's number, and endings tell when the client reconnects. Once
 connected, or with `withInitialRetry()`, the client keeps retrying after refusals such as bad
-credentials; to stop, call `disconnect()` from `onConnectFailed`. A refused subscription
-ends; the connection and its other subscriptions continue. A listener that falls far behind
+credentials; to stop, call `disconnect()` from `onConnectFailed`. An MQTT 5.0 broker that ends
+the connection says why: the ending's cause is an `MqttBrokerDisconnectException` with the
+broker's reason code, and the client stays disconnected when the broker bans it, hands its
+session to another client with the same `clientId`, or sends it to another server, named by
+`serverReference()`. A refused subscription ends; the connection and its other subscriptions
+continue. A listener that falls far behind
 loses its oldest notifications instead of slowing the client down, so release resources when
 the futures that own them complete, not only in `onDisconnected`. See
 [ConnectionListener](src/main/java/org/mqtt4j/hato/ConnectionListener.java) for callback

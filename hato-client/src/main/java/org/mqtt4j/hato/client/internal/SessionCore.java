@@ -11,6 +11,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.MqttBrokerDisconnectException;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
@@ -246,6 +247,8 @@ final class SessionCore {
     // Zero session expiry starts a new session with every connection.
     private final boolean cleanStart;
 
+    private final MqttVersion version;
+
     private final boolean credentialsRequired;
 
     private final ConnectionRequest request;
@@ -312,6 +315,7 @@ final class SessionCore {
         this.timeout = timeout;
         this.responseTimeout = responseTimeout;
         cleanStart = sessionExpiry.isZero();
+        this.version = version;
         this.credentialsRequired = credentialsRequired;
         request = new ConnectionRequest(backoff, initialRetry);
         current = new Connection(responseTimeout, Step.FIRST);
@@ -532,6 +536,10 @@ final class SessionCore {
             ));
         } else if (packet instanceof Packet.PubRel release) {
             receptions.released(release.packetId());
+        } else if (packet instanceof Packet.Disconnect ending && version == MqttVersion.V5) {
+            // An MQTT 5.0 broker ends the connection with a reason, which decides whether the
+            // client reconnects. MQTT 3.1.1 brokers never send DISCONNECT.
+            failed(connection, brokerDisconnect(ending));
         } else {
             failed(connection, protocolError("Unexpected " + packet.getClass().getSimpleName()));
         }
@@ -1060,6 +1068,17 @@ final class SessionCore {
 
     static PacketDecodeException protocolError(String message) {
         return new PacketDecodeException(ReasonCode.PROTOCOL_ERROR, message);
+    }
+
+    /// The failure with which `ending`, an MQTT 5.0 broker's DISCONNECT, ends the connection.
+    private static MqttBrokerDisconnectException brokerDisconnect(Packet.Disconnect ending) {
+        return new MqttBrokerDisconnectException(
+                ending.reasonCode(),
+                ConnectionEstablishment.text(ending.properties(), PropertyId.REASON_STRING)
+                        .orElse(null),
+                ConnectionEstablishment.text(ending.properties(), PropertyId.SERVER_REFERENCE)
+                        .orElse(null)
+        );
     }
 
     /// Whether an acknowledgement's `code` reports a failure: MQTT 5.0 gives failures values of

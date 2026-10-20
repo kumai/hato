@@ -19,6 +19,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.MqttBrokerDisconnectException;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
@@ -30,6 +32,9 @@ import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.client.internal.SessionPersistenceTest.Result;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -42,17 +47,52 @@ class ReconnectionTest {
     private final SessionPersistenceTest.RecordingPort port =
             new SessionPersistenceTest.RecordingPort();
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{0} reconnects: {1}")
     @CsvSource({
+            "MALFORMED_PACKET,false",
+            "PROTOCOL_ERROR,false",
             "UNSUPPORTED_PROTOCOL_VERSION,false",
             "CLIENT_IDENTIFIER_NOT_VALID,false",
-            "SERVER_UNAVAILABLE,true",
+            "BANNED,false",
+            "BAD_AUTHENTICATION_METHOD,false",
+            "SESSION_TAKEN_OVER,false",
+            "TOPIC_FILTER_INVALID,false",
+            "TOPIC_NAME_INVALID,false",
+            "RECEIVE_MAXIMUM_EXCEEDED,false",
+            "TOPIC_ALIAS_INVALID,false",
+            "PACKET_TOO_LARGE,false",
+            "ADMINISTRATIVE_ACTION,false",
+            "PAYLOAD_FORMAT_INVALID,false",
+            "RETAIN_NOT_SUPPORTED,false",
+            "QOS_NOT_SUPPORTED,false",
+            "USE_ANOTHER_SERVER,false",
+            "SERVER_MOVED,false",
+            "SHARED_SUBSCRIPTIONS_NOT_SUPPORTED,false",
+            "SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED,false",
+            "WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED,false",
+            "SUCCESS,true",
+            "UNSPECIFIED_ERROR,true",
+            "IMPLEMENTATION_SPECIFIC_ERROR,true",
             "BAD_USER_NAME_OR_PASSWORD,true",
-            "NOT_AUTHORIZED,true"
+            "NOT_AUTHORIZED,true",
+            "SERVER_UNAVAILABLE,true",
+            "SERVER_BUSY,true",
+            "SERVER_SHUTTING_DOWN,true",
+            "KEEP_ALIVE_TIMEOUT,true",
+            "MESSAGE_RATE_TOO_HIGH,true",
+            "QUOTA_EXCEEDED,true",
+            "CONNECTION_RATE_EXCEEDED,true",
+            "MAXIMUM_CONNECT_TIME,true"
     })
-    void broker_refusals_follow_the_retry_classification(String reason, boolean retry) {
-        var failure = new MqttConnectException("Refused", ReasonCode.valueOf(reason));
-        assertThat(ConnectionRequest.reconnectable(failure)).isEqualTo(retry);
+    void broker_reason_codes_follow_one_reconnection_table(String name, boolean reconnects) {
+        // Arrange: a CONNACK refusal and an MQTT 5.0 DISCONNECT with the same reason code.
+        var reason = ReasonCode.valueOf(name);
+        var refusal = new MqttConnectException("Refused", reason);
+        var ending = new MqttBrokerDisconnectException(reason, null, null);
+
+        // Act & Assert
+        assertThat(ConnectionRequest.reconnectable(refusal)).isEqualTo(reconnects);
+        assertThat(ConnectionRequest.reconnectable(ending)).isEqualTo(reconnects);
     }
 
     @ParameterizedTest
@@ -76,6 +116,113 @@ class ReconnectionTest {
         assertThat(sut.state()).isEqualTo(retry ? RECONNECT_WAIT : DISCONNECTED);
         assertThat(port.timers.containsKey(RECONNECT)).isEqualTo(retry);
         assertThat(port.results.containsKey(1L)).isEqualTo(!retry);
+    }
+
+    @Test
+    void a_broker_that_hands_the_session_to_another_client_stops_reconnection() {
+        // Arrange: an MQTT 5.0 connection with a QoS 1 publication waiting for PUBACK.
+        SessionCore sut = core(MqttVersion.V5, false);
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+        sut.publish(2, message(Qos.AT_LEAST_ONCE));
+
+        // Act
+        sut.received(1, new Packet.Disconnect(
+                ReasonCode.SESSION_TAKEN_OVER,
+                properties(new Property.StringValue(PropertyId.REASON_STRING, "taken over"))
+        ), 0, 4);
+
+        // Assert: the publication fails with the broker's reason as the cause of the ending.
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        Disconnection end = port.ends.getLast();
+        assertThat(end.reconnectDelay()).isEmpty();
+        Throwable cause = end.cause().orElseThrow();
+        assertThat(cause).isInstanceOfSatisfying(MqttBrokerDisconnectException.class, ending -> {
+            assertThat(ending.reasonCode()).isEqualTo(ReasonCode.SESSION_TAKEN_OVER);
+            assertThat(ending.reasonString()).contains("taken over");
+        });
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class)
+                .hasCause(cause);
+    }
+
+    @Test
+    void a_broker_shutting_down_is_reconnected_with_the_session_kept() {
+        // Arrange: a persistent MQTT 5.0 session with a QoS 1 publication waiting for PUBACK.
+        SessionCore sut = core(MqttVersion.V5, false);
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+        sut.publish(2, message(Qos.AT_LEAST_ONCE));
+
+        // Act
+        sut.received(1, new Packet.Disconnect(ReasonCode.SERVER_SHUTTING_DOWN, EMPTY), 0, 4);
+
+        // Assert: the publication waits for the next connection of the session.
+        assertThat(sut.state()).isEqualTo(RECONNECT_WAIT);
+        assertThat(port.ends.getLast().reconnectDelay()).isPresent();
+        assertThat(port.results).doesNotContainKey(2L);
+    }
+
+    @Test
+    void a_redirecting_broker_names_another_server_that_the_client_does_not_follow() {
+        // Arrange
+        SessionCore sut = core(MqttVersion.V5, false);
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+
+        // Act
+        sut.received(1, new Packet.Disconnect(
+                ReasonCode.SERVER_MOVED,
+                properties(new Property.StringValue(PropertyId.SERVER_REFERENCE, "other:1883"))
+        ), 0, 4);
+
+        // Assert
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.timers).doesNotContainKey(RECONNECT);
+        assertThat(port.ends.getLast().cause()).get().isInstanceOfSatisfying(
+                MqttBrokerDisconnectException.class,
+                ending -> assertThat(ending.serverReference()).contains("other:1883")
+        );
+    }
+
+    @Test
+    void an_mqtt_3_1_1_broker_that_sends_disconnect_breaks_the_protocol() {
+        // Arrange
+        SessionCore sut = core(false);
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+
+        // Act
+        sut.received(1, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY), 0, 4);
+
+        // Assert: MQTT 3.1.1 has no broker DISCONNECT, so it ends the connection as before.
+        assertThat(sut.state()).isEqualTo(RECONNECT_WAIT);
+        assertThat(port.ends.getLast().cause()).get().isInstanceOf(MqttProtocolException.class);
+    }
+
+    @Test
+    void an_mqtt_5_connack_refusal_carries_its_explanation_and_server_reference() {
+        // Arrange: the request retries initial failures that the broker does not rule out.
+        SessionCore sut = core(MqttVersion.V5, true);
+        sut.connect(attempt(1), 0);
+        sut.opened(1);
+
+        // Act
+        sut.received(1, new Packet.ConnAck(false, ReasonCode.USE_ANOTHER_SERVER, properties(
+                new Property.StringValue(PropertyId.REASON_STRING, "draining"),
+                new Property.StringValue(PropertyId.SERVER_REFERENCE, "other:1883")
+        )), 0, 4);
+
+        // Assert
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(requireNonNull(port.results.get(1L)).failure()).isInstanceOfSatisfying(
+                MqttConnectException.class,
+                refusal -> {
+                    assertThat(refusal.reasonCode()).contains(ReasonCode.USE_ANOTHER_SERVER);
+                    assertThat(refusal.reasonString()).contains("draining");
+                    assertThat(refusal.serverReference()).contains("other:1883");
+                }
+        );
     }
 
     @ParameterizedTest
@@ -680,12 +827,17 @@ class ReconnectionTest {
     }
 
     private SessionCore core(boolean initialRetry) {
+        return core(MqttVersion.V3_1_1, initialRetry);
+    }
+
+    /// A core of a persistent session that reconnects after a nanosecond-scale backoff.
+    private SessionCore core(MqttVersion version, boolean initialRetry) {
         return new SessionCore(
                 port,
                 "client",
                 Duration.ofSeconds(30),
                 Duration.ZERO,
-                MqttVersion.V3_1_1,
+                version,
                 Duration.ofHours(1),
                 16 * 1024 * 1024,
                 null,
@@ -702,6 +854,10 @@ class ReconnectionTest {
 
     private static ConnectionAttempt attempt(long operation) {
         return new ConnectionAttempt(operation);
+    }
+
+    private static Properties properties(Property... properties) {
+        return new Properties(List.of(properties));
     }
 
     private static void connected(SessionCore sut, long generation, long now) {

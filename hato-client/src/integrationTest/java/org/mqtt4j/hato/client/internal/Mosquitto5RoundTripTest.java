@@ -160,12 +160,45 @@ class Mosquitto5RoundTripTest {
         }
     }
 
-    private static MqttClient client(String clientId, Duration sessionExpiry) {
-        var endpoint = URI.create(
+    @Test
+    void a_client_whose_session_another_client_takes_over_stays_disconnected() throws Exception {
+        var endings = new LinkedBlockingQueue<Disconnection>();
+        try (
+                MqttClient first = MqttClient.builder()
+                        .server(endpoint())
+                        .version(MqttVersion.V5)
+                        .clientId("mqtt5-taken-over")
+                        .connectionListener(endings::add)
+                        .build();
+                MqttClient second = client("mqtt5-taken-over", Duration.ZERO)
+        ) {
+            // Arrange: the first client reconnects after other endings of its connection.
+            first.connect().get(5, SECONDS);
+
+            // Act
+            second.connect().get(5, SECONDS);
+
+            // Assert: Mosquitto ends the first connection, which leaves the session to the second.
+            Disconnection end = endings.poll(5, SECONDS);
+            assertThat(end).isNotNull();
+            assertThat(end.reconnectDelay()).isEmpty();
+            assertThat(end.cause()).get().isInstanceOfSatisfying(
+                    MqttBrokerDisconnectException.class,
+                    ending -> assertThat(ending.reasonCode())
+                            .isEqualTo(ReasonCode.SESSION_TAKEN_OVER)
+            );
+        }
+    }
+
+    private static URI endpoint() {
+        return URI.create(
                 "mqtt://" + broker.getHost() + ":" + broker.getMappedPort(Mosquitto.MQTT_PORT)
         );
+    }
+
+    private static MqttClient client(String clientId, Duration sessionExpiry) {
         return MqttClient.builder()
-                .server(endpoint)
+                .server(endpoint())
                 .version(MqttVersion.V5)
                 .clientId(clientId)
                 .sessionExpiry(sessionExpiry)

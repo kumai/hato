@@ -435,22 +435,26 @@ class Mqtt5PacketCodecTest {
 
     @ParameterizedTest
     @CsvSource({
-            "CONNACK, 00 80 81 82 83 84 85 86 87 88 89 8a 8c 90 95 97 99 9a 9b 9c 9d 9f",
-            "PUBACK, 00 10 80 83 87 90 91 97 99",
-            "PUBREC, 00 10 80 83 87 90 91 97 99",
-            "PUBREL, 00 92",
-            "PUBCOMP, 00 92",
-            "SUBACK, 00 01 02 80 83 87 8f 91 97 9e a1 a2",
-            "UNSUBACK, 00 11 80 83 87 8f 91",
+            "CONNACK, 00 80 81 82 83 84 85 86 87 88 89 8a 8c 90 95 97 99 9a 9b 9c 9d 9f, ''",
+            "PUBACK, 00 10 80 83 87 90 91 97 99, ''",
+            "PUBREC, 00 10 80 83 87 90 91 97 99, ''",
+            "PUBREL, 00 92, ''",
+            "PUBCOMP, 00 92, ''",
+            "SUBACK, 00 01 02 80 83 87 8f 91 97 9e a1 a2, ''",
+            "UNSUBACK, 00 11 80 83 87 8f 91, ''",
             "DISCONNECT, 00 04 80 81 82 83 87 89 8b 8d 8e 8f 90 93 94 95 96 97 98 99 "
-                    + "9a 9b 9c 9d 9e 9f a0 a1 a2",
-            "AUTH, 00 18 19"
+                    + "9a 9b 9c 9d 9e 9f a0 a1 a2, 8c",
+            "AUTH, 00 18 19, ''"
     })
-    void accepts_exactly_the_packet_specific_reason_table(PacketType type, String allowedHex) {
-        // Arrange: MQTT 5.0 section 3 packet-specific reason tables, including undefined bytes.
-        Set<Integer> allowed = Stream.of(allowedHex.split(" "))
-                .map(value -> Integer.parseInt(value, 16))
-                .collect(Collectors.toSet());
+    void accepts_exactly_the_packet_specific_reason_table(
+            PacketType type,
+            String allowedHex,
+            String toleratedHex
+    ) {
+        // Arrange: MQTT 5.0 section 3 packet-specific reason tables, including undefined bytes. A
+        // tolerated reason, which only Table 2-6 lists for the packet, is read but never written.
+        Set<Integer> allowed = codes(allowedHex);
+        Set<Integer> tolerated = codes(toleratedHex);
         for (int value = 0; value <= 255; value++) {
             byte[] wire = reasonWire(type, value);
             // Act & Assert
@@ -458,6 +462,10 @@ class Mqtt5PacketCodecTest {
                 Packet packet = reasonPacket(type, ReasonCode.of(value));
                 assertThat(sut.decode(wire)).as("%s reason %s", type, value).isEqualTo(packet);
                 assertThat(sut.decode(sut.encode(packet))).isEqualTo(packet);
+            } else if (tolerated.contains(value)) {
+                assertThat(sut.decode(wire))
+                        .as("%s reason %s", type, value)
+                        .isEqualTo(reasonPacket(type, ReasonCode.of(value)));
             } else {
                 assertThatThrownBy(() -> sut.decode(wire))
                         .as("%s reason %s", type, value)
@@ -472,6 +480,12 @@ class Mqtt5PacketCodecTest {
                         .isInstanceOf(IllegalArgumentException.class);
             }
         }
+    }
+
+    private static Set<Integer> codes(String hex) {
+        return hex.isEmpty() ? Set.of() : Stream.of(hex.split(" "))
+                .map(value -> Integer.parseInt(value, 16))
+                .collect(Collectors.toSet());
     }
 
     private static byte[] reasonWire(PacketType type, int reason) {

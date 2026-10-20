@@ -16,7 +16,8 @@ import java.io.Serial;
 /// do not fail when a connection ends, and [Subscription#receive()] keeps waiting.
 /// [Subscription#established()], [Subscription#unsubscribe()], and pull receives report this
 /// exception only when an internal failure closes the client, carrying that failure as its cause.
-/// Locally detected packet failures carry [MqttProtocolException] as their cause.
+/// Locally detected packet failures carry [MqttProtocolException] as their cause, and a
+/// DISCONNECT from an MQTT 5.0 broker carries [MqttBrokerDisconnectException].
 public final class MqttConnectionLostException extends MqttException {
 
     @Serial

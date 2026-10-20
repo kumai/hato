@@ -6,6 +6,7 @@ import java.util.List;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.MqttBrokerDisconnectException;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.ReasonCode;
 
@@ -112,19 +113,50 @@ final class ConnectionRequest {
         backoff.reset();
     }
 
-    /// Only refusals that the same CONNECT meets again, and endings without a failure, stop.
+    /// Whether the client may connect again after `cause` ended a connection or an attempt. An
+    /// ending without a failure stops; a broker's reason code, in a CONNACK refusal or an MQTT 5.0
+    /// DISCONNECT, decides by [#reconnects(ReasonCode)]; every other failure reconnects.
     static boolean reconnectable(@Nullable Throwable cause) {
-        if (cause == null) {
-            return false;
-        }
-        if (cause instanceof MqttConnectException failure) {
-            return failure.reasonCode()
-                    .map(reason ->
-                            (reason != ReasonCode.UNSUPPORTED_PROTOCOL_VERSION)
-                                    && (reason != ReasonCode.CLIENT_IDENTIFIER_NOT_VALID)
-                    )
+        return switch (cause) {
+            case null -> false;
+            case MqttConnectException refusal -> refusal.reasonCode()
+                    .map(ConnectionRequest::reconnects)
                     .orElse(true);
-        }
-        return true;
+            case MqttBrokerDisconnectException ending -> reconnects(ending.reasonCode());
+            default -> true;
+        };
+    }
+
+    /// The one table for both protocol versions, which map MQTT 3.1.1 CONNACK return codes to the
+    /// MQTT 5.0 reason codes of the same meaning. The client stays away when the same CONNECT or
+    /// the same session would meet the refusal again, and when the broker asks it to keep away
+    /// or to use another server. Every other reason, including one that a later MQTT version
+    /// adds, reconnects: bad credentials and missing authorization too, because each attempt
+    /// asks for credentials again.
+    private static boolean reconnects(ReasonCode reason) {
+        return switch (reason) {
+            case MALFORMED_PACKET,
+                 PROTOCOL_ERROR,
+                 UNSUPPORTED_PROTOCOL_VERSION,
+                 CLIENT_IDENTIFIER_NOT_VALID,
+                 BANNED,
+                 BAD_AUTHENTICATION_METHOD,
+                 SESSION_TAKEN_OVER,
+                 TOPIC_FILTER_INVALID,
+                 TOPIC_NAME_INVALID,
+                 RECEIVE_MAXIMUM_EXCEEDED,
+                 TOPIC_ALIAS_INVALID,
+                 PACKET_TOO_LARGE,
+                 ADMINISTRATIVE_ACTION,
+                 PAYLOAD_FORMAT_INVALID,
+                 RETAIN_NOT_SUPPORTED,
+                 QOS_NOT_SUPPORTED,
+                 USE_ANOTHER_SERVER,
+                 SERVER_MOVED,
+                 SHARED_SUBSCRIPTIONS_NOT_SUPPORTED,
+                 SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED,
+                 WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED -> false;
+            default -> true;
+        };
     }
 }

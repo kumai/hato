@@ -2,6 +2,7 @@ package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 import org.jspecify.annotations.Nullable;
@@ -191,9 +192,15 @@ final class ConnectionEstablishment {
     /// Session Present can continue.
     Outcome accept(Packet.ConnAck ack, Step step, boolean sessionEstablished, long attempt) {
         if (ack.reasonCode() != ReasonCode.SUCCESS) {
+            // An MQTT 5.0 broker can explain its refusal and name another server; an MQTT 3.1.1
+            // CONNACK carries no properties.
+            Optional<String> explanation = text(ack.properties(), PropertyId.REASON_STRING);
             return new Outcome.Failed(new MqttConnectException(
-                    "Broker refused connection",
-                    ack.reasonCode()
+                    "Broker refused connection: " + ack.reasonCode()
+                            + explanation.map(reason -> " (" + reason + ")").orElse(""),
+                    ack.reasonCode(),
+                    explanation.orElse(null),
+                    text(ack.properties(), PropertyId.SERVER_REFERENCE).orElse(null)
             ));
         }
         return switch (version) {
@@ -239,10 +246,8 @@ final class ConnectionEstablishment {
             return new Outcome.Failed(protocolError("Session Present with Clean Start"));
         }
         Properties properties = ack.properties();
-        if (properties.find(PropertyId.REASON_STRING).orElse(null)
-                instanceof Property.StringValue(var _, var reason)) {
-            log.debug("CONNACK reason for {}: {}", clientId, reason);
-        }
+        text(properties, PropertyId.REASON_STRING).ifPresent(reason ->
+                log.debug("CONNACK reason for {}: {}", clientId, reason));
         // An Assigned Client Identifier answers only an empty client identifier, which this
         // client never sends, so it is not read.
         var connAck = ConnAck.of(
@@ -266,6 +271,13 @@ final class ConnectionEstablishment {
         int receiveMaximum = (int) number(properties, PropertyId.RECEIVE_MAXIMUM)
                 .orElse(DEFAULT_RECEIVE_MAXIMUM);
         return new Outcome.Established(connAck, connectionKeepAlive, receiveMaximum);
+    }
+
+    /// The value of the string property `id`, or empty when `properties` has none.
+    static Optional<String> text(Properties properties, PropertyId id) {
+        return properties.find(id).orElse(null) instanceof Property.StringValue(var _, var value)
+                ? Optional.of(value)
+                : Optional.empty();
     }
 
     /// The value of the integer property `id`, or empty when `properties` has none.

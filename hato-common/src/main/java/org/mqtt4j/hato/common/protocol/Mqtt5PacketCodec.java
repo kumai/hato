@@ -549,7 +549,11 @@ final class Mqtt5PacketCodec implements PacketCodec {
 
     private static ReasonCode readReason(ByteBuffer input, PacketType type) {
         int value = input.get() & 0xFF;
-        if (!allowsReason(type, value)) {
+        // Table 2-6 lists Bad authentication method for DISCONNECT too, although the DISCONNECT
+        // table of section 3.14.2.1 does not. A peer that follows Table 2-6 is understood, but
+        // this codec never writes that DISCONNECT.
+        boolean tolerated = type == PacketType.DISCONNECT && value == 0x8C;
+        if (!allowsReason(type, value) && !tolerated) {
             throw new PacketDecodeException(
                     PROTOCOL_ERROR,
                     "Reason code is not allowed in " + type

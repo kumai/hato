@@ -36,8 +36,10 @@ public interface ConnectionListener {
     }
 
     /// Called for each established connection that ends, including local disconnect or
-    /// close, peer closure, protocol errors, overload, and internal failure.
-    /// [Disconnection#reconnectDelay()] tells when the client attempts to connect again.
+    /// close, peer closure, protocol errors, overload, and internal failure. When an MQTT 5.0
+    /// broker ends the connection with DISCONNECT, the cause is [MqttBrokerDisconnectException]
+    /// with the broker's reason code. [Disconnection#reconnectDelay()] tells when the client
+    /// attempts to connect again.
     void onDisconnected(Disconnection disconnection);
 
     /// Called for each connection attempt that ends without an established connection,

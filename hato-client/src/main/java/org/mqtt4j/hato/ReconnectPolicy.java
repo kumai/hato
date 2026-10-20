@@ -19,10 +19,17 @@ import static java.util.Objects.requireNonNull;
 /// doubles that bound up to `maxDelay`, without a limit on the number of attempts. A connection
 /// that stays established for a while resets the sequence; a successful CONNACK alone does not,
 /// so two clients that share a client identifier and keep taking over each other's connection
-/// slow down. Reconnecting stops at a refusal that the same CONNECT would meet again
-/// (unsupported protocol version or identifier rejected), and when the client's
-/// [timer scheduler][org.mqtt4j.hato.spi.TimerScheduler] fails. Other refusals and failures,
-/// including bad credentials or missing authorization, are retried.
+/// slow down. Reconnecting stops when the broker's reason code, in a CONNACK refusal or an
+/// MQTT 5.0 DISCONNECT, means that the same connection would be refused again or that the
+/// client should keep away or use another server: an unsupported protocol version, an invalid
+/// client identifier, a ban, an unsupported authentication method, a session taken over by a
+/// client with the same identifier, an administrative action, a redirection, and the reason
+/// codes for malformed packets, protocol errors, invalid topics or payloads, and broker limits
+/// or features that the client exceeded (0x81, 0x82, 0x8F, 0x90, 0x93 to 0x95, 0x99 to 0x9B,
+/// 0x9E, 0xA1, and 0xA2). It also stops when the client's
+/// [timer scheduler][org.mqtt4j.hato.spi.TimerScheduler] fails. Other refusals and failures
+/// are retried, including bad credentials, missing authorization, an unspecified error, and a
+/// reason code that this client does not know.
 /// [ConnectionListener#onConnectFailed(Disconnection)] reports each failed attempt, so an
 /// application that wants to stop on a particular cause can call [MqttClient#disconnect()].
 ///
