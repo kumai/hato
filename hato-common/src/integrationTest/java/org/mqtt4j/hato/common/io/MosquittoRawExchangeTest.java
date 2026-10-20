@@ -15,6 +15,7 @@ import org.mqtt4j.hato.common.value.Qos;
 import org.mqtt4j.hato.common.value.ReasonCode;
 import org.mqtt4j.hato.common.value.Topic;
 import org.mqtt4j.hato.common.value.TopicFilter;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -43,12 +44,12 @@ class MosquittoRawExchangeTest {
     /// Enables the tests when Docker is available, and also when Docker is required, so that
     /// `startBroker` fails with instructions instead of the tests being skipped.
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     @BeforeAll
     static void startBroker() {
-        Mosquitto.start(mosquitto);
+        Docker.start(mosquitto);
     }
 
     @AfterAll

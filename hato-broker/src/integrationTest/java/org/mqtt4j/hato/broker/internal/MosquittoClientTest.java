@@ -15,6 +15,7 @@ import org.testcontainers.containers.Container;
 import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.broker.MqttBroker;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -27,7 +28,7 @@ import static org.awaitility.Awaitility.await;
 class MosquittoClientTest {
 
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     @ParameterizedTest(name = "{0} QoS {1}")
@@ -47,7 +48,7 @@ class MosquittoClientTest {
                 GenericContainer<?> clientTools = Mosquitto.container()
         ) {
             Testcontainers.exposeHostPorts(sut.port());
-            Mosquitto.start(clientTools);
+            Docker.start(clientTools);
             String port = Integer.toString(sut.port());
             String level = Integer.toString(qos);
             String topic = "interop/qos" + qos;
@@ -115,7 +116,7 @@ class MosquittoClientTest {
                 GenericContainer<?> clientTools = Mosquitto.container()
         ) {
             Testcontainers.exposeHostPorts(sut.port());
-            Mosquitto.start(clientTools);
+            Docker.start(clientTools);
             String port = Integer.toString(sut.port());
             String topic = "interop/persistent";
             String level = Integer.toString(qos);

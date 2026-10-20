@@ -19,6 +19,7 @@ import org.mqtt4j.hato.common.value.MqttVersion;
 import org.mqtt4j.hato.common.value.Qos;
 import org.mqtt4j.hato.common.value.Topic;
 import org.mqtt4j.hato.common.value.TopicFilter;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -41,12 +42,12 @@ class Mosquitto5RawExchangeTest {
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V5);
 
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     @BeforeAll
     static void startBroker() {
-        Mosquitto.start(mosquitto);
+        Docker.start(mosquitto);
     }
 
     @AfterAll

@@ -20,6 +20,7 @@ import org.mqtt4j.hato.*;
 import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.Objects.requireNonNull;
@@ -35,12 +36,12 @@ class MosquittoWillTest {
     private static final GenericContainer<?> broker = Mosquitto.container();
 
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     @BeforeAll
     static void start() {
-        Mosquitto.start(broker);
+        Docker.start(broker);
     }
 
     @AfterAll
