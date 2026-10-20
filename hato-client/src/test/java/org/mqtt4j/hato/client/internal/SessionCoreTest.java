@@ -14,6 +14,7 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -2427,8 +2428,11 @@ class SessionCoreTest {
                 List.of(ReasonCode.SUCCESS, ReasonCode.SUCCESS),
                 EMPTY
         ), 0, 0);
+        mqtt5.sent(1, port.ticket, 0);
 
-        // Assert
+        // Assert: the client reports the violation before it closes the connection.
+        assertThat(port.sent).last()
+                .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
         assertThat(mqtt5.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end ->
                 assertThat(end.cause().orElseThrow()).isInstanceOf(MqttProtocolException.class));
@@ -3725,14 +3729,145 @@ class SessionCoreTest {
 
         // Act
         mqtt5.received(1, publication, 0, 19);
+        mqtt5.sent(1, port.ticket, 0);
 
         // Assert
         assertThat(port.deliveries).isEmpty();
+        assertThat(port.sent).last()
+                .isEqualTo(new Packet.Disconnect(ReasonCode.TOPIC_ALIAS_INVALID, EMPTY));
         assertThat(port.ends).singleElement().satisfies(end -> assertThat(end.cause())
                 .containsInstanceOf(MqttProtocolException.class)
                 .get()
                 .extracting(cause -> ((MqttProtocolException) cause).reasonCode())
                 .isEqualTo(ReasonCode.TOPIC_ALIAS_INVALID));
+    }
+
+    @Test
+    void a_requested_mqtt_5_disconnect_sends_normal_disconnection() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+
+        // Act
+        mqtt5.disconnect(2);
+
+        // Assert: only this reason code makes the broker discard the Will.
+        assertThat(port.sent).last().isEqualTo(new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
+    }
+
+    @Test
+    void an_mqtt_5_broker_learns_of_a_violation_before_the_connection_closes() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+
+        // Act: the broker sends a packet that only clients send.
+        mqtt5.received(1, new Packet.PingReq(), 0, 2);
+
+        // Assert: DISCONNECT carries the reason code, nothing follows it, and more violations in
+        // the same input wait for its write.
+        assertThat(port.sent).last()
+                .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
+        mqtt5.publish(2, qosOneMessage());
+        mqtt5.failed(1, new PacketDecodeException(ReasonCode.MALFORMED_PACKET, "more input"));
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttNotConnectedException.class);
+        assertThat(port.publications).isEmpty();
+        assertThat(port.ends).isEmpty();
+
+        // Act
+        mqtt5.sent(1, port.ticket, 0);
+
+        // Assert: the connection ends with the violation, which the application did not request.
+        assertThat(mqtt5.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.ends).singleElement().satisfies(end -> {
+            assertThat(end.userRequested()).isFalse();
+            assertThat(end.cause()).get().isInstanceOfSatisfying(
+                    MqttProtocolException.class,
+                    cause -> assertThat(cause.reasonCode()).isEqualTo(ReasonCode.PROTOCOL_ERROR)
+            );
+        });
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("interruptedViolationReports")
+    void a_violation_report_that_cannot_finish_ends_the_connection_with_the_violation(
+            Consumer<SessionCore> interruption
+    ) {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.received(1, new Packet.PingReq(), 0, 2);
+
+        // Act
+        interruption.accept(mqtt5);
+
+        // Assert
+        assertThat(mqtt5.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.ends).singleElement().satisfies(end -> assertThat(end.cause()).get()
+                .isInstanceOfSatisfying(MqttProtocolException.class, cause ->
+                        assertThat(cause.reasonCode()).isEqualTo(ReasonCode.PROTOCOL_ERROR)));
+    }
+
+    static Stream<Named<Consumer<SessionCore>>> interruptedViolationReports() {
+        return Stream.of(
+                Named.of(
+                        "the write deadline",
+                        core -> core.timer(1, SessionCore.Timer.DISCONNECT, 0)
+                ),
+                Named.of(
+                        "a transport failure",
+                        core -> core.failed(1, new IOException("reset"))
+                )
+        );
+    }
+
+    @Test
+    void a_full_send_queue_closes_the_connection_at_once_with_the_violation() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        port.sendResult = SendQueue.OfferResult.FULL;
+
+        // Act
+        mqtt5.received(1, new Packet.PingReq(), 0, 2);
+
+        // Assert
+        assertThat(mqtt5.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.ends).singleElement().satisfies(end -> assertThat(end.cause()).get()
+                .isInstanceOf(MqttProtocolException.class));
+    }
+
+    @Test
+    void a_disconnect_while_a_violation_is_reported_fails_without_another_disconnect() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.received(1, new Packet.PingReq(), 0, 2);
+        int sent = port.sent.size();
+
+        // Act
+        mqtt5.disconnect(2);
+        mqtt5.sent(1, port.ticket, 0);
+
+        // Assert: the written DISCONNECT lets the broker publish the Will.
+        assertThat(port.sent).hasSize(sent);
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class);
+        assertThat(port.ends).singleElement()
+                .satisfies(end -> assertThat(end.userRequested()).isTrue());
+    }
+
+    @Test
+    void a_connect_while_a_violation_is_reported_joins_the_standing_request() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.received(1, new Packet.PingReq(), 0, 2);
+
+        // Act
+        mqtt5.connect(attempt(2), 0);
+
+        // Assert: without reconnection, the joined call fails with the connection's failure.
+        assertThat(port.results).doesNotContainKey(2L);
+        mqtt5.sent(1, port.ticket, 0);
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttConnectException.class)
+                .hasCauseInstanceOf(MqttProtocolException.class);
     }
 
     static Stream<Named<Packet>> aliasedPublications() {

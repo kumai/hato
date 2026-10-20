@@ -367,7 +367,9 @@ final class SessionCore {
     }
 
     void connect(ConnectionAttempt attempt, long now) {
-        if (state == State.CLOSED || state == State.DISCONNECTING) {
+        // Reporting a violation is the client's own disconnect, not a pending disconnect().
+        boolean reporting = current.violation != null;
+        if (state == State.CLOSED || (state == State.DISCONNECTING && !reporting)) {
             if (attempt.operation != 0) {
                 port.complete(
                         attempt.operation,
@@ -388,7 +390,8 @@ final class SessionCore {
         if (attempt.operation != 0) {
             request.awaitConnection(attempt.operation);
         }
-        if (state == State.CONNECTING) {
+        // The standing request decides what follows a connection that ends for a violation.
+        if (state == State.CONNECTING || reporting) {
             return;
         }
         if (state == State.RECONNECT_WAIT) {
@@ -579,7 +582,7 @@ final class SessionCore {
         connecting = null;
         attemptCredentials = null;
         if (state == State.DISCONNECTING) {
-            beginDisconnect();
+            beginDisconnect(ReasonCode.SUCCESS);
         } else {
             completeConnections(result, null);
             if (!current.keepAlive.isZero()) {
@@ -610,6 +613,13 @@ final class SessionCore {
             drainDeferred();
         }
         if (ticket == current.disconnectTicket) {
+            PacketDecodeException violation = current.violation;
+            if (violation != null) {
+                // This DISCONNECT lets the broker publish the Will, so it cannot also satisfy a
+                // disconnect() requested meanwhile; the end fails that call.
+                end(violation, EndReason.CONNECTION_FAILURE);
+                return;
+            }
             MqttConnectException refusal = current.sessionRefusal;
             // Unless a disconnect() was requested meanwhile, the attempt goes on.
             if (current.abandoned && refusal == null && state == State.CONNECTING) {
@@ -825,7 +835,7 @@ final class SessionCore {
             state = State.DISCONNECTING;
             port.disconnecting();
             if (connected) {
-                beginDisconnect();
+                beginDisconnect(ReasonCode.SUCCESS);
             }
         }
     }
@@ -837,17 +847,28 @@ final class SessionCore {
         current.abandoned = true;
         current.sessionRefusal = refusal;
         port.cancel(Timer.CONNECT);
-        beginDisconnect();
+        beginDisconnect(ReasonCode.SUCCESS);
     }
 
-    private void beginDisconnect() {
+    /// Tells an MQTT 5.0 broker why the client ends the established connection: DISCONNECT with
+    /// the reason code of `violation`, which the client found in what the broker sent (MQTT 5.0
+    /// section 4.13). Nothing else is sent after it, as during a requested disconnect, but the
+    /// application's connection request stands. The completed write, its deadline, a full or
+    /// closed send queue, or any other failure ends the connection with `violation`.
+    private void reportViolation(PacketDecodeException violation) {
+        current.violation = violation;
+        state = State.DISCONNECTING;
+        beginDisconnect(violation.reasonCode());
+    }
+
+    private void beginDisconnect(ReasonCode reason) {
         port.cancel(Timer.KEEP_ALIVE);
         port.cancel(Timer.PING);
         port.cancel(Timer.STABLE);
         port.cancel(Timer.RESPONSE);
         current.disconnectTicket = ++nextTicket;
         port.schedule(generation, Timer.DISCONNECT, timeout);
-        sendRequired(current.disconnectTicket, new Packet.Disconnect(ReasonCode.SUCCESS, EMPTY));
+        sendRequired(current.disconnectTicket, new Packet.Disconnect(reason, EMPTY));
     }
 
     private boolean sendRequired(long ticket, Packet packet) {
@@ -863,7 +884,21 @@ final class SessionCore {
     }
 
     void failed(long connection, Throwable cause) {
-        if (connection == generation && connectionActive()) {
+        if (connection != generation || !connectionActive()) {
+            return;
+        }
+        PacketDecodeException reported = current.violation;
+        if (reported != null) {
+            // While the DISCONNECT that reports a violation is written, more of the same input
+            // changes nothing; any other failure closes the connection at once, as the first.
+            if (!(cause instanceof PacketDecodeException)) {
+                end(reported, EndReason.CONNECTION_FAILURE);
+            }
+        } else if (cause instanceof PacketDecodeException violation
+                && version == MqttVersion.V5
+                && state == State.CONNECTED) {
+            reportViolation(violation);
+        } else {
             end(cause, EndReason.CONNECTION_FAILURE);
         }
     }
@@ -884,12 +919,14 @@ final class SessionCore {
         }
         // A failure during a pending disconnect still belongs to that shutdown request.
         // Decide before replacing the cause with a session refusal below.
+        // Only a pending disconnect(), which withdraws the request, makes an ending requested. The
+        // DISCONNECT with which an attempt abandons a connection, or with which the client
+        // reports a violation, is the client's own.
+        boolean disconnectRequested = state == State.DISCONNECTING && !request.requested();
         boolean shutdownRequested = switch (reason) {
-            case CLIENT_CLOSE -> cause == null || state == State.DISCONNECTING;
-            // Only a pending disconnect() makes an ending requested; the DISCONNECT with which an
-            // attempt abandons a connection is the client's own.
+            case CLIENT_CLOSE -> cause == null || disconnectRequested;
             case DISCONNECT_WRITTEN, CONNECTION_FAILURE, HANDLER_FAILURE, SCHEDULER_FAILURE ->
-                    state == State.DISCONNECTING;
+                    disconnectRequested;
         };
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
         // The ended connection keeps only what this end still settles; the core sees fresh
@@ -1181,6 +1218,9 @@ final class SessionCore {
         Duration keepAlive = Duration.ZERO;
         // Set with the CONNACK: how many QoS 1 and QoS 2 publications the broker takes at once.
         int receiveMaximum;
+        // Set when the client found this violation in what an MQTT 5.0 broker sent, and writes
+        // DISCONNECT with its reason code before closing. It decides how the connection ends.
+        @Nullable PacketDecodeException violation;
         long stableDeadline;
         long pingTicket;
         long disconnectTicket;
