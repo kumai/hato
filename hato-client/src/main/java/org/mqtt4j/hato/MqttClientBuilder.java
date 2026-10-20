@@ -152,12 +152,11 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Selects the required wire protocol explicitly. Supports [MqttVersion#V3_1_1].
+    /// Selects the required wire protocol, [MqttVersion#V5] or [MqttVersion#V3_1_1]. An MQTT 5.0
+    /// broker announces limits when it accepts a connection, and the client keeps within them;
+    /// see [ConnAck] and [MqttPublisher#publish(MqttMessage)].
     public MqttClientBuilder version(MqttVersion value) {
-        if (requireNonNull(value, "version") != MqttVersion.V3_1_1) {
-            throw new IllegalArgumentException("Unsupported MQTT version: " + value);
-        }
-        version = value;
+        version = requireNonNull(value, "version");
         return this;
     }
 
@@ -170,10 +169,13 @@ public final class MqttClientBuilder {
     /// is not resumed: the attempt that finds it discards it and starts a new session, so
     /// messages that the broker stored for it are not received; see [MqttClient#connect()].
     /// [#build()] accepts zero, or durations from 1 through 4294967295 seconds inclusive.
-    /// Fractional seconds are accepted within that range, such as 1.5 seconds.
-    /// MQTT 3.1.1 does not send the duration, and the client does not enforce it locally: zero
-    /// selects Clean Session 1 and a positive value Clean Session 0, apart from the connection
-    /// that discards a broker session, and the broker determines how long the session lasts.
+    /// Fractional seconds are accepted within that range, such as 1.5 seconds. The client does
+    /// not enforce the duration locally. MQTT 5.0 sends it as the Session Expiry Interval,
+    /// rounded up to whole seconds so that the broker keeps the session at least that long;
+    /// 4294967295 seconds means that the session does not expire. MQTT 3.1.1 does not send it:
+    /// zero selects Clean Session 1 and a positive value Clean Session 0, apart from the
+    /// connection that discards a broker session, and the broker determines how long the
+    /// session lasts.
     public MqttClientBuilder sessionExpiry(Duration value) {
         sessionExpiry = requireNonNull(value, "sessionExpiry");
         return this;
@@ -183,8 +185,8 @@ public final class MqttClientBuilder {
     /// opening the attempt's first transport. Evaluation consumes the same
     /// [#connectionTimeout(Duration)] deadline as that transport's establishment and the
     /// broker's CONNACK response. Every connection of the attempt, including those with which
-    /// it replaces a broker session (see [MqttClient#connect()]), sends the same credentials,
-    /// so the value must stay valid for several connections.
+    /// an MQTT 3.1.1 attempt replaces a broker session (see [MqttClient#connect()]), sends the
+    /// same credentials, so the value must stay valid for several connections.
     /// The default is no credentials. At most one invocation runs at a time for this client;
     /// the supplier should respond to interruption when an attempt ends or the client closes.
     /// An invocation that ignores interruption delays evaluation for a later attempt until it
@@ -213,7 +215,8 @@ public final class MqttClientBuilder {
 
     /// Sets the keep-alive interval in whole seconds from 0 (disabled) to 65535; default 60.
     /// Idle time is measured from completed writes. The interval also bounds a PINGREQ write
-    /// and the wait for its PINGRESP, together.
+    /// and the wait for its PINGRESP, together. An MQTT 5.0 broker can set another interval for
+    /// a connection with Server Keep Alive, which the client then follows on that connection.
     public MqttClientBuilder keepAlive(Duration value) {
         requireNonNull(value, "keepAlive");
         if (value.isNegative() || value.getNano() != 0
@@ -228,8 +231,8 @@ public final class MqttClientBuilder {
 
     /// Deadline for establishing each connection: credentials, which an attempt evaluates before
     /// its first connection, transport establishment (including any TLS handshake), and
-    /// CONNACK. Also bounds each DISCONNECT write. An attempt that replaces a broker session,
-    /// as [MqttClient#connect()] describes, applies it to each of its connections and
+    /// CONNACK. Also bounds each DISCONNECT write. An MQTT 3.1.1 attempt that replaces a broker
+    /// session, as [MqttClient#connect()] describes, applies it to each of its connections and
     /// DISCONNECT writes, so it can take several times this duration.
     /// Defaults to 30 seconds. Must be positive and no greater than 2147483647 milliseconds.
     public MqttClientBuilder connectionTimeout(Duration value) {
@@ -265,7 +268,10 @@ public final class MqttClientBuilder {
 
     /// Inclusive incoming packet size, including the fixed header. Checked before allocation.
     /// Defaults to 16 MiB. Must be between 2 and 268435460 bytes.
-    /// Increasing this limit can also increase memory consumption.
+    /// Increasing this limit can also increase memory consumption. MQTT 5.0 announces the limit
+    /// to the broker, which then discards a message too large for this client instead of
+    /// sending it. An MQTT 3.1.1 broker does not learn the limit, and a larger packet ends the
+    /// connection with [MqttProtocolException].
     public MqttClientBuilder maxPacketSize(int value) {
         if (value < MIN_PACKET_SIZE || value > MAX_PACKET_SIZE) {
             throw new IllegalArgumentException(
@@ -324,9 +330,9 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Supplies a fresh transport for each connection; an attempt that replaces a broker
-    /// session, as [MqttClient#connect()] describes, opens several. Defaults to TCP for `mqtt`
-    /// and TLS over TCP for `mqtts`. The client owns and closes the returned transports.
+    /// Supplies a fresh transport for each connection; an MQTT 3.1.1 attempt that replaces a
+    /// broker session, as [MqttClient#connect()] describes, opens several. Defaults to TCP for
+    /// `mqtt` and TLS over TCP for `mqtts`. The client owns and closes the returned transports.
     /// An explicit factory cannot be combined with [#sslContext(SSLContext)] or
     /// [#sslParameters(Consumer)]. The factory's transports must reject unsupported URI schemes.
     public MqttClientBuilder transportFactory(Transport.Factory value) {

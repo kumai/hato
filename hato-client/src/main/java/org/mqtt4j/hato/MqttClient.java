@@ -92,23 +92,28 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     ///
     /// Local session state is held only in this client object's memory, so a new client object,
     /// for example after the application restarts, has none for a session that the broker
-    /// kept. When the broker reports Session Present before this client object has started a
-    /// session, the attempt replaces that session before it completes. With MQTT 3.1.1, the
-    /// client sends DISCONNECT, connects with Clean Session 1 and without the Will to discard the
-    /// session, sends DISCONNECT again, and connects as configured to start a new session.
-    /// Messages that the broker stored for the old session, including those that arrived while
-    /// the application was stopped, are not received. The broker may still publish the Will of
-    /// the first connection if that connection fails before its DISCONNECT is written, or if the
-    /// broker handles the next connection before that DISCONNECT. These connections share the
-    /// attempt's number and credentials, and the listener is notified only of the attempt's
-    /// outcome. Each connection and each DISCONNECT write has the whole
+    /// kept. Its first successful attempt replaces such a session with a new one, so messages
+    /// that the broker stored for the old session, including those that arrived while the
+    /// application was stopped, are not received. With MQTT 5.0, the attempt connects with
+    /// Clean Start, which makes the broker discard the old session. With MQTT 3.1.1, the broker
+    /// reports the old session with Session Present, and the attempt replaces it before it
+    /// completes: the client sends DISCONNECT, connects with Clean Session 1 and without the
+    /// Will to discard the session, sends DISCONNECT again, and connects as configured to start
+    /// a new session. The broker may still publish the Will of the first connection if that
+    /// connection fails before its DISCONNECT is written, or if the broker handles the next
+    /// connection before that DISCONNECT. These connections share the attempt's number and
+    /// credentials, and the listener is notified only of the attempt's outcome. Each
+    /// connection and each DISCONNECT write has the whole
     /// [connection timeout][MqttClientBuilder#connectionTimeout(java.time.Duration)], and a
     /// failure on any of them fails the attempt as on an ordinary connection. This future
     /// completes with the last CONNACK, whose [ConnAck#sessionPresent()] is false. If the
     /// connection that starts the new session finds a session again, the client sends
     /// DISCONNECT and the attempt fails with [MqttConnectException], which
     /// [ReconnectPolicy#withInitialRetry()] retries like other initial failures; a failure
-    /// while closing that connection is attached as a suppressed exception.
+    /// while closing that connection is attached as a suppressed exception. A broker that
+    /// limits how often one client identifier may connect, as AWS IoT Core allows one CONNECT
+    /// per second, may refuse or close the later connections and fail the attempt; MQTT 5.0
+    /// needs only one connection.
     CompletableFuture<ConnAck> connect();
 
     /// Observes the current or next established connection without requesting one. Returns an

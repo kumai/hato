@@ -16,8 +16,9 @@ MqttClient client = MqttClient.builder()
         .build();
 ```
 
-`server` and `version` are required. By default, each connection starts a fresh
-session, and omitting `clientId` generates a random one. The other settings have
+`server` and `version` are required, and `version` takes `MqttVersion.V5` or
+`MqttVersion.V3_1_1`. By default, each connection starts a fresh session, and omitting
+`clientId` generates a random one. The other settings have
 defaults; see the
 [builder Javadoc](src/main/java/org/mqtt4j/hato/MqttClientBuilder.java).
 
@@ -44,11 +45,12 @@ as shown below. Any QoS and retention flag are supported. A Will payload must fi
 65,535 bytes; `build()` rejects larger payloads.
 
 To retain a session between connections, use an explicit `clientId` and a positive
-expiry, such as `sessionExpiry(Duration.ofDays(1))`. With MQTT 3.1.1, the broker determines
-how long it retains the session. The client keeps its own session state in memory. When a new client object
-connects, for example after your application restarts, it therefore replaces the session that
-the broker kept with a new one: messages that the broker stored for the old session, including
-those published while your application was stopped, are not received.
+expiry, such as `sessionExpiry(Duration.ofDays(1))`. With MQTT 5.0, the broker keeps the
+session for that long after a connection ends; with MQTT 3.1.1, the broker determines how
+long it retains the session. The client keeps its own session state in memory. When a new
+client object connects, for example after your application restarts, it therefore replaces
+the session that the broker kept with a new one: messages that the broker stored for the
+old session, including those published while your application was stopped, are not received.
 
 ## Staying connected
 
@@ -338,6 +340,7 @@ and registration capacity fail `established()` and end only the returned handle.
 | `MqttConnectionLostException` | The connection ended before the result was known. A publication may or may not have reached the broker. |
 | `MqttCapacityException` | The client reached an admission limit. The connection stays up; let outstanding work drain before retrying. |
 | `MqttProtocolException` | The broker accepted a QoS 2 publication only at QoS 1, so it may be delivered more than once. The connection stays up. |
+| `MqttPublicationRefusedException` | An MQTT 5.0 broker refused the publication, or the publication exceeds a limit that the broker announced. The connection stays up. |
 | `MqttSubscriptionRefusedException` | The broker refused the subscription or does not support it. |
 
 The `connectionListener` is called whenever a connection ends, whether you

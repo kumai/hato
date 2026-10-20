@@ -141,7 +141,12 @@ class Mqtt5AcknowledgementTest {
     }
 
     private static MqttClient client(ServerSocket server) {
-        return Mqtt5Clients.client(endpoint(server), "mqtt5-acknowledgements", Duration.ZERO);
+        return MqttClient.builder()
+                .server(endpoint(server))
+                .version(MqttVersion.V5)
+                .clientId("mqtt5-acknowledgements")
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .build();
     }
 
     private static MqttMessage message(Qos qos) {

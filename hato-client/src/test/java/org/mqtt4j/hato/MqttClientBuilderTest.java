@@ -10,6 +10,7 @@ import javax.net.ssl.SSLParameters;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.spi.Transport;
@@ -84,15 +85,23 @@ class MqttClientBuilderTest {
     }
 
     @Test
-    void server_and_supported_version_are_required() {
+    void server_and_version_are_required() {
         assertThatThrownBy(() -> MqttClient.builder().build())
                 .isInstanceOf(IllegalStateException.class);
         assertThatThrownBy(() -> MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .build())
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> MqttClient.builder().version(MqttVersion.V5))
-                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest(name = "accepts {0}")
+    @EnumSource(MqttVersion.class)
+    void every_protocol_version_is_accepted(MqttVersion version) {
+        MqttClientBuilder sut = MqttClient.builder()
+                .server(URI.create("mqtt://localhost"))
+                .version(version);
+
+        assertThatCode(() -> sut.build().close()).doesNotThrowAnyException();
     }
 
     @ParameterizedTest(name = "rejects {0}")

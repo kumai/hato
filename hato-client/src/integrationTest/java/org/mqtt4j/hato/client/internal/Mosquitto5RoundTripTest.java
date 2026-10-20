@@ -164,6 +164,12 @@ class Mosquitto5RoundTripTest {
         var endpoint = URI.create(
                 "mqtt://" + broker.getHost() + ":" + broker.getMappedPort(Mosquitto.MQTT_PORT)
         );
-        return Mqtt5Clients.client(endpoint, clientId, sessionExpiry);
+        return MqttClient.builder()
+                .server(endpoint)
+                .version(MqttVersion.V5)
+                .clientId(clientId)
+                .sessionExpiry(sessionExpiry)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .build();
     }
 }
