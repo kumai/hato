@@ -14,6 +14,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttClientBuilder;
@@ -30,8 +31,9 @@ import org.mqtt4j.hato.broker.MqttBroker;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 /// Verifies that the packaged client and broker exchange messages at every QoS level in a native
-/// image, both through a handler and through receiving on the caller's thread, over TCP and over
-/// TLS. For TLS, a relay in front of the broker presents the repository's test server identity.
+/// image, through a handler, through a striped handler, and through receiving on the caller's
+/// thread, over TCP and over TLS. For TLS, a relay in front of the broker presents the
+/// repository's test server identity.
 /// The image reads the identities at run time from the directory given as the only argument,
 /// `test-support/src/main/resources/tls` in this repository: embedding them would take
 /// native-image resource metadata, which Hato itself does not need.
@@ -66,7 +68,8 @@ public final class NativeSmoke {
             );
         }
         System.out.println(
-                "hato native smoke: QoS 0/1/2 through handler and receive over TCP and TLS OK"
+                "hato native smoke: QoS 0/1/2 through handler, striped handler, and receive"
+                        + " over TCP and TLS OK"
         );
     }
 
@@ -88,8 +91,15 @@ public final class NativeSmoke {
                     Subscribe.of(new TopicFilter("smoke/pull"), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.MANUAL)
             );
+            var striped = new LinkedBlockingQueue<MqttMessage>();
+            Subscription stripes = client.subscribe(
+                    Subscribe.of(new TopicFilter("smoke/striped"), Qos.EXACTLY_ONCE),
+                    DeliveryOptions.striped(2),
+                    delivery -> striped.add(delivery.message())
+            );
             push.established().get(5, SECONDS);
             pull.established().get(5, SECONDS);
+            stripes.established().get(5, SECONDS);
 
             // The subscriptions request QoS 2, so every level arrives with its own QoS, which
             // the comparison of messages includes.
@@ -112,10 +122,21 @@ public final class NativeSmoke {
                     );
                 }
                 delivery.ack();
+
+                var stripedMessage =
+                        MqttMessage.of(new Topic("smoke/striped"), new byte[] {9}, qos, false);
+                client.publish(stripedMessage).get(5, SECONDS);
+                if (!stripedMessage.equals(striped.poll(5, SECONDS))) {
+                    throw new AssertionError(
+                            transport + " " + qos + " delivery to a striped handler changed the"
+                                    + " message"
+                    );
+                }
             }
 
             push.unsubscribe().get(5, SECONDS);
             pull.unsubscribe().get(5, SECONDS);
+            stripes.unsubscribe().get(5, SECONDS);
             if (!(pull.receive(Duration.ZERO) instanceof ReceiveResult.Ended)) {
                 throw new AssertionError(transport + " removed subscription kept receiving");
             }
