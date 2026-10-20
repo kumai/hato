@@ -113,12 +113,20 @@ final class RawSession implements AutoCloseable {
         try {
             session.send(connectV5(clientId, cleanStart, 0, sessionExpiry));
             assertThat(session.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(sessionPresent, SUCCESS, EMPTY));
+                    .isEqualTo(acceptedV5(sessionPresent));
             return session;
         } catch (Exception | AssertionError failure) {
             session.close();
             throw failure;
         }
+    }
+
+    /// The CONNACK that accepts an MQTT 5.0 client that chose its identifier. It announces that
+    /// the broker does not support Subscription Identifiers.
+    static Packet.ConnAck acceptedV5(boolean sessionPresent) {
+        return new Packet.ConnAck(sessionPresent, SUCCESS, new Properties(List.of(
+                new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0)
+        )));
     }
 
     /// An MQTT 5.0 CONNECT; a positive `sessionExpiry` keeps the session after the connection.
@@ -144,7 +152,17 @@ final class RawSession implements AutoCloseable {
     }
 
     static Packet.Subscription subscription(String filter, Qos qos) {
-        return new Packet.Subscription(new TopicFilter(filter), qos, false, false, 0);
+        return subscription(filter, qos, false, false);
+    }
+
+    /// A subscription with the MQTT 5.0 options No Local and Retain As Published.
+    static Packet.Subscription subscription(
+            String filter,
+            Qos qos,
+            boolean noLocal,
+            boolean retainAsPublished
+    ) {
+        return new Packet.Subscription(new TopicFilter(filter), qos, noLocal, retainAsPublished, 0);
     }
 
     static Packet.Publish publication(String topic, String payload, Qos qos, int packetId) {
@@ -154,8 +172,13 @@ final class RawSession implements AutoCloseable {
     }
 
     void subscribe(String filter, Qos qos) throws Exception {
-        send(new Packet.Subscribe(1, List.of(subscription(filter, qos)), EMPTY));
-        ReasonCode granted = switch (qos) {
+        subscribe(subscription(filter, qos));
+    }
+
+    /// Subscribes with packet identifier 1 and checks that the broker grants the requested QoS.
+    void subscribe(Packet.Subscription subscription) throws Exception {
+        send(new Packet.Subscribe(1, List.of(subscription), EMPTY));
+        ReasonCode granted = switch (subscription.qos()) {
             case AT_MOST_ONCE -> SUCCESS;
             case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
             case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;

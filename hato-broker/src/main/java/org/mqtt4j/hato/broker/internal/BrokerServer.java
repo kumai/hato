@@ -329,7 +329,9 @@ public final class BrokerServer implements AutoCloseable {
         // sets it again from its own CONNECT.
         private boolean kept;
 
-        private final Map<TopicFilter, Qos> subscriptions = new HashMap<>();
+        // Each filter's subscription with the options that the client requested. Retain Handling
+        // has no effect, because retained publications are not stored.
+        private final Map<TopicFilter, Packet.Subscription> subscriptions = new HashMap<>();
 
         private final PacketIds packetIds = new PacketIds();
 
@@ -358,7 +360,39 @@ public final class BrokerServer implements AutoCloseable {
             this.kept = kept;
         }
 
-        private void deliver(Packet.Publish publication, Qos qos) {
+        // Delivers `publication` from `publisher` for the subscriptions that match it.
+        // Overlapping subscriptions share one copy at their highest QoS [MQTT-3.3.4-2]. A retained
+        // publication takes a second copy when only some of them keep its retain flag, so that
+        // each subscription gets the flag it asked for [MQTT-3.3.1-12] [MQTT-3.3.1-13].
+        private void deliverMatching(Packet.Publish publication, Session publisher) {
+            // The highest QoS granted by the matching subscriptions with Retain As Published, and
+            // by the other matching subscriptions; -1 while none matches.
+            int asPublished = -1;
+            int cleared = -1;
+            for (Packet.Subscription subscription : subscriptions.values()) {
+                // No Local withholds a client's own publications [MQTT-3.8.3-3].
+                boolean withheld = subscription.noLocal() && publisher == this;
+                if (withheld || !subscription.filter().matches(publication.topic())) {
+                    continue;
+                }
+                int level = subscription.qos().level();
+                if (subscription.retainAsPublished()) {
+                    asPublished = Math.max(asPublished, level);
+                } else {
+                    cleared = Math.max(cleared, level);
+                }
+            }
+            int published = publication.qos().level();
+            if (publication.retain() && asPublished >= 0 && cleared >= 0) {
+                deliver(publication, Qos.of(Math.min(asPublished, published)), true);
+                deliver(publication, Qos.of(Math.min(cleared, published)), false);
+            } else if (asPublished >= 0 || cleared >= 0) {
+                Qos qos = Qos.of(Math.min(Math.max(asPublished, cleared), published));
+                deliver(publication, qos, publication.retain() && asPublished >= 0);
+            }
+        }
+
+        private void deliver(Packet.Publish publication, Qos qos, boolean retain) {
             Connection peer = connection;
             if (peer != null && peer.isEnded()) {
                 detach(peer);
@@ -367,7 +401,7 @@ public final class BrokerServer implements AutoCloseable {
             if (!online && (!kept || qos == Qos.AT_MOST_ONCE)) {
                 return;
             }
-            var delivery = new Delivery(publication, qos, version);
+            var delivery = new Delivery(publication, qos, retain, version);
             // A frame that can never fit must not block the head indefinitely.
             if (delivery.byteCount > sendBytes
                     || (qos != Qos.AT_MOST_ONCE && delivery.byteCount > maxInflightBytes)) {
@@ -551,6 +585,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private final Qos qos;
 
+        // The publisher's retain flag for a Retain As Published subscription, and false
+        // otherwise, as for every live delivery in MQTT 3.1.1.
+        private final boolean retain;
+
         // The publisher's properties reach MQTT 5.0 receivers unchanged; MQTT 3.1.1 has none.
         private final Properties properties;
 
@@ -560,9 +598,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private boolean sent;
 
-        private Delivery(Packet.Publish publication, Qos qos, MqttVersion version) {
+        private Delivery(Packet.Publish publication, Qos qos, boolean retain, MqttVersion version) {
             this.publication = publication;
             this.qos = qos;
+            this.retain = retain;
             properties = switch (version) {
                 case V3_1_1 -> Properties.EMPTY;
                 case V5 -> publication.properties();
@@ -570,7 +609,7 @@ public final class BrokerServer implements AutoCloseable {
             byte[] encodedHeader = PacketCodec.of(version).encodePublishHeader(
                     publication.topic(),
                     qos,
-                    false,
+                    retain,
                     false,
                     (qos == Qos.AT_MOST_ONCE) ? 0 : 1,
                     properties,
@@ -585,7 +624,7 @@ public final class BrokerServer implements AutoCloseable {
                     publication.topic(),
                     publication.payload(),
                     qos,
-                    false,
+                    retain,
                     qos != Qos.AT_MOST_ONCE && sent,
                     packetId,
                     properties
@@ -802,14 +841,10 @@ public final class BrokerServer implements AutoCloseable {
                     clientId = id;
                     session = accepted;
                     accepted.connection = this;
-                    Properties properties = Properties.EMPTY;
-                    if (request.version() == MqttVersion.V5 && request.clientId().isEmpty()) {
-                        // Only MQTT 5.0 can tell a client the identifier assigned to it.
-                        properties = new Properties(List.of(new Property.StringValue(
-                                PropertyId.ASSIGNED_CLIENT_IDENTIFIER,
-                                id
-                        )));
-                    }
+                    Properties properties = switch (request.version()) {
+                        case V3_1_1 -> Properties.EMPTY;
+                        case V5 -> acceptanceV5(id, request.clientId().isEmpty());
+                    };
                     enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, properties));
                 }
                 // Do not hold the new peer's monitor while ending the old peer.
@@ -825,6 +860,18 @@ public final class BrokerServer implements AutoCloseable {
             log.info("Broker accepted client {} from {} on port {}",
                     id, socket.getRemoteSocketAddress(), port());
             return true;
+        }
+
+        // The properties of an MQTT 5.0 CONNACK that accepts the connection. The broker sets no
+        // Subscription Identifiers on its deliveries, so it tells clients to send none; and only
+        // MQTT 5.0 can tell a client the identifier assigned to it.
+        private static Properties acceptanceV5(String id, boolean assigned) {
+            var entries = new ArrayList<Property>();
+            entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
+            if (assigned) {
+                entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
+            }
+            return new Properties(entries);
         }
 
         private @Nullable Session currentSession() {
@@ -845,11 +892,20 @@ public final class BrokerServer implements AutoCloseable {
         private void process(Session owner, Packet packet) {
             switch (packet) {
                 case Packet.Subscribe request -> {
+                    // CONNACK announced that Subscription Identifiers are not supported, so one
+                    // is a Protocol Error that subscribes to nothing (MQTT 5.0 section
+                    // 3.2.2.3.12). MQTT 3.1.1 has no properties.
+                    if (request.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
+                        disconnect(
+                                ReasonCode.SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED,
+                                "Subscription Identifier although none are supported"
+                        );
+                        return;
+                    }
                     var grants = new ArrayList<ReasonCode>();
                     for (Packet.Subscription subscription : request.subscriptions()) {
-                        Qos qos = subscription.qos();
-                        owner.subscriptions.put(subscription.filter(), qos);
-                        ReasonCode granted = switch (qos) {
+                        owner.subscriptions.put(subscription.filter(), subscription);
+                        ReasonCode granted = switch (subscription.qos()) {
                             case AT_MOST_ONCE -> ReasonCode.SUCCESS;
                             case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
                             case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
@@ -906,16 +962,7 @@ public final class BrokerServer implements AutoCloseable {
                     }
                     // Snapshot permits an overloaded target to remove itself during delivery.
                     for (Session target : List.copyOf(sessions.values())) {
-                        int granted = -1;
-                        for (var subscription : target.subscriptions.entrySet()) {
-                            if (subscription.getKey().matches(publish.topic())) {
-                                granted = Math.max(granted, subscription.getValue().level());
-                            }
-                        }
-                        if (granted >= 0) {
-                            Qos qos = Qos.of(Math.min(granted, publish.qos().level()));
-                            target.deliver(publish, qos);
-                        }
+                        target.deliverMatching(publish, owner);
                     }
                     // Acknowledge only after every delivery was enqueued or its target closed.
                     if (publish.qos() == Qos.AT_LEAST_ONCE) {
