@@ -29,6 +29,20 @@ testing {
             dependencies {
                 implementation(project(":test-support"))
             }
+            // Measurements of the delivery modes run only when asked for, with
+            // -Phato.measure=true, and print their results instead of asserting limits. Other
+            // runs leave them out rather than skip them, so a build still skips no test.
+            targets.configureEach {
+                testTask.configure {
+                    val measure = providers.gradleProperty("hato.measure").orElse("false").get()
+                    systemProperty("hato.measure", measure)
+                    if (measure != "true") {
+                        filter {
+                            excludeTestsMatching("*.DeliveryMeasurementTest")
+                        }
+                    }
+                }
+            }
             // Virtual threads are not preempted, so on a single carrier, as in a one-CPU
             // container, one busy virtual thread holds up all others. Run the suite that way too.
             targets.register("integrationTestSingleCarrier") {
