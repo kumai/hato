@@ -59,7 +59,7 @@ class MosquittoRawExchangeTest {
 
     @Test
     void a_client_connects_pings_and_disconnects() throws Exception {
-        try (var client = RawSession.open(codec, mosquitto)) {
+        try (var client = RawSession.open(codec, mosquitto, Mosquitto.MQTT_PORT)) {
             client.send(connect("hato-lifecycle", 60));
             // [MQTT-3.2.2-1]: a Clean Session connection is accepted without a stored session.
             assertThat(client.expect(Packet.ConnAck.class))
@@ -173,7 +173,7 @@ class MosquittoRawExchangeTest {
         byte[] connect = codec.encode(connect("hato-level-3", 60));
         assertThat(connect[8]).isEqualTo((byte) 4);
         connect[8] = 3;
-        try (var client = RawSession.open(codec, mosquitto)) {
+        try (var client = RawSession.open(codec, mosquitto, Mosquitto.MQTT_PORT)) {
             client.sendRaw(connect);
 
             // [MQTT-3.1.2-2]: CONNACK return code 0x01, then the broker disconnects.
@@ -186,7 +186,7 @@ class MosquittoRawExchangeTest {
 
     @Test
     void the_broker_closes_a_connection_that_stays_silent_past_its_keep_alive() throws Exception {
-        try (var client = RawSession.open(codec, mosquitto)) {
+        try (var client = RawSession.open(codec, mosquitto, Mosquitto.MQTT_PORT)) {
             client.send(connect("hato-keep-alive", 2));
             client.expect(Packet.ConnAck.class);
 
@@ -196,7 +196,7 @@ class MosquittoRawExchangeTest {
     }
 
     private static RawSession connected(String clientId) throws Exception {
-        var session = RawSession.open(codec, mosquitto);
+        var session = RawSession.open(codec, mosquitto, Mosquitto.MQTT_PORT);
         session.send(connect(clientId, 60));
         assertThat(session.expect(Packet.ConnAck.class))
                 .isEqualTo(new Packet.ConnAck(false, SUCCESS, EMPTY));
