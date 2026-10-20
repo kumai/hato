@@ -12,6 +12,8 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
+import org.junit.jupiter.params.ParameterizedClass;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.*;
@@ -24,11 +26,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The client's TLS against an independent implementation: Mosquitto's OpenSSL listeners.
+/// The client's TLS against an independent implementation: Mosquitto's OpenSSL listeners, in
+/// both protocol versions.
 @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
+@ParameterizedClass(name = "{0}")
+@EnumSource(MqttVersion.class)
 class MosquittoTlsTest {
 
     private static final GenericContainer<?> broker = Mosquitto.tlsContainer();
+
+    private final MqttVersion version;
 
     // Established connections and their ends, apart from attempts that never established one.
     private final LinkedBlockingQueue<Object> connections = new LinkedBlockingQueue<>();
@@ -51,6 +58,10 @@ class MosquittoTlsTest {
             failures.add(failure);
         }
     };
+
+    MosquittoTlsTest(MqttVersion version) {
+        this.version = version;
+    }
 
     static boolean dockerIsAvailableOrRequired() {
         return Mosquitto.availableOrRequired();
@@ -79,12 +90,12 @@ class MosquittoTlsTest {
         );
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint(Mosquitto.MQTTS_PORT))
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .sslContext(Tls.clientContext())
                 .connectionListener(listener)
                 .build()) {
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            ConnAck connAck = sut.connect().get(5, SECONDS);
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
             );
@@ -102,7 +113,8 @@ class MosquittoTlsTest {
             // Assert: the QoS 2 publication arrived unchanged, and the one connection lasted
             // until the requested disconnection.
             assertThat(received.delivery().message()).isEqualTo(publication);
-            assertThat(connections.poll(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            assertThat(connAck.sessionPresent()).isFalse();
+            assertThat(connections.poll(5, SECONDS)).isEqualTo(connAck);
             assertThat(connections.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             assertThat(connections).isEmpty();
             assertThat(failures).isEmpty();
@@ -119,7 +131,7 @@ class MosquittoTlsTest {
             sut.disconnect().get(5, SECONDS);
 
             // Assert
-            assertThat(connAck).isEqualTo(ConnAck.of(false, 1));
+            assertThat(connAck.sessionPresent()).isFalse();
             assertThat(connections.poll(5, SECONDS)).isEqualTo(connAck);
             assertThat(connections.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             assertThat(connections).isEmpty();
@@ -154,7 +166,7 @@ class MosquittoTlsTest {
     private MqttClient mutualTlsClient(SSLContext context) throws IOException {
         return MqttClient.builder()
                 .server(endpoint(Mosquitto.MUTUAL_TLS_PORT))
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .sslContext(context)
                 .sslParameters(parameters -> parameters.setProtocols(new String[] {"TLSv1.3"}))

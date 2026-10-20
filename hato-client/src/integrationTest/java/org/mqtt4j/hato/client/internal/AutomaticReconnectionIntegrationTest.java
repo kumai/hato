@@ -19,6 +19,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIf;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.*;
@@ -169,20 +171,25 @@ class AutomaticReconnectionIntegrationTest {
         }
     }
 
-    @Test
-    void the_embedded_broker_continues_a_session_across_automatic_reconnection() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void the_embedded_broker_continues_a_session_across_automatic_reconnection(
+            MqttVersion version
+    ) throws Exception {
         try (MqttBroker broker = MqttBroker.start()) {
-            continueAcrossAutomaticReconnection(brokerEndpoint(broker));
+            continueAcrossAutomaticReconnection(brokerEndpoint(broker), version);
         }
     }
 
-    @Test
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
     @Timeout(60)
     @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
-    void mosquitto_continues_a_session_across_automatic_reconnection() throws Exception {
+    void mosquitto_continues_a_session_across_automatic_reconnection(MqttVersion version)
+            throws Exception {
         try (GenericContainer<?> broker = Mosquitto.container()) {
             Mosquitto.start(broker);
-            continueAcrossAutomaticReconnection(mosquittoEndpoint(broker));
+            continueAcrossAutomaticReconnection(mosquittoEndpoint(broker), version);
         }
     }
 
@@ -220,7 +227,7 @@ class AutomaticReconnectionIntegrationTest {
                     .isEqualTo(ConnAck.of(false, 2));
             assertThat(failureOf(unfinished)).isInstanceOf(MqttConnectionLostException.class);
             subscription.established().get(5, SECONDS);
-            try (MqttClient publisher = plainClient(brokerEndpoint(broker))) {
+            try (MqttClient publisher = plainClient(brokerEndpoint(broker), MqttVersion.V3_1_1)) {
                 publisher.connect().get(5, SECONDS);
                 publisher.publish(message(topic, Qos.AT_LEAST_ONCE)).get(5, SECONDS);
             }
@@ -287,7 +294,11 @@ class AutomaticReconnectionIntegrationTest {
             }
         };
         try (MqttBroker broker = MqttBroker.start();
-                MqttClient sut = reconnectingClient(brokerEndpoint(broker), blocking)) {
+                MqttClient sut = reconnectingClient(
+                        brokerEndpoint(broker),
+                        MqttVersion.V3_1_1,
+                        blocking
+                )) {
             sut.connect().get(5, SECONDS);
             requireNonNull(transports.poll(5, SECONDS)).disconnect(new IOException("cut"));
             assertThat(entered.await(5, SECONDS)).isTrue();
@@ -309,12 +320,13 @@ class AutomaticReconnectionIntegrationTest {
 
     /// A persistent client's QoS 1 and QoS 2 publications and its subscription continue after
     /// its connection is cut, without subscribing again.
-    private void continueAcrossAutomaticReconnection(URI broker) throws Exception {
+    private void continueAcrossAutomaticReconnection(URI broker, MqttVersion version)
+            throws Exception {
         String outbound = uniqueTopic();
         String inbound = uniqueTopic();
-        try (MqttClient subscriber = plainClient(broker);
-                MqttClient other = plainClient(broker);
-                MqttClient sut = reconnectingClient(broker)) {
+        try (MqttClient subscriber = plainClient(broker, version);
+                MqttClient other = plainClient(broker, version);
+                MqttClient sut = reconnectingClient(broker, version, listener)) {
             // Arrange: a subscriber of the client's publications, and a subscription of its own.
             subscriber.connect().get(5, SECONDS);
             Subscription received = subscriber.subscribe(
@@ -350,7 +362,9 @@ class AutomaticReconnectionIntegrationTest {
             clock.advance(DELAY);
 
             // Assert: the held futures complete, and the subscription resumes unchanged.
-            assertThat(sut.whenConnected().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
+            ConnAck resumed = sut.whenConnected().get(5, SECONDS);
+            assertThat(resumed.sessionPresent()).isTrue();
+            assertThat(resumed.connectionAttempt()).isEqualTo(2);
             assertThat(atLeastOnce.get(5, SECONDS)).isEqualTo(PublishResult.of());
             assertThat(exactlyOnce.get(5, SECONDS)).isEqualTo(PublishResult.of());
             sut.publish(message(outbound, Qos.EXACTLY_ONCE, (byte) 5)).get(5, SECONDS);
@@ -369,7 +383,7 @@ class AutomaticReconnectionIntegrationTest {
     /// A failing handler stops the client. An explicit connection receives the redelivery and
     /// restores automatic reconnection.
     private void stopUntilConnectedAgain(URI broker) throws Exception {
-        try (MqttClient publisher = plainClient(broker);
+        try (MqttClient publisher = plainClient(broker, MqttVersion.V3_1_1);
                 MqttClient sut = reconnectingClient(broker)) {
             // Arrange: the handler fails once; the redelivery after reconnection succeeds.
             String topic = uniqueTopic();
@@ -414,13 +428,17 @@ class AutomaticReconnectionIntegrationTest {
     }
 
     private MqttClient reconnectingClient(URI broker) {
-        return reconnectingClient(broker, listener);
+        return reconnectingClient(broker, MqttVersion.V3_1_1, listener);
     }
 
-    private MqttClient reconnectingClient(URI broker, ConnectionListener notifications) {
+    private MqttClient reconnectingClient(
+            URI broker,
+            MqttVersion version,
+            ConnectionListener notifications
+    ) {
         return MqttClient.builder()
                 .server(broker)
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .clientId(clientId)
                 .sessionExpiry(Duration.ofSeconds(30))
                 .timerScheduler(clock)
@@ -434,10 +452,10 @@ class AutomaticReconnectionIntegrationTest {
                 .build();
     }
 
-    private static MqttClient plainClient(URI broker) {
+    private static MqttClient plainClient(URI broker, MqttVersion version) {
         return MqttClient.builder()
                 .server(broker)
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .build();
     }

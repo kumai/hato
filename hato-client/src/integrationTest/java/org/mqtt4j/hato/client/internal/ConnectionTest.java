@@ -9,6 +9,8 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedClass;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
@@ -29,8 +31,17 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-/// The same public client contract runs against Mosquitto and the embedded broker.
+/// The same public client contract runs against Mosquitto and the embedded broker, in both
+/// protocol versions.
+@ParameterizedClass(name = "{0}")
+@EnumSource(MqttVersion.class)
 abstract class ConnectionTest {
+
+    private final MqttVersion version;
+
+    ConnectionTest(MqttVersion version) {
+        this.version = version;
+    }
 
     @Test
     void connection_callbacks_can_publish_and_keep_their_order_while_the_client_progresses()
@@ -70,7 +81,7 @@ abstract class ConnectionTest {
         };
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(listener)
                 .build()) {
@@ -106,14 +117,17 @@ abstract class ConnectionTest {
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .keepAlive(Duration.ofSeconds(10))
                 .timerScheduler(scheduler)
                 .connectionListener(ended::add)
                 .build()) {
-            // Act & Assert: keep the connection alive across successive ping exchanges.
-            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            // Act & Assert: keep the connection alive across successive ping exchanges. An MQTT
+            // 5.0 broker may announce limits in its CONNACK, so only the session is compared.
+            ConnAck connAck = sut.connect().get(5, SECONDS);
+            assertThat(connAck.sessionPresent()).isFalse();
+            assertThat(connAck.connectionAttempt()).isEqualTo(1);
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
             for (int i = 0; i < 3; i++) {
                 scheduler.advance(Duration.ofSeconds(10));
@@ -134,7 +148,7 @@ abstract class ConnectionTest {
         var transport = new AtomicReference<FaultyTransport>();
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .keepAlive(Duration.ofSeconds(10))
                 .timerScheduler(scheduler)

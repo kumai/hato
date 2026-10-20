@@ -19,6 +19,7 @@ import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedClass;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -37,7 +38,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
-/// Public messaging contracts shared by the embedded broker and Mosquitto.
+/// Public messaging contracts shared by the embedded broker and Mosquitto, in both protocol
+/// versions.
+@ParameterizedClass(name = "{0}")
+@EnumSource(MqttVersion.class)
 abstract class MessagingTest {
 
     static final ClientActor.Usage NOTHING_HELD = new ClientActor.Usage(
@@ -52,6 +56,12 @@ abstract class MessagingTest {
             0,
             0
     );
+
+    private final MqttVersion version;
+
+    MessagingTest(MqttVersion version) {
+        this.version = version;
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -300,7 +310,7 @@ abstract class MessagingTest {
         var failure = new IOException("Connection cut before PUBACK reached the client");
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(ended::add)
                 .transportFactory(id -> {
@@ -533,7 +543,7 @@ abstract class MessagingTest {
         var transport = new AtomicReference<FaultyTransport>();
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(ended::add)
                 .transportFactory(id -> {
@@ -793,7 +803,7 @@ abstract class MessagingTest {
         var payloads = new LinkedBlockingQueue<Byte>();
         try (MqttClient sut = MqttClient.builder()
                         .server(endpoint())
-                        .version(MqttVersion.V3_1_1)
+                        .version(version)
                         .timerScheduler(clock)
                         .reconnectPolicy(ReconnectPolicy.exponentialBackoff(
                                 Duration.ofSeconds(1),
@@ -1000,7 +1010,7 @@ abstract class MessagingTest {
         try (
                 MqttClient sut = MqttClient.builder()
                         .server(endpoint())
-                        .version(MqttVersion.V3_1_1)
+                        .version(version)
                         .reconnectPolicy(ReconnectPolicy.disabled())
                         .connectionListener(ended::add)
                         .transportFactory(id -> {
@@ -1078,7 +1088,7 @@ abstract class MessagingTest {
     MqttClient client(ConnectionListener listener) {
         return MqttClient.builder()
                 .server(endpoint())
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(listener)
                 .build();

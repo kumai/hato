@@ -28,6 +28,10 @@ class MosquittoMessagingTest extends MessagingTest {
 
     private static final GenericContainer<?> broker = Mosquitto.container();
 
+    MosquittoMessagingTest(MqttVersion version) {
+        super(version);
+    }
+
     static boolean dockerIsAvailableOrRequired() {
         return Mosquitto.availableOrRequired();
     }
@@ -90,7 +94,7 @@ class MosquittoMessagingTest extends MessagingTest {
             sut.publish(publication).get(5, SECONDS);
             sut.publish(message(base + "/barrier", (byte) 4)).get(5, SECONDS);
 
-            // Assert: 3.1.1 carries no identifier to route a copy to only its intended filter.
+            // Assert: without Subscription Identifiers, no copy names its intended filter.
             for (int i = 0; i < 2; i++) {
                 assertThat(requireNonNull(wildcard.poll(5, SECONDS)).message())
                         .isEqualTo(publication);

@@ -7,6 +7,7 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.broker.MqttBroker;
 
 import static java.util.Objects.requireNonNull;
@@ -14,6 +15,10 @@ import static java.util.Objects.requireNonNull;
 class EmbeddedBrokerMessagingTest extends MessagingTest {
 
     private static @Nullable MqttBroker broker;
+
+    EmbeddedBrokerMessagingTest(MqttVersion version) {
+        super(version);
+    }
 
     @BeforeAll
     static void start() throws IOException {
