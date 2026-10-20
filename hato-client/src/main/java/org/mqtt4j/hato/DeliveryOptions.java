@@ -16,7 +16,9 @@ import static java.util.Objects.requireNonNull;
 /// [#withExecutor(Executor)] keeps that order but runs each handler on the application's
 /// executor. [#lanes(Function)] runs each delivery on the executor that the application chooses
 /// for its message, its lane: deliveries on the same lane keep that order, and different lanes
-/// can run at the same time.
+/// can run at the same time. [#striped(int)] keeps that order for deliveries with equal keys, by
+/// default their topics, and runs different keys at the same time on a fixed number of stripes;
+/// each stripe is a lane in what follows.
 ///
 /// An executor that runs handlers receives at most one task per subscription and lane at a time.
 /// The task runs one delivery's handler and, while further deliveries wait for the same lane,
@@ -77,8 +79,31 @@ public final class DeliveryOptions {
         return new DeliveryOptions(new HandlerExecution.Lanes(selector));
     }
 
-    /// The same order, one delivery at a time, with each handler running on `executor` instead
-    /// of an internal virtual thread. Replaces an executor chosen earlier.
+    /// Runs deliveries with equal topics one at a time in receive order, and deliveries with
+    /// different topics possibly at the same time, at most `stripes` at once. Each topic's
+    /// deliveries go to one of `stripes` fixed stripes that its hash chooses, so different topics
+    /// can share a stripe and then wait for each other. A stripe runs on an internal virtual
+    /// thread while it has deliveries, or on the executor that [#withExecutor(Executor)] sets.
+    ///
+    /// @throws IllegalArgumentException if `stripes` is less than 1 or greater than 256
+    public static DeliveryOptions striped(int stripes) {
+        return striped(stripes, MqttMessage::topic);
+    }
+
+    /// Like [#striped(int)], with the key that `key` returns for each message in place of its
+    /// topic; keys are compared with `equals` and `hashCode`. The key function runs on an
+    /// internal thread, once for each delivery in receive order. It receives the message rather
+    /// than the delivery, so it cannot acknowledge it. An exception or a null result ends that
+    /// delivery as a handler failure.
+    ///
+    /// @throws IllegalArgumentException if `stripes` is less than 1 or greater than 256
+    /// @throws NullPointerException if `key` is null
+    public static DeliveryOptions striped(int stripes, Function<MqttMessage, ?> key) {
+        return new DeliveryOptions(new HandlerExecution.Striped(stripes, key, null));
+    }
+
+    /// The same order and the same stripes, with each handler running on `executor` instead of
+    /// an internal virtual thread. Replaces an executor chosen earlier.
     ///
     /// @throws NullPointerException if `executor` is null
     /// @throws IllegalArgumentException if these options are [#lanes(Function)], whose selector
@@ -88,6 +113,9 @@ public final class DeliveryOptions {
         return switch (execution) {
             case HandlerExecution.Internal _, HandlerExecution.OnExecutor _ ->
                     new DeliveryOptions(new HandlerExecution.OnExecutor(executor));
+            case HandlerExecution.Striped striped -> new DeliveryOptions(
+                    new HandlerExecution.Striped(striped.stripes(), striped.key(), executor)
+            );
             case HandlerExecution.Lanes _ -> throw new IllegalArgumentException(
                     "Lanes take their executors from the selector"
             );

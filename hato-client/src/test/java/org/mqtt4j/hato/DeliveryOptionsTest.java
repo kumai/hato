@@ -4,6 +4,8 @@ import java.util.concurrent.Executor;
 import java.util.function.Function;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.client.internal.HandlerExecution;
 
@@ -49,11 +51,52 @@ class DeliveryOptionsTest {
     }
 
     @Test
+    void striped_options_key_on_the_topic_and_keep_their_stripes_on_an_executor() {
+        // Arrange
+        Executor executor = Runnable::run;
+        var message = MqttMessage.of(new Topic("devices/1"), new byte[0], Qos.AT_MOST_ONCE, false);
+
+        // Act
+        DeliveryOptions sut = DeliveryOptions.striped(4);
+        DeliveryOptions onExecutor = sut.withExecutor(executor);
+
+        // Assert: the default key is the topic, and the executor replaces the internal threads.
+        var striped = (HandlerExecution.Striped) sut.execution();
+        assertThat(striped.stripes()).isEqualTo(4);
+        assertThat(striped.key().apply(message)).isEqualTo(new Topic("devices/1"));
+        assertThat(striped.executor()).isNull();
+        assertThat(onExecutor.execution())
+                .isEqualTo(new HandlerExecution.Striped(4, striped.key(), executor));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {Integer.MIN_VALUE, -1, 0, 257})
+    void the_number_of_stripes_must_be_from_1_to_256(int stripes) {
+        assertThatThrownBy(() -> DeliveryOptions.striped(stripes))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> DeliveryOptions.striped(stripes, MqttMessage::topic))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 256})
+    void the_bounds_of_the_stripe_range_are_accepted(int stripes) {
+        Function<MqttMessage, ?> key = MqttMessage::topic;
+
+        assertThat(DeliveryOptions.striped(stripes, key).execution())
+                .isEqualTo(new HandlerExecution.Striped(stripes, key, null));
+    }
+
+    @Test
     @SuppressWarnings("NullAway") // Deliberately violates the non-null contracts.
-    void executors_and_selectors_cannot_be_null() {
+    void executors_selectors_and_keys_cannot_be_null() {
         assertThatThrownBy(() -> DeliveryOptions.serial().withExecutor(null))
                 .isInstanceOf(NullPointerException.class);
         assertThatThrownBy(() -> DeliveryOptions.lanes(null))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> DeliveryOptions.striped(4, null))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> DeliveryOptions.striped(4).withExecutor(null))
                 .isInstanceOf(NullPointerException.class);
     }
 

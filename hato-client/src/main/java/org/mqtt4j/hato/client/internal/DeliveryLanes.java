@@ -882,6 +882,8 @@ final class DeliveryLanes {
                     placeNext(lane, executor);
             case HandlerExecution.Lanes(Function<MqttMessage, Executor> selector) ->
                     placeNextOnLane(lane, selector);
+            case HandlerExecution.Striped striped ->
+                    placeNextOnStripe(lane, striped);
         };
     }
 
@@ -924,7 +926,7 @@ final class DeliveryLanes {
             if (!awaitNext(lane)) {
                 return false;
             }
-            submitting = place(lane, lane.queue.removeFirst(), executor);
+            submitting = place(lane, lane.queue.removeFirst(), sublane(lane, executor));
         } finally {
             lock.unlock();
         }
@@ -932,11 +934,41 @@ final class DeliveryLanes {
         return true;
     }
 
-    /// Lanes: asks the application's selector for the head's lane, without the lock, then places
-    /// the head there as [#placeNext] does. The head stays queued meanwhile, so a stop or a
-    /// connection's end still settles it, and the selector's answer is then dropped. A selector
-    /// that throws or returns null ends the head as a handler failure.
+    /// Lanes: places the head on the executor that the application's selector returns for it.
     private boolean placeNextOnLane(Lane lane, Function<MqttMessage, Executor> selector) {
+        return placeNextChosen(
+                lane,
+                message -> requireNonNull(selector.apply(message), "The selector returned null"),
+                executor -> sublane(lane, executor)
+        );
+    }
+
+    /// Striped: places the head on the stripe that its key's hash chooses. The key's hashCode()
+    /// is the application's code too, so the stripe's number is found without the lock as well.
+    private boolean placeNextOnStripe(Lane lane, HandlerExecution.Striped striped) {
+        return placeNextChosen(
+                lane,
+                message -> stripeOf(
+                        requireNonNull(
+                                striped.key().apply(message),
+                                "The key function returned null"
+                        ),
+                        striped.stripes()
+                ),
+                number -> stripe(lane, striped, number)
+        );
+    }
+
+    /// Lanes and Striped: asks the application's code about the head, without the lock, then
+    /// places the head on the sublane that `sublaneFor` returns for the answer, as [#placeNext]
+    /// does. The head stays queued meanwhile, so a stop or a connection's end still settles it,
+    /// and the answer is then dropped. Code that throws, or returns null, ends the head as a
+    /// handler failure.
+    private <T> boolean placeNextChosen(
+            Lane lane,
+            Function<MqttMessage, T> choose,
+            Function<T, Sublane> sublaneFor
+    ) {
         DeliveryView head;
         lock.lock();
         try {
@@ -947,15 +979,15 @@ final class DeliveryLanes {
         } finally {
             lock.unlock();
         }
-        Executor executor;
+        T choice;
         try {
-            executor = requireNonNull(selector.apply(head.message), "The selector returned null");
+            choice = choose.apply(head.message);
         } catch (Throwable failure) {
             boolean _ = Thread.interrupted();
             failSelected(lane, head, failure);
             return true;
         }
-        // Like a handler, the selector leaves no interrupt state on this thread.
+        // Like a handler, the application's code leaves no interrupt state on this thread.
         boolean _ = Thread.interrupted();
         Optional<Sublane> submitting;
         lock.lock();
@@ -963,7 +995,7 @@ final class DeliveryLanes {
             if (!canTake(lane, head)) {
                 return true;
             }
-            submitting = place(lane, lane.queue.removeFirst(), executor);
+            submitting = place(lane, lane.queue.removeFirst(), sublaneFor.apply(choice));
         } finally {
             lock.unlock();
         }
@@ -971,9 +1003,18 @@ final class DeliveryLanes {
         return true;
     }
 
-    /// Ends the head as a handler failure after the selector failed for it, unless a stop, a
-    /// connection's end, or the client's close has taken it meanwhile. Reporting a delivery that
-    /// one of those settled could stop the client for a subscription that no longer has it.
+    /// Spreads keys over `stripes` stripes, so that equal keys share one. Fibonacci hashing mixes
+    /// the key's hash code, so codes that differ only in their low bits, such as identifiers in
+    /// steps of the stripe count, still spread; the mixed code's high bits then pick the stripe.
+    static int stripeOf(Object key, int stripes) {
+        long mixed = (key.hashCode() * 0x9E3779B9) & 0xFFFFFFFFL;
+        return (int) ((mixed * stripes) >>> 32);
+    }
+
+    /// Ends the head as a handler failure after the application's code failed for it, unless a
+    /// stop, a connection's end, or the client's close has taken it meanwhile. Reporting a
+    /// delivery that one of those settled could stop the client for a subscription that no longer
+    /// has it.
     private void failSelected(Lane lane, DeliveryView head, Throwable failure) {
         lock.lock();
         try {
@@ -989,9 +1030,9 @@ final class DeliveryLanes {
         fail(lane, head, failure, false);
     }
 
-    /// Caller holds lock. Whether the dispatcher can still take `head`, which the selector
-    /// answered for: only the dispatcher takes the head, anything else that takes it clears the
-    /// queue, and after the client's close the head stays queued for the close to settle.
+    /// Caller holds lock. Whether the dispatcher can still take `head`, which the application's
+    /// code answered for: only the dispatcher takes the head, anything else that takes it clears
+    /// the queue, and after the client's close the head stays queued for the close to settle.
     private boolean canTake(Lane lane, DeliveryView head) {
         return lane.queue.peekFirst() == head && !handOffsClosed;
     }
@@ -1007,10 +1048,35 @@ final class DeliveryLanes {
         return new Claim(view, lane.ackMode == AckMode.ON_RECEIVE && markReady(view));
     }
 
-    /// Caller holds lock. Moves a delivery, still queued, to its executor's sublane. Returns the
-    /// sublane when no drain task is on its way there yet; the caller then submits one.
-    private Optional<Sublane> place(Lane lane, DeliveryView view, Executor executor) {
-        Sublane sublane = lane.sublanes.computeIfAbsent(executor, key -> new Sublane(lane, key));
+    /// Caller holds lock. The sublane of an application's executor, told apart by identity.
+    private Sublane sublane(Lane lane, Executor executor) {
+        return lane.sublanes.computeIfAbsent(
+                executor,
+                _ -> new Sublane(lane, executor, executor, false)
+        );
+    }
+
+    /// Caller holds lock. The sublane of the stripe numbered `number`. It runs on the options'
+    /// executor, or, without one, on an internal virtual thread that drains it until it is empty.
+    private Sublane stripe(Lane lane, HandlerExecution.Striped striped, int number) {
+        return lane.sublanes.computeIfAbsent(number, _ -> {
+            Executor executor = striped.executor();
+            if (executor != null) {
+                return new Sublane(lane, number, executor, false);
+            }
+            String name = "hato-" + clientId + "-delivery-" + lane.id + "-stripe-" + number;
+            return new Sublane(
+                    lane,
+                    number,
+                    task -> Thread.ofVirtual().name(name).start(task),
+                    true
+            );
+        });
+    }
+
+    /// Caller holds lock. Moves a delivery, still queued, to `sublane`. Returns the sublane when
+    /// no drain task is on its way there yet; the caller then submits one.
+    private Optional<Sublane> place(Lane lane, DeliveryView view, Sublane sublane) {
         sublane.queue.addLast(view);
         lane.queuedInSublanes++;
         placedDeliveries++;
@@ -1067,11 +1133,12 @@ final class DeliveryLanes {
         }
     }
 
-    /// A drain task, run by the sublane's executor: claims and executes the head delivery, then
-    /// asks the executor again while deliveries remain. When the executor runs that request before
-    /// its execute() returns, as a synchronous executor does, the outer frame takes it, so the
-    /// stack does not grow with the queue. The dispatcher does not end the lane while the task
-    /// runs, because it may still call the handler or the executor.
+    /// A drain task, run by the sublane's executor: claims and executes the head delivery. On an
+    /// application's executor, it then asks the executor again while deliveries remain. When the
+    /// executor runs that request before its execute() returns, as a synchronous executor does,
+    /// the outer frame takes it, so the stack does not grow with the queue. An internal stripe's
+    /// task instead goes on until its stripe is empty. The dispatcher does not end the lane while
+    /// the task runs, because it may still call the handler or the executor.
     private void drain(Sublane sublane) {
         Lane lane = sublane.lane;
         lock.lock();
@@ -1085,8 +1152,10 @@ final class DeliveryLanes {
             lock.unlock();
         }
         try {
-            while (runHead(lane, sublane) && askAgain(lane, sublane)) {
-                // The executor ran the next request inline; this frame runs it.
+            while (runHead(lane, sublane)
+                    && (sublane.drainsUntilEmpty || askAgain(lane, sublane))) {
+                // An internal stripe goes on, or the executor ran the next request inline and
+                // this frame runs it.
             }
         } finally {
             lock.lock();
@@ -1161,7 +1230,7 @@ final class DeliveryLanes {
     private void unschedule(Lane lane, Sublane sublane) {
         sublane.scheduled = false;
         if (sublane.queue.isEmpty()) {
-            lane.sublanes.remove(sublane.executor, sublane);
+            lane.sublanes.remove(sublane.key, sublane);
         }
     }
 
@@ -1784,9 +1853,11 @@ final class DeliveryLanes {
         // A hand-off lane shares the hand-off worker's condition.
         final Condition ready;
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
-        // An executor's sublane exists while deliveries wait there or a drain task is on its way.
-        // Executors are told apart by identity.
-        final Map<Executor, Sublane> sublanes = new IdentityHashMap<>();
+        // A sublane exists while deliveries wait there or a drain task is on its way. Executors
+        // are told apart by identity, so no application's equals() runs under the lock. Stripes
+        // are told apart by the equality of their numbers, because Java shares the boxed objects
+        // only for numbers from -128 to 127.
+        final Map<Object, Sublane> sublanes;
         // Deliveries that left this lane unprocessed, by reason.
         final long[] dropped = new long[Dropped.values().length];
         int retained;
@@ -1824,15 +1895,27 @@ final class DeliveryLanes {
             this.handler = handler;
             this.acceptor = acceptor;
             this.ready = ready;
+            sublanes = switch (execution) {
+                case HandlerExecution.Striped _ -> new HashMap<>();
+                case HandlerExecution.Internal _,
+                     HandlerExecution.OnExecutor _,
+                     HandlerExecution.Lanes _ -> new IdentityHashMap<>();
+            };
         }
     }
 
-    /// One lane's deliveries waiting for one executor, in receive order. While `scheduled` is set,
-    /// one drain task is on its way: submitted, running, or about to ask the executor again.
+    /// One lane's deliveries waiting for one executor or one stripe, in receive order. While
+    /// `scheduled` is set, one drain task is on its way: submitted, running, or about to ask the
+    /// executor again.
     private final class Sublane {
 
         final Lane lane;
+        // The sublane's key in its lane: its executor, or its stripe's number.
+        final Object key;
         final Executor executor;
+        // An internal stripe's drain task runs until the stripe is empty; one on an application's
+        // executor runs one delivery and asks the executor again.
+        final boolean drainsUntilEmpty;
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
         final DrainTask task;
         boolean scheduled;
@@ -1841,9 +1924,11 @@ final class DeliveryLanes {
         @Nullable Thread inline;
         boolean again;
 
-        Sublane(Lane lane, Executor executor) {
+        Sublane(Lane lane, Object key, Executor executor, boolean drainsUntilEmpty) {
             this.lane = lane;
+            this.key = key;
             this.executor = executor;
+            this.drainsUntilEmpty = drainsUntilEmpty;
             task = new DrainTask(this);
         }
 

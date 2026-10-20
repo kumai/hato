@@ -6139,6 +6139,527 @@ class ClientActorTest {
     }
 
     @Test
+    void striped_runs_each_topic_in_receive_order_with_one_task_per_stripe_at_a_time()
+            throws Exception {
+        // Arrange: four deliveries alternate between two topics on different stripes of an
+        // executor.
+        var executor = new ManualExecutor();
+        List<String> topics = topicsOnEachStripe(2);
+        var handled = new LinkedBlockingQueue<MqttMessage>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_MOST_ONCE),
+                    DeliveryOptions.striped(2).withExecutor(executor),
+                    delivery -> handled.add(delivery.message())
+            );
+            for (int value = 1; value <= 4; value++) {
+                transport.receive(publication(topics.get((value + 1) % 2), value));
+            }
+            await().until(() -> actor.placedDeliveries() == 4);
+            int held = executor.held();
+
+            // Act
+            for (int task = 1; task <= 4; task++) {
+                executor.runNext();
+            }
+
+            // Assert: each stripe had one task on its way, so both could run at once. Each topic
+            // kept its receive order, and every delivery took a task of its own.
+            assertThat(held).isEqualTo(2);
+            assertThat(handled)
+                    .extracting(message -> message.topic().name() + " " + message.payload()[0])
+                    .containsExactly(
+                            topics.get(0) + " 1",
+                            topics.get(1) + " 2",
+                            topics.get(0) + " 3",
+                            topics.get(1) + " 4"
+                    );
+            assertThat(executor.executions()).isEqualTo(4);
+            assertThat(executor.held()).isZero();
+        }
+    }
+
+    @Test
+    void a_topic_on_a_high_stripe_number_keeps_one_queue() throws Exception {
+        // Arrange: two deliveries for a topic whose stripe number is above the numbers from -128
+        // to 127, whose boxed objects Java shares.
+        var executor = new ManualExecutor();
+        String topic = IntStream.range(0, 10_000)
+                .mapToObj(index -> "devices/" + index)
+                .filter(name -> DeliveryLanes.stripeOf(new Topic(name), 256) >= 128)
+                .findFirst()
+                .orElseThrow();
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_MOST_ONCE),
+                    DeliveryOptions.striped(256).withExecutor(executor),
+                    delivery -> handled.add(delivery.message().payload()[0])
+            );
+            transport.receive(publication(topic, 1));
+            transport.receive(publication(topic, 2));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act
+            int held = executor.held();
+            executor.runNext();
+            executor.runNext();
+
+            // Assert: both waited on one stripe, with one task on its way, and ran in order.
+            assertThat(held).isEqualTo(1);
+            assertThat(handled).containsExactly((byte) 1, (byte) 2);
+        }
+    }
+
+    @Test
+    void different_stripes_run_their_handlers_at_the_same_time() throws Exception {
+        // Arrange: each handler waits until both have started.
+        List<String> topics = topicsOnEachStripe(2);
+        var started = new CountDownLatch(2);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_MOST_ONCE),
+                    DeliveryOptions.striped(2),
+                    _ -> {
+                        started.countDown();
+                        waitFor(started);
+                    }
+            );
+
+            // Act
+            transport.receive(publication(topics.get(0), 1));
+            transport.receive(publication(topics.get(1), 2));
+
+            // Assert: neither handler had to return before the other started.
+            assertThat(started.await(5, SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void an_internal_stripe_drains_what_waits_on_it_with_one_virtual_thread() throws Exception {
+        // Arrange: the first of three deliveries on the only stripe waits until the other two
+        // are placed behind it.
+        var release = new CountDownLatch(1);
+        var threads = new LinkedBlockingQueue<Thread>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.striped(1),
+                    delivery -> {
+                        threads.add(Thread.currentThread());
+                        if (delivery.message().payload()[0] == 1) {
+                            waitFor(release);
+                        }
+                    }
+            );
+            for (int value = 1; value <= 3; value++) {
+                transport.receive(publication(new byte[] {(byte) value}));
+            }
+            await().until(() -> actor.placedDeliveries() == 3);
+
+            // Act
+            release.countDown();
+
+            // Assert: the stripe's own virtual thread ran all three, without asking for another
+            // thread in between.
+            Thread first = requireNonNull(threads.poll(5, SECONDS));
+            assertThat(threads.poll(5, SECONDS)).isSameAs(first);
+            assertThat(threads.poll(5, SECONDS)).isSameAs(first);
+            assertThat(first.isVirtual()).isTrue();
+            assertThat(first.getName()).matches("hato-actor-test-delivery-\\d+-stripe-0");
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_key_function_that_throws_fails_its_delivery_as_a_handler_failure() throws Exception {
+        // Arrange
+        var failure = new IllegalStateException("No key for this message");
+        var threads = new LinkedBlockingQueue<Thread>();
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    qosOneRequest(),
+                    DeliveryOptions.striped(4, _ -> {
+                        threads.add(Thread.currentThread());
+                        throw failure;
+                    }),
+                    handled::add
+            );
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Assert: the key function ran on the subscription's dispatcher. As with a failing
+            // handler, the failure ends the connection and the message is not acknowledged.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(requireNonNull(threads.poll(5, SECONDS)).getName())
+                    .matches("hato-actor-test-delivery-\\d+");
+            assertThat(transport.sent).isEmpty();
+            assertThat(handled).isEmpty();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("NullAway") // Deliberately violates the key function's non-null contract.
+    void a_key_function_that_returns_null_fails_its_delivery_as_a_handler_failure()
+            throws Exception {
+        // Arrange
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    qosOneRequest(),
+                    DeliveryOptions.striped(4, _ -> null),
+                    handled::add
+            );
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Assert: the null result fails the delivery as an exception would.
+            Disconnection end = requireNonNull(ends.poll(5, SECONDS));
+            assertThat(end.cause().orElseThrow()).isInstanceOf(NullPointerException.class);
+            assertThat(transport.sent).isEmpty();
+            assertThat(handled).isEmpty();
+        }
+    }
+
+    @Test
+    void a_handler_failure_on_one_stripe_holds_the_other_stripes() throws Exception {
+        // Arrange: QoS 1 deliveries 1 and 2 wait on two stripes of an executor, and the handler
+        // fails for 1.
+        var executor = new ManualExecutor();
+        List<String> topics = topicsOnEachStripe(2);
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_LEAST_ONCE),
+                    DeliveryOptions.striped(2).withExecutor(executor),
+                    delivery -> {
+                        handled.add(delivery.message().payload()[0]);
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                    }
+            );
+            transport.receive(qosOnePublication(topics.get(0), 1, false));
+            transport.receive(qosOnePublication(topics.get(1), 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act: the first stripe fails, and the other stripe's task runs afterwards.
+            executor.runNext();
+            executor.runNext();
+
+            // Assert: the failure ends the connection, and the other stripe runs nothing.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(handled).containsExactly((byte) 1);
+            assertThat(transport.sent).isEmpty();
+        }
+    }
+
+    @Test
+    void skip_acknowledges_a_failed_delivery_on_one_stripe_while_the_other_stripes_go_on()
+            throws Exception {
+        // Arrange: QoS 1 deliveries 1 and 2 wait on two stripes of a skipping subscription, and
+        // the handler fails for 1.
+        var executor = new ManualExecutor();
+        List<String> topics = topicsOnEachStripe(2);
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_LEAST_ONCE).withFailurePolicy(FailurePolicy.SKIP),
+                    DeliveryOptions.striped(2).withExecutor(executor),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                        handled.add(delivery.message().payload()[0]);
+                    }
+            );
+            transport.receive(qosOnePublication(topics.get(0), 1, false));
+            transport.receive(qosOnePublication(topics.get(1), 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act
+            executor.runNext();
+            executor.runNext();
+
+            // Assert: the failed delivery is acknowledged unprocessed, and the other stripe runs.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 1));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 2));
+            assertThat(handled).containsExactly((byte) 2);
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @Test
+    void unsubscribe_runs_what_each_stripe_accepted_before_the_subscription_terminates()
+            throws Exception {
+        // Arrange: deliveries 1 and 3 wait on one stripe and 2 on another when removal is
+        // confirmed.
+        var executor = new ManualExecutor();
+        List<String> topics = topicsOnEachStripe(2);
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_MOST_ONCE),
+                    DeliveryOptions.striped(2).withExecutor(executor),
+                    delivery -> handled.add(delivery.message().payload()[0])
+            );
+            for (int value = 1; value <= 3; value++) {
+                transport.receive(publication(topics.get((value + 1) % 2), value));
+            }
+            await().until(() -> actor.placedDeliveries() == 3);
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+            var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
+            removing.get(5, SECONDS);
+            CompletableFuture<Void> terminated = subscription.terminated();
+
+            // Act & Assert: each stripe runs what it accepted, in order, and the subscription
+            // terminates only after the last of them.
+            executor.runNext();
+            executor.runNext();
+            assertThat(terminated).isNotDone();
+            executor.runNext();
+            terminated.get(5, SECONDS);
+            assertThat(handled).containsExactly((byte) 1, (byte) 2, (byte) 3);
+        }
+    }
+
+    @Test
+    void closing_a_striped_subscription_discards_what_waits_on_its_stripes() throws Exception {
+        // Arrange: two QoS 1 deliveries wait on two stripes of an executor that has run nothing.
+        var executor = new ManualExecutor();
+        List<String> topics = topicsOnEachStripe(2);
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_LEAST_ONCE),
+                    DeliveryOptions.striped(2).withExecutor(executor),
+                    handled::add
+            );
+            transport.receive(qosOnePublication(topics.get(0), 1, false));
+            transport.receive(qosOnePublication(topics.get(1), 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act
+            subscription.close();
+
+            // Assert: the subscription terminates without the tasks, which do nothing when they
+            // run late, and the discarded deliveries return their slots.
+            subscription.terminated().get(5, SECONDS);
+            executor.runNext();
+            executor.runNext();
+            assertThat(handled).isEmpty();
+            await().until(() -> actor.usage().deliveries() == 0);
+        }
+    }
+
+    @Test
+    void a_striped_subscription_counts_every_stripe_against_its_buffer() throws Exception {
+        // Arrange: a one-delivery buffer, and the handler holds the first delivery.
+        List<String> topics = topicsOnEachStripe(2);
+        var release = new CountDownLatch(1);
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_MOST_ONCE).withBufferCapacity(1),
+                    DeliveryOptions.striped(2),
+                    delivery -> {
+                        handled.add(delivery.message().payload()[0]);
+                        if (delivery.message().payload()[0] == 1) {
+                            waitFor(release);
+                        }
+                    }
+            );
+            transport.receive(publication(topics.get(0), 1));
+            assertThat(handled.poll(5, SECONDS)).isEqualTo((byte) 1);
+
+            // Act: a message for the other, idle stripe arrives while the buffer is full. This
+            // publication follows it through the mailbox, so it completes after routing.
+            transport.receive(publication(topics.get(1), 2));
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+            release.countDown();
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 0);
+            transport.receive(publication(topics.get(1), 3));
+
+            // Assert: the full buffer dropped the message although its stripe was idle, and the
+            // subscription goes on.
+            assertThat(handled.poll(5, SECONDS)).isEqualTo((byte) 3);
+            assertThat(handled).isEmpty();
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void acknowledgements_keep_receive_order_when_stripes_finish_out_of_order() throws Exception {
+        // Arrange: QoS 1 deliveries 1 and 2 on two stripes. The second one's handler
+        // acknowledges first, while the first one waits.
+        List<String> topics = topicsOnEachStripe(2);
+        var secondAcknowledged = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_LEAST_ONCE).withAckMode(AckMode.MANUAL),
+                    DeliveryOptions.striped(2),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            waitFor(release);
+                        }
+                        delivery.ack();
+                        if (delivery.message().payload()[0] == 2) {
+                            secondAcknowledged.countDown();
+                        }
+                    }
+            );
+            transport.receive(qosOnePublication(topics.get(0), 1, false));
+            transport.receive(qosOnePublication(topics.get(1), 2, false));
+            assertThat(secondAcknowledged.await(5, SECONDS)).isTrue();
+
+            // Act
+            release.countDown();
+
+            // Assert: PUBACK follows receive order although the second delivery finished first.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 1));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 2));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_a_handler_running_on_a_stripe() throws Exception {
+        // Arrange: a handler runs on an internal stripe.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.striped(4),
+                    _ -> {
+                        entered.countDown();
+                        waitFor(release);
+                    }
+            );
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the running handler alone keeps the subscription
+            // and the client from terminating.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(subscription.terminated()).isNotDone();
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            subscription.terminated().get(5, SECONDS);
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_a_key_function_still_running() throws Exception {
+        // Arrange: the key function keeps the dispatcher.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.striped(4, message -> {
+                        entered.countDown();
+                        waitFor(release);
+                        return message.topic();
+                    }),
+                    handled::add
+            );
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the key function alone keeps termination
+            // pending. Its answer, given after the close, runs no handler.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            terminated.get(5, SECONDS);
+            assertThat(handled).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void hand_off_rejects_acknowledgement_after_the_handler() throws Exception {
         // Arrange
         try (MqttClient sut = client()) {
@@ -6983,6 +7504,38 @@ class ClientActorTest {
         );
         establish(transport, subscription);
         return subscription;
+    }
+
+    private static Subscription subscribeWith(
+            MqttClient client,
+            ScriptTransport transport,
+            Subscribe request,
+            DeliveryOptions options,
+            Consumer<MqttDelivery> handler
+    ) throws Exception {
+        Subscription subscription = client.subscribe(request, options, handler);
+        establish(transport, subscription);
+        return subscription;
+    }
+
+    private static Subscribe devices(Qos qos) {
+        return Subscribe.of(new TopicFilter("devices/+"), qos);
+    }
+
+    /// One topic under `devices/` for each of `stripes` stripes, in stripe order, so that the
+    /// default striped key, the topic, sends each to a stripe of its own.
+    private static List<String> topicsOnEachStripe(int stripes) {
+        var topics = new String[stripes];
+        int found = 0;
+        for (int index = 0; found < stripes; index++) {
+            String topic = "devices/" + index;
+            int stripe = DeliveryLanes.stripeOf(new Topic(topic), stripes);
+            if (topics[stripe] == null) {
+                topics[stripe] = topic;
+                found++;
+            }
+        }
+        return List.of(topics);
     }
 
     /// Once an internal failure is published, establishment reports it, and a subscription closed

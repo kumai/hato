@@ -2280,6 +2280,31 @@ class DeliveryLanesTest {
         assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {1, 7, 8, 256})
+    void every_key_lands_within_the_range_and_equal_keys_share_a_stripe(int stripes) {
+        for (Object key : List.of("devices/1", "", Integer.MIN_VALUE, -1, Long.MAX_VALUE)) {
+            assertThat(DeliveryLanes.stripeOf(key, stripes)).isBetween(0, stripes - 1);
+        }
+        // An equal but distinct key lands on the same stripe.
+        assertThat(DeliveryLanes.stripeOf(new String("devices/1"), stripes))
+                .isEqualTo(DeliveryLanes.stripeOf("devices/1", stripes));
+    }
+
+    @Test
+    void keys_in_steps_of_the_stripe_count_still_spread_over_every_stripe() {
+        // Arrange: identifiers that are all multiples of the stripe count.
+        var used = new ArrayList<Integer>();
+
+        // Act
+        for (int id = 0; id < 8 * 64; id += 8) {
+            used.add(DeliveryLanes.stripeOf(id, 8));
+        }
+
+        // Assert
+        assertThat(used).containsOnly(0, 1, 2, 3, 4, 5, 6, 7);
+    }
+
     @Test
     void a_refused_qos_0_delivery_is_dropped_for_its_lane_only() throws Exception {
         // Arrange: lane 1 refuses every delivery, and lane 2 accepts.

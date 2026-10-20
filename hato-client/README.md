@@ -172,8 +172,8 @@ Subscription subscription = client.subscribe(
 - The executor stays yours: the client never shuts it down. Shut it down once
   `client.terminated()` completes; tasks it still holds then do nothing.
 
-To keep each device's messages in order while different devices run in parallel, pick a lane,
-an executor, for every message:
+To choose the executor for each message yourself, such as the single thread that owns a
+device's state, pick a lane, an executor, for every message:
 
 ```java
 Subscription subscription = client.subscribe(
@@ -189,6 +189,28 @@ Subscription subscription = client.subscribe(
 - A lane function that throws or returns null fails that message as a throwing handler would.
 - Acknowledgements still leave in arrival order, so a slow lane holds back the acknowledgement
   of later QoS 1 and 2 messages on other lanes.
+
+## Running messages in parallel
+
+To keep each device's messages in order while different devices run at the same time, stripe
+the subscription by a key:
+
+```java
+Subscription subscription = client.subscribe(
+        Subscribe.of(new TopicFilter("devices/+/events"), Qos.AT_LEAST_ONCE),
+        DeliveryOptions.striped(16, message -> deviceId(message.topic())),
+        delivery -> devices.apply(delivery.message())
+);
+```
+
+- Messages with equal keys run one at a time in arrival order. At most 16 handlers of this
+  subscription run at once, each on a virtual thread of the client.
+- `DeliveryOptions.striped(16)` uses each message's topic as its key.
+- The key's hash picks one of the 16 stripes, so two devices can share a stripe and then wait
+  for each other.
+- Add `.withExecutor(pool)` to run the stripes on your own executor.
+- Acknowledgements still leave in arrival order, so a slow stripe holds back the
+  acknowledgement of later QoS 1 and 2 messages on other stripes.
 
 ## Receiving on your own threads
 
