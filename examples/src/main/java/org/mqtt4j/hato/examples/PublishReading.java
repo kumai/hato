@@ -13,10 +13,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 /// Publishes the temperature reading from the root README to a local broker.
 public final class PublishReading {
 
-    private PublishReading() {
-    }
-
-    public static void main(String[] args) {
+    void main() {
         try (MqttClient client = MqttClient.builder()
                 .server(URI.create("mqtt://localhost:1883"))
                 .version(MqttVersion.V3_1_1)

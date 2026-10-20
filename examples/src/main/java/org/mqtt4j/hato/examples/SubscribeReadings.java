@@ -14,10 +14,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 /// Prints the sensor readings from the root README until Enter is pressed.
 public final class SubscribeReadings {
 
-    private SubscribeReadings() {
-    }
-
-    public static void main(String[] args) {
+    void main() {
         try (MqttClient client = MqttClient.builder()
                 .server(URI.create("mqtt://localhost:1883"))
                 .version(MqttVersion.V3_1_1)

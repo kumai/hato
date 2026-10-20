@@ -23,10 +23,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 /// alarms by receiving on the main thread and acknowledging them after printing.
 public final class Hello {
 
-    private Hello() {
-    }
-
-    public static void main(String[] args) throws IOException, InterruptedException {
+    void main() throws IOException, InterruptedException {
         try (MqttBroker broker = MqttBroker.start();
                 MqttClient client = MqttClient.builder()
                         .server(URI.create("mqtt://localhost:" + broker.port()))
