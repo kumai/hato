@@ -11,7 +11,7 @@ import org.mqtt4j.hato.broker.MqttBroker;
 
 import static java.util.Objects.requireNonNull;
 
-class EmbeddedBrokerConcurrentDeliveryTest extends ConcurrentDeliveryIntegrationTest {
+class EmbeddedBrokerDeliveryModesTest extends DeliveryModesIntegrationTest {
 
     private static @Nullable MqttBroker broker;
 

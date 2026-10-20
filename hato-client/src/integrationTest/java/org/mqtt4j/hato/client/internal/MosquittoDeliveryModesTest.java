@@ -13,7 +13,7 @@ import org.mqtt4j.hato.testsupport.Mosquitto;
         value = "dockerIsAvailableOrRequired",
         disabledReason = "Docker explicitly optional"
 )
-class MosquittoConcurrentDeliveryTest extends ConcurrentDeliveryIntegrationTest {
+class MosquittoDeliveryModesTest extends DeliveryModesIntegrationTest {
 
     private static final GenericContainer<?> broker = Mosquitto.container();
 
