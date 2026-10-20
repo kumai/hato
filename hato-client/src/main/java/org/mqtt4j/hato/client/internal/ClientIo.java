@@ -13,8 +13,6 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.spi.Transport;
 
-import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
-
 /// Adapts byte callbacks to protocol events and serializes preparation and writes off the actor.
 /// One sender survives connection changes; queued and active sends share a client-wide budget.
 final class ClientIo {
@@ -231,15 +229,18 @@ final class ClientIo {
             int packetId,
             @Nullable SendReceipt receipt
     ) {
+        // Measured outside the monitor: counting User Properties takes time in their length.
+        int bodySize = MessageProperties.bodySize(message);
         synchronized (sending) {
             Connection connection = current;
             if (shutdown || connection == null || connection.generation != generation) {
                 return SendQueue.OfferResult.CLOSED;
             }
-            // Refuse an oversized payload before even preparing its header. Final admission
-            // below reserves the complete wire size, including that header, atomically.
+            // Refuse an oversized payload or set of properties before even preparing the header.
+            // Final admission below reserves the complete wire size, including that header,
+            // atomically.
             SendQueue.OfferResult capacity = connection.queue.checkCapacity(
-                    message.payloadSize(),
+                    bodySize,
                     false
             );
             if (capacity != SendQueue.OfferResult.ACCEPTED) {
@@ -253,7 +254,7 @@ final class ClientIo {
                 message.retain(),
                 false,
                 packetId,
-                EMPTY,
+                MessageProperties.of(message),
                 message.payloadSize()
         );
         return enqueue(

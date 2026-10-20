@@ -94,6 +94,9 @@ public final class ClientActor implements MqttClient {
 
     private final String clientId;
 
+    // MQTT 3.1.1 cannot carry message properties, so publish() refuses them before admission.
+    private final MqttVersion version;
+
     // A nonpersistent session ends with the client, which confirms its pending removals.
     private final boolean cleanStart;
 
@@ -240,6 +243,7 @@ public final class ClientActor implements MqttClient {
     ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
+        this.version = version;
         this.scheduler = scheduler;
         this.executionOf = executionOf;
         cleanStart = sessionExpiry.isZero();
@@ -332,9 +336,15 @@ public final class ClientActor implements MqttClient {
     @Override
     public CompletableFuture<PublishResult> publish(MqttMessage message) {
         requireNonNull(message, "message");
+        if (version == MqttVersion.V3_1_1 && MessageProperties.present(message)) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                    "MQTT 3.1.1 cannot carry message properties"
+            ));
+        }
+        // The properties count with the payload: User Properties alone can be large.
         return submit(
                 Command.PUBLISH,
-                message.payloadSize(),
+                MessageProperties.bodySize(message),
                 token -> core.publish(token, message)
         );
     }

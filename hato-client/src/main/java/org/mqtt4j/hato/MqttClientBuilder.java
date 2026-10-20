@@ -17,6 +17,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.client.internal.ClientActor;
 import org.mqtt4j.hato.client.internal.DefaultTimerScheduler;
+import org.mqtt4j.hato.client.internal.MessageProperties;
 import org.mqtt4j.hato.client.internal.TcpTransport;
 import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
@@ -204,8 +205,9 @@ public final class MqttClientBuilder {
 
     /// Configures the message the broker publishes if the connection ends without receiving
     /// MQTT DISCONNECT, including [MqttClient#close()] alone. No Will is configured by default.
-    /// Any QoS and retention flag are accepted. [#build()] rejects payloads over 65535 bytes;
-    /// the immutable message already validates its topic and owns a copy of its payload.
+    /// Any QoS and retention flag are accepted. [#build()] rejects payloads over 65535 bytes
+    /// and messages with MQTT 5.0 properties, which a Will cannot carry; the immutable message
+    /// already validates its topic and owns a copy of its payload.
     /// Wait for [MqttClient#disconnect()] to complete successfully before [MqttClient#close()]
     /// so closing cannot discard the pending DISCONNECT. Completion confirms the write;
     /// the broker does not acknowledge receipt.
@@ -346,7 +348,7 @@ public final class MqttClientBuilder {
     /// @throws IllegalStateException if the server has not been specified
     /// @throws IllegalArgumentException if the session expiry is out of range, TLS settings are
     ///     invalid or incompatible, a persistent session has no explicit client id, or the Will
-    ///     payload exceeds 65535 bytes
+    ///     payload exceeds 65535 bytes or the Will has message properties
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null) {
@@ -365,6 +367,9 @@ public final class MqttClientBuilder {
             throw new IllegalArgumentException(
                     "Session expiry must be zero or 1..4294967295 seconds"
             );
+        }
+        if (will != null && MessageProperties.present(will)) {
+            throw new IllegalArgumentException("A Will cannot carry message properties");
         }
         // The CONNECT form checks the payload limit here, before the client starts any thread.
         Packet.Will connectWill = (will == null) ? null : new Packet.Will(

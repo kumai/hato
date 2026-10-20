@@ -38,9 +38,13 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -377,6 +381,62 @@ class SessionPersistenceTest {
         assertFailure(2, MqttCapacityException.class);
         assertThat(port.results).doesNotContainKey(3L);
         assertThat(port.accepted).hasSize(1);
+    }
+
+    @Test
+    void an_mqtt_5_session_counts_message_properties_toward_its_byte_budget() {
+        // Arrange: a persistent MQTT 5.0 session, and messages with small payloads.
+        SessionCore mqtt5 = core(MqttVersion.V5, false);
+        mqtt5.connect(new ConnectionAttempt(1), 0);
+        mqtt5.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        MqttMessage message = message("properties")
+                .withUserProperties(userPropertiesOf(20 * 1024 * 1024));
+
+        // Act: their User Properties take 40 MiB in all.
+        mqtt5.publish(2, message);
+        mqtt5.publish(3, message);
+
+        // Assert
+        assertThat(port.results).doesNotContainKey(2L);
+        assertFailure(3, MqttCapacityException.class);
+        assertThat(port.accepted).hasSize(1);
+    }
+
+    @Test
+    void mqtt_5_publications_keep_their_lifetime_while_they_wait_and_when_resent() {
+        // Arrange: a persistent MQTT 5.0 session with a broker that takes one publication at
+        // once. When the connection ends, one publication awaits PUBACK and the next waits
+        // for room.
+        SessionCore mqtt5 = core(MqttVersion.V5, false);
+        mqtt5.connect(new ConnectionAttempt(1), 0);
+        mqtt5.opened(port.generation);
+        mqtt5.received(port.generation, oneAtOnce(false), 0, 0);
+        MqttMessage message = message("expiring").withMessageExpiry(Duration.ofSeconds(10));
+        mqtt5.publish(2, message);
+        mqtt5.publish(3, message);
+        mqtt5.failed(port.generation, new IOException("lost"));
+
+        // Act: the session continues, and the broker acknowledges the resent publication.
+        mqtt5.connect(new ConnectionAttempt(4), 0);
+        mqtt5.opened(port.generation);
+        mqtt5.received(port.generation, oneAtOnce(true), 0, 0);
+        int resent = port.accepted.getLast().packetId();
+        mqtt5.received(
+                port.generation,
+                new Packet.PubAck(resent, ReasonCode.SUCCESS, EMPTY),
+                0,
+                0
+        );
+
+        // Assert: the first send, the resend, and the waiting publication ask for the lifetime
+        // that the application gave.
+        assertThat(port.accepted)
+                .extracting(publication -> publication.message().messageExpiry())
+                .containsExactly(
+                        Optional.of(Duration.ofSeconds(10)),
+                        Optional.of(Duration.ofSeconds(10)),
+                        Optional.of(Duration.ofSeconds(10))
+                );
     }
 
     @Test
@@ -959,6 +1019,22 @@ class SessionPersistenceTest {
 
     private static MqttMessage message(String topic) {
         return MqttMessage.of(new Topic(topic), new byte[] {1}, Qos.AT_LEAST_ONCE, false);
+    }
+
+    /// A successful CONNACK from a broker whose Receive Maximum is one publication.
+    private static Packet.ConnAck oneAtOnce(boolean sessionPresent) {
+        return new Packet.ConnAck(
+                sessionPresent,
+                ReasonCode.SUCCESS,
+                new Properties(List.of(new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 1)))
+        );
+    }
+
+    /// User Properties whose values take at least `bytes` in total. They share one value, so
+    /// the list costs little memory itself.
+    static List<UserProperty> userPropertiesOf(int bytes) {
+        var property = new UserProperty("n", "v".repeat(65_535));
+        return Collections.nCopies(Math.ceilDiv(bytes, 65_535), property);
     }
 
     static MqttMessage messageWithWireBytes(int bytes) {

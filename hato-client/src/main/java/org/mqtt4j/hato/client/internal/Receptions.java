@@ -123,11 +123,14 @@ final class Receptions {
             }
             return;
         }
-        var message = MqttMessage.of(
-                publish.topic(),
-                publish.payload(),
-                publish.qos(),
-                publish.retain()
+        MqttMessage message = MessageProperties.received(
+                MqttMessage.of(
+                        publish.topic(),
+                        publish.payload(),
+                        publish.qos(),
+                        publish.retain()
+                ),
+                publish.properties()
         );
         if (!port.deliver(
                 new DeliveryToken(core.sessionNumber(), core.generation(), core.attempt(), token),

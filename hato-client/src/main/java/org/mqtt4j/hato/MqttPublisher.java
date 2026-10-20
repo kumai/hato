@@ -23,6 +23,10 @@ public interface MqttPublisher {
     /// after the acknowledgement, and waiting publications count toward the admission capacity.
     /// QoS 0 publications do not wait.
     ///
+    /// The MQTT 5.0 properties of the message, such as [MqttMessage#contentType()], travel with
+    /// the PUBLISH. An MQTT 3.1.1 client cannot carry them: a message with any of them fails
+    /// with [IllegalArgumentException] without being sent.
+    ///
     /// A client without a connection, including one waiting to reconnect or with a requested
     /// disconnect pending, fails with [MqttNotConnectedException]. Admission capacity failures
     /// use [MqttCapacityException] and leave the connection usable.

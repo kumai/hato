@@ -245,6 +245,19 @@ class MqttClientBuilderTest {
     }
 
     @Test
+    void a_will_with_message_properties_is_rejected_at_build() {
+        // Arrange
+        var will = MqttMessage.of(new Topic("status"), new byte[0], Qos.AT_MOST_ONCE, false)
+                .withContentType("text/plain");
+        MqttClientBuilder sut = configuredBuilder().will(will);
+
+        // Act & Assert
+        assertThatThrownBy(sut::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("message properties");
+    }
+
+    @Test
     @SuppressWarnings("NullAway") // Deliberately violates the setters' non-null contracts.
     void credentials_and_will_cannot_be_null() {
         assertThatThrownBy(() -> configuredBuilder().credentials(null))

@@ -23,7 +23,7 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// serialized.
 final class ScriptTransport implements Transport {
 
-    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
+    private final PacketCodec codec;
 
     final LinkedBlockingQueue<Packet> sent = new LinkedBlockingQueue<>();
     volatile @Nullable Listener listener;
@@ -39,6 +39,16 @@ final class ScriptTransport implements Transport {
     Duration startTimeout = Duration.ZERO;
     // When set, close() leaves its report to finishClose(), as a transport still closing would.
     volatile boolean deferCloseReport;
+
+    /// A transport that speaks MQTT 3.1.1.
+    ScriptTransport() {
+        this(MqttVersion.V3_1_1);
+    }
+
+    /// A transport that decodes sends and encodes received packets in `version`.
+    ScriptTransport(MqttVersion version) {
+        codec = PacketCodec.of(version);
+    }
 
     Listener receiver() {
         return requireNonNull(listener);

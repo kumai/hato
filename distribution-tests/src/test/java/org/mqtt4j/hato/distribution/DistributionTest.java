@@ -126,6 +126,12 @@ class DistributionTest {
                     ))) {
                 throw new AssertionError("Client value factories are not usable");
             }
+            var property = new org.mqtt4j.hato.UserProperty("source", "probe");
+            var described = message.withUserProperties(java.util.List.of(property));
+            if (!described.userProperties().equals(java.util.List.of(property))
+                    || described.equals(message)) {
+                throw new AssertionError("Message properties are not usable");
+            }
             """;
     private static final String BROKER_PROBE = """
             try (var broker = org.mqtt4j.hato.broker.MqttBroker.start()) {
@@ -402,6 +408,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.Subscription",
                 "org.mqtt4j.hato.Topic",
                 "org.mqtt4j.hato.TopicFilter",
+                "org.mqtt4j.hato.UserProperty",
                 "org.mqtt4j.hato.spi.TimerScheduler",
                 "org.mqtt4j.hato.spi.TimerScheduler$Cancellable",
                 "org.mqtt4j.hato.spi.Transport",

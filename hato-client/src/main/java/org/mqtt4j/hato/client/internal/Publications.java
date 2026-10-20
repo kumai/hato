@@ -133,7 +133,7 @@ final class Publications {
             int byteCount = 0;
             if (kept) {
                 long remaining = INFLIGHT_BYTE_LIMIT - bytes;
-                if (message.payloadSize() > remaining) {
+                if (MessageProperties.bodySize(message) > remaining) {
                     capacityFailure(operation, "Publication byte capacity");
                     return;
                 }
@@ -530,7 +530,8 @@ final class Publications {
         }
     }
 
-    /// The size of the PUBLISH that carries `message`, including its fixed header.
+    /// The size of the PUBLISH that carries `message`, including its fixed header and its
+    /// properties.
     private int wireSize(MqttMessage message) {
         return codec.encodePublishHeader(
                 message.topic(),
@@ -538,7 +539,7 @@ final class Publications {
                 message.retain(),
                 false,
                 message.qos() == Qos.AT_MOST_ONCE ? 0 : 1,
-                EMPTY,
+                MessageProperties.of(message),
                 message.payloadSize()
         )
                 .length + message.payloadSize();

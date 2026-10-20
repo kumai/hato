@@ -73,10 +73,13 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
@@ -89,6 +92,7 @@ import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.mqtt4j.hato.client.internal.SessionPersistenceTest.userPropertiesOf;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.spi.Transport.SendResult.CLOSED;
 
@@ -4564,6 +4568,166 @@ class ClientActorTest {
         }
     }
 
+    @Test
+    void an_mqtt_5_publication_carries_the_message_properties_as_given() throws Exception {
+        // Arrange: a payload that is not UTF-8 although the message declares it so.
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+            List<UserProperty> userProperties = List.of(
+                    new UserProperty("source", "sensor"),
+                    new UserProperty("hop", "1"),
+                    new UserProperty("source", "relay")
+            );
+            MqttMessage message = message(new byte[] {(byte) 0xC3})
+                    .withPayloadUtf8(true)
+                    .withMessageExpiry(Duration.ofMillis(1_200))
+                    .withContentType("text/plain")
+                    .withResponseTopic(new Topic("replies/a"))
+                    .withCorrelationData(new byte[] {7})
+                    .withUserProperties(userProperties);
+
+            // Act
+            sut.publish(message).get(5, SECONDS);
+
+            // Assert: the lifetime rounds up to whole seconds, and User Properties keep their
+            // order and repeated names.
+            var publish = (Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS));
+            assertThat(publish.payload()).containsExactly(0xC3);
+            assertThat(publish.properties().entries()).containsExactlyInAnyOrder(
+                    new Property.ByteValue(PropertyId.PAYLOAD_FORMAT_INDICATOR, 1),
+                    new Property.FourByteValue(PropertyId.MESSAGE_EXPIRY_INTERVAL, 2),
+                    new Property.StringValue(PropertyId.CONTENT_TYPE, "text/plain"),
+                    new Property.StringValue(PropertyId.RESPONSE_TOPIC, "replies/a"),
+                    new Property.BinaryValue(PropertyId.CORRELATION_DATA, new byte[] {7}),
+                    new Property.UserProperty("source", "sensor"),
+                    new Property.UserProperty("hop", "1"),
+                    new Property.UserProperty("source", "relay")
+            );
+            assertThat(publish.properties().entries())
+                    .filteredOn(Property.UserProperty.class::isInstance)
+                    .containsExactly(
+                            new Property.UserProperty("source", "sensor"),
+                            new Property.UserProperty("hop", "1"),
+                            new Property.UserProperty("source", "relay")
+                    );
+        }
+    }
+
+    @Test
+    void an_mqtt_5_publication_of_unspecified_bytes_without_other_properties_sends_none()
+            throws Exception {
+        // Arrange
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+
+            // Act
+            sut.publish(message(new byte[] {1}).withPayloadUtf8(false)).get(5, SECONDS);
+
+            // Assert
+            var publish = (Packet.Publish) requireNonNull(transport.sent.poll(5, SECONDS));
+            assertThat(publish.properties().entries()).isEmpty();
+        }
+    }
+
+    static Stream<MqttMessage> messagesWithProperties() {
+        MqttMessage message = message(new byte[] {1});
+        return Stream.of(
+                message.withPayloadUtf8(true),
+                message.withMessageExpiry(Duration.ZERO),
+                message.withContentType(""),
+                message.withResponseTopic(new Topic("replies")),
+                message.withCorrelationData(new byte[0]),
+                message.withUserProperties(List.of(new UserProperty("", "")))
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("messagesWithProperties")
+    void an_mqtt_3_1_1_client_fails_a_publication_with_properties_without_sending_it(
+            MqttMessage message
+    ) throws Exception {
+        // Arrange
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+
+            // Act
+            CompletableFuture<PublishResult> publication = sut.publish(message);
+
+            // Assert: the failure is immediate, and the next publication is the first one sent.
+            assertThat(publication).isCompletedExceptionally();
+            assertThatThrownBy(publication::join)
+                    .hasCauseInstanceOf(IllegalArgumentException.class);
+            sut.publish(message(new byte[] {2})).get(5, SECONDS);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOfSatisfying(
+                    Packet.Publish.class,
+                    publish -> assertThat(publish.payload()).containsExactly(2)
+            );
+        }
+    }
+
+    @Test
+    void user_properties_beyond_the_send_budget_fail_the_publication_without_sending_it()
+            throws Exception {
+        // Arrange: 17 MiB of User Properties exceed the 16 MiB send budget with no payload.
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+            MqttMessage message = message(new byte[0])
+                    .withUserProperties(userPropertiesOf(17 * 1024 * 1024));
+
+            // Act
+            CompletableFuture<PublishResult> publication = sut.publish(message);
+
+            // Assert
+            assertThat(publication.handle((_, cause) -> cause).get(5, SECONDS))
+                    .isInstanceOf(MqttCapacityException.class)
+                    .hasMessage("Send queue capacity");
+            sut.publish(message(new byte[] {2})).get(5, SECONDS);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOfSatisfying(
+                    Packet.Publish.class,
+                    publish -> assertThat(publish.payload()).containsExactly(2)
+            );
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @Test
+    void user_properties_count_toward_the_command_budget() throws Exception {
+        // Arrange: hold the actor so that queued publications whose User Properties take 1 MiB
+        // each, without payload, fill the 32 MiB command budget.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+            holdActor(transport, entered, release);
+            MqttMessage message = message(new byte[0])
+                    .withUserProperties(userPropertiesOf(1024 * 1024));
+            var publications = new ArrayList<CompletableFuture<PublishResult>>();
+
+            // Act
+            for (int i = 0; i < 40; i++) {
+                publications.add(sut.publish(message));
+            }
+
+            // Assert: while the actor is held, only the command budget can end a publication,
+            // and it fails the excess at once.
+            List<CompletableFuture<PublishResult>> refused = publications.stream()
+                    .filter(CompletableFuture::isDone)
+                    .toList();
+            assertThat(refused).hasSizeGreaterThanOrEqualTo(7).allSatisfy(publication ->
+                    assertThat(publication.handle((_, cause) -> cause).join())
+                            .isInstanceOf(MqttCapacityException.class)
+                            .hasMessage("Command mailbox capacity"));
+            release.countDown();
+            for (CompletableFuture<PublishResult> publication : publications) {
+                publication.handle((_, _) -> null).get(5, SECONDS);
+            }
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(ApplicationCompletion.class)
     void an_application_completing_one_unsubscribe_call_does_not_affect_later_calls(
@@ -8189,6 +8353,36 @@ class ClientActorTest {
             PacketCodec packetCodec,
             boolean cleanStart
     ) {
+        return client(
+                clientId,
+                listener,
+                maxPacketSize,
+                packetCodec,
+                cleanStart,
+                MqttVersion.V3_1_1
+        );
+    }
+
+    /// An MQTT 5.0 client like [#client()], whose transports speak MQTT 5.0.
+    private MqttClient mqtt5Client() {
+        return client(
+                "actor-test",
+                ends::add,
+                16 * 1024 * 1024,
+                PacketCodec.of(MqttVersion.V5),
+                true,
+                MqttVersion.V5
+        );
+    }
+
+    private MqttClient client(
+            String clientId,
+            ConnectionListener listener,
+            int maxPacketSize,
+            PacketCodec packetCodec,
+            boolean cleanStart,
+            MqttVersion version
+    ) {
         var clock = new TimerScheduler() {
             private volatile @Nullable Thread actor;
 
@@ -8218,12 +8412,12 @@ class ClientActorTest {
                 clock,
                 listener,
                 _ -> {
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(version);
                     transports.add(transport);
                     return transport;
                 },
                 packetCodec,
-                MqttVersion.V3_1_1,
+                version,
                 cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 null,
                 null,

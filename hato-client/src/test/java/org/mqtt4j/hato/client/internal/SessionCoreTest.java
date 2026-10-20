@@ -48,6 +48,7 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
@@ -2020,6 +2021,16 @@ class SessionCoreTest {
                         ),
                         message.withPayload(new byte[64]),
                         ReasonCode.PACKET_TOO_LARGE
+                ),
+                Arguments.of(
+                        Named.of(
+                                "properties that take it beyond Maximum Packet Size",
+                                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 64)
+                        ),
+                        // A User Property of one-byte strings adds seven bytes.
+                        messageWithWireBytes(60, MqttVersion.V5)
+                                .withUserProperties(List.of(new UserProperty("k", "v"))),
+                        ReasonCode.PACKET_TOO_LARGE
                 )
         );
     }
@@ -3702,22 +3713,64 @@ class SessionCoreTest {
     }
 
     @Test
-    void an_mqtt_5_publication_reaches_the_handler_without_its_properties() {
+    void an_mqtt_5_publication_reaches_the_handler_with_its_message_properties() {
         // Arrange
         SessionCore mqtt5 = connectedMqtt5();
         mqtt5.subscribe(2, subscription("a/#"));
         var properties = new Properties(List.of(
                 new Property.UserProperty("source", "sensor"),
+                new Property.ByteValue(PropertyId.PAYLOAD_FORMAT_INDICATOR, 1),
                 new Property.FourByteValue(PropertyId.MESSAGE_EXPIRY_INTERVAL, 60),
-                new Property.StringValue(PropertyId.CONTENT_TYPE, "text/plain")
+                new Property.StringValue(PropertyId.CONTENT_TYPE, "text/plain"),
+                new Property.StringValue(PropertyId.RESPONSE_TOPIC, "replies/a"),
+                new Property.BinaryValue(PropertyId.CORRELATION_DATA, new byte[] {7}),
+                new Property.UserProperty("source", "relay")
         ));
 
         // Act
         mqtt5.received(1, publication(properties), 0, 19);
 
-        // Assert
+        // Assert: the lifetime is what remained when the broker forwarded the message.
+        MqttMessage expected = message()
+                .withPayloadUtf8(true)
+                .withMessageExpiry(Duration.ofSeconds(60))
+                .withContentType("text/plain")
+                .withResponseTopic(new Topic("replies/a"))
+                .withCorrelationData(new byte[] {7})
+                .withUserProperties(List.of(
+                        new UserProperty("source", "sensor"),
+                        new UserProperty("source", "relay")
+                ));
         assertThat(port.deliveries).singleElement()
-                .satisfies(delivery -> assertThat(delivery.message()).isEqualTo(message()));
+                .satisfies(delivery -> assertThat(delivery.message()).isEqualTo(expected));
+    }
+
+    @Test
+    void a_payload_declared_as_utf_8_is_delivered_without_checking_it() {
+        // Arrange: a lone lead byte of a two-byte UTF-8 sequence.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        var publish = new Packet.Publish(
+                new Topic("a/b"),
+                new byte[] {(byte) 0xC3},
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                new Properties(List.of(
+                        new Property.ByteValue(PropertyId.PAYLOAD_FORMAT_INDICATOR, 1)
+                ))
+        );
+
+        // Act
+        mqtt5.received(1, publish, 0, 8);
+
+        // Assert
+        assertThat(port.deliveries).singleElement().satisfies(delivery -> {
+            assertThat(delivery.message().payloadUtf8()).isTrue();
+            assertThat(delivery.message().payload()).containsExactly(0xC3);
+        });
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
     }
 
     @ParameterizedTest(name = "{0}")
