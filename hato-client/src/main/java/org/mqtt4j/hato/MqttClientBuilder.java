@@ -72,8 +72,6 @@ public final class MqttClientBuilder {
 
     private ReconnectPolicy reconnectPolicy = DEFAULT_RECONNECT_POLICY;
 
-    private boolean cleanStart = true;
-
     private Duration sessionExpiry = Duration.ZERO;
 
     private int maxPacketSize = DEFAULT_MAX_PACKET_SIZE;
@@ -163,29 +161,19 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Selects whether each connection starts a new session; default true. With false, the
-    /// session persists across this client's connections: the client gains local state when a
-    /// connection starts a session, and its later connections ask the broker to resume it. A
-    /// session that the broker kept for the identifier without local state in this client
-    /// object, for example from before the application restarted, is not resumed: the attempt
-    /// that finds it discards it and starts a new session, so messages that the broker stored
-    /// for it are not received; see [MqttClient#connect()].
-    /// MQTT 3.1.1 supports only true with zero [#sessionExpiry(Duration)], or false with a
-    /// positive expiry. [#build()] rejects other combinations. These map to Clean Session 1
-    /// and Clean Session 0, respectively, apart from the connection that discards a broker
-    /// session. The broker determines the persistent session's lifetime.
-    public MqttClientBuilder cleanStart(boolean value) {
-        cleanStart = value;
-        return this;
-    }
-
-    /// Configures session retention after disconnection; default zero.
+    /// Configures how long the session outlasts a connection; default zero, which starts a new
+    /// session for each connection. A positive duration selects a persistent session, which
+    /// requires an explicit [#clientId(String)] and lasts across this client's connections: the
+    /// client gains local state when a connection starts a session, and its later connections
+    /// ask the broker to resume it. A session that the broker kept for the identifier without
+    /// local state in this client object, for example from before the application restarted,
+    /// is not resumed: the attempt that finds it discards it and starts a new session, so
+    /// messages that the broker stored for it are not received; see [MqttClient#connect()].
     /// [#build()] accepts zero, or durations from 1 through 4294967295 seconds inclusive.
     /// Fractional seconds are accepted within that range, such as 1.5 seconds.
-    /// MQTT 3.1.1 requires zero with [#cleanStart(boolean)] true, or a positive value with it
-    /// false and an explicit [#clientId(String)]. The positive duration is not sent to the
-    /// broker or enforced locally; every positive value selects Clean Session 0, and the
-    /// broker determines the session's lifetime.
+    /// MQTT 3.1.1 does not send the duration, and the client does not enforce it locally: zero
+    /// selects Clean Session 1 and a positive value Clean Session 0, apart from the connection
+    /// that discards a broker session, and the broker determines how long the session lasts.
     public MqttClientBuilder sessionExpiry(Duration value) {
         sessionExpiry = requireNonNull(value, "sessionExpiry");
         return this;
@@ -349,8 +337,9 @@ public final class MqttClientBuilder {
     /// Creates a disconnected client. Call [MqttClient#connect] to open the connection.
     ///
     /// @throws IllegalStateException if the server or protocol version has not been specified
-    /// @throws IllegalArgumentException if session or TLS settings are invalid or incompatible,
-    ///     a persistent session has no explicit client id, or the Will payload exceeds 65535 bytes
+    /// @throws IllegalArgumentException if the session expiry is out of range, TLS settings are
+    ///     invalid or incompatible, a persistent session has no explicit client id, or the Will
+    ///     payload exceeds 65535 bytes
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null || version == null) {
@@ -370,12 +359,6 @@ public final class MqttClientBuilder {
                     "Session expiry must be zero or 1..4294967295 seconds"
             );
         }
-        if (cleanStart != sessionExpiry.isZero()) {
-            throw new IllegalArgumentException(
-                    "MQTT 3.1.1 requires cleanStart true with zero session expiry, "
-                            + "or false with positive session expiry"
-            );
-        }
         // The CONNECT form checks the payload limit here, before the client starts any thread.
         Packet.Will connectWill = (will == null) ? null : new Packet.Will(
                 will.topic(),
@@ -386,7 +369,7 @@ public final class MqttClientBuilder {
         );
         String id = clientId;
         if (id == null) {
-            if (!cleanStart) {
+            if (!sessionExpiry.isZero()) {
                 throw new IllegalArgumentException(
                         "Persistent sessions require an explicit client id"
                 );
@@ -407,7 +390,7 @@ public final class MqttClientBuilder {
                 timer,
                 listener,
                 factory,
-                cleanStart,
+                sessionExpiry.isZero(),
                 credentials,
                 connectWill,
                 reconnectPolicy.backoff(),

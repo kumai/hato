@@ -201,7 +201,6 @@ class Qos2PersistenceIntegrationTest {
                         .version(MqttVersion.V3_1_1)
                         .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(clientId)
-                        .cleanStart(false)
                         .sessionExpiry(Duration.ofSeconds(30))
                         .connectionListener(ended::add)
                         .transportFactory(id -> {
@@ -277,7 +276,6 @@ class Qos2PersistenceIntegrationTest {
                         .server(endpoint)
                         .version(MqttVersion.V3_1_1)
                         .clientId(clientId)
-                        .cleanStart(false)
                         .sessionExpiry(Duration.ofSeconds(30))
                         .timerScheduler(clock)
                         .reconnectPolicy(ReconnectPolicy.exponentialBackoff(

@@ -303,7 +303,6 @@ abstract class Qos2ReceptionIntegrationTest {
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(id)
-                .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))
                 .connectionListener(ended::add)
                 .transportFactory(connection -> {

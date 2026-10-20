@@ -493,7 +493,6 @@ class SessionPersistenceIntegrationTest {
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
-                .cleanStart(cleanStart)
                 .sessionExpiry(cleanStart ? Duration.ZERO : Duration.ofSeconds(30))
                 .build()) {
             try (ScriptedBroker peer = connect(server, sut, false, cleanStart)) {
@@ -632,7 +631,6 @@ class SessionPersistenceIntegrationTest {
                         .version(MqttVersion.V3_1_1)
                         .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(clientId)
-                        .cleanStart(false)
                         .sessionExpiry(Duration.ofSeconds(30))
                         .will(will)
                         .connectionListener(recording(notifications))
@@ -886,7 +884,6 @@ class SessionPersistenceIntegrationTest {
                     .version(MqttVersion.V3_1_1)
                     .reconnectPolicy(ReconnectPolicy.disabled())
                     .clientId(clientId)
-                    .cleanStart(false)
                     .sessionExpiry(Duration.ofSeconds(30))
                     .connectionListener(recording(notifications))
                     .transportFactory(id -> {
@@ -975,7 +972,6 @@ class SessionPersistenceIntegrationTest {
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
-                .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))
                 .connectionListener(listener)
                 .build();

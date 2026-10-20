@@ -655,7 +655,6 @@ abstract class DeliveryModesIntegrationTest {
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId("hato" + UUID.randomUUID().toString().replace("-", "").substring(0, 19))
-                .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))
                 .connectionListener(listener)
                 .build();

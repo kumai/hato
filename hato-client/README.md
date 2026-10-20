@@ -43,10 +43,9 @@ shutdown, wait for `disconnect()` to complete successfully before calling `close
 as shown below. Any QoS and retention flag are supported. A Will payload must fit in
 65,535 bytes; `build()` rejects larger payloads.
 
-To retain a session between connections, use an explicit `clientId` and set
-`cleanStart(false).sessionExpiry(Duration.ofDays(1))`. For MQTT 3.1.1, a positive
-expiry selects a persistent session; the broker determines how long it retains
-the session. The client keeps its own session state in memory. When a new client object
+To retain a session between connections, use an explicit `clientId` and a positive
+expiry, such as `sessionExpiry(Duration.ofDays(1))`. With MQTT 3.1.1, the broker determines
+how long it retains the session. The client keeps its own session state in memory. When a new client object
 connects, for example after your application restarts, it therefore replaces the session that
 the broker kept with a new one: messages that the broker stored for the old session, including
 those published while your application was stopped, are not received.

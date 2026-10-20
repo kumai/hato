@@ -262,7 +262,6 @@ class SubscriptionContinuityTest {
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId("pending-removal")
-                .cleanStart(false)
                 .sessionExpiry(Duration.ofMinutes(1))
                 .connectionListener(ended::add)
                 .build()) {

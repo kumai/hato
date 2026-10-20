@@ -75,7 +75,6 @@ class Qos2PublicationTest {
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
-                .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))
                 .connectionListener(ended::add)
                 .build()) {

@@ -160,7 +160,6 @@ class MosquittoWillTest {
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .clientId(clientId)
-                .cleanStart(false)
                 .sessionExpiry(Duration.ofMinutes(1))
                 .build()) {
             previous.connect().get(5, SECONDS);
@@ -173,7 +172,6 @@ class MosquittoWillTest {
                         .version(MqttVersion.V3_1_1)
                         .reconnectPolicy(ReconnectPolicy.disabled())
                         .clientId(clientId)
-                        .cleanStart(false)
                         .sessionExpiry(Duration.ofMinutes(1))
                         .will(message(topic, (byte) 1))
                         .transportFactory(id -> {
