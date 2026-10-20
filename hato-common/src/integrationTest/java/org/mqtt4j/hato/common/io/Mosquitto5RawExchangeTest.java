@@ -26,6 +26,7 @@ import static org.mqtt4j.hato.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.common.protocol.PropertyId.REASON_STRING;
 import static org.mqtt4j.hato.common.protocol.PropertyId.SUBSCRIPTION_IDENTIFIER;
 import static org.mqtt4j.hato.common.value.ReasonCode.GRANTED_QOS_2;
+import static org.mqtt4j.hato.common.value.ReasonCode.NO_MATCHING_SUBSCRIBERS;
 import static org.mqtt4j.hato.common.value.ReasonCode.NO_SUBSCRIPTION_EXISTED;
 import static org.mqtt4j.hato.common.value.ReasonCode.SUCCESS;
 
@@ -155,6 +156,27 @@ class Mosquitto5RawExchangeTest {
             );
             subscriber.send(new Packet.PingReq());
             subscriber.expect(Packet.PingResp.class);
+        }
+    }
+
+    @Test
+    void a_publication_without_subscribers_is_answered_with_no_matching_subscribers()
+            throws Exception {
+        try (var publisher = connected("hato-five-unmatched")) {
+            // Act
+            publisher.send(new Packet.Publish(
+                    new Topic("hato/five/nobody"),
+                    new byte[] {1},
+                    Qos.AT_LEAST_ONCE,
+                    false,
+                    false,
+                    11,
+                    EMPTY
+            ));
+
+            // Assert: recorded from the pinned Mosquitto 2.1.2 image.
+            assertThat(publisher.expect(Packet.PubAck.class))
+                    .isEqualTo(new Packet.PubAck(11, NO_MATCHING_SUBSCRIBERS, EMPTY));
         }
     }
 
