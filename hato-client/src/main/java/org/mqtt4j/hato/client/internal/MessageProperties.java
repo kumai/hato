@@ -38,8 +38,7 @@ public final class MessageProperties {
         }
         message.messageExpiry().ifPresent(expiry -> entries.add(new Property.FourByteValue(
                 PropertyId.MESSAGE_EXPIRY_INTERVAL,
-                // Rounding up never shortens the lifetime that the application asked for.
-                Math.ceilDiv(expiry.toNanos(), 1_000_000_000L)
+                seconds(expiry)
         )));
         message.contentType().ifPresent(type -> entries.add(new Property.StringValue(
                 PropertyId.CONTENT_TYPE,
@@ -59,11 +58,29 @@ public final class MessageProperties {
         return entries.isEmpty() ? Properties.EMPTY : new Properties(entries);
     }
 
+    /// The Will Properties of the Will message `will`: its message properties and, unless `delay`
+    /// is zero, a Will Delay Interval rounded up to whole seconds.
+    public static Properties will(MqttMessage will, Duration delay) {
+        Properties properties = of(will);
+        if (delay.isZero()) {
+            return properties;
+        }
+        var entries = new ArrayList<>(properties.entries());
+        entries.add(new Property.FourByteValue(PropertyId.WILL_DELAY_INTERVAL, seconds(delay)));
+        return new Properties(entries);
+    }
+
     /// The bytes that the payload and the properties of `message` take in a PUBLISH, which bound
     /// the memory that a waiting publication holds. Saturates at [Integer#MAX_VALUE], which no
     /// limit admits.
     static int bodySize(MqttMessage message) {
-        long bytes = message.payloadSize();
+        return (int) Math.min((long) message.payloadSize() + size(message), Integer.MAX_VALUE);
+    }
+
+    /// The bytes that the properties of `message` take in a PUBLISH or a Will, without their
+    /// length prefix. Saturates at [Integer#MAX_VALUE], which no limit admits.
+    public static int size(MqttMessage message) {
+        long bytes = 0;
         // Each property is a one-byte identifier and its value; strings and binary data have
         // a two-byte length.
         if (message.payloadUtf8()) {
@@ -105,6 +122,11 @@ public final class MessageProperties {
             }
         }
         return userProperties.isEmpty() ? result : result.withUserProperties(userProperties);
+    }
+
+    // Rounding up never shortens the lifetime or the delay that the application asked for.
+    private static long seconds(Duration duration) {
+        return Math.ceilDiv(duration.toNanos(), 1_000_000_000L);
     }
 
     private static int utf8Length(String value) {

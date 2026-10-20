@@ -21,6 +21,7 @@ import org.mqtt4j.hato.client.internal.MessageProperties;
 import org.mqtt4j.hato.client.internal.TcpTransport;
 import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.spi.Transport;
 
@@ -44,6 +45,15 @@ public final class MqttClientBuilder {
             ReconnectPolicy.exponentialBackoff(Duration.ofSeconds(1), Duration.ofSeconds(120));
 
     private static final Duration MAX_SESSION_EXPIRY = Duration.ofSeconds(0xFFFF_FFFFL);
+
+    // A Will Delay Interval is a four-byte count of seconds, like the Session Expiry Interval.
+    private static final Duration MAX_WILL_DELAY = Duration.ofSeconds(0xFFFF_FFFFL);
+
+    // The CONNECT that carries the Will must fit the send capacity that the client reserves for
+    // connection control (1 MiB), or no attempt could send it. Every other CONNECT field holds
+    // at most 65535 bytes, so Will Properties of at most 65535 bytes keep CONNECT well inside.
+    // A deliberate simplification: a larger bound needs that reserved capacity to grow with it.
+    private static final int MAX_WILL_PROPERTY_BYTES = 65_535;
 
     private static final int DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024;
 
@@ -90,6 +100,8 @@ public final class MqttClientBuilder {
     private @Nullable Supplier<MqttCredentials> credentials;
 
     private @Nullable MqttMessage will;
+
+    private Duration willDelay = Duration.ZERO;
 
     MqttClientBuilder() {
     }
@@ -205,14 +217,33 @@ public final class MqttClientBuilder {
 
     /// Configures the message the broker publishes if the connection ends without receiving
     /// MQTT DISCONNECT, including [MqttClient#close()] alone. No Will is configured by default.
-    /// Any QoS and retention flag are accepted. [#build()] rejects payloads over 65535 bytes
-    /// and messages with MQTT 5.0 properties, which a Will cannot carry; the immutable message
-    /// already validates its topic and owns a copy of its payload.
+    /// Any QoS and retention flag are accepted. With MQTT 5.0, the message's properties, such as
+    /// [MqttMessage#contentType()], go to the broker as the Will Properties. [#build()] rejects
+    /// payloads over 65535 bytes, properties that take more than 65535 bytes in all, and any
+    /// properties for MQTT 3.1.1, which cannot carry them; the immutable message already
+    /// validates its topic and owns a copy of its payload.
     /// Wait for [MqttClient#disconnect()] to complete successfully before [MqttClient#close()]
     /// so closing cannot discard the pending DISCONNECT. Completion confirms the write;
     /// the broker does not acknowledge receipt.
     public MqttClientBuilder will(MqttMessage value) {
         will = requireNonNull(value, "will");
+        return this;
+    }
+
+    /// Delays the Will (the MQTT 5.0 Will Delay Interval); default zero. [#build()] accepts zero
+    /// through 4294967295 seconds, and a fraction of a second is rounded up when sent. MQTT 5.0
+    /// has the broker publish the Will once the delay has passed after the connection ended, or
+    /// when the session ends, whichever comes first. With a positive
+    /// [#sessionExpiry(Duration)], a reconnection of this client within the delay resumes the
+    /// session, and the broker does not publish the Will. Brokers differ when the session ends
+    /// sooner. With the default zero session expiry, EMQX and HiveMQ CE, for example, publish
+    /// the Will as the connection ends, while Mosquitto waits for the delay. A new client object,
+    /// for example after the application restarts, starts a new session instead; EMQX and
+    /// HiveMQ CE then publish the old session's Will at once, while Mosquitto discards it.
+    /// [#build()] rejects a positive delay without a [#will(MqttMessage)], and any positive
+    /// delay for MQTT 3.1.1, which has no Will Delay.
+    public MqttClientBuilder willDelay(Duration value) {
+        willDelay = requireNonNull(value, "willDelay");
         return this;
     }
 
@@ -347,8 +378,10 @@ public final class MqttClientBuilder {
     ///
     /// @throws IllegalStateException if the server has not been specified
     /// @throws IllegalArgumentException if the session expiry is out of range, TLS settings are
-    ///     invalid or incompatible, a persistent session has no explicit client id, or the Will
-    ///     payload exceeds 65535 bytes or the Will has message properties
+    ///     invalid or incompatible, a persistent session has no explicit client id, the Will
+    ///     payload exceeds 65535 bytes, the Will's properties exceed 65535 bytes, the Will delay
+    ///     is out of range or positive without a Will, or MQTT 3.1.1 is chosen with Will
+    ///     properties or a positive Will delay
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null) {
@@ -368,17 +401,14 @@ public final class MqttClientBuilder {
                     "Session expiry must be zero or 1..4294967295 seconds"
             );
         }
-        if (will != null && MessageProperties.present(will)) {
-            throw new IllegalArgumentException("A Will cannot carry message properties");
+        if (willDelay.isNegative() || willDelay.compareTo(MAX_WILL_DELAY) > 0) {
+            throw new IllegalArgumentException("Will delay must be 0..4294967295 seconds");
+        }
+        if (!willDelay.isZero() && will == null) {
+            throw new IllegalArgumentException("A Will delay needs a Will");
         }
         // The CONNECT form checks the payload limit here, before the client starts any thread.
-        Packet.Will connectWill = (will == null) ? null : new Packet.Will(
-                will.topic(),
-                will.payload(),
-                will.qos(),
-                will.retain(),
-                EMPTY
-        );
+        Packet.Will connectWill = (will == null) ? null : connectWill(will);
         String id = clientId;
         if (id == null) {
             if (!sessionExpiry.isZero()) {
@@ -410,6 +440,36 @@ public final class MqttClientBuilder {
                 reconnectPolicy.initialRetry(),
                 responseTimeout,
                 DeliveryOptions::execution
+        );
+    }
+
+    /// The Will in the form that CONNECT carries, checked against what the protocol version can
+    /// carry and against the room that CONNECT has for its properties.
+    private Packet.Will connectWill(MqttMessage message) {
+        Properties properties = switch (version) {
+            case V3_1_1 -> {
+                if (MessageProperties.present(message) || !willDelay.isZero()) {
+                    throw new IllegalArgumentException(
+                            "MQTT 3.1.1 cannot carry Will properties or a Will delay"
+                    );
+                }
+                yield EMPTY;
+            }
+            case V5 -> {
+                // A Will Delay Interval takes five bytes: its identifier and its value.
+                long bytes = MessageProperties.size(message) + (willDelay.isZero() ? 0L : 5L);
+                if (bytes > MAX_WILL_PROPERTY_BYTES) {
+                    throw new IllegalArgumentException("Will properties exceed 65535 bytes");
+                }
+                yield MessageProperties.will(message, willDelay);
+            }
+        };
+        return new Packet.Will(
+                message.topic(),
+                message.payload(),
+                message.qos(),
+                message.retain(),
+                properties
         );
     }
 

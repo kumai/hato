@@ -5,20 +5,31 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.UnaryOperator;
+import java.util.stream.Stream;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 
 import org.jspecify.annotations.Nullable;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.spi.Transport;
 
+import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -245,16 +256,139 @@ class MqttClientBuilderTest {
     }
 
     @Test
-    void a_will_with_message_properties_is_rejected_at_build() {
+    void an_mqtt_5_will_carries_its_message_properties_and_delay_in_connect() throws Exception {
         // Arrange
-        var will = MqttMessage.of(new Topic("status"), new byte[0], Qos.AT_MOST_ONCE, false)
-                .withContentType("text/plain");
-        MqttClientBuilder sut = configuredBuilder().will(will);
+        MqttMessage will = willMessage()
+                .withContentType("text/plain")
+                .withMessageExpiry(Duration.ofMinutes(1))
+                .withUserProperties(List.of(new UserProperty("state", "offline")));
+        MqttClientBuilder sut = mqtt5Builder().will(will).willDelay(Duration.ofMillis(1_200));
+
+        // Act
+        Packet.Connect connect = sentConnect(sut);
+
+        // Assert: the delay rounds up to whole seconds.
+        Packet.Will sent = requireNonNull(connect.will());
+        assertThat(sent.properties().entries()).containsExactlyInAnyOrder(
+                new Property.StringValue(PropertyId.CONTENT_TYPE, "text/plain"),
+                new Property.FourByteValue(PropertyId.MESSAGE_EXPIRY_INTERVAL, 60),
+                new Property.UserProperty("state", "offline"),
+                new Property.FourByteValue(PropertyId.WILL_DELAY_INTERVAL, 2)
+        );
+    }
+
+    @Test
+    void a_zero_will_delay_is_not_sent() throws Exception {
+        // Arrange
+        MqttClientBuilder sut = mqtt5Builder().will(willMessage()).willDelay(Duration.ZERO);
+
+        // Act
+        Packet.Connect connect = sentConnect(sut);
+
+        // Assert
+        assertThat(requireNonNull(connect.will()).properties().entries()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {0, 4_294_967_295L})
+    void will_delays_within_four_bytes_of_seconds_are_accepted(long seconds) {
+        // Arrange
+        MqttClientBuilder sut = mqtt5Builder()
+                .will(willMessage())
+                .willDelay(Duration.ofSeconds(seconds));
+
+        // Act & Assert
+        assertThatCode(() -> sut.build().close()).doesNotThrowAnyException();
+    }
+
+    static Stream<Named<Duration>> willDelaysOutOfRange() {
+        return Stream.of(
+                Named.of("a negative delay", Duration.ofNanos(-1)),
+                Named.of(
+                        "a nanosecond beyond 4294967295 seconds",
+                        Duration.ofSeconds(4_294_967_295L).plusNanos(1)
+                )
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("willDelaysOutOfRange")
+    void will_delays_out_of_range_are_rejected_at_build(Duration delay) {
+        // Arrange
+        MqttClientBuilder sut = mqtt5Builder().will(willMessage()).willDelay(delay);
 
         // Act & Assert
         assertThatThrownBy(sut::build)
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("message properties");
+                .hasMessageContaining("Will delay must be");
+    }
+
+    @Test
+    void a_will_delay_without_a_will_is_rejected_at_build() {
+        // Arrange
+        MqttClientBuilder sut = mqtt5Builder().willDelay(Duration.ofSeconds(5));
+
+        // Act & Assert
+        assertThatThrownBy(sut::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("needs a Will");
+    }
+
+    @Test
+    void will_properties_may_take_up_to_65535_bytes() {
+        // Arrange: a User Property takes five bytes besides its name and value.
+        var largest = willMessage().withUserProperties(List.of(
+                new UserProperty("n", "v".repeat(65_529))
+        ));
+        var oneMore = willMessage().withUserProperties(List.of(
+                new UserProperty("n", "v".repeat(65_530))
+        ));
+
+        // Act & Assert
+        assertThatCode(() -> mqtt5Builder().will(largest).build().close())
+                .doesNotThrowAnyException();
+        assertThatThrownBy(() -> mqtt5Builder().will(oneMore).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Will properties");
+    }
+
+    @Test
+    void a_will_delay_counts_toward_the_will_properties() {
+        // Arrange: properties of 65535 bytes leave no room for the delay's five bytes.
+        var full = willMessage().withUserProperties(List.of(
+                new UserProperty("n", "v".repeat(65_529))
+        ));
+        MqttClientBuilder sut = mqtt5Builder().will(full).willDelay(Duration.ofSeconds(1));
+
+        // Act & Assert
+        assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    static Stream<Named<UnaryOperator<MqttClientBuilder>>> mqtt5OnlyWillSettings() {
+        return Stream.of(
+                Named.of(
+                        "a Will with properties",
+                        builder -> builder.will(willMessage().withPayloadUtf8(true))
+                ),
+                Named.of(
+                        "a Will delay",
+                        builder -> builder.will(willMessage()).willDelay(Duration.ofSeconds(1))
+                )
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("mqtt5OnlyWillSettings")
+    void an_mqtt_3_1_1_client_rejects_will_settings_that_only_mqtt_5_carries(
+            UnaryOperator<MqttClientBuilder> setting
+    ) {
+        // Arrange
+        MqttClientBuilder sut = setting.apply(configuredBuilder());
+
+        // Act & Assert
+        assertThatThrownBy(sut::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("MQTT 3.1.1");
     }
 
     @Test
@@ -455,6 +589,29 @@ class MqttClientBuilderTest {
         return MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1);
+    }
+
+    private static MqttClientBuilder mqtt5Builder() {
+        return MqttClient.builder()
+                .server(URI.create("mqtt://localhost"))
+                .version(MqttVersion.V5);
+    }
+
+    private static MqttMessage willMessage() {
+        return MqttMessage.of(new Topic("status"), new byte[0], Qos.AT_LEAST_ONCE, false);
+    }
+
+    /// The CONNECT that a client from `builder` sends first, read without answering it.
+    private static Packet.Connect sentConnect(MqttClientBuilder builder) throws Exception {
+        var transport = new ConnectCapture();
+        MqttClient client = builder.transportFactory(_ -> transport).build();
+        try {
+            CompletableFuture<ConnAck> _ = client.connect();
+            byte[] connect = transport.connect.get(5, SECONDS);
+            return PacketCodec.decodeConnect(connect, Set.of(MqttVersion.V5));
+        } finally {
+            client.close();
+        }
     }
 
     /// The protocol level of `connect`: the byte that follows the protocol name.
