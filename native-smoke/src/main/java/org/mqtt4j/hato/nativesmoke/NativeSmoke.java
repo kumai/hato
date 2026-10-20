@@ -32,8 +32,8 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 
 /// Verifies that the packaged client and broker exchange messages at every QoS level in a native
 /// image, through a handler, through a striped handler, and through receiving on the caller's
-/// thread, over TCP and over TLS. For TLS, a relay in front of the broker presents the
-/// repository's test server identity.
+/// thread, in MQTT 3.1.1 and 5.0, over TCP and over TLS. For TLS, a relay in front of the broker
+/// presents the repository's test server identity.
 /// The image reads the identities at run time from the directory given as the only argument,
 /// `test-support/src/main/resources/tls` in this repository: embedding them would take
 /// native-image resource metadata, which Hato itself does not need.
@@ -55,32 +55,35 @@ public final class NativeSmoke {
         Path identities = Path.of(args[0]);
         try (MqttBroker broker = MqttBroker.start();
                 var relay = new TlsRelay(broker.port(), serverContext(identities))) {
-            roundTrip(
-                    "TCP",
-                    MqttClient.builder()
-                            .server(URI.create("mqtt://localhost:" + broker.port()))
-            );
-            roundTrip(
-                    "TLS",
-                    MqttClient.builder()
-                            .server(relay.uri())
-                            .sslContext(clientContext(identities))
-            );
+            for (MqttVersion version : MqttVersion.values()) {
+                roundTrip(
+                        "TCP " + version,
+                        MqttClient.builder()
+                                .server(URI.create("mqtt://localhost:" + broker.port()))
+                                .version(version)
+                );
+                roundTrip(
+                        "TLS " + version,
+                        MqttClient.builder()
+                                .server(relay.uri())
+                                .version(version)
+                                .sslContext(clientContext(identities))
+                );
+            }
         }
         System.out.println(
                 "hato native smoke: QoS 0/1/2 through handler, striped handler, and receive"
-                        + " over TCP and TLS OK"
+                        + " in MQTT 3.1.1 and 5.0 over TCP and TLS OK"
         );
     }
 
-    private static void roundTrip(String transport, MqttClientBuilder builder) throws Exception {
+    private static void roundTrip(String route, MqttClientBuilder builder) throws Exception {
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (MqttClient client = builder
-                .version(MqttVersion.V3_1_1)
                 .connectionListener(ended::add)
                 .build()) {
             if (client.connect().get(5, SECONDS).sessionPresent()) {
-                throw new AssertionError(transport + " clean connection resumed a session");
+                throw new AssertionError(route + " clean connection resumed a session");
             }
             var handled = new LinkedBlockingQueue<MqttMessage>();
             Subscription push = client.subscribe(
@@ -108,7 +111,7 @@ public final class NativeSmoke {
                 client.publish(pushed).get(5, SECONDS);
                 if (!pushed.equals(handled.poll(5, SECONDS))) {
                     throw new AssertionError(
-                            transport + " " + qos + " delivery to a handler changed the message"
+                            route + " " + qos + " delivery to a handler changed the message"
                     );
                 }
 
@@ -118,7 +121,7 @@ public final class NativeSmoke {
                         instanceof ReceiveResult.Received(var delivery))
                         || !pulled.equals(delivery.message())) {
                     throw new AssertionError(
-                            transport + " " + qos + " delivery to a receiver changed the message"
+                            route + " " + qos + " delivery to a receiver changed the message"
                     );
                 }
                 delivery.ack();
@@ -128,7 +131,7 @@ public final class NativeSmoke {
                 client.publish(stripedMessage).get(5, SECONDS);
                 if (!stripedMessage.equals(striped.poll(5, SECONDS))) {
                     throw new AssertionError(
-                            transport + " " + qos + " delivery to a striped handler changed the"
+                            route + " " + qos + " delivery to a striped handler changed the"
                                     + " message"
                     );
                 }
@@ -138,13 +141,13 @@ public final class NativeSmoke {
             pull.unsubscribe().get(5, SECONDS);
             stripes.unsubscribe().get(5, SECONDS);
             if (!(pull.receive(Duration.ZERO) instanceof ReceiveResult.Ended)) {
-                throw new AssertionError(transport + " removed subscription kept receiving");
+                throw new AssertionError(route + " removed subscription kept receiving");
             }
             client.disconnect().get(5, SECONDS);
             // Removal and disconnect also complete without a connection, so only the listener
             // shows that the connection lasted until the requested disconnect.
             if (!Disconnection.of(null, true, 1).equals(ended.poll(5, SECONDS))) {
-                throw new AssertionError(transport + " connection ended before the disconnect");
+                throw new AssertionError(route + " connection ended before the disconnect");
             }
         }
     }

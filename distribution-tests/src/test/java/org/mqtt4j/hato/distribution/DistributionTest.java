@@ -135,83 +135,90 @@ class DistributionTest {
             }
             """;
     private static final String CONNECTION_PROBE = """
-            var ended =
-                    new java.util.concurrent.LinkedBlockingQueue<org.mqtt4j.hato.Disconnection>();
-            try (var broker = org.mqtt4j.hato.broker.MqttBroker.start();
-                    org.mqtt4j.hato.MqttClient sut = org.mqtt4j.hato.MqttClient.builder()
-                            .server(java.net.URI.create("mqtt://localhost:" + broker.port()))
-                            .version(org.mqtt4j.hato.MqttVersion.V3_1_1)
-                            .connectionListener(ended::add)
-                            .build()) {
-                org.mqtt4j.hato.ConnAck connAck = sut.connect()
-                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
-                if (connAck.sessionPresent()) {
-                    throw new AssertionError("Clean connection resumed a session");
-                }
-
-                // Arrange: use the public messaging roles from the distributed client jar,
-                // with one handler and one pull subscription.
-                var handled =
-                        new java.util.concurrent.LinkedBlockingQueue<org.mqtt4j.hato.MqttMessage>();
-                org.mqtt4j.hato.MqttSubscriber subscriber = sut;
-                org.mqtt4j.hato.MqttPublisher publisher = sut;
-                org.mqtt4j.hato.Subscription push = subscriber.subscribe(
-                        org.mqtt4j.hato.Subscribe.of(
-                                new org.mqtt4j.hato.TopicFilter("probe/push"),
-                                org.mqtt4j.hato.Qos.EXACTLY_ONCE
-                        ),
-                        delivery -> handled.add(delivery.message())
-                );
-                org.mqtt4j.hato.Subscription pull = subscriber.subscribe(
-                        org.mqtt4j.hato.Subscribe.of(
-                                new org.mqtt4j.hato.TopicFilter("probe/pull"),
-                                org.mqtt4j.hato.Qos.EXACTLY_ONCE
-                        ).withAckMode(org.mqtt4j.hato.AckMode.MANUAL)
-                );
-                push.established().get(5, java.util.concurrent.TimeUnit.SECONDS);
-                pull.established().get(5, java.util.concurrent.TimeUnit.SECONDS);
-
-                // Act & Assert: every QoS level reaches the handler and the receiving thread
-                // intact, QoS included, because the subscriptions request QoS 2 and the broker
-                // grants it.
-                for (var qos : org.mqtt4j.hato.Qos.values()) {
-                    var pushed = org.mqtt4j.hato.MqttMessage.of(
-                            new org.mqtt4j.hato.Topic("probe/push"),
-                            new byte[] {42},
-                            qos,
-                            false
-                    );
-                    publisher.publish(pushed).get(5, java.util.concurrent.TimeUnit.SECONDS);
-                    if (!pushed.equals(handled.poll(5, java.util.concurrent.TimeUnit.SECONDS))) {
-                        throw new AssertionError(qos + " delivery to a handler changed");
+            // Both protocol versions run, so that each codec in the jars is used.
+            for (var version : org.mqtt4j.hato.MqttVersion.values()) {
+                var ended = new java.util.concurrent.LinkedBlockingQueue<
+                        org.mqtt4j.hato.Disconnection
+                >();
+                try (var broker = org.mqtt4j.hato.broker.MqttBroker.start();
+                        org.mqtt4j.hato.MqttClient sut = org.mqtt4j.hato.MqttClient.builder()
+                                .server(java.net.URI.create("mqtt://localhost:" + broker.port()))
+                                .version(version)
+                                .connectionListener(ended::add)
+                                .build()) {
+                    org.mqtt4j.hato.ConnAck connAck = sut.connect()
+                            .get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    if (connAck.sessionPresent()) {
+                        throw new AssertionError(version + " clean connection resumed a session");
                     }
-                    var pulled = org.mqtt4j.hato.MqttMessage.of(
-                            new org.mqtt4j.hato.Topic("probe/pull"),
-                            new byte[] {7},
-                            qos,
-                            false
-                    );
-                    publisher.publish(pulled).get(5, java.util.concurrent.TimeUnit.SECONDS);
-                    if (!(pull.receive(java.time.Duration.ofSeconds(5))
-                            instanceof org.mqtt4j.hato.ReceiveResult.Received(var delivery))
-                            || !pulled.equals(delivery.message())) {
-                        throw new AssertionError(qos + " delivery to a receiver changed");
-                    }
-                    delivery.ack();
-                }
 
-                // Act & Assert: lifecycle operations must finish within the deadline.
-                push.unsubscribe().get(5, java.util.concurrent.TimeUnit.SECONDS);
-                pull.unsubscribe().get(5, java.util.concurrent.TimeUnit.SECONDS);
-                if (!(pull.receive() instanceof org.mqtt4j.hato.ReceiveResult.Ended)) {
-                    throw new AssertionError("A removed subscription kept receiving");
-                }
-                sut.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
-                // Removal and disconnect also complete without a connection, so only the
-                // listener shows that the connection lasted until the requested disconnect.
-                if (!org.mqtt4j.hato.Disconnection.of(null, true, 1)
-                        .equals(ended.poll(5, java.util.concurrent.TimeUnit.SECONDS))) {
-                    throw new AssertionError("The connection ended before the disconnect");
+                    // Arrange: use the public messaging roles from the distributed client jar,
+                    // with one handler and one pull subscription.
+                    var handled = new java.util.concurrent.LinkedBlockingQueue<
+                            org.mqtt4j.hato.MqttMessage
+                    >();
+                    org.mqtt4j.hato.MqttSubscriber subscriber = sut;
+                    org.mqtt4j.hato.MqttPublisher publisher = sut;
+                    org.mqtt4j.hato.Subscription push = subscriber.subscribe(
+                            org.mqtt4j.hato.Subscribe.of(
+                                    new org.mqtt4j.hato.TopicFilter("probe/push"),
+                                    org.mqtt4j.hato.Qos.EXACTLY_ONCE
+                            ),
+                            delivery -> handled.add(delivery.message())
+                    );
+                    org.mqtt4j.hato.Subscription pull = subscriber.subscribe(
+                            org.mqtt4j.hato.Subscribe.of(
+                                    new org.mqtt4j.hato.TopicFilter("probe/pull"),
+                                    org.mqtt4j.hato.Qos.EXACTLY_ONCE
+                            ).withAckMode(org.mqtt4j.hato.AckMode.MANUAL)
+                    );
+                    push.established().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    pull.established().get(5, java.util.concurrent.TimeUnit.SECONDS);
+
+                    // Act & Assert: every QoS level reaches the handler and the receiving thread
+                    // intact, QoS included, because the subscriptions request QoS 2 and the broker
+                    // grants it.
+                    for (var qos : org.mqtt4j.hato.Qos.values()) {
+                        var pushed = org.mqtt4j.hato.MqttMessage.of(
+                                new org.mqtt4j.hato.Topic("probe/push"),
+                                new byte[] {42},
+                                qos,
+                                false
+                        );
+                        publisher.publish(pushed).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                        var handledMessage =
+                                handled.poll(5, java.util.concurrent.TimeUnit.SECONDS);
+                        if (!pushed.equals(handledMessage)) {
+                            throw new AssertionError(version + " " + qos + " handler changed it");
+                        }
+                        var pulled = org.mqtt4j.hato.MqttMessage.of(
+                                new org.mqtt4j.hato.Topic("probe/pull"),
+                                new byte[] {7},
+                                qos,
+                                false
+                        );
+                        publisher.publish(pulled).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                        if (!(pull.receive(java.time.Duration.ofSeconds(5))
+                                instanceof org.mqtt4j.hato.ReceiveResult.Received(var delivery))
+                                || !pulled.equals(delivery.message())) {
+                            throw new AssertionError(version + " " + qos + " receiver changed it");
+                        }
+                        delivery.ack();
+                    }
+
+                    // Act & Assert: lifecycle operations must finish within the deadline.
+                    push.unsubscribe().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    pull.unsubscribe().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    if (!(pull.receive() instanceof org.mqtt4j.hato.ReceiveResult.Ended)) {
+                        throw new AssertionError(version + " removed subscription kept receiving");
+                    }
+                    sut.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    // Removal and disconnect also complete without a connection, so only the
+                    // listener shows that the connection lasted until the requested disconnect.
+                    if (!org.mqtt4j.hato.Disconnection.of(null, true, 1)
+                            .equals(ended.poll(5, java.util.concurrent.TimeUnit.SECONDS))) {
+                        throw new AssertionError(version + " connection ended before disconnect");
+                    }
                 }
             }
             """;
