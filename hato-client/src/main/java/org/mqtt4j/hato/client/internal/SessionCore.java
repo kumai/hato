@@ -18,12 +18,13 @@ import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscribeException;
-import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
+import org.mqtt4j.hato.client.internal.ConnectionEstablishment.Outcome;
+import org.mqtt4j.hato.client.internal.ConnectionEstablishment.Step;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
@@ -40,6 +41,8 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// [Publications] for outgoing exchanges, [Subscriptions] for registrations, and [Receptions]
 /// for incoming publications. The parts never call one another. They reach the core through
 /// [Context], and each replaces its own state of a connection or session that the core ends.
+/// A fourth part, [ConnectionEstablishment], keeps no state: it builds each connection's CONNECT
+/// and tells the core what its CONNACK means for the attempt.
 final class SessionCore {
 
     /// DISCONNECTING follows an accepted disconnect(), both while its attempt still waits for
@@ -70,19 +73,6 @@ final class SessionCore {
         HANDLER_FAILURE,
         SCHEDULER_FAILURE,
         CLIENT_CLOSE
-    }
-
-    /// The connections of one attempt. A broker session without local state cannot continue,
-    /// so an attempt that finds one replaces it, using up to three connections. As MQTT 3.1.1
-    /// describes for discarding session state on both sides, it disconnects, connects with Clean
-    /// Session 1, and disconnects again; then it starts a new persistent session.
-    private enum Step {
-        /// The attempt's first connection, which may find a broker session without local state.
-        FIRST,
-        /// A Clean Session 1 connection without a Will, which discards that session.
-        DISCARD,
-        /// The connection that starts a new persistent session once the old one is discarded.
-        NEW_SESSION
     }
 
     interface Port {
@@ -245,11 +235,11 @@ final class SessionCore {
 
     private final boolean cleanStart;
 
-    private final Packet.@Nullable Will will;
-
     private final boolean credentialsRequired;
 
     private final ConnectionRequest request;
+
+    private final ConnectionEstablishment establishment;
 
     private final Receptions receptions;
 
@@ -310,10 +300,10 @@ final class SessionCore {
         this.keepAlive = keepAlive;
         this.responseTimeout = responseTimeout;
         this.cleanStart = cleanStart;
-        this.will = will;
         this.credentialsRequired = credentialsRequired;
         request = new ConnectionRequest(backoff, initialRetry);
         current = new Connection(responseTimeout, Step.FIRST);
+        establishment = new ConnectionEstablishment(clientId, keepAlive, cleanStart, will);
         var context = new PartContext();
         receptions = new Receptions(port, context, clientId);
         subscriptions = new Subscriptions(port, context, cleanStart);
@@ -403,7 +393,7 @@ final class SessionCore {
     /// the listener sees the replaced connection. The parts keep no state of a connection before
     /// a CONNACK establishes it, so the replaced connection leaves them nothing to settle.
     private void openNextConnection(long now) {
-        Step next = (current.step == Step.FIRST) ? Step.DISCARD : Step.NEW_SESSION;
+        Step next = current.step.next();
         port.cancel(Timer.DISCONNECT);
         current = new Connection(responseTimeout, next);
         current.lastSent = now;
@@ -447,23 +437,7 @@ final class SessionCore {
     private void sendConnect() {
         if (current.transportConnected && credentialsReady && !current.connectSent) {
             current.connectSent = true;
-            MqttCredentials credentials = attemptCredentials;
-            // The connection that discards a broker session carries no Will, so losing it before
-            // its DISCONNECT publishes nothing.
-            boolean discarding = current.step == Step.DISCARD;
-            sendRequired(
-                    ++nextTicket,
-                    new Packet.Connect(
-                            clientId,
-                            MqttVersion.V3_1_1,
-                            cleanStart || discarding,
-                            (int) keepAlive.toSeconds(),
-                            discarding ? null : will,
-                            credentials == null ? null : credentials.username(),
-                            credentials == null ? null : credentials.password().orElse(null),
-                            EMPTY
-                    )
-            );
+            sendRequired(++nextTicket, establishment.connect(current.step, attemptCredentials));
         }
     }
 
@@ -481,59 +455,11 @@ final class SessionCore {
                 failed(connection, protocolError("Received packet before credentials were ready"));
             } else if (!(packet instanceof Packet.ConnAck ack)) {
                 failed(connection, protocolError("Expected CONNACK"));
-            } else if (ack.reasonCode() != ReasonCode.SUCCESS) {
-                failed(connection, new MqttConnectException(
-                        "Broker refused connection",
-                        ack.reasonCode()
-                ));
-            } else if (ack.sessionPresent() && (cleanStart || current.step == Step.DISCARD)) {
-                failed(connection, protocolError("Session Present with Clean Session"));
-            } else if (current.step == Step.DISCARD) {
-                log.info("Discarded broker session without local state for {}", clientId);
-                abandon(null);
-            } else if (ack.sessionPresent() && !session.established
-                    && current.step == Step.FIRST) {
-                // The attempt goes on to discard the broker's session.
-                abandon(null);
-            } else if (ack.sessionPresent() && !session.established) {
-                // Only one discard per attempt: a session found again fails the attempt.
-                abandon(new MqttConnectException("Broker session present after discarding it"));
             } else {
-                if (!ack.sessionPresent()) {
-                    discardSession();
-                    session.established = true;
-                    if (!cleanStart) {
-                        log.info("Started session for {}", clientId);
-                    }
-                } else {
-                    receptions.reconcile(port.receiveState(), false);
-                    publications.resume();
-                }
-                if (state == State.CONNECTING) {
-                    state = State.CONNECTED;
-                }
-                var result = ConnAck.of(ack.sessionPresent(), request.attempt());
-                current.ack = result;
-                request.establish();
-                port.admit(generation);
-                // Reconcile before announcing, so connect() and onConnected already find continued
-                // subscriptions established on this connection.
-                subscriptions.connectionEstablished(ack.sessionPresent());
-                port.connected(generation, result);
-                port.cancel(Timer.CONNECT);
-                connecting = null;
-                attemptCredentials = null;
-                if (state == State.DISCONNECTING) {
-                    beginDisconnect();
-                } else {
-                    completeConnections(result, null);
-                    if (!keepAlive.isZero()) {
-                        scheduleKeepAlive(now);
-                    }
-                    if (request.reconnects()) {
-                        current.stableDeadline = now + STABLE_CONNECTION.toNanos();
-                        port.schedule(generation, Timer.STABLE, STABLE_CONNECTION);
-                    }
+                switch (establishment.accept(ack, current.step, session.established)) {
+                    case Outcome.Failed(var cause) -> failed(connection, cause);
+                    case Outcome.Abandoned(var refusal) -> abandon(refusal);
+                    case Outcome.Established(var sessionPresent) -> establish(sessionPresent, now);
                 }
             }
         } else if (packet instanceof Packet.PubAck ack) {
@@ -568,6 +494,47 @@ final class SessionCore {
         // Acknowledgements can return packet identifiers or the close exchange window.
         subscriptions.drainClosures();
         drainDeferred();
+    }
+
+    /// Establishes the current connection after its successful CONNACK, which continues the
+    /// session when `sessionPresent` and otherwise starts a new one.
+    private void establish(boolean sessionPresent, long now) {
+        if (!sessionPresent) {
+            discardSession();
+            session.established = true;
+            if (!cleanStart) {
+                log.info("Started session for {}", clientId);
+            }
+        } else {
+            receptions.reconcile(port.receiveState(), false);
+            publications.resume();
+        }
+        if (state == State.CONNECTING) {
+            state = State.CONNECTED;
+        }
+        var result = ConnAck.of(sessionPresent, request.attempt());
+        current.ack = result;
+        request.establish();
+        port.admit(generation);
+        // Reconcile before announcing, so connect() and onConnected already find continued
+        // subscriptions established on this connection.
+        subscriptions.connectionEstablished(sessionPresent);
+        port.connected(generation, result);
+        port.cancel(Timer.CONNECT);
+        connecting = null;
+        attemptCredentials = null;
+        if (state == State.DISCONNECTING) {
+            beginDisconnect();
+        } else {
+            completeConnections(result, null);
+            if (!keepAlive.isZero()) {
+                scheduleKeepAlive(now);
+            }
+            if (request.reconnects()) {
+                current.stableDeadline = now + STABLE_CONNECTION.toNanos();
+                port.schedule(generation, Timer.STABLE, STABLE_CONNECTION);
+            }
+        }
     }
 
     void sent(long connection, long ticket, long now) {
