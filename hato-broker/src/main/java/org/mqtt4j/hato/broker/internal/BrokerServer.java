@@ -841,14 +841,10 @@ public final class BrokerServer implements AutoCloseable {
                     clientId = id;
                     session = accepted;
                     accepted.connection = this;
-                    Properties properties = Properties.EMPTY;
-                    if (request.version() == MqttVersion.V5 && request.clientId().isEmpty()) {
-                        // Only MQTT 5.0 can tell a client the identifier assigned to it.
-                        properties = new Properties(List.of(new Property.StringValue(
-                                PropertyId.ASSIGNED_CLIENT_IDENTIFIER,
-                                id
-                        )));
-                    }
+                    Properties properties = switch (request.version()) {
+                        case V3_1_1 -> Properties.EMPTY;
+                        case V5 -> acceptanceV5(id, request.clientId().isEmpty());
+                    };
                     enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, properties));
                 }
                 // Do not hold the new peer's monitor while ending the old peer.
@@ -864,6 +860,18 @@ public final class BrokerServer implements AutoCloseable {
             log.info("Broker accepted client {} from {} on port {}",
                     id, socket.getRemoteSocketAddress(), port());
             return true;
+        }
+
+        // The properties of an MQTT 5.0 CONNACK that accepts the connection. The broker sets no
+        // Subscription Identifiers on its deliveries, so it tells clients to send none; and only
+        // MQTT 5.0 can tell a client the identifier assigned to it.
+        private static Properties acceptanceV5(String id, boolean assigned) {
+            var entries = new ArrayList<Property>();
+            entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
+            if (assigned) {
+                entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
+            }
+            return new Properties(entries);
         }
 
         private @Nullable Session currentSession() {
@@ -884,6 +892,16 @@ public final class BrokerServer implements AutoCloseable {
         private void process(Session owner, Packet packet) {
             switch (packet) {
                 case Packet.Subscribe request -> {
+                    // CONNACK announced that Subscription Identifiers are not supported, so one
+                    // is a Protocol Error that subscribes to nothing (MQTT 5.0 section
+                    // 3.2.2.3.12). MQTT 3.1.1 has no properties.
+                    if (request.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
+                        disconnect(
+                                ReasonCode.SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED,
+                                "Subscription Identifier although none are supported"
+                        );
+                        return;
+                    }
                     var grants = new ArrayList<ReasonCode>();
                     for (Packet.Subscription subscription : request.subscriptions()) {
                         owner.subscriptions.put(subscription.filter(), subscription);

@@ -113,12 +113,20 @@ final class RawSession implements AutoCloseable {
         try {
             session.send(connectV5(clientId, cleanStart, 0, sessionExpiry));
             assertThat(session.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(sessionPresent, SUCCESS, EMPTY));
+                    .isEqualTo(acceptedV5(sessionPresent));
             return session;
         } catch (Exception | AssertionError failure) {
             session.close();
             throw failure;
         }
+    }
+
+    /// The CONNACK that accepts an MQTT 5.0 client that chose its identifier. It announces that
+    /// the broker does not support Subscription Identifiers.
+    static Packet.ConnAck acceptedV5(boolean sessionPresent) {
+        return new Packet.ConnAck(sessionPresent, SUCCESS, new Properties(List.of(
+                new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0)
+        )));
     }
 
     /// An MQTT 5.0 CONNECT; a positive `sessionExpiry` keeps the session after the connection.

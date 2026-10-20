@@ -29,6 +29,7 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mqtt4j.hato.broker.internal.RawSession.acceptedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
@@ -64,9 +65,15 @@ class BrokerMqtt5Test {
             // Act
             client.send(connectV5("accepted", true, 0, 0));
 
-            // Assert: only the MQTT 5.0 form, which has a reason code, decodes here.
-            assertThat(client.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(false, SUCCESS, EMPTY));
+            // Assert: only the MQTT 5.0 form, which has a reason code, decodes here. Its only
+            // announcement is that Subscription Identifiers are not supported.
+            var notSupported = new Property.ByteValue(
+                    PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE,
+                    0
+            );
+            assertThat(client.expect(Packet.ConnAck.class)).isEqualTo(
+                    new Packet.ConnAck(false, SUCCESS, new Properties(List.of(notSupported)))
+            );
             client.ping();
             client.disconnect();
         }
@@ -408,6 +415,15 @@ class BrokerMqtt5Test {
                         ),
                         ReasonCode.PROTOCOL_ERROR
                 ),
+                new Violation(
+                        "a SUBSCRIBE with a Subscription Identifier",
+                        new Packet.Subscribe(
+                                1,
+                                List.of(subscription("violation/#", AT_MOST_ONCE)),
+                                identifier
+                        ),
+                        ReasonCode.SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED
+                ),
                 new Violation("AUTH", new Packet.Auth(SUCCESS, EMPTY), ReasonCode.PROTOCOL_ERROR),
                 new Violation(
                         "a second CONNECT",
@@ -463,7 +479,7 @@ class BrokerMqtt5Test {
 
             // Assert: [MQTT-3.14.0-1].
             assertThat(client.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(false, SUCCESS, EMPTY));
+                    .isEqualTo(acceptedV5(false));
             assertThat(client.expect(Packet.Disconnect.class))
                     .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
             client.expectClosed();
