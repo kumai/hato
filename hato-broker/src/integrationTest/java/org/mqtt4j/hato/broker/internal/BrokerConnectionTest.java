@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
+import java.net.BindException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
@@ -19,6 +20,7 @@ import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
@@ -54,8 +56,11 @@ class BrokerConnectionTest {
             sut.close();
             client.expectClosed();
             var sameAddress = new InetSocketAddress(address.getAddress(), port);
-            try (var restarted = MqttBroker.start(sameAddress);
-                    var next = connected(restarted.port(), "restarted")) {
+            // close() does not wait for a blocked accept to release the native listener.
+            MqttBroker restarted = await().atMost(Duration.ofSeconds(5))
+                    .ignoreException(BindException.class)
+                    .until(() -> MqttBroker.start(sameAddress), value -> value != null);
+            try (restarted; var next = connected(restarted.port(), "restarted")) {
                 next.ping();
             }
         }
