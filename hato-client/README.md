@@ -147,6 +147,12 @@ subscription.unsubscribe().join();
   `Subscribe.of(filter, qos).withBufferCapacity(4096)`. A QoS 0 message that finds the queue
   full is dropped and logged, and the subscription goes on; a QoS 1 or 2 message ends the
   connection instead, as described below.
+- With MQTT 5.0, a subscription can also set options: `withNoLocal(true)` leaves out your own
+  publications, `withRetainAsPublished(true)` keeps the retain flag that the publisher set,
+  and `withRetainHandling(RetainHandling.DO_NOT_SEND)` skips the retained messages when you
+  subscribe; `RetainHandling.SEND_IF_NEW_SUBSCRIPTION` sends them only for a subscription that
+  the broker does not have yet. MQTT 3.1.1 has no options, so an MQTT 3.1.1 client refuses a
+  subscription that sets any.
 - `unsubscribe()` stops new messages and lets the queued ones finish; its future tells you
   when the broker has removed the subscription. `subscription.close()` instead stops delivery
   at once and drops queued messages without waiting for the broker. Either way,
