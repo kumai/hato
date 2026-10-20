@@ -18,6 +18,7 @@ import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttProtocolException;
+import org.mqtt4j.hato.MqttPublishException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
@@ -963,17 +964,68 @@ class Qos2SendTest {
         assertThat(port.timers).isEmpty();
     }
 
+    @ParameterizedTest(name = "PUBREC {0}")
+    @EnumSource(
+            value = ReasonCode.class,
+            names = {"UNSPECIFIED_ERROR", "NOT_AUTHORIZED", "QUOTA_EXCEEDED"}
+    )
+    void an_mqtt_5_refusing_pubrec_ends_the_exchange_without_pubrel(ReasonCode reason) {
+        // Arrange: the session holds as many exchanges as it allows.
+        sut = core(MqttVersion.V5, true, ReconnectBackoff.disabled());
+        connect(false);
+        long refused = publish(message());
+        int id = port.accepted.getLast().packetId();
+        for (int i = 1; i < 64; i++) {
+            publish(message());
+        }
+        assertThat(result(publish(message())).failure())
+                .isInstanceOf(MqttCapacityException.class);
+
+        // Act
+        receive(new Packet.PubRec(id, reason, EMPTY));
+
+        // Assert: the publication fails, nothing answers the refusal, and the exchange is over.
+        assertThat(result(refused).failure()).isInstanceOfSatisfying(
+                MqttPublishException.class,
+                refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
+        );
+        assertThat(port.releases).isEmpty();
+        long admitted = publish(message());
+        assertThat(port.results).doesNotContainKey(admitted);
+        assertThat(sut.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void an_mqtt_5_pubcomp_completes_the_publication_whatever_its_reason_code() {
+        // Arrange
+        sut = core(MqttVersion.V5, true, ReconnectBackoff.disabled());
+        connect(false);
+        long operation = publish(message());
+        int id = port.accepted.getLast().packetId();
+        receive(pubRec(id));
+
+        // Act: a broker that lost the exchange's state took the message at PUBREC.
+        receive(new Packet.PubComp(id, ReasonCode.PACKET_IDENTIFIER_NOT_FOUND, EMPTY));
+
+        // Assert
+        assertThat(result(operation).value()).isEqualTo(PublishResult.of());
+    }
+
     private SessionCore core(boolean cleanStart) {
         return core(cleanStart, ReconnectBackoff.disabled());
     }
 
     private SessionCore core(boolean cleanStart, ReconnectBackoff backoff) {
+        return core(MqttVersion.V3_1_1, cleanStart, backoff);
+    }
+
+    private SessionCore core(MqttVersion version, boolean cleanStart, ReconnectBackoff backoff) {
         return new SessionCore(
                 port,
                 "client",
                 Duration.ofSeconds(30),
                 Duration.ZERO,
-                MqttVersion.V3_1_1,
+                version,
                 cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 16 * 1024 * 1024,
                 null,

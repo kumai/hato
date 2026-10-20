@@ -32,6 +32,7 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketIds;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
@@ -315,7 +316,7 @@ final class SessionCore {
         );
         var context = new PartContext();
         receptions = new Receptions(port, context, clientId);
-        subscriptions = new Subscriptions(port, context, cleanStart);
+        subscriptions = new Subscriptions(port, context, clientId, cleanStart);
         publications = new Publications(
                 port,
                 context,
@@ -493,7 +494,7 @@ final class SessionCore {
             // progress without disturbing a pending shutdown.
             publications.acknowledged(ack);
         } else if (packet instanceof Packet.PubRec ack) {
-            publications.release(ack.packetId());
+            publications.release(ack);
         } else if (packet instanceof Packet.PubComp ack) {
             publications.completed(ack.packetId());
         } else if (state == State.DISCONNECTING) {
@@ -510,8 +511,16 @@ final class SessionCore {
             subscriptions.subscribed(ack);
         } else if (packet instanceof Packet.UnsubAck ack) {
             subscriptions.unsubscribed(ack);
-        } else if (packet instanceof Packet.Publish publish) {
+        } else if (packet instanceof Packet.Publish publish
+                && publish.properties().find(PropertyId.TOPIC_ALIAS).isEmpty()) {
+            // Other MQTT 5.0 properties do not change how the message is delivered.
             receptions.deliver(publish, bytes);
+        } else if (packet instanceof Packet.Publish || packet instanceof Packet.AliasPublish) {
+            // The client announces no Topic Alias Maximum, so the broker may use no alias.
+            failed(connection, new PacketDecodeException(
+                    ReasonCode.TOPIC_ALIAS_INVALID,
+                    "Topic Alias without Topic Alias Maximum"
+            ));
         } else if (packet instanceof Packet.PubRel release) {
             receptions.released(release.packetId());
         } else {
@@ -1040,6 +1049,12 @@ final class SessionCore {
 
     static PacketDecodeException protocolError(String message) {
         return new PacketDecodeException(ReasonCode.PROTOCOL_ERROR, message);
+    }
+
+    /// Whether an acknowledgement's `code` reports a failure: MQTT 5.0 gives failures values of
+    /// 0x80 or greater, and MQTT 3.1.1's only failure, a refused SUBACK, maps to 0x80.
+    static boolean isFailure(ReasonCode code) {
+        return code.value() >= 0x80;
     }
 
     private final class PartContext implements Context {

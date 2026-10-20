@@ -18,6 +18,7 @@ import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
+import org.mqtt4j.hato.MqttPublishException;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -28,6 +29,7 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 
 import static java.util.Objects.requireNonNull;
+import static org.mqtt4j.hato.client.internal.SessionCore.isFailure;
 import static org.mqtt4j.hato.client.internal.SessionCore.protocolError;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
@@ -184,12 +186,19 @@ final class Publications {
             case Release _ -> stageMismatch("PUBACK does not match the outgoing QoS stage");
             case Publication publication when publication.qos == Qos.EXACTLY_ONCE ->
                     downgraded(publication);
+            case Publication publication when isFailure(ack.reasonCode()) ->
+                    refused(publication, ack.reasonCode());
             case Publication publication -> completePublication(publication);
         }
     }
 
-    void release(int packetId) {
+    void release(Packet.PubRec ack) {
+        int packetId = ack.packetId();
         Inflight exchange = inflight.get(packetId);
+        if (isFailure(ack.reasonCode())) {
+            refusedRelease(exchange, ack.reasonCode());
+            return;
+        }
         switch (exchange) {
             case Publication publication -> {
                 if (publication.qos != Qos.EXACTLY_ONCE) {
@@ -414,6 +423,31 @@ final class Publications {
                             ReasonCode.PROTOCOL_ERROR
                     )
             );
+        }
+    }
+
+    /// A PUBREC with a failure reason code ends the exchange, and no PUBREL answers it (MQTT
+    /// 5.0 section 4.3.3). Only a QoS 2 publication still waiting for PUBREC has an exchange to
+    /// end; an exchange that the broker already accepted, or one that this client does not
+    /// know, needs nothing.
+    private void refusedRelease(@Nullable Inflight exchange, ReasonCode reason) {
+        switch (exchange) {
+            case Publication publication when publication.qos == Qos.EXACTLY_ONCE ->
+                    refused(publication, reason);
+            case Publication _ -> stageMismatch("PUBREC does not match the outgoing QoS stage");
+            case Release _ -> {
+            }
+            case null -> {
+            }
+        }
+    }
+
+    /// The broker did not accept the publication, which ends its exchange: the packet identifier
+    /// is free again, and the session does not resume the exchange.
+    private void refused(Publication publication, ReasonCode reason) {
+        removeInflight(publication.packetId);
+        if (publication.operation != 0) {
+            port.complete(publication.operation, null, new MqttPublishException(reason));
         }
     }
 

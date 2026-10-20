@@ -23,10 +23,12 @@ import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.SessionCore.State;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
+import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.SharedTopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.mqtt4j.hato.client.internal.SessionCore.isFailure;
 import static org.mqtt4j.hato.client.internal.SessionCore.protocolError;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
@@ -35,6 +37,8 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// broker on each connection. The core decides when registrations may use send capacity; this
 /// part reaches the rest of the core only through [SessionCore.Context].
 final class Subscriptions {
+
+    private static final Log log = Log.of(Subscriptions.class);
 
     // Broker registrations outlive locally closed handles until UNSUBACK or a CONNACK without
     // Session Present, so they are bounded apart from the delivery lanes that local closure
@@ -53,6 +57,8 @@ final class Subscriptions {
 
     private final SessionCore.Context core;
 
+    private final String clientId;
+
     private final boolean cleanStart;
 
     // The client's registrations by id, in registration order.
@@ -61,9 +67,15 @@ final class Subscriptions {
     // The current connection's exchanges; a connection end replaces them.
     private Window window = new Window();
 
-    Subscriptions(SessionCore.Port port, SessionCore.Context core, boolean cleanStart) {
+    Subscriptions(
+            SessionCore.Port port,
+            SessionCore.Context core,
+            String clientId,
+            boolean cleanStart
+    ) {
         this.port = port;
         this.core = core;
+        this.clientId = clientId;
         this.cleanStart = cleanStart;
     }
 
@@ -285,10 +297,9 @@ final class Subscriptions {
             return;
         }
         ReasonCode reason = ack.reasonCodes().getFirst();
-        if (reason != ReasonCode.UNSPECIFIED_ERROR
-                && reason.value() > local.requestedQos.level()) {
-            abandon(local, "SUBACK grants an unsupported QoS or reason for "
-                    + local.filter.pattern());
+        boolean refused = isFailure(reason);
+        if (!refused && reason.value() > local.requestedQos.level()) {
+            abandon(local, "SUBACK grants an unsupported QoS for " + local.filter.pattern());
             return;
         }
         window.subscribing.remove(ack.packetId());
@@ -296,7 +307,7 @@ final class Subscriptions {
         core.releasePacketId(ack.packetId());
         boolean restoring = local.confirmed;
         window.subscribingInFlight--;
-        if (reason == ReasonCode.UNSPECIFIED_ERROR) {
+        if (refused) {
             var refusal = new MqttSubscribeException(reason);
             if (!restoring) {
                 removeSubscription(local, refusal);
@@ -315,9 +326,18 @@ final class Subscriptions {
 
     void unsubscribed(Packet.UnsubAck ack) {
         UnsubscribeOperation pending = window.unsubscribing.get(ack.packetId());
-        if (pending == null || !ack.reasonCodes().isEmpty()) {
+        // MQTT 3.1.1 carries no reason code, and MQTT 5.0 one for the single filter sent.
+        if (pending == null || ack.reasonCodes().size() > 1) {
             core.fail(protocolError("Unexpected UNSUBACK"));
             return;
+        }
+        // Any answer confirms the removal, as a refused SUBACK confirms that there is nothing
+        // to remove. After a refusal the broker may still hold the subscription.
+        for (ReasonCode reason : ack.reasonCodes()) {
+            if (isFailure(reason)) {
+                log.warn("Broker refused to remove the subscription to {} for {}: {}",
+                        pending.subscription.filter.pattern(), clientId, reason);
+            }
         }
         window.unsubscribing.remove(ack.packetId());
         core.responses().answered(ResponseDeadlines.Kind.UNSUBACK, ack.packetId());

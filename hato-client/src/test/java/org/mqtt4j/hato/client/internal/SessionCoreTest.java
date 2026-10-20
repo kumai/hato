@@ -19,6 +19,7 @@ import java.util.stream.Stream;
 
 import com.sun.management.ThreadMXBean;
 import org.jspecify.annotations.Nullable;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -35,6 +36,7 @@ import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
+import org.mqtt4j.hato.MqttPublishException;
 import org.mqtt4j.hato.MqttSubscribeException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
@@ -1949,23 +1951,120 @@ class SessionCoreTest {
         assertThat(port.removed).containsExactly(2L);
     }
 
-    @Test
-    void an_unsuback_with_reason_codes_is_invalid_in_mqtt_three() {
+    @ParameterizedTest(name = "PUBACK {0}")
+    @EnumSource(value = ReasonCode.class, names = {"SUCCESS", "NO_MATCHING_SUBSCRIBERS"})
+    void an_mqtt_5_puback_below_0x80_completes_the_publication(ReasonCode reason) {
         // Arrange
-        connected();
-        sut.subscribe(2, subscription("a/#"));
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.publish(2, qosOneMessage());
+        int id = port.publicationIds.getLast();
+
+        // Act
+        mqtt5.received(1, new Packet.PubAck(id, reason, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(port.results.get(2L)).isEqualTo(new Result(PublishResult.of(), null));
+    }
+
+    @ParameterizedTest(name = "PUBACK {0}")
+    @EnumSource(value = ReasonCode.class, names = {
+            "UNSPECIFIED_ERROR",
+            "IMPLEMENTATION_SPECIFIC_ERROR",
+            "NOT_AUTHORIZED",
+            "TOPIC_NAME_INVALID",
+            "PACKET_IDENTIFIER_IN_USE",
+            "QUOTA_EXCEEDED",
+            "PAYLOAD_FORMAT_INVALID"
+    })
+    void an_mqtt_5_refusing_puback_fails_only_the_publication(ReasonCode reason) {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.publish(2, qosOneMessage());
+        int id = port.publicationIds.getLast();
+
+        // Act
+        mqtt5.received(1, new Packet.PubAck(id, reason, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).failure()).isInstanceOfSatisfying(
+                MqttPublishException.class,
+                refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
+        );
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
+    }
+
+    @ParameterizedTest(name = "SUBACK {0}")
+    @EnumSource(value = ReasonCode.class, names = {
+            "UNSPECIFIED_ERROR",
+            "IMPLEMENTATION_SPECIFIC_ERROR",
+            "NOT_AUTHORIZED",
+            "TOPIC_FILTER_INVALID",
+            "PACKET_IDENTIFIER_IN_USE",
+            "QUOTA_EXCEEDED",
+            "SHARED_SUBSCRIPTIONS_NOT_SUPPORTED",
+            "SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED",
+            "WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED"
+    })
+    void an_mqtt_5_refusal_ends_only_the_subscription_with_its_reason_code(ReasonCode reason) {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
         int id = ((Packet.Subscribe) port.sent.getLast()).packetId();
-        receive(1, new Packet.SubAck(id, List.of(ReasonCode.SUCCESS), EMPTY), 0);
-        sut.unsubscribe(3, 2);
+
+        // Act
+        mqtt5.received(1, new Packet.SubAck(id, List.of(reason), EMPTY), 0, 0);
+
+        // Assert
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
+        assertThat(requireNonNull(port.outcomes.get(2L)).failure()).isInstanceOfSatisfying(
+                MqttSubscribeException.class,
+                refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
+        );
+        assertThat(port.removed).containsExactly(2L);
+    }
+
+    @ParameterizedTest(name = "UNSUBACK {0}")
+    @EnumSource(
+            value = ReasonCode.class,
+            names = {"SUCCESS", "NO_SUBSCRIPTION_EXISTED", "NOT_AUTHORIZED"}
+    )
+    void any_mqtt_5_unsuback_reason_confirms_the_removal(ReasonCode reason) {
+        // Arrange: a refusal leaves the broker's subscription in place, which a log reports.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        int id = ((Packet.Subscribe) port.sent.getLast()).packetId();
+        mqtt5.received(1, new Packet.SubAck(id, List.of(ReasonCode.SUCCESS), EMPTY), 0, 0);
+        mqtt5.unsubscribe(3, 2);
         int unsubscribeId = ((Packet.Unsubscribe) port.sent.getLast()).packetId();
 
         // Act
-        receive(1, new Packet.UnsubAck(unsubscribeId, List.of(ReasonCode.SUCCESS), EMPTY), 0);
+        mqtt5.received(1, new Packet.UnsubAck(unsubscribeId, List.of(reason), EMPTY), 0, 0);
 
         // Assert
-        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
         assertThat(requireNonNull(port.results.get(3L)).failure()).isNull();
         assertThat(port.removed).containsExactly(2L);
+    }
+
+    @Test
+    void an_unsuback_with_more_reason_codes_than_filters_breaks_the_protocol() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        int id = ((Packet.Subscribe) port.sent.getLast()).packetId();
+        mqtt5.received(1, new Packet.SubAck(id, List.of(ReasonCode.SUCCESS), EMPTY), 0, 0);
+        mqtt5.unsubscribe(3, 2);
+        int unsubscribeId = ((Packet.Unsubscribe) port.sent.getLast()).packetId();
+
+        // Act
+        mqtt5.received(1, new Packet.UnsubAck(
+                unsubscribeId,
+                List.of(ReasonCode.SUCCESS, ReasonCode.SUCCESS),
+                EMPTY
+        ), 0, 0);
+
+        // Assert
+        assertThat(mqtt5.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends).singleElement().satisfies(end ->
                 assertThat(end.cause().orElseThrow()).isInstanceOf(MqttProtocolException.class));
     }
@@ -2060,8 +2159,7 @@ class SessionCoreTest {
         return Stream.of(
                 List.of(ReasonCode.SUCCESS, ReasonCode.SUCCESS),
                 List.of(ReasonCode.GRANTED_QOS_1),
-                List.of(ReasonCode.GRANTED_QOS_2),
-                List.of(ReasonCode.NOT_AUTHORIZED)
+                List.of(ReasonCode.GRANTED_QOS_2)
         );
     }
 
@@ -3233,9 +3331,74 @@ class SessionCoreTest {
                 .containsExactly("client", "client");
     }
 
+    @Test
+    void an_mqtt_5_publication_reaches_the_handler_without_its_properties() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        var properties = new Properties(List.of(
+                new Property.UserProperty("source", "sensor"),
+                new Property.FourByteValue(PropertyId.MESSAGE_EXPIRY_INTERVAL, 60),
+                new Property.StringValue(PropertyId.CONTENT_TYPE, "text/plain")
+        ));
+
+        // Act
+        mqtt5.received(1, publication(properties), 0, 19);
+
+        // Assert
+        assertThat(port.deliveries).singleElement()
+                .satisfies(delivery -> assertThat(delivery.message()).isEqualTo(message()));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("aliasedPublications")
+    void a_topic_alias_that_the_client_never_allowed_ends_the_connection(Packet publication) {
+        // Arrange: the client announces no Topic Alias Maximum.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+
+        // Act
+        mqtt5.received(1, publication, 0, 19);
+
+        // Assert
+        assertThat(port.deliveries).isEmpty();
+        assertThat(port.ends).singleElement().satisfies(end -> assertThat(end.cause())
+                .containsInstanceOf(MqttProtocolException.class)
+                .get()
+                .extracting(cause -> ((MqttProtocolException) cause).reasonCode())
+                .isEqualTo(ReasonCode.TOPIC_ALIAS_INVALID));
+    }
+
+    static Stream<Named<Packet>> aliasedPublications() {
+        var alias = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 1)));
+        return Stream.of(
+                Named.of("a topic with an alias", publication(alias)),
+                Named.of("an alias without a topic", new Packet.AliasPublish(
+                        new byte[] {1, 2},
+                        Qos.AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        alias
+                ))
+        );
+    }
+
     private void connected() {
         sut.connect(attempt(1), 0);
         accept();
+    }
+
+    private static Packet.Publish publication(Properties properties) {
+        return new Packet.Publish(
+                new Topic("a/b"),
+                new byte[] {1, 2},
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                properties
+        );
     }
 
     /// An MQTT 5.0 core like `sut`, with `sessionExpiry` and a packet limit of 1 KiB.
@@ -3254,6 +3417,15 @@ class SessionCoreTest {
                 false,
                 Duration.ofSeconds(60)
         );
+    }
+
+    /// An MQTT 5.0 core like `sut` whose first connection is established.
+    private SessionCore connectedMqtt5() {
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(), 0, 0);
+        return mqtt5;
     }
 
     /// A successful CONNACK without Session Present that carries `properties`.

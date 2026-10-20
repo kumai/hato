@@ -21,10 +21,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// A raw TCP or TLS peer whose replies are chosen by each test. A TLS peer completes its
-/// handshake on the first read.
+/// handshake on the first read. It speaks MQTT 3.1.1 unless a test chooses another version.
 final class ScriptedBroker implements AutoCloseable {
-
-    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
 
     static MqttClient client(ServerSocket server) {
         return MqttClient.builder()
@@ -47,20 +45,34 @@ final class ScriptedBroker implements AutoCloseable {
     private final Socket socket;
     private final FrameReader reader;
     private final FrameWriter writer;
+    private final PacketCodec codec;
 
-    private ScriptedBroker(Socket socket) throws IOException {
+    private ScriptedBroker(Socket socket, MqttVersion version) throws IOException {
         this.socket = socket;
         socket.setSoTimeout(5000);
         reader = new FrameReader(socket.getInputStream(), 1024 * 1024);
         writer = new FrameWriter(socket.getOutputStream());
+        codec = PacketCodec.of(version);
     }
 
     static ScriptedBroker connect(ServerSocket server, MqttClient sut) throws Exception {
         return connect(server, sut, false, _ -> { });
     }
 
+    static ScriptedBroker connect(
+            ServerSocket server,
+            MqttClient sut,
+            MqttVersion version
+    ) throws Exception {
+        return connect(server, sut, version, false, _ -> { });
+    }
+
     static ScriptedBroker accept(ServerSocket server) throws IOException {
-        return new ScriptedBroker(server.accept());
+        return accept(server, MqttVersion.V3_1_1);
+    }
+
+    static ScriptedBroker accept(ServerSocket server, MqttVersion version) throws IOException {
+        return new ScriptedBroker(server.accept(), version);
     }
 
     static ScriptedBroker connect(
@@ -69,8 +81,18 @@ final class ScriptedBroker implements AutoCloseable {
             boolean sessionPresent,
             Consumer<Packet.Connect> verifyConnect
     ) throws Exception {
+        return connect(server, sut, MqttVersion.V3_1_1, sessionPresent, verifyConnect);
+    }
+
+    private static ScriptedBroker connect(
+            ServerSocket server,
+            MqttClient sut,
+            MqttVersion version,
+            boolean sessionPresent,
+            Consumer<Packet.Connect> verifyConnect
+    ) throws Exception {
         CompletableFuture<ConnAck> connected = sut.connect();
-        ScriptedBroker peer = accept(server);
+        ScriptedBroker peer = accept(server, version);
         try {
             assertThat(peer.receive()).isInstanceOfSatisfying(Packet.Connect.class, verifyConnect);
             peer.send(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));

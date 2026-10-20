@@ -377,6 +377,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.MqttMessage",
                 "org.mqtt4j.hato.MqttNotConnectedException",
                 "org.mqtt4j.hato.MqttProtocolException",
+                "org.mqtt4j.hato.MqttPublishException",
                 "org.mqtt4j.hato.MqttPublisher",
                 "org.mqtt4j.hato.MqttSubscribeException",
                 "org.mqtt4j.hato.MqttSubscriber",
