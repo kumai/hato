@@ -148,6 +148,43 @@ subscription.unsubscribe().join();
   its delegate through an application-owned atomic reference.
 - The client and its subscriptions are safe to use from any thread.
 
+## Choosing how messages run
+
+A subscription with a plain handler runs its messages one at a time, in arrival order. The
+other ways change where your code runs, how many messages run at once, and which order is
+kept:
+
+| When you need | Use | Order | At once |
+| --- | --- | --- | --- |
+| The simplest code | [`client.subscribe(request, handler)`](#managing-subscriptions) | arrival | one |
+| Your own thread or pool | [`DeliveryOptions.serial().withExecutor(pool)`](#running-handlers-on-your-executor) | arrival | one |
+| Each device in order, devices in parallel | [`DeliveryOptions.striped(n, key)`](#running-messages-in-parallel) | per key | up to `n` |
+| Independent messages, as fast as possible | [`DeliveryOptions.parallel(n)`](#running-messages-in-parallel) | none | up to `n` |
+| The threads that own each device's state | [`DeliveryOptions.lanes(selector)`](#running-handlers-on-your-executor) | per lane | one per lane |
+| A queue that your application owns | [`client.handOff(request, mailbox::offer)`](#handing-messages-to-your-own-mailbox) | arrival, into your queue | your choice |
+| Your own threads taking messages | [`client.subscribe(request)` and `receive()`](#receiving-on-your-own-threads) | arrival, as taken | one per thread |
+
+- Start with a plain handler. When it is slower than messages arrive, such as a wildcard
+  subscription whose handler writes each reading to a database, messages queue up and their
+  acknowledgements wait behind them. Striping by device lets devices go on independently
+  while each keeps its order, and with enough stripes the handlers can keep up.
+- Choose by the order that you need, not by overhead: passing messages to stripes or parallel
+  handlers costs little next to a handler that does real work.
+- `parallel(n)` keeps no order at all: a later message can finish before an earlier one, even
+  one from the same device.
+- Use lanes when the work must run on threads that your application already owns. Hand off
+  when your application already has a queue, such as a mailbox that also takes work of its
+  own; the messages of all hand-off subscriptions reach it in one order. Receive on your own
+  threads when your loop should decide when to take each next message, for example with a
+  timeout. The [examples](../examples/README.md) show lanes and hand-off in complete programs.
+- Whichever you choose, the acknowledgements of QoS 1 and 2 messages leave in arrival order
+  across the connection, so a message whose acknowledgement waits, whether in a queue or for
+  slow processing, holds back the acknowledgements of all later ones, from every subscription.
+  Process messages as fast as they arrive, acknowledge before processing with
+  `AckMode.ON_RECEIVE` when you can afford to lose a message whose processing fails or is cut
+  short, or receive slow topics with a separate client, which has its own connection and its
+  own order.
+
 ## Running handlers on your executor
 
 Pass `DeliveryOptions` to run a subscription's handler on an executor that your application
@@ -225,6 +262,35 @@ Subscription subscription = client.subscribe(
 - Up to 16 messages run at once, in no particular order.
 - `.withExecutor(pool)` works here too, and acknowledgements still leave in arrival order.
 
+## Handing messages to your own mailbox
+
+When your application already runs its work through its own queue, such as one mailbox per
+device, hand each message to that queue directly. The client offers each message to your
+acceptor and lets go of it once the acceptor takes it:
+
+```java
+BlockingQueue<MqttDelivery> mailbox = new ArrayBlockingQueue<>(10_000);
+
+Subscription subscription = client.handOff(
+        Subscribe.of(new TopicFilter("devices/+/telemetry"), Qos.AT_LEAST_ONCE),
+        mailbox::offer
+);
+```
+
+- Return `true` to take a message; from then on it is yours to process or drop. QoS 1 and 2
+  messages are acknowledged when you take them. To acknowledge after your processing instead,
+  choose `AckMode.MANUAL` and call `delivery.ack()` when you are done; until then the message
+  holds back the acknowledgement of later QoS 1 and 2 messages.
+- Return `false` when your mailbox is full. The client treats that as a full subscription
+  queue: a QoS 0 message is dropped, and a QoS 1 or 2 message ends the connection.
+- One thread of the client offers the messages of all its hand-off subscriptions in the order
+  they arrive, so your mailbox sees one order across them. Never wait in the acceptor: use
+  `offer`, not `put`, or the other hand-off subscriptions wait too.
+- To stop, close the subscription, wait for `subscription.terminated()`, and then drain or
+  discard your mailbox: nothing is offered after that. Each message reports
+  `delivery.connectionAttempt()`, so messages kept across a reconnection can be told apart
+  from new ones.
+
 ## Receiving on your own threads
 
 Omit the handler to create a pull subscription. Call `receive()` from one or more
@@ -258,35 +324,6 @@ while (subscription.receive() instanceof ReceiveResult.Received(var delivery)) {
   that nobody takes or acknowledges can stop the broker's later QoS 1 and 2 messages. If you
   cannot process one, end the connection.
 - Messages not yet taken are dropped when the connection ends.
-
-## Handing messages to your own mailbox
-
-When your application already runs its work through its own queue, such as one mailbox per
-device, hand each message to that queue directly. The client offers each message to your
-acceptor and lets go of it once the acceptor takes it:
-
-```java
-BlockingQueue<MqttDelivery> mailbox = new ArrayBlockingQueue<>(10_000);
-
-Subscription subscription = client.handOff(
-        Subscribe.of(new TopicFilter("devices/+/telemetry"), Qos.AT_LEAST_ONCE),
-        mailbox::offer
-);
-```
-
-- Return `true` to take a message; from then on it is yours to process or drop. QoS 1 and 2
-  messages are acknowledged when you take them. To acknowledge after your processing instead,
-  choose `AckMode.MANUAL` and call `delivery.ack()` when you are done; until then the message
-  holds back the acknowledgement of later QoS 1 and 2 messages.
-- Return `false` when your mailbox is full. The client treats that as a full subscription
-  queue: a QoS 0 message is dropped, and a QoS 1 or 2 message ends the connection.
-- One thread of the client offers the messages of all its hand-off subscriptions in the order
-  they arrive, so your mailbox sees one order across them. Never wait in the acceptor: use
-  `offer`, not `put`, or the other hand-off subscriptions wait too.
-- To stop, close the subscription, wait for `subscription.terminated()`, and then drain or
-  discard your mailbox: nothing is offered after that. Each message reports
-  `delivery.connectionAttempt()`, so messages kept across a reconnection can be told apart
-  from new ones.
 
 ## Handling failures
 
