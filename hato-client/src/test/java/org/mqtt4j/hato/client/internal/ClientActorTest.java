@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -37,6 +38,7 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import org.jspecify.annotations.Nullable;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -69,6 +71,7 @@ import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.ReconnectPolicy;
+import org.mqtt4j.hato.RetainHandling;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
@@ -4662,6 +4665,49 @@ class ClientActorTest {
                     Packet.Publish.class,
                     publish -> assertThat(publish.payload()).containsExactly(2)
             );
+        }
+    }
+
+    static Stream<Named<BiFunction<MqttClient, Subscribe, Subscription>>> subscribeCalls() {
+        return Stream.of(
+                Named.of("push", (client, request) -> client.subscribe(request, _ -> { })),
+                Named.of(
+                        "push with delivery options",
+                        (client, request) -> client.subscribe(
+                                request,
+                                DeliveryOptions.striped(2),
+                                _ -> { }
+                        )
+                ),
+                Named.of("pull", (client, request) -> client.subscribe(request)),
+                Named.of("hand-off", (client, request) -> client.handOff(request, _ -> true))
+        );
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("subscribeCalls")
+    void an_mqtt_3_1_1_client_refuses_subscription_options_without_registering_them(
+            BiFunction<MqttClient, Subscribe, Subscription> call
+    ) throws Exception {
+        // Arrange
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+
+            // Act & Assert
+            for (Subscribe request : List.of(
+                    qosOneRequest().withNoLocal(true),
+                    qosOneRequest().withRetainAsPublished(true),
+                    qosOneRequest().withRetainHandling(RetainHandling.SEND_IF_NEW_SUBSCRIPTION),
+                    qosOneRequest().withRetainHandling(RetainHandling.DO_NOT_SEND)
+            )) {
+                assertThatThrownBy(() -> call.apply(sut, request))
+                        .as(request.toString())
+                        .isInstanceOf(IllegalArgumentException.class);
+            }
+
+            // Act & Assert: the filter stays free, so the default request is the only one sent.
+            establish(transport, call.apply(sut, qosOneRequest()));
+            assertThat(transport.sent).isEmpty();
         }
     }
 

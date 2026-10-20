@@ -18,6 +18,7 @@ import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.RetainHandling;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
@@ -436,12 +437,17 @@ final class Subscriptions {
     }
 
     private static Packet.Subscribe subscriptionPacket(LocalSubscription local, int id) {
+        int retainHandling = switch (local.retainHandling) {
+            case SEND -> 0;
+            case SEND_IF_NEW_SUBSCRIPTION -> 1;
+            case DO_NOT_SEND -> 2;
+        };
         return new Packet.Subscribe(id, List.of(new Packet.Subscription(
                 local.filter,
                 local.requestedQos,
-                false,
-                false,
-                0
+                local.noLocal,
+                local.retainAsPublished,
+                retainHandling
         )), EMPTY);
     }
 
@@ -526,6 +532,10 @@ final class Subscriptions {
         final TopicFilter filter;
         final TopicFilter matchingFilter;
         final Qos requestedQos;
+        // The subscription options, which every SUBSCRIBE for this registration carries.
+        final boolean noLocal;
+        final boolean retainAsPublished;
+        final RetainHandling retainHandling;
         final boolean shared;
         final Subscription handle;
         boolean confirmed;
@@ -543,6 +553,9 @@ final class Subscriptions {
             this.id = id;
             filter = request.filter();
             requestedQos = request.qos();
+            noLocal = request.noLocal();
+            retainAsPublished = request.retainAsPublished();
+            retainHandling = request.retainHandling();
             this.shared = shared;
             this.matchingFilter = matchingFilter;
             this.handle = handle;

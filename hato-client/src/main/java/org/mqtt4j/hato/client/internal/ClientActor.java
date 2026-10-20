@@ -43,6 +43,7 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReceiveResult;
+import org.mqtt4j.hato.RetainHandling;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.TopicFilter;
@@ -405,6 +406,14 @@ public final class ClientActor implements MqttClient {
             @Nullable Consumer<MqttDelivery> handler,
             @Nullable Predicate<MqttDelivery> acceptor
     ) {
+        // MQTT 3.1.1 has no subscription options, so a request that sets one is an argument
+        // error, decided by the version of the client.
+        boolean setsOptions = request.noLocal()
+                || request.retainAsPublished()
+                || request.retainHandling() != RetainHandling.SEND;
+        if (version == MqttVersion.V3_1_1 && setsOptions) {
+            throw new IllegalArgumentException("MQTT 3.1.1 has no subscription options");
+        }
         ClientSubscription subscription;
         MqttCapacityException rejection = null;
         synchronized (lifecycleLock) {

@@ -304,7 +304,9 @@ public final class MqttMessage {
         return qos;
     }
 
-    /// Whether publication requests retention, or reception is a retained delivery.
+    /// Whether publication requests retention, or reception is a retained delivery: one that the
+    /// broker sent from its retained messages as it made the subscription. A subscription with
+    /// [Subscribe#retainAsPublished()] instead receives the retain flag that the publisher set.
     public boolean retain() {
         return retain;
     }

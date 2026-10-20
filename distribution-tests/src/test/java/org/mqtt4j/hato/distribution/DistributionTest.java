@@ -404,6 +404,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.ReceiveResult$Ended",
                 "org.mqtt4j.hato.ReceiveResult$Received",
                 "org.mqtt4j.hato.ReceiveResult$TimedOut",
+                "org.mqtt4j.hato.RetainHandling",
                 "org.mqtt4j.hato.Subscribe",
                 "org.mqtt4j.hato.Subscription",
                 "org.mqtt4j.hato.Topic",
@@ -426,7 +427,7 @@ class DistributionTest {
     @ParameterizedTest
     @ValueSource(strings = {
             "Disconnection", "ConnAck", "PublishResult", "MqttMessage", "MqttCredentials",
-            "DeliveryOptions"
+            "DeliveryOptions", "Subscribe"
     })
     void evolving_value_types_are_final_classes_with_private_constructors(String type)
             throws Exception {

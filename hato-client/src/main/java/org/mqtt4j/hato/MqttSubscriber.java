@@ -73,13 +73,16 @@ public interface MqttSubscriber {
     /// Use separate clients when those filters are needed together. Ordinary subscriptions may
     /// overlap each other.
     ///
-    /// Null arguments throw [NullPointerException], and calls after client closure throw
-    /// [IllegalStateException], synchronously. Duplicate filters, shared-filter overlap, and
-    /// registration capacity are checked asynchronously: the returned handle ends, and
-    /// [Subscription#established()] fails with [IllegalStateException] for duplicates or overlap,
-    /// or [MqttCapacityException] for capacity. Pull receive methods report the same registration
-    /// failure. The client permits 256 registrations, including ones awaiting establishment or
-    /// broker removal. Registration does not consume operation capacity.
+    /// Null arguments throw [NullPointerException], calls after client closure throw
+    /// [IllegalStateException], and on an MQTT 3.1.1 client a request that sets a subscription
+    /// option throws [IllegalArgumentException], all synchronously and without registering.
+    /// Duplicate filters, including the same filter with other subscription options,
+    /// shared-filter overlap, and registration capacity are checked asynchronously: the returned
+    /// handle ends, and [Subscription#established()] fails with [IllegalStateException] for
+    /// duplicates or overlap, or [MqttCapacityException] for capacity. Pull receive methods
+    /// report the same registration failure. The client permits 256 registrations, including
+    /// ones awaiting establishment or broker removal. Registration does not consume operation
+    /// capacity.
     /// The same original filter remains reserved while pending, active, or awaiting removal.
     ///
     /// A refusal fails establishment with [MqttSubscriptionRefusedException] and permanently ends

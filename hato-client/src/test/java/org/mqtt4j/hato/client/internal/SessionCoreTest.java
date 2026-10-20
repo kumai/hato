@@ -44,6 +44,7 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.RetainHandling;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
@@ -2118,6 +2119,92 @@ class SessionCoreTest {
         // Assert
         assertThat(port.sent).last().isInstanceOf(Packet.Subscribe.class);
         assertThat(port.outcomes).doesNotContainKey(2L);
+    }
+
+    @ParameterizedTest(name = "{0} travels as {1}")
+    @CsvSource({
+            "SEND, 0",
+            "SEND_IF_NEW_SUBSCRIPTION, 1",
+            "DO_NOT_SEND, 2"
+    })
+    void a_subscribe_carries_the_retain_handling_and_by_default_no_other_option(
+            RetainHandling handling,
+            int value
+    ) {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+
+        // Act
+        mqtt5.subscribe(2, subscription("a/#").withRetainHandling(handling));
+
+        // Assert
+        assertThat(((Packet.Subscribe) port.sent.getLast()).subscriptions()).containsExactly(
+                new Packet.Subscription(
+                        new TopicFilter("a/#"),
+                        Qos.AT_MOST_ONCE,
+                        false,
+                        false,
+                        value
+                )
+        );
+    }
+
+    @Test
+    void a_recreated_subscription_carries_the_same_options() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        var expected = new Packet.Subscription(
+                new TopicFilter("a/#"),
+                Qos.AT_MOST_ONCE,
+                true,
+                true,
+                1
+        );
+        Subscribe request = subscription("a/#")
+                .withNoLocal(true)
+                .withRetainAsPublished(true)
+                .withRetainHandling(RetainHandling.SEND_IF_NEW_SUBSCRIPTION);
+        mqtt5.subscribe(2, request);
+        var first = (Packet.Subscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.SubAck(first.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+
+        // Act: the next connection resumes no session, so the subscription is made again.
+        mqtt5.failed(1, new IOException("connection lost"));
+        port.sent.clear();
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, connAck(), 0, 0);
+
+        // Assert
+        assertThat(first.subscriptions()).containsExactly(expected);
+        assertThat(port.sent)
+                .filteredOn(Packet.Subscribe.class::isInstance)
+                .singleElement()
+                .isInstanceOfSatisfying(
+                        Packet.Subscribe.class,
+                        recreated -> assertThat(recreated.subscriptions()).containsExactly(expected)
+                );
+    }
+
+    @Test
+    void a_second_subscription_to_a_filter_is_refused_even_with_other_options() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        int sent = port.sent.size();
+
+        // Act
+        mqtt5.subscribe(3, subscription("a/#").withNoLocal(true));
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(3L)).failure())
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(port.sent).hasSize(sent);
     }
 
     @Test

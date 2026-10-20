@@ -16,7 +16,9 @@ import static java.util.Objects.requireNonNull;
 /// A setting left unchanged takes its default, which can depend on how the subscription
 /// receives messages.
 ///
-/// Subscriptions support QoS 0, QoS 1, and QoS 2.
+/// Subscriptions support QoS 0, QoS 1, and QoS 2. The subscription options No Local, Retain As
+/// Published, and Retain Handling need MQTT 5.0: an MQTT 3.1.1 client refuses a request that
+/// changes any of them from its default with [IllegalArgumentException].
 public final class Subscribe {
 
     private static final int DEFAULT_BUFFER_CAPACITY = 1024;
@@ -32,35 +34,67 @@ public final class Subscribe {
 
     private final FailurePolicy failurePolicy;
 
+    private final boolean noLocal;
+
+    private final boolean retainAsPublished;
+
+    private final RetainHandling retainHandling;
+
     private Subscribe(
             TopicFilter filter,
             Qos qos,
             @Nullable AckMode ackMode,
             int bufferCapacity,
-            FailurePolicy failurePolicy
+            FailurePolicy failurePolicy,
+            boolean noLocal,
+            boolean retainAsPublished,
+            RetainHandling retainHandling
     ) {
         this.filter = filter;
         this.qos = qos;
         this.ackMode = ackMode;
         this.bufferCapacity = bufferCapacity;
         this.failurePolicy = failurePolicy;
+        this.noLocal = noLocal;
+        this.retainAsPublished = retainAsPublished;
+        this.retainHandling = retainHandling;
     }
 
     /// Requests `filter` with `qos` as the maximum quality of service, the default
-    /// acknowledgement mode, a buffer capacity of 1024, and [FailurePolicy#STOP].
+    /// acknowledgement mode, a buffer capacity of 1024, [FailurePolicy#STOP], and the MQTT 5.0
+    /// defaults for the subscription options: No Local and Retain As Published off, and
+    /// [RetainHandling#SEND].
     ///
     /// @throws IllegalArgumentException if shared syntax is invalid
     public static Subscribe of(TopicFilter filter, Qos qos) {
         requireNonNull(filter, "Filter must not be null");
         requireNonNull(qos, "QoS must not be null");
         SharedTopicFilter.parse(filter);
-        return new Subscribe(filter, qos, null, DEFAULT_BUFFER_CAPACITY, FailurePolicy.STOP);
+        return new Subscribe(
+                filter,
+                qos,
+                null,
+                DEFAULT_BUFFER_CAPACITY,
+                FailurePolicy.STOP,
+                false,
+                false,
+                RetainHandling.SEND
+        );
     }
 
     /// Returns a copy that uses `ackMode` instead of the default.
     public Subscribe withAckMode(AckMode ackMode) {
         requireNonNull(ackMode, "Ack mode must not be null");
-        return new Subscribe(filter, qos, ackMode, bufferCapacity, failurePolicy);
+        return new Subscribe(
+                filter,
+                qos,
+                ackMode,
+                bufferCapacity,
+                failurePolicy,
+                noLocal,
+                retainAsPublished,
+                retainHandling
+        );
     }
 
     /// Returns a copy with a different [buffer capacity][#bufferCapacity()].
@@ -70,14 +104,85 @@ public final class Subscribe {
         if (bufferCapacity < 1) {
             throw new IllegalArgumentException("Buffer capacity must be positive");
         }
-        return new Subscribe(filter, qos, ackMode, bufferCapacity, failurePolicy);
+        return new Subscribe(
+                filter,
+                qos,
+                ackMode,
+                bufferCapacity,
+                failurePolicy,
+                noLocal,
+                retainAsPublished,
+                retainHandling
+        );
     }
 
     /// Returns a copy that handles handler failures with `failurePolicy` instead of
     /// [FailurePolicy#STOP].
     public Subscribe withFailurePolicy(FailurePolicy failurePolicy) {
         requireNonNull(failurePolicy, "Failure policy must not be null");
-        return new Subscribe(filter, qos, ackMode, bufferCapacity, failurePolicy);
+        return new Subscribe(
+                filter,
+                qos,
+                ackMode,
+                bufferCapacity,
+                failurePolicy,
+                noLocal,
+                retainAsPublished,
+                retainHandling
+        );
+    }
+
+    /// Returns a copy that asks the broker not to deliver this client's own publications to this
+    /// subscription (the MQTT 5.0 No Local option), or to deliver them as usual.
+    ///
+    /// @throws IllegalArgumentException if `noLocal` is true for a shared subscription, which
+    ///     MQTT 5.0 does not allow
+    public Subscribe withNoLocal(boolean noLocal) {
+        if (noLocal && SharedTopicFilter.parse(filter).isPresent()) {
+            throw new IllegalArgumentException("A shared subscription cannot set No Local");
+        }
+        return new Subscribe(
+                filter,
+                qos,
+                ackMode,
+                bufferCapacity,
+                failurePolicy,
+                noLocal,
+                retainAsPublished,
+                retainHandling
+        );
+    }
+
+    /// Returns a copy that asks the broker to keep the retain flag that each publisher set on
+    /// the messages that it delivers to this subscription (the MQTT 5.0 Retain As Published
+    /// option), or to clear it as usual; see [MqttMessage#retain()].
+    public Subscribe withRetainAsPublished(boolean retainAsPublished) {
+        return new Subscribe(
+                filter,
+                qos,
+                ackMode,
+                bufferCapacity,
+                failurePolicy,
+                noLocal,
+                retainAsPublished,
+                retainHandling
+        );
+    }
+
+    /// Returns a copy that decides when the broker sends the matching retained messages as it
+    /// makes this subscription (the MQTT 5.0 Retain Handling option).
+    public Subscribe withRetainHandling(RetainHandling retainHandling) {
+        requireNonNull(retainHandling, "Retain handling must not be null");
+        return new Subscribe(
+                filter,
+                qos,
+                ackMode,
+                bufferCapacity,
+                failurePolicy,
+                noLocal,
+                retainAsPublished,
+                retainHandling
+        );
     }
 
     /// The filter sent to the broker.
@@ -124,6 +229,22 @@ public final class Subscribe {
         return failurePolicy;
     }
 
+    /// Whether the broker withholds this client's own publications from this subscription.
+    public boolean noLocal() {
+        return noLocal;
+    }
+
+    /// Whether the broker keeps the publisher's retain flag on the messages that it delivers to
+    /// this subscription.
+    public boolean retainAsPublished() {
+        return retainAsPublished;
+    }
+
+    /// When the broker sends the matching retained messages as it makes this subscription.
+    public RetainHandling retainHandling() {
+        return retainHandling;
+    }
+
     @Override
     @SuppressWarnings("exports") // Nullness annotations are compile-time only.
     public boolean equals(@Nullable Object other) {
@@ -132,18 +253,32 @@ public final class Subscribe {
                 && qos == that.qos
                 && ackMode == that.ackMode
                 && bufferCapacity == that.bufferCapacity
-                && failurePolicy == that.failurePolicy;
+                && failurePolicy == that.failurePolicy
+                && noLocal == that.noLocal
+                && retainAsPublished == that.retainAsPublished
+                && retainHandling == that.retainHandling;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(filter, qos, ackMode, bufferCapacity, failurePolicy);
+        return Objects.hash(
+                filter,
+                qos,
+                ackMode,
+                bufferCapacity,
+                failurePolicy,
+                noLocal,
+                retainAsPublished,
+                retainHandling
+        );
     }
 
     @Override
     public String toString() {
         return "Subscribe[filter=" + filter + ", qos=" + qos + ", ackMode="
                 + (ackMode == null ? "default" : ackMode) + ", bufferCapacity=" + bufferCapacity
-                + ", failurePolicy=" + failurePolicy + "]";
+                + ", failurePolicy=" + failurePolicy + ", noLocal=" + noLocal
+                + ", retainAsPublished=" + retainAsPublished
+                + ", retainHandling=" + retainHandling + "]";
     }
 }
