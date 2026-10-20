@@ -376,15 +376,9 @@ public final class ClientActor implements MqttClient {
     public Subscription handOff(Subscribe request, Predicate<MqttDelivery> acceptor) {
         requireNonNull(request, "request");
         requireNonNull(acceptor, "acceptor");
-        AckMode ackMode = request.ackMode().orElse(AckMode.ON_RECEIVE);
-        if (ackMode == AckMode.AFTER_HANDLER) {
+        if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
             throw new IllegalArgumentException(
                     "A hand-off subscription cannot see when its deliveries are processed"
-            );
-        }
-        if (ackMode == AckMode.MANUAL) {
-            throw new IllegalArgumentException(
-                    "A hand-off subscription acknowledges its deliveries when it accepts them"
             );
         }
         return subscribeInternal(request, new HandlerExecution.Internal(), null, acceptor);

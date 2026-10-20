@@ -2191,6 +2191,96 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void accepting_a_manual_delivery_returns_its_capacity_but_waits_for_its_ack()
+            throws Exception {
+        // Arrange: the application keeps what it accepts and acknowledges it later.
+        var mailbox = new LinkedBlockingQueue<MqttDelivery>();
+        assertThat(sut.registerHandOff(1, request(AckMode.MANUAL, 1), mailbox::offer)).isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(1), false, 10)).isTrue();
+        MqttDelivery accepted = requireNonNull(mailbox.poll(5, SECONDS));
+
+        // Assert: the one slot is free again for a later delivery, while the acknowledgement
+        // waits for ack().
+        await().until(() -> sut.retainedDeliveries() == 0);
+        assertThat(sut.retainedBytes()).isZero();
+        assertThat(sut.isReady(10)).isFalse();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(2), false, 10)).isTrue();
+        assertThat(mailbox.poll(5, SECONDS)).isNotNull();
+        accepted.ack();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(sut.isReady(11)).isFalse();
+    }
+
+    @Test
+    void an_ack_made_while_the_acceptor_runs_counts_once_the_delivery_is_accepted()
+            throws Exception {
+        // Arrange: the delivery is acknowledged before the acceptor returns.
+        assertThat(sut.registerHandOff(1, request(AckMode.MANUAL, 1), delivery -> {
+            delivery.ack();
+            return true;
+        })).isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+
+        // Assert
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        await().until(() -> sut.retainedDeliveries() == 0);
+    }
+
+    @Test
+    void an_ack_made_before_a_refusal_or_a_failure_has_no_effect() throws Exception {
+        // Arrange: lane 1 refuses and lane 2 throws, each after acknowledging.
+        var cause = new IllegalStateException("acceptor failed");
+        assertThat(sut.registerHandOff(1, request(AckMode.MANUAL, 1), delivery -> {
+            delivery.ack();
+            return false;
+        })).isTrue();
+        assertThat(sut.registerHandOff(2, request(AckMode.MANUAL, 1), delivery -> {
+            delivery.ack();
+            throw cause;
+        })).isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(1), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(2L), qosOneMessage(2), false, 10)).isTrue();
+
+        // Assert: neither acknowledgement condition is met.
+        assertThat(overloads.poll(5, SECONDS)).isEqualTo(token(1, 10));
+        assertThat(failures.poll(5, SECONDS)).isEqualTo(new Failure(token(1, 11), cause));
+        assertThat(sut.isReady(10)).isFalse();
+        assertThat(sut.isReady(11)).isFalse();
+        assertThat(ready).isEmpty();
+    }
+
+    @Test
+    void a_stop_voids_the_ack_of_an_accepted_manual_delivery_and_hands_it_off_again()
+            throws Exception {
+        // Arrange: the application holds an accepted MANUAL delivery when a stop ends the
+        // connection of a continued session.
+        var mailbox = new LinkedBlockingQueue<MqttDelivery>();
+        assertThat(sut.registerHandOff(1, request(AckMode.MANUAL, 2), mailbox::offer)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        MqttDelivery stale = requireNonNull(mailbox.poll(5, SECONDS));
+        await().until(() -> sut.retainedDeliveries() == 0);
+
+        // Act: the stop leaves the receipt not handed off, the application acknowledges late,
+        // and the broker retransmits as a new reception.
+        assertThat(sut.connectionEnded(true, true)).isEmpty();
+        stale.ack();
+        assertThat(sut.deliver(token(2, 11), List.of(1L), qosOneMessage(), true, 10)).isTrue();
+
+        // Assert: the late ack completes nothing, and only the retransmission's own ack counts.
+        MqttDelivery again = requireNonNull(mailbox.poll(5, SECONDS));
+        assertThat(again.dup()).isTrue();
+        assertThat(ready).isEmpty();
+        again.ack();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
+    }
+
+    @Test
     void a_refused_qos_0_delivery_is_dropped_for_its_lane_only() throws Exception {
         // Arrange: lane 1 refuses every delivery, and lane 2 accepts.
         var offers = new AtomicInteger();

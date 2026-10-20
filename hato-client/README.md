@@ -240,7 +240,9 @@ Subscription subscription = client.handOff(
 ```
 
 - Return `true` to take a message; from then on it is yours to process or drop. QoS 1 and 2
-  messages are acknowledged when you take them.
+  messages are acknowledged when you take them. To acknowledge after your processing instead,
+  choose `AckMode.MANUAL` and call `delivery.ack()` when you are done; until then the message
+  holds back the acknowledgement of later QoS 1 and 2 messages.
 - Return `false` when your mailbox is full. The client treats that as a full subscription
   queue: a QoS 0 message is dropped, and a QoS 1 or 2 message ends the connection.
 - One thread of the client offers the messages of all its hand-off subscriptions in the order

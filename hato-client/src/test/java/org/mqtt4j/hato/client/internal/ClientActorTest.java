@@ -6139,7 +6139,7 @@ class ClientActorTest {
     }
 
     @Test
-    void hand_off_rejects_acknowledgement_modes_that_wait_for_processing() throws Exception {
+    void hand_off_rejects_acknowledgement_after_the_handler() throws Exception {
         // Arrange
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
@@ -6149,11 +6149,104 @@ class ClientActorTest {
                     qosOneRequest().withAckMode(AckMode.AFTER_HANDLER),
                     _ -> true
             )).isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> sut.handOff(
-                    qosOneRequest().withAckMode(AckMode.MANUAL),
-                    _ -> true
-            )).isInstanceOf(IllegalArgumentException.class);
             assertThat(transport.sent).isEmpty();
+        }
+    }
+
+    @Test
+    void a_manual_hand_off_acknowledges_a_delivery_once_the_application_acks_it()
+            throws Exception {
+        // Arrange: the application's mailbox keeps two QoS 1 deliveries without acknowledging
+        // them.
+        var mailbox = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.handOff(
+                    qosOneRequest().withAckMode(AckMode.MANUAL),
+                    mailbox::offer
+            );
+            establish(transport, subscription);
+            transport.receive(qosOnePublication("messages", 7, false));
+            transport.receive(qosOnePublication("messages", 8, false));
+            MqttDelivery first = requireNonNull(mailbox.poll(5, SECONDS));
+            assertThat(mailbox.poll(5, SECONDS)).isNotNull();
+            // The worker finished accepting the first delivery before it offered the second, so
+            // a PUBACK for it would precede this publication.
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+
+            // Act
+            first.ack();
+
+            // Assert
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 7));
+        }
+    }
+
+    @Test
+    void an_ack_made_before_the_acceptor_returns_counts_only_if_it_accepts() throws Exception {
+        // Arrange: another thread acknowledges each delivery before its acceptor returns. a then
+        // accepts its delivery, and b refuses its own.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription a = sut.handOff(
+                    Subscribe.of(new TopicFilter("a"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL),
+                    delivery -> {
+                        CompletableFuture.runAsync(delivery::ack).join();
+                        return true;
+                    }
+            );
+            establish(transport, a);
+            Subscription b = sut.handOff(
+                    Subscribe.of(new TopicFilter("b"), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL),
+                    delivery -> {
+                        CompletableFuture.runAsync(delivery::ack).join();
+                        return false;
+                    }
+            );
+            establish(transport, b);
+
+            // Act
+            transport.receive(qosOnePublication("a", 7, false));
+            transport.receive(qosOnePublication("b", 8, false));
+
+            // Assert: the acceptance lets the first ack count. The refusal drops the second and
+            // ends the connection as overloaded.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 7));
+            assertThat(requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow())
+                    .isInstanceOf(MqttCapacityException.class)
+                    .hasMessage("Hand-off capacity");
+            assertThat(transport.sent).noneMatch(Packet.PubAck.class::isInstance);
+        }
+    }
+
+    @Test
+    void an_ack_made_before_the_acceptor_fails_is_dropped() throws Exception {
+        // Arrange: the default policy, and an acceptor that throws after another thread
+        // acknowledged the delivery.
+        var failure = new IllegalStateException("acceptor failed");
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.handOff(
+                    qosOneRequest().withAckMode(AckMode.MANUAL),
+                    delivery -> {
+                        CompletableFuture.runAsync(delivery::ack).join();
+                        throw failure;
+                    }
+            );
+            establish(transport, subscription);
+
+            // Act
+            transport.receive(qosOnePublication("messages", 7, false));
+
+            // Assert: the delivery still held back its acknowledgement, so the failure stops the
+            // client.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(transport.sent).noneMatch(Packet.PubAck.class::isInstance);
         }
     }
 

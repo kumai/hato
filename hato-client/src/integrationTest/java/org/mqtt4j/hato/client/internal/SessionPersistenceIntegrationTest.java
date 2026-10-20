@@ -733,6 +733,28 @@ class SessionPersistenceIntegrationTest {
         }
     }
 
+    @Test
+    void the_embedded_broker_hands_off_a_manual_delivery_again_after_a_stop() throws Exception {
+        try (MqttBroker broker = MqttBroker.start()) {
+            stoppedHandOffRoundTrip(URI.create("mqtt://localhost:" + broker.port()));
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
+    void mosquitto_hands_off_a_manual_delivery_again_after_a_stop() throws Exception {
+        try (GenericContainer<?> broker = Mosquitto.container()) {
+            Mosquitto.start(broker);
+            stoppedHandOffRoundTrip(
+                    URI.create(
+                            "mqtt://" + broker.getHost() + ":"
+                                    + broker.getMappedPort(Mosquitto.MQTT_PORT)
+                    )
+            );
+        }
+    }
+
     static boolean dockerIsAvailableOrRequired() {
         return Mosquitto.availableOrRequired();
     }
@@ -771,6 +793,68 @@ class SessionPersistenceIntegrationTest {
             }
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
             subscription.unsubscribe().get(5, SECONDS);
+            sut.disconnect().get(5, SECONDS);
+            publisher.disconnect().get(5, SECONDS);
+        }
+    }
+
+    /// The application still holds an accepted MANUAL hand-off delivery when another
+    /// subscription's handler failure stops the client.
+    private void stoppedHandOffRoundTrip(URI endpoint) throws Exception {
+        // Arrange: the mailbox keeps its message unacknowledged, and the other topic's handler
+        // fails once.
+        String topic = uniqueTopic();
+        String failing = uniqueTopic();
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        var mailbox = new LinkedBlockingQueue<MqttDelivery>();
+        var calls = new AtomicInteger();
+        var failure = new IllegalStateException("handler failed");
+        try (MqttClient sut = persistentClient(endpoint, ended::add);
+                MqttClient publisher = MqttClient.builder()
+                        .server(endpoint)
+                        .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
+                        .build()) {
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
+            publisher.connect().get(5, SECONDS);
+            Subscription handOff = sut.handOff(
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.MANUAL),
+                    mailbox::offer
+            );
+            handOff.established().get(5, SECONDS);
+            Subscription handled = sut.subscribe(
+                    Subscribe.of(new TopicFilter(failing), Qos.AT_LEAST_ONCE)
+                            .withAckMode(AckMode.AFTER_HANDLER),
+                    _ -> {
+                        if (calls.incrementAndGet() == 1) {
+                            throw failure;
+                        }
+                    }
+            );
+            handled.established().get(5, SECONDS);
+            MqttMessage held = message(topic, (byte) 1);
+            publisher.publish(held).get(5, SECONDS);
+            MqttDelivery stale = requireNonNull(mailbox.poll(5, SECONDS));
+            publisher.publish(message(failing, (byte) 2)).get(5, SECONDS);
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+
+            // Act: the application acknowledges the delivery it held, then connects again.
+            stale.ack();
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
+
+            // Assert: the stale ack completed nothing, so the broker's retransmission is handed
+            // off again, and its own ack completes it.
+            MqttDelivery again = requireNonNull(mailbox.poll(5, SECONDS));
+            assertThat(again.message()).isEqualTo(held);
+            assertThat(again.dup()).isTrue();
+            assertThat(again.connectionAttempt()).isEqualTo(2);
+            again.ack();
+            sut.disconnect().get(5, SECONDS);
+            assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 3));
+            MqttMessage marker = message(topic, (byte) 3);
+            publisher.publish(marker).get(5, SECONDS);
+            assertThat(requireNonNull(mailbox.poll(5, SECONDS)).message()).isEqualTo(marker);
             sut.disconnect().get(5, SECONDS);
             publisher.disconnect().get(5, SECONDS);
         }

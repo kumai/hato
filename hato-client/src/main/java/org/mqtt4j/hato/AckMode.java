@@ -10,20 +10,22 @@ package org.mqtt4j.hato;
 /// wait for such a delivery.
 /// Push subscriptions keep a delivery's capacity until its handler finishes and its PUBACK or
 /// PUBREC enters the send queue. Pull subscriptions release it at handoff (ON_RECEIVE) or at
-/// [MqttDelivery#ack()] (MANUAL). At most 4,096 receptions may await protocol completion in one
+/// [MqttDelivery#ack()] (MANUAL), and hand-off subscriptions when their acceptor accepts the
+/// delivery, in either mode. At most 4,096 receptions may await protocol completion in one
 /// session, including QoS 2 exchanges and connections that continue the session. A QoS 1 or 2
 /// message that exhausts either bound ends the connection; see [Subscribe#bufferCapacity()].
 /// Connection loss alone does not release a push delivery's capacity in a continued session.
 /// Acknowledgement never releases a running handler's capacity.
 public enum AckMode {
 
-    /// Immediately before invoking the handler, or when a pull receive hands off the delivery.
-    /// The default for a pull subscription. Does not wait for application processing, and a
-    /// handler failure does not withdraw it; see [FailurePolicy].
+    /// Immediately before invoking the handler, when a pull receive hands off the delivery, or
+    /// when a hand-off subscription's acceptor accepts it. The default for pull and hand-off
+    /// subscriptions. Does not wait for application processing, and a handler failure does not
+    /// withdraw it; see [FailurePolicy].
     ON_RECEIVE,
 
     /// After the handler returns normally. The default for a subscription with a handler;
-    /// rejected for pull subscriptions.
+    /// rejected for pull and hand-off subscriptions.
     AFTER_HANDLER,
 
     /// When the application calls [MqttDelivery#ack()]. Call it for every delivery; it has no

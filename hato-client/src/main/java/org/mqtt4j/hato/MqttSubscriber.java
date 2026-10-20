@@ -131,7 +131,11 @@ public interface MqttSubscriber {
     /// there for the termination of this subscription or the client never ends.
     ///
     /// [AckMode#ON_RECEIVE], the default, acknowledges a QoS 1 or 2 delivery when it is accepted.
-    /// [AckMode#AFTER_HANDLER] and [AckMode#MANUAL] throw [IllegalArgumentException].
+    /// With [AckMode#MANUAL], the application calls [MqttDelivery#ack()] once it has processed
+    /// the delivery, even before the acceptor returns; a call made before a refusal or a failure
+    /// has no effect. The capacity still returns at acceptance, and the open acknowledgement
+    /// holds back later ones as [AckMode] describes. [AckMode#AFTER_HANDLER] throws
+    /// [IllegalArgumentException], because the client cannot see when processing ends.
     ///
     /// [Subscription#close()], [Subscription#unsubscribe()], and closing the client end new
     /// hand-offs; `unsubscribe()` first hands off the deliveries it already accepted. A call that

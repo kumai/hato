@@ -91,17 +91,19 @@ public final class Subscribe {
     }
 
     /// When this subscription permits acknowledgement of a QoS 1 or 2 delivery. Empty uses the
-    /// default: [AckMode#AFTER_HANDLER] with a handler, or [AckMode#ON_RECEIVE] for pull
-    /// subscriptions.
+    /// default: [AckMode#AFTER_HANDLER] with a handler, or [AckMode#ON_RECEIVE] for pull and
+    /// hand-off subscriptions.
     public Optional<AckMode> ackMode() {
         return Optional.ofNullable(ackMode);
     }
 
     /// The maximum number of local deliveries this subscription holds at once. Pull subscriptions
     /// count queued deliveries and QoS 1/2 MANUAL deliveries awaiting ack; ON_RECEIVE and QoS 0
-    /// release the slot at handoff. Push subscriptions also count running handlers and deliveries
-    /// whose PUBACK or PUBREC is pending; see [AckMode]. The client also bounds deliveries and
-    /// bytes held across all of its subscriptions.
+    /// release the slot at handoff. Hand-off subscriptions count deliveries waiting for their
+    /// acceptor and release the slot when it accepts one, in either acknowledgement mode. Push
+    /// subscriptions also count running handlers and deliveries whose PUBACK or PUBREC is
+    /// pending; see [AckMode]. The client also bounds deliveries and bytes held across all of its
+    /// subscriptions.
     ///
     /// What happens beyond these bounds depends on the QoS of the received message, which can
     /// exceed the requested one when another subscription of the client also matches. A QoS 0

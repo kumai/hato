@@ -374,7 +374,7 @@ final class DeliveryLanes {
             }
             if (preserveSession) {
                 for (RetainedDelivery delivery : acknowledging.values()) {
-                    for (DeliveryView view : List.copyOf(delivery.views)) {
+                    for (DeliveryView view : trackedViews(delivery)) {
                         if (!view.valid || (stopped && !view.recipient.ready)) {
                             view.released = true;
                             invalidate(view);
@@ -452,13 +452,26 @@ final class DeliveryLanes {
         readyTokens.clear();
     }
 
+    /// Caller holds lock. A retired receipt meets no acknowledgement condition, so a late ack()
+    /// completes nothing. Every view's ack() is still detached, including accepted hand-off
+    /// views that returned their capacity already: a delivery the application keeps after its
+    /// receipt ends must not keep the client's lanes reachable through it.
     private void retire(RetainedDelivery delivery) {
         delivery.retired = true;
-        for (DeliveryView view : List.copyOf(delivery.views)) {
+        for (DeliveryView view : trackedViews(delivery)) {
             view.acknowledgement = null;
             view.released = true;
             releaseView(view);
         }
+        delivery.accepted.clear();
+    }
+
+    /// Caller holds lock. A copy of the views whose acknowledgement condition the receipt still
+    /// tracks: those that hold capacity, and accepted hand-off views, which returned theirs.
+    private static List<DeliveryView> trackedViews(RetainedDelivery delivery) {
+        var tracked = new ArrayList<DeliveryView>(delivery.views);
+        tracked.addAll(delivery.accepted);
+        return tracked;
     }
 
     /// Admits a received publication to its matching lanes. Returns false when it does not fit
@@ -1172,6 +1185,7 @@ final class DeliveryLanes {
                 view = lane.queue.removeFirst();
                 view.recipient.queued = false;
                 view.recipient.handed = true;
+                view.offered = true;
                 lane.accepting = true;
             } finally {
                 lock.unlock();
@@ -1223,6 +1237,7 @@ final class DeliveryLanes {
             fail(lane, view, failure, false);
             lock.lock();
             try {
+                view.offered = false;
                 finishAccepting(lane);
             } finally {
                 lock.unlock();
@@ -1239,15 +1254,22 @@ final class DeliveryLanes {
     }
 
     /// The acceptor took the delivery, and the application owns it from now on. An ON_RECEIVE
-    /// condition is met, and the delivery's capacity returns; its payload stays counted while
-    /// another subscription still holds the same message.
+    /// condition is met, and so is a MANUAL one that ack() met while the acceptor ran. The
+    /// delivery's capacity returns; its payload stays counted while another subscription still
+    /// holds the same message, and a MANUAL condition still open stays tracked.
     private void accept(Lane lane, DeliveryView view) {
         boolean ready;
         lock.lock();
         try {
+            view.offered = false;
             view.localDone = true;
-            ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
-            releaseView(view);
+            ready = (lane.ackMode == AckMode.ON_RECEIVE || view.ackedWhileOffered)
+                    && markReady(view);
+            if (holdsAcknowledgement(view)) {
+                keepAccepted(view);
+            } else {
+                releaseView(view);
+            }
             finishAccepting(lane);
         } finally {
             lock.unlock();
@@ -1268,6 +1290,7 @@ final class DeliveryLanes {
             Overflow overflow;
             lock.lock();
             try {
+                view.offered = false;
                 view.localDone = true;
                 overflow = overflow(lane, Dropped.REFUSED);
                 releaseView(view);
@@ -1279,6 +1302,7 @@ final class DeliveryLanes {
         } else {
             lock.lock();
             try {
+                view.offered = false;
                 view.localDone = true;
                 drop(lane, Dropped.REFUSED);
                 view.released = true;
@@ -1414,7 +1438,13 @@ final class DeliveryLanes {
         boolean ready;
         lock.lock();
         try {
+            if (view.offered) {
+                // The acceptor has not returned yet; its answer decides whether this ack counts.
+                view.ackedWhileOffered = true;
+                return;
+            }
             ready = markReady(view);
+            view.delivery.accepted.remove(view);
             releaseView(view);
         } finally {
             lock.unlock();
@@ -1452,6 +1482,7 @@ final class DeliveryLanes {
             }
             view.acknowledgement = null;
         }
+        view.delivery.accepted.remove(view);
         releaseView(view);
     }
 
@@ -1572,19 +1603,33 @@ final class DeliveryLanes {
     /// Push views retain capacity until both the handler and wire acknowledgement are released.
     private void releaseView(DeliveryView view) {
         Lane lane = view.lane;
-        RetainedDelivery delivery = view.delivery;
         if (lane != null && view.localDone
                 && (view.released || (lane.handler == null && view.recipient.ready))) {
-            view.lane = null;
             view.acknowledgement = null;
-            lane.retained--;
-            retainedDeliveries--;
-            // A fast pull recipient must not remain referenced by a slower overlapping one.
-            delivery.views.remove(view);
-            if (delivery.views.isEmpty()) {
-                retainedBytes -= delivery.bytes;
-                delivery.message = null;
-            }
+            returnCapacity(lane, view);
+        }
+    }
+
+    /// Caller holds lock. An accepted MANUAL hand-off delivery returns its capacity like any
+    /// accepted delivery, while its acknowledgement condition stays open: stops and retirement
+    /// find the view in the receipt's accepted list until ack() meets the condition.
+    private void keepAccepted(DeliveryView view) {
+        returnCapacity(requireNonNull(view.lane), view);
+        view.delivery.accepted.add(view);
+    }
+
+    /// Caller holds lock. The view leaves its lane's slot and the client's delivery slot, and the
+    /// payload once no other view holds it.
+    private void returnCapacity(Lane lane, DeliveryView view) {
+        RetainedDelivery delivery = view.delivery;
+        view.lane = null;
+        lane.retained--;
+        retainedDeliveries--;
+        // A fast pull recipient must not remain referenced by a slower overlapping one.
+        delivery.views.remove(view);
+        if (delivery.views.isEmpty()) {
+            retainedBytes -= delivery.bytes;
+            delivery.message = null;
         }
     }
 
@@ -1871,7 +1916,11 @@ final class DeliveryLanes {
         // Receipt metadata is bounded by the core's receipt limit and the 256 subscriptions.
         // Completed pull views leave only these IDs and conditions, without payload or lane.
         final Map<Long, Recipient> recipients = new LinkedHashMap<>();
+        // Views that hold capacity; the payload stays counted until the last of them leaves.
         final List<DeliveryView> views = new ArrayList<>(1);
+        // Accepted MANUAL hand-off views. They returned their capacity at acceptance, but their
+        // acknowledgement condition stays open until ack(), a stop, or retirement.
+        final List<DeliveryView> accepted = new ArrayList<>(0);
         @Nullable MqttMessage message;
         int pending;
         boolean retired;
@@ -1907,6 +1956,10 @@ final class DeliveryLanes {
         final DeliveryToken arrival;
         // Receive order across lanes, numbered when the copy is queued.
         long sequence;
+        // The hand-off worker is offering this view to its acceptor, so an ack() waits for the
+        // answer: acceptance meets the condition, and a refusal or failure drops the ack.
+        boolean offered;
+        boolean ackedWhileOffered;
         @Nullable Lane lane;
         volatile @Nullable Runnable acknowledgement;
         boolean localDone;
