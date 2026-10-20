@@ -13,7 +13,6 @@ import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
-import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
@@ -32,8 +31,6 @@ public final class HandOffToMailbox {
         try (MqttBroker broker = MqttBroker.start()) {
             MqttClient client = MqttClient.builder()
                     .server(URI.create("mqtt://localhost:" + broker.port()))
-                    // The embedded broker speaks MQTT 3.1.1.
-                    .version(MqttVersion.V3_1_1)
                     .build();
             // The application's own mailbox and the worker thread that processes it.
             var mailbox = new ArrayBlockingQueue<MqttDelivery>(1_000);

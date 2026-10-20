@@ -32,6 +32,8 @@ import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketIds;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
+import org.mqtt4j.hato.broker.internal.common.protocol.Property;
+import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.broker.internal.common.protocol.UnsupportedProtocolVersionException;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
@@ -45,9 +47,10 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final Log log = Log.of(BrokerServer.class);
 
-    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
-
-    private static final Set<MqttVersion> SUPPORTED_VERSIONS = EnumSet.of(MqttVersion.V3_1_1);
+    private static final Set<MqttVersion> SUPPORTED_VERSIONS = EnumSet.of(
+            MqttVersion.V3_1_1,
+            MqttVersion.V5
+    );
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
 
@@ -317,7 +320,14 @@ public final class BrokerServer implements AutoCloseable {
 
         private final String clientId;
 
-        private final boolean persistent;
+        // A session continues only with the protocol version that created it, so its deliveries
+        // are sized and encoded for one version.
+        private final MqttVersion version;
+
+        // Whether the session outlives its connection: Clean Session 0 in MQTT 3.1.1, or a
+        // positive Session Expiry Interval in MQTT 5.0. A connection that resumes the session
+        // sets it again from its own CONNECT.
+        private boolean kept;
 
         private final Map<TopicFilter, Qos> subscriptions = new HashMap<>();
 
@@ -342,9 +352,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private long pendingBytes;
 
-        private Session(String clientId, boolean persistent) {
+        private Session(String clientId, MqttVersion version, boolean kept) {
             this.clientId = clientId;
-            this.persistent = persistent;
+            this.version = version;
+            this.kept = kept;
         }
 
         private void deliver(Packet.Publish publication, Qos qos) {
@@ -353,10 +364,10 @@ public final class BrokerServer implements AutoCloseable {
                 detach(peer);
             }
             boolean online = connection != null;
-            if (!online && (!persistent || qos == Qos.AT_MOST_ONCE)) {
+            if (!online && (!kept || qos == Qos.AT_MOST_ONCE)) {
                 return;
             }
-            var delivery = new Delivery(publication, qos);
+            var delivery = new Delivery(publication, qos, version);
             // A frame that can never fit must not block the head indefinitely.
             if (delivery.byteCount > sendBytes
                     || (qos != Qos.AT_MOST_ONCE && delivery.byteCount > maxInflightBytes)) {
@@ -430,16 +441,11 @@ public final class BrokerServer implements AutoCloseable {
             if (!expected) {
                 throw new IOException("Acknowledgement does not match the outgoing QoS stage");
             }
-            inflight.remove(id);
-            deferred.remove(id);
-            packetIds.release(id);
-            if (outgoing instanceof Delivery delivery) {
-                inflightBytes -= delivery.byteCount;
-            }
+            end(id, outgoing);
             drain();
         }
 
-        private void release(int id) throws IOException {
+        private void release(int id, ReasonCode reason) throws IOException {
             Outgoing outgoing = inflight.get(id);
             if (outgoing == null) {
                 return;
@@ -451,15 +457,31 @@ public final class BrokerServer implements AutoCloseable {
                     if (delivery.qos != Qos.EXACTLY_ONCE) {
                         throw new IOException("PUBREC does not match the outgoing QoS stage");
                     }
-                    inflightBytes -= delivery.byteCount;
-                    var release = new Release(id);
-                    inflight.putLast(id, release);
-                    deferred.putLast(id, release);
+                    if (reason.value() >= 0x80) {
+                        // An MQTT 5.0 receiver that refuses the message ends the exchange here;
+                        // only a successful PUBREC leads to PUBREL.
+                        end(id, delivery);
+                    } else {
+                        inflightBytes -= delivery.byteCount;
+                        var release = new Release(id);
+                        inflight.putLast(id, release);
+                        deferred.putLast(id, release);
+                    }
                 }
                 // Duplicate PUBREC shares an unsent response without moving it behind later ids.
                 case Release release -> deferred.putIfAbsent(id, release);
             }
             drain();
+        }
+
+        // Forgets an outgoing exchange and returns its identifier and window share.
+        private void end(int id, Outgoing outgoing) {
+            inflight.remove(id);
+            deferred.remove(id);
+            packetIds.release(id);
+            if (outgoing instanceof Delivery delivery) {
+                inflightBytes -= delivery.byteCount;
+            }
         }
 
         private void detach(Connection peer) {
@@ -468,7 +490,7 @@ public final class BrokerServer implements AutoCloseable {
             }
             connection = null;
             deferred.clear();
-            if (!persistent) {
+            if (!kept) {
                 sessions.remove(clientId, this);
                 clear();
                 return;
@@ -523,22 +545,29 @@ public final class BrokerServer implements AutoCloseable {
 
         private final Qos qos;
 
+        // The publisher's properties reach MQTT 5.0 receivers unchanged; MQTT 3.1.1 has none.
+        private final Properties properties;
+
         private final int byteCount;
 
         private int packetId;
 
         private boolean sent;
 
-        private Delivery(Packet.Publish publication, Qos qos) {
+        private Delivery(Packet.Publish publication, Qos qos, MqttVersion version) {
             this.publication = publication;
             this.qos = qos;
-            byte[] encodedHeader = codec.encodePublishHeader(
+            properties = switch (version) {
+                case V3_1_1 -> Properties.EMPTY;
+                case V5 -> publication.properties();
+            };
+            byte[] encodedHeader = PacketCodec.of(version).encodePublishHeader(
                     publication.topic(),
                     qos,
                     false,
                     false,
                     (qos == Qos.AT_MOST_ONCE) ? 0 : 1,
-                    Properties.EMPTY,
+                    properties,
                     publication.payload().length
             );
             byteCount = encodedHeader.length + publication.payload().length;
@@ -553,7 +582,7 @@ public final class BrokerServer implements AutoCloseable {
                     false,
                     qos != Qos.AT_MOST_ONCE && sent,
                     packetId,
-                    Properties.EMPTY
+                    properties
             );
         }
     }
@@ -583,6 +612,10 @@ public final class BrokerServer implements AutoCloseable {
         private String clientId = "";
 
         // Remaining state is guarded by this connection's monitor.
+
+        // The version of the connection's CONNECT. Until CONNECT selects one, a refusal of an
+        // unsupported protocol level uses the MQTT 3.1.1 form, which every client can read.
+        private MqttVersion version = MqttVersion.V3_1_1;
 
         private boolean ended;
 
@@ -629,23 +662,26 @@ public final class BrokerServer implements AutoCloseable {
                     return;
                 }
                 received();
+                Packet.Connect request;
                 try {
-                    Packet.Connect request = PacketCodec.decodeConnect(
-                            first.get(),
-                            SUPPORTED_VERSIONS
-                    );
-                    beforeProcess.accept(request);
-                    writerCloses = !connect(request);
+                    request = PacketCodec.decodeConnect(first.get(), SUPPORTED_VERSIONS);
                 } catch (UnsupportedProtocolVersionException unsupported) {
                     refuse(
                             ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,
                             "protocol level " + unsupported.protocolLevel()
                     );
                     writerCloses = true;
+                    return;
                 }
+                synchronized (this) {
+                    version = request.version();
+                }
+                beforeProcess.accept(request);
+                writerCloses = !connect(request);
                 if (writerCloses) {
                     return;
                 }
+                PacketCodec codec = PacketCodec.of(request.version());
                 while (true) {
                     Optional<byte[]> bytes = reader.read();
                     if (bytes.isEmpty()) {
@@ -674,8 +710,19 @@ public final class BrokerServer implements AutoCloseable {
         }
 
         private boolean connect(Packet.Connect request) {
-            if (!request.cleanStart() && request.clientId().isEmpty()) {
+            // MQTT 3.1.1 refuses an empty identifier for a persistent session [MQTT-3.1.3-8];
+            // MQTT 5.0 assigns one below whatever the session.
+            if (request.version() == MqttVersion.V3_1_1
+                    && !request.cleanStart()
+                    && request.clientId().isEmpty()) {
                 refuse(ReasonCode.CLIENT_IDENTIFIER_NOT_VALID, "an empty persistent identifier");
+                return false;
+            }
+            if (request.properties().find(PropertyId.AUTHENTICATION_METHOD).isPresent()) {
+                refuse(
+                        ReasonCode.BAD_AUTHENTICATION_METHOD,
+                        "authentication for client '" + request.clientId() + "'"
+                );
                 return false;
             }
             if (request.will() != null) {
@@ -685,6 +732,14 @@ public final class BrokerServer implements AutoCloseable {
                 );
                 return false;
             }
+            boolean keep = switch (request.version()) {
+                case V3_1_1 -> !request.cleanStart();
+                // Only whether the interval is positive matters; sessions do not expire.
+                case V5 -> request.properties().find(PropertyId.SESSION_EXPIRY_INTERVAL)
+                        .filter(interval -> interval instanceof Property.FourByteValue value
+                                && value.value() > 0)
+                        .isPresent();
+            };
             String id;
             synchronized (routing) {
                 Connection previous;
@@ -706,9 +761,12 @@ public final class BrokerServer implements AutoCloseable {
                     }
                     Session existing = sessions.get(id);
                     boolean present = !request.cleanStart()
-                            && existing != null && existing.persistent;
-                    if (!request.cleanStart() && !present
-                            && sessions.values().stream().filter(value -> value.persistent).count()
+                            && existing != null
+                            && existing.kept
+                            && existing.version == request.version();
+                    // Resuming or replacing a kept session reuses its place in the limit.
+                    if (keep && (existing == null || !existing.kept)
+                            && sessions.values().stream().filter(value -> value.kept).count()
                             >= maxSessions) {
                         refuse(
                                 ReasonCode.SERVER_UNAVAILABLE,
@@ -722,17 +780,26 @@ public final class BrokerServer implements AutoCloseable {
                         if (previous != null) {
                             accepted.detach(previous);
                         }
+                        accepted.kept = keep;
                     } else {
                         if (existing != null) {
                             existing.clear();
                         }
-                        accepted = new Session(id, !request.cleanStart());
+                        accepted = new Session(id, request.version(), keep);
                         sessions.put(id, accepted);
                     }
                     clientId = id;
                     session = accepted;
                     accepted.connection = this;
-                    enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, Properties.EMPTY));
+                    Properties properties = Properties.EMPTY;
+                    if (request.version() == MqttVersion.V5 && request.clientId().isEmpty()) {
+                        // Only MQTT 5.0 can tell a client the identifier assigned to it.
+                        properties = new Properties(List.of(new Property.StringValue(
+                                PropertyId.ASSIGNED_CLIENT_IDENTIFIER,
+                                id
+                        )));
+                    }
+                    enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, properties));
                 }
                 // Do not hold the new peer's monitor while closing the old peer.
                 if (previous != null) {
@@ -783,10 +850,35 @@ public final class BrokerServer implements AutoCloseable {
                     send(new Packet.SubAck(request.packetId(), grants, Properties.EMPTY));
                 }
                 case Packet.Unsubscribe request -> {
-                    request.filters().forEach(owner.subscriptions::remove);
-                    send(new Packet.UnsubAck(request.packetId(), List.of(), Properties.EMPTY));
+                    var results = new ArrayList<ReasonCode>();
+                    for (TopicFilter filter : request.filters()) {
+                        boolean existed = owner.subscriptions.remove(filter) != null;
+                        results.add(
+                                existed ? ReasonCode.SUCCESS : ReasonCode.NO_SUBSCRIPTION_EXISTED
+                        );
+                    }
+                    // MQTT 3.1.1 UNSUBACK carries no results.
+                    List<ReasonCode> reasonCodes = switch (owner.version) {
+                        case V3_1_1 -> List.of();
+                        case V5 -> results;
+                    };
+                    send(new Packet.UnsubAck(request.packetId(), reasonCodes, Properties.EMPTY));
                 }
                 case Packet.Publish publish -> {
+                    // The broker announces no Topic Alias Maximum, so no alias is valid, and only
+                    // a server sets Subscription Identifiers. MQTT 3.1.1 has no properties.
+                    if (publish.properties().find(PropertyId.TOPIC_ALIAS).isPresent()) {
+                        throw new PacketDecodeException(
+                                ReasonCode.TOPIC_ALIAS_INVALID,
+                                "Topic Alias without an announced maximum"
+                        );
+                    }
+                    if (publish.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
+                        throw new PacketDecodeException(
+                                ReasonCode.PROTOCOL_ERROR,
+                                "Subscription Identifier from a client"
+                        );
+                    }
                     if (publish.qos() == Qos.EXACTLY_ONCE) {
                         if (owner.received.get(publish.packetId())) {
                             send(new Packet.PubRec(
@@ -832,22 +924,29 @@ public final class BrokerServer implements AutoCloseable {
                     }
                 }
                 case Packet.PubAck ack -> owner.acknowledge(ack.packetId(), false);
-                case Packet.PubRec ack -> owner.release(ack.packetId());
+                case Packet.PubRec ack -> owner.release(ack.packetId(), ack.reasonCode());
                 case Packet.PubRel ack -> {
                     owner.received.clear(ack.packetId());
                     send(new Packet.PubComp(ack.packetId(), ReasonCode.SUCCESS, Properties.EMPTY));
                 }
                 case Packet.PubComp ack -> owner.acknowledge(ack.packetId(), true);
                 case Packet.PingReq _ -> send(new Packet.PingResp());
-                case Packet.Disconnect _ -> close("client sent DISCONNECT");
+                case Packet.Disconnect disconnect -> close(
+                        disconnect.reasonCode() == ReasonCode.SUCCESS
+                                ? "client sent DISCONNECT"
+                                : "client sent DISCONNECT with " + disconnect.reasonCode()
+                );
+                case Packet.AliasPublish _ -> throw new PacketDecodeException(
+                        ReasonCode.TOPIC_ALIAS_INVALID,
+                        "Topic Alias without an announced maximum"
+                );
                 // Name only the type; the INFO end log must not carry fields such as AUTH data.
                 case Packet.Connect _,
                      Packet.ConnAck _,
                      Packet.SubAck _,
                      Packet.UnsubAck _,
                      Packet.PingResp _,
-                     Packet.Auth _,
-                     Packet.AliasPublish _ -> throw new IOException(
+                     Packet.Auth _ -> throw new IOException(
                              "Unexpected " + packet.getClass().getSimpleName() + " packet"
                      );
             }
@@ -863,7 +962,7 @@ public final class BrokerServer implements AutoCloseable {
                     ? SendQueue.OfferResult.ACCEPTED
                     : outgoing.checkCapacity(delivery.byteCount, false);
             if (result == SendQueue.OfferResult.ACCEPTED) {
-                byte[] bytes = codec.encode(message.packet());
+                byte[] bytes = PacketCodec.of(version).encode(message.packet());
                 result = outgoing.offer(
                         ++ticket,
                         new Outbound(bytes, delivery),
@@ -894,7 +993,7 @@ public final class BrokerServer implements AutoCloseable {
             if (ended) {
                 return false;
             }
-            byte[] bytes = codec.encode(packet);
+            byte[] bytes = PacketCodec.of(version).encode(packet);
             boolean enqueueFailed = outgoing.offer(
                     ++ticket,
                     new Outbound(bytes, null),

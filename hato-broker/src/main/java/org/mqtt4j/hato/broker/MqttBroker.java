@@ -6,7 +6,7 @@ import java.net.InetSocketAddress;
 
 import org.mqtt4j.hato.broker.internal.BrokerServer;
 
-/// An experimental, in-memory MQTT 3.1.1 broker for tests.
+/// An experimental, in-memory MQTT 3.1.1 and 5.0 broker for tests.
 ///
 /// Each start creates an independent broker. Clean Session true and false and QoS 0/1/2
 /// publications are supported. A persistent session retains subscriptions, unacknowledged
@@ -24,6 +24,17 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// an empty identifier with Clean Session false is refused with Identifier rejected.
 /// Retained publications are forwarded to current subscribers but are not stored.
 /// Credentials are not checked. `$share/` filters are matched literally, without shared routing.
+///
+/// MQTT 5.0 support covers what client tests need. A positive Session Expiry Interval makes a
+/// session persistent, as Clean Session false does, but the session never expires; Clean Start
+/// false resumes it. A session resumes only with the protocol version that created it. An empty
+/// client identifier is assigned and returned in CONNACK. Publication properties reach MQTT 5.0
+/// subscribers unchanged and are dropped for MQTT 3.1.1 subscribers; Message Expiry Interval is
+/// not counted down. CONNACK announces no limits, and the broker ignores the client's Receive
+/// Maximum and Maximum Packet Size, subscription options other than QoS, and Subscription
+/// Identifiers. An Authentication Method is refused with Bad authentication method. AUTH, or a
+/// PUBLISH with a Topic Alias or a Subscription Identifier, closes the connection. A PUBREC with
+/// a failure reason code ends the QoS 2 delivery without PUBREL.
 ///
 /// QoS 1/2 deliveries wait when unacknowledged deliveries reach their count or size limit.
 /// Deliveries also wait while a subscriber's connection is slow to accept data. The number and

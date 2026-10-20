@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
-import java.util.HexFormat;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -14,7 +13,6 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
-import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
@@ -75,44 +73,6 @@ class BrokerConnectionTest {
             assertThat(client.expect(Packet.ConnAck.class)).isEqualTo(new Packet.ConnAck(
                     false, ReasonCode.UNSUPPORTED_PROTOCOL_VERSION, EMPTY
             ));
-            client.expectClosed();
-        }
-    }
-
-    @Test
-    void mqtt_5_connect_is_refused_until_the_broker_supports_it() throws Exception {
-        // The common codec accepts MQTT 5.0, but the broker still speaks MQTT 3.1.1.
-        byte[] bytes = PacketCodec.of(MqttVersion.V5).encode(
-                new Packet.Connect(
-                        "unsupported-version",
-                        MqttVersion.V5,
-                        true,
-                        0,
-                        null,
-                        null,
-                        null,
-                        EMPTY
-                )
-        );
-        try (var sut = MqttBroker.start(); var client = RawSession.open(sut.port())) {
-            client.sendRaw(bytes);
-            assertThat(client.expect(Packet.ConnAck.class)).isEqualTo(
-                    new Packet.ConnAck(false, ReasonCode.UNSUPPORTED_PROTOCOL_VERSION, EMPTY)
-            );
-            client.expectClosed();
-        }
-    }
-
-    @Test
-    void mqtt_5_connect_is_refused_by_level_even_when_its_body_is_malformed() throws Exception {
-        // [MQTT-3.1.2-2]: the Remaining Length below is not minimally encoded, which only the
-        // MQTT 5.0 codec rejects; the version refusal must come first.
-        byte[] bytes = HexFormat.of().parseHex("108e0000044d5154540502003c00000163");
-        try (var sut = MqttBroker.start(); var client = RawSession.open(sut.port())) {
-            client.sendRaw(bytes);
-            assertThat(client.expect(Packet.ConnAck.class)).isEqualTo(
-                    new Packet.ConnAck(false, ReasonCode.UNSUPPORTED_PROTOCOL_VERSION, EMPTY)
-            );
             client.expectClosed();
         }
     }

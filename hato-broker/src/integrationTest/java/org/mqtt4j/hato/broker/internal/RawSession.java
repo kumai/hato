@@ -18,6 +18,9 @@ import org.mqtt4j.hato.broker.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.broker.internal.common.io.TcpConnection;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
+import org.mqtt4j.hato.broker.internal.common.protocol.Property;
+import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
@@ -31,28 +34,39 @@ import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.SUCCESS;
 
 /// One raw connection using the broker's embedded codec, as in the common Mosquitto tests.
+/// It speaks the version it was opened with, MQTT 3.1.1 unless chosen otherwise.
 /// Every blocking read has a deadline and closes the connection when it expires.
 final class RawSession implements AutoCloseable {
 
+    /// The MQTT 3.1.1 codec, for tests that build or measure raw packets.
     static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
     private static final Duration READ_TIMEOUT = Duration.ofSeconds(5);
 
     private final TcpConnection connection;
+    private final MqttVersion version;
     private final FrameReader reader;
     private final FrameWriter writer;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
-    private RawSession(TcpConnection connection) {
+    private RawSession(TcpConnection connection, MqttVersion version) {
         this.connection = connection;
+        this.version = version;
         reader = new FrameReader(connection.input(), 1024 * 1024);
         writer = new FrameWriter(connection.output());
     }
 
     static RawSession open(int port) throws IOException {
-        return new RawSession(TcpConnection.connect(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), port),
-                Duration.ofSeconds(5)
-        ));
+        return open(port, MqttVersion.V3_1_1);
+    }
+
+    static RawSession open(int port, MqttVersion version) throws IOException {
+        return new RawSession(
+                TcpConnection.connect(
+                        new InetSocketAddress(InetAddress.getLoopbackAddress(), port),
+                        Duration.ofSeconds(5)
+                ),
+                version
+        );
     }
 
     static RawSession connected(int port, String clientId) throws Exception {
@@ -80,6 +94,52 @@ final class RawSession implements AutoCloseable {
     static Packet.Connect connect(String clientId, boolean cleanSession, int keepAlive) {
         return new Packet.Connect(
                 clientId, MqttVersion.V3_1_1, cleanSession, keepAlive, null, null, null, EMPTY
+        );
+    }
+
+    /// An MQTT 5.0 session that starts clean and ends with its connection.
+    static RawSession connectedV5(int port, String clientId) throws Exception {
+        return connectedV5(port, clientId, true, 0, false);
+    }
+
+    static RawSession connectedV5(
+            int port,
+            String clientId,
+            boolean cleanStart,
+            long sessionExpiry,
+            boolean sessionPresent
+    ) throws Exception {
+        RawSession session = open(port, MqttVersion.V5);
+        try {
+            session.send(connectV5(clientId, cleanStart, 0, sessionExpiry));
+            assertThat(session.expect(Packet.ConnAck.class))
+                    .isEqualTo(new Packet.ConnAck(sessionPresent, SUCCESS, EMPTY));
+            return session;
+        } catch (Exception | AssertionError failure) {
+            session.close();
+            throw failure;
+        }
+    }
+
+    /// An MQTT 5.0 CONNECT; a positive `sessionExpiry` keeps the session after the connection.
+    static Packet.Connect connectV5(
+            String clientId,
+            boolean cleanStart,
+            int keepAlive,
+            long sessionExpiry
+    ) {
+        Properties properties = sessionExpiry == 0 ? EMPTY : new Properties(List.of(
+                new Property.FourByteValue(PropertyId.SESSION_EXPIRY_INTERVAL, sessionExpiry)
+        ));
+        return new Packet.Connect(
+                clientId,
+                MqttVersion.V5,
+                cleanStart,
+                keepAlive,
+                null,
+                null,
+                null,
+                properties
         );
     }
 
@@ -131,7 +191,7 @@ final class RawSession implements AutoCloseable {
     }
 
     void send(Packet packet) throws IOException {
-        sendRaw(codec.encode(packet));
+        sendRaw(PacketCodec.of(version).encode(packet));
     }
 
     void sendRaw(byte[] bytes) throws IOException {
@@ -142,7 +202,7 @@ final class RawSession implements AutoCloseable {
         byte[] frame = nextFrame(READ_TIMEOUT).orElseThrow(() -> new AssertionError(
                 "The broker closed the connection instead of sending " + type.getSimpleName()
         ));
-        Packet packet = codec.decode(frame);
+        Packet packet = PacketCodec.of(version).decode(frame);
         assertThat(packet).isInstanceOf(type);
         return type.cast(packet);
     }

@@ -8,7 +8,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.testcontainers.DockerClientFactory;
 import org.testcontainers.Testcontainers;
 import org.testcontainers.containers.Container;
@@ -30,9 +30,17 @@ class MosquittoClientTest {
         return Mosquitto.availableOrRequired();
     }
 
-    @ParameterizedTest
-    @ValueSource(ints = {0, 1, 2})
-    void independent_mosquitto_clients_exchange_the_requested_qos(int qos) throws Exception {
+    @ParameterizedTest(name = "{0} QoS {1}")
+    @CsvSource({
+            "mqttv311, 0",
+            "mqttv311, 1",
+            "mqttv311, 2",
+            "mqttv5, 0",
+            "mqttv5, 1",
+            "mqttv5, 2"
+    })
+    void independent_mosquitto_clients_exchange_the_requested_qos(String version, int qos)
+            throws Exception {
         // Arrange
         try (
                 var sut = MqttBroker.start();
@@ -53,7 +61,7 @@ class MosquittoClientTest {
                             "-p",
                             port,
                             "-V",
-                            "mqttv311",
+                            version,
                             "-q",
                             level,
                             "-t",
@@ -84,7 +92,7 @@ class MosquittoClientTest {
                         assertThat(output.toString()).contains("Subscribed (mid: 1): " + qos));
 
                 // Act
-                publish(clientTools, port, level, topic, "independent exchange");
+                publish(clientTools, version, port, level, topic, "independent exchange");
 
                 // Assert
                 assertThat(callback.awaitCompletion(10, SECONDS)).isTrue();
@@ -95,10 +103,12 @@ class MosquittoClientTest {
         }
     }
 
-    @ParameterizedTest
-    @ValueSource(ints = {1, 2})
-    void independent_mosquitto_client_resumes_queued_qos_one_and_two_deliveries(int qos)
-            throws Exception {
+    @ParameterizedTest(name = "{0} QoS {1}")
+    @CsvSource({"mqttv311, 1", "mqttv311, 2", "mqttv5, 1", "mqttv5, 2"})
+    void independent_mosquitto_client_resumes_queued_qos_one_and_two_deliveries(
+            String version,
+            int qos
+    ) throws Exception {
         // Arrange
         try (
                 var sut = MqttBroker.start();
@@ -116,6 +126,7 @@ class MosquittoClientTest {
                     for (int publishedQos : List.of(1, 2)) {
                         publish(
                                 clientTools,
+                                version,
                                 port,
                                 Integer.toString(publishedQos),
                                 topic,
@@ -132,7 +143,7 @@ class MosquittoClientTest {
                                 "-p",
                                 port,
                                 "-V",
-                                "mqttv311",
+                                version,
                                 "-c",
                                 "-i",
                                 "persistent-subscriber",
@@ -164,7 +175,7 @@ class MosquittoClientTest {
                         await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                                 assertThat(output.toString())
                                         .contains("Subscribed (mid: 1): " + qos));
-                        publish(clientTools, port, level, topic, "registered");
+                        publish(clientTools, version, port, level, topic, "registered");
                     }
                     assertThat(callback.awaitCompletion(10, SECONDS)).isTrue();
                     assertThat(docker.inspectExecCmd(subscription).exec().getExitCodeLong())
@@ -185,6 +196,7 @@ class MosquittoClientTest {
     /// Publishes `message` with the image's `mosquitto_pub` and checks that the command succeeded.
     private static void publish(
             GenericContainer<?> clientTools,
+            String version,
             String port,
             String qos,
             String topic,
@@ -197,7 +209,7 @@ class MosquittoClientTest {
                 "-p",
                 port,
                 "-V",
-                "mqttv311",
+                version,
                 "-q",
                 qos,
                 "-t",
