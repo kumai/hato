@@ -105,6 +105,22 @@ they use, such as a database connection or an injected `TimerScheduler`.
 Use `Qos.EXACTLY_ONCE` in the [publishing example](../README.md#publishing)
 to publish at QoS 2.
 
+With MQTT 5.0, a message can also carry properties, such as a content type, a lifetime, and
+name-value pairs of your own:
+
+```java
+MqttMessage reading = MqttMessage.of(topic, payload, Qos.AT_LEAST_ONCE, false)
+        .withPayloadUtf8(true)
+        .withContentType("application/json")
+        .withMessageExpiry(Duration.ofMinutes(5))
+        .withUserProperties(List.of(new UserProperty("site", "plant-3")));
+```
+
+Subscribers read them from the received message, for example with `contentType()`. For a
+request that expects a reply, set `withResponseTopic(...)` and `withCorrelationData(...)`.
+MQTT 3.1.1 has no properties, so an MQTT 3.1.1 client refuses to publish a message that has
+any.
+
 ## Managing subscriptions
 
 ```java
