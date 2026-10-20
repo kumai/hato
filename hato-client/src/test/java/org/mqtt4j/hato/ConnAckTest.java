@@ -1,11 +1,14 @@
 package org.mqtt4j.hato;
 
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
 class ConnAckTest {
 
@@ -30,5 +33,63 @@ class ConnAckTest {
     @Test
     void attempt_numbers_start_at_one() {
         assertThatIllegalArgumentException().isThrownBy(() -> ConnAck.of(false, 0));
+    }
+
+    @Test
+    void a_broker_without_announced_limits_allows_what_mqtt_allows() {
+        // Act
+        var sut = ConnAck.of(false, 1);
+
+        // Assert
+        assertThat(sut.maximumQos()).isEqualTo(Qos.EXACTLY_ONCE);
+        assertThat(sut.retainAvailable()).isTrue();
+        assertThat(sut.wildcardSubscriptionAvailable()).isTrue();
+        assertThat(sut.sharedSubscriptionAvailable()).isTrue();
+        assertThat(sut.maximumPacketSize()).isEqualTo(268_435_460);
+    }
+
+    @Test
+    void preserves_announced_limits_and_compares_them_by_value() {
+        // Act
+        var sut = ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, false, true, 1024);
+
+        // Assert
+        assertThat(sut.maximumQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+        assertThat(sut.retainAvailable()).isFalse();
+        assertThat(sut.wildcardSubscriptionAvailable()).isFalse();
+        assertThat(sut.sharedSubscriptionAvailable()).isTrue();
+        assertThat(sut.maximumPacketSize()).isEqualTo(1024);
+        var same = ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, false, true, 1024);
+        assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same);
+        assertThat(List.of(
+                ConnAck.of(true, 2, Qos.EXACTLY_ONCE, false, false, true, 1024),
+                ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, true, false, true, 1024),
+                ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, true, true, 1024),
+                ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, false, false, 1024),
+                ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, false, true, 1025)
+        )).doesNotContain(sut);
+        assertThat(sut.toString()).contains(
+                "maximumQos=AT_LEAST_ONCE",
+                "retainAvailable=false",
+                "wildcardSubscriptionAvailable=false",
+                "sharedSubscriptionAvailable=true",
+                "maximumPacketSize=1024"
+        );
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 268_435_461})
+    void packet_sizes_outside_what_mqtt_carries_are_rejected(int size) {
+        assertThatIllegalArgumentException().isThrownBy(
+                () -> ConnAck.of(false, 1, Qos.EXACTLY_ONCE, true, true, true, size)
+        );
+    }
+
+    @Test
+    @SuppressWarnings("NullAway") // Deliberately violates the non-null contract.
+    void the_maximum_qos_cannot_be_null() {
+        assertThatNullPointerException().isThrownBy(
+                () -> ConnAck.of(false, 1, null, true, true, true, 1024)
+        );
     }
 }

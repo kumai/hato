@@ -36,6 +36,21 @@ class PropertiesTest {
     }
 
     @Test
+    void finds_the_first_property_with_an_identifier() {
+        var first = new Property.UserProperty("key", "first");
+        var keepAlive = new Property.TwoByteValue(PropertyId.SERVER_KEEP_ALIVE, 30);
+        var sut = new Properties(List.of(
+                first,
+                keepAlive,
+                new Property.UserProperty("key", "second")
+        ));
+
+        assertThat(sut.find(PropertyId.USER_PROPERTY)).contains(first);
+        assertThat(sut.find(PropertyId.SERVER_KEEP_ALIVE)).contains(keepAlive);
+        assertThat(sut.find(PropertyId.REASON_STRING)).isEmpty();
+    }
+
+    @Test
     void user_property_names_and_values_can_be_empty() {
         var sut = new Property.UserProperty("", "");
 

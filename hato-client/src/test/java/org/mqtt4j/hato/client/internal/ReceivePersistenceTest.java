@@ -35,6 +35,8 @@ import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -45,21 +47,37 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 class ReceivePersistenceTest {
 
     private final RecordingPort port = new RecordingPort();
-    private final SessionCore sut = new SessionCore(
-            port,
-            "client",
-            Duration.ofSeconds(30),
-            Duration.ZERO,
-            MqttVersion.V3_1_1,
-            Duration.ofHours(1),
-            null,
-            false,
-            ReconnectBackoff.disabled(),
-            false,
-            Duration.ofSeconds(60)
-    );
+    private SessionCore sut = core(MqttVersion.V3_1_1);
     private long nextOperation;
     private long generation;
+
+    @Test
+    void an_mqtt_5_reconnection_announces_only_the_room_that_carried_over_receptions_leave() {
+        // Arrange: an MQTT 5.0 session whose handlers still hold two receptions when its
+        // connection ends.
+        sut = core(MqttVersion.V5);
+        connectedWithSubscription();
+        receive(7, false);
+        receive(8, false);
+        sut.failed(generation, new IOException("lost"));
+
+        // Act
+        connect(true);
+
+        // Assert
+        List<Packet.Connect> connects = port.sent.stream()
+                .map(Sent::packet)
+                .filter(Packet.Connect.class::isInstance)
+                .map(Packet.Connect.class::cast)
+                .toList();
+        assertThat(connects).extracting(connect -> connect.properties()
+                        .find(PropertyId.RECEIVE_MAXIMUM)
+                        .orElseThrow())
+                .containsExactly(
+                        new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4096),
+                        new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4094)
+                );
+    }
 
     @Test
     void offline_readiness_waits_for_a_retransmission_on_the_new_connection() {
@@ -522,6 +540,23 @@ class ReceivePersistenceTest {
         assertThat(sut.state()).isEqualTo(present ? DISCONNECTED : CONNECTED);
         assertThat(port.ends).containsExactlyElementsOf(expectedEnds);
         assertThat(acknowledgedIds()).isEqualTo(receiveOrder);
+    }
+
+    private SessionCore core(MqttVersion version) {
+        return new SessionCore(
+                port,
+                "client",
+                Duration.ofSeconds(30),
+                Duration.ZERO,
+                version,
+                Duration.ofHours(1),
+                16 * 1024 * 1024,
+                null,
+                false,
+                ReconnectBackoff.disabled(),
+                false,
+                Duration.ofSeconds(60)
+        );
     }
 
     private void connectedWithSubscription() {

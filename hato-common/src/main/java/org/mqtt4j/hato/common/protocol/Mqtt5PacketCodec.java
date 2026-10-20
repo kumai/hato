@@ -123,7 +123,7 @@ final class Mqtt5PacketCodec implements PacketCodec {
             case Packet.Auth p -> {
                 type = PacketType.AUTH;
                 if ((p.reasonCode() != SUCCESS || !p.properties().isEmpty())
-                        && !hasProperty(p.properties(), PropertyId.AUTHENTICATION_METHOD)) {
+                        && p.properties().find(PropertyId.AUTHENTICATION_METHOD).isEmpty()) {
                     throw new IllegalArgumentException("AUTH requires Authentication Method");
                 }
                 writeOptionalReason(body, p.reasonCode(), p.properties(), type);
@@ -373,7 +373,7 @@ final class Mqtt5PacketCodec implements PacketCodec {
         var payload = new byte[input.remaining()];
         input.get(payload);
         if (topicName.isEmpty()) {
-            if (!hasProperty(properties, PropertyId.TOPIC_ALIAS)) {
+            if (properties.find(PropertyId.TOPIC_ALIAS).isEmpty()) {
                 throw new PacketDecodeException(PROTOCOL_ERROR, "Empty topic requires Topic Alias");
             }
             return new Packet.AliasPublish(
@@ -522,7 +522,7 @@ final class Mqtt5PacketCodec implements PacketCodec {
         }
         ReasonCode reason = readReason(input, PacketType.AUTH);
         Properties properties = Mqtt5Properties.read(input, PacketType.AUTH);
-        if (!hasProperty(properties, PropertyId.AUTHENTICATION_METHOD)) {
+        if (properties.find(PropertyId.AUTHENTICATION_METHOD).isEmpty()) {
             throw new PacketDecodeException(PROTOCOL_ERROR, "AUTH requires Authentication Method");
         }
         return new Packet.Auth(reason, properties);
@@ -615,12 +615,8 @@ final class Mqtt5PacketCodec implements PacketCodec {
         }
     }
 
-    private static boolean hasProperty(Properties properties, PropertyId id) {
-        return properties.entries().stream().anyMatch(p -> p.id() == id);
-    }
-
     private static void requireTopicAlias(Properties properties) {
-        if (!hasProperty(properties, PropertyId.TOPIC_ALIAS)) {
+        if (properties.find(PropertyId.TOPIC_ALIAS).isEmpty()) {
             throw new IllegalArgumentException("Empty topic requires Topic Alias");
         }
     }

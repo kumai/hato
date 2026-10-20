@@ -231,8 +231,6 @@ final class SessionCore {
 
     private final Duration timeout;
 
-    private final Duration keepAlive;
-
     private final Duration responseTimeout;
 
     // Zero session expiry starts a new session with every connection.
@@ -292,6 +290,7 @@ final class SessionCore {
             Duration keepAlive,
             MqttVersion version,
             Duration sessionExpiry,
+            int maxPacketSize,
             Packet.@Nullable Will will,
             boolean credentialsRequired,
             ReconnectBackoff backoff,
@@ -301,7 +300,6 @@ final class SessionCore {
         this.port = port;
         this.clientId = clientId;
         this.timeout = timeout;
-        this.keepAlive = keepAlive;
         this.responseTimeout = responseTimeout;
         cleanStart = sessionExpiry.isZero();
         this.credentialsRequired = credentialsRequired;
@@ -312,6 +310,7 @@ final class SessionCore {
                 version,
                 keepAlive,
                 sessionExpiry,
+                maxPacketSize,
                 will
         );
         var context = new PartContext();
@@ -453,7 +452,12 @@ final class SessionCore {
     private void sendConnect() {
         if (current.transportConnected && credentialsReady && !current.connectSent) {
             current.connectSent = true;
-            sendRequired(++nextTicket, establishment.connect(current.step, attemptCredentials));
+            sendRequired(++nextTicket, establishment.connect(
+                    current.step,
+                    attemptCredentials,
+                    session.established,
+                    receptions.room()
+            ));
         }
     }
 
@@ -472,10 +476,16 @@ final class SessionCore {
             } else if (!(packet instanceof Packet.ConnAck ack)) {
                 failed(connection, protocolError("Expected CONNACK"));
             } else {
-                switch (establishment.accept(ack, current.step, session.established)) {
+                switch (establishment.accept(
+                        ack,
+                        current.step,
+                        session.established,
+                        request.attempt()
+                )) {
                     case Outcome.Failed(var cause) -> failed(connection, cause);
                     case Outcome.Abandoned(var refusal) -> abandon(refusal);
-                    case Outcome.Established(var sessionPresent) -> establish(sessionPresent, now);
+                    case Outcome.Established(var result, var keepAlive) ->
+                            establish(result, keepAlive, now);
                 }
             }
         } else if (packet instanceof Packet.PubAck ack) {
@@ -512,9 +522,11 @@ final class SessionCore {
         drainDeferred();
     }
 
-    /// Establishes the current connection after its successful CONNACK, which continues the
-    /// session when `sessionPresent` and otherwise starts a new one.
-    private void establish(boolean sessionPresent, long now) {
+    /// Establishes the current connection with `result`, which continues the session when it has
+    /// Session Present and otherwise starts a new one, and keeps the connection alive at
+    /// `keepAlive`.
+    private void establish(ConnAck result, Duration keepAlive, long now) {
+        boolean sessionPresent = result.sessionPresent();
         if (!sessionPresent) {
             discardSession();
             session.established = true;
@@ -528,8 +540,8 @@ final class SessionCore {
         if (state == State.CONNECTING) {
             state = State.CONNECTED;
         }
-        var result = ConnAck.of(sessionPresent, request.attempt());
         current.ack = result;
+        current.keepAlive = keepAlive;
         request.establish();
         port.admit(generation);
         // Reconcile before announcing, so connect() and onConnected already find continued
@@ -543,7 +555,7 @@ final class SessionCore {
             beginDisconnect();
         } else {
             completeConnections(result, null);
-            if (!keepAlive.isZero()) {
+            if (!current.keepAlive.isZero()) {
                 scheduleKeepAlive(now);
             }
             if (request.reconnects()) {
@@ -696,18 +708,18 @@ final class SessionCore {
             }
             case KEEP_ALIVE -> {
                 if (state == State.CONNECTED) {
-                    long remaining = keepAlive.toNanos() - (now - current.lastSent);
+                    long remaining = current.keepAlive.toNanos() - (now - current.lastSent);
                     if (current.awaitingPing) {
-                        port.schedule(generation, Timer.KEEP_ALIVE, keepAlive);
+                        port.schedule(generation, Timer.KEEP_ALIVE, current.keepAlive);
                     } else if (remaining > 0) {
                         port.schedule(generation, Timer.KEEP_ALIVE, Duration.ofNanos(remaining));
                     } else {
                         current.awaitingPing = true;
                         current.pingTicket = ++nextTicket;
                         // Include a stalled write in the deadline; otherwise it can wait forever.
-                        port.schedule(generation, Timer.PING, keepAlive);
+                        port.schedule(generation, Timer.PING, current.keepAlive);
                         if (sendRequired(current.pingTicket, new Packet.PingReq())) {
-                            port.schedule(generation, Timer.KEEP_ALIVE, keepAlive);
+                            port.schedule(generation, Timer.KEEP_ALIVE, current.keepAlive);
                         }
                     }
                 }
@@ -750,11 +762,8 @@ final class SessionCore {
     }
 
     private void scheduleKeepAlive(long now) {
-        port.schedule(
-                generation,
-                Timer.KEEP_ALIVE,
-                Duration.ofNanos(Math.max(0, keepAlive.toNanos() - (now - current.lastSent)))
-        );
+        long remaining = current.keepAlive.toNanos() - (now - current.lastSent);
+        port.schedule(generation, Timer.KEEP_ALIVE, Duration.ofNanos(Math.max(0, remaining)));
     }
 
     void disconnect(long operation) {
@@ -1112,6 +1121,9 @@ final class SessionCore {
 
         // Present once a successful CONNACK has established this connection.
         @Nullable ConnAck ack;
+        // Set with the CONNACK: the configured interval, or the broker's Server Keep Alive,
+        // which lasts for this connection only.
+        Duration keepAlive = Duration.ZERO;
         long stableDeadline;
         long pingTicket;
         long disconnectTicket;

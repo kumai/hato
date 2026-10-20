@@ -63,6 +63,11 @@ final class ReceiveTable {
         return List.copyOf(entries.values());
     }
 
+    /// How many more receptions the table can hold.
+    int room() {
+        return capacity - entries.size();
+    }
+
     /// Frees the identifier without releasing capacity held by an admitted acknowledgement.
     Optional<Entry> supersede(int packetId) {
         return Optional.ofNullable(identifiers.remove(packetId));

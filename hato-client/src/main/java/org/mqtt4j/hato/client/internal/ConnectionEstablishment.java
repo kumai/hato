@@ -1,15 +1,22 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.OptionalLong;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static org.mqtt4j.hato.client.internal.SessionCore.protocolError;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
@@ -21,10 +28,12 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// credentials, and whether this client object has started a session.
 final class ConnectionEstablishment {
 
-    /// The connections of one attempt. A broker session without local state cannot continue,
-    /// so an attempt that finds one replaces it, using up to three connections. As MQTT 3.1.1
-    /// describes for discarding session state on both sides, it disconnects, connects with Clean
-    /// Session 1, and disconnects again; then it starts a new persistent session.
+    /// The connections of one MQTT 3.1.1 attempt. A broker session without local state cannot
+    /// continue, so an attempt that finds one replaces it, using up to three connections. As
+    /// MQTT 3.1.1 describes for discarding session state on both sides, it disconnects,
+    /// connects with Clean Session 1, and disconnects again; then it starts a new persistent
+    /// session. MQTT 5.0 needs one connection, whose Clean Start replaces the broker's session,
+    /// so its attempts stay at the first step.
     enum Step {
         /// The attempt's first connection, which may find a broker session without local state.
         FIRST,
@@ -50,21 +59,32 @@ final class ConnectionEstablishment {
         /// once DISCONNECT is written; with it, the attempt fails then.
         record Abandoned(@Nullable MqttConnectException refusal) implements Outcome {}
 
-        /// The connection is established. It continues the session when `sessionPresent`, and
-        /// otherwise starts a new one.
-        record Established(boolean sessionPresent) implements Outcome {}
+        /// The connection is established with `ack`, which continues the session when it has
+        /// Session Present and otherwise starts a new one. The connection keeps alive at
+        /// `keepAlive`: the configured interval, or the one that the broker set instead.
+        record Established(ConnAck ack, Duration keepAlive) implements Outcome {}
     }
 
     private static final Log log = Log.of(ConnectionEstablishment.class);
+
+    // The largest packet that MQTT can carry, including the fixed header. A broker that
+    // announces no Maximum Packet Size, or a larger one, accepts packets up to this size.
+    private static final long LARGEST_PACKET_SIZE = 268_435_460;
 
     private final String clientId;
 
     private final MqttVersion version;
 
-    private final int keepAliveSeconds;
+    private final Duration keepAlive;
 
     // Zero session expiry starts a new session with every connection.
     private final boolean cleanStart;
+
+    // MQTT 5.0 counts the expiry in whole seconds. Rounding up never shortens the requested
+    // expiry; the largest value means that the session never expires.
+    private final long sessionExpirySeconds;
+
+    private final int maxPacketSize;
 
     private final Packet.@Nullable Will will;
 
@@ -73,41 +93,112 @@ final class ConnectionEstablishment {
             MqttVersion version,
             Duration keepAlive,
             Duration sessionExpiry,
+            int maxPacketSize,
             Packet.@Nullable Will will
     ) {
         this.clientId = clientId;
         this.version = version;
-        keepAliveSeconds = (int) keepAlive.toSeconds();
+        this.keepAlive = keepAlive;
         cleanStart = sessionExpiry.isZero();
+        sessionExpirySeconds = Math.ceilDiv(sessionExpiry.toNanos(), 1_000_000_000L);
+        this.maxPacketSize = maxPacketSize;
         this.will = will;
     }
 
     /// The CONNECT of a connection at `step` that sends the attempt's `credentials`, if any.
-    Packet.Connect connect(Step step, @Nullable MqttCredentials credentials) {
-        // The connection that discards a broker session carries no Will, so losing it before
-        // its DISCONNECT publishes nothing.
-        boolean discarding = step == Step.DISCARD;
+    /// `sessionEstablished` tells whether this client object has started a session, and
+    /// `receiveRoom` how many more receptions the session's receive table can hold.
+    Packet.Connect connect(
+            Step step,
+            @Nullable MqttCredentials credentials,
+            boolean sessionEstablished,
+            int receiveRoom
+    ) {
+        return switch (version) {
+            case V3_1_1 -> {
+                // The connection that discards a broker session carries no Will, so losing it
+                // before its DISCONNECT publishes nothing.
+                boolean discarding = step == Step.DISCARD;
+                yield connectPacket(
+                        cleanStart || discarding,
+                        discarding ? null : will,
+                        credentials,
+                        EMPTY
+                );
+            }
+            // Without local state, Clean Start replaces any session that the broker kept, so
+            // one connection starts the new session.
+            case V5 -> connectPacket(
+                    cleanStart || !sessionEstablished,
+                    will,
+                    credentials,
+                    connectProperties(receiveRoom)
+            );
+        };
+    }
+
+    private Packet.Connect connectPacket(
+            boolean cleanStartFlag,
+            Packet.@Nullable Will connectWill,
+            @Nullable MqttCredentials credentials,
+            Properties properties
+    ) {
         return new Packet.Connect(
                 clientId,
                 version,
-                cleanStart || discarding,
-                keepAliveSeconds,
-                discarding ? null : will,
+                cleanStartFlag,
+                (int) keepAlive.toSeconds(),
+                connectWill,
                 credentials == null ? null : credentials.username(),
                 credentials == null ? null : credentials.password().orElse(null),
-                EMPTY
+                properties
         );
     }
 
-    /// What `ack` means for the connection at `step`. `sessionEstablished` tells whether this
-    /// client object has started a session that a Session Present can continue.
-    Outcome accept(Packet.ConnAck ack, Step step, boolean sessionEstablished) {
+    /// The MQTT 5.0 CONNECT properties: the expiry of a persistent session, how many QoS 1 and
+    /// QoS 2 publications the broker may send before their acknowledgements, and the largest
+    /// packet that the client accepts.
+    private Properties connectProperties(int receiveRoom) {
+        var properties = new ArrayList<Property>();
+        if (!cleanStart) {
+            properties.add(new Property.FourByteValue(
+                    PropertyId.SESSION_EXPIRY_INTERVAL,
+                    sessionExpirySeconds
+            ));
+        }
+        // Receptions that a continued session carries over can still await PUBREL, and the
+        // broker's new quota does not count them (MQTT 5.0 section 4.9). Announcing only the
+        // room left in the receive table keeps a conforming broker within it.
+        properties.add(new Property.TwoByteValue(
+                PropertyId.RECEIVE_MAXIMUM,
+                Math.max(1, receiveRoom)
+        ));
+        properties.add(new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, maxPacketSize));
+        return new Properties(properties);
+    }
+
+    /// What `ack` means for the connection at `step` of attempt number `attempt`.
+    /// `sessionEstablished` tells whether this client object has started a session that a
+    /// Session Present can continue.
+    Outcome accept(Packet.ConnAck ack, Step step, boolean sessionEstablished, long attempt) {
         if (ack.reasonCode() != ReasonCode.SUCCESS) {
             return new Outcome.Failed(new MqttConnectException(
                     "Broker refused connection",
                     ack.reasonCode()
             ));
         }
+        return switch (version) {
+            case V3_1_1 -> acceptMqtt311(ack, step, sessionEstablished, attempt);
+            case V5 -> acceptMqtt5(ack, sessionEstablished, attempt);
+        };
+    }
+
+    private Outcome acceptMqtt311(
+            Packet.ConnAck ack,
+            Step step,
+            boolean sessionEstablished,
+            long attempt
+    ) {
         if (ack.sessionPresent() && (cleanStart || step == Step.DISCARD)) {
             return new Outcome.Failed(protocolError("Session Present with Clean Session"));
         }
@@ -125,6 +216,50 @@ final class ConnectionEstablishment {
                     new MqttConnectException("Broker session present after discarding it")
             );
         }
-        return new Outcome.Established(ack.sessionPresent());
+        return new Outcome.Established(ConnAck.of(ack.sessionPresent(), attempt), keepAlive);
+    }
+
+    private Outcome acceptMqtt5(Packet.ConnAck ack, boolean sessionEstablished, long attempt) {
+        // A connection without local state sent Clean Start, which the broker answers without
+        // Session Present [MQTT-3.2.2-2].
+        if (ack.sessionPresent() && (cleanStart || !sessionEstablished)) {
+            return new Outcome.Failed(protocolError("Session Present with Clean Start"));
+        }
+        Properties properties = ack.properties();
+        if (properties.find(PropertyId.REASON_STRING).orElse(null)
+                instanceof Property.StringValue(var _, var reason)) {
+            log.debug("CONNACK reason for {}: {}", clientId, reason);
+        }
+        // An Assigned Client Identifier answers only an empty client identifier, which this
+        // client never sends, so it is not read.
+        var connAck = ConnAck.of(
+                ack.sessionPresent(),
+                attempt,
+                Qos.of((int) number(properties, PropertyId.MAXIMUM_QOS).orElse(2)),
+                number(properties, PropertyId.RETAIN_AVAILABLE).orElse(1) == 1,
+                number(properties, PropertyId.WILDCARD_SUBSCRIPTION_AVAILABLE).orElse(1) == 1,
+                number(properties, PropertyId.SHARED_SUBSCRIPTION_AVAILABLE).orElse(1) == 1,
+                (int) Math.min(
+                        number(properties, PropertyId.MAXIMUM_PACKET_SIZE)
+                                .orElse(LARGEST_PACKET_SIZE),
+                        LARGEST_PACKET_SIZE
+                )
+        );
+        // Server Keep Alive replaces the configured interval for this connection only.
+        OptionalLong serverKeepAlive = number(properties, PropertyId.SERVER_KEEP_ALIVE);
+        Duration connectionKeepAlive = serverKeepAlive.isPresent()
+                ? Duration.ofSeconds(serverKeepAlive.getAsLong())
+                : keepAlive;
+        return new Outcome.Established(connAck, connectionKeepAlive);
+    }
+
+    /// The value of the integer property `id`, or empty when `properties` has none.
+    private static OptionalLong number(Properties properties, PropertyId id) {
+        return switch (properties.find(id).orElse(null)) {
+            case Property.ByteValue(var _, var value) -> OptionalLong.of(value);
+            case Property.TwoByteValue(var _, var value) -> OptionalLong.of(value);
+            case Property.FourByteValue(var _, var value) -> OptionalLong.of(value);
+            case null, default -> OptionalLong.empty();
+        };
     }
 }

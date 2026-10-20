@@ -266,6 +266,11 @@ final class Receptions {
         }
     }
 
+    /// How many more receptions the session's receive table can hold.
+    int room() {
+        return received.room();
+    }
+
     /// A permanent or nonpersistent end keeps no reception.
     void clear() {
         received.clear();

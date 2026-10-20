@@ -47,6 +47,9 @@ import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -70,6 +73,7 @@ class SessionCoreTest {
             Duration.ofSeconds(10),
             MqttVersion.V3_1_1,
             Duration.ZERO,
+            16 * 1024 * 1024,
             null,
             false,
             ReconnectBackoff.disabled(),
@@ -3009,9 +3013,252 @@ class SessionCoreTest {
         return Subscribe.of(new TopicFilter(filter), Qos.AT_MOST_ONCE).withBufferCapacity(4);
     }
 
+    @ParameterizedTest(name = "session expiry {0} is sent as {1}")
+    @CsvSource(nullValues = "none", value = {
+            "PT0S, none",
+            "PT1S, 1",
+            "PT1.5S, 2",
+            "PT4294967294.5S, 4294967295",
+            "PT4294967295S, 4294967295"
+    })
+    void an_mqtt_5_connect_sends_the_session_expiry_in_whole_seconds_rounded_up(
+            Duration expiry,
+            @Nullable Long seconds
+    ) {
+        // Arrange: no local state yet, so Clean Start goes with every expiry.
+        SessionCore mqtt5 = mqtt5Core(expiry);
+
+        // Act
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Assert
+        var connect = (Packet.Connect) port.sent.getLast();
+        assertThat(connect.version()).isEqualTo(MqttVersion.V5);
+        assertThat(connect.cleanStart()).isTrue();
+        assertThat(connect.properties().find(PropertyId.SESSION_EXPIRY_INTERVAL)).isEqualTo(
+                Optional.ofNullable(seconds).map(value -> new Property.FourByteValue(
+                        PropertyId.SESSION_EXPIRY_INTERVAL,
+                        value
+                ))
+        );
+    }
+
+    @Test
+    void an_mqtt_5_connect_announces_its_receive_maximum_and_packet_size_and_nothing_else() {
+        // Arrange
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+
+        // Act
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Assert: no Topic Alias Maximum and no requests for problem or response information.
+        var connect = (Packet.Connect) port.sent.getLast();
+        assertThat(connect.properties().entries()).containsExactly(
+                new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4096),
+                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 1024)
+        );
+    }
+
+    @Test
+    void an_mqtt_5_session_starts_in_one_connection_and_later_ones_continue_it() {
+        // Arrange: a persistent session, started by a connection without local state.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        mqtt5.failed(1, new IOException("connection lost"));
+
+        // Act
+        mqtt5.connect(attempt(2), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 0);
+
+        // Assert: Clean Start went only with the connection that had no local state.
+        assertThat(port.sent).filteredOn(Packet.Connect.class::isInstance)
+                .extracting(packet -> ((Packet.Connect) packet).cleanStart())
+                .containsExactly(true, false);
+        assertThat(port.results.get(2L)).isEqualTo(new Result(ConnAck.of(true, 2), null));
+    }
+
+    @Test
+    void session_present_in_answer_to_mqtt_5_clean_start_breaks_the_protocol() {
+        // Arrange
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Act
+        mqtt5.received(1, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(1L)).failure())
+                .isInstanceOf(MqttConnectException.class)
+                .hasCauseInstanceOf(MqttProtocolException.class);
+    }
+
+    @Test
+    void an_mqtt_5_refusal_fails_the_attempt_with_its_reason_code() {
+        // Arrange
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Act
+        mqtt5.received(1, new Packet.ConnAck(false, ReasonCode.NOT_AUTHORIZED, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(1L)).failure()).isInstanceOfSatisfying(
+                MqttConnectException.class,
+                failure -> assertThat(failure.reasonCode()).contains(ReasonCode.NOT_AUTHORIZED)
+        );
+    }
+
+    @Test
+    void an_mqtt_5_connack_reports_the_limits_that_the_broker_announced() {
+        // Arrange
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Act
+        mqtt5.received(1, connAck(
+                new Property.ByteValue(PropertyId.MAXIMUM_QOS, 1),
+                new Property.ByteValue(PropertyId.RETAIN_AVAILABLE, 0),
+                new Property.ByteValue(PropertyId.WILDCARD_SUBSCRIPTION_AVAILABLE, 0),
+                new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0),
+                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 2048),
+                new Property.StringValue(PropertyId.REASON_STRING, "welcome")
+        ), 0, 0);
+
+        // Assert
+        var expected = ConnAck.of(false, 1, Qos.AT_LEAST_ONCE, false, false, false, 2048);
+        assertThat(port.results.get(1L)).isEqualTo(new Result(expected, null));
+        assertThat(port.connections).containsExactly(new Connection(1, expected));
+    }
+
+    @Test
+    void an_mqtt_5_connack_without_limits_reports_what_mqtt_5_assumes() {
+        // Arrange
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Act
+        mqtt5.received(1, connAck(), 0, 0);
+
+        // Assert
+        assertThat(port.results.get(1L)).isEqualTo(new Result(ConnAck.of(false, 1), null));
+    }
+
+    @Test
+    void a_maximum_packet_size_beyond_what_mqtt_carries_reports_the_largest_packet() {
+        // Arrange
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Act
+        mqtt5.received(1, connAck(
+                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 0xFFFF_FFFFL)
+        ), 0, 0);
+
+        // Assert
+        assertThat(port.connections.getLast().ack().maximumPacketSize()).isEqualTo(268_435_460);
+    }
+
+    @Test
+    void server_keep_alive_replaces_the_keep_alive_of_its_connection_only() {
+        // Arrange: a 10 second keep-alive, which the broker shortens to 3 seconds.
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(
+                new Property.TwoByteValue(PropertyId.SERVER_KEEP_ALIVE, 3)
+        ), 0, 0);
+        assertThat(port.timers).containsEntry(KEEP_ALIVE, Duration.ofSeconds(3));
+
+        // Act: the interval passes without a write.
+        mqtt5.timer(1, KEEP_ALIVE, seconds(3));
+
+        // Assert: PINGREQ goes out and its answer is due within the same interval.
+        assertThat(port.sent.getLast()).isInstanceOf(Packet.PingReq.class);
+        assertThat(port.timers).containsEntry(PING, Duration.ofSeconds(3));
+
+        // Act: the next connection's broker sets no keep-alive.
+        mqtt5.failed(1, new IOException("connection lost"));
+        mqtt5.connect(attempt(2), seconds(4));
+        mqtt5.opened(2);
+        mqtt5.received(2, connAck(), seconds(4), 0);
+
+        // Assert
+        assertThat(port.timers).containsEntry(KEEP_ALIVE, Duration.ofSeconds(10));
+    }
+
+    @Test
+    void a_server_keep_alive_of_zero_turns_keep_alive_off_for_its_connection() {
+        // Arrange
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Act
+        mqtt5.received(1, connAck(
+                new Property.TwoByteValue(PropertyId.SERVER_KEEP_ALIVE, 0)
+        ), 0, 0);
+
+        // Assert
+        assertThat(port.timers).doesNotContainKey(KEEP_ALIVE);
+    }
+
+    @Test
+    void an_assigned_client_identifier_does_not_replace_the_configured_one() {
+        // Arrange: the broker announces an identifier, as it would for an empty one.
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(
+                new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, "assigned")
+        ), 0, 0);
+        mqtt5.failed(1, new IOException("connection lost"));
+
+        // Act
+        mqtt5.connect(attempt(2), 0);
+        mqtt5.opened(2);
+
+        // Assert
+        assertThat(port.sent).filteredOn(Packet.Connect.class::isInstance)
+                .extracting(packet -> ((Packet.Connect) packet).clientId())
+                .containsExactly("client", "client");
+    }
+
     private void connected() {
         sut.connect(attempt(1), 0);
         accept();
+    }
+
+    /// An MQTT 5.0 core like `sut`, with `sessionExpiry` and a packet limit of 1 KiB.
+    private SessionCore mqtt5Core(Duration sessionExpiry) {
+        return new SessionCore(
+                port,
+                "client",
+                Duration.ofSeconds(30),
+                Duration.ofSeconds(10),
+                MqttVersion.V5,
+                sessionExpiry,
+                1024,
+                null,
+                false,
+                ReconnectBackoff.disabled(),
+                false,
+                Duration.ofSeconds(60)
+        );
+    }
+
+    /// A successful CONNACK without Session Present that carries `properties`.
+    private static Packet.ConnAck connAck(Property... properties) {
+        return new Packet.ConnAck(false, ReasonCode.SUCCESS, new Properties(List.of(properties)));
     }
 
     private static ConnectionAttempt attempt(long operation) {
@@ -3027,6 +3274,7 @@ class SessionCoreTest {
                 Duration.ofSeconds(10),
                 MqttVersion.V3_1_1,
                 Duration.ZERO,
+                16 * 1024 * 1024,
                 null,
                 true,
                 ReconnectBackoff.disabled(),

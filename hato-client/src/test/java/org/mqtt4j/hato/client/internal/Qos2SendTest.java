@@ -975,6 +975,7 @@ class Qos2SendTest {
                 Duration.ZERO,
                 MqttVersion.V3_1_1,
                 cleanStart ? Duration.ZERO : Duration.ofHours(1),
+                16 * 1024 * 1024,
                 null,
                 false,
                 backoff,

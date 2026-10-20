@@ -276,6 +276,7 @@ public final class ClientActor implements MqttClient {
                 keepAlive,
                 version,
                 sessionExpiry,
+                maxPacketSize,
                 will,
                 credentials != null,
                 backoff,

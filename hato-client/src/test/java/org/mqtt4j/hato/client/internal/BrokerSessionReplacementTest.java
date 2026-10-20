@@ -869,6 +869,7 @@ class BrokerSessionReplacementTest {
                 Duration.ZERO,
                 MqttVersion.V3_1_1,
                 Duration.ofHours(1),
+                16 * 1024 * 1024,
                 WILL,
                 credentialsRequired,
                 backoff,

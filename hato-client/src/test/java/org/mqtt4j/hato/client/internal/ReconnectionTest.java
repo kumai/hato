@@ -298,6 +298,7 @@ class ReconnectionTest {
                 Duration.ZERO,
                 MqttVersion.V3_1_1,
                 Duration.ZERO,
+                16 * 1024 * 1024,
                 null,
                 false,
                 new ReconnectBackoff(
@@ -393,6 +394,7 @@ class ReconnectionTest {
                 Duration.ZERO,
                 MqttVersion.V3_1_1,
                 Duration.ofHours(1),
+                16 * 1024 * 1024,
                 null,
                 true,
                 new ReconnectBackoff(
@@ -685,6 +687,7 @@ class ReconnectionTest {
                 Duration.ZERO,
                 MqttVersion.V3_1_1,
                 Duration.ofHours(1),
+                16 * 1024 * 1024,
                 null,
                 false,
                 new ReconnectBackoff(

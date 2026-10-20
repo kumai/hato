@@ -874,6 +874,7 @@ class SessionPersistenceTest {
                 Duration.ZERO,
                 version,
                 cleanStart ? Duration.ZERO : Duration.ofHours(1),
+                16 * 1024 * 1024,
                 null,
                 false,
                 ReconnectBackoff.disabled(),
