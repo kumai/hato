@@ -115,20 +115,24 @@ abstract class Mqtt5RoundTripTest {
         }
     }
 
-    @Test
-    void a_publication_without_subscribers_succeeds() throws Exception {
-        try (MqttClient sut = client("mqtt5-unmatched", Duration.ZERO)) {
+    @ParameterizedTest
+    @EnumSource(value = Qos.class, names = {"AT_LEAST_ONCE", "EXACTLY_ONCE"})
+    void a_publication_without_subscribers_reports_the_brokers_reason_code(Qos qos)
+            throws Exception {
+        try (MqttClient sut = client("mqtt5-unmatched-" + qos.level(), Duration.ZERO)) {
             // Arrange
             sut.connect().get(5, SECONDS);
 
-            // Act & Assert: Mosquitto, EMQX, and HiveMQ CE answer No matching subscribers, and
-            // the embedded broker answers success.
-            assertThat(sut.publish(MqttMessage.of(
+            // Act
+            PublishResult result = sut.publish(MqttMessage.of(
                     new Topic("hato/mqtt5/nobody"),
                     new byte[] {1},
-                    Qos.AT_LEAST_ONCE,
+                    qos,
                     false
-            )).get(5, SECONDS)).isEqualTo(PublishResult.of());
+            )).get(5, SECONDS);
+
+            // Assert: a broker may answer No matching subscribers or success.
+            assertThat(result).isEqualTo(PublishResult.of(unmatchedPublicationReason(qos)));
         }
     }
 
@@ -220,6 +224,10 @@ abstract class Mqtt5RoundTripTest {
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .build();
     }
+
+    /// The reason code with which the broker acknowledges a publication at `qos` that no
+    /// subscription matches, as recorded for it.
+    abstract ReasonCode unmatchedPublicationReason(Qos qos);
 
     abstract URI endpoint();
 }

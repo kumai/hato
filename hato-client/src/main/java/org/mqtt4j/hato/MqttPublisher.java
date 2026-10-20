@@ -14,9 +14,11 @@ public interface MqttPublisher {
     /// [MqttProtocolException] while the connection stays usable, and a persistent session does
     /// not resume it.
     ///
-    /// An MQTT 5.0 broker can refuse a QoS 1 or QoS 2 publication in PUBACK or PUBREC. The
-    /// publication then fails with [MqttPublicationRefusedException], which carries the reason
-    /// code, and the connection stays usable. A publication that exceeds a limit that the
+    /// An MQTT 5.0 broker acknowledges a QoS 1 or QoS 2 publication with a reason code, which
+    /// [PublishResult#reasonCode()] reports, for example when no subscription matched. It can
+    /// also refuse the publication in PUBACK or PUBREC. The publication then fails with
+    /// [MqttPublicationRefusedException], which carries the reason code and any reason string,
+    /// and the connection stays usable. A publication that exceeds a limit that the
     /// broker announced in [ConnAck] fails the same way without being sent. QoS 1 and QoS 2
     /// publications beyond the broker's Receive Maximum wait in publish order until the broker
     /// acknowledges earlier ones: this method still returns at once, the future completes

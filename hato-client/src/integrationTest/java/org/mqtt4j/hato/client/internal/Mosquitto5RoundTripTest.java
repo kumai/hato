@@ -84,6 +84,12 @@ class Mosquitto5RoundTripTest extends Mqtt5RoundTripTest {
         }
     }
 
+    // Mosquitto 2.1.2 reports no matching subscribers in PUBACK, but success in PUBREC.
+    @Override
+    ReasonCode unmatchedPublicationReason(Qos qos) {
+        return qos == Qos.EXACTLY_ONCE ? ReasonCode.SUCCESS : ReasonCode.NO_MATCHING_SUBSCRIBERS;
+    }
+
     @Override
     URI endpoint() {
         return URI.create(

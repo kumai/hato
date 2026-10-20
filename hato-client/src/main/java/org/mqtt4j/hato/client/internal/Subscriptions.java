@@ -26,6 +26,7 @@ import org.mqtt4j.hato.client.internal.SessionCore.State;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.client.internal.common.protocol.SharedTopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -264,7 +265,7 @@ final class Subscriptions {
             Optional<ReasonCode> refusal = refusal(local.filter);
             if (refusal.isPresent()) {
                 window.registrations.removeFirst();
-                refuse(local, refusal.orElseThrow());
+                refuse(local, refusal.orElseThrow(), null);
                 continue;
             }
             OptionalInt allocated = core.allocatePacketId();
@@ -314,7 +315,12 @@ final class Subscriptions {
         core.releasePacketId(ack.packetId());
         window.subscribingInFlight--;
         if (refused) {
-            refuse(local, reason);
+            refuse(
+                    local,
+                    reason,
+                    ConnectionEstablishment.text(ack.properties(), PropertyId.REASON_STRING)
+                            .orElse(null)
+            );
         } else {
             local.confirmed = true;
             local.established = true;
@@ -334,8 +340,10 @@ final class Subscriptions {
         // to remove. After a refusal the broker may still hold the subscription.
         for (ReasonCode reason : ack.reasonCodes()) {
             if (isFailure(reason)) {
-                log.warn("Broker refused to remove the subscription to {} for {}: {}",
-                        pending.subscription.filter.pattern(), clientId, reason);
+                log.warn("Broker refused to remove the subscription to {} for {}: {} ({})",
+                        pending.subscription.filter.pattern(), clientId, reason,
+                        ConnectionEstablishment.text(ack.properties(), PropertyId.REASON_STRING)
+                                .orElse("no reason string"));
             }
         }
         window.unsubscribing.remove(ack.packetId());
@@ -349,8 +357,12 @@ final class Subscriptions {
     /// Ends a registration that the broker refused, or would refuse by the limits that it
     /// announced for the connection. A first registration fails with the refusal; one that a
     /// continued or new session re-creates is reported as a failed re-creation.
-    private void refuse(LocalSubscription local, ReasonCode reason) {
-        var refusal = new MqttSubscriptionRefusedException(reason);
+    private void refuse(
+            LocalSubscription local,
+            ReasonCode reason,
+            @Nullable String reasonString
+    ) {
+        var refusal = new MqttSubscriptionRefusedException(reason, reasonString);
         if (!local.confirmed) {
             removeSubscription(local, refusal);
         } else {

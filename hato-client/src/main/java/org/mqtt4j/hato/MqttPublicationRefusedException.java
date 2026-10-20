@@ -1,6 +1,9 @@
 package org.mqtt4j.hato;
 
 import java.io.Serial;
+import java.util.Optional;
+
+import org.jspecify.annotations.Nullable;
 
 import static java.util.Objects.requireNonNull;
 
@@ -13,6 +16,7 @@ import static java.util.Objects.requireNonNull;
 /// [ReasonCode#RETAIN_NOT_SUPPORTED] without [ConnAck#retainAvailable()], and
 /// [ReasonCode#PACKET_TOO_LARGE] beyond [ConnAck#maximumPacketSize()]. Either way the
 /// connection goes on. Only MQTT 5.0 brokers refuse publications or announce these limits.
+@SuppressWarnings("exports") // Nullness annotations are compile-time only.
 public final class MqttPublicationRefusedException extends MqttException {
 
     @Serial
@@ -20,14 +24,38 @@ public final class MqttPublicationRefusedException extends MqttException {
 
     private final ReasonCode reasonCode;
 
+    private final @Nullable String reasonString;
+
+    /// A refusal without an explanation, such as the one that the client makes itself.
     public MqttPublicationRefusedException(ReasonCode reasonCode) {
-        super("Publication refused: " + requireNonNull(reasonCode, "reasonCode must not be null"));
+        this(reasonCode, null);
+    }
+
+    /// A refusal with the broker's explanation, if the broker sent one.
+    public MqttPublicationRefusedException(
+            ReasonCode reasonCode,
+            @Nullable String reasonString
+    ) {
+        super(message(reasonCode, reasonString));
         this.reasonCode = reasonCode;
+        this.reasonString = reasonString;
     }
 
     /// The reason for the refusal, received in PUBACK or PUBREC, or the one that the broker
     /// would use for a publication that exceeds its announced limits.
     public ReasonCode reasonCode() {
         return reasonCode;
+    }
+
+    /// The broker's explanation for people diagnosing the refusal, received in PUBACK or PUBREC,
+    /// or empty when the broker sent none or the client refused without sending.
+    public Optional<String> reasonString() {
+        return Optional.ofNullable(reasonString);
+    }
+
+    private static String message(ReasonCode reasonCode, @Nullable String reasonString) {
+        String message = "Publication refused: "
+                + requireNonNull(reasonCode, "reasonCode must not be null");
+        return reasonString == null ? message : message + " (" + reasonString + ")";
     }
 }

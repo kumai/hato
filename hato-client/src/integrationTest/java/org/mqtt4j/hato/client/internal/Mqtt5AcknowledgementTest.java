@@ -24,7 +24,7 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 class Mqtt5AcknowledgementTest {
 
     @Test
-    void a_publication_without_matching_subscribers_succeeds() throws Exception {
+    void a_publication_without_matching_subscribers_reports_it_in_its_result() throws Exception {
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut, MqttVersion.V5)) {
             // Arrange
@@ -39,7 +39,8 @@ class Mqtt5AcknowledgementTest {
             ));
 
             // Assert
-            assertThat(published.get(5, SECONDS)).isEqualTo(PublishResult.of());
+            assertThat(published.get(5, SECONDS))
+                    .isEqualTo(PublishResult.of(ReasonCode.NO_MATCHING_SUBSCRIBERS));
         }
     }
 

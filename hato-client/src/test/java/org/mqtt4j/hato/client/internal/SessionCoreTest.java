@@ -1970,10 +1970,14 @@ class SessionCoreTest {
         // Act
         mqtt5.publish(2, message);
 
-        // Assert: the broker would end the connection with the same reason code.
+        // Assert: the broker would end the connection with the same reason code, and the
+        // client, which refused it, has no reason string to report.
         assertThat(requireNonNull(port.results.get(2L)).failure()).isInstanceOfSatisfying(
                 MqttPublicationRefusedException.class,
-                refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
+                refusal -> {
+                    assertThat(refusal.reasonCode()).isEqualTo(reason);
+                    assertThat(refusal.reasonString()).isEmpty();
+                }
         );
         assertThat(port.publications).isEmpty();
         assertThat(mqtt5.state()).isEqualTo(CONNECTED);
@@ -2068,7 +2072,10 @@ class SessionCoreTest {
         assertThat(port.sent).noneMatch(Packet.Subscribe.class::isInstance);
         assertThat(requireNonNull(port.outcomes.get(2L)).failure()).isInstanceOfSatisfying(
                 MqttSubscriptionRefusedException.class,
-                refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
+                refusal -> {
+                    assertThat(refusal.reasonCode()).isEqualTo(reason);
+                    assertThat(refusal.reasonString()).isEmpty();
+                }
         );
         assertThat(mqtt5.state()).isEqualTo(CONNECTED);
     }
@@ -2330,7 +2337,9 @@ class SessionCoreTest {
 
     @ParameterizedTest(name = "PUBACK {0}")
     @EnumSource(value = ReasonCode.class, names = {"SUCCESS", "NO_MATCHING_SUBSCRIBERS"})
-    void an_mqtt_5_puback_below_0x80_completes_the_publication(ReasonCode reason) {
+    void an_mqtt_5_puback_below_0x80_completes_the_publication_with_its_reason_code(
+            ReasonCode reason
+    ) {
         // Arrange
         SessionCore mqtt5 = connectedMqtt5();
         mqtt5.publish(2, qosOneMessage());
@@ -2340,7 +2349,92 @@ class SessionCoreTest {
         mqtt5.received(1, new Packet.PubAck(id, reason, EMPTY), 0, 0);
 
         // Assert
-        assertThat(port.results.get(2L)).isEqualTo(new Result(PublishResult.of(), null));
+        assertThat(port.results.get(2L)).isEqualTo(new Result(PublishResult.of(reason), null));
+    }
+
+    @Test
+    void an_mqtt_5_qos_2_publication_reports_the_reason_code_of_its_pubrec() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.publish(2, qosOneMessage().withQos(Qos.EXACTLY_ONCE));
+        int id = port.publicationIds.getLast();
+        mqtt5.received(
+                1,
+                new Packet.PubRec(id, ReasonCode.NO_MATCHING_SUBSCRIBERS, EMPTY),
+                0,
+                0
+        );
+
+        // Act
+        mqtt5.received(1, new Packet.PubComp(id, ReasonCode.SUCCESS, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(port.results.get(2L)).isEqualTo(new Result(
+                PublishResult.of(ReasonCode.NO_MATCHING_SUBSCRIBERS),
+                null
+        ));
+    }
+
+    static Stream<Arguments> refusalsWithReasonStrings() {
+        var reason = new Properties(List.of(
+                new Property.StringValue(PropertyId.REASON_STRING, "topic is read-only")
+        ));
+        return Stream.of(
+                Arguments.of(
+                        Qos.AT_LEAST_ONCE,
+                        Named.of("PUBACK", new Packet.PubAck(1, ReasonCode.NOT_AUTHORIZED, reason))
+                ),
+                Arguments.of(
+                        Qos.EXACTLY_ONCE,
+                        Named.of("PUBREC", new Packet.PubRec(1, ReasonCode.NOT_AUTHORIZED, reason))
+                )
+        );
+    }
+
+    @ParameterizedTest(name = "{1}")
+    @MethodSource("refusalsWithReasonStrings")
+    void a_refused_publication_carries_the_brokers_reason_string(Qos qos, Packet refusal) {
+        // Arrange: the first publication takes packet identifier 1.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.publish(2, qosOneMessage().withQos(qos));
+        assertThat(port.publicationIds.getLast()).isEqualTo(1);
+
+        // Act
+        mqtt5.received(1, refusal, 0, 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(2L)).failure()).isInstanceOfSatisfying(
+                MqttPublicationRefusedException.class,
+                failure -> {
+                    assertThat(failure.reasonCode()).isEqualTo(ReasonCode.NOT_AUTHORIZED);
+                    assertThat(failure.reasonString()).contains("topic is read-only");
+                }
+        );
+    }
+
+    @Test
+    void a_refused_subscription_carries_the_brokers_reason_string() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        int id = ((Packet.Subscribe) port.sent.getLast()).packetId();
+        var reason = new Properties(List.of(
+                new Property.StringValue(PropertyId.REASON_STRING, "no access to a/#")
+        ));
+
+        // Act
+        mqtt5.received(
+                1,
+                new Packet.SubAck(id, List.of(ReasonCode.NOT_AUTHORIZED), reason),
+                0,
+                0
+        );
+
+        // Assert
+        assertThat(requireNonNull(port.outcomes.get(2L)).failure()).isInstanceOfSatisfying(
+                MqttSubscriptionRefusedException.class,
+                failure -> assertThat(failure.reasonString()).contains("no access to a/#")
+        );
     }
 
     @ParameterizedTest(name = "PUBACK {0}")

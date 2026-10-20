@@ -29,6 +29,8 @@ import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.SessionCore.isFailure;
@@ -202,9 +204,16 @@ final class Publications {
             case Release _ -> stageMismatch("PUBACK does not match the outgoing QoS stage");
             case Publication publication when publication.qos == Qos.EXACTLY_ONCE ->
                     downgraded(publication);
-            case Publication publication when isFailure(ack.reasonCode()) ->
-                    refused(publication, ack.reasonCode());
-            case Publication publication -> completePublication(publication);
+            case Publication publication when isFailure(ack.reasonCode()) -> refused(
+                    publication,
+                    ack.reasonCode(),
+                    ConnectionEstablishment.text(ack.properties(), PropertyId.REASON_STRING)
+                            .orElse(null)
+            );
+            case Publication publication -> {
+                logReason("PUBACK", ack.packetId(), ack.properties());
+                completePublication(publication, ack.reasonCode());
+            }
         }
     }
 
@@ -212,7 +221,12 @@ final class Publications {
         int packetId = ack.packetId();
         Inflight exchange = inflight.get(packetId);
         if (isFailure(ack.reasonCode())) {
-            refusedRelease(exchange, ack.reasonCode());
+            refusedRelease(
+                    exchange,
+                    ack.reasonCode(),
+                    ConnectionEstablishment.text(ack.properties(), PropertyId.REASON_STRING)
+                            .orElse(null)
+            );
             return;
         }
         switch (exchange) {
@@ -226,7 +240,12 @@ final class Publications {
                 bytes -= publication.bytes;
                 window.unsent.remove(publication);
                 core.responses().answered(ResponseDeadlines.Kind.PUBREC, packetId);
-                inflight.putLast(packetId, new Release(packetId, publication.operation));
+                logReason("PUBREC", packetId, ack.properties());
+                // The result reports PUBREC's reason code once PUBCOMP completes the exchange.
+                inflight.putLast(
+                        packetId,
+                        new Release(packetId, publication.operation, ack.reasonCode())
+                );
             }
             case Release pending -> {
                 // A PUBREL replay still waiting for capacity also answers this duplicate. The
@@ -271,11 +290,11 @@ final class Publications {
             }
             return;
         }
-        if (!(exchange instanceof Release)) {
+        if (!(exchange instanceof Release release)) {
             stageMismatch("PUBCOMP does not match the outgoing QoS stage");
             return;
         }
-        completePublication(exchange);
+        completePublication(release, release.reasonCode);
     }
 
     /// Queues the session's exchanges for a connection that continues the session.
@@ -313,7 +332,7 @@ final class Publications {
             // connection, and every reconnection would replay the same publication.
             Optional<ReasonCode> refusal = refusal(message);
             if (refusal.isPresent()) {
-                refused(next, refusal.orElseThrow());
+                refused(next, refusal.orElseThrow(), null);
                 continue;
             }
             long ticket = core.nextTicket();
@@ -486,10 +505,14 @@ final class Publications {
     /// 5.0 section 4.3.3). Only a QoS 2 publication still waiting for PUBREC has an exchange to
     /// end; an exchange that the broker already accepted, or one that this client does not
     /// know, needs nothing.
-    private void refusedRelease(@Nullable Inflight exchange, ReasonCode reason) {
+    private void refusedRelease(
+            @Nullable Inflight exchange,
+            ReasonCode reason,
+            @Nullable String reasonString
+    ) {
         switch (exchange) {
             case Publication publication when publication.qos == Qos.EXACTLY_ONCE ->
-                    refused(publication, reason);
+                    refused(publication, reason, reasonString);
             case Publication _ -> stageMismatch("PUBREC does not match the outgoing QoS stage");
             case Release _ -> {
             }
@@ -547,10 +570,18 @@ final class Publications {
 
     /// The broker did not accept the publication, which ends its exchange: the packet identifier
     /// is free again, and the session does not resume the exchange.
-    private void refused(Publication publication, ReasonCode reason) {
+    private void refused(
+            Publication publication,
+            ReasonCode reason,
+            @Nullable String reasonString
+    ) {
         removeInflight(publication.packetId);
         if (publication.operation != 0) {
-            port.complete(publication.operation, null, new MqttPublicationRefusedException(reason));
+            port.complete(
+                    publication.operation,
+                    null,
+                    new MqttPublicationRefusedException(reason, reasonString)
+            );
         }
     }
 
@@ -562,11 +593,18 @@ final class Publications {
         }
     }
 
-    private void completePublication(Inflight exchange) {
+    private void completePublication(Inflight exchange, ReasonCode reason) {
         removeInflight(exchange.packetId);
         if (exchange.operation != 0) {
-            port.complete(exchange.operation, PublishResult.of(), null);
+            port.complete(exchange.operation, PublishResult.of(reason), null);
         }
+    }
+
+    /// Logs the explanation that the broker sent with a successful acknowledgement, which the
+    /// result does not report.
+    private void logReason(String packet, int packetId, Properties properties) {
+        ConnectionEstablishment.text(properties, PropertyId.REASON_STRING).ifPresent(reason ->
+                log.debug("{} {} reason for {}: {}", packet, packetId, clientId, reason));
     }
 
     private void removeInflight(int packetId) {
@@ -653,8 +691,12 @@ final class Publications {
 
     private static final class Release extends Inflight {
 
-        Release(int packetId, long operation) {
+        // The reason code of the PUBREC that started the release, which the result reports.
+        final ReasonCode reasonCode;
+
+        Release(int packetId, long operation, ReasonCode reasonCode) {
             super(packetId, operation);
+            this.reasonCode = reasonCode;
         }
     }
 }

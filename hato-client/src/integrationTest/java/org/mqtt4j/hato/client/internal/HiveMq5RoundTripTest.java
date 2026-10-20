@@ -75,11 +75,20 @@ class HiveMq5RoundTripTest extends Mqtt5RoundTripTest {
                     .map(sut::publish)
                     .toList();
 
-            // Assert
+            // Assert: no subscription matches the topic.
+            PublishResult unmatched = PublishResult.of(
+                    unmatchedPublicationReason(Qos.EXACTLY_ONCE)
+            );
             for (CompletableFuture<PublishResult> publication : publications) {
-                assertThat(publication.get(5, SECONDS)).isEqualTo(PublishResult.of());
+                assertThat(publication.get(5, SECONDS)).isEqualTo(unmatched);
             }
         }
+    }
+
+    // HiveMQ CE 2026.5 reports no matching subscribers in both PUBACK and PUBREC.
+    @Override
+    ReasonCode unmatchedPublicationReason(Qos qos) {
+        return ReasonCode.NO_MATCHING_SUBSCRIBERS;
     }
 
     @Override

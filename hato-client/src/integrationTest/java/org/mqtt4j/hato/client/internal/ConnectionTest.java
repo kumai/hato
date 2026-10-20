@@ -89,7 +89,7 @@ abstract class ConnectionTest {
             try {
                 // Act & Assert: the first onConnected publishes on its own connection.
                 ConnAck first = sut.connect().get(5, SECONDS);
-                assertThat(published.get(5, SECONDS)).isEqualTo(PublishResult.of());
+                assertThat(published).succeedsWithin(Duration.ofSeconds(5));
 
                 // Act: both operations finish while the first callback remains blocked.
                 sut.disconnect().get(5, SECONDS);
