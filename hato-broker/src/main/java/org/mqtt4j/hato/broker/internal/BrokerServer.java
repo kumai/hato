@@ -430,7 +430,7 @@ public final class BrokerServer implements AutoCloseable {
             }
         }
 
-        private void acknowledge(int id, boolean complete) throws IOException {
+        private void acknowledge(int id, boolean complete) {
             Outgoing outgoing = inflight.get(id);
             if (outgoing == null) {
                 return;
@@ -439,13 +439,16 @@ public final class BrokerServer implements AutoCloseable {
                     ? outgoing instanceof Release
                     : outgoing instanceof Delivery delivery && delivery.qos == Qos.AT_LEAST_ONCE;
             if (!expected) {
-                throw new IOException("Acknowledgement does not match the outgoing QoS stage");
+                throw new PacketDecodeException(
+                        ReasonCode.PROTOCOL_ERROR,
+                        "Acknowledgement does not match the outgoing QoS stage"
+                );
             }
             end(id, outgoing);
             drain();
         }
 
-        private void release(int id, ReasonCode reason) throws IOException {
+        private void release(int id, ReasonCode reason) {
             Outgoing outgoing = inflight.get(id);
             if (outgoing == null) {
                 return;
@@ -455,7 +458,10 @@ public final class BrokerServer implements AutoCloseable {
             switch (outgoing) {
                 case Delivery delivery -> {
                     if (delivery.qos != Qos.EXACTLY_ONCE) {
-                        throw new IOException("PUBREC does not match the outgoing QoS stage");
+                        throw new PacketDecodeException(
+                                ReasonCode.PROTOCOL_ERROR,
+                                "PUBREC does not match the outgoing QoS stage"
+                        );
                     }
                     if (reason.value() >= 0x80) {
                         // An MQTT 5.0 receiver that refuses the message ends the exchange here;
@@ -624,7 +630,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private long ticket;
 
-        private long closeAfterWrite;
+        // Set once the connection is to end with these bytes, such as a refusal CONNACK or a
+        // DISCONNECT. The queue then admits nothing more; the writer writes what waits, except
+        // deliveries, then these bytes, and closes.
+        private byte @Nullable [] lastPacket;
 
         // A delivery or PUBREL found its queue full; the writer's next completion resumes it.
         private boolean awaitingSpace;
@@ -652,9 +661,6 @@ public final class BrokerServer implements AutoCloseable {
         }
 
         private void readLoop() {
-            // The writer closes a refused or already terminated connection after writing any
-            // refusal CONNACK; closing here could drop that CONNACK.
-            boolean writerCloses = false;
             String reason = "connection closed by the peer";
             try {
                 Optional<byte[]> first = reader.read();
@@ -670,15 +676,13 @@ public final class BrokerServer implements AutoCloseable {
                             ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,
                             "protocol level " + unsupported.protocolLevel()
                     );
-                    writerCloses = true;
                     return;
                 }
                 synchronized (this) {
                     version = request.version();
                 }
                 beforeProcess.accept(request);
-                writerCloses = !connect(request);
-                if (writerCloses) {
+                if (!connect(request)) {
                     return;
                 }
                 PacketCodec codec = PacketCodec.of(request.version());
@@ -702,8 +706,15 @@ public final class BrokerServer implements AutoCloseable {
                 }
             } catch (Throwable failure) {
                 reason = failureReason("reader", failure);
+                // A CONNECT that fails to decode leaves the version at MQTT 3.1.1, so DISCONNECT
+                // only follows an accepted CONNECT.
+                if (failure instanceof PacketDecodeException violation) {
+                    disconnect(violation.reasonCode(), reason);
+                }
             } finally {
-                if (!writerCloses) {
+                // The writer closes a connection that ends with a last packet; closing here could
+                // drop that packet.
+                if (!endsWithLastPacket()) {
                     close(reason);
                 }
             }
@@ -801,9 +812,12 @@ public final class BrokerServer implements AutoCloseable {
                     }
                     enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, properties));
                 }
-                // Do not hold the new peer's monitor while closing the old peer.
+                // Do not hold the new peer's monitor while ending the old peer.
                 if (previous != null) {
-                    previous.close("taken over by " + socket.getRemoteSocketAddress());
+                    previous.disconnect(
+                            ReasonCode.SESSION_TAKEN_OVER,
+                            "taken over by " + socket.getRemoteSocketAddress()
+                    );
                 }
                 // CONNACK, retransmissions, and queued deliveries stay ahead of later publications.
                 accepted.resume();
@@ -824,16 +838,11 @@ public final class BrokerServer implements AutoCloseable {
             log.info("Broker refused {} from {} on port {}: {}",
                     request, socket.getRemoteSocketAddress(), port(), reason);
             synchronized (this) {
-                if (enqueue(new Packet.ConnAck(false, reason, Properties.EMPTY))) {
-                    // The writer closes the socket once it has written this CONNACK.
-                    closeAfterWrite = ticket;
-                    return;
-                }
+                closeAfter(new Packet.ConnAck(false, reason, Properties.EMPTY), "refusal sent");
             }
-            close("send queue full");
         }
 
-        private void process(Session owner, Packet packet) throws IOException {
+        private void process(Session owner, Packet packet) {
             switch (packet) {
                 case Packet.Subscribe request -> {
                     var grants = new ArrayList<ReasonCode>();
@@ -946,13 +955,17 @@ public final class BrokerServer implements AutoCloseable {
                      Packet.SubAck _,
                      Packet.UnsubAck _,
                      Packet.PingResp _,
-                     Packet.Auth _ -> throw new IOException(
+                     Packet.Auth _ -> throw new PacketDecodeException(
+                             ReasonCode.PROTOCOL_ERROR,
                              "Unexpected " + packet.getClass().getSimpleName() + " packet"
                      );
             }
         }
 
         private synchronized SendQueue.OfferResult enqueue(Outgoing message) {
+            if (lastPacket != null) {
+                return SendQueue.OfferResult.CLOSED;
+            }
             Delivery delivery = message instanceof Delivery value ? value : null;
             // PUBLISH and PUBREL share the regular queue, whose window always fits a resumed
             // session, and leave the reserved queue to responses to the client's requests.
@@ -981,7 +994,8 @@ public final class BrokerServer implements AutoCloseable {
         private void send(Packet packet) {
             boolean accepted;
             synchronized (this) {
-                accepted = enqueue(packet);
+                // A connection that ends with a last packet drops later responses.
+                accepted = lastPacket != null || enqueue(packet);
             }
             if (!accepted) {
                 close("send queue full");
@@ -990,7 +1004,7 @@ public final class BrokerServer implements AutoCloseable {
 
         // Called under the connection monitor; no socket I/O occurs on a routing thread.
         private boolean enqueue(Packet packet) {
-            if (ended) {
+            if (ended || lastPacket != null) {
                 return false;
             }
             byte[] bytes = PacketCodec.of(version).encode(packet);
@@ -1008,40 +1022,51 @@ public final class BrokerServer implements AutoCloseable {
         }
 
         private void writeLoop() {
-            // Unless a write fails, the writer ends an open connection only after a refusal.
-            String reason = "refusal sent";
+            // Unless a write fails, the writer ends an open connection only after its last
+            // packet, and the connection already holds the reason for that end.
+            String reason = "last packet written";
             try {
                 while (true) {
-                    SendQueue.Send<Outbound> send;
+                    Optional<SendQueue.Send<Outbound>> next;
+                    byte[] last;
                     synchronized (this) {
-                        Optional<SendQueue.Send<Outbound>> next = outgoing.poll();
-                        while (!ended && next.isEmpty()) {
+                        next = outgoing.poll();
+                        while (!ended && next.isEmpty() && lastPacket == null) {
                             wait();
                             next = outgoing.poll();
                         }
                         if (ended) {
                             return;
                         }
-                        send = next.orElseThrow();
+                        last = lastPacket;
                     }
+                    if (next.isEmpty()) {
+                        writer.write(requireNonNull(last));
+                        return;
+                    }
+                    SendQueue.Send<Outbound> send = next.get();
                     Delivery delivery = send.value().delivery();
+                    boolean skip = false;
                     if (delivery != null) {
                         beforeDeliveryWrite.run();
                         synchronized (routing) {
-                            Session owner = currentSession();
-                            if (owner == null) {
+                            if (currentSession() != null) {
+                                delivery.sent = true;
+                            } else if (endsWithLastPacket()) {
+                                // The delivery stays unsent for the session's next connection;
+                                // the last packet still follows.
+                                skip = true;
+                            } else {
                                 return;
                             }
-                            delivery.sent = true;
                         }
                     }
-                    writer.write(send.value().bytes());
+                    if (!skip) {
+                        writer.write(send.value().bytes());
+                    }
                     boolean resume;
                     synchronized (this) {
                         outgoing.completed(send.ticket());
-                        if (send.ticket() == closeAfterWrite) {
-                            return;
-                        }
                         // Refusal and completion share this monitor, so no wakeup is lost.
                         resume = awaitingSpace;
                         awaitingSpace = false;
@@ -1095,8 +1120,43 @@ public final class BrokerServer implements AutoCloseable {
             }
         }
 
+        // Whether routing must leave this connection: it has ended or ends with its last packet.
         private synchronized boolean isEnded() {
-            return ended;
+            return ended || lastPacket != null;
+        }
+
+        private synchronized boolean endsWithLastPacket() {
+            return lastPacket != null;
+        }
+
+        // Ends the connection, first telling an MQTT 5.0 client why with DISCONNECT. MQTT 3.1.1
+        // has no DISCONNECT from a server.
+        private synchronized void disconnect(ReasonCode reasonCode, String reason) {
+            switch (version) {
+                case V3_1_1 -> terminate(reason);
+                case V5 -> closeAfter(new Packet.Disconnect(reasonCode, Properties.EMPTY), reason);
+            }
+        }
+
+        // Ends the connection with `packet` after the sends that wait. Called under the
+        // connection monitor.
+        private void closeAfter(Packet packet, String reason) {
+            if (ended || lastPacket != null) {
+                return;
+            }
+            byte[] bytes = PacketCodec.of(version).encode(packet);
+            // The connect timeout bounds the wait for a writer that a slow peer holds up.
+            cancelTimer();
+            try {
+                armTimer(connectTimeout);
+            } catch (RuntimeException failure) {
+                log.warn("Broker timer for {} failed", socket.getRemoteSocketAddress(), failure);
+                terminate(reason);
+                return;
+            }
+            lastPacket = bytes;
+            endReason = reason;
+            notifyAll();
         }
 
         private synchronized void received() {
@@ -1153,6 +1213,11 @@ public final class BrokerServer implements AutoCloseable {
                     if (ended || generation != timerGeneration) {
                         return;
                     }
+                    if (lastPacket != null) {
+                        // The writer did not get the last packet out within the connect timeout.
+                        terminate(endReason);
+                        return;
+                    }
                     long remaining = receiveTimeout - (scheduler.nanoTime() - lastReceived);
                     if (remaining > 0) {
                         armTimer(remaining);
@@ -1160,7 +1225,11 @@ public final class BrokerServer implements AutoCloseable {
                     }
                     // Mark the deadline under the same lock as receipt; a late frame cannot
                     // revive this connection while removal waits for an ongoing route.
-                    terminate(clientId.isEmpty() ? "CONNECT timeout" : "keep-alive timeout");
+                    if (clientId.isEmpty()) {
+                        terminate("CONNECT timeout");
+                    } else {
+                        disconnect(ReasonCode.KEEP_ALIVE_TIMEOUT, "keep-alive timeout");
+                    }
                 }
             } catch (Throwable failure) {
                 log.warn("Broker timer for {} failed", socket.getRemoteSocketAddress(), failure);
@@ -1168,7 +1237,7 @@ public final class BrokerServer implements AutoCloseable {
                     terminate("timer failure");
                 }
             }
-            // Closing the socket releases reader/writer, which remove the session. Do not
+            // Ending the connection releases reader/writer, which remove the session. Do not
             // make the shared timer wait for the routing lock before checking another peer.
         }
 
@@ -1178,7 +1247,10 @@ public final class BrokerServer implements AutoCloseable {
                 return;
             }
             ended = true;
-            endReason = reason;
+            // A connection that ends with a last packet already holds its reason.
+            if (endReason.isEmpty()) {
+                endReason = reason;
+            }
             cancelTimer();
             outgoing.close();
             notifyAll();

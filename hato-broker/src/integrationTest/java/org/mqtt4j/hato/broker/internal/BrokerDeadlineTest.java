@@ -19,6 +19,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
+import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
@@ -26,8 +28,10 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
+import static org.mqtt4j.hato.broker.internal.RawSession.connectV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
+import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_MOST_ONCE;
 
 class BrokerDeadlineTest {
@@ -83,6 +87,116 @@ class BrokerDeadlineTest {
 
             client.expectClosed();
             assertThat(timer.clock.pendingTaskCount()).isZero();
+        }
+    }
+
+    @Test
+    void an_mqtt_5_client_learns_of_its_keep_alive_timeout_before_the_connection_closes()
+            throws Exception {
+        var timer = new ManualTimer();
+        try (
+                BrokerServer sut = start(timer);
+                var client = RawSession.open(sut.port(), MqttVersion.V5)
+        ) {
+            // Arrange
+            client.send(connectV5("silent", true, 1, 0));
+            client.expect(Packet.ConnAck.class);
+
+            // Act
+            timer.clock.advance(KEEP_ALIVE_TIMEOUT);
+
+            // Assert
+            assertThat(client.expect(Packet.Disconnect.class))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.KEEP_ALIVE_TIMEOUT, EMPTY));
+            client.expectClosed();
+            assertThat(timer.clock.pendingTaskCount()).isZero();
+        }
+    }
+
+    @Test
+    void a_writer_that_its_peer_holds_up_cannot_keep_a_timed_out_connection_open()
+            throws Exception {
+        var timer = new ManualTimer();
+        var armed = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(CONNECT_TIMEOUT)
+                        .scheduler(timer)
+                        .beforeDeliveryWrite(() -> {
+                            if (armed.compareAndSet(true, false)) {
+                                held.countDown();
+                                awaitCountDown(release);
+                            }
+                        })
+                        .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                var subscriber = RawSession.open(sut.port(), MqttVersion.V5);
+                var publisher = connected(sut.port(), "publisher")
+        ) {
+            // Arrange: the subscriber's writer holds a delivery, as for a peer that stops reading.
+            subscriber.send(connectV5("held", true, 1, 0));
+            subscriber.expect(Packet.ConnAck.class);
+            subscriber.subscribe("held/#", AT_MOST_ONCE);
+            armed.set(true);
+            publisher.publish("held/topic", "held", AT_MOST_ONCE, 0);
+            awaitCountDown(held);
+
+            // Act: the keep-alive expires, and then the time for writing DISCONNECT.
+            timer.clock.advance(KEEP_ALIVE_TIMEOUT);
+            timer.clock.advance(CONNECT_TIMEOUT);
+
+            // Assert
+            subscriber.expectClosed();
+            assertThat(timer.clock.pendingTaskCount()).isZero();
+            publisher.ping();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void responses_that_wait_are_written_before_disconnect() throws Exception {
+        var timer = new ManualTimer();
+        var armed = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(CONNECT_TIMEOUT)
+                        .scheduler(timer)
+                        .beforeDeliveryWrite(() -> {
+                            if (armed.compareAndSet(true, false)) {
+                                held.countDown();
+                                awaitCountDown(release);
+                            }
+                        })
+                        .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                var client = RawSession.open(sut.port(), MqttVersion.V5);
+                var publisher = connected(sut.port(), "publisher")
+        ) {
+            // Arrange: the client's writer holds a delivery, and no connection has a deadline.
+            client.send(connectV5("violating", true, 0, 0));
+            client.expect(Packet.ConnAck.class);
+            client.subscribe("held/#", AT_MOST_ONCE);
+            armed.set(true);
+            publisher.publish("held/topic", "held", AT_MOST_ONCE, 0);
+            awaitCountDown(held);
+
+            // Act: PINGRESP waits behind the delivery when AUTH ends the connection, which
+            // arms the deadline for its DISCONNECT.
+            client.send(new Packet.PingReq());
+            client.send(new Packet.Auth(ReasonCode.SUCCESS, EMPTY));
+            timer.awaitPendingTasks(1);
+            release.countDown();
+
+            // Assert: the held delivery is not written, and the waiting response comes first.
+            client.expect(Packet.PingResp.class);
+            assertThat(client.expect(Packet.Disconnect.class))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
+            client.expectClosed();
+        } finally {
+            release.countDown();
         }
     }
 
@@ -342,6 +456,15 @@ class BrokerDeadlineTest {
             }
         }
         assertThat(timer.clock.pendingTaskCount()).isZero();
+    }
+
+    private static void awaitCountDown(CountDownLatch latch) {
+        try {
+            assertThat(latch.await(5, SECONDS)).isTrue();
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(failure);
+        }
     }
 
     private static BrokerServer start(Timer timer) throws IOException {

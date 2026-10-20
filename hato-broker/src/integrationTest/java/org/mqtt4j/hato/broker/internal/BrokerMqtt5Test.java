@@ -2,11 +2,13 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
-import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -15,6 +17,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
 import org.mqtt4j.hato.broker.internal.common.protocol.Property;
 import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
@@ -24,6 +27,7 @@ import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectV5;
@@ -352,7 +356,7 @@ class BrokerMqtt5Test {
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("violations")
-    void a_violation_closes_the_connection_without_forwarding_anything(Packet violation)
+    void a_violation_is_reported_with_disconnect_and_forwards_nothing(Violation violation)
             throws Exception {
         try (
                 var sut = MqttBroker.start();
@@ -363,15 +367,17 @@ class BrokerMqtt5Test {
             subscriber.subscribe("violation/#", AT_MOST_ONCE);
 
             // Act
-            client.send(violation);
+            client.sendRaw(violation.bytes());
 
             // Assert
+            assertThat(client.expect(Packet.Disconnect.class))
+                    .isEqualTo(new Packet.Disconnect(violation.reason(), EMPTY));
             client.expectClosed();
             subscriber.ping();
         }
     }
 
-    static Stream<Named<Packet>> violations() {
+    static Stream<Violation> violations() {
         byte[] payload = "payload".getBytes(UTF_8);
         var alias = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 1)));
         var identifier = new Properties(List.of(
@@ -379,15 +385,17 @@ class BrokerMqtt5Test {
         ));
         var topic = new Topic("violation/topic");
         return Stream.of(
-                Named.of(
+                new Violation(
                         "a Topic Alias",
-                        new Packet.Publish(topic, payload, AT_MOST_ONCE, false, false, 0, alias)
+                        new Packet.Publish(topic, payload, AT_MOST_ONCE, false, false, 0, alias),
+                        ReasonCode.TOPIC_ALIAS_INVALID
                 ),
-                Named.of(
+                new Violation(
                         "a topic given only by its alias",
-                        new Packet.AliasPublish(payload, AT_MOST_ONCE, false, false, 0, alias)
+                        new Packet.AliasPublish(payload, AT_MOST_ONCE, false, false, 0, alias),
+                        ReasonCode.TOPIC_ALIAS_INVALID
                 ),
-                Named.of(
+                new Violation(
                         "a Subscription Identifier",
                         new Packet.Publish(
                                 topic,
@@ -397,11 +405,126 @@ class BrokerMqtt5Test {
                                 false,
                                 0,
                                 identifier
-                        )
+                        ),
+                        ReasonCode.PROTOCOL_ERROR
                 ),
-                Named.of("AUTH", new Packet.Auth(SUCCESS, EMPTY)),
-                Named.of("a second CONNECT", connectV5("violating", true, 0, 0))
+                new Violation("AUTH", new Packet.Auth(SUCCESS, EMPTY), ReasonCode.PROTOCOL_ERROR),
+                new Violation(
+                        "a second CONNECT",
+                        connectV5("violating", true, 0, 0),
+                        ReasonCode.PROTOCOL_ERROR
+                ),
+                // A PUBLISH whose QoS bits hold the reserved value 3.
+                new Violation(
+                        "a malformed packet",
+                        HexFormat.of().parseHex("3603000161"),
+                        ReasonCode.MALFORMED_PACKET
+                )
         );
+    }
+
+    @Test
+    void an_acknowledgement_for_the_wrong_stage_is_reported_as_a_protocol_error()
+            throws Exception {
+        try (
+                var sut = MqttBroker.start();
+                var subscriber = connectedV5(sut.port(), "subscriber");
+                var publisher = connectedV5(sut.port(), "publisher")
+        ) {
+            // Arrange
+            subscriber.subscribe("stage/#", AT_LEAST_ONCE);
+            publisher.publish("stage/topic", "payload", AT_LEAST_ONCE, 1);
+            Packet.Publish delivery = subscriber.expect(Packet.Publish.class);
+
+            // Act: PUBREC belongs to QoS 2.
+            subscriber.send(new Packet.PubRec(delivery.packetId(), SUCCESS, EMPTY));
+
+            // Assert
+            assertThat(subscriber.expect(Packet.Disconnect.class))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
+            subscriber.expectClosed();
+        }
+    }
+
+    @Test
+    void disconnect_follows_the_connack_of_the_connection_that_it_ends() throws Exception {
+        // Arrange: a violation arrives with CONNECT, before CONNACK can have been written.
+        var codec5 = PacketCodec.of(MqttVersion.V5);
+        byte[] connect = codec5.encode(connectV5("hasty", true, 0, 0));
+        byte[] auth = codec5.encode(new Packet.Auth(SUCCESS, EMPTY));
+        byte[] both = Arrays.copyOf(connect, connect.length + auth.length);
+        System.arraycopy(auth, 0, both, connect.length, auth.length);
+        try (
+                var sut = MqttBroker.start();
+                var client = RawSession.open(sut.port(), MqttVersion.V5)
+        ) {
+            // Act
+            client.sendRaw(both);
+
+            // Assert: [MQTT-3.14.0-1].
+            assertThat(client.expect(Packet.ConnAck.class))
+                    .isEqualTo(new Packet.ConnAck(false, SUCCESS, EMPTY));
+            assertThat(client.expect(Packet.Disconnect.class))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
+            client.expectClosed();
+        }
+    }
+
+    @ParameterizedTest(name = "replaced over {0}")
+    @EnumSource(MqttVersion.class)
+    void a_taken_over_mqtt_5_connection_learns_why_before_it_closes(MqttVersion replacement)
+            throws Exception {
+        try (var sut = MqttBroker.start(); var first = connectedV5(sut.port(), "same-id")) {
+            // Act
+            try (var second = clean(sut.port(), "same-id", replacement)) {
+                // Assert
+                assertThat(first.expect(Packet.Disconnect.class))
+                        .isEqualTo(new Packet.Disconnect(ReasonCode.SESSION_TAKEN_OVER, EMPTY));
+                first.expectClosed();
+                second.ping();
+            }
+        }
+    }
+
+    @Test
+    void a_taken_over_connection_leaves_held_deliveries_to_its_replacement() throws Exception {
+        var armed = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .beforeDeliveryWrite(() -> {
+                            if (armed.compareAndSet(true, false)) {
+                                held.countDown();
+                                awaitCountDown(release);
+                            }
+                        })
+                        .start(loopback());
+                var first = connectedV5(sut.port(), "same-id", false, 60, false);
+                var publisher = connectedV5(sut.port(), "publisher")
+        ) {
+            // Arrange: the first connection's writer holds a delivery.
+            first.subscribe("held/#", AT_LEAST_ONCE);
+            armed.set(true);
+            publisher.publish("held/topic", "held", AT_LEAST_ONCE, 1);
+            awaitCountDown(held);
+
+            // Act
+            try (var second = connectedV5(sut.port(), "same-id", false, 60, true)) {
+                release.countDown();
+
+                // Assert: the delivery goes out once, unsent before, on the new connection.
+                assertThat(first.expect(Packet.Disconnect.class))
+                        .isEqualTo(new Packet.Disconnect(ReasonCode.SESSION_TAKEN_OVER, EMPTY));
+                first.expectClosed();
+                Packet.Publish delivery = second.expect(Packet.Publish.class);
+                assertThat(delivery).isEqualTo(
+                        publication("held/topic", "held", AT_LEAST_ONCE, delivery.packetId())
+                );
+            }
+        } finally {
+            release.countDown();
+        }
     }
 
     @Test
@@ -479,6 +602,18 @@ class BrokerMqtt5Test {
         }
     }
 
+    record Violation(String name, byte[] bytes, ReasonCode reason) {
+
+        Violation(String name, Packet packet, ReasonCode reason) {
+            this(name, PacketCodec.of(MqttVersion.V5).encode(packet), reason);
+        }
+
+        @Override
+        public String toString() {
+            return name;
+        }
+    }
+
     private static Packet.Publish publicationWith(
             String topic,
             Properties properties,
@@ -524,5 +659,14 @@ class BrokerMqtt5Test {
 
     private static InetSocketAddress loopback() {
         return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+    }
+
+    private static void awaitCountDown(CountDownLatch latch) {
+        try {
+            assertThat(latch.await(5, SECONDS)).isTrue();
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(failure);
+        }
     }
 }
