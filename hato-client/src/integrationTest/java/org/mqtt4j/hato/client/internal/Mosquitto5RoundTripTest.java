@@ -2,7 +2,10 @@ package org.mqtt4j.hato.client.internal;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -99,6 +102,33 @@ class Mosquitto5RoundTripTest {
                     Qos.AT_LEAST_ONCE,
                     false
             )).get(5, SECONDS)).isEqualTo(PublishResult.of());
+        }
+    }
+
+    @Test
+    void publications_beyond_the_receive_maximum_wait_instead_of_being_refused() throws Exception {
+        var topic = new Topic("hato/mqtt5/receive-maximum");
+        try (MqttClient sut = client("mqtt5-receive-maximum", Duration.ZERO)) {
+            // Arrange: Mosquitto takes 20 publications at once and refuses more with Quota
+            // exceeded. QoS 2 keeps that room until PUBCOMP, whereas Mosquitto frees it at once
+            // for QoS 1, so only a QoS 2 burst runs into the limit.
+            sut.connect().get(5, SECONDS);
+
+            // Act: publish all that the client admits at once.
+            List<CompletableFuture<PublishResult>> publications = IntStream.range(0, 64)
+                    .mapToObj(i -> MqttMessage.of(
+                            topic,
+                            new byte[] {(byte) i},
+                            Qos.EXACTLY_ONCE,
+                            false
+                    ))
+                    .map(sut::publish)
+                    .toList();
+
+            // Assert
+            for (CompletableFuture<PublishResult> publication : publications) {
+                assertThat(publication.get(5, SECONDS)).isEqualTo(PublishResult.of());
+            }
         }
     }
 

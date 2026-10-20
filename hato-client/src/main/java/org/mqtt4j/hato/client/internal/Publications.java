@@ -37,13 +37,15 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// The session core's part for outgoing publications. It keeps the session's QoS 1 and QoS 2
 /// exchanges, replays them on a continued session, answers PUBREC with PUBREL, and decides each
-/// publication's future when its exchange or its connection ends. The core decides when queued
-/// work may use send capacity; this part reaches the rest of the core only through
-/// [SessionCore.Context].
+/// publication's future when its exchange or its connection ends. Publications beyond the
+/// broker's Receive Maximum wait, in session order, until earlier exchanges finish. The core
+/// decides when queued work may use send capacity; this part reaches the rest of the core only
+/// through [SessionCore.Context].
 final class Publications {
 
     private static final Log log = Log.of(Publications.class);
 
+    // The session's QoS 1 and QoS 2 exchanges, including publications that wait to be sent.
     private static final int INFLIGHT_LIMIT = 64;
 
     private static final long INFLIGHT_BYTE_LIMIT = 32L * 1024 * 1024;
@@ -109,12 +111,12 @@ final class Publications {
             );
             return;
         }
-        // Replays precede subscription restoration; SUBACK waiting does not block publication.
-        if (!window.replays.isEmpty()) {
-            capacityFailure(operation, "Publication replay pending");
+        // A new publication neither overtakes nor joins exchanges that wait for send capacity.
+        // SUBACK waiting does not block publication.
+        if (window.stalled) {
+            capacityFailure(operation, "Send queue capacity");
             return;
         }
-        long ticket = core.nextTicket();
         int packetId = 0;
         SendReceipt receipt = null;
         if (message.qos() != Qos.AT_MOST_ONCE) {
@@ -122,8 +124,14 @@ final class Publications {
                 capacityFailure(operation, "Publication capacity");
                 return;
             }
+            // Beyond the broker's Receive Maximum, a publication waits for an earlier exchange to
+            // finish, and later ones wait behind it. QoS 0 never waits.
+            boolean waits = !window.unsent.isEmpty() || outstanding() >= receiveMaximum();
+            // A persistent session keeps the PUBLISH until PUBACK or PUBREC, and a clean one only
+            // while it waits; the byte budget counts what is kept.
+            boolean kept = !cleanStart || waits;
             int byteCount = 0;
-            if (!cleanStart) {
+            if (kept) {
                 long remaining = INFLIGHT_BYTE_LIMIT - bytes;
                 if (message.payloadSize() > remaining) {
                     capacityFailure(operation, "Publication byte capacity");
@@ -145,13 +153,19 @@ final class Publications {
                     packetId,
                     operation,
                     message.qos(),
-                    cleanStart ? null : message,
+                    kept ? message : null,
                     byteCount
             );
             inflight.put(packetId, publication);
             bytes += byteCount;
+            if (waits) {
+                window.unsent.add(publication);
+                return;
+            }
             receipt = publication.receipt;
-        } else {
+        }
+        long ticket = core.nextTicket();
+        if (packetId == 0) {
             window.publications.put(ticket, operation);
         }
         SendQueue.OfferResult result = port.publish(
@@ -210,14 +224,14 @@ final class Publications {
                 // The receiver owns the body after PUBREC, but the id and count stay reserved
                 // until PUBCOMP. Replacing the entry drops the body and retains PUBREC order.
                 bytes -= publication.bytes;
-                window.replays.remove(publication);
+                window.unsent.remove(publication);
                 core.responses().answered(ResponseDeadlines.Kind.PUBREC, packetId);
                 inflight.putLast(packetId, new Release(packetId, publication.operation));
             }
             case Release pending -> {
                 // A PUBREL replay still waiting for capacity also answers this duplicate. The
                 // scan is bounded by the 64 exchanges; index it only if that limit grows.
-                if (window.replays.contains(pending)) {
+                if (window.releaseReplays.contains(pending)) {
                     return;
                 }
             }
@@ -264,49 +278,66 @@ final class Publications {
         completePublication(exchange);
     }
 
-    /// Queues the session's exchanges for replay on a connection that continues the session.
+    /// Queues the session's exchanges for a connection that continues the session.
     void resume() {
-        window.replays.addAll(inflight.values());
+        for (Inflight exchange : inflight.values()) {
+            switch (exchange) {
+                case Publication publication -> window.unsent.add(publication);
+                case Release release -> window.releaseReplays.add(release);
+            }
+        }
     }
 
-    /// Replays the session's exchanges in their order and returns whether every replay was
-    /// admitted; while one waits, the core sends no other queued work. A duplicate PUBREC shares
-    /// a PUBREL replay still waiting here instead of adding another response.
-    boolean replay() {
-        Inflight next;
-        while ((next = window.replays.peekFirst()) != null) {
-            if (inflight.get(next.packetId) != next) {
-                window.replays.removeFirst();
-                continue;
-            }
-            if (next instanceof Publication publication) {
-                // A continued session can reach a broker with stricter limits. Sending would end
-                // the connection, and every reconnection would replay the same publication.
-                Optional<ReasonCode> refusal = refusal(requireNonNull(publication.message));
-                if (refusal.isPresent()) {
-                    refused(publication, refusal.orElseThrow());
-                    continue;
-                }
-            }
+    /// Sends what this connection has yet to send and returns whether nothing waits for send
+    /// capacity; while something does, the core sends no other queued work. The PUBRELs that a
+    /// continued session resends go first, because they need no room under the broker's Receive
+    /// Maximum and their PUBCOMPs make some. Publications follow in session order while room
+    /// lasts. One that waits only for room holds back later publications, but no other packet:
+    /// those keep flowing even when the broker's quota is used up (MQTT 5.0 section 4.9). A
+    /// duplicate PUBREC shares a PUBREL replay still waiting here instead of adding another
+    /// response.
+    boolean sendQueued() {
+        Release release;
+        while ((release = window.releaseReplays.peekFirst()) != null) {
             long ticket = core.nextTicket();
-            SendQueue.OfferResult result = switch (next) {
-                case Publication publication -> port.publish(
-                        core.generation(),
-                        ticket,
-                        requireNonNull(publication.message),
-                        publication.packetId,
-                        requireNonNull(publication.receipt)
-                );
-                case Release release -> sendRelease(ticket, release.packetId);
-            };
-            if (result != SendQueue.OfferResult.ACCEPTED) {
+            if (sendRelease(ticket, release.packetId) != SendQueue.OfferResult.ACCEPTED) {
+                window.stalled = true;
                 return false;
             }
-            if (next instanceof Publication publication) {
-                awaitPublication(ticket, publication.qos, publication.packetId);
-            }
-            window.replays.removeFirst();
+            window.releaseReplays.removeFirst();
         }
+        Publication next;
+        while ((next = window.unsent.peekFirst()) != null && outstanding() < receiveMaximum()) {
+            MqttMessage message = requireNonNull(next.message);
+            // A continued session can reach a broker with stricter limits. Sending would end the
+            // connection, and every reconnection would replay the same publication.
+            Optional<ReasonCode> refusal = refusal(message);
+            if (refusal.isPresent()) {
+                refused(next, refusal.orElseThrow());
+                continue;
+            }
+            long ticket = core.nextTicket();
+            SendQueue.OfferResult result = port.publish(
+                    core.generation(),
+                    ticket,
+                    message,
+                    next.packetId,
+                    next.receipt
+            );
+            if (result != SendQueue.OfferResult.ACCEPTED) {
+                window.stalled = true;
+                return false;
+            }
+            awaitPublication(ticket, next.qos, next.packetId);
+            window.unsent.removeFirst();
+            if (cleanStart) {
+                // A clean session never resends, so it keeps the PUBLISH only until it is sent.
+                bytes -= next.bytes;
+                next.bytes = 0;
+                next.message = null;
+            }
+        }
+        window.stalled = false;
         return true;
     }
 
@@ -388,6 +419,20 @@ final class Publications {
 
     private void capacityFailure(long operation, String message) {
         port.complete(operation, null, new MqttCapacityException(message));
+    }
+
+    /// The exchanges that take room under the broker's Receive Maximum: the publications that
+    /// this connection has sent, and every exchange awaiting PUBCOMP. MQTT 5.0 section 4.9 lets a
+    /// new connection leave out an exchange whose PUBREL it resends, but a broker can count it
+    /// from the reconnection on, as Mosquitto does; counting it here keeps within both.
+    private int outstanding() {
+        return inflight.size() - window.unsent.size();
+    }
+
+    /// How many exchanges may be outstanding on this connection: the broker's Receive Maximum,
+    /// within the session's own limit.
+    private int receiveMaximum() {
+        return Math.min(INFLIGHT_LIMIT, core.receiveMaximum());
     }
 
     private void awaitPublication(long ticket, Qos qos, int packetId) {
@@ -538,7 +583,8 @@ final class Publications {
             } else {
                 core.responses().answered(ResponseDeadlines.Kind.PUBCOMP, packetId);
             }
-            window.replays.remove(exchange);
+            window.unsent.remove(exchange);
+            window.releaseReplays.remove(exchange);
             window.releases.remove(packetId);
         }
     }
@@ -548,8 +594,14 @@ final class Publications {
 
         // QoS 0 publications by ticket; they complete when their write completes.
         final Map<Long, Long> publications = new HashMap<>();
-        // At most 64 retained publications await queue admission, in the session's order.
-        final ArrayDeque<Inflight> replays = new ArrayDeque<>();
+        // Exchanges awaiting PUBCOMP whose PUBREL a continued session resends, in PUBREC order.
+        final ArrayDeque<Release> releaseReplays = new ArrayDeque<>();
+        // At most 64 publications that this connection has yet to send, in session order: those
+        // that a continued session resends, then those that wait for room under the broker's
+        // Receive Maximum.
+        final ArrayDeque<Publication> unsent = new ArrayDeque<>();
+        // Set while a queued exchange waits for send capacity.
+        boolean stalled;
         // PUBREC responses have their own FIFO: an application's unready incoming
         // acknowledgement must not block its outgoing publication. Coalescing by id bounds even
         // unknown responses to the protocol's 65,535 identifiers.
@@ -577,8 +629,10 @@ final class Publications {
     private static final class Publication extends Inflight {
 
         final Qos qos;
-        final @Nullable MqttMessage message;
-        final int bytes;
+        // A persistent session keeps the PUBLISH until PUBACK or PUBREC so that it can resend
+        // it; a clean one keeps it only until it is sent. The byte budget counts what is kept.
+        @Nullable MqttMessage message;
+        int bytes;
         final @Nullable SendReceipt receipt;
 
         Publication(

@@ -206,7 +206,7 @@ final class SessionCore {
 
         void releasePacketId(int packetId);
 
-        /// Sends queued replays, PUBREC responses, and registrations, in that order.
+        /// Sends queued exchanges, PUBREC responses, and registrations, in that order.
         void drain();
 
         /// Lets acknowledgements, removals, and other queued work use returned send capacity.
@@ -224,6 +224,11 @@ final class SessionCore {
         /// The limits that the broker announced for the established connection. Only valid
         /// while a connection is established.
         ConnAck limits();
+
+        /// How many QoS 1 and QoS 2 publications the broker takes at once on the established
+        /// connection: its Receive Maximum, which is 65,535 when it announced none. Only valid
+        /// while a connection is established.
+        int receiveMaximum();
     }
 
     private static final Log log = Log.of(SessionCore.class);
@@ -489,8 +494,8 @@ final class SessionCore {
                 )) {
                     case Outcome.Failed(var cause) -> failed(connection, cause);
                     case Outcome.Abandoned(var refusal) -> abandon(refusal);
-                    case Outcome.Established(var result, var keepAlive) ->
-                            establish(result, keepAlive, now);
+                    case Outcome.Established(var result, var keepAlive, var receiveMaximum) ->
+                            establish(result, keepAlive, receiveMaximum, now);
                 }
             }
         } else if (packet instanceof Packet.PubAck ack) {
@@ -537,8 +542,8 @@ final class SessionCore {
 
     /// Establishes the current connection with `result`, which continues the session when it has
     /// Session Present and otherwise starts a new one, and keeps the connection alive at
-    /// `keepAlive`.
-    private void establish(ConnAck result, Duration keepAlive, long now) {
+    /// `keepAlive`. The broker takes up to `receiveMaximum` QoS 1 and QoS 2 publications at once.
+    private void establish(ConnAck result, Duration keepAlive, int receiveMaximum, long now) {
         boolean sessionPresent = result.sessionPresent();
         if (!sessionPresent) {
             discardSession();
@@ -555,6 +560,7 @@ final class SessionCore {
         }
         current.ack = result;
         current.keepAlive = keepAlive;
+        current.receiveMaximum = receiveMaximum;
         request.establish();
         port.admit(generation);
         // Reconcile before announcing, so connect() and onConnected already find continued
@@ -636,15 +642,16 @@ final class SessionCore {
         subscriptions.unsubscribe(operation, subscriptionId);
     }
 
-    /// Sends queued work in order: the session's replays, then PUBREC responses, then
+    /// Sends queued work in order: the session's queued exchanges, then PUBREC responses, then
     /// registrations, which use no application operation slots and resume when capacity returns.
     private void drainDeferred() {
         if (state != State.CONNECTED) {
             return;
         }
-        // A replay waiting for capacity holds back everything after it. PUBREC responses use
-        // the reserved quota, so registrations in the regular quota proceed even when they wait.
-        if (publications.replay()) {
+        // An exchange waiting for capacity holds back everything after it, unlike publications
+        // that wait only for the broker's Receive Maximum. PUBREC responses use the reserved
+        // quota, so registrations in the regular quota proceed even when they wait.
+        if (publications.sendQueued()) {
             publications.sendReleases();
             subscriptions.sendRegistrations();
         }
@@ -1137,6 +1144,11 @@ final class SessionCore {
         public ConnAck limits() {
             return requireNonNull(current.ack);
         }
+
+        @Override
+        public int receiveMaximum() {
+            return current.receiveMaximum;
+        }
     }
 
     // State owned by one connection. Its attempt, the session, and the parts' own state can
@@ -1148,6 +1160,8 @@ final class SessionCore {
         // Set with the CONNACK: the configured interval, or the broker's Server Keep Alive,
         // which lasts for this connection only.
         Duration keepAlive = Duration.ZERO;
+        // Set with the CONNACK: how many QoS 1 and QoS 2 publications the broker takes at once.
+        int receiveMaximum;
         long stableDeadline;
         long pingTicket;
         long disconnectTicket;

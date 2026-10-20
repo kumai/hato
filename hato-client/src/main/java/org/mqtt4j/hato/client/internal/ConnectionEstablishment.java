@@ -61,8 +61,14 @@ final class ConnectionEstablishment {
 
         /// The connection is established with `ack`, which continues the session when it has
         /// Session Present and otherwise starts a new one. The connection keeps alive at
-        /// `keepAlive`: the configured interval, or the one that the broker set instead.
-        record Established(ConnAck ack, Duration keepAlive) implements Outcome {}
+        /// `keepAlive`: the configured interval, or the one that the broker set instead. The
+        /// broker takes up to `receiveMaximum` QoS 1 and QoS 2 publications at once from this
+        /// client.
+        record Established(
+                ConnAck ack,
+                Duration keepAlive,
+                int receiveMaximum
+        ) implements Outcome {}
     }
 
     private static final Log log = Log.of(ConnectionEstablishment.class);
@@ -70,6 +76,9 @@ final class ConnectionEstablishment {
     // The largest packet that MQTT can carry, including the fixed header. A broker that
     // announces no Maximum Packet Size, or a larger one, accepts packets up to this size.
     static final int LARGEST_PACKET_SIZE = 268_435_460;
+
+    // The Receive Maximum when the broker announces none, as no MQTT 3.1.1 broker can.
+    private static final int DEFAULT_RECEIVE_MAXIMUM = 65_535;
 
     private final String clientId;
 
@@ -216,7 +225,11 @@ final class ConnectionEstablishment {
                     new MqttConnectException("Broker session present after discarding it")
             );
         }
-        return new Outcome.Established(ConnAck.of(ack.sessionPresent(), attempt), keepAlive);
+        return new Outcome.Established(
+                ConnAck.of(ack.sessionPresent(), attempt),
+                keepAlive,
+                DEFAULT_RECEIVE_MAXIMUM
+        );
     }
 
     private Outcome acceptMqtt5(Packet.ConnAck ack, boolean sessionEstablished, long attempt) {
@@ -250,7 +263,9 @@ final class ConnectionEstablishment {
         Duration connectionKeepAlive = serverKeepAlive.isPresent()
                 ? Duration.ofSeconds(serverKeepAlive.getAsLong())
                 : keepAlive;
-        return new Outcome.Established(connAck, connectionKeepAlive);
+        int receiveMaximum = (int) number(properties, PropertyId.RECEIVE_MAXIMUM)
+                .orElse(DEFAULT_RECEIVE_MAXIMUM);
+        return new Outcome.Established(connAck, connectionKeepAlive, receiveMaximum);
     }
 
     /// The value of the integer property `id`, or empty when `properties` has none.

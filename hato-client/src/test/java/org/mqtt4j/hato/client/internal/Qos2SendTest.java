@@ -567,7 +567,7 @@ class Qos2SendTest {
     }
 
     @Test
-    void pubrec_during_disconnect_moves_the_exchange_to_the_end_and_replays_only_pubrel() {
+    void pubrec_during_disconnect_leaves_only_pubrel_to_resend() {
         // Arrange
         connect(false);
         long operation = publish(message());
@@ -595,9 +595,9 @@ class Qos2SendTest {
         port.outgoingIds.clear();
         connect(true);
 
-        // Assert
+        // Assert: the resent PUBREL goes before the resent PUBLISH.
         assertThat(failed.failure()).isInstanceOf(MqttConnectionLostException.class);
-        assertThat(port.outgoingIds).containsExactly(second, first);
+        assertThat(port.outgoingIds).containsExactly(first, second);
         assertThat(port.releases).containsExactly(pubRel(first));
         assertThat(result(operation)).isSameAs(failed);
 
@@ -721,7 +721,7 @@ class Qos2SendTest {
     }
 
     @Test
-    void mixed_replay_keeps_publish_order_and_moves_releases_in_pubrec_order() {
+    void mixed_replay_resends_pubrel_in_pubrec_order_before_publish_in_send_order() {
         // Arrange
         connect(false);
         publish(message().withQos(Qos.AT_LEAST_ONCE));
@@ -742,7 +742,7 @@ class Qos2SendTest {
         connect(true);
 
         // Assert: duplicate PUBREC does not move an existing PUBCOMP wait to the end.
-        assertThat(port.outgoingIds).containsExactly(first, fourth, third, second);
+        assertThat(port.outgoingIds).containsExactly(third, second, first, fourth);
         assertThat(port.accepted.subList(4, port.accepted.size()))
                 .extracting(Publication::packetId)
                 .containsExactly(first, fourth);
@@ -776,7 +776,7 @@ class Qos2SendTest {
 
     @Test
     void a_duplicate_pubrec_shares_a_pubrel_replay_still_waiting_for_capacity() {
-        // Arrange: PUBREC moved the first exchange behind the second in the session order.
+        // Arrange: the PUBREL that the continued session resends waits for send capacity.
         connect(false);
         publish(message());
         int first = port.accepted.getLast().packetId();
@@ -784,17 +784,17 @@ class Qos2SendTest {
         int second = port.accepted.getLast().packetId();
         receive(pubRec(first));
         sut.failed(generation, new IOException("connection lost"));
-        port.publishAllowance = 0;
+        port.releaseAllowance = 0;
         port.outgoingIds.clear();
         connect(true);
 
-        // Act
+        // Act: room for two PUBRELs returns after the duplicate.
         receive(pubRec(first));
-        port.publishAllowance = 1;
+        port.releaseAllowance = 2;
         sut.sendCapacityAvailable(generation);
 
         // Assert
-        assertThat(port.outgoingIds).containsExactly(second, first);
+        assertThat(port.outgoingIds).containsExactly(first, second);
     }
 
     @ParameterizedTest

@@ -64,6 +64,7 @@ import static org.mqtt4j.hato.client.internal.SessionCore.State.DISCONNECTED;
 import static org.mqtt4j.hato.client.internal.SessionCore.Timer.CONNECT;
 import static org.mqtt4j.hato.client.internal.SessionCore.Timer.KEEP_ALIVE;
 import static org.mqtt4j.hato.client.internal.SessionCore.Timer.PING;
+import static org.mqtt4j.hato.client.internal.SessionCore.Timer.RESPONSE;
 import static org.mqtt4j.hato.client.internal.SessionPersistenceTest.messageWithWireBytes;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
@@ -2123,6 +2124,198 @@ class SessionCoreTest {
         assertThat(mqtt5.state()).isEqualTo(CONNECTED);
     }
 
+    @Test
+    void publications_beyond_the_brokers_receive_maximum_wait_for_room() {
+        // Arrange: the broker takes two publications at once.
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(2));
+        mqtt5.publish(2, qosOneMessage());
+        mqtt5.publish(3, qosOneMessage().withQos(Qos.EXACTLY_ONCE));
+
+        // Act
+        mqtt5.publish(4, qosOneMessage().withTopic(new Topic("waiting")));
+
+        // Assert: the third publication waits without failing.
+        assertThat(port.publications).hasSize(2);
+        assertThat(port.results).doesNotContainKeys(2L, 3L, 4L);
+
+        // Act: the first PUBACK makes room.
+        int first = port.publicationIds.getFirst();
+        mqtt5.received(1, new Packet.PubAck(first, ReasonCode.SUCCESS, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(port.publications).hasSize(3);
+        assertThat(port.publications.getLast().topic()).isEqualTo(new Topic("waiting"));
+        assertThat(port.results).containsKey(2L).doesNotContainKeys(3L, 4L);
+    }
+
+    @Test
+    void a_qos_2_exchange_keeps_its_room_until_pubcomp_while_pubrel_still_flows() {
+        // Arrange: the broker takes one publication at once, so the second one waits.
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
+        mqtt5.publish(2, qosOneMessage().withQos(Qos.EXACTLY_ONCE));
+        int id = port.publicationIds.getLast();
+        mqtt5.publish(3, qosOneMessage());
+
+        // Act
+        mqtt5.received(1, new Packet.PubRec(id, ReasonCode.SUCCESS, EMPTY), 0, 0);
+
+        // Assert: PUBREL goes out although the broker has no room for another publication.
+        assertThat(port.sent).last().isEqualTo(new Packet.PubRel(id, ReasonCode.SUCCESS, EMPTY));
+        assertThat(port.publications).hasSize(1);
+
+        // Act
+        mqtt5.received(1, new Packet.PubComp(id, ReasonCode.SUCCESS, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(port.publications).hasSize(2);
+    }
+
+    @Test
+    void a_refusing_pubrec_makes_room_for_the_next_publication() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
+        mqtt5.publish(2, qosOneMessage().withQos(Qos.EXACTLY_ONCE));
+        int id = port.publicationIds.getLast();
+        mqtt5.publish(3, qosOneMessage());
+
+        // Act
+        mqtt5.received(1, new Packet.PubRec(id, ReasonCode.NOT_AUTHORIZED, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(port.publications).hasSize(2);
+        assertThat(port.sent).noneMatch(Packet.PubRel.class::isInstance);
+    }
+
+    @Test
+    void qos_0_does_not_wait_behind_publications_that_the_broker_has_no_room_for() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
+        mqtt5.publish(2, qosOneMessage());
+        mqtt5.publish(3, qosOneMessage());
+
+        // Act
+        mqtt5.publish(4, qosOneMessage().withQos(Qos.AT_MOST_ONCE));
+
+        // Assert
+        assertThat(port.publications)
+                .extracting(MqttMessage::qos)
+                .containsExactly(Qos.AT_LEAST_ONCE, Qos.AT_MOST_ONCE);
+    }
+
+    @Test
+    void publications_waiting_for_room_hold_back_no_other_packet() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
+        mqtt5.publish(2, qosOneMessage());
+        mqtt5.publish(3, qosOneMessage());
+
+        // Act
+        mqtt5.subscribe(4, subscription("a/#"));
+
+        // Assert
+        assertThat(port.sent).last().isInstanceOf(Packet.Subscribe.class);
+    }
+
+    @Test
+    void waiting_publications_count_toward_the_sixty_four_that_a_session_admits() {
+        // Arrange: one publication takes the broker's only room, so 63 wait.
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
+        for (int i = 0; i < 64; i++) {
+            mqtt5.publish(2 + i, qosOneMessage());
+        }
+
+        // Act
+        mqtt5.publish(66, qosOneMessage());
+
+        // Assert
+        assertThat(port.publications).hasSize(1);
+        assertThat(port.results).doesNotContainKeys(2L, 65L);
+        assertThat(requireNonNull(port.results.get(66L)).failure())
+                .isInstanceOf(MqttCapacityException.class);
+    }
+
+    @Test
+    void a_clean_session_counts_waiting_publications_toward_the_byte_budget_until_sent() {
+        // Arrange: the first publication is sent, and the next two wait with 32 MiB in all.
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
+        MqttMessage half = messageWithWireBytes(16 * 1024 * 1024, MqttVersion.V5);
+        mqtt5.publish(2, half);
+        int first = port.publicationIds.getLast();
+        mqtt5.publish(3, half);
+        mqtt5.publish(4, half);
+        mqtt5.publish(5, qosOneMessage());
+        assertThat(requireNonNull(port.results.get(5L)).failure())
+                .isInstanceOf(MqttCapacityException.class);
+
+        // Act: sending the second publication returns its share of the budget.
+        mqtt5.received(1, new Packet.PubAck(first, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        mqtt5.publish(6, qosOneMessage());
+
+        // Assert
+        assertThat(port.publications).hasSize(2);
+        assertThat(port.results).doesNotContainKeys(3L, 4L, 6L);
+    }
+
+    @Test
+    void a_continued_session_resends_pubrel_first_and_publications_within_the_new_maximum() {
+        // Arrange: a QoS 2 exchange awaits PUBCOMP and two QoS 1 publications await PUBACK.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(), 0, 0);
+        mqtt5.publish(2, qosOneMessage().withQos(Qos.EXACTLY_ONCE));
+        int released = port.publicationIds.getLast();
+        mqtt5.received(1, new Packet.PubRec(released, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        mqtt5.publish(3, qosOneMessage());
+        int first = port.publicationIds.getLast();
+        mqtt5.publish(4, qosOneMessage());
+        int second = port.publicationIds.getLast();
+        mqtt5.failed(1, new IOException("connection lost"));
+        port.sent.clear();
+        port.publicationIds.clear();
+
+        // Act: the session continues where the broker takes one publication at once.
+        mqtt5.connect(attempt(5), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(
+                true,
+                ReasonCode.SUCCESS,
+                new Properties(List.of(receiveMaximum(1)))
+        ), 0, 0);
+
+        // Assert: the resent PUBREL holds the only room until PUBCOMP.
+        assertThat(port.sent).filteredOn(Packet.PubRel.class::isInstance).containsExactly(
+                new Packet.PubRel(released, ReasonCode.SUCCESS, EMPTY)
+        );
+        assertThat(port.publicationIds).isEmpty();
+
+        // Act & Assert: each answer makes room for the next resent publication.
+        mqtt5.received(2, new Packet.PubComp(released, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        assertThat(port.publicationIds).containsExactly(first);
+        mqtt5.received(2, new Packet.PubAck(first, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        assertThat(port.publicationIds).containsExactly(first, second);
+    }
+
+    @Test
+    void the_response_deadline_of_a_waiting_publication_starts_at_its_write() {
+        // Arrange: the second publication waits 50 seconds for room.
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
+        mqtt5.publish(2, qosOneMessage());
+        int first = port.publicationIds.getLast();
+        mqtt5.sent(1, port.ticket, 0);
+        mqtt5.publish(3, qosOneMessage());
+        long later = Duration.ofSeconds(50).toNanos();
+        mqtt5.received(1, new Packet.PubAck(first, ReasonCode.SUCCESS, EMPTY), later, 0);
+        mqtt5.sent(1, port.ticket, later);
+
+        // Act: 60 seconds have passed since the publish, but not since the write.
+        mqtt5.timer(1, RESPONSE, Duration.ofSeconds(60).toNanos());
+
+        // Assert
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
+        assertThat(port.results).doesNotContainKey(3L);
+    }
+
     @ParameterizedTest(name = "PUBACK {0}")
     @EnumSource(value = ReasonCode.class, names = {"SUCCESS", "NO_MATCHING_SUBSCRIBERS"})
     void an_mqtt_5_puback_below_0x80_completes_the_publication(ReasonCode reason) {
@@ -3604,6 +3797,11 @@ class SessionCoreTest {
     /// A successful CONNACK without Session Present that carries `properties`.
     private static Packet.ConnAck connAck(Property... properties) {
         return new Packet.ConnAck(false, ReasonCode.SUCCESS, new Properties(List.of(properties)));
+    }
+
+    /// The CONNACK property with which the broker takes `publications` at once.
+    private static Property receiveMaximum(int publications) {
+        return new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, publications);
     }
 
     private static ConnectionAttempt attempt(long operation) {

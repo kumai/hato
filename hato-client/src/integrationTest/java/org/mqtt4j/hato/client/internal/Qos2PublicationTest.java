@@ -103,11 +103,15 @@ class Qos2PublicationTest {
                 failures.add(failure);
             }
 
-            // Act: PUBLISH keeps its original order, PUBREL follows the PUBREC reception order.
+            // Act: PUBREL goes first in the PUBREC reception order, and PUBLISH follows in its
+            // original order.
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut, true, request -> {
                 assertThat(request.clientId()).isEqualTo(clientId);
                 assertThat(request.cleanStart()).isFalse();
             })) {
+                for (int index : List.of(3, 0)) {
+                    expectRelease(peer, originals.get(index).packetId());
+                }
                 for (int index : List.of(1, 2)) {
                     Packet.Publish old = originals.get(index);
                     assertThat(peer.receive()).isEqualTo(new Packet.Publish(
@@ -119,9 +123,6 @@ class Qos2PublicationTest {
                             old.packetId(),
                             old.properties()
                     ));
-                }
-                for (int index : List.of(3, 0)) {
-                    expectRelease(peer, originals.get(index).packetId());
                 }
                 peer.send(
                         new Packet.PubAck(originals.get(1).packetId(), ReasonCode.SUCCESS, EMPTY)
