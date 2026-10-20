@@ -137,6 +137,13 @@ public sealed interface Packet {
         public int hashCode() {
             return Objects.hash(topic, Arrays.hashCode(payload), qos, retain, properties);
         }
+
+        /// Reports the payload only by size, like the properties' application data.
+        @Override
+        public String toString() {
+            return "Will[topic=" + topic + ", payloadBytes=" + payload.length + ", qos=" + qos
+                    + ", retain=" + retain + ", properties=" + properties + "]";
+        }
     }
 
     /// CONNACK — the connection result.

@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.common.protocol;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -60,6 +61,44 @@ class PacketTest {
 
         assertThat(sut.toString()).contains("clientId=client", "keepAliveSeconds=60")
                 .doesNotContain("private-user", "username=", "password=", "[B@");
+    }
+
+    @Test
+    void connect_shows_the_application_data_of_its_will_only_by_size() {
+        var will = new Packet.Will(
+                new Topic("status"),
+                "offline-payload".getBytes(StandardCharsets.UTF_8),
+                Qos.AT_LEAST_ONCE,
+                false,
+                new Properties(List.of(
+                        new Property.StringValue(PropertyId.CONTENT_TYPE, "text/plain"),
+                        new Property.BinaryValue(
+                                PropertyId.CORRELATION_DATA,
+                                "request-17".getBytes(StandardCharsets.UTF_8)
+                        ),
+                        new Property.UserProperty("token", "s3cret")
+                ))
+        );
+        var sut = new Packet.Connect(
+                "client",
+                MqttVersion.V5,
+                true,
+                60,
+                will,
+                null,
+                null,
+                Properties.EMPTY
+        );
+
+        assertThat(sut.toString())
+                .contains(
+                        "topic=status",
+                        "payloadBytes=15",
+                        "text/plain",
+                        "CORRELATION_DATA, bytes=10",
+                        "UserProperty[omitted]"
+                )
+                .doesNotContain("offline-payload", "request-17", "token", "s3cret", "[B@");
     }
 
     @ParameterizedTest

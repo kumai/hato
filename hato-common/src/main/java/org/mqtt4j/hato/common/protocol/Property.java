@@ -80,6 +80,13 @@ public sealed interface Property {
         public int hashCode() {
             return 31 * id.hashCode() + Arrays.hashCode(value);
         }
+
+        /// Reports only the size, because binary properties such as Correlation Data and
+        /// Authentication Data carry application data or secrets.
+        @Override
+        public String toString() {
+            return "BinaryValue[id=" + id + ", bytes=" + value.length + "]";
+        }
     }
 
     /// A UTF-8 string. Response Topic additionally requires a nonempty topic without wildcards.
@@ -106,6 +113,12 @@ public sealed interface Property {
         @Override
         public PropertyId id() {
             return PropertyId.USER_PROPERTY;
+        }
+
+        /// Leaves out the name and the value, which carry application data.
+        @Override
+        public String toString() {
+            return "UserProperty[omitted]";
         }
     }
 
