@@ -16,9 +16,9 @@ import org.mqtt4j.hato.*;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/// The client's MQTT 5.0 connections, shared by Mosquitto and the embedded broker: publications
-/// at every QoS, message properties, a persistent session that keeps messages while the client
-/// is away, and a session that another client takes over.
+/// The client's MQTT 5.0 connections, shared by Mosquitto, EMQX, HiveMQ CE, and the embedded
+/// broker: publications at every QoS, message properties, a persistent session that keeps
+/// messages while the client is away, and a session that another client takes over.
 @Timeout(30)
 abstract class Mqtt5RoundTripTest {
 
@@ -121,8 +121,8 @@ abstract class Mqtt5RoundTripTest {
             // Arrange
             sut.connect().get(5, SECONDS);
 
-            // Act & Assert: Mosquitto answers No matching subscribers, and the embedded
-            // broker answers success.
+            // Act & Assert: Mosquitto, EMQX, and HiveMQ CE answer No matching subscribers, and
+            // the embedded broker answers success.
             assertThat(sut.publish(MqttMessage.of(
                     new Topic("hato/mqtt5/nobody"),
                     new byte[] {1},

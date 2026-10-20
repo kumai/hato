@@ -13,6 +13,7 @@ import org.junit.jupiter.api.condition.EnabledIf;
 import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.*;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -28,12 +29,12 @@ class Mosquitto5RoundTripTest extends Mqtt5RoundTripTest {
     private static final GenericContainer<?> broker = Mosquitto.container();
 
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     @BeforeAll
     static void start() {
-        Mosquitto.start(broker);
+        Docker.start(broker);
     }
 
     @AfterAll

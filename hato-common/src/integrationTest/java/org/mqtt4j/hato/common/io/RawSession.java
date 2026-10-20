@@ -8,11 +8,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeoutException;
 
+import org.jspecify.annotations.Nullable;
 import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.common.protocol.Packet;
 import org.mqtt4j.hato.common.protocol.PacketCodec;
-import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -32,6 +32,10 @@ final class RawSession implements AutoCloseable {
     private final FrameWriter writer;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
+    /// A read that outlasted the wait of [#poll(Duration)]. The next read takes its frame instead
+    /// of reading again, so the frame reader never has two readers and no frame is skipped.
+    private @Nullable Future<Optional<byte[]>> pendingRead;
+
     private RawSession(PacketCodec codec, TcpConnection connection) {
         this.codec = codec;
         this.connection = connection;
@@ -39,11 +43,13 @@ final class RawSession implements AutoCloseable {
         this.writer = new FrameWriter(connection.output());
     }
 
-    /// Connects to the broker's MQTT port; `codec` decides the wire version of every packet.
-    static RawSession open(PacketCodec codec, GenericContainer<?> broker) throws IOException {
+    /// Connects to the MQTT listener that the broker container exposes at `port`; `codec`
+    /// decides the wire version of every packet.
+    static RawSession open(PacketCodec codec, GenericContainer<?> broker, int port)
+            throws IOException {
         return new RawSession(codec, TcpConnection.connect(
                 broker.getHost(),
-                broker.getMappedPort(Mosquitto.MQTT_PORT),
+                broker.getMappedPort(port),
                 CONNECT_TIMEOUT
         ));
     }
@@ -73,12 +79,27 @@ final class RawSession implements AutoCloseable {
         return type.cast(packet);
     }
 
+    /// Returns the next packet if it arrives within `wait`, and otherwise empty, leaving the
+    /// connection open for later reads.
+    Optional<Packet> poll(Duration wait) throws Exception {
+        Future<Optional<byte[]>> frame = nextRead();
+        try {
+            byte[] bytes = frame.get(wait.toMillis(), MILLISECONDS).orElseThrow(
+                    () -> new AssertionError("The broker closed the connection")
+            );
+            return Optional.of(codec.decode(bytes));
+        } catch (TimeoutException _) {
+            pendingRead = frame;
+            return Optional.empty();
+        }
+    }
+
     void expectEndOfStream() throws Exception {
         assertThat(read()).as("packet received instead of the end of stream").isEmpty();
     }
 
     private Optional<byte[]> read() throws Exception {
-        Future<Optional<byte[]>> frame = executor.submit(reader::read);
+        Future<Optional<byte[]>> frame = nextRead();
         try {
             return frame.get(READ_TIMEOUT.toMillis(), MILLISECONDS);
         } catch (TimeoutException e) {
@@ -86,6 +107,12 @@ final class RawSession implements AutoCloseable {
             connection.close();
             throw new AssertionError("No packet from the broker within " + READ_TIMEOUT, e);
         }
+    }
+
+    private Future<Optional<byte[]>> nextRead() {
+        Future<Optional<byte[]>> frame = pendingRead;
+        pendingRead = null;
+        return frame != null ? frame : executor.submit(reader::read);
     }
 
     @Override

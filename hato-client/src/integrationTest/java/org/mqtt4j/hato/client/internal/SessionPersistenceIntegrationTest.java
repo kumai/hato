@@ -44,6 +44,7 @@ import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.spi.Transport;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.Objects.requireNonNull;
@@ -699,7 +700,7 @@ class SessionPersistenceIntegrationTest {
     @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
     void mosquitto_lets_a_restarted_client_start_a_new_session() throws Exception {
         try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
+            Docker.start(broker);
             restartedClientRoundTrip(
                     URI.create(
                             "mqtt://" + broker.getHost() + ":"
@@ -721,7 +722,7 @@ class SessionPersistenceIntegrationTest {
     @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
     void mosquitto_continues_delivery_on_the_same_persistent_client() throws Exception {
         try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
+            Docker.start(broker);
             persistentDeliveryRoundTrip(
                     URI.create(
                             "mqtt://" + broker.getHost() + ":"
@@ -743,7 +744,7 @@ class SessionPersistenceIntegrationTest {
     @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
     void mosquitto_hands_off_a_manual_delivery_again_after_a_stop() throws Exception {
         try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
+            Docker.start(broker);
             stoppedHandOffRoundTrip(
                     URI.create(
                             "mqtt://" + broker.getHost() + ":"
@@ -754,7 +755,7 @@ class SessionPersistenceIntegrationTest {
     }
 
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     private void persistentDeliveryRoundTrip(URI endpoint) throws Exception {

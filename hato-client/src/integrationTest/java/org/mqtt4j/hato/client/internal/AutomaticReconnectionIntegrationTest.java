@@ -29,6 +29,7 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.Objects.requireNonNull;
@@ -188,7 +189,7 @@ class AutomaticReconnectionIntegrationTest {
     void mosquitto_continues_a_session_across_automatic_reconnection(MqttVersion version)
             throws Exception {
         try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
+            Docker.start(broker);
             continueAcrossAutomaticReconnection(mosquittoEndpoint(broker), version);
         }
     }
@@ -252,7 +253,7 @@ class AutomaticReconnectionIntegrationTest {
     void mosquitto_sees_no_reconnection_after_a_handler_failure_until_the_application_connects()
             throws Exception {
         try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
+            Docker.start(broker);
             stopUntilConnectedAgain(mosquittoEndpoint(broker));
         }
     }
@@ -315,7 +316,7 @@ class AutomaticReconnectionIntegrationTest {
     }
 
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     /// A persistent client's QoS 1 and QoS 2 publications and its subscription continue after

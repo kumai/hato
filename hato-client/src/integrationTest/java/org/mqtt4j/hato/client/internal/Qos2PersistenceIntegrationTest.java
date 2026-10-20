@@ -19,6 +19,7 @@ import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.Objects.requireNonNull;
@@ -64,7 +65,7 @@ class Qos2PersistenceIntegrationTest {
     @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
     void mosquitto_completes_a_continued_exchange_once(Cut cut) throws Exception {
         try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
+            Docker.start(broker);
             exchangeAcrossDisconnection(
                     URI.create(
                             "mqtt://" + broker.getHost() + ":"
@@ -109,7 +110,7 @@ class Qos2PersistenceIntegrationTest {
     void mosquitto_completes_a_held_exchange_after_automatic_reconnection(Cut cut)
             throws Exception {
         try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
+            Docker.start(broker);
             heldExchangeAcrossReconnection(
                     URI.create(
                             "mqtt://" + broker.getHost() + ":"
@@ -131,7 +132,7 @@ class Qos2PersistenceIntegrationTest {
         var ended = new LinkedBlockingQueue<Disconnection>();
         String topic = uniqueTopic();
         try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
+            Docker.start(broker);
             var endpoint = URI.create(
                     "mqtt://" + broker.getHost() + ":"
                             + broker.getMappedPort(Mosquitto.MQTT_PORT)
@@ -181,7 +182,7 @@ class Qos2PersistenceIntegrationTest {
     }
 
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     private static void exchangeAcrossDisconnection(

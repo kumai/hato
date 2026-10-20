@@ -14,6 +14,7 @@ import org.junit.jupiter.api.condition.EnabledIf;
 import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.*;
+import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.Objects.requireNonNull;
@@ -33,12 +34,12 @@ class MosquittoMessagingTest extends MessagingTest {
     }
 
     static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
+        return Docker.availableOrRequired();
     }
 
     @BeforeAll
     static void start() {
-        Mosquitto.start(broker);
+        Docker.start(broker);
     }
 
     @AfterAll
