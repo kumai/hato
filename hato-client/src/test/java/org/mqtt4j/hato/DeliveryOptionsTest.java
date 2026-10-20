@@ -69,22 +69,40 @@ class DeliveryOptionsTest {
                 .isEqualTo(new HandlerExecution.Striped(4, striped.key(), executor));
     }
 
+    @Test
+    void parallel_options_keep_their_parallelism_on_an_executor() {
+        // Arrange
+        Executor executor = Runnable::run;
+
+        // Act
+        DeliveryOptions sut = DeliveryOptions.parallel(8);
+
+        // Assert
+        assertThat(sut.execution()).isEqualTo(new HandlerExecution.Parallel(8, null));
+        assertThat(sut.withExecutor(executor).execution())
+                .isEqualTo(new HandlerExecution.Parallel(8, executor));
+    }
+
     @ParameterizedTest
     @ValueSource(ints = {Integer.MIN_VALUE, -1, 0, 257})
-    void the_number_of_stripes_must_be_from_1_to_256(int stripes) {
-        assertThatThrownBy(() -> DeliveryOptions.striped(stripes))
+    void stripes_and_parallelism_must_be_from_1_to_256(int value) {
+        assertThatThrownBy(() -> DeliveryOptions.striped(value))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> DeliveryOptions.striped(stripes, MqttMessage::topic))
+        assertThatThrownBy(() -> DeliveryOptions.striped(value, MqttMessage::topic))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> DeliveryOptions.parallel(value))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @ParameterizedTest
     @ValueSource(ints = {1, 256})
-    void the_bounds_of_the_stripe_range_are_accepted(int stripes) {
+    void the_bounds_of_the_range_are_accepted(int value) {
         Function<MqttMessage, ?> key = MqttMessage::topic;
 
-        assertThat(DeliveryOptions.striped(stripes, key).execution())
-                .isEqualTo(new HandlerExecution.Striped(stripes, key, null));
+        assertThat(DeliveryOptions.striped(value, key).execution())
+                .isEqualTo(new HandlerExecution.Striped(value, key, null));
+        assertThat(DeliveryOptions.parallel(value).execution())
+                .isEqualTo(new HandlerExecution.Parallel(value, null));
     }
 
     @Test
@@ -97,6 +115,8 @@ class DeliveryOptionsTest {
         assertThatThrownBy(() -> DeliveryOptions.striped(4, null))
                 .isInstanceOf(NullPointerException.class);
         assertThatThrownBy(() -> DeliveryOptions.striped(4).withExecutor(null))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> DeliveryOptions.parallel(4).withExecutor(null))
                 .isInstanceOf(NullPointerException.class);
     }
 

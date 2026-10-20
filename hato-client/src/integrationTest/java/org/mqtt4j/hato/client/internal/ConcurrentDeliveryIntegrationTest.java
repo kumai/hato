@@ -2,15 +2,15 @@ package org.mqtt4j.hato.client.internal;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.condition.EnabledIf;
-import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.ConnAck;
@@ -24,66 +24,87 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
-import org.mqtt4j.hato.broker.MqttBroker;
-import org.mqtt4j.hato.testsupport.Mosquitto;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// Real brokers complete the QoS 1 and 2 exchanges of a striped subscription whose deliveries
-/// finish out of receive order, because the client still acknowledges them in receive order.
+/// Both brokers complete the QoS 1 and 2 exchanges of deliveries that striped and parallel
+/// subscriptions finish out of receive order, because the client still acknowledges them in
+/// receive order.
 @Timeout(30)
-class StripedDeliveryIntegrationTest {
+abstract class ConcurrentDeliveryIntegrationTest {
 
-    private static final int STRIPES = 4;
+    private static final int HANDLERS = 4;
 
     private static final int MESSAGES = 24;
 
-    private final String clientId = "hato" + UUID.randomUUID().toString().replace("-", "")
-            .substring(0, 19);
+    private static final byte MARKER = 100;
+
+    abstract URI endpoint();
 
     @Test
-    void the_embedded_broker_completes_striped_deliveries_that_finish_out_of_order()
+    void striped_deliveries_finished_out_of_order_complete_in_each_topics_order()
             throws Exception {
-        try (MqttBroker broker = MqttBroker.start()) {
-            outOfOrderRoundTrip(URI.create("mqtt://localhost:" + broker.port()));
+        // Arrange: one topic for each stripe.
+        String prefix = uniqueTopic();
+        List<String> topics = topicsOnEachStripe(prefix);
+
+        // Act
+        RoundTrip result = outOfOrderRoundTrip(DeliveryOptions.striped(HANDLERS), prefix, topics);
+
+        // Assert: every message ran once, in its topic's receive order, and the broker kept
+        // nothing unacknowledged.
+        var received = new int[HANDLERS];
+        for (MqttMessage message : result.handled()) {
+            int topic = topics.indexOf(message.topic().name());
+            assertThat(message.payload()[0])
+                    .isEqualTo((byte) (received[topic] * HANDLERS + topic));
+            received[topic]++;
         }
+        assertThat(received).containsOnly(MESSAGES / HANDLERS);
+        assertThat(result.redelivered()).isEmpty();
     }
 
     @Test
-    @Timeout(60)
-    @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
-    void mosquitto_completes_striped_deliveries_that_finish_out_of_order() throws Exception {
-        try (GenericContainer<?> broker = Mosquitto.container()) {
-            Mosquitto.start(broker);
-            outOfOrderRoundTrip(
-                    URI.create(
-                            "mqtt://" + broker.getHost() + ":"
-                                    + broker.getMappedPort(Mosquitto.MQTT_PORT)
-                    )
-            );
-        }
-    }
-
-    static boolean dockerIsAvailableOrRequired() {
-        return Mosquitto.availableOrRequired();
-    }
-
-    /// QoS 1 and 2 messages alternate over one topic per stripe. The first message is
-    /// acknowledged only after the second, which is on another stripe.
-    private void outOfOrderRoundTrip(URI endpoint) throws Exception {
+    void parallel_deliveries_finished_out_of_order_complete() throws Exception {
         // Arrange
         String prefix = uniqueTopic();
         List<String> topics = topicsOnEachStripe(prefix);
+
+        // Act
+        RoundTrip result = outOfOrderRoundTrip(DeliveryOptions.parallel(HANDLERS), prefix, topics);
+
+        // Assert: every message ran once, and the broker kept nothing unacknowledged.
+        assertThat(result.handled())
+                .extracting(message -> (int) message.payload()[0])
+                .containsExactlyInAnyOrderElementsOf(
+                        IntStream.range(0, MESSAGES).boxed().toList()
+                );
+        assertThat(result.redelivered()).isEmpty();
+    }
+
+    /// The messages that the handler took, and those that came again after a reconnection,
+    /// before a later marker.
+    private record RoundTrip(List<MqttMessage> handled, List<MqttMessage> redelivered) {}
+
+    /// QoS 1 and 2 messages alternate over `topics` to a persistent client. Its handler
+    /// acknowledges the first message only after the second, which runs at the same time on
+    /// another stripe or handler. The client then reconnects, and a marker follows.
+    private RoundTrip outOfOrderRoundTrip(
+            DeliveryOptions options,
+            String prefix,
+            List<String> topics
+    ) throws Exception {
+        URI endpoint = endpoint();
         var secondAcknowledged = new CountDownLatch(1);
         var handled = new LinkedBlockingQueue<MqttMessage>();
         try (MqttClient sut = MqttClient.builder()
                 .server(endpoint)
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
-                .clientId(clientId)
+                .clientId("hato" + UUID.randomUUID().toString().replace("-", "").substring(0, 19))
                 .cleanStart(false)
                 .sessionExpiry(Duration.ofSeconds(30))
                 .build();
@@ -97,7 +118,7 @@ class StripedDeliveryIntegrationTest {
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(prefix + "/+"), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.MANUAL),
-                    DeliveryOptions.striped(STRIPES),
+                    options,
                     delivery -> {
                         if (delivery.message().payload()[0] == 0) {
                             waitFor(secondAcknowledged);
@@ -110,41 +131,42 @@ class StripedDeliveryIntegrationTest {
                     }
             );
             subscription.established().get(5, SECONDS);
-
-            // Act
             for (int index = 0; index < MESSAGES; index++) {
                 Qos qos = index % 2 == 0 ? Qos.AT_LEAST_ONCE : Qos.EXACTLY_ONCE;
-                publisher.publish(message(topics.get(index % STRIPES), index, qos)).get(5, SECONDS);
+                publisher.publish(message(topics.get(index % HANDLERS), index, qos))
+                        .get(5, SECONDS);
+            }
+            var taken = new ArrayList<MqttMessage>();
+            for (int count = 0; count < MESSAGES; count++) {
+                taken.add(requireNonNull(handled.poll(5, SECONDS)));
             }
 
-            // Assert: every message ran once, and each topic kept its receive order.
-            var received = new int[STRIPES];
-            for (int count = 0; count < MESSAGES; count++) {
-                MqttMessage message = requireNonNull(handled.poll(5, SECONDS));
-                int topic = topics.indexOf(message.topic().name());
-                assertThat(message.payload()[0])
-                        .isEqualTo((byte) (received[topic] * STRIPES + topic));
-                received[topic]++;
-            }
-            // The broker kept nothing unacknowledged: after a reconnection the marker arrives
-            // first, and no message is delivered again.
             sut.disconnect().get(5, SECONDS);
             assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
-            publisher.publish(message(topics.getFirst(), 100, Qos.AT_LEAST_ONCE)).get(5, SECONDS);
-            assertThat(requireNonNull(handled.poll(5, SECONDS)).payload()).containsExactly(100);
+            publisher.publish(message(topics.getFirst(), MARKER, Qos.AT_LEAST_ONCE))
+                    .get(5, SECONDS);
+            var redelivered = new ArrayList<MqttMessage>();
+            while (true) {
+                MqttMessage next = requireNonNull(handled.poll(5, SECONDS));
+                if (next.payload()[0] == MARKER) {
+                    break;
+                }
+                redelivered.add(next);
+            }
             sut.disconnect().get(5, SECONDS);
             publisher.disconnect().get(5, SECONDS);
+            return new RoundTrip(taken, redelivered);
         }
     }
 
     /// One topic under `prefix` for each stripe, in stripe order, so that the default striped
     /// key, the topic, sends each to a stripe of its own.
     private static List<String> topicsOnEachStripe(String prefix) {
-        var topics = new String[STRIPES];
+        var topics = new String[HANDLERS];
         int found = 0;
-        for (int index = 0; found < STRIPES; index++) {
+        for (int index = 0; found < HANDLERS; index++) {
             String topic = prefix + "/" + index;
-            int stripe = DeliveryLanes.stripeOf(new Topic(topic), STRIPES);
+            int stripe = DeliveryLanes.stripeOf(new Topic(topic), HANDLERS);
             if (topics[stripe] == null) {
                 topics[stripe] = topic;
                 found++;

@@ -12,6 +12,11 @@ import static java.util.Objects.requireNonNull;
 /// How a push subscription's handler runs, as the application's delivery options chose.
 public sealed interface HandlerExecution {
 
+    /// Bounds the handlers that one subscription runs at once, as the stripes of [Striped] or the
+    /// parallelism of [Parallel]. With the client's 256 subscriptions, at most 65,536 handlers
+    /// run at once.
+    int MAX_PARALLELISM = 256;
+
     /// The subscription's dispatcher runs each handler in place, on its internal virtual thread.
     record Internal() implements HandlerExecution {}
 
@@ -41,17 +46,27 @@ public sealed interface HandlerExecution {
             @Nullable Executor executor
     ) implements HandlerExecution {
 
-        /// Bounds the handlers that one subscription runs at once. With the client's 256
-        /// subscriptions, at most 65,536 handlers run at once.
-        public static final int MAX_STRIPES = 256;
-
         public Striped {
-            if (stripes < 1 || stripes > MAX_STRIPES) {
-                throw new IllegalArgumentException(
-                        "Stripes must be from 1 to " + MAX_STRIPES + ": " + stripes
-                );
-            }
+            checkParallelism("Stripes", stripes);
             requireNonNull(key, "key");
+        }
+    }
+
+    /// Up to `parallelism` handlers run at once, taking the deliveries in receive order from one
+    /// queue, so they can finish in any order. They run on `executor`, or, when it is null, on
+    /// internal virtual threads while deliveries wait.
+    record Parallel(int parallelism, @Nullable Executor executor) implements HandlerExecution {
+
+        public Parallel {
+            checkParallelism("Parallelism", parallelism);
+        }
+    }
+
+    private static void checkParallelism(String name, int value) {
+        if (value < 1 || value > MAX_PARALLELISM) {
+            throw new IllegalArgumentException(
+                    name + " must be from 1 to " + MAX_PARALLELISM + ": " + value
+            );
         }
     }
 }

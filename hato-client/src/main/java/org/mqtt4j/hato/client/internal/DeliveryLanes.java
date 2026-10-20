@@ -366,7 +366,7 @@ final class DeliveryLanes {
                 }
                 // A sublane keeps the drain task on its way, so the next connection's deliveries
                 // there wait for a handler still running, as on an internal thread.
-                lane.sublanes.values().removeIf(sublane -> !sublane.scheduled);
+                lane.sublanes.values().removeIf(sublane -> sublane.scheduled == 0);
                 lane.queuedInSublanes = 0;
                 lane.failed = false;
                 settle(lane);
@@ -884,6 +884,8 @@ final class DeliveryLanes {
                     placeNextOnLane(lane, selector);
             case HandlerExecution.Striped striped ->
                     placeNextOnStripe(lane, striped);
+            case HandlerExecution.Parallel parallel ->
+                    placeNextShared(lane, parallel);
         };
     }
 
@@ -920,17 +922,38 @@ final class DeliveryLanes {
     /// An application executor: moves the head to the executor's sublane, then submits a drain
     /// task unless one is on its way there.
     private boolean placeNext(Lane lane, Executor executor) {
-        Optional<Sublane> submitting;
+        Sublane sublane;
+        Optional<DrainTask> submitting;
         lock.lock();
         try {
             if (!awaitNext(lane)) {
                 return false;
             }
-            submitting = place(lane, lane.queue.removeFirst(), sublane(lane, executor));
+            sublane = sublane(lane, executor);
+            submitting = place(lane, lane.queue.removeFirst(), sublane);
         } finally {
             lock.unlock();
         }
-        submitting.ifPresent(sublane -> submit(lane, sublane));
+        submitting.ifPresent(task -> submit(lane, sublane, task));
+        return true;
+    }
+
+    /// Parallel: moves the head to the lane's one shared sublane, then submits another drain task
+    /// unless as many as the parallelism are on their way there.
+    private boolean placeNextShared(Lane lane, HandlerExecution.Parallel parallel) {
+        Sublane sublane;
+        Optional<DrainTask> submitting;
+        lock.lock();
+        try {
+            if (!awaitNext(lane)) {
+                return false;
+            }
+            sublane = shared(lane, parallel);
+            submitting = place(lane, lane.queue.removeFirst(), sublane);
+        } finally {
+            lock.unlock();
+        }
+        submitting.ifPresent(task -> submit(lane, sublane, task));
         return true;
     }
 
@@ -989,17 +1012,19 @@ final class DeliveryLanes {
         }
         // Like a handler, the application's code leaves no interrupt state on this thread.
         boolean _ = Thread.interrupted();
-        Optional<Sublane> submitting;
+        Sublane sublane;
+        Optional<DrainTask> submitting;
         lock.lock();
         try {
             if (!canTake(lane, head)) {
                 return true;
             }
-            submitting = place(lane, lane.queue.removeFirst(), sublaneFor.apply(choice));
+            sublane = sublaneFor.apply(choice);
+            submitting = place(lane, lane.queue.removeFirst(), sublane);
         } finally {
             lock.unlock();
         }
-        submitting.ifPresent(sublane -> submit(lane, sublane));
+        submitting.ifPresent(task -> submit(lane, sublane, task));
         return true;
     }
 
@@ -1052,7 +1077,7 @@ final class DeliveryLanes {
     private Sublane sublane(Lane lane, Executor executor) {
         return lane.sublanes.computeIfAbsent(
                 executor,
-                _ -> new Sublane(lane, executor, executor, false)
+                _ -> new Sublane(lane, executor, executor, false, 1)
         );
     }
 
@@ -1062,55 +1087,76 @@ final class DeliveryLanes {
         return lane.sublanes.computeIfAbsent(number, _ -> {
             Executor executor = striped.executor();
             if (executor != null) {
-                return new Sublane(lane, number, executor, false);
+                return new Sublane(lane, number, executor, false, 1);
             }
             String name = "hato-" + clientId + "-delivery-" + lane.id + "-stripe-" + number;
             return new Sublane(
                     lane,
                     number,
                     task -> Thread.ofVirtual().name(name).start(task),
-                    true
+                    true,
+                    1
             );
         });
     }
 
-    /// Caller holds lock. Moves a delivery, still queued, to `sublane`. Returns the sublane when
-    /// no drain task is on its way there yet; the caller then submits one.
-    private Optional<Sublane> place(Lane lane, DeliveryView view, Sublane sublane) {
+    /// Caller holds lock. A parallel lane's one sublane, from which up to `parallelism` drain
+    /// tasks take deliveries at once. They run on the options' executor, or, without one, each
+    /// on an internal virtual thread that drains the sublane until it is empty.
+    private Sublane shared(Lane lane, HandlerExecution.Parallel parallel) {
+        return lane.sublanes.computeIfAbsent(0, _ -> {
+            Executor executor = parallel.executor();
+            if (executor != null) {
+                return new Sublane(lane, 0, executor, false, parallel.parallelism());
+            }
+            String name = "hato-" + clientId + "-delivery-" + lane.id + "-parallel";
+            return new Sublane(
+                    lane,
+                    0,
+                    task -> Thread.ofVirtual().name(name).start(task),
+                    true,
+                    parallel.parallelism()
+            );
+        });
+    }
+
+    /// Caller holds lock. Moves a delivery, still queued, to `sublane`. Returns a drain task while
+    /// fewer than the sublane's limit are on their way there; the caller then submits it.
+    private Optional<DrainTask> place(Lane lane, DeliveryView view, Sublane sublane) {
         sublane.queue.addLast(view);
         lane.queuedInSublanes++;
         placedDeliveries++;
-        if (sublane.scheduled) {
+        if (sublane.scheduled == sublane.limit) {
             return Optional.empty();
         }
-        sublane.scheduled = true;
-        return Optional.of(sublane);
+        sublane.scheduled++;
+        return Optional.of(sublane.idle.removeFirst());
     }
 
-    /// Hands the sublane's drain task to its executor, without the lock. An executor that throws
-    /// ends the head delivery as a handler failure; while the lane goes on, the next head is
-    /// tried, so a refusing executor leaves no delivery waiting for a task.
-    private void submit(Lane lane, Sublane sublane) {
+    /// Hands a drain task of the sublane to its executor, without the lock. An executor that
+    /// throws ends the head delivery as a handler failure; while the lane goes on, the next head
+    /// is tried, so a refusing executor leaves no delivery waiting for a task.
+    private void submit(Lane lane, Sublane sublane, DrainTask task) {
         while (true) {
             try {
-                sublane.executor.execute(sublane.task);
+                sublane.executor.execute(task);
                 return;
             } catch (Throwable failure) {
-                if (!failHead(lane, sublane, failure)) {
+                if (!failHead(lane, sublane, task, failure)) {
                     return;
                 }
             }
         }
     }
 
-    /// Ends the sublane's head as a handler failure, after its executor refused the task that
+    /// Ends the sublane's head as a handler failure, after its executor refused `task`, which
     /// would have run it. Returns whether to ask the executor again for the rest.
-    private boolean failHead(Lane lane, Sublane sublane, Throwable failure) {
+    private boolean failHead(Lane lane, Sublane sublane, DrainTask task, Throwable failure) {
         DeliveryView view;
         lock.lock();
         try {
             if (!canClaim(lane, sublane)) {
-                unschedule(lane, sublane);
+                unschedule(lane, sublane, task);
                 return false;
             }
             view = sublane.queue.removeFirst();
@@ -1124,7 +1170,7 @@ final class DeliveryLanes {
         lock.lock();
         try {
             if (!canClaim(lane, sublane)) {
-                unschedule(lane, sublane);
+                unschedule(lane, sublane, task);
                 return false;
             }
             return true;
@@ -1136,15 +1182,15 @@ final class DeliveryLanes {
     /// A drain task, run by the sublane's executor: claims and executes the head delivery. On an
     /// application's executor, it then asks the executor again while deliveries remain. When the
     /// executor runs that request before its execute() returns, as a synchronous executor does,
-    /// the outer frame takes it, so the stack does not grow with the queue. An internal stripe's
-    /// task instead goes on until its stripe is empty. The dispatcher does not end the lane while
-    /// the task runs, because it may still call the handler or the executor.
-    private void drain(Sublane sublane) {
+    /// the outer frame takes it, so the stack does not grow with the queue. A task on an internal
+    /// thread instead goes on until the sublane is empty. The dispatcher does not end the lane
+    /// while the task runs, because it may still call the handler or the executor.
+    private void drain(Sublane sublane, DrainTask task) {
         Lane lane = sublane.lane;
         lock.lock();
         try {
-            if (sublane.inline == Thread.currentThread()) {
-                sublane.again = true;
+            if (task.inline == Thread.currentThread()) {
+                task.again = true;
                 return;
             }
             lane.activeTasks++;
@@ -1152,9 +1198,9 @@ final class DeliveryLanes {
             lock.unlock();
         }
         try {
-            while (runHead(lane, sublane)
-                    && (sublane.drainsUntilEmpty || askAgain(lane, sublane))) {
-                // An internal stripe goes on, or the executor ran the next request inline and
+            while (runHead(lane, sublane, task)
+                    && (sublane.drainsUntilEmpty || askAgain(lane, sublane, task))) {
+                // An internal thread goes on, or the executor ran the next request inline and
                 // this frame runs it.
             }
         } finally {
@@ -1170,13 +1216,13 @@ final class DeliveryLanes {
     }
 
     /// Claims and executes the sublane's head on this thread. False when none can be claimed,
-    /// after which no drain task is on its way to the sublane.
-    private boolean runHead(Lane lane, Sublane sublane) {
+    /// after which `task` is no longer on its way to the sublane.
+    private boolean runHead(Lane lane, Sublane sublane, DrainTask task) {
         Claim claim;
         lock.lock();
         try {
             if (!canClaim(lane, sublane)) {
-                unschedule(lane, sublane);
+                unschedule(lane, sublane, task);
                 return false;
             }
             claim = claim(lane, sublane.queue);
@@ -1188,31 +1234,31 @@ final class DeliveryLanes {
         return true;
     }
 
-    /// After one delivery, asks the executor for the next request while deliveries remain.
+    /// After one delivery, asks the executor to run `task` again while deliveries remain.
     /// Returns whether that request ran inline, for this frame to continue.
-    private boolean askAgain(Lane lane, Sublane sublane) {
+    private boolean askAgain(Lane lane, Sublane sublane, DrainTask task) {
         Thread current = Thread.currentThread();
         lock.lock();
         try {
             if (!canClaim(lane, sublane)) {
-                unschedule(lane, sublane);
+                unschedule(lane, sublane, task);
                 return false;
             }
-            sublane.inline = current;
-            sublane.again = false;
+            task.inline = current;
+            task.again = false;
         } finally {
             lock.unlock();
         }
-        submit(lane, sublane);
+        submit(lane, sublane, task);
         lock.lock();
         try {
             // A request that went to another thread may already be asking again from there.
-            if (sublane.inline != current) {
+            if (task.inline != current) {
                 return false;
             }
-            sublane.inline = null;
-            boolean again = sublane.again;
-            sublane.again = false;
+            task.inline = null;
+            boolean again = task.again;
+            task.again = false;
             return again;
         } finally {
             lock.unlock();
@@ -1225,11 +1271,12 @@ final class DeliveryLanes {
         return !lane.stopped && !handOffsClosed && !lane.failed && !sublane.queue.isEmpty();
     }
 
-    /// Caller holds lock. No drain task is on its way to the sublane any more, and an empty
-    /// sublane leaves its lane.
-    private void unschedule(Lane lane, Sublane sublane) {
-        sublane.scheduled = false;
-        if (sublane.queue.isEmpty()) {
+    /// Caller holds lock. `task` is no longer on its way to the sublane and waits for the next
+    /// placement there. A sublane that is empty, with no task on its way, leaves its lane.
+    private void unschedule(Lane lane, Sublane sublane, DrainTask task) {
+        sublane.scheduled--;
+        sublane.idle.addLast(task);
+        if (sublane.scheduled == 0 && sublane.queue.isEmpty()) {
             lane.sublanes.remove(sublane.key, sublane);
         }
     }
@@ -1594,7 +1641,9 @@ final class DeliveryLanes {
         boolean ready = abandon(lane, lane.queue);
         for (Sublane sublane : lane.sublanes.values()) {
             ready |= abandon(lane, sublane.queue);
-            sublane.task.detach();
+            for (DrainTask task : sublane.tasks) {
+                task.detach();
+            }
         }
         lane.sublanes.clear();
         lane.queuedInSublanes = 0;
@@ -1854,9 +1903,9 @@ final class DeliveryLanes {
         final Condition ready;
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
         // A sublane exists while deliveries wait there or a drain task is on its way. Executors
-        // are told apart by identity, so no application's equals() runs under the lock. Stripes
-        // are told apart by the equality of their numbers, because Java shares the boxed objects
-        // only for numbers from -128 to 127.
+        // are told apart by identity, so no application's equals() runs under the lock. Stripes,
+        // and the one sublane of a parallel lane, are told apart by the equality of their
+        // numbers, because Java shares the boxed objects only for numbers from -128 to 127.
         final Map<Object, Sublane> sublanes;
         // Deliveries that left this lane unprocessed, by reason.
         final long[] dropped = new long[Dropped.values().length];
@@ -1896,7 +1945,8 @@ final class DeliveryLanes {
             this.acceptor = acceptor;
             this.ready = ready;
             sublanes = switch (execution) {
-                case HandlerExecution.Striped _ -> new HashMap<>();
+                case HandlerExecution.Striped _,
+                     HandlerExecution.Parallel _ -> new HashMap<>();
                 case HandlerExecution.Internal _,
                      HandlerExecution.OnExecutor _,
                      HandlerExecution.Lanes _ -> new IdentityHashMap<>();
@@ -1904,36 +1954,48 @@ final class DeliveryLanes {
         }
     }
 
-    /// One lane's deliveries waiting for one executor or one stripe, in receive order. While
-    /// `scheduled` is set, one drain task is on its way: submitted, running, or about to ask the
-    /// executor again.
+    /// One lane's deliveries waiting for one executor, one stripe, or the handlers of a parallel
+    /// lane, in receive order. At most `limit` drain tasks are on their way at once: submitted,
+    /// running, or about to ask the executor again.
     private final class Sublane {
 
         final Lane lane;
-        // The sublane's key in its lane: its executor, or its stripe's number.
+        // The sublane's key in its lane: its executor, or its number.
         final Object key;
         final Executor executor;
-        // An internal stripe's drain task runs until the stripe is empty; one on an application's
-        // executor runs one delivery and asks the executor again.
+        // A drain task on an internal thread runs until the sublane is empty; one on an
+        // application's executor runs one delivery and asks the executor again.
         final boolean drainsUntilEmpty;
+        // A parallel lane's parallelism, and otherwise one, which keeps the receive order.
+        final int limit;
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
-        final DrainTask task;
-        boolean scheduled;
-        // The thread asking the executor again; `again` records that the executor ran that
-        // request before returning, for the asking frame to run instead.
-        @Nullable Thread inline;
-        boolean again;
+        // The sublane's `limit` drain tasks; those not on their way wait in `idle`, so
+        // `scheduled` plus the size of `idle` is always `limit`.
+        final List<DrainTask> tasks;
+        final ArrayDeque<DrainTask> idle;
+        int scheduled;
 
-        Sublane(Lane lane, Object key, Executor executor, boolean drainsUntilEmpty) {
+        Sublane(
+                Lane lane,
+                Object key,
+                Executor executor,
+                boolean drainsUntilEmpty,
+                int limit
+        ) {
             this.lane = lane;
             this.key = key;
             this.executor = executor;
             this.drainsUntilEmpty = drainsUntilEmpty;
-            task = new DrainTask(this);
+            this.limit = limit;
+            tasks = new ArrayList<>(limit);
+            for (int index = 0; index < limit; index++) {
+                tasks.add(new DrainTask(this));
+            }
+            idle = new ArrayDeque<>(tasks);
         }
 
-        void drain() {
-            DeliveryLanes.this.drain(this);
+        void drain(DrainTask task) {
+            DeliveryLanes.this.drain(this, task);
         }
     }
 
@@ -1945,6 +2007,11 @@ final class DeliveryLanes {
         // is decided under the lock, so a run that read the sublane just before it was cleared
         // only finds the lane stopped; volatile alone lets later runs see the clearing at once.
         private volatile @Nullable Sublane sublane;
+        // Read and written under the lock. The thread asking the executor to run this task again;
+        // `again` records that the executor ran that request before returning, for the asking
+        // frame to run instead.
+        @Nullable Thread inline;
+        boolean again;
 
         DrainTask(Sublane sublane) {
             this.sublane = sublane;
@@ -1954,7 +2021,7 @@ final class DeliveryLanes {
         public void run() {
             Sublane target = sublane;
             if (target != null) {
-                target.drain();
+                target.drain(this);
             }
         }
 

@@ -6660,6 +6660,455 @@ class ClientActorTest {
     }
 
     @Test
+    void parallel_takes_deliveries_from_one_queue_with_up_to_its_parallelism_at_once()
+            throws Exception {
+        // Arrange: four deliveries wait for an executor that runs two handlers at a time.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.parallel(2).withExecutor(executor),
+                    delivery -> handled.add(delivery.message().payload()[0])
+            );
+            for (int value = 1; value <= 4; value++) {
+                transport.receive(publication(new byte[] {(byte) value}));
+            }
+            await().until(() -> actor.placedDeliveries() == 4);
+            int held = executor.held();
+
+            // Act
+            while (executor.held() > 0) {
+                executor.runNext();
+            }
+
+            // Assert: two tasks were on their way at once, and together they ran every delivery
+            // once.
+            assertThat(held).isEqualTo(2);
+            assertThat(handled).containsExactlyInAnyOrder((byte) 1, (byte) 2, (byte) 3, (byte) 4);
+        }
+    }
+
+    @Test
+    void a_parallel_task_that_found_nothing_runs_again_for_later_deliveries() throws Exception {
+        // Arrange: deliveries 1 and 2 take both tasks of an executor. The first task runs 1 and
+        // asks again for 2, which the second task then runs and finds nothing more.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.parallel(2).withExecutor(executor),
+                    delivery -> handled.add(delivery.message().payload()[0])
+            );
+            transport.receive(publication(new byte[] {1}));
+            transport.receive(publication(new byte[] {2}));
+            await().until(() -> actor.placedDeliveries() == 2);
+            executor.runNext();
+            executor.runNext();
+
+            // Act: two more deliveries arrive while the first task is still held.
+            transport.receive(publication(new byte[] {3}));
+            transport.receive(publication(new byte[] {4}));
+
+            // Assert: the second task is on its way again, and every delivery runs once.
+            await().until(() -> actor.placedDeliveries() == 4);
+            assertThat(executor.held()).isEqualTo(2);
+            while (executor.held() > 0) {
+                executor.runNext();
+            }
+            assertThat(handled).containsExactlyInAnyOrder((byte) 1, (byte) 2, (byte) 3, (byte) 4);
+        }
+    }
+
+    @Test
+    void parallel_runs_deliveries_of_one_topic_at_the_same_time() throws Exception {
+        // Arrange: each handler waits until both have started.
+        var started = new CountDownLatch(2);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.parallel(2),
+                    _ -> {
+                        started.countDown();
+                        waitFor(started);
+                    }
+            );
+
+            // Act
+            transport.receive(publication(new byte[] {1}));
+            transport.receive(publication(new byte[] {2}));
+
+            // Assert: neither handler had to return before the other started.
+            assertThat(started.await(5, SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void an_internal_parallel_thread_drains_what_waits_without_starting_another() throws Exception {
+        // Arrange: with one handler at a time, the first of three deliveries waits until the
+        // other two are placed behind it.
+        var release = new CountDownLatch(1);
+        var threads = new LinkedBlockingQueue<Thread>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.parallel(1),
+                    delivery -> {
+                        threads.add(Thread.currentThread());
+                        if (delivery.message().payload()[0] == 1) {
+                            waitFor(release);
+                        }
+                    }
+            );
+            for (int value = 1; value <= 3; value++) {
+                transport.receive(publication(new byte[] {(byte) value}));
+            }
+            await().until(() -> actor.placedDeliveries() == 3);
+
+            // Act
+            release.countDown();
+
+            // Assert: one virtual thread of the subscription ran all three.
+            Thread first = requireNonNull(threads.poll(5, SECONDS));
+            assertThat(threads.poll(5, SECONDS)).isSameAs(first);
+            assertThat(threads.poll(5, SECONDS)).isSameAs(first);
+            assertThat(first.isVirtual()).isTrue();
+            assertThat(first.getName()).matches("hato-actor-test-delivery-\\d+-parallel");
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_synchronous_executor_runs_parallel_deliveries_without_deepening_the_stack()
+            throws Exception {
+        // Arrange: deliveries wait behind two held tasks; the executor then runs each later task
+        // on the thread that submits it, as a caller-runs policy does when its pool is busy.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        var depths = new LinkedBlockingQueue<Long>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    qosOneRequest(),
+                    DeliveryOptions.parallel(2).withExecutor(executor),
+                    delivery -> {
+                        handled.add(delivery.message().payload()[0]);
+                        depths.add(StackWalker.getInstance().walk(Stream::count));
+                    }
+            );
+            for (int packetId = 1; packetId <= 50; packetId++) {
+                transport.receive(qosOnePublication("messages", packetId, false));
+            }
+            await().until(() -> actor.placedDeliveries() == 50);
+            executor.runDirectly();
+
+            // Act
+            while (executor.held() > 0) {
+                executor.runNext();
+            }
+
+            // Assert: every delivery ran once at one stack depth, and each slot returned with its
+            // PUBACK in receive order.
+            assertThat(handled).containsExactlyInAnyOrderElementsOf(
+                    IntStream.rangeClosed(1, 50).mapToObj(value -> (byte) value).toList()
+            );
+            assertThat(Set.copyOf(depths)).hasSize(1);
+            for (int packetId = 1; packetId <= 50; packetId++) {
+                assertThat(transport.sent.poll(5, SECONDS))
+                        .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, packetId));
+            }
+            await().until(() -> actor.usage().deliveries() == 0);
+        }
+    }
+
+    @Test
+    void a_parallel_handler_failure_holds_the_other_handlers() throws Exception {
+        // Arrange: QoS 1 deliveries 1 and 2 wait for an executor that runs two handlers at a
+        // time, and the handler fails for 1.
+        var executor = new ManualExecutor();
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    qosOneRequest(),
+                    DeliveryOptions.parallel(2).withExecutor(executor),
+                    delivery -> {
+                        handled.add(delivery.message().payload()[0]);
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                    }
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+            transport.receive(qosOnePublication("messages", 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act: the first task fails its delivery, and the second task runs afterwards.
+            executor.runNext();
+            executor.runNext();
+
+            // Assert: the failure ends the connection, and the second task runs nothing.
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(handled).containsExactly((byte) 1);
+            assertThat(transport.sent).isEmpty();
+        }
+    }
+
+    @Test
+    void skip_acknowledges_a_failed_parallel_delivery_while_the_others_go_on() throws Exception {
+        // Arrange: QoS 1 deliveries 1 and 2 wait for an executor that runs two handlers of a
+        // skipping subscription at a time, and the handler fails for 1.
+        var executor = new ManualExecutor();
+        var failure = new IllegalStateException("handler failed");
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    qosOneRequest().withFailurePolicy(FailurePolicy.SKIP),
+                    DeliveryOptions.parallel(2).withExecutor(executor),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            throw failure;
+                        }
+                        handled.add(delivery.message().payload()[0]);
+                    }
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+            transport.receive(qosOnePublication("messages", 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act
+            executor.runNext();
+            executor.runNext();
+
+            // Assert: the failed delivery is acknowledged unprocessed, and the other one runs.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 1));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 2));
+            assertThat(handled).containsExactly((byte) 2);
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @Test
+    void unsubscribe_runs_what_a_parallel_subscription_accepted_before_it_terminates()
+            throws Exception {
+        // Arrange: three deliveries wait for an executor that runs two handlers at a time when
+        // removal is confirmed.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.parallel(2).withExecutor(executor),
+                    delivery -> handled.add(delivery.message().payload()[0])
+            );
+            for (int value = 1; value <= 3; value++) {
+                transport.receive(publication(new byte[] {(byte) value}));
+            }
+            await().until(() -> actor.placedDeliveries() == 3);
+            CompletableFuture<Void> removing = subscription.unsubscribe();
+            var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
+            removing.get(5, SECONDS);
+            CompletableFuture<Void> terminated = subscription.terminated();
+
+            // Act & Assert: the subscription terminates only after the accepted deliveries ran.
+            executor.runNext();
+            executor.runNext();
+            assertThat(terminated).isNotDone();
+            while (executor.held() > 0) {
+                executor.runNext();
+            }
+            terminated.get(5, SECONDS);
+            assertThat(handled).containsExactlyInAnyOrder((byte) 1, (byte) 2, (byte) 3);
+        }
+    }
+
+    @Test
+    void closing_a_parallel_subscription_discards_what_waits_for_its_handlers()
+            throws Exception {
+        // Arrange: two QoS 1 deliveries wait for an executor that has run nothing yet.
+        var executor = new ManualExecutor();
+        var handled = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeWith(
+                    sut,
+                    transport,
+                    qosOneRequest(),
+                    DeliveryOptions.parallel(2).withExecutor(executor),
+                    handled::add
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+            transport.receive(qosOnePublication("messages", 2, false));
+            await().until(() -> actor.placedDeliveries() == 2);
+
+            // Act
+            subscription.close();
+
+            // Assert: the subscription terminates without the tasks, which do nothing when they
+            // run late, and the discarded deliveries return their slots.
+            subscription.terminated().get(5, SECONDS);
+            executor.runNext();
+            executor.runNext();
+            assertThat(handled).isEmpty();
+            await().until(() -> actor.usage().deliveries() == 0);
+        }
+    }
+
+    @Test
+    void a_parallel_subscription_counts_running_handlers_against_its_buffer() throws Exception {
+        // Arrange: a one-delivery buffer, and the handler holds the first delivery.
+        var release = new CountDownLatch(1);
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    request().withBufferCapacity(1),
+                    DeliveryOptions.parallel(2),
+                    delivery -> {
+                        handled.add(delivery.message().payload()[0]);
+                        if (delivery.message().payload()[0] == 1) {
+                            waitFor(release);
+                        }
+                    }
+            );
+            transport.receive(publication(new byte[] {1}));
+            assertThat(handled.poll(5, SECONDS)).isEqualTo((byte) 1);
+
+            // Act: a message arrives while the buffer is full, though a second handler could run.
+            // This publication follows it through the mailbox, so it completes after routing.
+            transport.receive(publication(new byte[] {2}));
+            sut.publish(message(new byte[0])).get(5, SECONDS);
+            release.countDown();
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 0);
+            transport.receive(publication(new byte[] {3}));
+
+            // Assert: the full buffer dropped the message, and the subscription goes on.
+            assertThat(handled.poll(5, SECONDS)).isEqualTo((byte) 3);
+            assertThat(handled).isEmpty();
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void acknowledgements_keep_receive_order_when_parallel_handlers_finish_out_of_order()
+            throws Exception {
+        // Arrange: the handler of QoS 1 delivery 2 acknowledges first, while that of 1 waits.
+        var secondAcknowledged = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(
+                    sut,
+                    transport,
+                    qosOneRequest().withAckMode(AckMode.MANUAL),
+                    DeliveryOptions.parallel(2),
+                    delivery -> {
+                        if (delivery.message().payload()[0] == 1) {
+                            waitFor(release);
+                        }
+                        delivery.ack();
+                        if (delivery.message().payload()[0] == 2) {
+                            secondAcknowledged.countDown();
+                        }
+                    }
+            );
+            transport.receive(qosOnePublication("messages", 1, false));
+            transport.receive(qosOnePublication("messages", 2, false));
+            assertThat(secondAcknowledged.await(5, SECONDS)).isTrue();
+
+            // Act
+            release.countDown();
+
+            // Assert: PUBACK follows receive order although the second delivery finished first.
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 1));
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 2));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void client_termination_waits_for_a_parallel_handler_still_running() throws Exception {
+        // Arrange: a handler runs on one of the subscription's internal threads.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            var actor = (ClientActor) sut;
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribeWith(
+                    sut,
+                    transport,
+                    request(),
+                    DeliveryOptions.parallel(4),
+                    _ -> {
+                        entered.countDown();
+                        waitFor(release);
+                    }
+            );
+            transport.receive(publication(new byte[] {1}));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> terminated = sut.terminated();
+
+            // Act
+            sut.close();
+
+            // Assert: everything else ends, and the running handler alone keeps the subscription
+            // and the client from terminating.
+            awaitTerminationPending(actor, ClientTermination.Pending.LANES);
+            assertThat(subscription.terminated()).isNotDone();
+            assertThat(terminated).isNotDone();
+            release.countDown();
+            subscription.terminated().get(5, SECONDS);
+            terminated.get(5, SECONDS);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void hand_off_rejects_acknowledgement_after_the_handler() throws Exception {
         // Arrange
         try (MqttClient sut = client()) {

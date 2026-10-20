@@ -18,13 +18,15 @@ import static java.util.Objects.requireNonNull;
 /// for its message, its lane: deliveries on the same lane keep that order, and different lanes
 /// can run at the same time. [#striped(int)] keeps that order for deliveries with equal keys, by
 /// default their topics, and runs different keys at the same time on a fixed number of stripes;
-/// each stripe is a lane in what follows.
+/// each stripe is a lane in what follows. [#parallel(int)] runs up to a given number of
+/// deliveries at the same time in no particular order, as one lane that runs that many at once.
 ///
-/// An executor that runs handlers receives at most one task per subscription and lane at a time.
-/// The task runs one delivery's handler and, while further deliveries wait for the same lane,
-/// asks the executor again, so the executor's queue holds at most one task per subscription and
-/// lane, and waiting deliveries count against [Subscribe#bufferCapacity()] as with an internal
-/// thread. While no delivery waits, the subscription holds none of the executor's threads. The
+/// An executor that runs handlers receives at most one task per subscription and lane at a time,
+/// or, for [#parallel(int)], as many as its parallelism. A task runs one delivery's handler and,
+/// while further deliveries wait for the same lane, asks the executor again, so the executor's
+/// queue holds no more tasks than that, and waiting deliveries count against
+/// [Subscribe#bufferCapacity()] as with an internal thread. While no delivery waits, the
+/// subscription holds none of the executor's threads. The
 /// executor must run each task it accepts, or throw from [Executor#execute(Runnable)]: an
 /// exception of any type ends the delivery that the task would have run as a handler failure
 /// under [FailurePolicy#STOP], whatever the subscription's policy, since a refusing executor has
@@ -45,8 +47,8 @@ import static java.util.Objects.requireNonNull;
 ///
 /// Acknowledgement follows the request's [AckMode] wherever the handler runs: [AckMode#ON_RECEIVE]
 /// just before the handler starts on its executor, and [AckMode#AFTER_HANDLER] when it returns
-/// there. PUBACK and PUBREC still follow receive order across lanes, so a slow lane holds back
-/// the acknowledgement of later deliveries on other lanes; see [AckMode].
+/// there. PUBACK and PUBREC still follow receive order, so a slow handler holds back the
+/// acknowledgement of later deliveries, on other lanes too; see [AckMode].
 public final class DeliveryOptions {
 
     private static final DeliveryOptions SERIAL =
@@ -102,8 +104,17 @@ public final class DeliveryOptions {
         return new DeliveryOptions(new HandlerExecution.Striped(stripes, key, null));
     }
 
-    /// The same order and the same stripes, with each handler running on `executor` instead of
-    /// an internal virtual thread. Replaces an executor chosen earlier.
+    /// Runs up to `parallelism` deliveries at the same time, in no particular order. Handlers run
+    /// on internal virtual threads while deliveries wait, or on the executor that
+    /// [#withExecutor(Executor)] sets.
+    ///
+    /// @throws IllegalArgumentException if `parallelism` is less than 1 or greater than 256
+    public static DeliveryOptions parallel(int parallelism) {
+        return new DeliveryOptions(new HandlerExecution.Parallel(parallelism, null));
+    }
+
+    /// Keeps the order, stripes, or parallelism of these options, with each handler running on
+    /// `executor` instead of an internal virtual thread. Replaces an executor chosen earlier.
     ///
     /// @throws NullPointerException if `executor` is null
     /// @throws IllegalArgumentException if these options are [#lanes(Function)], whose selector
@@ -115,6 +126,9 @@ public final class DeliveryOptions {
                     new DeliveryOptions(new HandlerExecution.OnExecutor(executor));
             case HandlerExecution.Striped striped -> new DeliveryOptions(
                     new HandlerExecution.Striped(striped.stripes(), striped.key(), executor)
+            );
+            case HandlerExecution.Parallel parallel -> new DeliveryOptions(
+                    new HandlerExecution.Parallel(parallel.parallelism(), executor)
             );
             case HandlerExecution.Lanes _ -> throw new IllegalArgumentException(
                     "Lanes take their executors from the selector"

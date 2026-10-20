@@ -212,6 +212,19 @@ Subscription subscription = client.subscribe(
 - Acknowledgements still leave in arrival order, so a slow stripe holds back the
   acknowledgement of later QoS 1 and 2 messages on other stripes.
 
+When messages do not depend on each other, run them in any order:
+
+```java
+Subscription subscription = client.subscribe(
+        Subscribe.of(new TopicFilter("jobs/+/requests"), Qos.AT_LEAST_ONCE),
+        DeliveryOptions.parallel(16),
+        delivery -> jobs.run(delivery.message())
+);
+```
+
+- Up to 16 messages run at once, in no particular order.
+- `.withExecutor(pool)` works here too, and acknowledgements still leave in arrival order.
+
 ## Receiving on your own threads
 
 Omit the handler to create a pull subscription. Call `receive()` from one or more
