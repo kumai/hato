@@ -6,8 +6,6 @@ import java.util.UUID;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.*;
 
@@ -16,9 +14,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The MQTT 5.0 subscription options, shared by Mosquitto, EMQX, and HiveMQ CE: No Local, Retain
-/// As Published, and Retain Handling. The embedded broker ignores the options and keeps no
-/// retained messages, so it runs none of these.
+/// The MQTT 5.0 subscription options that act on publications as they arrive, shared by
+/// Mosquitto, EMQX, HiveMQ CE, and the embedded broker: No Local and Retain As Published.
+/// [Mqtt5RetainHandlingTest] adds Retain Handling for the brokers that keep retained messages.
 @Timeout(30)
 abstract class Mqtt5SubscriptionOptionsTest {
 
@@ -60,55 +58,6 @@ abstract class Mqtt5SubscriptionOptionsTest {
             // Assert: without the option, the broker clears the flag of a live publication.
             assertThat(receive(asPublished).retain()).isTrue();
             assertThat(receive(cleared).retain()).isFalse();
-        }
-    }
-
-    @ParameterizedTest
-    @EnumSource(value = RetainHandling.class, names = {"SEND", "SEND_IF_NEW_SUBSCRIPTION"})
-    void a_new_subscription_receives_the_retained_message_when_its_retain_handling_sends_it(
-            RetainHandling handling
-    ) throws Exception {
-        String topic = uniqueTopic();
-        try (
-                MqttClient sut = connected(Duration.ZERO);
-                MqttClient publisher = connected(Duration.ZERO)
-        ) {
-            // Arrange
-            publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
-
-            // Act
-            Subscription subscription = subscribe(
-                    sut,
-                    request(topic).withRetainHandling(handling)
-            );
-
-            // Assert: a retained delivery carries the retain flag.
-            MqttMessage retained = receive(subscription);
-            assertThat(retained.payload()).containsExactly(1);
-            assertThat(retained.retain()).isTrue();
-        }
-    }
-
-    @Test
-    void a_subscription_that_withholds_retained_messages_receives_only_later_publications()
-            throws Exception {
-        String topic = uniqueTopic();
-        try (
-                MqttClient sut = connected(Duration.ZERO);
-                MqttClient publisher = connected(Duration.ZERO)
-        ) {
-            // Arrange
-            publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
-
-            // Act
-            Subscription subscription = subscribe(
-                    sut,
-                    request(topic).withRetainHandling(RetainHandling.DO_NOT_SEND)
-            );
-            publisher.publish(message(topic, 2)).get(5, SECONDS);
-
-            // Assert
-            assertThat(receive(subscription).payload()).containsExactly(2);
         }
     }
 
