@@ -1,12 +1,16 @@
 package org.mqtt4j.hato;
 
+import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -15,6 +19,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.spi.Transport;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -85,13 +90,27 @@ class MqttClientBuilderTest {
     }
 
     @Test
-    void server_and_version_are_required() {
+    void a_server_is_required() {
         assertThatThrownBy(() -> MqttClient.builder().build())
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> MqttClient.builder()
+    }
+
+    @Test
+    void a_client_without_a_version_speaks_mqtt_5() throws Exception {
+        // Arrange: a transport that keeps the CONNECT without answering it.
+        var transport = new ConnectCapture();
+        MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
-                .build())
-                .isInstanceOf(IllegalStateException.class);
+                .transportFactory(_ -> transport)
+                .build();
+
+        // Act
+        CompletableFuture<ConnAck> _ = sut.connect();
+        byte[] connect = transport.connect.get(5, SECONDS);
+        sut.close();
+
+        // Assert
+        assertThat(protocolLevel(connect)).isEqualTo(MqttVersion.V5.protocolLevel());
     }
 
     @ParameterizedTest(name = "accepts {0}")
@@ -423,5 +442,46 @@ class MqttClientBuilderTest {
         return MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1);
+    }
+
+    /// The protocol level of `connect`: the byte that follows the protocol name.
+    private static int protocolLevel(byte[] connect) {
+        byte[] name = {0, 4, 'M', 'Q', 'T', 'T'};
+        for (int start = 0; start + name.length < connect.length; start++) {
+            if (Arrays.equals(connect, start, start + name.length, name, 0, name.length)) {
+                return connect[start + name.length];
+            }
+        }
+        throw new AssertionError("CONNECT without a protocol name");
+    }
+
+    /// Connects at once and keeps the first packet that the client sends, its CONNECT, without
+    /// answering it.
+    private static final class ConnectCapture implements Transport {
+
+        final CompletableFuture<byte[]> connect = new CompletableFuture<>();
+
+        private @Nullable Listener listener;
+
+        @Override
+        public synchronized void start(URI endpoint, Duration timeout, Listener receiver) {
+            listener = receiver;
+            receiver.onConnected();
+        }
+
+        @Override
+        public SendResult send(long ticket, byte[] bytes) {
+            boolean _ = connect.complete(bytes);
+            return SendResult.ACCEPTED;
+        }
+
+        @Override
+        public synchronized void close() {
+            Listener receiver = listener;
+            listener = null;
+            if (receiver != null) {
+                receiver.onClosed(new IOException("Closed"));
+            }
+        }
     }
 }

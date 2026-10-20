@@ -4,7 +4,6 @@ import java.net.URI;
 
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttMessage;
-import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.TopicFilter;
@@ -17,7 +16,6 @@ public final class SubscribeReadings {
     void main() {
         try (MqttClient client = MqttClient.builder()
                 .server(URI.create("mqtt://localhost:1883"))
-                .version(MqttVersion.V3_1_1)
                 .build()) {
             client.connect().join();
             client.subscribe(

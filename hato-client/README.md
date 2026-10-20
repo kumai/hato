@@ -9,16 +9,15 @@ shown in [Getting it](../README.md#getting-it). For JPMS, the module name is
 ```java
 MqttClient client = MqttClient.builder()
         .server(URI.create("mqtt://broker.example.com:1883"))
-        .version(MqttVersion.V3_1_1)
         .clientId("sensor-17")
         .keepAlive(Duration.ofSeconds(30))
         .connectionListener(end -> System.out.println("Connection ended: " + end))
         .build();
 ```
 
-`server` and `version` are required, and `version` takes `MqttVersion.V5` or
-`MqttVersion.V3_1_1`. By default, each connection starts a fresh session, and omitting
-`clientId` generates a random one. The other settings have
+`server` is required. The client speaks MQTT 5.0 unless you choose
+`version(MqttVersion.V3_1_1)` for a broker without it. By default, each connection starts a
+fresh session, and omitting `clientId` generates a random one. The other settings have
 defaults; see the
 [builder Javadoc](src/main/java/org/mqtt4j/hato/MqttClientBuilder.java).
 
@@ -69,7 +68,6 @@ ReconnectPolicy policy = ReconnectPolicy
         .withInitialRetry();
 MqttClient client = MqttClient.builder()
         .server(URI.create("mqtt://broker.example.com:1883"))
-        .version(MqttVersion.V3_1_1)
         .reconnectPolicy(policy)
         .build();
 ```

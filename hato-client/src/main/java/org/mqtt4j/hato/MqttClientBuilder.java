@@ -27,7 +27,7 @@ import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// Configures a client without opening a connection. Not thread safe.
-/// Set [#server(URI)] and [#version(MqttVersion)] before calling [#build].
+/// Set [#server(URI)] before calling [#build]; the other settings have defaults.
 /// Invalid or unsupported configuration is rejected with [IllegalArgumentException].
 public final class MqttClientBuilder {
 
@@ -62,7 +62,7 @@ public final class MqttClientBuilder {
 
     private @Nullable String clientId;
 
-    private @Nullable MqttVersion version;
+    private MqttVersion version = MqttVersion.V5;
 
     private Duration keepAlive = DEFAULT_KEEP_ALIVE;
 
@@ -152,9 +152,10 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Selects the required wire protocol, [MqttVersion#V5] or [MqttVersion#V3_1_1]. An MQTT 5.0
-    /// broker announces limits when it accepts a connection, and the client keeps within them;
-    /// see [ConnAck] and [MqttPublisher#publish(MqttMessage)].
+    /// Selects the wire protocol; default [MqttVersion#V5]. Choose [MqttVersion#V3_1_1] for a
+    /// broker without MQTT 5.0. An MQTT 5.0 broker announces limits when it accepts a
+    /// connection, and the client keeps within them; see [ConnAck] and
+    /// [MqttPublisher#publish(MqttMessage)].
     public MqttClientBuilder version(MqttVersion value) {
         version = requireNonNull(value, "version");
         return this;
@@ -342,15 +343,14 @@ public final class MqttClientBuilder {
 
     /// Creates a disconnected client. Call [MqttClient#connect] to open the connection.
     ///
-    /// @throws IllegalStateException if the server or protocol version has not been specified
+    /// @throws IllegalStateException if the server has not been specified
     /// @throws IllegalArgumentException if the session expiry is out of range, TLS settings are
     ///     invalid or incompatible, a persistent session has no explicit client id, or the Will
     ///     payload exceeds 65535 bytes
     public MqttClient build() {
         URI endpoint = server;
-        MqttVersion selectedVersion = version;
-        if (endpoint == null || selectedVersion == null) {
-            throw new IllegalStateException("Server and MQTT version must be specified");
+        if (endpoint == null) {
+            throw new IllegalStateException("Server must be specified");
         }
         boolean tls = "mqtts".equals(endpoint.getScheme());
         Transport.Factory factory = transportFactory;
@@ -397,7 +397,7 @@ public final class MqttClientBuilder {
                 timer,
                 listener,
                 factory,
-                selectedVersion,
+                version,
                 sessionExpiry,
                 credentials,
                 connectWill,

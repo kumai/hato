@@ -44,6 +44,7 @@ void main() throws IOException {
             MqttBroker broker = MqttBroker.start();
             MqttClient client = MqttClient.builder()
                     .server(URI.create("mqtt://localhost:" + broker.port()))
+                    // The embedded broker speaks MQTT 3.1.1.
                     .version(MqttVersion.V3_1_1)
                     .build()
     ) {
