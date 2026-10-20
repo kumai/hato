@@ -41,7 +41,9 @@ Use `will(MqttMessage.of(topic, payload, qos, retain))` to ask the broker to pub
 a last Will if the connection ends without receiving MQTT DISCONNECT. For normal
 shutdown, wait for `disconnect()` to complete successfully before calling `close()`,
 as shown below. Any QoS and retention flag are supported. A Will payload must fit in
-65,535 bytes; `build()` rejects larger payloads.
+65,535 bytes; `build()` rejects larger payloads. With MQTT 5.0, the Will can also carry
+message properties, and `willDelay(Duration.ofSeconds(30))` asks the broker to hold it for a
+while: a client with a persistent session that reconnects within the delay publishes no Will.
 
 To retain a session between connections, use an explicit `clientId` and a positive
 expiry, such as `sessionExpiry(Duration.ofDays(1))`. With MQTT 5.0, the broker keeps the
