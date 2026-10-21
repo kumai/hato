@@ -13,6 +13,10 @@ public final class HiveMq {
     /// connections and topics.
     public static final int MQTT_PORT = 1883;
 
+    /// The [#container()] listener for MQTT over WebSocket that the image's default
+    /// configuration opens, on the path `/mqtt`.
+    public static final int WEBSOCKET_PORT = 8000;
+
     private static final DockerImageName IMAGE = DockerImageName.parse("hivemq/hivemq-ce:2026.5");
 
     private HiveMq() {
@@ -31,7 +35,7 @@ public final class HiveMq {
     public static GenericContainer<?> container() {
         // HiveMQ logs this line once its listeners accept connections.
         return new GenericContainer<>(IMAGE)
-                .withExposedPorts(MQTT_PORT)
+                .withExposedPorts(MQTT_PORT, WEBSOCKET_PORT)
                 .waitingFor(Wait.forLogMessage(".*Started HiveMQ in .*", 1));
     }
 }

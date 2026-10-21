@@ -25,6 +25,14 @@ public final class Mosquitto {
     /// CA, such as the one [Tls#clientContextWithCertificate()] presents.
     public static final int MUTUAL_TLS_PORT = 8884;
 
+    /// The [#tlsContainer()] listener for MQTT over WebSocket that authenticates only the broker,
+    /// as [#MQTTS_PORT] does. It serves every path.
+    public static final int SECURE_WEBSOCKET_PORT = 8081;
+
+    /// The [#tlsContainer()] listener for MQTT over WebSocket that also requires a client
+    /// certificate, as [#MUTUAL_TLS_PORT] does. It serves every path.
+    public static final int MUTUAL_TLS_WEBSOCKET_PORT = 8082;
+
     private static final DockerImageName IMAGE =
             DockerImageName.parse("eclipse-mosquitto:2.1.2-alpine");
 
@@ -56,10 +64,11 @@ public final class Mosquitto {
                 .withExposedPorts(MQTT_PORT);
     }
 
-    /// Mosquitto with only the TLS listeners [#MQTTS_PORT] and [#MUTUAL_TLS_PORT], which present
-    /// the server identity of [Tls#serverContext()]. That certificate names `localhost` and no IP
-    /// address, so clients that verify the host name must reach a Docker daemon on this machine
-    /// as `localhost`.
+    /// Mosquitto with only TLS listeners: [#MQTTS_PORT] and [#MUTUAL_TLS_PORT] for MQTT over TCP,
+    /// and [#SECURE_WEBSOCKET_PORT] and [#MUTUAL_TLS_WEBSOCKET_PORT] for MQTT over WebSocket.
+    /// They present the server identity of [Tls#serverContext()]. That certificate names
+    /// `localhost` and no IP address, so clients that verify the host name must reach a Docker
+    /// daemon on this machine as `localhost`.
     public static GenericContainer<?> tlsContainer() {
         // Mosquitto reads PEM files only. They are exported from the bundled PKCS12 identities
         // here, so the repository holds no PEM private key. Mosquitto reads the key after giving
@@ -82,7 +91,12 @@ public final class Mosquitto {
                             Transferable.of(Tls.privateKeyPem("server")),
                             "/mosquitto/config/tls/server.key"
                     )
-                    .withExposedPorts(MQTTS_PORT, MUTUAL_TLS_PORT);
+                    .withExposedPorts(
+                            MQTTS_PORT,
+                            MUTUAL_TLS_PORT,
+                            SECURE_WEBSOCKET_PORT,
+                            MUTUAL_TLS_WEBSOCKET_PORT
+                    );
         } catch (IOException | GeneralSecurityException failure) {
             throw new IllegalStateException("The bundled test identities are unreadable", failure);
         }

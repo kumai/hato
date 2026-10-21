@@ -15,6 +15,9 @@ public final class Emqx {
     /// The listener that the image opens to anonymous clients without further configuration.
     public static final int MQTT_PORT = 1883;
 
+    /// The listener for MQTT over WebSocket that the image also opens, on the path `/mqtt`.
+    public static final int WEBSOCKET_PORT = 8083;
+
     private static final DockerImageName IMAGE = DockerImageName.parse("emqx/emqx:6.3.2");
 
     private Emqx() {
@@ -39,7 +42,7 @@ public final class Emqx {
         // EMQX opens its listeners about a second before the node finishes starting, so the
         // container is ready when EMQX says so rather than when the port accepts connections.
         return new GenericContainer<>(IMAGE)
-                .withExposedPorts(MQTT_PORT)
+                .withExposedPorts(MQTT_PORT, WEBSOCKET_PORT)
                 .waitingFor(Wait.forLogMessage(".* is running now!.*", 1));
     }
 }
