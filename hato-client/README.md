@@ -36,6 +36,9 @@ Evaluation, transport establishment, and CONNACK share one connection timeout.
 Its exception, a null result, or exceeding the connection timeout fails that attempt with
 `MqttConnectException`. Only one supplier invocation runs at a time per client;
 respond to interruption so an abandoned invocation does not delay the next attempt.
+Hato authenticates with these credentials and TLS, not with MQTT 5.0 enhanced authentication
+such as SCRAM. A broker that requires it refuses the connection: with Bad authentication
+method the client stops, and with Not authorized it asks the supplier again and retries.
 
 Use `will(MqttMessage.of(topic, payload, qos, retain))` to ask the broker to publish
 a last Will if the connection ends without receiving MQTT DISCONNECT. For normal

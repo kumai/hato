@@ -251,6 +251,11 @@ final class ConnectionEstablishment {
             return new Outcome.Failed(protocolError("Session Present with Clean Start"));
         }
         Properties properties = ack.properties();
+        // The client announces no Authentication Method, so the broker may send none back
+        // [MQTT-4.12.0-6].
+        if (properties.find(PropertyId.AUTHENTICATION_METHOD).isPresent()) {
+            return new Outcome.Failed(protocolError("Authentication Method in CONNACK"));
+        }
         text(properties, PropertyId.REASON_STRING).ifPresent(reason ->
                 log.debug("CONNACK reason for {}: {}", clientId, reason));
         // An Assigned Client Identifier answers only an empty client identifier, which this

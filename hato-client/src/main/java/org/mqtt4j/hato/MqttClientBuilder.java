@@ -210,6 +210,14 @@ public final class MqttClientBuilder {
     /// An exception, a null result, or exceeding [#connectionTimeout(Duration)] fails only
     /// that attempt with [MqttConnectException]. A later attempt evaluates the supplier again.
     /// The supplier is not evaluated during [#build()].
+    ///
+    /// The client authenticates only with these credentials and TLS: it does not implement MQTT
+    /// 5.0 enhanced authentication and sends no Authentication Method. A broker that requires
+    /// enhanced authentication refuses the connection. When it refuses with
+    /// [ReasonCode#BAD_AUTHENTICATION_METHOD], the client does not reconnect; when it refuses
+    /// with [ReasonCode#NOT_AUTHORIZED], the client reconnects and evaluates the supplier again.
+    /// A broker that still sends an AUTH packet, or an Authentication Method in CONNACK, breaks
+    /// the protocol: the attempt or the connection ends with [MqttProtocolException].
     public MqttClientBuilder credentials(Supplier<MqttCredentials> value) {
         credentials = requireNonNull(value, "credentials");
         return this;

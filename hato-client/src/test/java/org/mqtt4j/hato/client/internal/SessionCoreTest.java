@@ -4293,6 +4293,42 @@ class SessionCoreTest {
     }
 
     @Test
+    void an_auth_on_an_established_mqtt_5_connection_is_a_protocol_error() {
+        // Arrange: the client announced no Authentication Method.
+        SessionCore mqtt5 = connectedMqtt5();
+
+        // Act
+        mqtt5.received(1, new Packet.Auth(ReasonCode.CONTINUE_AUTHENTICATION, EMPTY), 0, 0);
+
+        // Assert
+        assertThat(port.sent).last()
+                .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
+    }
+
+    @Test
+    void a_connack_with_an_authentication_method_fails_the_attempt_as_a_protocol_error() {
+        // Arrange: the client announced no Authentication Method.
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+
+        // Act
+        mqtt5.received(1, connAck(new Property.StringValue(
+                PropertyId.AUTHENTICATION_METHOD,
+                "SCRAM-SHA-256"
+        )), 0, 0);
+
+        // Assert
+        assertThat(requireNonNull(port.results.get(1L)).failure())
+                .isInstanceOf(MqttConnectException.class)
+                .cause()
+                .isInstanceOfSatisfying(
+                        MqttProtocolException.class,
+                        cause -> assertThat(cause.reasonCode()).isEqualTo(ReasonCode.PROTOCOL_ERROR)
+                );
+    }
+
+    @Test
     void session_present_in_answer_to_mqtt_5_clean_start_breaks_the_protocol() {
         // Arrange
         SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
