@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.ServerSocket;
@@ -25,6 +26,7 @@ import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
@@ -32,6 +34,7 @@ import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
@@ -39,9 +42,9 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// Measures the delivery modes and prints the results instead of asserting limits: how a slow
 /// handler backs up deliveries and their acknowledgements under serial and striped delivery, how
 /// long finished deliveries wait behind slower ones in the one receive-order acknowledgement
-/// queue, and what handing deliveries from the dispatcher to drain tasks costs. Runs only with
-/// `-Phato.measure=true`; the integrationTestSingleCarrier task measures the worst case of one
-/// carrier thread.
+/// queue, what handing deliveries from the dispatcher to drain tasks costs, and what receiving a
+/// publication through the whole client costs. Runs only with `-Phato.measure=true`; the
+/// integrationTestSingleCarrier task measures the worst case of one carrier thread.
 @EnabledIfSystemProperty(named = "hato.measure", matches = "true")
 @Timeout(600)
 class DeliveryMeasurementTest {
@@ -75,6 +78,14 @@ class DeliveryMeasurementTest {
     private static final int WINDOW = 1_000;
 
     private static final int RUNS = 5;
+
+    private static final int RECEPTIONS = 100_000;
+
+    // The peer writes this many publications at once and keeps at most RECEIVE_WINDOW of them
+    // unfinished, well within the client's receive table and the subscription's buffer.
+    private static final int RECEIVE_BATCH = 50;
+
+    private static final int RECEIVE_WINDOW = 500;
 
     @Test
     void a_slow_handler_backs_up_deliveries_and_acknowledgements() throws Exception {
@@ -184,6 +195,27 @@ class DeliveryMeasurementTest {
                             percentile(sorted(samples), 50));
                 }
             }
+        }
+    }
+
+    @Test
+    void receiving_publications_through_the_client_costs() throws Exception {
+        print(
+                "%s: nanoseconds per publication received through the client, median of %d runs"
+                        + " of %d publications, no-op handler",
+                carriers(),
+                RUNS,
+                RECEPTIONS
+        );
+        print("%-14s | %s", "qos", "ns per publication");
+        for (Qos qos : Qos.values()) {
+            var samples = new long[RUNS];
+            // The first run warms up the code paths.
+            long _ = receiveNanos(qos);
+            for (int run = 0; run < RUNS; run++) {
+                samples[run] = receiveNanos(qos);
+            }
+            print("%-14s | %d", qos, percentile(sorted(samples), 50));
         }
     }
 
@@ -371,6 +403,86 @@ class DeliveryMeasurementTest {
         lanes.closeHandOffs();
         lanes.close(null);
         return elapsed / copies;
+    }
+
+    /// Sends [#RECEPTIONS] publications at `qos` from a raw peer and returns the time per
+    /// publication until each has finished: QoS 0 once its no-op handler has run, QoS 1 at
+    /// PUBACK, and QoS 2 at PUBCOMP, after the peer has answered PUBREC. The publications are
+    /// encoded before the clock starts, so the time is mostly the client's.
+    private static long receiveNanos(Qos qos) throws Exception {
+        var codec = PacketCodec.of(MqttVersion.V3_1_1);
+        var batches = new byte[RECEPTIONS / RECEIVE_BATCH][];
+        for (int batch = 0; batch < batches.length; batch++) {
+            var bytes = new ByteArrayOutputStream();
+            for (int index = batch * RECEIVE_BATCH; index < (batch + 1) * RECEIVE_BATCH; index++) {
+                bytes.writeBytes(codec.encode(new Packet.Publish(
+                        new Topic("receive/" + index % 64),
+                        new byte[] {1},
+                        qos,
+                        false,
+                        false,
+                        qos == Qos.AT_MOST_ONCE ? 0 : index % 65_535 + 1,
+                        EMPTY
+                )));
+            }
+            batches[batch] = bytes.toByteArray();
+        }
+        var handled = new AtomicLong();
+        var acknowledged = new AtomicLong();
+        AtomicLong finished = qos == Qos.AT_MOST_ONCE ? handled : acknowledged;
+        try (ServerSocket server = ScriptedBroker.listen();
+                MqttClient sut = ScriptedBroker.client(server);
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter("receive/+"), qos),
+                    _ -> handled.incrementAndGet()
+            );
+            establish(peer, subscription, qos);
+            // The reader answers PUBREC on the socket that the sender writes, so they write in
+            // turn.
+            Thread reader = Thread.ofPlatform().start(() -> {
+                while (qos != Qos.AT_MOST_ONCE && acknowledged.get() < RECEPTIONS) {
+                    switch (receive(peer)) {
+                        case Packet.PubAck _, Packet.PubComp _ -> acknowledged.incrementAndGet();
+                        case Packet.PubRec received -> {
+                            var release = new Packet.PubRel(
+                                    received.packetId(),
+                                    ReasonCode.SUCCESS,
+                                    EMPTY
+                            );
+                            send(peer, codec.encode(release));
+                        }
+                        case Packet other -> throw new AssertionError(
+                                "Unexpected packet: " + other
+                        );
+                    }
+                }
+            });
+            long start = System.nanoTime();
+            for (int batch = 0; batch < batches.length; batch++) {
+                long sent = (long) (batch + 1) * RECEIVE_BATCH;
+                while (sent - finished.get() > RECEIVE_WINDOW) {
+                    Thread.onSpinWait();
+                }
+                send(peer, batches[batch]);
+            }
+            while (finished.get() < RECEPTIONS) {
+                Thread.onSpinWait();
+            }
+            long elapsed = System.nanoTime() - start;
+            reader.join();
+            return elapsed / RECEPTIONS;
+        }
+    }
+
+    private static void send(ScriptedBroker peer, byte[] bytes) {
+        synchronized (peer) {
+            try {
+                peer.send(bytes);
+            } catch (IOException cause) {
+                throw new UncheckedIOException(cause);
+            }
+        }
     }
 
     private static void establish(ScriptedBroker peer, Subscription subscription, Qos qos)

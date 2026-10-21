@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -50,7 +51,11 @@ final class ScriptedBroker implements AutoCloseable {
     private ScriptedBroker(Socket socket, MqttVersion version) throws IOException {
         this.socket = socket;
         socket.setSoTimeout(5000);
-        reader = new FrameReader(socket.getInputStream(), 1024 * 1024);
+        // Small packets, such as PUBREL, go out at once, as the client's own do; reads are
+        // buffered, so that the client's small acknowledgements cost no system call for each
+        // byte of their headers.
+        socket.setTcpNoDelay(true);
+        reader = new FrameReader(new BufferedInputStream(socket.getInputStream()), 1024 * 1024);
         writer = new FrameWriter(socket.getOutputStream());
         codec = PacketCodec.of(version);
     }
