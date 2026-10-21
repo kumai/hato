@@ -132,6 +132,23 @@ class DistributionTest {
                     || described.equals(message)) {
                 throw new AssertionError("Message properties are not usable");
             }
+            // A WebSocket attempt runs the JDK's HTTP client, which the module requires, and the
+            // client's termination waits until that client has ended.
+            org.mqtt4j.hato.MqttClient webSocket = org.mqtt4j.hato.MqttClient.builder()
+                    .server(java.net.URI.create("ws://127.0.0.1:1/mqtt"))
+                    .reconnectPolicy(org.mqtt4j.hato.ReconnectPolicy.disabled())
+                    .build();
+            try {
+                webSocket.connect().get(10, java.util.concurrent.TimeUnit.SECONDS);
+                throw new AssertionError("A closed port accepted a WebSocket connection");
+            } catch (java.util.concurrent.ExecutionException refused) {
+                if (!(refused.getCause() instanceof org.mqtt4j.hato.MqttConnectException)) {
+                    throw new AssertionError("WebSocket attempt failed oddly", refused);
+                }
+            } finally {
+                webSocket.close();
+            }
+            webSocket.terminated().get(10, java.util.concurrent.TimeUnit.SECONDS);
             """;
     private static final String BROKER_PROBE = """
             try (var broker = org.mqtt4j.hato.broker.MqttBroker.start()) {

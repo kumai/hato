@@ -26,6 +26,10 @@ JDK's default trust and verifies the broker hostname. Supply `sslContext(context
 for your own CA or client certificate, and `sslParameters(parameters -> ...)` for
 SNI, ALPN, or protocol settings.
 
+For MQTT over WebSocket, use a `ws` URI with the port and path of the broker's WebSocket
+listener, such as `ws://broker.example.com:8080/mqtt` (the default port is 80). The client
+uses the JDK's WebSocket client, and connects directly, without the JVM's HTTP proxy settings.
+
 For username/password authentication, add
 `credentials(() -> MqttCredentials.of(username, passwordBytes))`. The password is
 binary and is copied when the credentials are created. For a username without a

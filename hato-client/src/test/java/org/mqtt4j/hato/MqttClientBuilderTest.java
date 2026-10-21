@@ -45,7 +45,11 @@ class MqttClientBuilderTest {
             "mqtt://[::1]:1883",
             "mqtts://localhost",
             "mqtts://mqtt-broker:8883",
-            "mqtts://[::1]:8883"
+            "mqtts://[::1]:8883",
+            "ws://localhost",
+            "ws://mqtt-broker:8080/mqtt",
+            "ws://127.0.0.1/mqtt?tenant=a",
+            "ws://[::1]:8080/mqtt"
     })
     void supported_hosts_and_ip_literals_are_accepted(String uri) {
         // Arrange
@@ -80,7 +84,8 @@ class MqttClientBuilderTest {
             "mqtt://alice:s3cret@localhost, s3cret, mqtt://***@localhost",
             "mqtt://alice:p@ss@localhost, p@ss, mqtt://***@localhost",
             "mqtt://alice:s3cret@mqtt_broker:1883, s3cret, mqtt://***@mqtt_broker:1883",
-            "mqtt:alice:s3cret@localhost, s3cret, mqtt:***@localhost"
+            "mqtt:alice:s3cret@localhost, s3cret, mqtt:***@localhost",
+            "ws://alice:s3cret@localhost/mqtt, s3cret, ws://***@localhost/mqtt"
     })
     void rejection_messages_never_reveal_user_information(
             String uri,
@@ -145,7 +150,13 @@ class MqttClientBuilderTest {
             "mqtt://localhost/topic",
             "mqtt://localhost?x=1",
             "mqtt://localhost#fragment",
-            "mqtt:/"
+            "mqtt:/",
+            "WS://localhost/mqtt",
+            "wss://localhost/mqtt",
+            "ws://localhost:0/mqtt",
+            "ws://localhost:65536/mqtt",
+            "ws://localhost/mqtt#fragment",
+            "ws:/mqtt"
     })
     void unsupported_or_ambiguous_uris_are_rejected(String uri) {
         // Arrange

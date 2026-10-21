@@ -19,6 +19,7 @@ import org.mqtt4j.hato.client.internal.ClientActor;
 import org.mqtt4j.hato.client.internal.DefaultTimerScheduler;
 import org.mqtt4j.hato.client.internal.MessageProperties;
 import org.mqtt4j.hato.client.internal.TcpTransport;
+import org.mqtt4j.hato.client.internal.WebSocketTransports;
 import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
@@ -106,11 +107,14 @@ public final class MqttClientBuilder {
     MqttClientBuilder() {
     }
 
-    /// A required broker URI using `mqtt` for TCP or `mqtts` for TLS over TCP.
-    /// The default ports are 1883 and 8883, respectively.
-    /// Hosts must satisfy [URI#parseServerAuthority]; names containing underscores are rejected.
-    /// User information, paths, queries, and fragments are not accepted. Rejection messages
-    /// hide any user information in the given URI.
+    /// A required broker URI using `mqtt` for TCP, `mqtts` for TLS over TCP, or `ws` for
+    /// WebSocket. The default ports are 1883, 8883, and 80, respectively; a broker's WebSocket
+    /// listener often has its own port and path, such as `ws://broker.example.com:8080/mqtt`.
+    /// A `ws` URI keeps its path and query for the opening handshake, and connects directly,
+    /// without a proxy that the JVM configures for HTTP. Hosts must satisfy
+    /// [URI#parseServerAuthority]; names containing underscores are rejected. Schemes must be in
+    /// lower case. User information and fragments are not accepted, nor are paths and queries
+    /// for `mqtt` and `mqtts`. Rejection messages hide any user information in the given URI.
     public MqttClientBuilder server(URI value) {
         requireNonNull(value, "server");
         try {
@@ -119,17 +123,20 @@ public final class MqttClientBuilder {
             // The exception's message and input repeat the whole URI, so only the reason is kept.
             throw new IllegalArgumentException(failure.getReason() + ": " + redactUserInfo(value));
         }
-        if ((!"mqtt".equals(value.getScheme()) && !"mqtts".equals(value.getScheme()))
+        boolean tcp = "mqtt".equals(value.getScheme()) || "mqtts".equals(value.getScheme());
+        boolean webSocket = "ws".equals(value.getScheme());
+        if ((!tcp && !webSocket)
             || value.getHost() == null
             || value.getRawUserInfo() != null
-            || value.getRawQuery() != null
             || value.getRawFragment() != null
-            || (value.getRawPath() != null && !value.getRawPath().isEmpty())
+            || (tcp && value.getRawQuery() != null)
+            || (tcp && value.getRawPath() != null && !value.getRawPath().isEmpty())
             || value.getPort() == 0
             || value.getPort() > MAX_PORT
         ) {
             throw new IllegalArgumentException(
-                    "Expected mqtt://host[:port] or mqtts://host[:port]: " + redactUserInfo(value)
+                    "Expected mqtt://host[:port], mqtts://host[:port], or"
+                            + " ws://host[:port][/path][?query]: " + redactUserInfo(value)
             );
         }
         server = value;
@@ -430,7 +437,11 @@ public final class MqttClientBuilder {
         }
         TimerScheduler timer = scheduler;
         if (factory == null) {
-            factory = tls ? tlsTransportFactory(timer) : value -> new TcpTransport(value, timer);
+            factory = switch (requireNonNull(endpoint.getScheme())) {
+                case "mqtts" -> tlsTransportFactory(timer);
+                case "ws" -> new WebSocketTransports(id, timer);
+                default -> value -> new TcpTransport(value, timer);
+            };
         }
         return new ClientActor(
                 endpoint,

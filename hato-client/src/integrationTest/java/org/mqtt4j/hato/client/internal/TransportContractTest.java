@@ -75,7 +75,7 @@ class TransportContractTest {
     }
 
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
-    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
+    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true", "WS, false", "WS, true"})
     void disconnect_succeeds_when_peer_close_precedes_the_write_completion_notification(
             Kind kind,
             boolean faulty
