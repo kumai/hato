@@ -26,6 +26,7 @@ import org.mqtt4j.hato.client.internal.WebSocketTransports;
 import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.spi.MetricsListener;
 import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.spi.Transport;
 
@@ -105,6 +106,8 @@ public final class MqttClientBuilder {
     private TimerScheduler scheduler = DefaultTimerScheduler.instance;
 
     private ConnectionListener listener = _ -> { };
+
+    private @Nullable MetricsListener metrics;
 
     private Transport.@Nullable Factory transportFactory;
 
@@ -404,6 +407,14 @@ public final class MqttClientBuilder {
         return this;
     }
 
+    /// Registers the single listener for the timings of publications and deliveries; see
+    /// [MetricsListener]. Without one, which is the default, the client reads no time and
+    /// creates no event for them.
+    public MqttClientBuilder metricsListener(MetricsListener value) {
+        metrics = requireNonNull(value, "metricsListener");
+        return this;
+    }
+
     /// Supplies the TLS context for an `mqtts` or `wss` connection, including trust and client
     /// keys. If omitted, [#build()] obtains [SSLContext#getDefault()] once. The same context is
     /// reused across connection attempts. Initialize it before building and do not reinitialize
@@ -530,6 +541,7 @@ public final class MqttClientBuilder {
                 maxPacketSize,
                 timer,
                 listener,
+                metrics,
                 factory,
                 version,
                 sessionExpiry,

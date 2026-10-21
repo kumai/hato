@@ -7,7 +7,8 @@ import java.time.Duration;
 /// already dispatched callback may still run. The client does not own or close this scheduler.
 /// Runtime exceptions from time reads or scheduling fail the affected operation or connection
 /// and stop automatic reconnection; the client remains reusable through a later
-/// [org.mqtt4j.hato.MqttClient#connect()]. Cancellation failures are logged and cleanup
+/// [org.mqtt4j.hato.MqttClient#connect()]. A failed read for the timing of a [MetricsListener]
+/// event only leaves that event unreported. Cancellation failures are logged and cleanup
 /// continues.
 public interface TimerScheduler {
 

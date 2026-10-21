@@ -8878,6 +8878,7 @@ class ClientActorTest {
                 maxPacketSize,
                 clock,
                 listener,
+                null,
                 _ -> {
                     var transport = new ScriptTransport(version);
                     transports.add(transport);

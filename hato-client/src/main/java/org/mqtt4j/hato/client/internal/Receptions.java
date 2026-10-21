@@ -98,7 +98,9 @@ final class Receptions {
         return receiveMaximum;
     }
 
-    void deliver(Packet.Publish publish, int bytes) {
+    /// `receivedAt` is when the transport handed `publish` to the client, or
+    /// [DeliveryToken#UNTIMED].
+    void deliver(Packet.Publish publish, int bytes, long receivedAt) {
         publishes[publish.qos().ordinal()]++;
         long token = 0;
         boolean continued = false;
@@ -194,7 +196,13 @@ final class Receptions {
                 publish.properties()
         );
         if (!port.deliver(
-                new DeliveryToken(core.sessionNumber(), core.generation(), core.attempt(), token),
+                new DeliveryToken(
+                        core.sessionNumber(),
+                        core.generation(),
+                        core.attempt(),
+                        token,
+                        receivedAt
+                ),
                 matches,
                 message,
                 publish.dup(),

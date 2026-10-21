@@ -558,6 +558,12 @@ final class SessionCore {
     }
 
     void received(long connection, Packet packet, long now, int bytes) {
+        received(connection, packet, now, bytes, DeliveryToken.UNTIMED);
+    }
+
+    /// Like [#received(long, Packet, long, int)]; `receivedAt` is when the transport handed a
+    /// PUBLISH to the client, for the timing of its deliveries, or [DeliveryToken#UNTIMED].
+    void received(long connection, Packet packet, long now, int bytes, long receivedAt) {
         eventTime = now;
         if (connection != generation || !connectionActive()) {
             return;
@@ -609,7 +615,7 @@ final class SessionCore {
         } else if (packet instanceof Packet.Publish publish) {
             // The connection has resolved any Topic Alias, and the other MQTT 5.0 properties do
             // not change how the message is delivered.
-            receptions.deliver(publish, bytes);
+            receptions.deliver(publish, bytes, receivedAt);
         } else if (packet instanceof Packet.PubRel release) {
             receptions.released(release.packetId());
         } else if (packet instanceof Packet.Disconnect ending && version == MqttVersion.V5) {

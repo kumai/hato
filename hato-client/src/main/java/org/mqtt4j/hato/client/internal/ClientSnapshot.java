@@ -29,6 +29,8 @@ import org.mqtt4j.hato.TopicFilter;
 /// @param subscriptions the values of each subscription that the client holds
 /// @param refusals the operations refused for capacity, by limit, over the client's lifetime
 /// @param overloads the connections ended for overload, by cause, over the client's lifetime
+/// @param droppedMetricEvents the metrics listener events dropped because the listener fell
+///     behind, over the client's lifetime
 public record ClientSnapshot(
         Connection connection,
         Receiving receiving,
@@ -36,7 +38,8 @@ public record ClientSnapshot(
         Subscribing subscribing,
         List<SubscriptionValues> subscriptions,
         Map<CapacityLimit, Long> refusals,
-        Map<OverloadCause, Long> overloads
+        Map<OverloadCause, Long> overloads,
+        long droppedMetricEvents
 ) {
 
     public ClientSnapshot {

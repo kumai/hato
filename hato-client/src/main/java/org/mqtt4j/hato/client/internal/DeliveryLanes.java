@@ -92,6 +92,10 @@ final class DeliveryLanes {
     // push lane's dispatcher has ended it, or a pull lane has stopped.
     private final LongConsumer onTerminated;
 
+    // Told when application code receives a delivery, for its timing; null when nothing times
+    // deliveries.
+    private final @Nullable Started onStarted;
+
     // Lanes that ended under the lock. Their terminations run after it is released.
     private final List<Lane> terminatedLanes = new ArrayList<>();
 
@@ -136,7 +140,8 @@ final class DeliveryLanes {
             BiPredicate<DeliveryToken, Throwable> onFailure,
             Consumer<DeliveryToken> onOverload,
             Runnable onReady,
-            LongConsumer onTerminated
+            LongConsumer onTerminated,
+            @Nullable Started onStarted
     ) {
         this.clientId = clientId;
         this.byteLimit = byteLimit;
@@ -145,6 +150,7 @@ final class DeliveryLanes {
         this.onOverload = onOverload;
         this.onReady = onReady;
         this.onTerminated = onTerminated;
+        this.onStarted = onStarted;
     }
 
     /// A serial push lane whose dispatcher executes each handler in place.
@@ -1412,6 +1418,7 @@ final class DeliveryLanes {
     private void offer(Lane lane, DeliveryView view) {
         boolean accepted;
         try {
+            started(lane, view);
             accepted = requireNonNull(lane.acceptor).test(view);
         } catch (Throwable failure) {
             boolean _ = Thread.interrupted();
@@ -1519,6 +1526,7 @@ final class DeliveryLanes {
             if (claim.ready()) {
                 onReady.run();
             }
+            started(lane, view);
             requireNonNull(lane.handler).accept(view);
             // Clear handler-owned interrupt state before the next delivery or queue wait.
             boolean _ = Thread.interrupted();
@@ -1606,6 +1614,15 @@ final class DeliveryLanes {
     private boolean holdsAcknowledgement(DeliveryView view) {
         return view.delivery.token.acknowledgement() != 0 && !view.delivery.retired
                 && view.valid && !view.recipient.ready;
+    }
+
+    /// Tells the client, when it times deliveries, that application code receives `view` now:
+    /// its handler starts, its acceptor is called, or a pull receive returns it.
+    private void started(Lane lane, DeliveryView view) {
+        Started timing = onStarted;
+        if (timing != null) {
+            timing.started(lane.id, view.arrival.receivedAt());
+        }
     }
 
     /// Caller holds lock. Counts a delivery that left `lane` unprocessed, for the subscription and
@@ -1914,6 +1931,11 @@ final class DeliveryLanes {
                     releaseView(view);
                     // Receiving the last delivery accepted before a confirmed removal ends it.
                     settle(lane);
+                    // Timed under the lock, where the lane cannot yet terminate, so the client
+                    // queues the event before its termination can complete. Time reads do not
+                    // block, as the scheduler's contract requires; the metrics lane may log its
+                    // first drop here, once per client.
+                    started(lane, view);
                     result = new ReceiveResult.Received(view);
                 }
             } finally {
@@ -2130,6 +2152,15 @@ final class DeliveryLanes {
                 0,
                 ClientSnapshot.counts(new long[DropReason.values().length], DropReason.class)
         );
+    }
+
+    /// Told on the thread that hands a delivery of the lane `id` to application code, at the
+    /// moment it does; `receivedAt` is the reception time of the delivery's PUBLISH, or
+    /// [DeliveryToken#UNTIMED].
+    @FunctionalInterface
+    interface Started {
+
+        void started(long id, long receivedAt);
     }
 
     /// A QoS 0 delivery that overflow kept from the lane `id`, logged after the lock is released.

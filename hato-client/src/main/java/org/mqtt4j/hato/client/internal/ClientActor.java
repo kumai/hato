@@ -4,7 +4,6 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +55,7 @@ import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.spi.MetricsListener;
 import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.spi.Transport;
 
@@ -73,6 +73,10 @@ public final class ClientActor implements MqttClient {
     // Connection notifications waiting for the listener, excluding the one running. Attempt
     // numbers reveal what a listener that fell this far behind has lost.
     private static final int LISTENER_QUEUE_LIMIT = 64;
+
+    // Timings waiting for the metrics listener, excluding the one running. They come as often as
+    // publications and deliveries, so more of them wait than connection notifications.
+    private static final int METRICS_QUEUE_LIMIT = 1024;
 
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
     // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
@@ -97,6 +101,12 @@ public final class ClientActor implements MqttClient {
     private final String clientId;
 
     private final ConnectionListener listener;
+
+    // Both null when no listener times publications and deliveries; the client then reads no
+    // time for them.
+    private final @Nullable MetricsListener metrics;
+
+    private final @Nullable ListenerLane metricsLane;
 
     // MQTT 3.1.1 cannot carry message properties, so publish() refuses them before admission.
     private final MqttVersion version;
@@ -191,9 +201,10 @@ public final class ClientActor implements MqttClient {
     // mailbox refuses only registrations beyond its queue bound.
     private final Map<Long, ClientSubscription> subscriptions = new ConcurrentHashMap<>();
 
-    // Handles whose lane may still run, guarded by lifecycleLock. A lane's termination finds its
-    // handle here after retirement has removed it from subscriptions.
-    private final Map<Long, ClientSubscription> unterminated = new HashMap<>();
+    // Handles whose lane may still run, changed under lifecycleLock. A lane's termination finds
+    // its handle here after retirement has removed it from subscriptions, and so does the timing
+    // of a delivery, which reads it from the lane's thread without the lock.
+    private final Map<Long, ClientSubscription> unterminated = new ConcurrentHashMap<>();
 
     // Guarded by lifecycleLock. Set once the actor's cleanup has retired every subscription.
     private boolean cleanedUp;
@@ -217,6 +228,7 @@ public final class ClientActor implements MqttClient {
             int maxPacketSize,
             TimerScheduler scheduler,
             ConnectionListener listener,
+            @Nullable MetricsListener metrics,
             Transport.Factory transportFactory,
             MqttVersion version,
             Duration sessionExpiry,
@@ -237,6 +249,7 @@ public final class ClientActor implements MqttClient {
                 maxPacketSize,
                 scheduler,
                 listener,
+                metrics,
                 transportFactory,
                 PacketCodec.of(version),
                 version,
@@ -260,6 +273,7 @@ public final class ClientActor implements MqttClient {
             int maxPacketSize,
             TimerScheduler scheduler,
             ConnectionListener listener,
+            @Nullable MetricsListener metrics,
             Transport.Factory transportFactory,
             PacketCodec codec,
             MqttVersion version,
@@ -301,6 +315,15 @@ public final class ClientActor implements MqttClient {
                 LISTENER_QUEUE_LIMIT,
                 termination::check
         );
+        this.metrics = metrics;
+        metricsLane = metrics == null ? null : new ListenerLane(
+                endpoint,
+                clientId,
+                "Metrics listener",
+                "metrics",
+                METRICS_QUEUE_LIMIT,
+                termination::check
+        );
         mailbox = createMailbox(maxPacketSize, limits);
         lanes = new DeliveryLanes(
                 clientId,
@@ -309,7 +332,8 @@ public final class ClientActor implements MqttClient {
                 this::deliveryFailed,
                 this::handOffRefused,
                 this::deliveryReady,
-                this::laneTerminated
+                this::laneTerminated,
+                metrics == null ? null : this::deliveryStarted
         );
         webSockets = transportFactory instanceof WebSocketTransports owner ? owner : null;
         io = new ClientIo(
@@ -342,13 +366,13 @@ public final class ClientActor implements MqttClient {
                 () -> post(0, this::applyCredentials, Mailbox.Kind.CREDENTIALS_READY, 0),
                 termination::check
         );
-        termination.watch(listenerLane, this.credentials);
+        termination.watch(listenerLane, metricsLane, this.credentials);
         Thread.ofVirtual().name(threadName("actor")).start(this::run);
     }
 
     @Override
     public CompletableFuture<ConnAck> connect() {
-        return submit(Command.CONNECT, 0, token -> {
+        return submit(Command.CONNECT, 0, null, token -> {
             long now;
             try {
                 now = scheduler.nanoTime();
@@ -379,7 +403,7 @@ public final class ClientActor implements MqttClient {
 
     @Override
     public CompletableFuture<Void> disconnect() {
-        return submit(Command.DISCONNECT, 0, core::disconnect);
+        return submit(Command.DISCONNECT, 0, null, core::disconnect);
     }
 
     @Override
@@ -394,6 +418,7 @@ public final class ClientActor implements MqttClient {
         return submit(
                 Command.PUBLISH,
                 MessageProperties.bodySize(message),
+                publishTiming(message.qos()),
                 token -> core.publish(token, message)
         );
     }
@@ -514,6 +539,7 @@ public final class ClientActor implements MqttClient {
     private <T> CompletableFuture<T> submit(
             Command kind,
             int bytes,
+            @Nullable PublishTiming timing,
             LongConsumer command
     ) {
         boolean needsConnection = kind == Command.PUBLISH;
@@ -539,7 +565,8 @@ public final class ClientActor implements MqttClient {
             long generation = connectedGeneration;
             var operation = new Operation<T>(
                     requireNonNull(slot),
-                    (kind == Command.CONNECT) ? new ConnectionAttempt(token) : null
+                    (kind == Command.CONNECT) ? new ConnectionAttempt(token) : null,
+                    timing
             );
             operations.put(token, operation);
             Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
@@ -889,12 +916,87 @@ public final class ClientActor implements MqttClient {
         }
         Thread.ofVirtual().name(threadName("complete-" + token)).start(() -> {
             try {
+                // Reported before the slot returns, so that termination waits for the report.
+                reportPublication(operation.timing, failure);
                 operation.finish(result, failure);
             } finally {
                 operation.slot.release();
                 termination.check();
             }
         });
+    }
+
+    /// The start of a publication's timing at `qos`, or null when publications are not timed or
+    /// the clock fails. A failing clock costs only this timing; the actor's own readings handle
+    /// the failure as the scheduler's contract describes.
+    private @Nullable PublishTiming publishTiming(Qos qos) {
+        if (metrics == null) {
+            return null;
+        }
+        try {
+            return new PublishTiming(qos, scheduler.nanoTime());
+        } catch (RuntimeException _) {
+            return null;
+        }
+    }
+
+    /// Reports the completion of a timed publication, failed with `failure` or successful when it
+    /// is null. Called on the thread that completes the publication's future, just before it
+    /// does.
+    private void reportPublication(@Nullable PublishTiming timing, @Nullable Throwable failure) {
+        ListenerLane lane = metricsLane;
+        MetricsListener metricsListener = metrics;
+        if (timing == null || lane == null || metricsListener == null) {
+            return;
+        }
+        long now;
+        try {
+            now = scheduler.nanoTime();
+        } catch (RuntimeException _) {
+            return;
+        }
+        Duration duration = Duration.ofNanos(Math.max(0, now - timing.admittedAt()));
+        MetricsListener.PublishCompletion completion = failure == null
+                ? MetricsListener.PublishCompletion.of(timing.qos(), duration)
+                : MetricsListener.PublishCompletion.of(timing.qos(), failure, duration);
+        lane.submit(() -> metricsListener.onPublishCompleted(completion));
+    }
+
+    /// Reports that application code receives a delivery of the subscription `id` that the
+    /// client received at `receivedAt`. Called by the delivery lanes on the thread that hands the
+    /// delivery over, before termination can complete: the subscription is then still listed.
+    private void deliveryStarted(long id, long receivedAt) {
+        ListenerLane lane = metricsLane;
+        MetricsListener metricsListener = metrics;
+        ClientSubscription subscription = unterminated.get(id);
+        if (receivedAt == DeliveryToken.UNTIMED || lane == null || metricsListener == null
+                || subscription == null) {
+            return;
+        }
+        long now;
+        try {
+            now = scheduler.nanoTime();
+        } catch (RuntimeException _) {
+            return;
+        }
+        var start = MetricsListener.DeliveryStart.of(
+                subscription,
+                Duration.ofNanos(Math.max(0, now - receivedAt))
+        );
+        lane.submit(() -> metricsListener.onDeliveryStarted(start));
+    }
+
+    /// When a timed PUBLISH reached the client, or [DeliveryToken#UNTIMED] when deliveries are
+    /// not timed or the clock fails.
+    private long receptionTime() {
+        if (metrics == null) {
+            return DeliveryToken.UNTIMED;
+        }
+        try {
+            return scheduler.nanoTime();
+        } catch (RuntimeException _) {
+            return DeliveryToken.UNTIMED;
+        }
     }
 
     private String threadName(String role) {
@@ -1058,7 +1160,8 @@ public final class ClientActor implements MqttClient {
                 ),
                 held,
                 refused,
-                session.overloads()
+                session.overloads(),
+                metricsLane == null ? 0 : metricsLane.dropped()
         );
     }
 
@@ -1510,9 +1613,19 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void received(long generation, Packet packet, int size) {
+            // A PUBLISH's deliveries are timed from here, before it waits for the actor.
+            long receivedAt = packet instanceof Packet.Publish
+                    ? receptionTime()
+                    : DeliveryToken.UNTIMED;
             post(
                     generation,
-                    () -> core.received(generation, packet, nanoTime(generation), size),
+                    () -> core.received(
+                            generation,
+                            packet,
+                            nanoTime(generation),
+                            size,
+                            receivedAt
+                    ),
                     Mailbox.Kind.INCOMING,
                     size
             );
@@ -1919,6 +2032,9 @@ public final class ClientActor implements MqttClient {
         });
     }
 
+    /// A timed publication's QoS and the time the client admitted it.
+    private record PublishTiming(Qos qos, long admittedAt) {}
+
     private enum Command {
         CONNECT,
         DISCONNECT,
@@ -1936,9 +2052,17 @@ public final class ClientActor implements MqttClient {
         // completes at once.
         final @Nullable ConnectionAttempt attempt;
 
-        Operation(Semaphore slot, @Nullable ConnectionAttempt attempt) {
+        // Present for a publication that a metrics listener times.
+        final @Nullable PublishTiming timing;
+
+        Operation(
+                Semaphore slot,
+                @Nullable ConnectionAttempt attempt,
+                @Nullable PublishTiming timing
+        ) {
             this.slot = slot;
             this.attempt = attempt;
+            this.timing = timing;
         }
 
         @SuppressWarnings("unchecked") // Tokens retain their operation's result type in the core.

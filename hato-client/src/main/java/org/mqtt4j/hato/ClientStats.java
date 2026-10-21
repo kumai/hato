@@ -92,6 +92,12 @@ public final class ClientStats {
         return snapshot.overloads();
     }
 
+    /// A lifetime count of [org.mqtt4j.hato.spi.MetricsListener] events dropped because the
+    /// listener fell behind.
+    public long droppedMetricEvents() {
+        return snapshot.droppedMetricEvents();
+    }
+
     @Override
     @SuppressWarnings("exports") // Nullness annotations are compile-time only.
     public boolean equals(@Nullable Object other) {

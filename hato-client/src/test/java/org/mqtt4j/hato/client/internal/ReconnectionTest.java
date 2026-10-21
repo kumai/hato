@@ -567,7 +567,10 @@ class ReconnectionTest {
         var failure = new IllegalArgumentException("handler");
 
         // Act
-        sut.deliveryFailed(new DeliveryToken(sut.sessionNumber(), 1, 1, 0), failure);
+        sut.deliveryFailed(
+                new DeliveryToken(sut.sessionNumber(), 1, 1, 0, DeliveryToken.UNTIMED),
+                failure
+        );
 
         // Assert
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
@@ -579,7 +582,10 @@ class ReconnectionTest {
         connected(sut, 2, 0);
         sut.failed(2, new IOException("lost again"));
         sut.timer(0, RECONNECT, 0);
-        sut.deliveryFailed(new DeliveryToken(sut.sessionNumber(), 2, 2, 0), failure);
+        sut.deliveryFailed(
+                new DeliveryToken(sut.sessionNumber(), 2, 2, 0, DeliveryToken.UNTIMED),
+                failure
+        );
 
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(port.ends.getLast().cause()).containsSame(failure);
@@ -639,7 +645,7 @@ class ReconnectionTest {
         // Act
         sut.timer(0, RECONNECT, 3);
         sut.deliveryFailed(
-                new DeliveryToken(sut.sessionNumber(), 1, 1, 0),
+                new DeliveryToken(sut.sessionNumber(), 1, 1, 0, DeliveryToken.UNTIMED),
                 new IllegalArgumentException("handler")
         );
 
@@ -897,7 +903,7 @@ class ReconnectionTest {
 
     private static void failHandler(SessionCore sut) {
         sut.deliveryFailed(
-                new DeliveryToken(sut.sessionNumber(), 1, 1, 0),
+                new DeliveryToken(sut.sessionNumber(), 1, 1, 0, DeliveryToken.UNTIMED),
                 new IllegalStateException("handler")
         );
     }

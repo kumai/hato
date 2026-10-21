@@ -1199,6 +1199,7 @@ class AutomaticReconnectionTest {
                 16 * 1024 * 1024,
                 clock,
                 notifications,
+                null,
                 _ -> {
                     RuntimeException failure = factoryFailure;
                     if (failure != null) {

@@ -182,8 +182,8 @@ class DeliveryLanesTest {
         // Arrange: the first copy arrives on the second connection of attempt 1, as when that
         // attempt replaced a broker session. One receiver takes it, and the other's copy is
         // discarded when the connection ends, so the continued session keeps the receipt.
-        var firstCopy = new DeliveryToken(SESSION, 2, 1, 10);
-        var retransmission = new DeliveryToken(SESSION, 3, 2, 10);
+        var firstCopy = new DeliveryToken(SESSION, 2, 1, 10, DeliveryToken.UNTIMED);
+        var retransmission = new DeliveryToken(SESSION, 3, 2, 10, DeliveryToken.UNTIMED);
         DeliveryLanes.Receiver taken = registerPull(sut, 1, request(1));
         DeliveryLanes.Receiver discarded = registerPull(sut, 2, request(1));
         assertThat(sut.deliver(firstCopy, List.of(1L, 2L), qosOneMessage(), false, 10)).isTrue();
@@ -2332,7 +2332,7 @@ class DeliveryLanesTest {
             throws Exception {
         // Arrange
         var offers = new AtomicInteger();
-        var arrival = new DeliveryToken(SESSION, 3, 2, 10);
+        var arrival = new DeliveryToken(SESSION, 3, 2, 10, DeliveryToken.UNTIMED);
         assertThat(sut.registerHandOff(1, request(AckMode.ON_RECEIVE, 2), _ -> {
             offers.incrementAndGet();
             return false;
@@ -2594,7 +2594,13 @@ class DeliveryLanesTest {
 
     /// A token whose connection was established by an attempt of the same number.
     private DeliveryToken token(long connection, long acknowledgement) {
-        return new DeliveryToken(SESSION, connection, connection, acknowledgement);
+        return new DeliveryToken(
+                SESSION,
+                connection,
+                connection,
+                acknowledgement,
+                DeliveryToken.UNTIMED
+        );
     }
 
     private static Subscribe request(AckMode ackMode, int capacity) {
@@ -2635,7 +2641,8 @@ class DeliveryLanesTest {
                 onFailure,
                 overloads::add,
                 onReady,
-                terminated::add
+                terminated::add,
+                null
         );
         managers.add(manager);
         return manager;

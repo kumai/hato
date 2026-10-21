@@ -5,5 +5,16 @@ package org.mqtt4j.hato.client.internal;
 /// The attempt is the number of the connection attempt that established the receiving
 /// connection, as [org.mqtt4j.hato.ConnAck#connectionAttempt()] reports it.
 /// The acknowledgement token is zero for QoS 0, otherwise unique for the client's lifetime.
-record DeliveryToken(long session, long connection, long attempt, long acknowledgement) {
+/// `receivedAt` is when the transport handed the PUBLISH to the client, on the client's clock,
+/// for the timing of its deliveries; it is [#UNTIMED] when no listener asked for that timing.
+record DeliveryToken(
+        long session,
+        long connection,
+        long attempt,
+        long acknowledgement,
+        long receivedAt
+) {
+
+    /// The reception time of a PUBLISH whose reception was not timed.
+    static final long UNTIMED = Long.MIN_VALUE;
 }

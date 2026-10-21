@@ -370,7 +370,8 @@ class DeliveryMeasurementTest {
                 (_, _) -> true,
                 _ -> { },
                 () -> { },
-                _ -> { }
+                _ -> { },
+                null
         );
         Subscribe request = Subscribe.of(new TopicFilter("#"), Qos.AT_MOST_ONCE)
                 .withBufferCapacity(WINDOW * subscriptions);
@@ -387,7 +388,7 @@ class DeliveryMeasurementTest {
                         false
                 ))
                 .toArray(MqttMessage[]::new);
-        var token = new DeliveryToken(1, 1, 1, 0);
+        var token = new DeliveryToken(1, 1, 1, 0, DeliveryToken.UNTIMED);
         long copies = (long) HAND_OFFS * subscriptions;
         long start = System.nanoTime();
         for (int index = 0; index < HAND_OFFS; index++) {

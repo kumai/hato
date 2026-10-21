@@ -438,6 +438,9 @@ class DistributionTest {
                 "org.mqtt4j.hato.Topic",
                 "org.mqtt4j.hato.TopicFilter",
                 "org.mqtt4j.hato.UserProperty",
+                "org.mqtt4j.hato.spi.MetricsListener",
+                "org.mqtt4j.hato.spi.MetricsListener$DeliveryStart",
+                "org.mqtt4j.hato.spi.MetricsListener$PublishCompletion",
                 "org.mqtt4j.hato.spi.TimerScheduler",
                 "org.mqtt4j.hato.spi.TimerScheduler$Cancellable",
                 "org.mqtt4j.hato.spi.Transport",
@@ -457,7 +460,8 @@ class DistributionTest {
             "Disconnection", "ConnAck", "PublishResult", "MqttMessage", "MqttCredentials",
             "DeliveryOptions", "Subscribe", "ClientStats", "ClientStats$Connection",
             "ClientStats$Receiving", "ClientStats$Sending", "ClientStats$Subscribing",
-            "ClientStats$SubscriptionStats"
+            "ClientStats$SubscriptionStats", "spi/MetricsListener$PublishCompletion",
+            "spi/MetricsListener$DeliveryStart"
     })
     void evolving_value_types_are_final_classes_with_private_constructors(String type)
             throws Exception {

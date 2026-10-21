@@ -26,7 +26,7 @@ final class ClientTermination {
         /// A subscription that has not terminated, with a running handler or dispatcher.
         LANES,
 
-        /// A listener notification that is queued or running.
+        /// A connection or metrics listener callback that is queued or running.
         LISTENER,
 
         /// A credentials supplier call that has not returned.
@@ -55,6 +55,8 @@ final class ClientTermination {
 
     // Bound once by watch(), before the actor starts.
     private @Nullable ListenerLane listeners;
+
+    private @Nullable ListenerLane metrics;
 
     private @Nullable CredentialsEvaluator credentials;
 
@@ -90,10 +92,15 @@ final class ClientTermination {
         this.observationRefused = observationRefused;
     }
 
-    /// Binds the parts that report here when they become idle. Without credentials, none is
-    /// evaluated.
-    synchronized void watch(ListenerLane listeners, @Nullable CredentialsEvaluator credentials) {
+    /// Binds the parts that report here when they become idle. Without a metrics listener, no
+    /// timing is reported, and without credentials, none is evaluated.
+    synchronized void watch(
+            ListenerLane listeners,
+            @Nullable ListenerLane metrics,
+            @Nullable CredentialsEvaluator credentials
+    ) {
         this.listeners = listeners;
+        this.metrics = metrics;
         this.credentials = credentials;
     }
 
@@ -165,7 +172,8 @@ final class ClientTermination {
             pending.add(Pending.LANES);
         }
         ListenerLane lane = listeners;
-        if (lane == null || !lane.idle()) {
+        ListenerLane timings = metrics;
+        if (lane == null || !lane.idle() || (timings != null && !timings.idle())) {
             pending.add(Pending.LISTENER);
         }
         CredentialsEvaluator evaluator = credentials;

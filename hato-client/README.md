@@ -471,10 +471,33 @@ for (ClientStats.SubscriptionStats subscription : stats.subscriptions()) {
 ```
 
 It also counts operations refused by each limit, connections that the client ended because it
-was overloaded, and notifications that a slow listener lost. The values come from one moment,
-so they agree with each other, and the counts cover the client's whole life. Calling often is
-cheap: calls made while one is pending share its snapshot. After `close()`, `stats()` returns
-the last values, ready for a final report.
+was overloaded, and notifications and timings that a slow listener lost. The values come from
+one moment, so they agree with each other, and the counts cover the client's whole life.
+Calling often is cheap: calls made while one is pending share its snapshot. After `close()`,
+`stats()` returns the last values, ready for a final report.
+
+To time the client, register a `MetricsListener`. It learns how long each publication took,
+from `publish()` until its future completed, and how long each message waited between its
+arrival and your code receiving it, whether through a handler, a hand-off, or `receive()`.
+Feed the timings to the timers of your metrics library:
+
+```java
+MetricsListener timings = new MetricsListener() {
+    @Override
+    public void onPublishCompleted(MetricsListener.PublishCompletion completion) {
+        publishTimer.record(completion.duration());
+    }
+
+    @Override
+    public void onDeliveryStarted(MetricsListener.DeliveryStart start) {
+        deliveryWaitTimer.record(start.waited());
+    }
+};
+```
+
+Pass it with `metricsListener(timings)` when building the client. Its callbacks run on a
+thread of their own, so a slow listener never delays publications or deliveries. Without a
+listener, the client takes no timings.
 
 ## Passing the client to your code
 
