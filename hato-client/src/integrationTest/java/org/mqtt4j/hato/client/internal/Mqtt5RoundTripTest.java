@@ -17,9 +17,9 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /// The client's MQTT 5.0 connections, shared by Mosquitto, EMQX, HiveMQ CE, and the embedded
-/// broker: publications at every QoS, message properties, overlapping subscriptions, a persistent
-/// session that keeps messages while the client is away, and a session that another client takes
-/// over.
+/// broker: publications at every QoS, message properties, repeated publications on one topic,
+/// overlapping subscriptions, a persistent session that keeps messages while the client is away,
+/// and a session that another client takes over.
 @Timeout(30)
 abstract class Mqtt5RoundTripTest {
 
@@ -134,6 +134,39 @@ abstract class Mqtt5RoundTripTest {
 
             // Assert: a broker may answer No matching subscribers or success.
             assertThat(result).isEqualTo(PublishResult.of(unmatchedPublicationReason(qos)));
+        }
+    }
+
+    @Test
+    void repeated_publications_on_one_topic_arrive_with_their_topic() throws Exception {
+        var topic = new Topic("hato/mqtt5/repeated");
+        var received = new LinkedBlockingQueue<MqttMessage>();
+        try (
+                MqttClient subscriber = client("mqtt5-repeated-sub", Duration.ZERO);
+                MqttClient publisher = client("mqtt5-repeated-pub", Duration.ZERO)
+        ) {
+            // Arrange: a broker that uses Topic Aliases sends the topic with the first only.
+            subscriber.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            subscriber.subscribe(
+                    Subscribe.of(new TopicFilter(topic.name()), Qos.AT_LEAST_ONCE),
+                    delivery -> received.add(delivery.message())
+            ).established().get(5, SECONDS);
+            List<MqttMessage> messages = List.of(
+                    MqttMessage.of(topic, new byte[] {1}, Qos.AT_LEAST_ONCE, false),
+                    MqttMessage.of(topic, new byte[] {2}, Qos.AT_LEAST_ONCE, false),
+                    MqttMessage.of(topic, new byte[] {3}, Qos.AT_LEAST_ONCE, false)
+            );
+
+            // Act
+            for (MqttMessage message : messages) {
+                publisher.publish(message).get(5, SECONDS);
+            }
+
+            // Assert
+            for (MqttMessage message : messages) {
+                assertThat(received.poll(5, SECONDS)).isEqualTo(message);
+            }
         }
     }
 
