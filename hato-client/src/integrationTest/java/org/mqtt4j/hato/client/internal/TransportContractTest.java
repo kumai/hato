@@ -21,7 +21,7 @@ import javax.net.ssl.SSLSocket;
 
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.Disconnection;
@@ -45,28 +45,29 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.mqtt4j.hato.spi.Transport.SendResult.ACCEPTED;
 import static org.mqtt4j.hato.spi.Transport.SendResult.CLOSED;
 
-/// The same ownership, ordering, and termination contract for TCP, TLS, and their fault wrappers.
+/// The same ownership, ordering, and termination contract for every transport kind and its fault
+/// wrapper. Each kind makes its transports and the local peer that they connect to, so a test
+/// sees the peer only as the byte stream that carries MQTT packets.
 @SuppressWarnings("try") // Explicit close is the behavior under test; try still cleans up failures.
 class TransportContractTest {
 
-    @ParameterizedTest(name = "{displayName}, TLS: {0}, fault injection wrapper: {1}")
-    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
+    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
     void disconnect_succeeds_when_peer_close_precedes_the_write_completion_notification(
-            boolean tls,
+            Kind kind,
             boolean faulty
     ) throws Exception {
         // Arrange: hold a successful write's return until the reader has observed peer EOF.
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (
-                ServerSocket server = listen(tls);
-                Transport transport = delayedTransport(
-                        tls,
+                PeerServer server = kind.listen();
+                Transport transport = kind.delayedTransport(
                         faulty,
                         false,
                         new ManualTimerScheduler()
                 );
                 MqttClient sut = MqttClient.builder()
-                        .server(endpoint(server, tls))
+                        .server(server.endpoint())
                         .version(MqttVersion.V3_1_1)
                         .reconnectPolicy(ReconnectPolicy.disabled())
                         .connectionListener(ended::add)
@@ -74,9 +75,9 @@ class TransportContractTest {
                         .build()
         ) {
             CompletableFuture<ConnAck> connected = sut.connect();
-            try (Socket peer = accept(server)) {
-                var reader = new FrameReader(peer.getInputStream(), 1024);
-                var writer = new FrameWriter(peer.getOutputStream());
+            try (Peer peer = server.accept()) {
+                var reader = new FrameReader(peer.input(), 1024);
+                var writer = new FrameWriter(peer.output());
                 assertThat(reader.read().orElseThrow()[0]).isEqualTo((byte) 0x10);
                 writer.write(new byte[] {0x20, 0x02, 0x00, 0x00});
                 connected.get(5, SECONDS);
@@ -94,24 +95,24 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, TLS: {0}, wrapper: {1}, local close: {2}, "
+    @ParameterizedTest(name = "{displayName}, {0}, wrapper: {1}, local close: {2}, "
             + "write fails: {3}, delayed: {4}")
     @CsvSource({
-            "false, false, false, false, false", "false, false, false, true, false",
-            "false, false, true, false, false", "false, false, true, true, false",
-            "false, true, false, false, false", "false, true, false, true, false",
-            "false, true, true, false, false", "false, true, true, true, false",
-            "false, true, false, false, true", "false, true, false, true, true",
-            "false, true, true, false, true", "false, true, true, true, true",
-            "true, false, false, false, false", "true, false, false, true, false",
-            "true, false, true, false, false", "true, false, true, true, false",
-            "true, true, false, false, false", "true, true, false, true, false",
-            "true, true, true, false, false", "true, true, true, true, false",
-            "true, true, false, false, true", "true, true, false, true, true",
-            "true, true, true, false, true", "true, true, true, true, true"
+            "TCP, false, false, false, false", "TCP, false, false, true, false",
+            "TCP, false, true, false, false", "TCP, false, true, true, false",
+            "TCP, true, false, false, false", "TCP, true, false, true, false",
+            "TCP, true, true, false, false", "TCP, true, true, true, false",
+            "TCP, true, false, false, true", "TCP, true, false, true, true",
+            "TCP, true, true, false, true", "TCP, true, true, true, true",
+            "TLS, false, false, false, false", "TLS, false, false, true, false",
+            "TLS, false, true, false, false", "TLS, false, true, true, false",
+            "TLS, true, false, false, false", "TLS, true, false, true, false",
+            "TLS, true, true, false, false", "TLS, true, true, true, false",
+            "TLS, true, false, false, true", "TLS, true, false, true, true",
+            "TLS, true, true, false, true", "TLS, true, true, true, true"
     })
     void shutdown_preserves_the_local_write_result(
-            boolean tls,
+            Kind kind,
             boolean faulty,
             boolean localClose,
             boolean writeFails,
@@ -121,12 +122,12 @@ class TransportContractTest {
         byte[] packet = {(byte) 0xE0, 0x00};
         var clock = new ManualTimerScheduler();
         try (
-                ServerSocket server = listen(tls);
-                Transport sut = delayedTransport(tls, faulty, writeFails, clock)
+                PeerServer server = kind.listen();
+                Transport sut = kind.delayedTransport(faulty, writeFails, clock)
         ) {
             var receiver = new Receiver();
-            sut.start(endpoint(server, tls), Duration.ofSeconds(5), receiver);
-            try (Socket peer = accept(server)) {
+            sut.start(server.endpoint(), Duration.ofSeconds(5), receiver);
+            try (Peer peer = server.accept()) {
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
                 if (delayed) {
                     ((FaultyTransport) sut).sendDelay(Duration.ofSeconds(1));
@@ -136,7 +137,7 @@ class TransportContractTest {
                     assertThat(clock.pendingTaskCount()).isEqualTo(1);
                     clock.advance(Duration.ofSeconds(1));
                 }
-                assertThat(peer.getInputStream().readNBytes(packet.length)).isEqualTo(packet);
+                assertThat(peer.input().readNBytes(packet.length)).isEqualTo(packet);
 
                 // Act: terminate after peer receipt, before the local write's result is known.
                 if (localClose) {
@@ -158,19 +159,20 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, TLS: {0}")
-    @ValueSource(booleans = {false, true})
-    void a_connection_returned_after_close_is_closed_without_connected_notification(boolean tls)
+    @ParameterizedTest(name = "{displayName}, {0}")
+    @EnumSource(value = Kind.class, names = {"TCP", "TLS"})
+    void a_connection_returned_after_close_is_closed_without_connected_notification(Kind kind)
             throws Exception {
-        // Arrange: hold the socket result until after shutdown has been requested.
+        // Arrange: hold the socket result until after shutdown has been requested. The case holds
+        // TcpTransport's connection step, so only the kinds built on it run it.
         var result = new CompletableFuture<TcpTransport.Connection>();
         var entered = new CompletableFuture<Void>();
-        SSLContext context = Tls.clientContext();
+        TcpTransport.Connector connector = kind.connector();
         try (
-                ServerSocket server = listen();
+                ServerSocket server = loopbackServer();
                 var sut = new TcpTransport(
                         "late",
-                        tls ? "mqtts" : "mqtt",
+                        kind.scheme,
                         new Semaphore(1),
                         InetAddress::getByName,
                         (_, _, _) -> {
@@ -181,7 +183,7 @@ class TransportContractTest {
                 )
         ) {
             var receiver = new Receiver();
-            sut.start(endpoint(server, tls), Duration.ofSeconds(5), receiver);
+            sut.start(kind.endpoint(server.getLocalPort()), Duration.ofSeconds(5), receiver);
             entered.get(5, SECONDS);
             assertThatThrownBy(() -> sut.send(1, new byte[] {1}))
                     .isInstanceOf(IllegalStateException.class);
@@ -193,19 +195,11 @@ class TransportContractTest {
             assertThat(sut.send(2, new byte[] {2})).isEqualTo(CLOSED);
             assertThat(receiver.events.poll(5, SECONDS)).isInstanceOf(Throwable.class);
             try (
-                    TcpTransport.Connection late = tls
-                            ? TcpTransport.tls(
-                                    "localhost",
-                                    new InetSocketAddress("localhost", server.getLocalPort()),
-                                    Duration.ofSeconds(5),
-                                    context,
-                                    context.getDefaultSSLParameters()
-                            )
-                            : TcpTransport.plain(TcpConnection.connect(
-                                    "127.0.0.1",
-                                    server.getLocalPort(),
-                                    Duration.ofSeconds(5)
-                            ));
+                    TcpTransport.Connection late = connector.connect(
+                            kind.host,
+                            new InetSocketAddress(kind.host, server.getLocalPort()),
+                            Duration.ofSeconds(5)
+                    );
                     Socket peer = server.accept()
             ) {
                 peer.setSoTimeout(5000);
@@ -222,26 +216,25 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, TLS: {0}, wrapper: {1}, delayed: {2}")
+    @ParameterizedTest(name = "{displayName}, {0}, wrapper: {1}, delayed: {2}")
     @CsvSource({
-            "false, false, false", "false, true, false", "false, true, true",
-            "true, false, false", "true, true, false", "true, true, true"
+            "TCP, false, false", "TCP, true, false", "TCP, true, true",
+            "TLS, false, false", "TLS, true, false", "TLS, true, true"
     })
     void ordered_bytes_write_completions_and_a_single_terminal_event(
-            boolean tls,
+            Kind kind,
             boolean faulty,
             boolean delayed
     ) throws Exception {
         // Arrange
         var clock = new ManualTimerScheduler();
         try (
-                ServerSocket server = listen(tls);
-                Transport sut = transport(tls, faulty, clock)
+                PeerServer server = kind.listen();
+                Transport sut = kind.transport(faulty, clock)
         ) {
             var receiver = new Receiver();
-            sut.start(endpoint(server, tls), Duration.ofSeconds(5), receiver);
-            try (Socket socket = accept(server)) {
-                socket.setSoTimeout(5000);
+            sut.start(server.endpoint(), Duration.ofSeconds(5), receiver);
+            try (Peer peer = server.accept()) {
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
                 if (delayed) {
                     ((FaultyTransport) sut).sendDelay(Duration.ofSeconds(1));
@@ -270,18 +263,18 @@ class TransportContractTest {
                 }
 
                 // Assert
-                assertThat(socket.getInputStream().readNBytes(5)).containsExactly(1, 2, 3, 4, 5);
+                assertThat(peer.input().readNBytes(5)).containsExactly(1, 2, 3, 4, 5);
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo(1L);
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo(2L);
                 assertThat(first).containsExactly(1, 2, 3);
 
                 // Act: retain a received chunk while subsequent input arrives.
-                socket.getOutputStream().write(new byte[] {6, 7});
-                socket.getOutputStream().flush();
+                peer.output().write(new byte[] {6, 7});
+                peer.output().flush();
                 byte[] received = requireNonNull(receiver.bytes.poll(5, SECONDS));
                 byte[] saved = received.clone();
-                socket.getOutputStream().write(new byte[] {8, 9});
-                socket.getOutputStream().flush();
+                peer.output().write(new byte[] {8, 9});
+                peer.output().flush();
                 var all = new ArrayList<Byte>();
                 for (byte value : received) {
                     all.add(value);
@@ -295,38 +288,37 @@ class TransportContractTest {
                 // Assert: receiving again must not mutate the transferred buffer.
                 assertThat(all).containsExactly((byte) 6, (byte) 7, (byte) 8, (byte) 9);
                 assertThat(received).containsExactly(saved);
-                socket.shutdownOutput();
+                peer.shutdownOutput();
                 assertThat(receiver.events.poll(5, SECONDS)).isInstanceOf(Throwable.class);
                 sut.close();
                 sut.close();
                 assertThat(sut.send(3, new byte[] {1})).isEqualTo(CLOSED);
-                assertThat(socket.getInputStream().read()).isEqualTo(-1);
+                assertThat(peer.input().read()).isEqualTo(-1);
                 assertThat(clock.pendingTaskCount()).isZero();
                 assertThat(receiver.events).isEmpty();
             }
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, TLS: {0}, ending: {1}")
+    @ParameterizedTest(name = "{displayName}, {0}, ending: {1}")
     @CsvSource({
-            "false, close", "false, disconnect", "false, peer EOF",
-            "true, close", "true, disconnect", "true, peer EOF"
+            "TCP, close", "TCP, disconnect", "TCP, peer EOF",
+            "TLS, close", "TLS, disconnect", "TLS, peer EOF"
     })
-    void ending_a_delayed_send_returns_ownership_without_writing(boolean tls, String ending)
+    void ending_a_delayed_send_returns_ownership_without_writing(Kind kind, String ending)
             throws Exception {
         // Arrange: the wrapper owns the bytes, but TCP has not received a send yet.
         var clock = new ManualTimerScheduler();
         var failure = new IOException("Injected disconnect before writing");
         byte[] bytes = {1, 2, 3};
         try (
-                ServerSocket server = listen(tls);
-                FaultyTransport sut = new FaultyTransport(transport(tls, false, clock), clock)
+                PeerServer server = kind.listen();
+                FaultyTransport sut = new FaultyTransport(kind.transport(false, clock), clock)
                         .sendDelay(Duration.ofSeconds(1))
         ) {
             var receiver = new Receiver();
-            sut.start(endpoint(server, tls), Duration.ofSeconds(5), receiver);
-            try (Socket peer = accept(server)) {
-                peer.setSoTimeout(5000);
+            sut.start(server.endpoint(), Duration.ofSeconds(5), receiver);
+            try (Peer peer = server.accept()) {
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
                 assertThat(sut.send(1, bytes)).isEqualTo(ACCEPTED);
                 assertThat(clock.pendingTaskCount()).isEqualTo(1);
@@ -348,7 +340,7 @@ class TransportContractTest {
                 assertThat(clock.pendingTaskCount()).isZero();
                 bytes[0] = 9;
                 clock.advance(Duration.ofSeconds(1));
-                assertThat(peer.getInputStream().read()).isEqualTo(-1);
+                assertThat(peer.input().read()).isEqualTo(-1);
                 assertThat(sut.send(2, bytes)).isEqualTo(CLOSED);
                 sut.close();
                 assertThat(receiver.events).isEmpty();
@@ -356,19 +348,19 @@ class TransportContractTest {
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, TLS: {0}, fault injection wrapper: {1}")
-    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
-    void stalled_writes_allow_reads_and_close_without_waiting(boolean tls, boolean faulty)
+    @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
+    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
+    void stalled_writes_allow_reads_and_close_without_waiting(Kind kind, boolean faulty)
             throws Exception {
         // Arrange
         try (
-                ServerSocket server = listen(tls);
-                Transport sut = transport(tls, faulty, new ManualTimerScheduler())
+                PeerServer server = kind.listen();
+                Transport sut = kind.transport(faulty, new ManualTimerScheduler())
         ) {
-            server.setReceiveBufferSize(1024);
+            server.receiveBufferSize(1024);
             var receiver = new Receiver();
-            sut.start(endpoint(server, tls), Duration.ofSeconds(5), receiver);
-            try (Socket socket = accept(server)) {
+            sut.start(server.endpoint(), Duration.ofSeconds(5), receiver);
+            try (Peer peer = server.accept()) {
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
 
                 // Arrange: exceed the old transport byte limit in one outstanding write.
@@ -377,9 +369,8 @@ class TransportContractTest {
                         .isInstanceOf(IllegalStateException.class);
 
                 // Assert: the peer can send while deliberately refusing to drain our write.
-                socket.setSoTimeout(5000);
-                assertThat(socket.getInputStream().read()).isZero();
-                socket.getOutputStream().write(42);
+                assertThat(peer.input().read()).isZero();
+                peer.output().write(42);
                 assertThat(receiver.bytes.poll(5, SECONDS)).containsExactly((byte) 42);
                 assertThat(receiver.events).isEmpty();
 
@@ -395,45 +386,44 @@ class TransportContractTest {
                 assertThat(event).isInstanceOf(Throwable.class);
                 assertThat(sut.send(101, new byte[] {1})).isEqualTo(CLOSED);
                 assertThat(receiver.events).isEmpty();
-                assertThat(socket.isClosed()).isFalse();
+                assertThat(peer.isClosed()).isFalse();
             }
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, TLS: {0}, fault injection wrapper: {1}")
-    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
-    void a_large_write_completes_for_a_peer_that_only_reads(boolean tls, boolean faulty)
+    @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
+    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
+    void a_large_write_completes_for_a_peer_that_only_reads(Kind kind, boolean faulty)
             throws Exception {
         // Arrange: the write exceeds the socket buffers, and the peer never sends anything.
         var payload = new byte[8 * 1024 * 1024];
         try (
-                ServerSocket server = listen(tls);
-                Transport sut = transport(tls, faulty, new ManualTimerScheduler())
+                PeerServer server = kind.listen();
+                Transport sut = kind.transport(faulty, new ManualTimerScheduler())
         ) {
-            server.setReceiveBufferSize(64 * 1024);
+            server.receiveBufferSize(64 * 1024);
             var receiver = new Receiver();
-            sut.start(endpoint(server, tls), Duration.ofSeconds(5), receiver);
-            try (Socket socket = accept(server)) {
+            sut.start(server.endpoint(), Duration.ofSeconds(5), receiver);
+            try (Peer peer = server.accept()) {
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
-                socket.setSoTimeout(5000);
 
                 // Act
                 assertThat(sut.send(1, payload)).isEqualTo(ACCEPTED);
 
                 // Assert: draining alone lets the transport finish the write.
-                assertThat(socket.getInputStream().readNBytes(payload.length).length)
+                assertThat(peer.input().readNBytes(payload.length).length)
                         .isEqualTo(payload.length);
                 assertThat(receiver.events.poll(5, SECONDS)).isEqualTo(1L);
             }
         }
     }
 
-    @ParameterizedTest(name = "{displayName}, TLS: {0}, fault injection wrapper: {1}")
-    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
-    void close_before_start_never_establishes_a_connection(boolean tls, boolean faulty)
+    @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
+    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
+    void close_before_start_never_establishes_a_connection(Kind kind, boolean faulty)
             throws Exception {
         // Arrange
-        try (Transport sut = transport(tls, faulty, new ManualTimerScheduler())) {
+        try (Transport sut = kind.transport(faulty, new ManualTimerScheduler())) {
             var receiver = new Receiver();
             assertThatThrownBy(() -> sut.send(1, new byte[] {1}))
                     .isInstanceOf(IllegalStateException.class);
@@ -442,7 +432,7 @@ class TransportContractTest {
             sut.close();
             assertThat(sut.send(2, new byte[] {2})).isEqualTo(CLOSED);
             sut.start(
-                    URI.create((tls ? "mqtts" : "mqtt") + "://127.0.0.1:1"),
+                    URI.create(kind.scheme + "://127.0.0.1:1"),
                     Duration.ofSeconds(1),
                     receiver
             );
@@ -453,50 +443,126 @@ class TransportContractTest {
         }
     }
 
-    private static Transport transport(
-            boolean tls,
-            boolean faulty,
-            ManualTimerScheduler clock
-    ) throws Exception {
-        Transport socket;
-        if (tls) {
-            SSLContext context = Tls.clientContext();
-            SSLParameters parameters = context.getDefaultSSLParameters();
-            parameters.setEndpointIdentificationAlgorithm("HTTPS");
-            socket = new TcpTransport(
+    /// The transport kinds under the contract. Each kind makes the transports that the tests
+    /// exercise and the local peer that they connect to.
+    enum Kind {
+        TCP("mqtt", "127.0.0.1"),
+        // The test server certificate names localhost, so TLS connects by that name.
+        TLS("mqtts", "localhost");
+
+        final String scheme;
+
+        final String host;
+
+        Kind(String scheme, String host) {
+            this.scheme = scheme;
+            this.host = host;
+        }
+
+        URI endpoint(int port) {
+            return URI.create(scheme + "://" + host + ":" + port);
+        }
+
+        /// The kind's transport, alone or behind the fault injection wrapper.
+        Transport transport(boolean faulty, ManualTimerScheduler clock) throws Exception {
+            Transport transport = switch (this) {
+                case TCP -> Transport.tcp("contract");
+                case TLS -> {
+                    SSLContext context = Tls.clientContext();
+                    yield new TcpTransport(
+                            "contract",
+                            context,
+                            verifyingParameters(context),
+                            DefaultTimerScheduler.instance
+                    );
+                }
+            };
+            return faulty ? new FaultyTransport(transport, clock) : transport;
+        }
+
+        /// A transport whose DISCONNECT write returns only after its connection closes, and then
+        /// fails if `writeFails`.
+        Transport delayedTransport(
+                boolean faulty,
+                boolean writeFails,
+                ManualTimerScheduler clock
+        ) throws Exception {
+            TcpTransport.Connector connector = connector();
+            var transport = new TcpTransport(
                     "contract",
-                    context,
-                    parameters,
+                    scheme,
+                    new Semaphore(1),
+                    InetAddress::getByName,
+                    (host, address, timeout) -> delayedConnection(
+                            connector.connect(host, address, timeout),
+                            writeFails
+                    ),
                     DefaultTimerScheduler.instance
             );
-        } else {
-            socket = Transport.tcp("contract");
+            return faulty ? new FaultyTransport(transport, clock) : transport;
         }
-        return faulty ? new FaultyTransport(socket, clock) : socket;
+
+        /// Opens the kind's connections the way its TcpTransport does, before any handshake.
+        TcpTransport.Connector connector() throws Exception {
+            return switch (this) {
+                case TCP -> (_, address, timeout) -> TcpTransport.plain(
+                        TcpConnection.connect(address, timeout)
+                );
+                case TLS -> {
+                    SSLContext context = Tls.clientContext();
+                    SSLParameters parameters = verifyingParameters(context);
+                    yield (host, address, timeout) -> TcpTransport.tls(
+                            host,
+                            address,
+                            timeout,
+                            context,
+                            parameters
+                    );
+                }
+            };
+        }
+
+        /// A listening peer for the kind's transports.
+        PeerServer listen() throws Exception {
+            ServerSocket server = switch (this) {
+                case TCP -> loopbackServer();
+                case TLS -> Tls.serverSocket();
+            };
+            return new SocketPeerServer(server, endpoint(server.getLocalPort()));
+        }
     }
 
-    private static Transport delayedTransport(
-            boolean tls,
-            boolean faulty,
-            boolean writeFails,
-            ManualTimerScheduler clock
-    ) throws Exception {
-        SSLContext context = Tls.clientContext();
-        SSLParameters parameters = context.getDefaultSSLParameters();
-        parameters.setEndpointIdentificationAlgorithm("HTTPS");
-        var transport = new TcpTransport(
-                "contract",
-                tls ? "mqtts" : "mqtt",
-                new Semaphore(1),
-                InetAddress::getByName,
-                (host, address, timeout) -> delayedConnection(
-                        tls ? TcpTransport.tls(host, address, timeout, context, parameters)
-                                : TcpTransport.plain(TcpConnection.connect(address, timeout)),
-                        writeFails
-                ),
-                DefaultTimerScheduler.instance
-        );
-        return faulty ? new FaultyTransport(transport, clock) : transport;
+    /// A listening peer, and the endpoint where the kind's transports find it.
+    interface PeerServer extends AutoCloseable {
+
+        URI endpoint();
+
+        /// Limits the receive buffer of the connections accepted afterward, so that a peer that
+        /// does not read stalls the transport's writes.
+        void receiveBufferSize(int bytes) throws IOException;
+
+        /// Waits for the next connection, whose reads then wait at most five seconds.
+        Peer accept() throws IOException;
+
+        @Override
+        void close() throws IOException;
+    }
+
+    /// The peer side of one connection, seen as the byte stream that carries MQTT packets.
+    interface Peer extends AutoCloseable {
+
+        InputStream input() throws IOException;
+
+        OutputStream output() throws IOException;
+
+        /// Ends the peer's stream while its input stays readable.
+        void shutdownOutput() throws IOException;
+
+        boolean isClosed();
+
+        /// Drops the connection.
+        @Override
+        void close() throws IOException;
     }
 
     private static TcpTransport.Connection delayedConnection(
@@ -564,31 +630,68 @@ class TransportContractTest {
         };
     }
 
-    private static ServerSocket listen(boolean tls) throws Exception {
-        return tls ? Tls.serverSocket() : listen();
+    // The default parameters of `context`, verifying the server's name as HTTPS does.
+    private static SSLParameters verifyingParameters(SSLContext context) {
+        SSLParameters parameters = context.getDefaultSSLParameters();
+        parameters.setEndpointIdentificationAlgorithm("HTTPS");
+        return parameters;
     }
 
-    private static Socket accept(ServerSocket server) throws IOException {
-        Socket socket = server.accept();
-        socket.setSoTimeout(5000);
-        if (socket instanceof SSLSocket secure) {
-            secure.startHandshake();
-        }
-        return socket;
-    }
-
-    private static URI endpoint(ServerSocket server, boolean tls) {
-        return tls ? URI.create("mqtts://localhost:" + server.getLocalPort()) : endpoint(server);
-    }
-
-    private static ServerSocket listen() throws Exception {
+    private static ServerSocket loopbackServer() throws IOException {
         var server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
         server.setSoTimeout(5000);
         return server;
     }
 
-    private static URI endpoint(ServerSocket server) {
-        return URI.create("mqtt://127.0.0.1:" + server.getLocalPort());
+    private record SocketPeerServer(ServerSocket server, URI endpoint) implements PeerServer {
+
+        @Override
+        public void receiveBufferSize(int bytes) throws IOException {
+            server.setReceiveBufferSize(bytes);
+        }
+
+        @Override
+        public Peer accept() throws IOException {
+            Socket socket = server.accept();
+            socket.setSoTimeout(5000);
+            if (socket instanceof SSLSocket secure) {
+                secure.startHandshake();
+            }
+            return new SocketPeer(socket);
+        }
+
+        @Override
+        public void close() throws IOException {
+            server.close();
+        }
+    }
+
+    private record SocketPeer(Socket socket) implements Peer {
+
+        @Override
+        public InputStream input() throws IOException {
+            return socket.getInputStream();
+        }
+
+        @Override
+        public OutputStream output() throws IOException {
+            return socket.getOutputStream();
+        }
+
+        @Override
+        public void shutdownOutput() throws IOException {
+            socket.shutdownOutput();
+        }
+
+        @Override
+        public boolean isClosed() {
+            return socket.isClosed();
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
+        }
     }
 
     private static final class Receiver implements Transport.Listener {
