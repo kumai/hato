@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<!-- Open the default listener, and announce smaller limits than the defaults. -->
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+    </listeners>
+    <mqtt>
+        <packets>
+            <max-packet-size>512</max-packet-size>
+        </packets>
+        <receive-maximum>
+            <server-receive-maximum>2</server-receive-maximum>
+        </receive-maximum>
+        <topic-alias>
+            <enabled>false</enabled>
+        </topic-alias>
+        <subscription-identifier>
+            <enabled>false</enabled>
+        </subscription-identifier>
+        <wildcard-subscriptions>
+            <enabled>false</enabled>
+        </wildcard-subscriptions>
+        <shared-subscriptions>
+            <enabled>false</enabled>
+        </shared-subscriptions>
+        <quality-of-service>
+            <max-qos>1</max-qos>
+        </quality-of-service>
+        <retained-messages>
+            <enabled>false</enabled>
+        </retained-messages>
+    </mqtt>
+</hivemq>

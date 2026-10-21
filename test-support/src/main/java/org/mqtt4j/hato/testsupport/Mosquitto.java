@@ -39,6 +39,19 @@ public final class Mosquitto {
                 .withExposedPorts(MQTT_PORT);
     }
 
+    /// Mosquitto on [#MQTT_PORT] that announces smaller limits than the defaults: Maximum QoS 1,
+    /// no retained messages, a Maximum Packet Size of 512 bytes, a Receive Maximum of 2, and no
+    /// Topic Aliases from clients. Mosquitto has no setting that withdraws wildcard
+    /// subscriptions, shared subscriptions, or Subscription Identifiers.
+    public static GenericContainer<?> restrictedContainer() {
+        return new GenericContainer<>(IMAGE)
+                .withCopyFileToContainer(
+                        MountableFile.forClasspathResource("mosquitto-restricted.conf"),
+                        CONFIGURATION
+                )
+                .withExposedPorts(MQTT_PORT);
+    }
+
     /// Mosquitto with only the TLS listeners [#MQTTS_PORT] and [#MUTUAL_TLS_PORT], which present
     /// the server identity of [Tls#serverContext()]. That certificate names `localhost` and no IP
     /// address, so clients that verify the host name must reach a Docker daemon on this machine
