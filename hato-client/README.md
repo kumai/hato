@@ -27,8 +27,11 @@ for your own CA or client certificate, and `sslParameters(parameters -> ...)` fo
 SNI, ALPN, or protocol settings.
 
 For MQTT over WebSocket, use a `ws` URI with the port and path of the broker's WebSocket
-listener, such as `ws://broker.example.com:8080/mqtt` (the default port is 80). The client
-uses the JDK's WebSocket client, and connects directly, without the JVM's HTTP proxy settings.
+listener, such as `ws://broker.example.com:8080/mqtt` (the default port is 80), or `wss` for
+WebSocket over TLS (the default port is 443). The client uses the JDK's WebSocket client, and
+connects directly, without the JVM's HTTP proxy settings. A `wss` connection takes the same
+`sslContext(context)` and always verifies the broker hostname; `build()` rejects TLS
+parameters that it cannot apply, such as ALPN.
 
 For username/password authentication, add
 `credentials(() -> MqttCredentials.of(username, passwordBytes))`. The password is

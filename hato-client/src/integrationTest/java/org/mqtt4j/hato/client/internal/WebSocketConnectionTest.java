@@ -12,7 +12,12 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
+import javax.net.ssl.ExtendedSSLSession;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLParameters;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -22,6 +27,7 @@ import org.mqtt4j.hato.client.internal.WebSocketPeer.Frame;
 import org.mqtt4j.hato.client.internal.common.io.FrameReader;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.testsupport.Tls;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -30,9 +36,9 @@ import static org.mqtt4j.hato.client.internal.WebSocketPeer.BINARY;
 import static org.mqtt4j.hato.client.internal.WebSocketPeer.CONTINUATION;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
-/// MQTT clients that connect with a `ws` URI, against the test WebSocket server acting as the
-/// broker: the handshake follows the URI, packets survive any split into frames, and the client's
-/// HttpClient ends with the client.
+/// MQTT clients that connect with a `ws` or `wss` URI, against the test WebSocket server acting as
+/// the broker: the handshake follows the URI, packets survive any split into frames, the client's
+/// HttpClient ends with the client, and `wss` uses the TLS parameters that the builder checked.
 @Timeout(30)
 class WebSocketConnectionTest {
 
@@ -254,6 +260,65 @@ class WebSocketConnectionTest {
                     System.setProperty(names.get(i), value);
                 }
             }
+        }
+    }
+
+    @Test
+    void a_wss_client_of_an_ip_address_uses_the_server_names_of_its_parameters()
+            throws Exception {
+        // Arrange: the certificate names test.hato.invalid and no IP address, so the client
+        // verifies it against the server name.
+        try (WebSocketPeer server = WebSocketPeer.listen(Tls.serverSocket());
+                MqttClient sut = MqttClient.builder()
+                        .server(URI.create("wss://127.0.0.1:" + server.port() + "/mqtt"))
+                        .sslContext(Tls.clientContext())
+                        .sslParameters(parameters -> parameters.setServerNames(
+                                List.of(new SNIHostName("test.hato.invalid"))
+                        ))
+                        .reconnectPolicy(ReconnectPolicy.disabled())
+                        .build()) {
+            // Act
+            try (Broker broker = connect(server, sut)) {
+                // Assert
+                var session = (ExtendedSSLSession) broker.connection().tlsSession();
+                assertThat(session.getRequestedServerNames())
+                        .containsExactly(new SNIHostName("test.hato.invalid"));
+            }
+        }
+    }
+
+    @Test
+    void wss_parameters_are_copied_at_build_and_reused_for_later_connections() throws Exception {
+        // Arrange: application code retains and then mutates the customizable JDK value before
+        // the first connection creates the client's HttpClient.
+        var customized = new AtomicReference<SSLParameters>();
+        var calls = new AtomicInteger();
+        ReconnectPolicy soon = ReconnectPolicy.exponentialBackoff(
+                Duration.ofMillis(10),
+                Duration.ofMillis(10)
+        );
+        try (WebSocketPeer server = WebSocketPeer.listen(Tls.serverSocket());
+                MqttClient sut = MqttClient.builder()
+                        .server(server.uri("/mqtt"))
+                        .sslContext(Tls.clientContext())
+                        .sslParameters(parameters -> {
+                            customized.set(parameters);
+                            calls.incrementAndGet();
+                        })
+                        .reconnectPolicy(soon)
+                        .build()) {
+            requireNonNull(customized.get()).setProtocols(new String[] {"invalid-protocol"});
+
+            // Act: the broker drops the first connection, and the client connects again.
+            try (Broker _ = connect(server, sut)) {
+                assertThat(calls).hasValue(1);
+            }
+            try (Broker broker = accept(server)) {
+                assertThat(broker.receive()).isInstanceOf(Packet.Connect.class);
+            }
+
+            // Assert: both connections used the checked copy, without another callback.
+            assertThat(calls).hasValue(1);
         }
     }
 

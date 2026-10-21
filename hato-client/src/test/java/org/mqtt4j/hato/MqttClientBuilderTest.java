@@ -9,8 +9,10 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
+import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 
@@ -49,7 +51,11 @@ class MqttClientBuilderTest {
             "ws://localhost",
             "ws://mqtt-broker:8080/mqtt",
             "ws://127.0.0.1/mqtt?tenant=a",
-            "ws://[::1]:8080/mqtt"
+            "ws://[::1]:8080/mqtt",
+            "wss://localhost",
+            "wss://mqtt-broker:8443/mqtt",
+            "wss://127.0.0.1/mqtt?tenant=a",
+            "wss://[::1]:8443/mqtt"
     })
     void supported_hosts_and_ip_literals_are_accepted(String uri) {
         // Arrange
@@ -85,7 +91,8 @@ class MqttClientBuilderTest {
             "mqtt://alice:p@ss@localhost, p@ss, mqtt://***@localhost",
             "mqtt://alice:s3cret@mqtt_broker:1883, s3cret, mqtt://***@mqtt_broker:1883",
             "mqtt:alice:s3cret@localhost, s3cret, mqtt:***@localhost",
-            "ws://alice:s3cret@localhost/mqtt, s3cret, ws://***@localhost/mqtt"
+            "ws://alice:s3cret@localhost/mqtt, s3cret, ws://***@localhost/mqtt",
+            "wss://alice:s3cret@localhost/mqtt, s3cret, wss://***@localhost/mqtt"
     })
     void rejection_messages_never_reveal_user_information(
             String uri,
@@ -152,11 +159,14 @@ class MqttClientBuilderTest {
             "mqtt://localhost#fragment",
             "mqtt:/",
             "WS://localhost/mqtt",
-            "wss://localhost/mqtt",
             "ws://localhost:0/mqtt",
             "ws://localhost:65536/mqtt",
             "ws://localhost/mqtt#fragment",
-            "ws:/mqtt"
+            "ws:/mqtt",
+            "WSS://localhost/mqtt",
+            "wss://localhost:65536/mqtt",
+            "wss://localhost/mqtt#fragment",
+            "wss:/mqtt"
     })
     void unsupported_or_ambiguous_uris_are_rejected(String uri) {
         // Arrange
@@ -453,15 +463,17 @@ class MqttClientBuilderTest {
                 .isInstanceOf(NullPointerException.class);
     }
 
-    @Test
-    void tls_uses_the_selected_context_defaults_with_hostname_verification() throws Exception {
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void tls_uses_the_selected_context_defaults_with_hostname_verification(String uri)
+            throws Exception {
         // Arrange
         SSLContext context = SSLContext.getInstance("TLSv1.2");
         context.init(null, null, null);
         SSLParameters defaults = context.getDefaultSSLParameters();
         var calls = new AtomicInteger();
         var customized = new ArrayList<SSLParameters>();
-        MqttClientBuilder sut = configuredTlsBuilder()
+        MqttClientBuilder sut = configuredBuilder(uri)
                 .sslContext(context)
                 .sslParameters(parameters -> {
                     assertThat(parameters.getEndpointIdentificationAlgorithm()).isEqualTo("HTTPS");
@@ -482,58 +494,150 @@ class MqttClientBuilderTest {
         assertThat(customized.get(0)).isNotSameAs(customized.get(1));
     }
 
-    @Test
-    void tls_defaults_do_not_require_an_explicit_context() {
-        assertThatCode(() -> configuredTlsBuilder().build().close()).doesNotThrowAnyException();
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void tls_defaults_do_not_require_an_explicit_context(String uri) {
+        assertThatCode(() -> configuredBuilder(uri).build().close()).doesNotThrowAnyException();
     }
 
     @Test
-    void hostname_verification_can_be_explicitly_disabled() {
+    void mqtts_hostname_verification_can_be_explicitly_disabled() {
         assertThatCode(() -> configuredTlsBuilder()
                 .sslParameters(parameters -> parameters.setEndpointIdentificationAlgorithm(null))
                 .build().close()).doesNotThrowAnyException();
     }
 
-    @Test
-    void plaintext_connections_reject_an_explicit_tls_context_at_build() throws Exception {
+    static Stream<Named<Consumer<SSLParameters>>> parametersThatWssCannotApply() {
+        return Stream.of(
+                Named.of(
+                        "disabled hostname verification",
+                        parameters -> parameters.setEndpointIdentificationAlgorithm(null)
+                ),
+                Named.of(
+                        "another endpoint identification",
+                        parameters -> parameters.setEndpointIdentificationAlgorithm("LDAPS")
+                ),
+                Named.of(
+                        "application protocols",
+                        parameters -> parameters.setApplicationProtocols(new String[] {"mqtt"})
+                ),
+                Named.of(
+                        "named groups",
+                        parameters -> parameters.setNamedGroups(new String[] {"x25519"})
+                ),
+                Named.of(
+                        "signature schemes",
+                        parameters -> parameters.setSignatureSchemes(
+                                new String[] {"ecdsa_secp256r1_sha256"}
+                        )
+                ),
+                Named.of(
+                        "server names for a host name",
+                        parameters -> parameters.setServerNames(
+                                List.of(new SNIHostName("test.hato.invalid"))
+                        )
+                ),
+                Named.of(
+                        "no server names for a host name",
+                        parameters -> parameters.setServerNames(List.of())
+                )
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("parametersThatWssCannotApply")
+    void wss_rejects_tls_parameters_that_it_cannot_apply(Consumer<SSLParameters> setting) {
+        // Arrange
+        MqttClientBuilder sut = configuredBuilder("wss://localhost/mqtt").sslParameters(setting);
+
+        // Act & Assert
+        assertThatThrownBy(sut::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageStartingWith("wss");
+    }
+
+    static Stream<Named<Consumer<SSLParameters>>> parametersThatWssApplies() {
+        return Stream.of(
+                Named.of(
+                        "protocols",
+                        parameters -> parameters.setProtocols(new String[] {"TLSv1.2"})
+                ),
+                Named.of(
+                        "cipher suites",
+                        parameters -> parameters.setCipherSuites(
+                                new String[] {"TLS_AES_128_GCM_SHA256"}
+                        )
+                ),
+                Named.of(
+                        "the HTTPS endpoint identification in lower case",
+                        parameters -> parameters.setEndpointIdentificationAlgorithm("https")
+                )
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("parametersThatWssApplies")
+    void wss_accepts_tls_parameters_that_it_applies(Consumer<SSLParameters> setting) {
+        MqttClientBuilder sut = configuredBuilder("wss://localhost/mqtt").sslParameters(setting);
+
+        assertThatCode(() -> sut.build().close()).doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"wss://127.0.0.1/mqtt", "wss://[::1]/mqtt"})
+    void wss_accepts_server_names_for_an_ip_address_host(String uri) {
+        MqttClientBuilder sut = configuredBuilder(uri).sslParameters(parameters -> {
+            parameters.setServerNames(List.of(new SNIHostName("test.hato.invalid")));
+        });
+
+        assertThatCode(() -> sut.build().close()).doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtt://localhost", "ws://localhost/mqtt"})
+    void plaintext_connections_reject_an_explicit_tls_context_at_build(String uri)
+            throws Exception {
         SSLContext context = SSLContext.getDefault();
-        MqttClientBuilder sut = configuredBuilder().sslContext(context);
+        MqttClientBuilder sut = configuredBuilder(uri).sslContext(context);
 
         assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> MqttClient.builder()
                 .sslContext(context)
-                .server(URI.create("mqtt://localhost"))
+                .server(URI.create(uri))
                 .version(MqttVersion.V3_1_1)
                 .build()).isInstanceOf(IllegalArgumentException.class);
     }
 
-    @Test
-    void plaintext_connections_reject_a_tls_customizer_without_invoking_it() {
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtt://localhost", "ws://localhost/mqtt"})
+    void plaintext_connections_reject_a_tls_customizer_without_invoking_it(String uri) {
         var calls = new AtomicInteger();
-        MqttClientBuilder sut = configuredBuilder().sslParameters(_ -> calls.incrementAndGet());
+        MqttClientBuilder sut = configuredBuilder(uri).sslParameters(_ -> calls.incrementAndGet());
 
         assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
         assertThat(calls).hasValue(0);
     }
 
-    @Test
-    void custom_transports_reject_an_explicit_tls_context_at_build() throws Exception {
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void custom_transports_reject_an_explicit_tls_context_at_build(String uri) throws Exception {
         SSLContext context = SSLContext.getDefault();
-        MqttClientBuilder sut = configuredTlsBuilder()
+        MqttClientBuilder sut = configuredBuilder(uri)
                 .transportFactory(Transport::tcp)
                 .sslContext(context);
 
         assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> configuredTlsBuilder()
+        assertThatThrownBy(() -> configuredBuilder(uri)
                 .sslContext(context)
                 .transportFactory(Transport::tcp)
                 .build()).isInstanceOf(IllegalArgumentException.class);
     }
 
-    @Test
-    void custom_transports_reject_a_tls_customizer_without_invoking_it() {
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void custom_transports_reject_a_tls_customizer_without_invoking_it(String uri) {
         var calls = new AtomicInteger();
-        MqttClientBuilder sut = configuredTlsBuilder()
+        MqttClientBuilder sut = configuredBuilder(uri)
                 .sslParameters(_ -> calls.incrementAndGet())
                 .transportFactory(Transport::tcp);
 
@@ -541,42 +645,47 @@ class MqttClientBuilderTest {
         assertThat(calls).hasValue(0);
     }
 
-    @Test
-    void a_custom_transport_may_handle_tls_without_builder_tls_settings() {
-        assertThatCode(() -> configuredTlsBuilder()
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void a_custom_transport_may_handle_tls_without_builder_tls_settings(String uri) {
+        assertThatCode(() -> configuredBuilder(uri)
                 .transportFactory(Transport::tcp)
                 .build().close()).doesNotThrowAnyException();
     }
 
-    @Test
-    void unsupported_tls_protocols_are_rejected_at_build() {
-        MqttClientBuilder sut = configuredTlsBuilder()
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void unsupported_tls_protocols_are_rejected_at_build(String uri) {
+        MqttClientBuilder sut = configuredBuilder(uri)
                 .sslParameters(parameters -> parameters.setProtocols(new String[]{"invalid"}));
 
         assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
     }
 
-    @Test
-    void unsupported_tls_cipher_suites_are_rejected_at_build() {
-        MqttClientBuilder sut = configuredTlsBuilder()
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void unsupported_tls_cipher_suites_are_rejected_at_build(String uri) {
+        MqttClientBuilder sut = configuredBuilder(uri)
                 .sslParameters(parameters -> parameters.setCipherSuites(new String[]{"invalid"}));
 
         assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
     }
 
-    @Test
-    void an_uninitialized_tls_context_is_rejected_at_build() throws Exception {
-        MqttClientBuilder sut = configuredTlsBuilder().sslContext(SSLContext.getInstance("TLS"));
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void an_uninitialized_tls_context_is_rejected_at_build(String uri) throws Exception {
+        MqttClientBuilder sut = configuredBuilder(uri).sslContext(SSLContext.getInstance("TLS"));
 
         assertThatThrownBy(sut::build)
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasCauseInstanceOf(IllegalStateException.class);
     }
 
-    @Test
-    void a_customizer_failure_prevents_building_the_client() {
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"mqtts://localhost", "wss://localhost/mqtt"})
+    void a_customizer_failure_prevents_building_the_client(String uri) {
         var failure = new IllegalStateException("customization failed");
-        MqttClientBuilder sut = configuredTlsBuilder().sslParameters(_ -> {
+        MqttClientBuilder sut = configuredBuilder(uri).sslParameters(_ -> {
             throw failure;
         });
 
@@ -593,7 +702,11 @@ class MqttClientBuilderTest {
     }
 
     private static MqttClientBuilder configuredTlsBuilder() {
-        return configuredBuilder().server(URI.create("mqtts://localhost"));
+        return configuredBuilder("mqtts://localhost");
+    }
+
+    private static MqttClientBuilder configuredBuilder(String uri) {
+        return configuredBuilder().server(URI.create(uri));
     }
 
     private static MqttClientBuilder configuredBuilder() {

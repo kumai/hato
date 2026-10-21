@@ -2,10 +2,12 @@ package org.mqtt4j.hato;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -107,14 +109,15 @@ public final class MqttClientBuilder {
     MqttClientBuilder() {
     }
 
-    /// A required broker URI using `mqtt` for TCP, `mqtts` for TLS over TCP, or `ws` for
-    /// WebSocket. The default ports are 1883, 8883, and 80, respectively; a broker's WebSocket
-    /// listener often has its own port and path, such as `ws://broker.example.com:8080/mqtt`.
-    /// A `ws` URI keeps its path and query for the opening handshake, and connects directly,
-    /// without a proxy that the JVM configures for HTTP. Hosts must satisfy
-    /// [URI#parseServerAuthority]; names containing underscores are rejected. Schemes must be in
-    /// lower case. User information and fragments are not accepted, nor are paths and queries
-    /// for `mqtt` and `mqtts`. Rejection messages hide any user information in the given URI.
+    /// A required broker URI using `mqtt` for TCP, `mqtts` for TLS over TCP, `ws` for WebSocket,
+    /// or `wss` for WebSocket over TLS. The default ports are 1883, 8883, 80, and 443,
+    /// respectively; a broker's WebSocket listener often has its own port and path, such as
+    /// `ws://broker.example.com:8080/mqtt`. A `ws` or `wss` URI keeps its path and query for the
+    /// opening handshake, and connects directly, without a proxy that the JVM configures for
+    /// HTTP. Hosts must satisfy [URI#parseServerAuthority]; names containing underscores are
+    /// rejected. Schemes must be in lower case. User information and fragments are not accepted,
+    /// nor are paths and queries for `mqtt` and `mqtts`. Rejection messages hide any user
+    /// information in the given URI.
     public MqttClientBuilder server(URI value) {
         requireNonNull(value, "server");
         try {
@@ -124,7 +127,7 @@ public final class MqttClientBuilder {
             throw new IllegalArgumentException(failure.getReason() + ": " + redactUserInfo(value));
         }
         boolean tcp = "mqtt".equals(value.getScheme()) || "mqtts".equals(value.getScheme());
-        boolean webSocket = "ws".equals(value.getScheme());
+        boolean webSocket = "ws".equals(value.getScheme()) || "wss".equals(value.getScheme());
         if ((!tcp && !webSocket)
             || value.getHost() == null
             || value.getRawUserInfo() != null
@@ -135,8 +138,9 @@ public final class MqttClientBuilder {
             || value.getPort() > MAX_PORT
         ) {
             throw new IllegalArgumentException(
-                    "Expected mqtt://host[:port], mqtts://host[:port], or"
-                            + " ws://host[:port][/path][?query]: " + redactUserInfo(value)
+                    "Expected mqtt://host[:port], mqtts://host[:port],"
+                            + " ws://host[:port][/path][?query], or"
+                            + " wss://host[:port][/path][?query]: " + redactUserInfo(value)
             );
         }
         server = value;
@@ -334,9 +338,11 @@ public final class MqttClientBuilder {
 
     /// Supplies monotonic time and delayed callbacks. Defaults to a shared daemon timer with
     /// [System#nanoTime]. The scheduler is borrowed and is not closed with the client.
-    /// The default TCP and TLS transports use it for the connection and TLS handshake
-    /// deadlines and TLS close-notify grace period. JDK socket connection and name resolution
-    /// waits still use real time. Custom transports manage their own clocks.
+    /// The default transports use it for connection deadlines, including the TLS handshake and
+    /// the WebSocket opening handshake, and for the grace periods of TLS close-notify and the
+    /// WebSocket closing handshake. JDK socket connection and name resolution waits, and the JDK's
+    /// own deadline for the WebSocket opening handshake, still use real time. Custom transports
+    /// manage their own clocks.
     public MqttClientBuilder timerScheduler(TimerScheduler value) {
         scheduler = requireNonNull(value, "timerScheduler");
         return this;
@@ -349,11 +355,11 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Supplies the TLS context for an `mqtts` connection, including trust and client keys.
-    /// If omitted, [#build()] obtains [SSLContext#getDefault()] once. The same context is
+    /// Supplies the TLS context for an `mqtts` or `wss` connection, including trust and client
+    /// keys. If omitted, [#build()] obtains [SSLContext#getDefault()] once. The same context is
     /// reused across connection attempts. Initialize it before building and do not reinitialize
-    /// it while the client is in use. Explicit TLS settings require `mqtts` and cannot be
-    /// combined with [#transportFactory(Transport.Factory)].
+    /// it while the client is in use. Explicit TLS settings require `mqtts` or `wss` and cannot
+    /// be combined with [#transportFactory(Transport.Factory)].
     public MqttClientBuilder sslContext(SSLContext value) {
         sslContext = requireNonNull(value, "sslContext");
         return this;
@@ -361,16 +367,25 @@ public final class MqttClientBuilder {
 
     /// Customizes TLS parameters once per [#build()], starting with the selected context's
     /// defaults and endpoint identification set to `"HTTPS"` for hostname verification.
-    /// Setting the endpoint identification algorithm to `null` explicitly disables verification.
-    /// The parameters are validated during [#build()], and a detached snapshot is used
-    /// for every connection. Custom algorithm constraints and SNI matchers remain shared;
+    /// For `mqtts`, setting the endpoint identification algorithm to `null` explicitly disables
+    /// verification. The parameters are validated during [#build()], and a detached snapshot is
+    /// used for every connection. Custom algorithm constraints and SNI matchers remain shared;
     /// do not mutate those objects while the client is in use.
     /// A later call replaces the customizer.
-    /// Explicit TLS settings require `mqtts` and cannot be combined with
+    /// Explicit TLS settings require `mqtts` or `wss` and cannot be combined with
     /// [#transportFactory(Transport.Factory)].
     ///
-    /// For AWS IoT Core with X.509 client authentication on port 443, configure the client keys
-    /// in [#sslContext(SSLContext)] and set ALPN with:
+    /// A `wss` connection goes through the JDK's HTTP client, which applies only part of the
+    /// parameters: it always verifies the hostname, uses no ALPN, and keeps the context's named
+    /// groups and signature schemes. Its SNI is the URI's host name; only for an IP address host
+    /// does it use the server names of the parameters, for both SNI and hostname verification.
+    /// For `wss`, [#build()] therefore rejects parameters that change the endpoint
+    /// identification algorithm, set application protocols, change the named groups or
+    /// signature schemes, or set server names for a host name. The context, the protocols, and
+    /// the cipher suites apply to both `mqtts` and `wss`.
+    ///
+    /// For AWS IoT Core with X.509 client authentication on port 443, use `mqtts`, configure the
+    /// client keys in [#sslContext(SSLContext)], and set ALPN with:
     /// ```java
     /// builder.sslParameters(parameters ->
     ///         parameters.setApplicationProtocols(new String[]{"x-amzn-mqtt-ca"}));
@@ -382,7 +397,8 @@ public final class MqttClientBuilder {
 
     /// Supplies a fresh transport for each connection; an MQTT 3.1.1 attempt that replaces a
     /// broker session, as [MqttClient#connect()] describes, opens several. Defaults to TCP for
-    /// `mqtt` and TLS over TCP for `mqtts`. The client owns and closes the returned transports.
+    /// `mqtt`, TLS over TCP for `mqtts`, and the JDK's WebSocket client for `ws` and `wss`. The
+    /// client owns and closes the returned transports.
     /// An explicit factory cannot be combined with [#sslContext(SSLContext)] or
     /// [#sslParameters(Consumer)]. The factory's transports must reject unsupported URI schemes.
     public MqttClientBuilder transportFactory(Transport.Factory value) {
@@ -403,11 +419,11 @@ public final class MqttClientBuilder {
         if (endpoint == null) {
             throw new IllegalStateException("Server must be specified");
         }
-        boolean tls = "mqtts".equals(endpoint.getScheme());
+        boolean tls = "mqtts".equals(endpoint.getScheme()) || "wss".equals(endpoint.getScheme());
         Transport.Factory factory = transportFactory;
         if ((sslContext != null || sslParameters != null) && (!tls || factory != null)) {
             throw new IllegalArgumentException(
-                    "TLS settings require mqtts and the default transport factory"
+                    "TLS settings require mqtts or wss and the default transport factory"
             );
         }
         if (!sessionExpiry.isZero()
@@ -438,8 +454,22 @@ public final class MqttClientBuilder {
         TimerScheduler timer = scheduler;
         if (factory == null) {
             factory = switch (requireNonNull(endpoint.getScheme())) {
-                case "mqtts" -> tlsTransportFactory(timer);
+                case "mqtts" -> {
+                    SSLContext context = tlsContext();
+                    SSLParameters parameters = tlsParameters(context);
+                    yield value -> new TcpTransport(value, context, parameters, timer);
+                }
                 case "ws" -> new WebSocketTransports(id, timer);
+                case "wss" -> {
+                    SSLContext context = tlsContext();
+                    SSLParameters parameters = tlsParameters(context);
+                    requireEffectiveOverWebSocket(
+                            parameters,
+                            defaultParameters(context),
+                            endpoint.getHost()
+                    );
+                    yield new WebSocketTransports(id, timer, context, parameters);
+                }
                 default -> value -> new TcpTransport(value, timer);
             };
         }
@@ -493,23 +523,69 @@ public final class MqttClientBuilder {
         );
     }
 
-    private Transport.Factory tlsTransportFactory(TimerScheduler timer) {
+    // The context of every TLS connection of the client.
+    private SSLContext tlsContext() {
         try {
-            SSLContext context = sslContext != null ? sslContext : SSLContext.getDefault();
-            SSLParameters parameters = defaultParameters(context);
-            parameters.setEndpointIdentificationAlgorithm("HTTPS");
-            if (sslParameters != null) {
-                sslParameters.accept(parameters);
-            }
-            // A fresh socket preserves an explicit null endpoint algorithm. Reading back its
-            // parameters also detaches the configuration from the customizer's mutable object.
-            try (var socket = (SSLSocket) context.getSocketFactory().createSocket()) {
-                socket.setSSLParameters(parameters);
-                SSLParameters snapshot = socket.getSSLParameters();
-                return id -> new TcpTransport(id, context, snapshot, timer);
-            }
-        } catch (IOException | NoSuchAlgorithmException failure) {
+            return sslContext != null ? sslContext : SSLContext.getDefault();
+        } catch (NoSuchAlgorithmException failure) {
             throw new IllegalArgumentException("Cannot initialize TLS configuration", failure);
+        }
+    }
+
+    // The customized parameters of every TLS connection of the client, checked on a socket.
+    private SSLParameters tlsParameters(SSLContext context) {
+        SSLParameters parameters = defaultParameters(context);
+        parameters.setEndpointIdentificationAlgorithm("HTTPS");
+        if (sslParameters != null) {
+            sslParameters.accept(parameters);
+        }
+        // A fresh socket preserves an explicit null endpoint algorithm. Reading back its
+        // parameters also detaches the configuration from the customizer's mutable object.
+        try (var socket = (SSLSocket) context.getSocketFactory().createSocket()) {
+            socket.setSSLParameters(parameters);
+            return socket.getSSLParameters();
+        } catch (IOException failure) {
+            throw new IllegalArgumentException("Cannot initialize TLS configuration", failure);
+        }
+    }
+
+    /// HttpClient, which carries `wss`, copies only part of the parameters to each connection:
+    /// it always verifies the hostname, sets no ALPN, keeps the context's named groups and
+    /// signature schemes, and sends a host name for SNI rather than the server names of the
+    /// parameters. Parameters that it would ignore are rejected rather than dropped.
+    private static void requireEffectiveOverWebSocket(
+            SSLParameters parameters,
+            SSLParameters defaults,
+            String host
+    ) {
+        if (!"HTTPS".equalsIgnoreCase(parameters.getEndpointIdentificationAlgorithm())) {
+            throw new IllegalArgumentException(
+                    "wss always verifies the hostname, so endpoint identification must stay HTTPS"
+            );
+        }
+        if (parameters.getApplicationProtocols().length > 0) {
+            throw new IllegalArgumentException("wss cannot set application protocols (ALPN)");
+        }
+        if (!Arrays.equals(parameters.getNamedGroups(), defaults.getNamedGroups())) {
+            throw new IllegalArgumentException("wss cannot change the context's named groups");
+        }
+        if (!Arrays.equals(parameters.getSignatureSchemes(), defaults.getSignatureSchemes())) {
+            throw new IllegalArgumentException("wss cannot change the context's signature schemes");
+        }
+        if (parameters.getServerNames() != null && !ipAddress(host)) {
+            throw new IllegalArgumentException(
+                    "wss sends the host name for SNI, so server names need an IP address host"
+            );
+        }
+    }
+
+    // Whether HttpClient treats `host` as an IP address, without resolving a name.
+    private static boolean ipAddress(String host) {
+        try {
+            InetAddress _ = InetAddress.ofLiteral(host);
+            return true;
+        } catch (IllegalArgumentException _) {
+            return false;
         }
     }
 
