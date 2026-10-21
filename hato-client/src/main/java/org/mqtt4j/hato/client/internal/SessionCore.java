@@ -320,7 +320,8 @@ final class SessionCore {
             boolean credentialsRequired,
             ReconnectBackoff backoff,
             RetryRules rules,
-            Duration responseTimeout
+            Duration responseTimeout,
+            ClientLimits limits
     ) {
         this.port = port;
         this.clientId = clientId;
@@ -341,13 +342,20 @@ final class SessionCore {
         );
         var context = new PartContext();
         receptions = new Receptions(port, context, clientId, version == MqttVersion.V5);
-        subscriptions = new Subscriptions(port, context, clientId, cleanStart);
+        subscriptions = new Subscriptions(
+                port,
+                context,
+                clientId,
+                cleanStart,
+                limits.subscriptions()
+        );
         publications = new Publications(
                 port,
                 context,
                 clientId,
                 cleanStart,
-                PacketCodec.of(version)
+                PacketCodec.of(version),
+                limits.inflightPublishes()
         );
     }
 

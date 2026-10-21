@@ -874,7 +874,8 @@ class BrokerSessionReplacementTest {
                 credentialsRequired,
                 backoff,
                 initialRetry ? RetryRules.DEFAULT.withInitialRetry() : RetryRules.DEFAULT,
-                Duration.ofSeconds(60)
+                Duration.ofSeconds(60),
+                ClientLimits.DEFAULT
         );
     }
 

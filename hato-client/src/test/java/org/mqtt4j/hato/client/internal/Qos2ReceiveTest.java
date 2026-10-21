@@ -51,7 +51,8 @@ class Qos2ReceiveTest {
             false,
             ReconnectBackoff.disabled(),
             RetryRules.DEFAULT,
-            Duration.ofSeconds(60)
+            Duration.ofSeconds(60),
+            ClientLimits.DEFAULT
     );
     private long nextOperation;
     private long generation;

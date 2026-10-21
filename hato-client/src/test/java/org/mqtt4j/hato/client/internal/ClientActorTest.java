@@ -2897,6 +2897,211 @@ class ClientActorTest {
     }
 
     @Test
+    void one_unfinished_publish_leaves_room_for_qos_0_subscriptions_and_control()
+            throws Exception {
+        // Arrange: the client admits one unfinished exchange, which the broker never answers.
+        try (MqttClient sut = client(new ClientLimits(1, 256))) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<PublishResult> _ = sut.publish(
+                    message(new byte[0]).withQos(Qos.AT_LEAST_ONCE)
+            );
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+
+            // Act & Assert: a second exchange finds no room.
+            assertThatThrownBy(() -> sut.publish(
+                    message(new byte[0]).withQos(Qos.AT_LEAST_ONCE)
+            ).get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttCapacityException.class)
+                    .hasRootCauseMessage("Publication capacity");
+
+            // Act & Assert: QoS 0 publications at once, a subscription, its removal, and the
+            // disconnection all proceed.
+            var publications = new ArrayList<CompletableFuture<PublishResult>>();
+            for (int i = 0; i < 32; i++) {
+                publications.add(sut.publish(message(new byte[] {(byte) i})));
+            }
+            CompletableFuture.allOf(publications.toArray(CompletableFuture[]::new))
+                    .get(5, SECONDS);
+            for (int i = 0; i < 32; i++) {
+                assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            }
+            Subscription subscription = subscribe(sut, transport);
+            CompletableFuture<Void> unsubscribing = subscription.unsubscribe();
+            var removal = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY));
+            unsubscribing.get(5, SECONDS);
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+        }
+    }
+
+    @Test
+    void a_large_inflight_limit_fits_the_write_completions_of_a_full_send_queue()
+            throws Exception {
+        // Arrange: a thousand QoS 1 publications queue behind a write that does not complete.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient client = client(new ClientLimits(1000, 256))) {
+            var sut = (ClientActor) client;
+            ScriptTransport transport = connect(sut);
+            transport.completeSends = false;
+            var publications = new ArrayList<CompletableFuture<PublishResult>>();
+            for (int i = 0; i < 1000; i++) {
+                publications.add(sut.publish(message(new byte[] {1}).withQos(Qos.AT_LEAST_ONCE)));
+            }
+            await().untilAsserted(() -> assertThat(sut.usage().sends()).isEqualTo(1000));
+            holdActor(transport, entered, release);
+
+            // Act: every write completes while the actor is held, so that each completion
+            // waits for it as a control event.
+            transport.completeSends = true;
+            transport.completeSend();
+            await().untilAsserted(() -> assertThat(sut.usage().sends()).isZero());
+            release.countDown();
+
+            // Assert: the connection lasts, and the broker's acknowledgements complete them all.
+            List<Packet.Publish> sent = transport.sent.stream()
+                    .filter(Packet.Publish.class::isInstance)
+                    .map(Packet.Publish.class::cast)
+                    .toList();
+            assertThat(sent).hasSize(1000);
+            for (Packet.Publish publish : sent) {
+                transport.receive(new Packet.PubAck(publish.packetId(), ReasonCode.SUCCESS, EMPTY));
+            }
+            CompletableFuture.allOf(publications.toArray(CompletableFuture[]::new))
+                    .get(5, SECONDS);
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void the_subscription_limit_counts_registrations_and_lanes_that_handlers_still_hold()
+            throws Exception {
+        // Arrange: a client that holds two subscriptions, one of them a push subscription whose
+        // handler blocks.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient client = client(new ClientLimits(64, 2))) {
+            var sut = (ClientActor) client;
+            ScriptTransport transport = connect(sut);
+            subscribePull(sut, transport, Subscribe.of(new TopicFilter("pull"), Qos.AT_MOST_ONCE));
+            Subscription push = sut.subscribe(
+                    Subscribe.of(new TopicFilter("push"), Qos.AT_MOST_ONCE),
+                    _ -> {
+                        entered.countDown();
+                        waitFor(release);
+                    }
+            );
+            establish(transport, push);
+
+            // Act & Assert: a third registration exceeds the limit.
+            assertThatThrownBy(() -> sut.subscribe(request()).established().get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttCapacityException.class)
+                    .hasRootCauseMessage("Subscription capacity");
+
+            // Act & Assert: the removed push subscription's lane still counts while its handler
+            // runs, and stops counting when the handler returns.
+            transport.receive(new Packet.Publish(
+                    new Topic("push"),
+                    new byte[0],
+                    Qos.AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    EMPTY
+            ));
+            assertThat(entered.await(5, SECONDS)).isTrue();
+            CompletableFuture<Void> unsubscribing = push.unsubscribe();
+            var removal = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
+            transport.receive(new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY));
+            unsubscribing.get(5, SECONDS);
+            assertThat(sut.usage().lanes()).isEqualTo(2);
+            assertThatThrownBy(() -> sut.subscribe(request()).established().get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttCapacityException.class)
+                    .hasRootCauseMessage("Subscription capacity");
+            release.countDown();
+            await().pollInterval(Duration.ofMillis(1))
+                    .untilAsserted(() -> assertThat(sut.usage().lanes()).isEqualTo(1));
+            assertThat(subscribePull(sut, transport, request())).isNotNull();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void registrations_awaiting_the_brokers_removal_count_toward_the_subscription_limit()
+            throws Exception {
+        // Arrange: a client that holds two subscriptions closes both, which releases their
+        // lanes, and the broker has not confirmed their removal yet.
+        try (MqttClient client = client(new ClientLimits(64, 2))) {
+            var sut = (ClientActor) client;
+            ScriptTransport transport = connect(sut);
+            Subscription first = subscribePull(
+                    sut,
+                    transport,
+                    Subscribe.of(new TopicFilter("a"), Qos.AT_MOST_ONCE)
+            );
+            Subscription second = subscribePull(
+                    sut,
+                    transport,
+                    Subscribe.of(new TopicFilter("b"), Qos.AT_MOST_ONCE)
+            );
+            first.close();
+            second.close();
+            var removals = new ArrayList<Packet.Unsubscribe>();
+            for (int i = 0; i < 2; i++) {
+                removals.add((Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS)));
+            }
+            await().untilAsserted(() -> assertThat(sut.usage().lanes()).isZero());
+
+            // Act & Assert: the closed registrations still fill the limit.
+            assertThatThrownBy(() -> sut.subscribe(request()).established().get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttCapacityException.class)
+                    .hasRootCauseMessage("Subscription capacity");
+
+            // Act & Assert: the broker's confirmations free them.
+            for (Packet.Unsubscribe removal : removals) {
+                transport.receive(new Packet.UnsubAck(removal.packetId(), List.of(), EMPTY));
+            }
+            assertThat(subscribePull(sut, transport, request())).isNotNull();
+        }
+    }
+
+    @Test
+    void registrations_queued_for_a_held_actor_stay_within_the_subscription_limit()
+            throws Exception {
+        // Arrange: the actor is held, so registrations wait for it in the mailbox.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client(new ClientLimits(64, 2))) {
+            ScriptTransport transport = connect(sut);
+            holdActor(transport, entered, release);
+
+            // Act
+            Subscription first = sut.subscribe(
+                    Subscribe.of(new TopicFilter("a"), Qos.AT_MOST_ONCE)
+            );
+            Subscription second = sut.subscribe(
+                    Subscribe.of(new TopicFilter("b"), Qos.AT_MOST_ONCE)
+            );
+            Subscription third = sut.subscribe(
+                    Subscribe.of(new TopicFilter("c"), Qos.AT_MOST_ONCE)
+            );
+
+            // Assert: the third ends at once; the first two wait for the actor.
+            assertThatThrownBy(() -> third.established().get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttCapacityException.class)
+                    .hasRootCauseMessage("Registration mailbox capacity");
+            assertThat(first.established()).isNotDone();
+            assertThat(second.established()).isNotDone();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void a_registration_refused_by_the_lanes_leaves_its_filter_available()
             throws Exception {
         // Arrange: an unsubscribed push lane stays retained while its handler runs, so 256 lanes
@@ -8603,6 +8808,19 @@ class ClientActorTest {
         );
     }
 
+    /// A client like [#client()] whose capacity follows `limits`.
+    private MqttClient client(ClientLimits limits) {
+        return client(
+                "actor-test",
+                ends::add,
+                16 * 1024 * 1024,
+                codec,
+                true,
+                MqttVersion.V3_1_1,
+                limits
+        );
+    }
+
     private MqttClient client(
             String clientId,
             ConnectionListener listener,
@@ -8610,6 +8828,26 @@ class ClientActorTest {
             PacketCodec packetCodec,
             boolean cleanStart,
             MqttVersion version
+    ) {
+        return client(
+                clientId,
+                listener,
+                maxPacketSize,
+                packetCodec,
+                cleanStart,
+                version,
+                ClientLimits.DEFAULT
+        );
+    }
+
+    private MqttClient client(
+            String clientId,
+            ConnectionListener listener,
+            int maxPacketSize,
+            PacketCodec packetCodec,
+            boolean cleanStart,
+            MqttVersion version,
+            ClientLimits limits
     ) {
         var clock = new TimerScheduler() {
             private volatile @Nullable Thread actor;
@@ -8652,7 +8890,8 @@ class ClientActorTest {
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
-                DeliveryOptionsAccess::execution
+                DeliveryOptionsAccess::execution,
+                limits
         );
     }
 

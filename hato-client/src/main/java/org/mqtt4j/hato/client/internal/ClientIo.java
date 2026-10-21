@@ -59,14 +59,12 @@ final class ClientIo {
 
     private static final Log log = Log.of(ClientIo.class);
 
-    private static final int REGULAR_SEND_LIMIT = 128;
-
     private static final int REGULAR_SEND_BYTE_LIMIT = 16 * 1024 * 1024;
 
     // PUBLISH must not consume the capacity needed to finish protocol exchanges. MQTT 3.1.1
     // PUBACK/PUBREC/PUBREL/PUBCOMP each use four bytes; the core defers them when this budget is
     // full and resumes on returned capacity, so a whole inflight window need not fit at once.
-    private static final int RESERVED_SEND_LIMIT = 16;
+    static final int RESERVED_SEND_LIMIT = 16;
 
     private static final int RESERVED_SEND_BYTE_LIMIT = 1024 * 1024;
 
@@ -89,12 +87,7 @@ final class ClientIo {
 
     private final PacketCodec codec;
 
-    private final SendQueue.Budget budget = new SendQueue.Budget(
-            REGULAR_SEND_LIMIT,
-            REGULAR_SEND_BYTE_LIMIT,
-            RESERVED_SEND_LIMIT,
-            RESERVED_SEND_BYTE_LIMIT
-    );
+    private final SendQueue.Budget budget;
 
     // Guards current, shutdown, and each Connection's mutable state. Never call Transport while
     // holding this monitor: its callbacks may acquire it inline.
@@ -118,6 +111,7 @@ final class ClientIo {
             URI endpoint,
             String clientId,
             int maxPacketSize,
+            int regularSendLimit,
             Transport.Factory factory,
             Events events,
             PacketCodec codec
@@ -128,6 +122,12 @@ final class ClientIo {
         this.factory = factory;
         this.events = events;
         this.codec = codec;
+        budget = new SendQueue.Budget(
+                regularSendLimit,
+                REGULAR_SEND_BYTE_LIMIT,
+                RESERVED_SEND_LIMIT,
+                RESERVED_SEND_BYTE_LIMIT
+        );
         Thread.ofVirtual().name("hato-" + clientId + "-sender").start(this::run);
     }
 

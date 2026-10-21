@@ -1161,7 +1161,7 @@ class DeliveryLanesTest {
     @Test
     void a_failure_after_connection_end_keeps_its_origin_and_resumes_the_lane() throws Exception {
         // Arrange: the handler outlives the connection that received its QoS 1 delivery.
-        var mailbox = new Mailbox(1, 10, 1, 10, 1);
+        var mailbox = new Mailbox(1, 10, 256, 1, 10, 1);
         mailbox.activate(7);
         DeliveryLanes sut = lanes(BYTE_LIMIT, () -> { }, (token, cause) -> {
             failures.add(new Failure(token, cause));
@@ -2631,6 +2631,7 @@ class DeliveryLanesTest {
         var manager = new DeliveryLanes(
                 "lane-test",
                 byteLimit,
+                256,
                 onFailure,
                 overloads::add,
                 onReady,

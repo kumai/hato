@@ -46,11 +46,6 @@ final class Subscriptions {
 
     private static final Log log = Log.of(Subscriptions.class);
 
-    // Broker registrations outlive locally closed handles until UNSUBACK or a CONNACK without
-    // Session Present, so they are bounded apart from the delivery lanes that local closure
-    // releases. The mailbox bounds registrations still queued for the actor by the same limit.
-    static final int REGISTRATION_LIMIT = 256;
-
     // Removals use no operation slots. Bound their exchanges so a batch of closures cannot
     // flood the actor with send completions and UNSUBACKs.
     private static final int CLOSE_INFLIGHT_LIMIT = 16;
@@ -70,6 +65,11 @@ final class Subscriptions {
 
     private final boolean cleanStart;
 
+    // Broker registrations outlive locally closed handles until UNSUBACK or a CONNACK without
+    // Session Present, so they are bounded apart from the delivery lanes that local closure
+    // releases. The mailbox bounds registrations still queued for the actor by the same limit.
+    private final int registrationLimit;
+
     // The client's registrations by id, in registration order.
     private final Map<Long, LocalSubscription> registry = new LinkedHashMap<>();
 
@@ -83,12 +83,14 @@ final class Subscriptions {
             SessionCore.Port port,
             SessionCore.Context core,
             String clientId,
-            boolean cleanStart
+            boolean cleanStart,
+            int registrationLimit
     ) {
         this.port = port;
         this.core = core;
         this.clientId = clientId;
         this.cleanStart = cleanStart;
+        this.registrationLimit = registrationLimit;
     }
 
     void subscribe(long operation, Subscribe request) {
@@ -119,7 +121,7 @@ final class Subscriptions {
             ));
             return;
         }
-        if (registry.size() >= REGISTRATION_LIMIT) {
+        if (registry.size() >= registrationLimit) {
             port.complete(operation, null, new MqttCapacityException("Subscription capacity"));
             return;
         }

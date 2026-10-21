@@ -87,7 +87,8 @@ class SessionCoreTest {
             false,
             ReconnectBackoff.disabled(),
             RetryRules.DEFAULT,
-            Duration.ofSeconds(60)
+            Duration.ofSeconds(60),
+            ClientLimits.DEFAULT
     );
 
     // The time that interleaved chains pass to the core. Only the keep-alive step advances it,
@@ -2706,6 +2707,42 @@ class SessionCoreTest {
                 .isInstanceOf(MqttCapacityException.class);
     }
 
+    @ParameterizedTest(name = "limit {0}")
+    @ValueSource(ints = {1, 3, 100})
+    void a_session_admits_as_many_unfinished_publications_as_its_limit(int limit) {
+        // Arrange: the broker announces no Receive Maximum, so every admitted publication is sent.
+        SessionCore mqtt5 = connectedMqtt5(new ClientLimits(limit, 256));
+        for (int i = 0; i < limit; i++) {
+            mqtt5.publish(2 + i, qosOneMessage());
+        }
+
+        // Act
+        mqtt5.publish(2 + limit, qosOneMessage());
+
+        // Assert
+        assertThat(port.publications).hasSize(limit);
+        assertThat(requireNonNull(port.results.get(2L + limit)).failure())
+                .isInstanceOf(MqttCapacityException.class);
+    }
+
+    @Test
+    void a_receive_maximum_below_the_limit_holds_admitted_publications_back() {
+        // Arrange: the session admits five unfinished publications, and the broker takes two.
+        SessionCore mqtt5 = connectedMqtt5(new ClientLimits(5, 256), receiveMaximum(2));
+        for (int i = 0; i < 5; i++) {
+            mqtt5.publish(2 + i, qosOneMessage());
+        }
+
+        // Act
+        mqtt5.publish(7, qosOneMessage());
+
+        // Assert: two are sent and three wait, while a sixth exceeds the limit.
+        assertThat(port.publications).hasSize(2);
+        assertThat(port.results).doesNotContainKeys(2L, 3L, 4L, 5L, 6L);
+        assertThat(requireNonNull(port.results.get(7L)).failure())
+                .isInstanceOf(MqttCapacityException.class);
+    }
+
     @Test
     void a_clean_session_counts_waiting_publications_toward_the_byte_budget_until_sent() {
         // Arrange: the first publication is sent, and the next two wait with 32 MiB in all.
@@ -4712,6 +4749,11 @@ class SessionCoreTest {
 
     /// An MQTT 5.0 core like `sut`, with `sessionExpiry` and a packet limit of 1 KiB.
     private SessionCore mqtt5Core(Duration sessionExpiry) {
+        return mqtt5Core(sessionExpiry, ClientLimits.DEFAULT);
+    }
+
+    /// An MQTT 5.0 core like [#mqtt5Core(Duration)], whose capacity follows `limits`.
+    private SessionCore mqtt5Core(Duration sessionExpiry, ClientLimits limits) {
         return new SessionCore(
                 port,
                 "client",
@@ -4724,13 +4766,20 @@ class SessionCoreTest {
                 false,
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
-                Duration.ofSeconds(60)
+                Duration.ofSeconds(60),
+                limits
         );
     }
 
     /// An MQTT 5.0 core like `sut` whose first connection is established.
     private SessionCore connectedMqtt5(Property... limits) {
-        SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
+        return connectedMqtt5(ClientLimits.DEFAULT, limits);
+    }
+
+    /// An MQTT 5.0 core like `sut`, with `clientLimits`, whose first connection is established
+    /// with the broker's `limits`.
+    private SessionCore connectedMqtt5(ClientLimits clientLimits, Property... limits) {
+        SessionCore mqtt5 = mqtt5Core(Duration.ZERO, clientLimits);
         mqtt5.connect(attempt(1), 0);
         mqtt5.opened(1);
         mqtt5.received(1, connAck(limits), 0, 0);
@@ -4789,7 +4838,8 @@ class SessionCoreTest {
                 true,
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
-                Duration.ofSeconds(60)
+                Duration.ofSeconds(60),
+                ClientLimits.DEFAULT
         );
     }
 

@@ -334,6 +334,7 @@ class DeliveryMeasurementTest {
         var lanes = new DeliveryLanes(
                 "measure",
                 Long.MAX_VALUE,
+                256,
                 (_, _) -> true,
                 _ -> { },
                 () -> { },

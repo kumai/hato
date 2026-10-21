@@ -52,8 +52,6 @@ final class DeliveryLanes {
 
     private static final Log log = Log.of(DeliveryLanes.class);
 
-    private static final int LANE_LIMIT = 256;
-
     // Bounds per-delivery overhead across all subscriptions (about 240 bytes each when measured);
     // the byte limit bounds payloads. Keep it high enough not to override a subscription's own
     // buffer capacity in ordinary use.
@@ -74,6 +72,9 @@ final class DeliveryLanes {
     private final String clientId;
 
     private final long byteLimit;
+
+    // The lanes that may be retained, including stopped lanes whose handlers have not returned.
+    private final int laneLimit;
 
     // True when the failure ends the current connection or the client; the lane then runs
     // nothing more until connection cleanup or removal. An old receipt returns false.
@@ -126,6 +127,7 @@ final class DeliveryLanes {
     DeliveryLanes(
             String clientId,
             long byteLimit,
+            int laneLimit,
             BiPredicate<DeliveryToken, Throwable> onFailure,
             Consumer<DeliveryToken> onOverload,
             Runnable onReady,
@@ -133,6 +135,7 @@ final class DeliveryLanes {
     ) {
         this.clientId = clientId;
         this.byteLimit = byteLimit;
+        this.laneLimit = laneLimit;
         this.onFailure = onFailure;
         this.onOverload = onOverload;
         this.onReady = onReady;
@@ -206,7 +209,7 @@ final class DeliveryLanes {
                 // A receiver ended before the actor admitted it stays ended, without a lane slot.
                 return true;
             }
-            if (retainedLanes >= LANE_LIMIT) {
+            if (retainedLanes >= laneLimit) {
                 return false;
             }
             if (lanes.containsKey(lane.id)) {

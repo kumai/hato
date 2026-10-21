@@ -72,6 +72,8 @@ final class Mailbox {
 
     private final long commandByteLimit;
 
+    private final int registrationLimit;
+
     private final int incomingLimit;
 
     private final long incomingByteLimit;
@@ -107,12 +109,14 @@ final class Mailbox {
     Mailbox(
             int commandLimit,
             long commandByteLimit,
+            int registrationLimit,
             int incomingLimit,
             long incomingByteLimit,
             int controlLimit
     ) {
         this.commandLimit = commandLimit;
         this.commandByteLimit = commandByteLimit;
+        this.registrationLimit = registrationLimit;
         this.incomingLimit = incomingLimit;
         this.incomingByteLimit = incomingByteLimit;
         this.controlLimit = controlLimit;
@@ -157,7 +161,7 @@ final class Mailbox {
             case COMMAND -> commandCount >= commandLimit
                     || event.bytes() > commandByteLimit - commandBytes;
             // One burst can queue the core's whole registration limit without operation capacity.
-            case REGISTRATION -> registrationCount >= Subscriptions.REGISTRATION_LIMIT;
+            case REGISTRATION -> registrationCount >= registrationLimit;
             case INCOMING -> incomingCount >= incomingLimit
                     || event.bytes() > incomingByteLimit - incomingBytes;
             case CONTROL -> controlCount >= controlLimit;

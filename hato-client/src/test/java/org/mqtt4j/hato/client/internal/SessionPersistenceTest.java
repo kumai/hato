@@ -939,7 +939,8 @@ class SessionPersistenceTest {
                 false,
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
-                Duration.ofSeconds(60)
+                Duration.ofSeconds(60),
+                ClientLimits.DEFAULT
         );
     }
 

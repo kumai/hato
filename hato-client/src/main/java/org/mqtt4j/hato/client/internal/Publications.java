@@ -47,9 +47,6 @@ final class Publications {
 
     private static final Log log = Log.of(Publications.class);
 
-    // The session's QoS 1 and QoS 2 exchanges, including publications that wait to be sent.
-    private static final int INFLIGHT_LIMIT = 64;
-
     private static final long INFLIGHT_BYTE_LIMIT = 32L * 1024 * 1024;
 
     // A Topic Alias property: its identifier and its two-byte value.
@@ -69,6 +66,9 @@ final class Publications {
 
     // The connection's codec, which sizes the retained PUBLISH of a persistent session.
     private final PacketCodec codec;
+
+    // The session's QoS 1 and QoS 2 exchanges, including publications that wait to be sent.
+    private final int inflightLimit;
 
     // The session's exchanges by packet identifier. PUBLISH entries retain send order; replacing
     // one with PUBREL moves it to the end in PUBREC order. Both stages share the identifier and
@@ -94,13 +94,15 @@ final class Publications {
             SessionCore.Context core,
             String clientId,
             boolean cleanStart,
-            PacketCodec codec
+            PacketCodec codec,
+            int inflightLimit
     ) {
         this.port = port;
         this.core = core;
         this.clientId = clientId;
         this.cleanStart = cleanStart;
         this.codec = codec;
+        this.inflightLimit = inflightLimit;
     }
 
     void publish(long operation, MqttMessage message) {
@@ -125,7 +127,7 @@ final class Publications {
         int packetId = 0;
         SendReceipt receipt = null;
         if (message.qos() != Qos.AT_MOST_ONCE) {
-            if (inflight.size() >= INFLIGHT_LIMIT) {
+            if (inflight.size() >= inflightLimit) {
                 capacityFailure(operation, "Publication capacity");
                 return;
             }
@@ -460,7 +462,7 @@ final class Publications {
     /// How many exchanges may be outstanding on this connection: the broker's Receive Maximum,
     /// within the session's own limit.
     private int receiveMaximum() {
-        return Math.min(INFLIGHT_LIMIT, core.receiveMaximum());
+        return Math.min(inflightLimit, core.receiveMaximum());
     }
 
     private void awaitPublication(long ticket, Qos qos, int packetId) {

@@ -67,6 +67,7 @@ class ClientIoTest {
             URI.create("mqtt://localhost"),
             "io-test",
             16 * 1024 * 1024,
+            128,
             _ -> {
                 var transport = new SingleWriteTransport();
                 transport.startFailure = nextStartFailure;

@@ -18,6 +18,7 @@ import javax.net.ssl.SSLSocket;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.client.internal.ClientActor;
+import org.mqtt4j.hato.client.internal.ClientLimits;
 import org.mqtt4j.hato.client.internal.DefaultTimerScheduler;
 import org.mqtt4j.hato.client.internal.MessageProperties;
 import org.mqtt4j.hato.client.internal.TcpTransport;
@@ -489,7 +490,8 @@ public final class MqttClientBuilder {
                 reconnectPolicy.backoff(),
                 reconnectPolicy.rules(),
                 responseTimeout,
-                DeliveryOptions::execution
+                DeliveryOptions::execution,
+                ClientLimits.DEFAULT
         );
     }
 

@@ -1217,7 +1217,8 @@ class AutomaticReconnectionTest {
                 backoff,
                 initialRetry ? RetryRules.DEFAULT.withInitialRetry() : RetryRules.DEFAULT,
                 responseTimeout,
-                DeliveryOptionsAccess::execution
+                DeliveryOptionsAccess::execution,
+                ClientLimits.DEFAULT
         );
     }
 

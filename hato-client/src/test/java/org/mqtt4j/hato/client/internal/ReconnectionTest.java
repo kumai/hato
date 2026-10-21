@@ -532,7 +532,8 @@ class ReconnectionTest {
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
                 RetryRules.DEFAULT,
-                Duration.ofSeconds(60)
+                Duration.ofSeconds(60),
+                ClientLimits.DEFAULT
         );
         sut.connect(attempt(1), 0);
         connected(sut, 1, 0);
@@ -628,7 +629,8 @@ class ReconnectionTest {
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
                 RetryRules.DEFAULT.withInitialRetry(),
-                Duration.ofSeconds(60)
+                Duration.ofSeconds(60),
+                ClientLimits.DEFAULT
         );
         ConnectionAttempt first = attempt(1);
         sut.connect(first, 0);
@@ -933,7 +935,8 @@ class ReconnectionTest {
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
                 rules,
-                Duration.ofSeconds(60)
+                Duration.ofSeconds(60),
+                ClientLimits.DEFAULT
         );
     }
 

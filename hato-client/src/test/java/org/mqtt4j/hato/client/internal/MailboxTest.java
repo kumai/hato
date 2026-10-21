@@ -22,7 +22,7 @@ class MailboxTest {
     @Test
     void registration_and_operation_capacity_are_independent_in_the_same_fifo() throws Exception {
         // Arrange: operation admission is already full before the registration burst.
-        var sut = new Mailbox(1, 10, 0, 0, 0);
+        var sut = new Mailbox(1, 10, 256, 0, 0, 0);
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
         var registration = new Mailbox.Event(0, () -> { }, Mailbox.Kind.REGISTRATION, 0);
         var next = new Mailbox.Event(0, () -> { }, Mailbox.Kind.REGISTRATION, 0);
@@ -50,7 +50,7 @@ class MailboxTest {
     @Test
     void queued_registrations_keep_their_slots_across_connections_and_release_them_on_shutdown() {
         // Arrange
-        var sut = new Mailbox(0, 0, 0, 0, 0);
+        var sut = new Mailbox(0, 0, 256, 0, 0, 0);
         var registration = new Mailbox.Event(0, () -> { }, Mailbox.Kind.REGISTRATION, 0);
         sut.activate(1);
         for (int i = 0; i < 256; i++) {
@@ -73,7 +73,7 @@ class MailboxTest {
     void commands_incoming_packets_and_control_have_independent_capacity_in_one_fifo()
             throws Exception {
         // Arrange
-        var sut = new Mailbox(1, 10, 1, 10, 1);
+        var sut = new Mailbox(1, 10, 256, 1, 10, 1);
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
         var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
         var control = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
@@ -98,7 +98,7 @@ class MailboxTest {
     @Test
     void keep_alive_events_go_ahead_of_queued_input_but_not_of_termination() throws Exception {
         // Arrange
-        var sut = new Mailbox(1, 10, 1, 10, 1);
+        var sut = new Mailbox(1, 10, 256, 1, 10, 1);
         var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
         var timer = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
         var response = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
@@ -121,7 +121,7 @@ class MailboxTest {
     @Test
     void keep_alive_events_have_a_bounded_class_that_ends_with_its_connection() {
         // Arrange
-        var sut = new Mailbox(1, 10, 1, 10, 1);
+        var sut = new Mailbox(1, 10, 256, 1, 10, 1);
         var current = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
         var next = new Mailbox.Event(2, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
         sut.activate(1);
@@ -144,7 +144,7 @@ class MailboxTest {
     @Test
     void coalesced_wakes_keep_independent_slots_when_control_capacity_is_full() throws Exception {
         // Arrange
-        var sut = new Mailbox(1, 0, 0, 0, 1);
+        var sut = new Mailbox(1, 0, 256, 0, 0, 1);
         var control = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
         var ready = new Mailbox.Event(1, () -> { }, Mailbox.Kind.DELIVERY_READY, 0);
         var capacity = new Mailbox.Event(1, () -> { }, Mailbox.Kind.SEND_CAPACITY, 0);
@@ -192,7 +192,7 @@ class MailboxTest {
     @MethodSource("wakes")
     void taking_a_wake_rearms_it_before_its_action_runs(Mailbox.Kind kind) throws Exception {
         // Arrange
-        var sut = new Mailbox(1, 0, 0, 0, 0);
+        var sut = new Mailbox(1, 0, 256, 0, 0, 0);
         var first = new Mailbox.Event(1, () -> { }, kind, 0);
         var next = new Mailbox.Event(1, () -> { }, kind, 0);
         var duplicate = new Mailbox.Event(1, () -> { }, kind, 0);
@@ -219,7 +219,7 @@ class MailboxTest {
     void discarding_an_old_wake_does_not_clear_the_current_generations_marker(Mailbox.Kind kind)
             throws Exception {
         // Arrange: a new marker is admitted before the old generation is discarded.
-        var sut = new Mailbox(1, 0, 0, 0, 0);
+        var sut = new Mailbox(1, 0, 256, 0, 0, 0);
         var old = new Mailbox.Event(1, () -> { }, kind, 0);
         var current = new Mailbox.Event(2, () -> { }, kind, 0);
         var duplicate = new Mailbox.Event(2, () -> { }, kind, 0);
@@ -244,7 +244,7 @@ class MailboxTest {
     @MethodSource("wakes")
     void wakes_require_an_active_matching_generation(Mailbox.Kind kind) throws Exception {
         // Arrange
-        var sut = new Mailbox(1, 0, 0, 0, 0);
+        var sut = new Mailbox(1, 0, 256, 0, 0, 0);
         var old = new Mailbox.Event(1, () -> { }, kind, 0);
         var current = new Mailbox.Event(2, () -> { }, kind, 0);
 
@@ -265,7 +265,7 @@ class MailboxTest {
     void client_wakes_survive_connection_end_and_rearm_before_their_action(Mailbox.Kind kind)
             throws Exception {
         // Arrange: every ordinary admission class is full, even while disconnected.
-        var sut = new Mailbox(0, 0, 0, 0, 0);
+        var sut = new Mailbox(0, 0, 256, 0, 0, 0);
         var first = new Mailbox.Event(0, () -> { }, kind, 0);
         var next = new Mailbox.Event(0, () -> { }, kind, 0);
         assertThat(sut.offer(first)).isEqualTo(ACCEPTED);
@@ -297,7 +297,7 @@ class MailboxTest {
     @Test
     void reconnect_keeps_queued_command_capacity_until_the_command_is_taken() throws Exception {
         // Arrange
-        var sut = new Mailbox(1, 10, 1, 10, 1);
+        var sut = new Mailbox(1, 10, 256, 1, 10, 1);
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
         var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
         sut.activate(1);
@@ -318,7 +318,7 @@ class MailboxTest {
     @Test
     void a_larger_incoming_packet_limit_does_not_expand_the_command_byte_budget() {
         // Arrange
-        Mailbox sut = ClientActor.createMailbox(64 * 1024 * 1024);
+        Mailbox sut = ClientActor.createMailbox(64 * 1024 * 1024, ClientLimits.DEFAULT);
         var command = new Mailbox.Event(
                 0,
                 () -> { },
@@ -342,7 +342,7 @@ class MailboxTest {
     void transport_termination_follows_preceding_input_when_control_capacity_remains()
             throws Exception {
         // Arrange
-        var sut = new Mailbox(2, 10, 1, 10, 2);
+        var sut = new Mailbox(2, 10, 256, 1, 10, 2);
         var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
         var control = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
         var end = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
@@ -363,7 +363,7 @@ class MailboxTest {
     void transport_termination_keeps_its_original_event_when_the_control_queue_is_full()
             throws Exception {
         // Arrange
-        var sut = new Mailbox(2, 10, 1, 10, 1);
+        var sut = new Mailbox(2, 10, 256, 1, 10, 1);
         var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
         var control = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
         var end = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
@@ -384,7 +384,7 @@ class MailboxTest {
     @ValueSource(ints = {1, 2})
     void a_late_transport_end_cannot_hide_the_current_end(int controlCapacity) throws Exception {
         // Arrange: leave either zero or one control slot available in the new connection.
-        var sut = new Mailbox(2, 10, 1, 10, controlCapacity);
+        var sut = new Mailbox(2, 10, 256, 1, 10, controlCapacity);
         var old = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
         var control = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
         var current = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
@@ -407,7 +407,7 @@ class MailboxTest {
     @Test
     void a_late_failure_from_an_old_connection_cannot_hide_the_current_failure() throws Exception {
         // Arrange
-        var sut = new Mailbox(2, 10, 1, 10, 1);
+        var sut = new Mailbox(2, 10, 256, 1, 10, 1);
         var old = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
         var current = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
         var later = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
@@ -431,7 +431,7 @@ class MailboxTest {
             boolean handlerFirst
     ) throws Exception {
         // Arrange: every ordinary slot is full after the same session reconnects.
-        var sut = new Mailbox(1, 0, 1, 0, 0);
+        var sut = new Mailbox(1, 0, 256, 1, 0, 0);
         long session = 1;
         var input = new Mailbox.Event(2, () -> { }, Mailbox.Kind.INCOMING, 0);
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
@@ -469,7 +469,7 @@ class MailboxTest {
     void replacing_a_session_removes_only_its_handler_notification(boolean transportFirst)
             throws Exception {
         // Arrange: CONNACK can replace the session within the same connection generation.
-        var sut = new Mailbox(0, 0, 0, 0, 0);
+        var sut = new Mailbox(0, 0, 256, 0, 0, 0);
         long old = 1;
         long current = 2;
         var transport = new Mailbox.Event(2, () -> { }, Mailbox.Kind.CONTROL, 0);
@@ -498,7 +498,7 @@ class MailboxTest {
     @Test
     void a_session_stop_requires_a_connection_request_and_the_current_session() throws Exception {
         // Arrange
-        var sut = new Mailbox(0, 0, 0, 0, 0);
+        var sut = new Mailbox(0, 0, 256, 0, 0, 0);
         long session = 1;
         long other = 2;
         sut.activateSession(session);
@@ -521,7 +521,7 @@ class MailboxTest {
     @Test
     void closing_stop_admission_removes_a_pending_stop_before_lanes_resume() throws Exception {
         // Arrange: no connection generation exists while waiting to reconnect.
-        var sut = new Mailbox(1, 0, 0, 0, 0);
+        var sut = new Mailbox(1, 0, 256, 0, 0, 0);
         sut.activateSession(1);
         sut.connectionRequested(true);
         assertThat(sut.stopSession(1, () -> { })).isTrue();
@@ -541,7 +541,7 @@ class MailboxTest {
     void old_callbacks_cannot_consume_capacity_after_reconnecting(boolean control)
             throws Exception {
         // Arrange
-        var sut = new Mailbox(2, 10, 1, 10, 1);
+        var sut = new Mailbox(2, 10, 256, 1, 10, 1);
         Mailbox.Kind kind = control ? Mailbox.Kind.CONTROL : Mailbox.Kind.INCOMING;
         var old = new Mailbox.Event(1, () -> { }, kind, 10);
         var current = new Mailbox.Event(2, () -> { }, kind, 10);
@@ -563,7 +563,7 @@ class MailboxTest {
     void ending_a_connection_clears_queued_work_and_rejects_late_callbacks(long generation)
             throws Exception {
         // Arrange
-        var sut = new Mailbox(2, 10, 1, 10, 1);
+        var sut = new Mailbox(2, 10, 256, 1, 10, 1);
         var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
         var end = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
         var command = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
@@ -588,7 +588,7 @@ class MailboxTest {
     @Test
     void api_commands_survive_connection_changes_in_fifo_order() throws Exception {
         // Arrange
-        var sut = new Mailbox(2, 10, 1, 10, 2);
+        var sut = new Mailbox(2, 10, 256, 1, 10, 2);
         var first = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
         var second = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 0);
         assertThat(sut.offer(first)).isEqualTo(ACCEPTED);
@@ -615,7 +615,7 @@ class MailboxTest {
     void an_empty_client_mailbox_accepts_the_configured_maximum_packet_size(int maxPacketSize)
             throws Exception {
         // Arrange
-        Mailbox sut = ClientActor.createMailbox(maxPacketSize);
+        Mailbox sut = ClientActor.createMailbox(maxPacketSize, ClientLimits.DEFAULT);
         sut.activate(1);
         var packet = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, maxPacketSize);
 
@@ -629,7 +629,7 @@ class MailboxTest {
     void byte_capacity_is_enforced_even_when_event_slots_remain(Mailbox.Kind kind)
             throws Exception {
         // Arrange
-        var sut = new Mailbox(2, 10, 2, 10, 1);
+        var sut = new Mailbox(2, 10, 256, 2, 10, 1);
         sut.activate(1);
         long generation = kind == Mailbox.Kind.COMMAND ? 0 : 1;
         var full = new Mailbox.Event(generation, () -> { }, kind, 10);
@@ -647,7 +647,7 @@ class MailboxTest {
     void full_incoming_capacity_preserves_control_capacity_fifo_and_out_of_band_termination()
             throws Exception {
         // Arrange
-        var sut = new Mailbox(2, 10, 1, 10, 1);
+        var sut = new Mailbox(2, 10, 256, 1, 10, 1);
         sut.activate(1);
         var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
         var control = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);

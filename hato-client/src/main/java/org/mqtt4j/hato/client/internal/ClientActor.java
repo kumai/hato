@@ -63,20 +63,12 @@ public final class ClientActor implements MqttClient {
 
     private static final Log log = Log.of(ClientActor.class);
 
-    private static final int OPERATION_LIMIT = 64;
-
-    // The shared operation slots plus the connect and disconnect slots. Every admitted operation
-    // holds one of them and posts one command, so the command count never refuses one.
-    private static final int COMMAND_LIMIT = OPERATION_LIMIT + 2;
-
     private static final int WAITER_LIMIT = 1024;
 
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
     // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
     // each when measured); the byte limit bounds the packets themselves.
     private static final int MAILBOX_INCOMING_LIMIT = 65_536;
-
-    private static final int MAILBOX_CONTROL_LIMIT = 256;
 
     private static final int MAILBOX_COMMAND_BYTE_LIMIT = 32 * 1024 * 1024;
 
@@ -155,7 +147,9 @@ public final class ClientActor implements MqttClient {
     // own budget; neither local close nor public unsubscribe needs an operation slot.
     private final Map<Long, UnsubscribeAttempt> closingAttempts = new LinkedHashMap<>();
 
-    private final Semaphore operationSlots = new Semaphore(OPERATION_LIMIT);
+    private final Semaphore operationSlots;
+
+    private final int commandLimit;
 
     // connect() and disconnect() keep one slot each, so publications holding every operation
     // slot while they wait for a reconnection cannot refuse the call that hastens or ends it.
@@ -203,7 +197,8 @@ public final class ClientActor implements MqttClient {
             ReconnectBackoff backoff,
             RetryRules rules,
             Duration responseTimeout,
-            Function<DeliveryOptions, HandlerExecution> executionOf
+            Function<DeliveryOptions, HandlerExecution> executionOf,
+            ClientLimits limits
     ) {
         this(
                 endpoint,
@@ -222,7 +217,8 @@ public final class ClientActor implements MqttClient {
                 backoff,
                 rules,
                 responseTimeout,
-                executionOf
+                executionOf,
+                limits
         );
     }
 
@@ -243,7 +239,8 @@ public final class ClientActor implements MqttClient {
             ReconnectBackoff backoff,
             RetryRules rules,
             Duration responseTimeout,
-            Function<DeliveryOptions, HandlerExecution> executionOf
+            Function<DeliveryOptions, HandlerExecution> executionOf,
+            ClientLimits limits
     ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
@@ -252,18 +249,21 @@ public final class ClientActor implements MqttClient {
         this.executionOf = executionOf;
         cleanStart = sessionExpiry.isZero();
         reconnects = backoff.enabled();
+        operationSlots = new Semaphore(limits.operations());
+        commandLimit = commandLimit(limits);
         termination = new ClientTermination(
                 threadName("terminated"),
                 waiterSlots,
                 WAITER_LIMIT,
                 List.of(operationSlots, connectSlot, disconnectSlot),
-                COMMAND_LIMIT
+                commandLimit
         );
         listenerLane = new ListenerLane(endpoint, clientId, listener, termination::check);
-        mailbox = createMailbox(maxPacketSize);
+        mailbox = createMailbox(maxPacketSize, limits);
         lanes = new DeliveryLanes(
                 clientId,
                 receiveByteLimit(maxPacketSize),
+                limits.subscriptions(),
                 this::deliveryFailed,
                 this::handOffRefused,
                 this::deliveryReady,
@@ -274,6 +274,7 @@ public final class ClientActor implements MqttClient {
                 endpoint,
                 clientId,
                 maxPacketSize,
+                limits.regularSends(),
                 transportFactory,
                 new IoEvents(),
                 codec
@@ -290,7 +291,8 @@ public final class ClientActor implements MqttClient {
                 credentials != null,
                 backoff,
                 rules,
-                responseTimeout
+                responseTimeout,
+                limits
         );
         this.credentials = credentials == null ? null : new CredentialsEvaluator(
                 threadName("credentials"),
@@ -849,7 +851,7 @@ public final class ClientActor implements MqttClient {
     /// until applications get statistics. The parts are read one after another, not atomically.
     Usage usage() {
         return new Usage(
-                COMMAND_LIMIT
+                commandLimit
                         - operationSlots.availablePermits()
                         - connectSlot.availablePermits()
                         - disconnectSlot.availablePermits(),
@@ -895,15 +897,22 @@ public final class ClientActor implements MqttClient {
         return termination.pending();
     }
 
-    static Mailbox createMailbox(int maxPacketSize) {
+    static Mailbox createMailbox(int maxPacketSize, ClientLimits limits) {
         // Registrations have their own admission class within the shared FIFO.
         return new Mailbox(
-                COMMAND_LIMIT,
+                commandLimit(limits),
                 MAILBOX_COMMAND_BYTE_LIMIT,
+                limits.subscriptions(),
                 MAILBOX_INCOMING_LIMIT,
                 receiveByteLimit(maxPacketSize),
-                MAILBOX_CONTROL_LIMIT
+                limits.controlEvents()
         );
+    }
+
+    // The shared operation slots plus the connect and disconnect slots. Every admitted operation
+    // holds one of them and posts one command, so the command count never refuses one.
+    private static int commandLimit(ClientLimits limits) {
+        return limits.operations() + 2;
     }
 
     /// An empty mailbox or set of lanes must admit one packet up to the configured maximum.

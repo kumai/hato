@@ -282,7 +282,8 @@ class CoreResponseDeadlineTest {
                 false,
                 backoff,
                 RetryRules.DEFAULT,
-                RESPONSE_TIMEOUT
+                RESPONSE_TIMEOUT,
+                ClientLimits.DEFAULT
         );
         core.connect(new ConnectionAttempt(1), 0);
         core.opened(1);
