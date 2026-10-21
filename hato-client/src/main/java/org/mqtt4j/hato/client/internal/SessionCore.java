@@ -531,16 +531,10 @@ final class SessionCore {
             subscriptions.subscribed(ack);
         } else if (packet instanceof Packet.UnsubAck ack) {
             subscriptions.unsubscribed(ack);
-        } else if (packet instanceof Packet.Publish publish
-                && publish.properties().find(PropertyId.TOPIC_ALIAS).isEmpty()) {
-            // Other MQTT 5.0 properties do not change how the message is delivered.
+        } else if (packet instanceof Packet.Publish publish) {
+            // The connection has resolved any Topic Alias, and the other MQTT 5.0 properties do
+            // not change how the message is delivered.
             receptions.deliver(publish, bytes);
-        } else if (packet instanceof Packet.Publish || packet instanceof Packet.AliasPublish) {
-            // The client announces no Topic Alias Maximum, so the broker may use no alias.
-            failed(connection, new PacketDecodeException(
-                    ReasonCode.TOPIC_ALIAS_INVALID,
-                    "Topic Alias without Topic Alias Maximum"
-            ));
         } else if (packet instanceof Packet.PubRel release) {
             receptions.released(release.packetId());
         } else if (packet instanceof Packet.Disconnect ending && version == MqttVersion.V5) {

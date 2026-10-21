@@ -168,8 +168,8 @@ final class ConnectionEstablishment {
     }
 
     /// The MQTT 5.0 CONNECT properties: the expiry of a persistent session, how many QoS 1 and
-    /// QoS 2 publications the broker may send before their acknowledgements, and the largest
-    /// packet that the client accepts.
+    /// QoS 2 publications the broker may send before their acknowledgements, the largest packet
+    /// that the client accepts, and how many Topic Aliases the broker may set.
     private Properties connectProperties(int receiveRoom) {
         var properties = new ArrayList<Property>();
         if (!cleanStart) {
@@ -186,6 +186,10 @@ final class ConnectionEstablishment {
                 Math.max(1, receiveRoom)
         ));
         properties.add(new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, maxPacketSize));
+        properties.add(new Property.TwoByteValue(
+                PropertyId.TOPIC_ALIAS_MAXIMUM,
+                IncomingAliases.TOPIC_ALIAS_MAXIMUM
+        ));
         return new Properties(properties);
     }
 
@@ -291,7 +295,7 @@ final class ConnectionEstablishment {
     }
 
     /// The value of the integer property `id`, or empty when `properties` has none.
-    private static OptionalLong number(Properties properties, PropertyId id) {
+    static OptionalLong number(Properties properties, PropertyId id) {
         return switch (properties.find(id).orElse(null)) {
             case Property.ByteValue(var _, var value) -> OptionalLong.of(value);
             case Property.TwoByteValue(var _, var value) -> OptionalLong.of(value);

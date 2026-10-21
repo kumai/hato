@@ -3978,7 +3978,7 @@ class SessionCoreTest {
     }
 
     @Test
-    void an_mqtt_5_connect_announces_its_receive_maximum_and_packet_size_and_nothing_else() {
+    void an_mqtt_5_connect_announces_its_receive_limits_and_topic_aliases_and_nothing_else() {
         // Arrange
         SessionCore mqtt5 = mqtt5Core(Duration.ZERO);
 
@@ -3986,11 +3986,12 @@ class SessionCoreTest {
         mqtt5.connect(attempt(1), 0);
         mqtt5.opened(1);
 
-        // Assert: no Topic Alias Maximum and no requests for problem or response information.
+        // Assert: no requests for problem or response information.
         var connect = (Packet.Connect) port.sent.getLast();
         assertThat(connect.properties().entries()).containsExactly(
                 new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4096),
-                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 1024)
+                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 1024),
+                new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16)
         );
     }
 
@@ -4227,28 +4228,6 @@ class SessionCoreTest {
         assertThat(mqtt5.state()).isEqualTo(CONNECTED);
     }
 
-    @ParameterizedTest(name = "{0}")
-    @MethodSource("aliasedPublications")
-    void a_topic_alias_that_the_client_never_allowed_ends_the_connection(Packet publication) {
-        // Arrange: the client announces no Topic Alias Maximum.
-        SessionCore mqtt5 = connectedMqtt5();
-        mqtt5.subscribe(2, subscription("a/#"));
-
-        // Act
-        mqtt5.received(1, publication, 0, 19);
-        mqtt5.sent(1, port.ticket, 0);
-
-        // Assert
-        assertThat(port.deliveries).isEmpty();
-        assertThat(port.sent).last()
-                .isEqualTo(new Packet.Disconnect(ReasonCode.TOPIC_ALIAS_INVALID, EMPTY));
-        assertThat(port.ends).singleElement().satisfies(end -> assertThat(end.cause())
-                .containsInstanceOf(MqttProtocolException.class)
-                .get()
-                .extracting(cause -> ((MqttProtocolException) cause).reasonCode())
-                .isEqualTo(ReasonCode.TOPIC_ALIAS_INVALID));
-    }
-
     @Test
     void a_requested_mqtt_5_disconnect_sends_normal_disconnection() {
         // Arrange
@@ -4375,21 +4354,6 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectException.class)
                 .hasCauseInstanceOf(MqttProtocolException.class);
-    }
-
-    static Stream<Named<Packet>> aliasedPublications() {
-        var alias = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 1)));
-        return Stream.of(
-                Named.of("a topic with an alias", publication(alias)),
-                Named.of("an alias without a topic", new Packet.AliasPublish(
-                        new byte[] {1, 2},
-                        Qos.AT_MOST_ONCE,
-                        false,
-                        false,
-                        0,
-                        alias
-                ))
-        );
     }
 
     private void connected() {

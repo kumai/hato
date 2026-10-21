@@ -4712,6 +4712,130 @@ class ClientActorTest {
     }
 
     @Test
+    void a_broker_topic_alias_delivers_its_topic_and_counts_it_in_receive_capacity()
+            throws Exception {
+        // Arrange: the broker sets alias 1 with its first publication and then sends it alone.
+        var first = new Packet.Publish(
+                new Topic("messages"),
+                new byte[] {1},
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                1,
+                topicAlias(1)
+        );
+        var aliased = new Packet.AliasPublish(
+                new byte[] {2},
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                2,
+                topicAlias(1)
+        );
+        var mqtt5 = PacketCodec.of(MqttVersion.V5);
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribePull(sut, transport, qosOneRequest());
+
+            // Act
+            transport.receive(first);
+            transport.receive(aliased);
+
+            // Assert: the frame without its topic counts as if it carried the topic.
+            long counted = mqtt5.encode(first).length
+                    + mqtt5.encode(aliased).length
+                    + "messages".length();
+            await().untilAsserted(() -> assertThat(((ClientActor) sut).usage().deliveryBytes())
+                    .isEqualTo(counted));
+            assertThat(received(subscription.receive(Duration.ofSeconds(5))).message())
+                    .isEqualTo(message(new byte[] {1}).withQos(Qos.AT_LEAST_ONCE));
+            assertThat(received(subscription.receive(Duration.ofSeconds(5))).message())
+                    .isEqualTo(message(new byte[] {2}).withQos(Qos.AT_LEAST_ONCE));
+        }
+    }
+
+    @Test
+    void a_later_topic_for_an_alias_replaces_the_earlier_one() throws Exception {
+        // Arrange
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = subscribePull(
+                    sut,
+                    transport,
+                    Subscribe.of(new TopicFilter("#"), Qos.AT_MOST_ONCE)
+            );
+
+            // Act
+            transport.receive(aliasedPublication("first", 1));
+            transport.receive(aliasedPublication("second", 1));
+            transport.receive(new Packet.AliasPublish(
+                    new byte[] {3},
+                    Qos.AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    topicAlias(1)
+            ));
+
+            // Assert
+            for (String topic : List.of("first", "second", "second")) {
+                assertThat(received(subscription.receive(Duration.ofSeconds(5))).message().topic())
+                        .isEqualTo(new Topic(topic));
+            }
+        }
+    }
+
+    @Test
+    void an_alias_beyond_the_announced_maximum_ends_the_connection_as_topic_alias_invalid()
+            throws Exception {
+        // Arrange: the client announces 16 aliases.
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+
+            // Act
+            transport.receive(aliasedPublication("messages", 17));
+
+            // Assert
+            assertThat(transport.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.TOPIC_ALIAS_INVALID, EMPTY));
+            assertThat(ends.poll(5, SECONDS)).isNotNull().satisfies(end -> assertThat(end.cause())
+                    .get()
+                    .isInstanceOfSatisfying(
+                            MqttProtocolException.class,
+                            cause -> assertThat(cause.reasonCode())
+                                    .isEqualTo(ReasonCode.TOPIC_ALIAS_INVALID)
+                    ));
+        }
+    }
+
+    @Test
+    void an_alias_that_an_earlier_connection_set_ends_the_next_one_as_a_protocol_error()
+            throws Exception {
+        // Arrange: the first connection sets alias 1.
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport first = connect(sut);
+            first.receive(aliasedPublication("messages", 1));
+            sut.disconnect().get(5, SECONDS);
+            assertThat(ends.poll(5, SECONDS)).isNotNull();
+            ScriptTransport second = connect(sut);
+
+            // Act
+            second.receive(new Packet.AliasPublish(
+                    new byte[] {2},
+                    Qos.AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    topicAlias(1)
+            ));
+
+            // Assert: the mapping lasted for the first connection only.
+            assertThat(second.sent.poll(5, SECONDS))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
+        }
+    }
+
+    @Test
     void user_properties_beyond_the_send_budget_fail_the_publication_without_sending_it()
             throws Exception {
         // Arrange: 17 MiB of User Properties exceed the 16 MiB send budget with no payload.
@@ -8265,6 +8389,23 @@ class ClientActorTest {
 
     private static Subscribe qosOneRequest() {
         return Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE);
+    }
+
+    private static Properties topicAlias(int alias) {
+        return new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, alias)));
+    }
+
+    /// A QoS 0 publication on `topic` that sets the Topic Alias `alias`.
+    private static Packet.Publish aliasedPublication(String topic, int alias) {
+        return new Packet.Publish(
+                new Topic(topic),
+                new byte[] {1},
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                topicAlias(alias)
+        );
     }
 
     private static MqttMessage message(byte[] bytes) {

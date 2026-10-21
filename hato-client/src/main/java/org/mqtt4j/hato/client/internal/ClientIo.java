@@ -13,6 +13,8 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.spi.Transport;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 /// Adapts byte callbacks to protocol events and serializes preparation and writes off the actor.
 /// One sender survives connection changes; queued and active sends share a client-wide budget.
 final class ClientIo {
@@ -133,6 +135,8 @@ final class ClientIo {
             throw new SpiException(generation, failure);
         }
         var connection = new Connection(generation, transport, new SendQueue<>(budget));
+        // The broker's Topic Aliases last for this connection, so its own callback resolves them.
+        var aliases = new IncomingAliases();
         var frames = new IncomingFrames(
                 maxPacketSize,
                 codec,
@@ -140,6 +144,17 @@ final class ClientIo {
                     log.debug("Received {} ({} bytes)", packet.getClass().getSimpleName(), size);
                     if (packet instanceof Packet.PingResp && answersPing(connection)) {
                         events.pingResponse(generation, packet, size);
+                    } else if (packet instanceof Packet.Publish publish) {
+                        events.received(generation, aliases.set(publish), size);
+                    } else if (packet instanceof Packet.AliasPublish publish) {
+                        Packet.Publish resolved = aliases.resolve(publish);
+                        // Receive capacity counts the topic as if the broker had sent it, so an
+                        // alias saves bandwidth without changing what a delivery costs.
+                        events.received(
+                                generation,
+                                resolved,
+                                size + resolved.topic().name().getBytes(UTF_8).length
+                        );
                     } else {
                         events.received(generation, packet, size);
                     }
