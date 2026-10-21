@@ -13,7 +13,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.params.ParameterizedClass;
-import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.*;
@@ -27,16 +27,18 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The client's TLS against an independent implementation: Mosquitto's OpenSSL listeners, in
-/// both protocol versions.
+/// The client's TLS against an independent implementation: Mosquitto's OpenSSL listeners, for
+/// MQTT over TCP (`mqtts`) and over WebSocket (`wss`), in both protocol versions.
 @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
-@ParameterizedClass(name = "{0}")
-@EnumSource(MqttVersion.class)
+@ParameterizedClass(name = "{0}, {1}")
+@CsvSource({"V3_1_1, mqtts", "V5, mqtts", "V3_1_1, wss", "V5, wss"})
 class MosquittoTlsTest {
 
     private static final GenericContainer<?> broker = Mosquitto.tlsContainer();
 
     private final MqttVersion version;
+
+    private final String scheme;
 
     // Established connections and their ends, apart from attempts that never established one.
     private final LinkedBlockingQueue<Object> connections = new LinkedBlockingQueue<>();
@@ -60,8 +62,9 @@ class MosquittoTlsTest {
         }
     };
 
-    MosquittoTlsTest(MqttVersion version) {
+    MosquittoTlsTest(MqttVersion version, String scheme) {
         this.version = version;
+        this.scheme = scheme;
     }
 
     static boolean dockerIsAvailableOrRequired() {
@@ -79,18 +82,14 @@ class MosquittoTlsTest {
     }
 
     @Test
-    void publications_round_trip_over_tls_with_server_authentication() throws Exception {
+    void publications_at_every_qos_level_round_trip_with_server_authentication()
+            throws Exception {
         // Arrange: the URI uses localhost, a name in the broker's certificate, so the default
-        // hostname verification passes. TlsConnectionTest checks that a mismatch is refused.
+        // hostname verification passes. TlsConnectionTest and WebSocketTransportTest check that
+        // a mismatch is refused.
         String topic = uniqueTopic();
-        var publication = MqttMessage.of(
-                new Topic(topic),
-                new byte[] {1, 2, 3},
-                Qos.EXACTLY_ONCE,
-                false
-        );
         try (MqttClient sut = MqttClient.builder()
-                .server(endpoint(Mosquitto.MQTTS_PORT))
+                .server(endpoint(Mosquitto.MQTTS_PORT, Mosquitto.SECURE_WEBSOCKET_PORT))
                 .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .sslContext(Tls.clientContext())
@@ -102,18 +101,29 @@ class MosquittoTlsTest {
             );
             subscription.established().get(5, SECONDS);
 
-            // Act
-            sut.publish(publication).get(5, SECONDS);
-            ReceiveResult.Received received = assertInstanceOf(
-                    ReceiveResult.Received.class,
-                    subscription.receive(Duration.ofSeconds(5))
-            );
+            for (Qos qos : Qos.values()) {
+                var publication = MqttMessage.of(
+                        new Topic(topic),
+                        new byte[] {(byte) qos.level()},
+                        qos,
+                        false
+                );
+
+                // Act
+                sut.publish(publication).get(5, SECONDS);
+
+                // Assert: the subscription grants QoS 2, so each publication arrives unchanged.
+                assertThat(assertInstanceOf(
+                        ReceiveResult.Received.class,
+                        subscription.receive(Duration.ofSeconds(5))
+                ).delivery().message()).isEqualTo(publication);
+            }
             subscription.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
 
-            // Assert: the QoS 2 publication arrived unchanged, and the one connection lasted
-            // until the requested disconnection.
-            assertThat(received.delivery().message()).isEqualTo(publication);
+            // Assert: the one connection lasted until the requested disconnection. Over wss,
+            // Mosquitto writes its Close after DISCONNECT without TLS, which fails the end of
+            // the WebSocket; the requested disconnection is still a clean one.
             assertThat(connAck.sessionPresent()).isFalse();
             assertThat(connections.poll(5, SECONDS)).isEqualTo(connAck);
             assertThat(connections.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
@@ -166,7 +176,7 @@ class MosquittoTlsTest {
     // instead of quietly moving the refusal into the handshake.
     private MqttClient mutualTlsClient(SSLContext context) throws IOException {
         return MqttClient.builder()
-                .server(endpoint(Mosquitto.MUTUAL_TLS_PORT))
+                .server(endpoint(Mosquitto.MUTUAL_TLS_PORT, Mosquitto.MUTUAL_TLS_WEBSOCKET_PORT))
                 .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .sslContext(context)
@@ -175,12 +185,15 @@ class MosquittoTlsTest {
                 .build();
     }
 
-    // The test certificate names localhost and no IP address, so the default hostname
-    // verification needs a Docker daemon on this machine, reached as localhost.
-    private static URI endpoint(int port) throws IOException {
+    // The URI of the listener on `port` for mqtts, or on `webSocketPort` for wss. The test
+    // certificate names localhost and no IP address, so the default hostname verification
+    // needs a Docker daemon on this machine, reached as localhost.
+    private URI endpoint(int port, int webSocketPort) throws IOException {
         assertThat(InetAddress.getByName(broker.getHost()).isLoopbackAddress())
                 .as("Docker host %s is not this machine", broker.getHost())
                 .isTrue();
-        return URI.create("mqtts://localhost:" + broker.getMappedPort(port));
+        return scheme.equals("wss")
+                ? URI.create("wss://localhost:" + broker.getMappedPort(webSocketPort) + "/mqtt")
+                : URI.create("mqtts://localhost:" + broker.getMappedPort(port));
     }
 }
