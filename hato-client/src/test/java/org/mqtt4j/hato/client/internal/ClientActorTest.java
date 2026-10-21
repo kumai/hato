@@ -161,11 +161,13 @@ class ClientActorTest {
             @Override
             public long nanoTime() {
                 // The first read starts connect on the actor. A write completion read by the
-                // sender must not take the failure meant for the next connect.
+                // sender must not take the failure meant for the next connect. Every actor read
+                // fails while rejecting, because the actor can handle an earlier write
+                // completion before the next connect, and either one stops the request.
                 if (actor == null) {
                     actor = Thread.currentThread();
                 }
-                if (actor == Thread.currentThread() && reject.getAndSet(false)) {
+                if (actor == Thread.currentThread() && reject.get()) {
                     throw failure;
                 }
                 return scheduler.nanoTime();
@@ -197,6 +199,8 @@ class ClientActorTest {
             assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectException.class)
                     .hasRootCause(failure);
+            // Reads succeed again, so closing the client meets no further failure.
+            reject.set(false);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
             assertThat(transport.closed).isTrue();
             assertThat(scheduler.pendingTaskCount()).isZero();
