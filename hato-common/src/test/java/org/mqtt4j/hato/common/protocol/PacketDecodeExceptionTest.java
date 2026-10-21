@@ -15,7 +15,8 @@ class PacketDecodeExceptionTest {
     @EnumSource(
             value = ReasonCode.class,
             names = {
-                    "MALFORMED_PACKET", "PROTOCOL_ERROR", "PACKET_TOO_LARGE", "TOPIC_ALIAS_INVALID"
+                    "MALFORMED_PACKET", "PROTOCOL_ERROR", "PACKET_TOO_LARGE", "TOPIC_ALIAS_INVALID",
+                    "RECEIVE_MAXIMUM_EXCEEDED"
             }
     )
     void retains_the_reason_and_message(ReasonCode reasonCode) {
@@ -43,7 +44,8 @@ class PacketDecodeExceptionTest {
             value = ReasonCode.class,
             mode = EnumSource.Mode.EXCLUDE,
             names = {
-                    "MALFORMED_PACKET", "PROTOCOL_ERROR", "PACKET_TOO_LARGE", "TOPIC_ALIAS_INVALID"
+                    "MALFORMED_PACKET", "PROTOCOL_ERROR", "PACKET_TOO_LARGE", "TOPIC_ALIAS_INVALID",
+                    "RECEIVE_MAXIMUM_EXCEEDED"
             }
     )
     void rejects_unrelated_reason_codes(ReasonCode reasonCode) {
