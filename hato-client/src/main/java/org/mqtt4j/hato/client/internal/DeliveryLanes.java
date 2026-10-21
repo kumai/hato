@@ -12,6 +12,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -119,6 +120,17 @@ final class DeliveryLanes {
     // lane is left or the client's close has ended hand-off; the next hand-off lane starts a
     // new one.
     private boolean handOffStarted;
+
+    // The hand-off lanes in the routing map.
+    private int handOffLanes;
+
+    // The heads of hand-off lanes, oldest first, so the worker finds the oldest one without
+    // visiting every lane. Each lane that can hand off has an entry for its head: queuing into
+    // an empty lane, the worker taking a head, and a cleared failure enter one. An entry goes
+    // stale when its lane stops, fails, or empties at a connection's end; the worker drops stale
+    // entries as it reaches them.
+    private final PriorityQueue<HandOffHead> handOffHeads =
+            new PriorityQueue<>(Comparator.comparingLong(HandOffHead::sequence));
 
     // Numbers queued deliveries in receive order across all lanes, so the hand-off worker can
     // take the oldest head.
@@ -244,6 +256,9 @@ final class DeliveryLanes {
             }
             lanes.put(lane.id, lane);
             retainedLanes++;
+            if (lane.acceptor != null) {
+                handOffLanes++;
+            }
             try {
                 if (lane.handler != null) {
                     Thread.ofVirtual()
@@ -258,6 +273,9 @@ final class DeliveryLanes {
             } catch (Throwable failure) {
                 lanes.remove(lane.id);
                 retainedLanes--;
+                if (lane.acceptor != null) {
+                    handOffLanes--;
+                }
                 throw failure;
             }
             return true;
@@ -347,6 +365,7 @@ final class DeliveryLanes {
             retireAcknowledgements();
             for (Lane lane : lanes.values()) {
                 lane.failed = false;
+                indexHandOff(lane);
                 lane.ready.signalAll();
             }
         } finally {
@@ -371,6 +390,7 @@ final class DeliveryLanes {
             }
             for (Lane lane : lanes.values()) {
                 lane.failed = false;
+                indexHandOff(lane);
                 lane.ready.signalAll();
             }
         } finally {
@@ -689,6 +709,7 @@ final class DeliveryLanes {
         view.recipient.queued = true;
         lane.retained++;
         lane.queue.addLast(view);
+        indexHandOff(lane);
         lane.ready.signal();
     }
 
@@ -1394,6 +1415,8 @@ final class DeliveryLanes {
                 view.recipient.handed = true;
                 view.offered = true;
                 lane.accepting = true;
+                // The lane's next delivery waits for its turn behind the older heads.
+                indexHandOff(lane);
             } finally {
                 lock.unlock();
             }
@@ -1405,7 +1428,7 @@ final class DeliveryLanes {
     /// lets the next hand-off lane start a new worker, once no hand-off lane is left or the
     /// client's close has ended hand-off.
     private Optional<Lane> awaitHandOff() {
-        while (!handOffsClosed && hasHandOffLanes()) {
+        while (!handOffsClosed && handOffLanes > 0) {
             Optional<Lane> oldest = oldestHandOff();
             if (oldest.isPresent()) {
                 return oldest;
@@ -1414,22 +1437,41 @@ final class DeliveryLanes {
             handOffReady.awaitUninterruptibly();
         }
         handOffStarted = false;
+        // Every entry left is stale; dropping them keeps no stopped lane reachable.
+        handOffHeads.clear();
         return Optional.empty();
     }
 
-    /// Caller holds lock. Stopped lanes have left the routing map.
-    private boolean hasHandOffLanes() {
-        return lanes.values().stream().anyMatch(lane -> lane.acceptor != null);
+    /// Caller holds lock. Among the hand-off lanes that can hand off now, the one whose head
+    /// arrived first. A failure holds its lane until it clears. The stale entries on the way
+    /// are dropped, so the search takes time that grows with them, not with the lanes.
+    private Optional<Lane> oldestHandOff() {
+        while (!handOffHeads.isEmpty()) {
+            HandOffHead entry = handOffHeads.remove();
+            Lane lane = entry.lane();
+            if (lane.indexedHead == entry.sequence()) {
+                // The lane has no entry left; a cleared failure or a new head enters one.
+                lane.indexedHead = 0;
+            }
+            if (!lane.stopped && !lane.failed && !lane.queue.isEmpty()
+                    && lane.queue.getFirst().sequence == entry.sequence()) {
+                return Optional.of(lane);
+            }
+        }
+        return Optional.empty();
     }
 
-    /// Caller holds lock. Among the hand-off lanes that can hand off now, the one whose head
-    /// arrived first. A failure holds its lane until it clears. This scans every lane, O(lanes)
-    /// per delivery with at most 256 lanes; ordering the lanes by their heads' sequence would make
-    /// it O(log lanes) if measurements show the scan.
-    private Optional<Lane> oldestHandOff() {
-        return lanes.values().stream()
-                .filter(lane -> lane.acceptor != null && !lane.failed && !lane.queue.isEmpty())
-                .min(Comparator.comparingLong(lane -> lane.queue.getFirst().sequence));
+    /// Caller holds lock. Enters the head of `lane`, if it is a hand-off lane that can hand off
+    /// and has no entry for that head yet; see [#handOffHeads].
+    private void indexHandOff(Lane lane) {
+        if (lane.acceptor == null || lane.stopped || lane.failed || lane.queue.isEmpty()) {
+            return;
+        }
+        long head = lane.queue.getFirst().sequence;
+        if (lane.indexedHead != head) {
+            lane.indexedHead = head;
+            handOffHeads.add(new HandOffHead(head, lane));
+        }
     }
 
     /// Offers a claimed delivery to its lane's acceptor, without the lock. True accepts it, false
@@ -1738,7 +1780,9 @@ final class DeliveryLanes {
         if (lane.stopped) {
             return false;
         }
-        lanes.remove(lane.id, lane);
+        if (lanes.remove(lane.id, lane) && lane.acceptor != null) {
+            handOffLanes--;
+        }
         lane.stopped = true;
         boolean ready = abandon(lane, lane.queue);
         for (Sublane sublane : lane.sublanes.values()) {
@@ -2028,6 +2072,9 @@ final class DeliveryLanes {
         // The hand-off worker is in this lane's acceptor; a stop then leaves the lane's end to
         // the worker.
         boolean accepting;
+        // The sequence of the head that this hand-off lane last entered in handOffHeads, or 0
+        // when it has no entry there; sequences start at 1.
+        long indexedHead;
         // Reasons whose first drop from this lane has been logged at warning level; later drops
         // for the same reason are logged at debug level.
         final Set<DropReason> warned = EnumSet.noneOf(DropReason.class);
@@ -2186,6 +2233,9 @@ final class DeliveryLanes {
 
     /// A QoS 0 delivery that overflow kept from the lane `id`, logged after the lock is released.
     private record Overflow(long id, DropReason reason, boolean first) {}
+
+    /// The head of a hand-off lane, by the sequence that it was queued with.
+    private record HandOffHead(long sequence, Lane lane) {}
 
     /// A delivery taken from its lane's queue. `ready` says whether taking it met the last
     /// acknowledgement condition of its receipt, which `execute` announces without the lock.

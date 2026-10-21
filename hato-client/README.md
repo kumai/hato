@@ -123,8 +123,9 @@ to publish at QoS 2.
 
 A client keeps up to 64 QoS 1 and QoS 2 publications unfinished at once, including those that
 wait for the broker to take them; a publication beyond that fails with `MqttCapacityException`.
-Set `maxInflightPublishes(n)` on the builder to keep more or fewer. Likewise,
-`maxSubscriptions(n)` lowers the 256 subscriptions that a client holds by default.
+Set `maxInflightPublishes(n)` on the builder to keep more or fewer. Likewise, a client holds up
+to 256 subscriptions by default; `maxSubscriptions(n)` raises or lowers that, and routing a
+message takes no longer as the client holds more.
 
 With MQTT 5.0, a message can also carry properties, such as a content type, a lifetime, and
 name-value pairs of your own:

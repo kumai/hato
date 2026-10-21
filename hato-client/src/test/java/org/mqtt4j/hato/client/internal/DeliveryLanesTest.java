@@ -2166,6 +2166,56 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void the_hand_off_worker_keeps_receive_order_across_many_lanes_and_waits_out_a_failure()
+            throws Exception {
+        // Arrange: lane 1 holds the worker while each of 40 lanes takes a delivery, after a
+        // QoS 1 delivery whose acceptor fails lane 20.
+        var offered = new LinkedBlockingQueue<String>();
+        var entered = new CountDownLatch(1);
+        CountDownLatch release = release();
+        for (long id = 1; id <= 40; id++) {
+            long lane = id;
+            assertThat(sut.registerHandOff(lane, request(8), delivery -> {
+                byte value = delivery.message().payload()[0];
+                offered.add(lane + ":" + value);
+                if (entered.getCount() > 0) {
+                    entered.countDown();
+                    waitFor(release);
+                }
+                if (value == 99) {
+                    throw new IllegalStateException("acceptor failure");
+                }
+                return true;
+            })).isTrue();
+        }
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
+        assertThat(entered.await(5, SECONDS)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(20L), qosOneMessage(99), false, 1)).isTrue();
+        for (long id = 2; id <= 40; id++) {
+            assertThat(sut.deliver(token(1, 0), List.of(id), message((int) id), false, 1))
+                    .isTrue();
+        }
+
+        // Act
+        release.countDown();
+
+        // Assert: the other lanes keep receive order, and the failed lane waits for its failure
+        // to clear.
+        var expected = new ArrayList<>(List.of("1:1", "20:99"));
+        for (int id = 2; id <= 40; id++) {
+            if (id != 20) {
+                expected.add(id + ":" + id);
+            }
+        }
+        await().until(() -> offered.size() == expected.size());
+        assertThat(requireNonNull(failures.poll(5, SECONDS)).token()).isEqualTo(token(1, 10));
+        assertThat(offered).containsExactlyElementsOf(expected);
+        sut.sessionDiscarded();
+        await().until(() -> offered.size() == expected.size() + 1);
+        assertThat(List.copyOf(offered).getLast()).isEqualTo("20:20");
+    }
+
+    @Test
     void a_fan_out_beyond_the_condition_limit_is_refused_until_a_receipt_ends()
             throws Exception {
         // Arrange: receipts may hold 2 acknowledgement conditions, and the first one, received

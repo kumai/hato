@@ -2,14 +2,17 @@ package org.mqtt4j.hato.client.internal;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Set;
 import java.util.function.IntPredicate;
 
 import org.jspecify.annotations.Nullable;
@@ -74,10 +77,15 @@ final class Subscriptions {
     private final int registrationLimit;
 
     // The client's registrations by id, in registration order. The indexes below hold the same
-    // registrations, so that routing a publication does not scan them all.
+    // registrations, so that no single registration or publication scans them all.
     private final Map<Long, LocalSubscription> registry = new LinkedHashMap<>();
 
+    private final Map<TopicFilter, LocalSubscription> byFilter = new HashMap<>();
+
     private final Map<Integer, LocalSubscription> byIdentifier = new HashMap<>();
+
+    // Shared subscriptions, which no other subscription may overlap, in registration order.
+    private final Set<LocalSubscription> sharedRegistrations = new LinkedHashSet<>();
 
     // The registrations by the filter that they match topics with.
     private final FilterTree<LocalSubscription> byTopic = new FilterTree<>();
@@ -107,8 +115,7 @@ final class Subscriptions {
             port.complete(operation, null, new IllegalStateException("Client is closed"));
             return;
         }
-        if (registry.values().stream()
-                .anyMatch(local -> local.filter.equals(request.filter()))) {
+        if (byFilter.containsKey(request.filter())) {
             port.complete(operation, null, new IllegalStateException(
                     "Subscription already exists: " + request.filter().pattern()
             ));
@@ -118,9 +125,11 @@ final class Subscriptions {
         boolean shared = sharedFilter.isPresent();
         TopicFilter matchingFilter = sharedFilter.map(SharedTopicFilter::filter)
                 .orElse(request.filter());
-        Optional<LocalSubscription> conflict = registry.values().stream()
-                .filter(existing -> (shared || existing.shared)
-                        && filtersOverlap(matchingFilter, existing.matchingFilter))
+        // A shared subscription is compared with every registration, in time that grows with
+        // them, and any other one only with the shared subscriptions, which are few.
+        Collection<LocalSubscription> candidates = shared ? registry.values() : sharedRegistrations;
+        Optional<LocalSubscription> conflict = candidates.stream()
+                .filter(existing -> filtersOverlap(matchingFilter, existing.matchingFilter))
                 .findFirst();
         if (conflict.isPresent()) {
             port.complete(operation, null, new IllegalStateException(
@@ -168,8 +177,8 @@ final class Subscriptions {
             // The shell starts one durable removal per registration, observed by all its callers.
             return;
         }
+        // A registration still queued for SUBSCRIBE stays in the queue, which passes over it.
         local.removal = new UnsubscribeOperation(operation, local);
-        window.registrations.remove(local);
         if (core.state() != State.CONNECTED) {
             if (cleanStart) {
                 removeSubscription(local, null);
@@ -294,6 +303,11 @@ final class Subscriptions {
         Iterator<UnsubscribeOperation> removals = window.queuedClosures.iterator();
         while (window.closingInFlight < CLOSE_INFLIGHT_LIMIT && removals.hasNext()) {
             UnsubscribeOperation removal = removals.next();
+            // A removal that finished otherwise leaves the queue when the drain reaches it.
+            if (removal.subscription.removal != removal) {
+                removals.remove();
+                continue;
+            }
             if (!removal.subscription.established) {
                 continue;
             }
@@ -313,7 +327,8 @@ final class Subscriptions {
                 return;
             }
             LocalSubscription local = window.registrations.getFirst();
-            if (!registry.containsKey(local.id)) {
+            // A removed registration, or one whose removal has begun, leaves the queue here.
+            if (!registry.containsKey(local.id) || local.removal != null) {
                 window.registrations.removeFirst();
                 continue;
             }
@@ -530,18 +545,14 @@ final class Subscriptions {
     /// increase, so a message that the broker still holds for a removed registration does not
     /// reach a newer one.
     private int allocateIdentifier() {
-        int identifier = freeIdentifier(
-                nextIdentifier,
-                candidate -> registry.values().stream()
-                        .anyMatch(local -> local.identifier == candidate)
-        );
+        int identifier = freeIdentifier(nextIdentifier, byIdentifier::containsKey);
         nextIdentifier = identifier == MAX_SUBSCRIPTION_IDENTIFIER ? 1 : identifier + 1;
         return identifier;
     }
 
     /// The first identifier that is not `inUse`, searching from `start` on and continuing from 1
-    /// past the largest. At most 256 registrations hold an identifier, so the search ends
-    /// quickly.
+    /// past the largest. The registration limit stays within the identifiers, so one is free;
+    /// identifiers only increase, so the search usually ends at `start`.
     static int freeIdentifier(int start, IntPredicate inUse) {
         int candidate = start;
         while (inUse.test(candidate)) {
@@ -550,35 +561,41 @@ final class Subscriptions {
         return candidate;
     }
 
-    /// Records `local` in the registry and in the indexes that find it by identifier and topic.
+    /// Records `local` in the registry and in the indexes that find it by filter, identifier,
+    /// and topic.
     private void register(LocalSubscription local) {
         registry.put(local.id, local);
+        byFilter.put(local.filter, local);
         byIdentifier.put(local.identifier, local);
+        if (local.shared) {
+            sharedRegistrations.add(local);
+        }
         byTopic.add(local.matchingFilter, local);
     }
 
-    /// Removes `local` from the registry and its indexes, if it is still there.
+    /// Removes `local` from the registry and its indexes, if it is still there. The queues of
+    /// the connection's window pass over it.
     private void unregister(LocalSubscription local) {
         if (registry.remove(local.id) == null) {
             return;
         }
+        byFilter.remove(local.filter);
         byIdentifier.remove(local.identifier);
+        sharedRegistrations.remove(local);
         byTopic.remove(local.matchingFilter, local);
     }
 
     private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
         unregister(local);
-        window.registrations.remove(local);
         port.removeSubscription(local.id, local.handle, cause);
     }
 
+    /// Completes the pending removal of `local`, if any. A queued removal leaves the queue when
+    /// the drain reaches it.
     private void finishRemoval(LocalSubscription local) {
         UnsubscribeOperation removal = local.removal;
-        if (removal != null) {
-            window.queuedClosures.remove(removal);
-            if (removal.operation != 0) {
-                port.complete(removal.operation, null, null);
-            }
+        if (removal != null && removal.operation != 0) {
+            port.complete(removal.operation, null, null);
         }
         local.removal = null;
     }
@@ -633,8 +650,10 @@ final class Subscriptions {
         final Map<Integer, LocalSubscription> subscribing = new HashMap<>();
         final Map<Integer, UnsubscribeOperation> unsubscribing = new HashMap<>();
         // At most one removal per registered subscription; the registry supplies the total bound.
+        // A removal that finished otherwise stays until the drain passes it.
         final ArrayDeque<UnsubscribeOperation> queuedClosures = new ArrayDeque<>();
-        // At most 256 broker registrations await queue admission.
+        // Registrations that await queue admission for SUBSCRIBE, at most the registration limit.
+        // A removed one stays until the sending passes it.
         final ArrayDeque<LocalSubscription> registrations = new ArrayDeque<>();
         int subscribingInFlight;
         int closingInFlight;

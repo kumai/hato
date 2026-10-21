@@ -131,8 +131,8 @@ class MqttClientBuilderTest {
     }
 
     @ParameterizedTest(name = "accepts {0}")
-    @ValueSource(ints = {1, 256})
-    void subscription_limits_from_1_to_256_are_accepted(int limit) {
+    @ValueSource(ints = {1, 256, 268_435_455})
+    void subscription_limits_up_to_the_subscription_identifiers_are_accepted(int limit) {
         MqttClientBuilder sut = configuredBuilder();
 
         assertThatCode(() -> sut.maxSubscriptions(limit).build().close())
@@ -140,8 +140,8 @@ class MqttClientBuilderTest {
     }
 
     @ParameterizedTest(name = "rejects {0}")
-    @ValueSource(ints = {-1, 0, 257})
-    void subscription_limits_outside_1_to_256_are_rejected(int limit) {
+    @ValueSource(ints = {-1, 0, 268_435_456})
+    void subscription_limits_beyond_the_subscription_identifiers_are_rejected(int limit) {
         MqttClientBuilder sut = configuredBuilder();
 
         assertThatThrownBy(() -> sut.maxSubscriptions(limit))
@@ -156,6 +156,11 @@ class MqttClientBuilderTest {
     @Test
     void a_client_holds_as_many_publications_and_subscriptions_as_configured() throws Exception {
         assertLimitsHold(configuredBuilder().maxInflightPublishes(2).maxSubscriptions(1), 2, 1);
+    }
+
+    @Test
+    void a_client_holds_more_subscriptions_than_the_default_when_configured() throws Exception {
+        assertLimitsHold(configuredBuilder().maxSubscriptions(1_000), 64, 1_000);
     }
 
     @Test

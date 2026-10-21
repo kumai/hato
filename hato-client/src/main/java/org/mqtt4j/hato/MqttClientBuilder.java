@@ -73,9 +73,8 @@ public final class MqttClientBuilder {
     // QoS 1 and QoS 2 exchanges need distinct packet identifiers.
     private static final int MAX_INFLIGHT_PUBLISHES = 65_535;
 
-    // A deliberate ceiling: matching and fan-out are not yet measured with more subscriptions.
-    // Raise it once they are.
-    private static final int MAX_SUBSCRIPTIONS = 256;
+    // Each subscription takes an MQTT 5.0 Subscription Identifier of its own.
+    private static final int MAX_SUBSCRIPTIONS = 268_435_455;
 
     private static final int GENERATED_CLIENT_ID_LENGTH = 23;
 
@@ -374,12 +373,17 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Limits the subscriptions that the client holds, from 1 to 256; defaults to 256. A
-    /// subscription counts from its request through [MqttSubscriber], including while it awaits
-    /// establishment, until the broker has removed it, and its delivery lane counts until its
-    /// handlers have returned. A subscription beyond the limit ends its handle, and
-    /// [Subscription#established()] fails with [MqttCapacityException]. The client keeps the
-    /// deliveries that it holds across all subscriptions within an internal limit.
+    /// Limits the subscriptions that the client holds, from 1 to 268,435,455, the number of MQTT
+    /// 5.0 Subscription Identifiers; defaults to 256. The limit guards against an application
+    /// that subscribes without end: each subscription keeps a delivery lane, and a reconnection
+    /// to a new session sends a SUBSCRIBE for each one. Routing a received publication takes
+    /// time that grows with its topic's levels and with the subscriptions that it matches, not
+    /// with the subscriptions that the client holds. A subscription counts from its request
+    /// through [MqttSubscriber], including while it awaits establishment, until the broker has
+    /// removed it, and its delivery lane counts until its handlers have returned. A subscription
+    /// beyond the limit ends its handle, and [Subscription#established()] fails with
+    /// [MqttCapacityException]. The client keeps the deliveries that it holds across all
+    /// subscriptions within an internal limit.
     public MqttClientBuilder maxSubscriptions(int value) {
         if (value < 1 || value > MAX_SUBSCRIPTIONS) {
             throw new IllegalArgumentException("Subscriptions must be 1.." + MAX_SUBSCRIPTIONS);
