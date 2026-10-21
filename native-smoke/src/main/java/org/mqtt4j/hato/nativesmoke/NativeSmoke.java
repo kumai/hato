@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -26,14 +27,15 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.broker.MqttBroker;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 /// Verifies that the packaged client and broker exchange messages at every QoS level in a native
 /// image, through a handler, through a striped handler, and through receiving on the caller's
-/// thread, in MQTT 3.1.1 and 5.0, over TCP and over TLS. For TLS, a relay in front of the broker
-/// presents the repository's test server identity.
+/// thread, in MQTT 3.1.1 and in MQTT 5.0 with message properties, over TCP and over TLS. For TLS,
+/// a relay in front of the broker presents the repository's test server identity.
 /// The image reads the identities at run time from the directory given as the only argument,
 /// `test-support/src/main/resources/tls` in this repository: embedding them would take
 /// native-image resource metadata, which Hato itself does not need.
@@ -58,12 +60,14 @@ public final class NativeSmoke {
             for (MqttVersion version : MqttVersion.values()) {
                 roundTrip(
                         "TCP " + version,
+                        version,
                         MqttClient.builder()
                                 .server(URI.create("mqtt://localhost:" + broker.port()))
                                 .version(version)
                 );
                 roundTrip(
                         "TLS " + version,
+                        version,
                         MqttClient.builder()
                                 .server(relay.uri())
                                 .version(version)
@@ -73,11 +77,15 @@ public final class NativeSmoke {
         }
         System.out.println(
                 "hato native smoke: QoS 0/1/2 through handler, striped handler, and receive"
-                        + " in MQTT 3.1.1 and 5.0 over TCP and TLS OK"
+                        + " in MQTT 3.1.1, and in MQTT 5.0 with properties, over TCP and TLS OK"
         );
     }
 
-    private static void roundTrip(String route, MqttClientBuilder builder) throws Exception {
+    private static void roundTrip(
+            String route,
+            MqttVersion version,
+            MqttClientBuilder builder
+    ) throws Exception {
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (MqttClient client = builder
                 .connectionListener(ended::add)
@@ -107,7 +115,7 @@ public final class NativeSmoke {
             // The subscriptions request QoS 2, so every level arrives with its own QoS, which
             // the comparison of messages includes.
             for (Qos qos : Qos.values()) {
-                var pushed = MqttMessage.of(new Topic("smoke/push"), new byte[] {42}, qos, false);
+                MqttMessage pushed = message(version, "smoke/push", (byte) 42, qos);
                 client.publish(pushed).get(5, SECONDS);
                 if (!pushed.equals(handled.poll(5, SECONDS))) {
                     throw new AssertionError(
@@ -115,7 +123,7 @@ public final class NativeSmoke {
                     );
                 }
 
-                var pulled = MqttMessage.of(new Topic("smoke/pull"), new byte[] {7}, qos, false);
+                MqttMessage pulled = message(version, "smoke/pull", (byte) 7, qos);
                 client.publish(pulled).get(5, SECONDS);
                 if (!(pull.receive(Duration.ofSeconds(5))
                         instanceof ReceiveResult.Received(var delivery))
@@ -126,8 +134,7 @@ public final class NativeSmoke {
                 }
                 delivery.ack();
 
-                var stripedMessage =
-                        MqttMessage.of(new Topic("smoke/striped"), new byte[] {9}, qos, false);
+                MqttMessage stripedMessage = message(version, "smoke/striped", (byte) 9, qos);
                 client.publish(stripedMessage).get(5, SECONDS);
                 if (!stripedMessage.equals(striped.poll(5, SECONDS))) {
                     throw new AssertionError(
@@ -150,6 +157,27 @@ public final class NativeSmoke {
                 throw new AssertionError(route + " connection ended before the disconnect");
             }
         }
+    }
+
+    // A message to publish on `topic`. An MQTT 5.0 message also carries each property that the
+    // broker forwards unchanged, so the comparison on arrival covers them, User Properties and
+    // their order included. The message expiry is left out, because the broker forwards only what
+    // is left of it.
+    private static MqttMessage message(MqttVersion version, String topic, byte payload, Qos qos) {
+        var message = MqttMessage.of(new Topic(topic), new byte[] {payload}, qos, false);
+        return switch (version) {
+            case V3_1_1 -> message;
+            case V5 -> message
+                    .withPayloadUtf8(true)
+                    .withContentType("text/plain")
+                    .withResponseTopic(new Topic(topic + "/replies"))
+                    .withCorrelationData(new byte[] {1, 2, 3})
+                    .withUserProperties(List.of(
+                            new UserProperty("route", "native"),
+                            new UserProperty("hop", "1"),
+                            new UserProperty("route", "smoke")
+                    ));
+        };
     }
 
     private static SSLContext serverContext(Path identities)
