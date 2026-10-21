@@ -1276,6 +1276,25 @@ class ClientIoTest {
         }
 
         @Override
+        public byte[] encodeAliasPublishHeader(
+                Qos qos,
+                boolean retain,
+                boolean dup,
+                int packetId,
+                Properties properties,
+                int payloadSize
+        ) {
+            return delegate.encodeAliasPublishHeader(
+                    qos,
+                    retain,
+                    dup,
+                    packetId,
+                    properties,
+                    payloadSize
+            );
+        }
+
+        @Override
         public byte[] encodePublish(byte[] header, byte[] payload) {
             prepared.incrementAndGet();
             beforeEncode.run();

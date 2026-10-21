@@ -555,6 +555,23 @@ class PacketCodecTest {
         )).isInstanceOf(IllegalArgumentException.class);
     }
 
+    @Test
+    void an_mqtt_3_1_1_publish_header_cannot_omit_its_topic() {
+        // Arrange
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        var alias = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 1)));
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.encodeAliasPublishHeader(
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                alias,
+                0
+        )).isInstanceOf(IllegalArgumentException.class);
+    }
+
     @ParameterizedTest
     @CsvSource(textBlock = """
             AT_MOST_ONCE, true, 0

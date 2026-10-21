@@ -576,6 +576,48 @@ class Mqtt5PacketCodecTest {
     }
 
     @Test
+    void prepares_the_header_of_a_publish_that_omits_its_topic() {
+        // Arrange
+        byte[] payload = {1, 2, 3};
+        var properties = new Properties(List.of(
+                new Property.UserProperty("site", "plant-3"),
+                new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 3)
+        ));
+
+        // Act
+        byte[] header = sut.encodeAliasPublishHeader(
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                1,
+                properties,
+                payload.length
+        );
+
+        // Assert
+        assertThat(sut.encodePublish(header, payload)).isEqualTo(sut.encode(new Packet.AliasPublish(
+                payload,
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                1,
+                properties
+        )));
+    }
+
+    @Test
+    void a_publish_header_that_omits_its_topic_requires_an_alias() {
+        assertThatThrownBy(() -> sut.encodeAliasPublishHeader(
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                EMPTY,
+                0
+        )).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void requires_an_alias_for_an_omitted_publish_topic() {
         var packet = new Packet.AliasPublish(
                 new byte[0],

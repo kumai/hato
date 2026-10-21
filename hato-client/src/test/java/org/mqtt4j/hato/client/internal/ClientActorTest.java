@@ -8750,6 +8750,25 @@ class ClientActorTest {
         }
 
         @Override
+        public byte[] encodeAliasPublishHeader(
+                Qos qos,
+                boolean retain,
+                boolean dup,
+                int packetId,
+                Properties properties,
+                int payloadSize
+        ) {
+            return codec.encodeAliasPublishHeader(
+                    qos,
+                    retain,
+                    dup,
+                    packetId,
+                    properties,
+                    payloadSize
+            );
+        }
+
+        @Override
         public byte[] encodePublish(byte[] header, byte[] payload) {
             beforePublish.run();
             return codec.encodePublish(header, payload);

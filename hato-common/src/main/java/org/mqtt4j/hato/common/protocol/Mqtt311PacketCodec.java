@@ -140,6 +140,18 @@ final class Mqtt311PacketCodec implements PacketCodec {
     }
 
     @Override
+    public byte[] encodeAliasPublishHeader(
+            Qos qos,
+            boolean retain,
+            boolean dup,
+            int packetId,
+            Properties properties,
+            int payloadSize
+    ) {
+        throw new IllegalArgumentException("MQTT 3.1.1 requires a PUBLISH topic name");
+    }
+
+    @Override
     public byte[] encodePublishHeader(
             Topic topic,
             Qos qos,

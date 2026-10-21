@@ -162,6 +162,29 @@ final class Mqtt5PacketCodec implements PacketCodec {
         );
     }
 
+    @Override
+    public byte[] encodeAliasPublishHeader(
+            Qos qos,
+            boolean retain,
+            boolean dup,
+            int packetId,
+            Properties properties,
+            int payloadSize
+    ) {
+        // Validate the shared packet invariants without allocating the declared payload.
+        var packet = new Packet.AliasPublish(new byte[0], qos, retain, dup, packetId, properties);
+        requireTopicAlias(packet.properties());
+        return writePublishHeader(
+                "",
+                qos,
+                retain,
+                dup,
+                packetId,
+                properties,
+                payloadSize
+        );
+    }
+
     private static byte[] writePublishHeader(
             String topic,
             Qos qos,

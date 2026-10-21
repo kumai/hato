@@ -56,6 +56,21 @@ public interface PacketCodec {
             int payloadSize
     );
 
+    /// Prepares the headers of an MQTT 5.0 PUBLISH that omits its topic name, like
+    /// [#encodePublishHeader] for an [Packet.AliasPublish]: `properties` must carry the Topic
+    /// Alias that stands for the topic.
+    ///
+    /// @throws IllegalArgumentException if `properties` has no Topic Alias, this version has no
+    ///         Topic Alias, or the arguments are invalid as for [#encodePublishHeader]
+    byte[] encodeAliasPublishHeader(
+            Qos qos,
+            boolean retain,
+            boolean dup,
+            int packetId,
+            Properties properties,
+            int payloadSize
+    );
+
     /// Appends a payload to its prepared PUBLISH header in a new complete packet array.
     ///
     /// `header` must be the unchanged result of [#encodePublishHeader] with `payload.length` as
