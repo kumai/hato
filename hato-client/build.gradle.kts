@@ -45,9 +45,14 @@ testing {
             }
             // Virtual threads are not preempted, so on a single carrier, as in a one-CPU
             // container, one busy virtual thread holds up all others. Run the suite that way too.
+            // Brokers configured with smaller limits check the client's decisions against what
+            // they announce, which a single carrier does not change, so they run once.
             targets.register("integrationTestSingleCarrier") {
                 testTask.configure {
                     jvmArgs("-Djdk.virtualThreadScheduler.parallelism=1")
+                    filter {
+                        excludeTestsMatching("*5RestrictedTest")
+                    }
                 }
             }
         }
