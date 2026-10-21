@@ -79,8 +79,8 @@ class Qos2ReceiveTest {
         requireNonNull(received.receipt()).markAccepted();
         receive(pubRel(7));
         Sent completed = lastAcknowledgement();
-        sut.written(generation, received.ticket());
-        sut.written(generation, completed.ticket());
+        sut.written(generation, received.ticket(), 0);
+        sut.written(generation, completed.ticket(), 0);
 
         // Assert
         assertThat(acknowledgements()).containsExactly(pubRec(7), pubComp(7));
@@ -191,8 +191,8 @@ class Qos2ReceiveTest {
         // Act: the broker may reuse its id before the PUBCOMP write callback reaches the actor.
         receive(publish(7, Qos.EXACTLY_ONCE, false));
         DeliveryToken current = port.deliveries.getLast();
-        sut.written(generation, received.ticket());
-        sut.written(generation, completed.ticket());
+        sut.written(generation, received.ticket(), 0);
+        sut.written(generation, completed.ticket(), 0);
         ready(current);
 
         // Assert
@@ -303,7 +303,7 @@ class Qos2ReceiveTest {
         DeliveryToken original = port.deliveries.getLast();
         ready(original);
         Sent received = lastAcknowledgement();
-        sut.written(generation, received.ticket());
+        sut.written(generation, received.ticket(), 0);
         sut.failed(generation, new IOException("lost before PUBREL"));
 
         // Act: the continued broker can start with PUBREL, without sending PUBLISH again.
@@ -325,7 +325,7 @@ class Qos2ReceiveTest {
         DeliveryToken original = port.deliveries.getLast();
         ready(original);
         Sent received = lastAcknowledgement();
-        sut.written(generation, received.ticket());
+        sut.written(generation, received.ticket(), 0);
         assertThat(port.handed).isEmpty();
         sut.failed(generation, new IOException("lost after PUBREC was written"));
 
@@ -430,7 +430,7 @@ class Qos2ReceiveTest {
         receive(publish(7, Qos.EXACTLY_ONCE, false));
         DeliveryToken current = port.deliveries.getLast();
         ready(old);
-        sut.written(received.generation(), received.ticket());
+        sut.written(received.generation(), received.ticket(), 0);
         ready(current);
 
         // Assert
@@ -501,7 +501,7 @@ class Qos2ReceiveTest {
         // Act: each PUBCOMP write returns the capacity its reception still held.
         for (int id = 1; id <= 4096; id++) {
             receive(pubRel(id));
-            sut.written(generation, lastAcknowledgement().ticket());
+            sut.written(generation, lastAcknowledgement().ticket(), 0);
         }
         receive(publish(1, Qos.EXACTLY_ONCE, false));
 
@@ -568,8 +568,8 @@ class Qos2ReceiveTest {
         connect(true);
         receive(pubRel(7));
         Sent repeatedCompletion = lastAcknowledgement();
-        sut.written(originalCompletion.generation(), originalCompletion.ticket());
-        sut.written(generation, repeatedCompletion.ticket());
+        sut.written(originalCompletion.generation(), originalCompletion.ticket(), 0);
+        sut.written(generation, repeatedCompletion.ticket(), 0);
 
         // Assert
         assertThat(port.deliveries).containsExactly(original);
@@ -608,7 +608,7 @@ class Qos2ReceiveTest {
         receive(publish(7, Qos.EXACTLY_ONCE, true));
         DeliveryToken current = port.deliveries.getLast();
         ready(original);
-        originalWrites.forEach(send -> sut.written(send.generation(), send.ticket()));
+        originalWrites.forEach(send -> sut.written(send.generation(), send.ticket(), 0));
 
         // Assert
         assertThat(current.acknowledgement()).isNotEqualTo(original.acknowledgement());
@@ -657,7 +657,7 @@ class Qos2ReceiveTest {
                                     && send.packet() instanceof Packet.PubRec)
                             .mapToLong(Sent::ticket)
                             .findFirst().orElse(Long.MAX_VALUE);
-                    sut.written(originalGeneration, ticket);
+                    sut.written(originalGeneration, ticket, 0);
                 }
                 case PUBREL -> {
                     sut.received(originalGeneration, pubRel(7), 0, 16);
@@ -707,7 +707,7 @@ class Qos2ReceiveTest {
         List<Sent> oldWrites = port.sent.stream()
                 .filter(send -> send.generation() == originalGeneration)
                 .toList();
-        oldWrites.forEach(send -> sut.written(originalGeneration, send.ticket()));
+        oldWrites.forEach(send -> sut.written(originalGeneration, send.ticket(), 0));
         sut.received(originalGeneration, pubRel(7), 0, 16);
         ready(original);
         assertThat(acknowledgements()).containsExactlyElementsOf(expected);
@@ -760,7 +760,7 @@ class Qos2ReceiveTest {
             ready(port.deliveries.getLast());
             Sent received = lastAcknowledgement();
             requireNonNull(received.receipt()).markAccepted();
-            sut.written(generation, received.ticket());
+            sut.written(generation, received.ticket(), 0);
         }
     }
 

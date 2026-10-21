@@ -104,7 +104,7 @@ class ReceivePersistenceTest {
         assertThat(port.released).containsExactly(original.acknowledgement());
         Sent acknowledgement = lastAcknowledgement();
         requireNonNull(acknowledgement.receipt()).markAccepted();
-        sut.written(generation, acknowledgement.ticket());
+        sut.written(generation, acknowledgement.ticket(), 0);
         assertThat(port.released).containsExactly(original.acknowledgement());
     }
 
@@ -182,7 +182,7 @@ class ReceivePersistenceTest {
         // Act
         receive(7, dup);
         ready(original);
-        sut.written(acknowledgement.generation(), acknowledgement.ticket());
+        sut.written(acknowledgement.generation(), acknowledgement.ticket(), 0);
 
         // Assert
         DeliveryToken current = port.deliveries.getLast();
@@ -367,7 +367,7 @@ class ReceivePersistenceTest {
             ready(original);
             Sent acknowledgement = lastAcknowledgement();
             requireNonNull(acknowledgement.receipt()).markAccepted();
-            sut.written(generation, acknowledgement.ticket());
+            sut.written(generation, acknowledgement.ticket(), 0);
         }
         sut.failed(generation, new IOException("lost"));
         connect(present);
@@ -470,7 +470,7 @@ class ReceivePersistenceTest {
             if (handed) {
                 endings.add(() -> requireNonNull(acknowledgement.receipt()).markAccepted());
                 if (random.nextBoolean()) {
-                    endings.add(() -> sut.written(oldGeneration, acknowledgement.ticket()));
+                    endings.add(() -> sut.written(oldGeneration, acknowledgement.ticket(), 0));
                 }
             }
         }
@@ -494,7 +494,7 @@ class ReceivePersistenceTest {
                 expected.add(id);
             }
             ready(original);
-            sut.written(oldGeneration, originalAcks.get(id - 1).ticket());
+            sut.written(oldGeneration, originalAcks.get(id - 1).ticket(), 0);
 
             // Assert: stale conditions and writes cannot acknowledge a new identifier occupant.
             assertThat(current.acknowledgement() == original.acknowledgement())
@@ -514,7 +514,7 @@ class ReceivePersistenceTest {
         for (Sent acknowledgement : port.sent.stream()
                 .filter(send -> send.packet() instanceof Packet.PubAck).toList()) {
             requireNonNull(acknowledgement.receipt()).markAccepted();
-            sut.written(generation, acknowledgement.ticket());
+            sut.written(generation, acknowledgement.ticket(), 0);
         }
         assertThat(port.handed).isEmpty();
         var handlerFailure = new IOException("late handler failure for seed " + seed);
@@ -527,7 +527,7 @@ class ReceivePersistenceTest {
             DeliveryToken token = originals.get(i);
             Sent acknowledgement = originalAcks.get(i);
             completions.add(() -> ready(token));
-            completions.add(() -> sut.written(oldGeneration, acknowledgement.ticket()));
+            completions.add(() -> sut.written(oldGeneration, acknowledgement.ticket(), 0));
         }
         DeliveryToken failed = originals.get(random.nextInt(originals.size()));
         completions.add(() -> sut.deliveryFailed(failed, handlerFailure));

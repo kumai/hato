@@ -13,6 +13,8 @@ import java.util.function.IntPredicate;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.ClientStats.CapacityLimit;
+import org.mqtt4j.hato.ClientStats.Usage;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttProtocolException;
@@ -122,6 +124,7 @@ final class Subscriptions {
             return;
         }
         if (registry.size() >= registrationLimit) {
+            core.refused(CapacityLimit.SUBSCRIPTIONS);
             port.complete(operation, null, new MqttCapacityException("Subscription capacity"));
             return;
         }
@@ -129,6 +132,7 @@ final class Subscriptions {
         // Registration precedes send: a broker may publish before sending SUBACK.
         Optional<Subscription> registered = port.registerSubscription(operation);
         if (registered.isEmpty()) {
+            core.refused(CapacityLimit.SUBSCRIPTIONS);
             port.complete(operation, null, new MqttCapacityException("Subscription capacity"));
             return;
         }
@@ -600,6 +604,34 @@ final class Subscriptions {
         int subscribingInFlight;
         int closingInFlight;
     }
+
+    /// The registrations' values in [ClientSnapshot.Subscribing] that the core knows.
+    Values values() {
+        long established = 0;
+        long pending = 0;
+        long removing = 0;
+        for (LocalSubscription local : registry.values()) {
+            if (local.removal != null) {
+                removing++;
+            } else if (local.established) {
+                established++;
+            } else {
+                pending++;
+            }
+        }
+        return new Values(
+                new Usage(registry.size(), registrationLimit),
+                established,
+                pending,
+                removing
+        );
+    }
+
+    /// @param registrations the registrations, against their limit
+    /// @param established registrations that the broker has granted
+    /// @param pending registrations that wait for a connection or for SUBACK
+    /// @param removing registrations whose removal waits for the broker
+    record Values(Usage registrations, long established, long pending, long removing) {}
 
     private static final class LocalSubscription {
 

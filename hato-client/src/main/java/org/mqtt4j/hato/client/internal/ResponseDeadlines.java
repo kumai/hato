@@ -80,6 +80,15 @@ final class ResponseDeadlines {
         return Optional.of(Duration.ofNanos(remaining));
     }
 
+    /// How long the oldest awaited response has been awaited at `now` on the client's clock,
+    /// since the write that it answers completed; empty if no response is awaited.
+    Optional<Duration> oldestWait(long now) {
+        Map.Entry<Response, Long> head = waiting.firstEntry();
+        return head == null
+                ? Optional.empty()
+                : Optional.of(Duration.ofNanos(now - head.getValue()));
+    }
+
     Kind headKind() {
         return requireNonNull(waiting.firstEntry()).getKey().kind();
     }

@@ -212,4 +212,23 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// listener, supplier, or continuation that the client runs, or on a thread that such code
     /// needs in order to return, never completes.
     CompletableFuture<Void> terminated();
+
+    /// Takes a snapshot of what this client holds and has counted, which only the client can
+    /// know; see [ClientStats]. The client collects it at one point, so its values agree with
+    /// each other. A call made while an earlier call waits for the client shares that call's
+    /// snapshot, so calling often does not crowd the client. After [#close()], the future
+    /// completes with the snapshot collected when the client stopped, which no longer changes.
+    ///
+    /// Each call returns an independent future. Pending calls share the client-wide limit
+    /// described by [Subscription#established()], and a full limit returns a future already
+    /// failed with [MqttCapacityException]. A runtime exception from the time read of the
+    /// client's [org.mqtt4j.hato.spi.TimerScheduler] fails the pending calls with that
+    /// exception and affects the connection as that interface describes. A client that keeps
+    /// no statistics, such as an application's test double, returns a future failed with
+    /// [UnsupportedOperationException], as this default method does.
+    default CompletableFuture<ClientStats> stats() {
+        return CompletableFuture.failedFuture(
+                new UnsupportedOperationException("This client keeps no statistics")
+        );
+    }
 }

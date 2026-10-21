@@ -103,7 +103,7 @@ void show(MqttMessage message) {
 ## Guides
 
 - [Client](hato-client/README.md): configure connections, manage subscriptions,
-  and handle failures.
+  handle failures, and watch the client.
 - [Embedded broker](hato-broker/README.md): run a broker inside your application
   for tests, device simulators, and demos.
 - [Test kit](hato-testkit/README.md): simulate connection failures and control time

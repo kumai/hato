@@ -27,6 +27,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.ClientStats.DropReason;
 import org.mqtt4j.hato.FailurePolicy;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
@@ -35,7 +36,6 @@ import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
-import org.mqtt4j.hato.client.internal.DeliveryLanes.Dropped;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -94,8 +94,8 @@ class DeliveryLanesTest {
         sut.connectionEnded(false, false);
 
         // Assert
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isZero();
-        assertThat(sut.dropped(Dropped.CONNECTION_ENDED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isZero();
+        assertThat(sut.dropped(DropReason.CONNECTION_ENDED)).isEqualTo(1);
         assertThat(sut.retainedLanes()).isEqualTo(1);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
@@ -122,8 +122,8 @@ class DeliveryLanesTest {
 
         // Assert
         assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isZero();
-        assertThat(sut.dropped(Dropped.CONNECTION_ENDED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isZero();
+        assertThat(sut.dropped(DropReason.CONNECTION_ENDED)).isEqualTo(1);
         assertThat(sut.retainedLanes()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isZero();
     }
@@ -141,7 +141,7 @@ class DeliveryLanesTest {
         assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 20)).isTrue();
 
         assertThat(sut.connectionEnded(true, false)).containsExactlyEntriesOf(Map.of(10L, false));
-        assertThat(sut.dropped(Dropped.CONNECTION_ENDED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.CONNECTION_ENDED)).isEqualTo(1);
         assertThat(sut.acknowledgingDeliveries()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(10);
         assertThat(sut.deliver(token(2, 10), List.of(1L), qosOneMessage(), true, 10)).isTrue();
@@ -733,7 +733,7 @@ class DeliveryLanesTest {
         assertThat(entered).isEmpty();
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
         assertThat(sut.retainedBytes()).isEqualTo(30);
-        assertThat(sut.dropped(1, Dropped.SUBSCRIPTION_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(1, DropReason.SUBSCRIPTION_FULL)).isEqualTo(1);
 
         // Act: returning the first handler lets the queued delivery run.
         release.countDown();
@@ -779,7 +779,7 @@ class DeliveryLanesTest {
         assertThat(workers.poll(5, SECONDS)).isSameAs(worker);
         assertThat(interruptStates.poll(5, SECONDS)).isFalse();
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
-        assertThat(sut.dropped(Dropped.FAILED)).isZero();
+        assertThat(sut.dropped(DropReason.FAILED)).isZero();
     }
 
     @Test
@@ -809,7 +809,7 @@ class DeliveryLanesTest {
         // Assert
         assertThat(interruptStates.poll(5, SECONDS)).isFalse();
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
-        assertThat(sut.dropped(Dropped.FAILED)).isZero();
+        assertThat(sut.dropped(DropReason.FAILED)).isZero();
         assertThat(failures).isEmpty();
     }
 
@@ -850,7 +850,7 @@ class DeliveryLanesTest {
         assertThat(sut.deliver(token(1, 0), List.of(1L, 2L), message(3), false, 10)).isTrue();
         assertThat(entered.poll(5, SECONDS)).isEqualTo(1L);
         assertThat(entered).isEmpty();
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isZero();
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isZero();
     }
 
     @Test
@@ -896,8 +896,8 @@ class DeliveryLanesTest {
 
         // Assert: only the full lane misses the publication; the other lane runs it.
         assertThat(entered.poll(5, SECONDS)).isEqualTo(2L);
-        assertThat(sut.dropped(1, Dropped.SUBSCRIPTION_FULL)).isEqualTo(1);
-        assertThat(sut.dropped(2, Dropped.SUBSCRIPTION_FULL)).isZero();
+        assertThat(sut.dropped(1, DropReason.SUBSCRIPTION_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(2, DropReason.SUBSCRIPTION_FULL)).isZero();
         release.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
         assertThat(entered).isEmpty();
@@ -930,13 +930,13 @@ class DeliveryLanesTest {
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isEqualTo(1));
         assertThat(sut.retainedBytes()).isEqualTo(BYTE_LIMIT);
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 1)).isTrue();
-        assertThat(sut.dropped(1, Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(1, DropReason.CLIENT_FULL)).isEqualTo(1);
 
         // Act & Assert: the last handler returns the shared capacity.
         secondRelease.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 1)).isTrue();
-        assertThat(sut.dropped(Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.CLIENT_FULL)).isEqualTo(1);
     }
 
     @Test
@@ -976,7 +976,7 @@ class DeliveryLanesTest {
         assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(2));
         await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
         assertThat(entered).isEmpty();
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isZero();
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isZero();
     }
 
     @Test
@@ -1001,7 +1001,7 @@ class DeliveryLanesTest {
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(10);
         assertThat(sut.retainedLanes()).isEqualTo(1);
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isEqualTo(2);
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isEqualTo(2);
 
         // Act & Assert: the worker exits after the running handler returns.
         release.countDown();
@@ -1026,14 +1026,14 @@ class DeliveryLanesTest {
         sut.connectionEnded(false, false);
         assertThat(sut.register(2, request(2), _ -> { })).isTrue();
         assertThat(sut.deliver(token(2, 0), List.of(2L), message(2), false, 1)).isTrue();
-        assertThat(sut.dropped(2, Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(2, DropReason.CLIENT_FULL)).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(BYTE_LIMIT);
 
         // Act & Assert: returning the old handler permits delivery in the new generation.
         release.countDown();
         await().untilAsserted(() -> assertThat(sut.retainedBytes()).isZero());
         assertThat(sut.deliver(token(2, 0), List.of(2L), message(2), false, 1)).isTrue();
-        assertThat(sut.dropped(2, Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(2, DropReason.CLIENT_FULL)).isEqualTo(1);
     }
 
     @Test
@@ -1054,7 +1054,7 @@ class DeliveryLanesTest {
         // delivery is dropped, and a QoS 1 delivery behind the QoS 0 backlog is refused, which
         // ends the connection.
         assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 1)).isTrue();
-        assertThat(sut.dropped(1, Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(1, DropReason.CLIENT_FULL)).isEqualTo(1);
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 1)).isFalse();
         assertThat(sut.retainedDeliveries()).isEqualTo(65_536);
 
@@ -1064,7 +1064,7 @@ class DeliveryLanesTest {
         // Assert: queued deliveries are abandoned; the executing handler keeps its reservation.
         assertThat(sut.retainedDeliveries()).isEqualTo(1);
         assertThat(sut.retainedBytes()).isEqualTo(1);
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isEqualTo(65_535);
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isEqualTo(65_535);
     }
 
     @Test
@@ -1091,8 +1091,8 @@ class DeliveryLanesTest {
         // Assert: the publication reaches neither lane rather than the one that would fit, and
         // a later one for the second lane alone fits.
         assertThat(sut.retainedDeliveries()).isEqualTo(65_535);
-        assertThat(sut.dropped(1, Dropped.CLIENT_FULL)).isEqualTo(1);
-        assertThat(sut.dropped(2, Dropped.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(1, DropReason.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(2, DropReason.CLIENT_FULL)).isEqualTo(1);
         assertThat(sut.deliver(token(1, 0), List.of(2L), message(3), false, 1)).isTrue();
         assertThat(handled.poll(5, SECONDS)).isEqualTo(message(3));
         assertThat(handled).isEmpty();
@@ -1153,8 +1153,8 @@ class DeliveryLanesTest {
         assertThat(sut.retainedLanes()).isEqualTo(1);
         assertThat(sut.retainedDeliveries()).isZero();
         assertThat(sut.retainedBytes()).isZero();
-        assertThat(sut.dropped(Dropped.FAILED)).isEqualTo(1);
-        assertThat(sut.dropped(Dropped.CONNECTION_ENDED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.FAILED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.CONNECTION_ENDED)).isEqualTo(1);
         assertThat(calls.get()).isEqualTo(1);
     }
 
@@ -1232,7 +1232,7 @@ class DeliveryLanesTest {
         // Assert: nothing is left to protect, so the failure stops nothing and the lane goes on.
         await().until(() -> sut.reportedFailures() == 1);
         assertThat(failures).isEmpty();
-        assertThat(sut.dropped(Dropped.FAILED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.FAILED)).isEqualTo(1);
         assertThat(sut.retainedBytes()).isZero();
         assertThat(sut.deliver(token(2, 0), List.of(1L), message(2), false, 1)).isTrue();
         assertThat(requireNonNull(received.poll(5, SECONDS)).message()).isEqualTo(message(2));
@@ -1263,7 +1263,7 @@ class DeliveryLanesTest {
         // skips the failure, and the lane goes on.
         await().until(() -> sut.reportedFailures() == 1);
         assertThat(failures).isEmpty();
-        assertThat(sut.dropped(Dropped.FAILED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.FAILED)).isEqualTo(1);
         assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(2), false, 1)).isTrue();
         assertThat(received.poll(5, SECONDS)).isEqualTo(qosOneMessage(2));
         assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
@@ -1312,7 +1312,7 @@ class DeliveryLanesTest {
             assertThat(sut.retainedLanes()).isEqualTo(1);
             assertThat(failures).isEmpty();
             assertThat(logCalls.get()).isEqualTo(1);
-            assertThat(sut.dropped(Dropped.FAILED)).isEqualTo(1);
+            assertThat(sut.dropped(DropReason.FAILED)).isEqualTo(1);
         } finally {
             jul.removeHandler(handler);
             jul.setLevel(previousLevel);
@@ -1485,7 +1485,7 @@ class DeliveryLanesTest {
         assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
         assertThat(ready).isEmpty();
         assertThat(received).isEmpty();
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isEqualTo(1);
         assertThat(sut.retainedDeliveries()).isEqualTo(2);
         delivery.ack();
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
@@ -1774,7 +1774,7 @@ class DeliveryLanesTest {
         assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
         assertThat(handled).containsExactly(message(1), message(2));
         assertThat(sut.retainedLanes()).isZero();
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isZero();
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isZero();
         assertThat(terminated).isEmpty();
     }
 
@@ -1839,7 +1839,7 @@ class DeliveryLanesTest {
         // Assert: nothing remains to receive, so the lane stops without another receive call.
         assertThat(terminated).containsExactly(1L);
         assertThat(receiver.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.Ended());
-        assertThat(sut.dropped(Dropped.CONNECTION_ENDED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.CONNECTION_ENDED)).isEqualTo(1);
     }
 
     @Test
@@ -1911,7 +1911,7 @@ class DeliveryLanesTest {
         // Assert: the task ran the first delivery, and each refused request skipped the next
         // one, so no delivery waits for a task, every slot has returned, and the lane goes on.
         assertThat(handled).containsExactly((byte) 1);
-        assertThat(sut.dropped(Dropped.FAILED)).isEqualTo(2);
+        assertThat(sut.dropped(DropReason.FAILED)).isEqualTo(2);
         assertThat(executor.executions()).isEqualTo(3);
         assertThat(executor.held()).isZero();
         assertThat(sut.retainedDeliveries()).isZero();
@@ -2068,7 +2068,7 @@ class DeliveryLanesTest {
         // Assert: the discarded delivery got no lane and no failure; the next one ran.
         assertThat(selected).containsExactly((byte) 1, (byte) 2);
         assertThat(handled).containsExactly((byte) 2);
-        assertThat(sut.dropped(Dropped.CONNECTION_ENDED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.CONNECTION_ENDED)).isEqualTo(1);
         assertThat(sut.reportedFailures()).isZero();
     }
 
@@ -2126,12 +2126,12 @@ class DeliveryLanesTest {
         sut.connectionEnded(false, false);
 
         // Assert
-        assertThat(sut.dropped(1, Dropped.FAILED)).isEqualTo(2);
-        assertThat(sut.dropped(1, Dropped.CONNECTION_ENDED)).isZero();
-        assertThat(sut.dropped(2, Dropped.FAILED)).isZero();
-        assertThat(sut.dropped(2, Dropped.CONNECTION_ENDED)).isEqualTo(1);
-        assertThat(sut.dropped(Dropped.FAILED)).isEqualTo(2);
-        assertThat(sut.dropped(Dropped.CONNECTION_ENDED)).isEqualTo(1);
+        assertThat(sut.dropped(1, DropReason.FAILED)).isEqualTo(2);
+        assertThat(sut.dropped(1, DropReason.CONNECTION_ENDED)).isZero();
+        assertThat(sut.dropped(2, DropReason.FAILED)).isZero();
+        assertThat(sut.dropped(2, DropReason.CONNECTION_ENDED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.FAILED)).isEqualTo(2);
+        assertThat(sut.dropped(DropReason.CONNECTION_ENDED)).isEqualTo(1);
     }
 
     @Test
@@ -2322,8 +2322,8 @@ class DeliveryLanesTest {
         // Assert: the other lane receives it, the refusing acceptor is not asked again, and no
         // connection ends.
         assertThat(accepted.poll(5, SECONDS)).isNotNull();
-        assertThat(sut.dropped(1, Dropped.REFUSED)).isEqualTo(1);
-        assertThat(sut.dropped(2, Dropped.REFUSED)).isZero();
+        assertThat(sut.dropped(1, DropReason.REFUSED)).isEqualTo(1);
+        assertThat(sut.dropped(2, DropReason.REFUSED)).isZero();
         assertThat(offers).hasValue(1);
     }
 
@@ -2344,7 +2344,7 @@ class DeliveryLanesTest {
         // Assert: the connection that delivered it ends as overloaded. Its acknowledgement is
         // not met, and it counts as not handed off, so a continued session hands it off again.
         assertThat(overloads.poll(5, SECONDS)).isEqualTo(arrival);
-        assertThat(sut.dropped(1, Dropped.REFUSED)).isEqualTo(1);
+        assertThat(sut.dropped(1, DropReason.REFUSED)).isEqualTo(1);
         assertThat(offers).hasValue(1);
         assertThat(sut.isReady(10)).isFalse();
         assertThat(sut.receiveState()).isEmpty();
@@ -2397,7 +2397,7 @@ class DeliveryLanesTest {
 
         // Assert: the overload ends connection 2, not the receipt's first connection.
         assertThat(overloads.poll(5, SECONDS)).isEqualTo(token(2, 10));
-        assertThat(sut.dropped(2, Dropped.REFUSED)).isEqualTo(2);
+        assertThat(sut.dropped(2, DropReason.REFUSED)).isEqualTo(2);
     }
 
     @Test
@@ -2447,7 +2447,7 @@ class DeliveryLanesTest {
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
         assertThat(offered).containsExactly((byte) 1, (byte) 2);
-        assertThat(sut.dropped(1, Dropped.FAILED)).isEqualTo(1);
+        assertThat(sut.dropped(1, DropReason.FAILED)).isEqualTo(1);
     }
 
     @Test
@@ -2471,7 +2471,7 @@ class DeliveryLanesTest {
 
         // Assert: the waiting delivery is discarded at once, but the lane keeps its slot and
         // ends only after the acceptor returns, which accepts the offered delivery.
-        assertThat(sut.dropped(Dropped.SUBSCRIPTION_STOPPED)).isEqualTo(1);
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isEqualTo(1);
         assertThat(terminated).isEmpty();
         assertThat(sut.retainedLanes()).isEqualTo(1);
         release.countDown();
@@ -2545,7 +2545,7 @@ class DeliveryLanesTest {
         // Assert
         await().until(() -> sut.retainedDeliveries() == 0);
         assertThat(offered).containsExactly((byte) 1);
-        assertThat(sut.dropped(1, Dropped.CONNECTION_ENDED)).isEqualTo(2);
+        assertThat(sut.dropped(1, DropReason.CONNECTION_ENDED)).isEqualTo(2);
     }
 
     @Test

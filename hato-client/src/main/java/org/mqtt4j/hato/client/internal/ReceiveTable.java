@@ -33,12 +33,13 @@ final class ReceiveTable {
         this.capacity = capacity;
     }
 
-    /// Superseded receptions keep counting until their pending write is removed.
-    Optional<Entry> add(long token, int packetId, Qos qos) {
+    /// Superseded receptions keep counting until their pending write is removed. `now` is the
+    /// time of the reception on the client's clock.
+    Optional<Entry> add(long token, int packetId, Qos qos, long now) {
         if (entries.size() >= capacity || identifiers.containsKey(packetId)) {
             return Optional.empty();
         }
-        var entry = new Entry(token, packetId, qos);
+        var entry = new Entry(token, packetId, qos, now);
         entries.put(token, entry);
         identifiers.put(packetId, entry);
         return Optional.of(entry);
@@ -68,6 +69,10 @@ final class ReceiveTable {
         return capacity - entries.size();
     }
 
+    int capacity() {
+        return capacity;
+    }
+
     /// Frees the identifier without releasing capacity held by an admitted acknowledgement.
     Optional<Entry> supersede(int packetId) {
         return Optional.ofNullable(identifiers.remove(packetId));
@@ -95,14 +100,18 @@ final class ReceiveTable {
         private final long token;
         private final int packetId;
         private final Qos qos;
+        // When the reception arrived, and when it began to await PUBREL, on the client's clock.
+        private final long receivedAt;
+        private long awaitingReleaseSince;
         private Stage stage = Stage.RECEIVING;
         private boolean ready;
         private @Nullable SendReceipt receipt;
 
-        Entry(long token, int packetId, Qos qos) {
+        Entry(long token, int packetId, Qos qos, long receivedAt) {
             this.token = token;
             this.packetId = packetId;
             this.qos = qos;
+            this.receivedAt = receivedAt;
         }
 
         long token() {
@@ -129,25 +138,35 @@ final class ReceiveTable {
             return receipt;
         }
 
-        void submitted(SendReceipt receipt) {
-            observeReceipt();
+        long receivedAt() {
+            return receivedAt;
+        }
+
+        long awaitingReleaseSince() {
+            return awaitingReleaseSince;
+        }
+
+        void submitted(SendReceipt receipt, long now) {
+            observeReceipt(now);
             this.receipt = receipt;
         }
 
         /// Transport can accept PUBREC before the actor sees its write completion. Returns the
         /// single read of acceptance, so a caller that also judges it cannot see a later value.
-        boolean observeReceipt() {
+        boolean observeReceipt(long now) {
             boolean accepted = receipt != null && receipt.accepted();
             if (accepted) {
-                pubrecAccepted();
+                pubrecAccepted(now);
             }
             return accepted;
         }
 
-        void pubrecAccepted() {
+        /// `now` is when the actor learned that PUBREC was written, on the client's clock.
+        void pubrecAccepted(long now) {
             if (qos == Qos.EXACTLY_ONCE && stage == Stage.RECEIVING) {
                 stage = Stage.WAITING_PUBREL;
                 ready = true;
+                awaitingReleaseSince = now;
             }
         }
     }

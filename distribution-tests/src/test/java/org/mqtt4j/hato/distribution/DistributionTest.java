@@ -391,6 +391,17 @@ class DistributionTest {
         // A change here is a change to the public API; update the list only on purpose.
         assertThat(publicTypes(CLIENT)).containsExactlyInAnyOrder(
                 "org.mqtt4j.hato.AckMode",
+                "org.mqtt4j.hato.ClientStats",
+                "org.mqtt4j.hato.ClientStats$CapacityLimit",
+                "org.mqtt4j.hato.ClientStats$Connection",
+                "org.mqtt4j.hato.ClientStats$ConnectionState",
+                "org.mqtt4j.hato.ClientStats$DropReason",
+                "org.mqtt4j.hato.ClientStats$OverloadCause",
+                "org.mqtt4j.hato.ClientStats$Receiving",
+                "org.mqtt4j.hato.ClientStats$Sending",
+                "org.mqtt4j.hato.ClientStats$Subscribing",
+                "org.mqtt4j.hato.ClientStats$SubscriptionStats",
+                "org.mqtt4j.hato.ClientStats$Usage",
                 "org.mqtt4j.hato.ConnAck",
                 "org.mqtt4j.hato.ConnectionListener",
                 "org.mqtt4j.hato.DeliveryOptions",
@@ -444,7 +455,9 @@ class DistributionTest {
     @ParameterizedTest
     @ValueSource(strings = {
             "Disconnection", "ConnAck", "PublishResult", "MqttMessage", "MqttCredentials",
-            "DeliveryOptions", "Subscribe"
+            "DeliveryOptions", "Subscribe", "ClientStats", "ClientStats$Connection",
+            "ClientStats$Receiving", "ClientStats$Sending", "ClientStats$Subscribing",
+            "ClientStats$SubscriptionStats"
     })
     void evolving_value_types_are_final_classes_with_private_constructors(String type)
             throws Exception {

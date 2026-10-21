@@ -89,6 +89,8 @@ final class ClientIo {
 
     private final SendQueue.Budget budget;
 
+    private final int regularSendLimit;
+
     // Guards current, shutdown, and each Connection's mutable state. Never call Transport while
     // holding this monitor: its callbacks may acquire it inline.
     private final Object sending = new Object();
@@ -122,6 +124,7 @@ final class ClientIo {
         this.factory = factory;
         this.events = events;
         this.codec = codec;
+        this.regularSendLimit = regularSendLimit;
         budget = new SendQueue.Budget(
                 regularSendLimit,
                 REGULAR_SEND_BYTE_LIMIT,
@@ -616,6 +619,17 @@ final class ClientIo {
 
     long sendBytes() {
         return budget.bytes();
+    }
+
+    /// The most writes of any packet that the send queue holds, in its regular and reserved
+    /// quotas together.
+    int sendLimit() {
+        return regularSendLimit + RESERVED_SEND_LIMIT;
+    }
+
+    /// The most bytes that the send queue holds, in its regular and reserved quotas together.
+    long sendByteLimit() {
+        return (long) REGULAR_SEND_BYTE_LIMIT + RESERVED_SEND_BYTE_LIMIT;
     }
 
     /// Counts connection ends posted to the actor. The count changes under the send monitor

@@ -1,11 +1,16 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import org.jspecify.annotations.Nullable;
+
+import org.mqtt4j.hato.ClientStats.OverloadCause;
+import org.mqtt4j.hato.ClientStats.Usage;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.Qos;
@@ -61,6 +66,12 @@ final class Receptions {
 
     private boolean reusedIdentifierLogged;
 
+    // Lifetime counts: PUBLISH packets by QoS level, and publications that matched no
+    // subscription.
+    private final long[] publishes = new long[Qos.values().length];
+
+    private long unmatched;
+
     Receptions(
             SessionCore.Port port,
             SessionCore.Context core,
@@ -88,6 +99,7 @@ final class Receptions {
     }
 
     void deliver(Packet.Publish publish, int bytes) {
+        publishes[publish.qos().ordinal()]++;
         long token = 0;
         boolean continued = false;
         if (publish.qos() != Qos.AT_MOST_ONCE) {
@@ -110,7 +122,7 @@ final class Receptions {
             Optional<ReceiveTable.Entry> existing = received.find(packetId);
             if (existing.isPresent()) {
                 ReceiveTable.Entry earlier = existing.orElseThrow();
-                earlier.observeReceipt();
+                earlier.observeReceipt(core.now());
                 // QoS 2 joins its unfinished reception until PUBREL even without DUP, while
                 // QoS 1 joins only a DUP retransmission. Neither may change the id's QoS.
                 if (earlier.qos() == Qos.EXACTLY_ONCE || publish.dup()) {
@@ -146,10 +158,14 @@ final class Receptions {
                 Optional<ReceiveTable.Entry> added = received.add(
                         token,
                         packetId,
-                        publish.qos()
+                        publish.qos(),
+                        core.now()
                 );
                 if (added.isEmpty()) {
-                    core.fail(new MqttCapacityException("Acknowledgement capacity"));
+                    core.overloaded(
+                            OverloadCause.RECEPTIONS,
+                            new MqttCapacityException("Acknowledgement capacity")
+                    );
                     return;
                 }
                 acknowledgements.add(added.orElseThrow(), kind);
@@ -157,6 +173,7 @@ final class Receptions {
         }
         List<Long> matches = core.matching(publish);
         if (matches.isEmpty() && !continued) {
+            unmatched++;
             if (token != 0) {
                 // A reception that no subscription takes is ready for its acknowledgement now.
                 received.ready(token);
@@ -183,8 +200,13 @@ final class Receptions {
                 publish.dup(),
                 bytes
         )) {
-            core.fail(new MqttCapacityException("Delivery capacity"));
-        } else if (continued) {
+            core.overloaded(
+                    OverloadCause.DELIVERIES,
+                    new MqttCapacityException("Delivery capacity")
+            );
+            return;
+        }
+        if (continued) {
             received.ready(token, port.readyDelivery(token));
             core.sendCapacityAvailable();
         }
@@ -203,7 +225,7 @@ final class Receptions {
             if (receipt != null && receipt.started()) {
                 // The peer's PUBREL proves PUBREC arrived, even when Transport.send has not
                 // returned ACCEPTED or reported the write. A queue-only receipt is not enough.
-                entry.pubrecAccepted();
+                entry.pubrecAccepted(core.now());
             }
             if (entry.stage() != Stage.WAITING_PUBREL) {
                 core.fail(protocolError("PUBREL precedes PUBREC for the received id"));
@@ -220,10 +242,14 @@ final class Receptions {
             Optional<ReceiveTable.Entry> added = received.add(
                     ++nextDelivery,
                     packetId,
-                    Qos.EXACTLY_ONCE
+                    Qos.EXACTLY_ONCE,
+                    core.now()
             );
             if (added.isEmpty()) {
-                core.fail(new MqttCapacityException("Acknowledgement capacity"));
+                core.overloaded(
+                        OverloadCause.RECEPTIONS,
+                        new MqttCapacityException("Acknowledgement capacity")
+                );
                 return;
             }
             entry = added.orElseThrow();
@@ -239,7 +265,7 @@ final class Receptions {
         acknowledgements.written(ticket).ifPresent(acknowledgement -> {
             ReceiveTable.Entry entry = acknowledgement.entry();
             if (acknowledgement.kind() == Kind.PUBREC) {
-                entry.pubrecAccepted();
+                entry.pubrecAccepted(core.now());
             } else {
                 received.remove(entry);
             }
@@ -279,7 +305,7 @@ final class Receptions {
             }
             core.acknowledgementAdmitted();
             acknowledgements.submitted(ticket);
-            entry.submitted(receipt);
+            entry.submitted(receipt, core.now());
             if (acknowledgement.kind() != Kind.PUBREC) {
                 // PUBACK and PUBCOMP end the exchange, which returns the broker's send quota.
                 quota.remove(entry.packetId());
@@ -296,7 +322,7 @@ final class Receptions {
         for (ReceiveTable.Entry entry : received.entries()) {
             // The sender can accept a PUBREC during this pass. Judge it by one read, so a QoS 2
             // reception that missed WAITING_PUBREL is not dropped by the QoS 1 rule below.
-            boolean accepted = entry.observeReceipt();
+            boolean accepted = entry.observeReceipt(core.now());
             SendReceipt receipt = entry.receipt();
             Boolean ready = handedReadiness.get(entry.token());
             if (entry.stage() == Stage.WAITING_PUBREL) {
@@ -315,6 +341,59 @@ final class Receptions {
                 received.ready(entry.token(), ready);
             }
         }
+    }
+
+    /// The receptions' part of a statistics snapshot at `now` on the client's clock. Each
+    /// reception counts in the one stage that the actor has processed it to.
+    Values values(long now) {
+        long conditions = 0;
+        long turn = 0;
+        long writing = 0;
+        long release = 0;
+        long completing = 0;
+        // The longest waits so far, or -1 before any.
+        long longestConditions = -1;
+        long longestRelease = -1;
+        List<ReceiveTable.Entry> entries = received.entries();
+        for (ReceiveTable.Entry entry : entries) {
+            switch (entry.stage()) {
+                case RECEIVING -> {
+                    if (entry.receipt() != null) {
+                        writing++;
+                    } else if (entry.ready()) {
+                        turn++;
+                    } else {
+                        conditions++;
+                        longestConditions = Math.max(longestConditions, now - entry.receivedAt());
+                    }
+                }
+                case WAITING_PUBREL -> {
+                    release++;
+                    longestRelease = Math.max(
+                            longestRelease,
+                            now - entry.awaitingReleaseSince()
+                    );
+                }
+                case COMPLETING -> completing++;
+            }
+        }
+        return new Values(
+                ClientSnapshot.counts(publishes, Qos.class),
+                unmatched,
+                conditions,
+                turn,
+                writing,
+                release,
+                completing,
+                new Usage(entries.size(), received.capacity()),
+                longest(longestConditions),
+                longest(longestRelease)
+        );
+    }
+
+    /// The longest wait in `nanos`, or null when no reception waited.
+    private static @Nullable Duration longest(long nanos) {
+        return nanos < 0 ? null : Duration.ofNanos(nanos);
     }
 
     /// A permanent or nonpersistent end keeps no reception.
@@ -345,4 +424,18 @@ final class Receptions {
         port.forgetDelivery(token);
         core.sendCapacityAvailable();
     }
+
+    /// The receptions' values in [ClientSnapshot.Receiving] that the core knows.
+    record Values(
+            Map<Qos, Long> publishes,
+            long unmatched,
+            long awaitingConditions,
+            long awaitingTurn,
+            long awaitingAcknowledgementWrite,
+            long awaitingRelease,
+            long awaitingCompletionWrite,
+            Usage receptions,
+            @Nullable Duration oldestAwaitingConditions,
+            @Nullable Duration oldestAwaitingRelease
+    ) {}
 }

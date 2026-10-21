@@ -16,9 +16,9 @@ class AckSequencerTest {
         // Arrange
         var receptions = new ReceiveTable(3);
         var sut = new AckSequencer();
-        sut.add(receptions.add(1, 7, Qos.AT_LEAST_ONCE).orElseThrow(), Kind.PUBACK);
-        sut.add(receptions.add(2, 8, Qos.AT_LEAST_ONCE).orElseThrow(), Kind.PUBACK);
-        sut.add(receptions.add(3, 9, Qos.AT_LEAST_ONCE).orElseThrow(), Kind.PUBACK);
+        sut.add(receptions.add(1, 7, Qos.AT_LEAST_ONCE, 0).orElseThrow(), Kind.PUBACK);
+        sut.add(receptions.add(2, 8, Qos.AT_LEAST_ONCE, 0).orElseThrow(), Kind.PUBACK);
+        sut.add(receptions.add(3, 9, Qos.AT_LEAST_ONCE, 0).orElseThrow(), Kind.PUBACK);
 
         // Act
         receptions.ready(3);
@@ -46,8 +46,8 @@ class AckSequencerTest {
         // Arrange
         var receptions = new ReceiveTable(2);
         var sut = new AckSequencer();
-        Entry earlier = receptions.add(1, 7, Qos.AT_LEAST_ONCE).orElseThrow();
-        Entry following = receptions.add(2, 8, Qos.AT_LEAST_ONCE).orElseThrow();
+        Entry earlier = receptions.add(1, 7, Qos.AT_LEAST_ONCE, 0).orElseThrow();
+        Entry following = receptions.add(2, 8, Qos.AT_LEAST_ONCE, 0).orElseThrow();
         sut.add(earlier, Kind.PUBACK);
         sut.add(following, Kind.PUBACK);
         receptions.ready(2);
@@ -69,7 +69,7 @@ class AckSequencerTest {
         // Arrange
         var receptions = new ReceiveTable(1);
         var sut = new AckSequencer();
-        Entry entry = receptions.add(1, 7, Qos.AT_LEAST_ONCE).orElseThrow();
+        Entry entry = receptions.add(1, 7, Qos.AT_LEAST_ONCE, 0).orElseThrow();
         sut.add(entry, Kind.PUBACK);
         receptions.ready(1);
         sut.submitted(10);
@@ -93,9 +93,9 @@ class AckSequencerTest {
         // Arrange
         var receptions = new ReceiveTable(3);
         var sut = new AckSequencer();
-        Entry first = receptions.add(1, 7, Qos.AT_LEAST_ONCE).orElseThrow();
-        Entry publication = receptions.add(2, 8, Qos.EXACTLY_ONCE).orElseThrow();
-        Entry completion = receptions.add(3, 9, Qos.EXACTLY_ONCE).orElseThrow();
+        Entry first = receptions.add(1, 7, Qos.AT_LEAST_ONCE, 0).orElseThrow();
+        Entry publication = receptions.add(2, 8, Qos.EXACTLY_ONCE, 0).orElseThrow();
+        Entry completion = receptions.add(3, 9, Qos.EXACTLY_ONCE, 0).orElseThrow();
         receptions.complete(completion);
         sut.add(first, Kind.PUBACK);
         sut.add(publication, Kind.PUBREC);
@@ -121,13 +121,13 @@ class AckSequencerTest {
         // Arrange
         var receptions = new ReceiveTable(1);
         var sut = new AckSequencer();
-        Entry entry = receptions.add(1, 7, Qos.EXACTLY_ONCE).orElseThrow();
+        Entry entry = receptions.add(1, 7, Qos.EXACTLY_ONCE, 0).orElseThrow();
         receptions.ready(1);
         sut.add(entry, Kind.PUBREC);
         sut.submitted(10);
 
         // Act
-        entry.pubrecAccepted();
+        entry.pubrecAccepted(0);
         receptions.complete(entry);
         sut.add(entry, Kind.PUBCOMP);
 
@@ -145,9 +145,9 @@ class AckSequencerTest {
         // Arrange
         var receptions = new ReceiveTable(2);
         var sut = new AckSequencer();
-        Entry entry = receptions.add(1, 7, Qos.EXACTLY_ONCE).orElseThrow();
-        Entry following = receptions.add(2, 8, Qos.AT_LEAST_ONCE).orElseThrow();
-        entry.pubrecAccepted();
+        Entry entry = receptions.add(1, 7, Qos.EXACTLY_ONCE, 0).orElseThrow();
+        Entry following = receptions.add(2, 8, Qos.AT_LEAST_ONCE, 0).orElseThrow();
+        entry.pubrecAccepted(0);
         sut.add(entry, Kind.PUBREC);
         sut.submitted(10);
         sut.add(entry, Kind.PUBREC);
@@ -175,13 +175,13 @@ class AckSequencerTest {
         // Arrange
         var receptions = new ReceiveTable(2);
         var sut = new AckSequencer();
-        Entry earlier = receptions.add(1, 7, Qos.EXACTLY_ONCE).orElseThrow();
-        earlier.pubrecAccepted();
+        Entry earlier = receptions.add(1, 7, Qos.EXACTLY_ONCE, 0).orElseThrow();
+        earlier.pubrecAccepted(0);
         sut.add(earlier, Kind.PUBREC);
         sut.submitted(10);
         sut.add(earlier, Kind.PUBREC);
         receptions.complete(earlier);
-        Entry current = receptions.add(2, 7, Qos.AT_LEAST_ONCE).orElseThrow();
+        Entry current = receptions.add(2, 7, Qos.AT_LEAST_ONCE, 0).orElseThrow();
         sut.add(current, Kind.PUBACK);
         receptions.ready(2);
 

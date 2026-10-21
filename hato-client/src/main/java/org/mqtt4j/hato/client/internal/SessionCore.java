@@ -9,6 +9,8 @@ import java.util.concurrent.TimeoutException;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.ClientStats.CapacityLimit;
+import org.mqtt4j.hato.ClientStats.OverloadCause;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttBrokerDisconnectException;
@@ -181,6 +183,34 @@ final class SessionCore {
         );
     }
 
+    /// The core's values in [ClientSnapshot], read at one point.
+    ///
+    /// @param state the connection's state
+    /// @param attempt the number of the latest attempt, or 0 before the first
+    /// @param establishedAttempt the number of the attempt that established the latest
+    ///     connection, or 0 if none has
+    /// @param receiving the receptions' values
+    /// @param sending the publications' values
+    /// @param quota the MQTT 5.0 send quota left on the established connection, or null without
+    ///     one
+    /// @param oldestResponseWait how long the oldest awaited response has been awaited, or null
+    ///     if none is
+    /// @param subscribing the registrations' values
+    /// @param refusals the core's lifetime counts of operations refused for capacity
+    /// @param overloads the lifetime counts of connections ended for overload
+    record Values(
+            State state,
+            long attempt,
+            long establishedAttempt,
+            Receptions.Values receiving,
+            Publications.Values sending,
+            @Nullable Integer quota,
+            @Nullable Duration oldestResponseWait,
+            Subscriptions.Values subscribing,
+            Map<CapacityLimit, Long> refusals,
+            Map<OverloadCause, Long> overloads
+    ) {}
+
     /// What the core lends its parts. The core owns every value behind it; a part keeps no value
     /// that a connection end or a new session replaces.
     interface Context {
@@ -199,6 +229,15 @@ final class SessionCore {
 
         /// Ends the current connection with `cause`.
         void fail(Throwable cause);
+
+        /// Ends the current connection as overloaded by `cause`, with `failure`, and counts it.
+        void overloaded(OverloadCause cause, MqttCapacityException failure);
+
+        /// Counts an operation refused for capacity by `limit`.
+        void refused(CapacityLimit limit);
+
+        /// The time of the event that the core is processing, on the client's clock.
+        long now();
 
         /// The response deadlines of the current connection.
         ResponseDeadlines responses();
@@ -308,6 +347,19 @@ final class SessionCore {
     // room goes first to the side that did not take the last slot, so neither can starve.
     private boolean releasesFirst;
 
+    // The time of the event that the core is processing, on the client's clock. An event that
+    // brings no time, such as a delivery's readiness, keeps the latest one.
+    private long eventTime;
+
+    // The number of the attempt that established the latest connection, or 0 if none has.
+    private long establishedAttempt;
+
+    // Lifetime counts of operations that the core refused for capacity, and of connections that
+    // it ended for overload.
+    private final long[] refusals = new long[CapacityLimit.values().length];
+
+    private final long[] overloads = new long[OverloadCause.values().length];
+
     SessionCore(
             Port port,
             String clientId,
@@ -386,7 +438,13 @@ final class SessionCore {
         return sessionNumber;
     }
 
+    /// The time of the latest event that brought one, on the client's clock.
+    long eventTime() {
+        return eventTime;
+    }
+
     void connect(ConnectionAttempt attempt, long now) {
+        eventTime = now;
         // Reporting a violation is the client's own disconnect, not a pending disconnect().
         boolean reporting = current.violation != null;
         if (state == State.CLOSED || (state == State.DISCONNECTING && !reporting)) {
@@ -469,6 +527,7 @@ final class SessionCore {
             @Nullable Throwable failure,
             long now
     ) {
+        eventTime = now;
         if (connecting != attempt || credentialsReady) {
             return;
         }
@@ -499,6 +558,7 @@ final class SessionCore {
     }
 
     void received(long connection, Packet packet, long now, int bytes) {
+        eventTime = now;
         if (connection != generation || !connectionActive()) {
             return;
         }
@@ -567,6 +627,7 @@ final class SessionCore {
     /// Establishes the current connection as `established` describes: its CONNACK continues the
     /// session when it has Session Present and otherwise starts a new one.
     private void establish(Outcome.Established established, long now) {
+        establishedAttempt = request.attempt();
         ConnAck result = established.ack();
         boolean sessionPresent = result.sessionPresent();
         if (!sessionPresent) {
@@ -615,6 +676,7 @@ final class SessionCore {
     }
 
     void sent(long connection, long ticket, long writtenAt, long now) {
+        eventTime = now;
         if (connection != generation || !connectionActive()) {
             return;
         }
@@ -655,8 +717,10 @@ final class SessionCore {
         }
     }
 
-    /// Write completion retires PUBACK/PUBCOMP, while PUBREC retains the id for PUBREL.
-    void written(long connection, long ticket) {
+    /// Write completion retires PUBACK/PUBCOMP, while PUBREC retains the id for PUBREL. `now`
+    /// is when the actor processes the completion.
+    void written(long connection, long ticket, long now) {
+        eventTime = now;
         if (connection == generation && established()) {
             receptions.written(ticket);
             sendCapacityAvailable(connection);
@@ -741,6 +805,7 @@ final class SessionCore {
     }
 
     void timer(long connection, Timer timer, long now) {
+        eventTime = now;
         if (timer == Timer.RECONNECT) {
             if (connection == 0 && state == State.RECONNECT_WAIT && request.requested()) {
                 startAttempt(new ConnectionAttempt(0), now);
@@ -890,7 +955,11 @@ final class SessionCore {
         return switch (port.send(generation, ticket, packet, null)) {
             case ACCEPTED -> true;
             case FULL -> {
-                failed(generation, new MqttCapacityException("Reserved send queue capacity"));
+                overloaded(
+                        generation,
+                        OverloadCause.RESERVED_SENDS,
+                        new MqttCapacityException("Reserved send queue capacity")
+                );
                 yield false;
             }
             // Wait for the connection's terminal notification to preserve its original cause.
@@ -916,6 +985,20 @@ final class SessionCore {
         } else {
             end(cause, EndReason.CONNECTION_FAILURE);
         }
+    }
+
+    /// Ends the connection as overloaded by `cause`, with `failure`, and counts it if it is the
+    /// current one.
+    void overloaded(long connection, OverloadCause cause, MqttCapacityException failure) {
+        if (connection != generation || !connectionActive()) {
+            return;
+        }
+        // While the DISCONNECT that reports a violation is written, the violation stays the
+        // connection's cause, so the overload does not end it.
+        if (current.violation == null) {
+            overloads[cause.ordinal()]++;
+        }
+        failed(connection, failure);
     }
 
     void schedulerFailed(long connection, Throwable cause) {
@@ -1118,6 +1201,23 @@ final class SessionCore {
         }
     }
 
+    /// The core's part of a statistics snapshot at `now` on the client's clock.
+    Values values(long now) {
+        boolean established = established();
+        return new Values(
+                state,
+                request.attempt(),
+                establishedAttempt,
+                receptions.values(now),
+                publications.values(),
+                established && version == MqttVersion.V5 ? publications.quota() : null,
+                established ? current.responses.oldestWait(now).orElse(null) : null,
+                subscriptions.values(),
+                ClientSnapshot.counts(refusals, CapacityLimit.class),
+                ClientSnapshot.counts(overloads, OverloadCause.class)
+        );
+    }
+
     static PacketDecodeException protocolError(String message) {
         return new PacketDecodeException(ReasonCode.PROTOCOL_ERROR, message);
     }
@@ -1169,6 +1269,21 @@ final class SessionCore {
         @Override
         public void fail(Throwable cause) {
             failed(generation, cause);
+        }
+
+        @Override
+        public void overloaded(OverloadCause cause, MqttCapacityException failure) {
+            SessionCore.this.overloaded(generation, cause, failure);
+        }
+
+        @Override
+        public void refused(CapacityLimit limit) {
+            refusals[limit.ordinal()]++;
+        }
+
+        @Override
+        public long now() {
+            return eventTime;
         }
 
         @Override

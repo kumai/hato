@@ -34,7 +34,8 @@ final class Mailbox {
         SEND_CAPACITY,
         CREDENTIALS_READY,
         SUBSCRIPTION_CLOSE,
-        RECONNECT;
+        RECONNECT,
+        STATS;
 
         /// A wake keeps at most one queued event per generation and is never full. Admission,
         /// queueing, and release all ask this, so a new kind is classified in one place.
@@ -49,7 +50,8 @@ final class Mailbox {
                      SEND_CAPACITY,
                      CREDENTIALS_READY,
                      SUBSCRIPTION_CLOSE,
-                     RECONNECT -> true;
+                     RECONNECT,
+                     STATS -> true;
             };
         }
     }
@@ -167,7 +169,7 @@ final class Mailbox {
             case CONTROL -> controlCount >= controlLimit;
             case KEEP_ALIVE -> keepAlive.size() >= KEEP_ALIVE_LIMIT;
             case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE, CREDENTIALS_READY,
-                    RECONNECT -> false;
+                    RECONNECT, STATS -> false;
         };
         if (full) {
             return OfferResult.FULL;

@@ -1,7 +1,7 @@
 # Hato client
 
-Configure connections, manage subscriptions, and handle failures. Add the client as
-shown in [Getting it](../README.md#getting-it). For JPMS, the module name is
+Configure connections, manage subscriptions, handle failures, and watch the client. Add the
+client as shown in [Getting it](../README.md#getting-it). For JPMS, the module name is
 `org.mqtt4j.hato.client`.
 
 ## Configuring a connection
@@ -452,6 +452,29 @@ policy. To skip a single message, record the error and return normally with
 `AFTER_HANDLER`, or call `delivery.ack()` with `MANUAL`. Returning normally or
 acknowledging records completion even when the application chose not to process
 the message.
+
+## Watching the client
+
+`stats()` shows what only the client can see: the messages waiting for each subscription, the
+acknowledgements it holds back and how long the oldest has waited, and what it dropped or
+refused, and why.
+
+```java
+ClientStats stats = client.stats().join();
+stats.receiving().oldestAwaitingConditions()
+        .filter(age -> age.compareTo(Duration.ofMinutes(1)) > 0)
+        .ifPresent(age -> System.err.println("A message has waited for its handler for " + age));
+for (ClientStats.SubscriptionStats subscription : stats.subscriptions()) {
+    System.out.println(subscription.filter().pattern() + ": " + subscription.waiting()
+            + " waiting, " + subscription.dropped());
+}
+```
+
+It also counts operations refused by each limit, connections that the client ended because it
+was overloaded, and notifications that a slow listener lost. The values come from one moment,
+so they agree with each other, and the counts cover the client's whole life. Calling often is
+cheap: calls made while one is pending share its snapshot. After `close()`, `stats()` returns
+the last values, ready for a final report.
 
 ## Passing the client to your code
 

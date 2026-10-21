@@ -71,18 +71,23 @@ final class ClientTermination {
     // them nor for their continuations.
     private final List<CompletableFuture<Void>> waiters = new ArrayList<>();
 
+    // Counts an observation refused because the waiter slots are full.
+    private final Runnable observationRefused;
+
     ClientTermination(
             String threadName,
             Semaphore waiterSlots,
             int waiterLimit,
             List<Semaphore> operationSlots,
-            int operationLimit
+            int operationLimit,
+            Runnable observationRefused
     ) {
         this.threadName = threadName;
         this.waiterSlots = waiterSlots;
         this.waiterLimit = waiterLimit;
         this.operationSlots = List.copyOf(operationSlots);
         this.operationLimit = operationLimit;
+        this.observationRefused = observationRefused;
     }
 
     /// Binds the parts that report here when they become idle. Without credentials, none is
@@ -98,6 +103,7 @@ final class ClientTermination {
             return CompletableFuture.completedFuture(null);
         }
         if (!waiterSlots.tryAcquire()) {
+            observationRefused.run();
             return CompletableFuture.failedFuture(new MqttCapacityException("Waiter capacity"));
         }
         var future = new CompletableFuture<Void>();

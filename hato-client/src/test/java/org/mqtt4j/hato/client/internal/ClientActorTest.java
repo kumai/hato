@@ -49,6 +49,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.ClientStatsAccess;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.DeliveryOptions;
@@ -8891,6 +8892,7 @@ class ClientActorTest {
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
                 DeliveryOptionsAccess::execution,
+                ClientStatsAccess::of,
                 limits
         );
     }

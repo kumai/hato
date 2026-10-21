@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -25,6 +26,10 @@ import java.util.function.Supplier;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.ClientStats;
+import org.mqtt4j.hato.ClientStats.CapacityLimit;
+import org.mqtt4j.hato.ClientStats.ConnectionState;
+import org.mqtt4j.hato.ClientStats.OverloadCause;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.DeliveryOptions;
@@ -129,6 +134,23 @@ public final class ClientActor implements MqttClient {
     // Guarded by lifecycleLock. whenConnected() observations waiting for a connection.
     private final List<CompletableFuture<ConnAck>> connectionWaiters = new ArrayList<>();
 
+    // Guarded by lifecycleLock. stats() observations waiting for the actor's next snapshot.
+    private final List<CompletableFuture<ClientStats>> statsWaiters = new ArrayList<>();
+
+    // Guarded by lifecycleLock. Set once the actor has ended: the statistics that stats() returns
+    // from then on, or the failure that it returns instead.
+    private @Nullable ClientStats lastStats;
+
+    private @Nullable RuntimeException lastStatsFailure;
+
+    // Lifetime counts of operations refused for capacity on the callers' threads, by limit; the
+    // core counts its own refusals.
+    private final AtomicLongArray refusals = new AtomicLongArray(CapacityLimit.values().length);
+
+    private final Function<ClientSnapshot, ClientStats> statsOf;
+
+    private final ClientLimits limits;
+
     // Guarded by lifecycleLock. Set when the core accepts a requested disconnect and cleared when
     // the connection ends or a new attempt begins; meanwhile, establishment observations wait
     // for a later connection.
@@ -198,6 +220,7 @@ public final class ClientActor implements MqttClient {
             RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf,
+            Function<ClientSnapshot, ClientStats> statsOf,
             ClientLimits limits
     ) {
         this(
@@ -218,6 +241,7 @@ public final class ClientActor implements MqttClient {
                 rules,
                 responseTimeout,
                 executionOf,
+                statsOf,
                 limits
         );
     }
@@ -240,6 +264,7 @@ public final class ClientActor implements MqttClient {
             RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf,
+            Function<ClientSnapshot, ClientStats> statsOf,
             ClientLimits limits
     ) {
         this.endpoint = endpoint;
@@ -247,6 +272,8 @@ public final class ClientActor implements MqttClient {
         this.version = version;
         this.scheduler = scheduler;
         this.executionOf = executionOf;
+        this.statsOf = statsOf;
+        this.limits = limits;
         cleanStart = sessionExpiry.isZero();
         reconnects = backoff.enabled();
         operationSlots = new Semaphore(limits.operations());
@@ -256,7 +283,8 @@ public final class ClientActor implements MqttClient {
                 waiterSlots,
                 WAITER_LIMIT,
                 List.of(operationSlots, connectSlot, disconnectSlot),
-                commandLimit
+                commandLimit,
+                () -> refused(CapacityLimit.OBSERVATIONS)
         );
         listenerLane = new ListenerLane(endpoint, clientId, listener, termination::check);
         mailbox = createMailbox(maxPacketSize, limits);
@@ -437,6 +465,7 @@ public final class ClientActor implements MqttClient {
                     0
             ));
             if (admitted == Mailbox.OfferResult.FULL) {
+                refused(CapacityLimit.REGISTRATION_QUEUE);
                 rejection = new MqttCapacityException("Registration mailbox capacity");
                 retire(subscription, rejection);
             }
@@ -484,6 +513,7 @@ public final class ClientActor implements MqttClient {
             } else {
                 slot = acquireSlot(kind);
                 if (slot == null) {
+                    refused(CapacityLimit.OPERATIONS);
                     refusal = new MqttCapacityException("Operation capacity");
                 }
             }
@@ -516,6 +546,7 @@ public final class ClientActor implements MqttClient {
                     bytes
             ));
             if (admitted == Mailbox.OfferResult.FULL) {
+                refused(CapacityLimit.OPERATION_QUEUE);
                 completeOperation(token, null,
                         new MqttCapacityException("Command mailbox capacity"));
             }
@@ -622,6 +653,7 @@ public final class ClientActor implements MqttClient {
                     try {
                         io.shutdown();
                     } finally {
+                        recordLastStats();
                         synchronized (lifecycleLock) {
                             cleanedUp = true;
                             checkLanesEnded();
@@ -750,9 +782,13 @@ public final class ClientActor implements MqttClient {
                 case INCOMING -> "Incoming";
                 case KEEP_ALIVE -> "Keep-alive";
                 case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE,
-                        CREDENTIALS_READY, RECONNECT -> "Control";
+                        CREDENTIALS_READY, RECONNECT, STATS -> "Control";
             };
-            signalFailure(generation, new MqttCapacityException(admission + " mailbox capacity"));
+            signalOverload(
+                    generation,
+                    OverloadCause.EVENTS,
+                    new MqttCapacityException(admission + " mailbox capacity")
+            );
         }
     }
 
@@ -760,10 +796,22 @@ public final class ClientActor implements MqttClient {
         terminate(generation, () -> core.failed(generation, failure));
     }
 
+    private void signalOverload(
+            long generation,
+            OverloadCause cause,
+            MqttCapacityException failure
+    ) {
+        terminate(generation, () -> core.overloaded(generation, cause, failure));
+    }
+
     /// An acceptor refused a QoS 1 or 2 delivery, so the connection that delivered it ends as
     /// overloaded, as with a full buffer. Called by the hand-off worker.
     private void handOffRefused(DeliveryToken arrival) {
-        signalFailure(arrival.connection(), new MqttCapacityException("Hand-off capacity"));
+        signalOverload(
+                arrival.connection(),
+                OverloadCause.HAND_OFF,
+                new MqttCapacityException("Hand-off capacity")
+        );
     }
 
     /// A result belongs to the attempt, which may span more than one connection. One for an
@@ -847,8 +895,177 @@ public final class ClientActor implements MqttClient {
         }
     }
 
-    /// What the client holds against its internal bounds. Tests compare this with the bounds
-    /// until applications get statistics. The parts are read one after another, not atomically.
+    @Override
+    public CompletableFuture<ClientStats> stats() {
+        synchronized (lifecycleLock) {
+            if (lastStats != null) {
+                return CompletableFuture.completedFuture(lastStats);
+            }
+            if (lastStatsFailure != null) {
+                return CompletableFuture.failedFuture(lastStatsFailure);
+            }
+            CompletableFuture<ClientStats> observed = observeFuture(statsWaiters);
+            if (!observed.isDone()) {
+                // The request is a wake, which the mailbox queues once; every observation made
+                // before the actor answers it shares its snapshot.
+                post(0, this::takeStats, Mailbox.Kind.STATS, 0);
+            }
+            return observed;
+        }
+    }
+
+    /// Answers the waiting stats() observations with a snapshot taken now. A clock failure fails
+    /// them and then ends the connection as other clock failures do.
+    private void takeStats() {
+        long now;
+        try {
+            now = scheduler.nanoTime();
+        } catch (RuntimeException failure) {
+            answerStats(null, failure);
+            throw SpiException.scheduler(0, failure);
+        }
+        answerStats(statsOf.apply(snapshot(now)), null);
+    }
+
+    /// From close() on, the waiting observations get the snapshot collected when the actor ends
+    /// instead, so that no call made after close() sees an earlier one.
+    private void answerStats(@Nullable ClientStats stats, @Nullable Throwable failure) {
+        synchronized (lifecycleLock) {
+            if (!stopping.get()) {
+                completeWaiters(statsWaiters, stats, failure);
+            }
+        }
+    }
+
+    /// Runs on the actor at its end: keeps what the client counted for later stats() calls, and
+    /// answers those that waited, so that termination does not wait for them.
+    private void recordLastStats() {
+        try {
+            long now;
+            try {
+                now = scheduler.nanoTime();
+            } catch (RuntimeException _) {
+                // Durations then end at the latest event that brought a time.
+                now = core.eventTime();
+            }
+            ClientStats last = statsOf.apply(snapshot(now));
+            synchronized (lifecycleLock) {
+                lastStats = last;
+                completeWaiters(statsWaiters, last, null);
+            }
+        } catch (RuntimeException failure) {
+            log.error("Final statistics failed for {} at {}", clientId, endpoint, failure);
+            synchronized (lifecycleLock) {
+                lastStatsFailure = failure;
+                completeWaiters(statsWaiters, null, failure);
+            }
+        }
+    }
+
+    /// Called only on the actor. The core's values at one point, then the subscriptions that the
+    /// client holds, and the lanes' values read under their own lock.
+    private ClientSnapshot snapshot(long now) {
+        SessionCore.Values session = core.values(now);
+        List<ClientSubscription> listed;
+        synchronized (lifecycleLock) {
+            // A closed subscription leaves the list at once; its broker removal may continue.
+            listed = subscriptions.values().stream()
+                    .filter(subscription -> !subscription.ended)
+                    .toList();
+        }
+        DeliveryLanes.Values delivery = lanes.values();
+        var held = new ArrayList<ClientSnapshot.SubscriptionValues>();
+        for (ClientSubscription subscription : listed) {
+            DeliveryLanes.LaneValues lane = delivery.lanes().getOrDefault(
+                    subscription.id,
+                    DeliveryLanes.LaneValues.UNREGISTERED
+            );
+            held.add(new ClientSnapshot.SubscriptionValues(
+                    subscription,
+                    subscription.filter(),
+                    lane.waiting(),
+                    lane.running(),
+                    lane.awaitingAck(),
+                    subscription.request.bufferCapacity(),
+                    lane.dropped()
+            ));
+        }
+        var refused = new EnumMap<CapacityLimit, Long>(session.refusals());
+        for (CapacityLimit limit : CapacityLimit.values()) {
+            refused.merge(limit, refusals.get(limit.ordinal()), Long::sum);
+        }
+        Receptions.Values received = session.receiving();
+        Publications.Values published = session.sending();
+        Subscriptions.Values registered = session.subscribing();
+        return new ClientSnapshot(
+                new ClientSnapshot.Connection(
+                        connectionState(session.state()),
+                        session.attempt(),
+                        session.establishedAttempt(),
+                        listenerLane.dropped()
+                ),
+                new ClientSnapshot.Receiving(
+                        received.publishes(),
+                        received.unmatched(),
+                        delivery.admitted(),
+                        delivery.dropped(),
+                        delivery.deliveries(),
+                        delivery.bytes(),
+                        received.awaitingConditions(),
+                        received.awaitingTurn(),
+                        received.awaitingAcknowledgementWrite(),
+                        received.awaitingRelease(),
+                        received.awaitingCompletionWrite(),
+                        received.receptions(),
+                        received.oldestAwaitingConditions(),
+                        received.oldestAwaitingRelease()
+                ),
+                new ClientSnapshot.Sending(
+                        new ClientStats.Usage(
+                                limits.operations() - operationSlots.availablePermits(),
+                                limits.operations()
+                        ),
+                        new ClientStats.Usage(io.sends(), io.sendLimit()),
+                        new ClientStats.Usage(io.sendBytes(), io.sendByteLimit()),
+                        published.awaitingPubAck(),
+                        published.awaitingPubRec(),
+                        published.awaitingPubComp(),
+                        published.publications(),
+                        published.keptBytes(),
+                        session.quota(),
+                        session.oldestResponseWait()
+                ),
+                new ClientSnapshot.Subscribing(
+                        registered.registrations(),
+                        registered.established(),
+                        registered.pending(),
+                        registered.removing(),
+                        delivery.retainedLanes()
+                ),
+                held,
+                refused,
+                session.overloads()
+        );
+    }
+
+    private static ConnectionState connectionState(SessionCore.State state) {
+        return switch (state) {
+            case DISCONNECTED -> ConnectionState.DISCONNECTED;
+            case CONNECTING -> ConnectionState.CONNECTING;
+            case CONNECTED -> ConnectionState.CONNECTED;
+            case DISCONNECTING -> ConnectionState.DISCONNECTING;
+            case RECONNECT_WAIT -> ConnectionState.WAITING_TO_RECONNECT;
+            case CLOSED -> ConnectionState.CLOSED;
+        };
+    }
+
+    /// Counts an operation refused for capacity outside the core; any thread.
+    private void refused(CapacityLimit limit) {
+        refusals.incrementAndGet(limit.ordinal());
+    }
+
+    /// What the client holds against its internal bounds. Tests compare this with the bounds.
+    /// The parts are read one after another, not atomically.
     Usage usage() {
         return new Usage(
                 commandLimit
@@ -1305,7 +1522,12 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void written(long generation, long ticket) {
-            post(generation, () -> core.written(generation, ticket), Mailbox.Kind.CONTROL, 0);
+            post(
+                    generation,
+                    () -> core.written(generation, ticket, nanoTime(generation)),
+                    Mailbox.Kind.CONTROL,
+                    0
+            );
         }
 
         @Override
@@ -1644,6 +1866,7 @@ public final class ClientActor implements MqttClient {
     /// Caller holds lifecycleLock. The budget includes completion through synchronous callbacks.
     private <T> CompletableFuture<T> observeFuture(List<CompletableFuture<T>> observers) {
         if (!waiterSlots.tryAcquire()) {
+            refused(CapacityLimit.OBSERVATIONS);
             return CompletableFuture.failedFuture(new MqttCapacityException("Waiter capacity"));
         }
         var future = new CompletableFuture<T>();

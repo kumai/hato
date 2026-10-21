@@ -14,6 +14,8 @@ import java.util.Set;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.ClientStats.CapacityLimit;
+import org.mqtt4j.hato.ClientStats.Usage;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
@@ -121,14 +123,18 @@ final class Publications {
         // A new publication neither overtakes nor joins exchanges that wait for send capacity.
         // SUBACK waiting does not block publication.
         if (window.stalled) {
-            capacityFailure(operation, "Send queue capacity");
+            capacityFailure(operation, CapacityLimit.SEND_QUEUE, "Send queue capacity");
             return;
         }
         int packetId = 0;
         SendReceipt receipt = null;
         if (message.qos() != Qos.AT_MOST_ONCE) {
             if (inflight.size() >= inflightLimit) {
-                capacityFailure(operation, "Publication capacity");
+                capacityFailure(
+                        operation,
+                        CapacityLimit.INFLIGHT_PUBLISHES,
+                        "Publication capacity"
+                );
                 return;
             }
             // Beyond the broker's Receive Maximum, a publication waits for an earlier exchange to
@@ -141,18 +147,30 @@ final class Publications {
             if (kept) {
                 long remaining = INFLIGHT_BYTE_LIMIT - bytes;
                 if (MessageProperties.bodySize(message) > remaining) {
-                    capacityFailure(operation, "Publication byte capacity");
+                    capacityFailure(
+                            operation,
+                            CapacityLimit.PUBLICATION_BYTES,
+                            "Publication byte capacity"
+                    );
                     return;
                 }
                 byteCount = wireSize(message);
                 if (byteCount > remaining) {
-                    capacityFailure(operation, "Publication byte capacity");
+                    capacityFailure(
+                            operation,
+                            CapacityLimit.PUBLICATION_BYTES,
+                            "Publication byte capacity"
+                    );
                     return;
                 }
             }
             OptionalInt allocated = core.allocatePacketId();
             if (allocated.isEmpty()) {
-                capacityFailure(operation, "Packet identifier capacity");
+                capacityFailure(
+                        operation,
+                        CapacityLimit.PACKET_IDENTIFIERS,
+                        "Packet identifier capacity"
+                );
                 return;
             }
             packetId = allocated.getAsInt();
@@ -193,7 +211,7 @@ final class Publications {
             } else {
                 removeInflight(packetId);
             }
-            capacityFailure(operation, "Send queue capacity");
+            capacityFailure(operation, CapacityLimit.SEND_QUEUE, "Send queue capacity");
         }
         // CLOSED waits for the connection's terminal notification, as do SUBSCRIBE/UNSUBSCRIBE.
     }
@@ -447,8 +465,37 @@ final class Publications {
         return false;
     }
 
-    private void capacityFailure(long operation, String message) {
+    private void capacityFailure(long operation, CapacityLimit limit, String message) {
+        core.refused(limit);
         port.complete(operation, null, new MqttCapacityException(message));
+    }
+
+    /// The publications' values in [ClientSnapshot.Sending] that the core knows. Publications
+    /// that wait to be sent count in their first stage.
+    Values values() {
+        long pubAck = 0;
+        long pubRec = 0;
+        long pubComp = 0;
+        for (Inflight exchange : inflight.values()) {
+            switch (exchange) {
+                case Publication publication when publication.qos == Qos.AT_LEAST_ONCE -> pubAck++;
+                case Publication _ -> pubRec++;
+                case Release _ -> pubComp++;
+            }
+        }
+        return new Values(
+                pubAck,
+                pubRec,
+                pubComp,
+                new Usage(inflight.size(), inflightLimit),
+                new Usage(bytes, INFLIGHT_BYTE_LIMIT)
+        );
+    }
+
+    /// How many more exchanges the established connection lets the client have in progress,
+    /// within the broker's Receive Maximum.
+    int quota() {
+        return Math.max(0, receiveMaximum() - outstanding());
     }
 
     /// The exchanges that take room under the broker's Receive Maximum: the publications that
@@ -687,6 +734,19 @@ final class Publications {
         // A repeated PUBREC can leave two answers in flight, and the first must not free the id.
         final Map<Integer, Integer> unknownReleases = new HashMap<>();
     }
+
+    /// @param awaitingPubAck QoS 1 publications that await PUBACK
+    /// @param awaitingPubRec QoS 2 publications that await PUBREC
+    /// @param awaitingPubComp QoS 2 exchanges that await PUBCOMP
+    /// @param publications all unfinished exchanges, against their limit
+    /// @param keptBytes the bytes that unfinished publications keep, against their limit
+    record Values(
+            long awaitingPubAck,
+            long awaitingPubRec,
+            long awaitingPubComp,
+            Usage publications,
+            Usage keptBytes
+    ) {}
 
     private abstract static sealed class Inflight {
 

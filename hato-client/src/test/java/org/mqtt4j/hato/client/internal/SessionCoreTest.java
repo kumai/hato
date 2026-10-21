@@ -3421,7 +3421,7 @@ class SessionCoreTest {
                     DeliveryToken current = port.deliveries.getLast().delivery();
                     sut.deliveryReady(current.acknowledgement());
                     if (current.acknowledgement() != 0) {
-                        sut.written(2, port.ackTickets.getLast());
+                        sut.written(2, port.ackTickets.getLast(), 0);
                     }
                 },
                 () -> {
@@ -3481,7 +3481,7 @@ class SessionCoreTest {
         )));
         chains.add(new ArrayDeque<>(List.of(
                 () -> sut.sendCapacityAvailable(1),
-                () -> sut.written(1, port.ticket)
+                () -> sut.written(1, port.ticket, 0)
         )));
 
         // Act & Assert: readiness before connection loss may finish the original receipt,
@@ -3730,7 +3730,7 @@ class SessionCoreTest {
 
         // Act
         for (int i = 0; i < 32; i++) {
-            sut.written(1, port.ackTickets.get(i));
+            sut.written(1, port.ackTickets.get(i), 0);
         }
 
         // Assert
@@ -3748,12 +3748,12 @@ class SessionCoreTest {
         long first = port.deliveries.getFirst().token();
         sut.deliveryReady(first);
         long ackTicket = port.ackTickets.getFirst();
-        sut.written(1, ackTicket);
+        sut.written(1, ackTicket, 0);
 
         // Act: the next message may even have identical topic and payload.
         receive(1, qosOnePublication(7, "a/b", dup), 0);
         sut.deliveryReady(first);
-        sut.written(1, ackTicket);
+        sut.written(1, ackTicket, 0);
 
         // Assert: the new exchange has its own readiness condition.
         assertThat(port.deliveries).hasSize(2);
@@ -3806,7 +3806,7 @@ class SessionCoreTest {
 
         // Act: the reported write must not free the identifier of the new reception.
         receive(1, qosOnePublication(7, "a/b", false), 0);
-        sut.written(1, earlierAck);
+        sut.written(1, earlierAck, 0);
         receive(1, qosOnePublication(7, "a/b", true), 0);
 
         // Assert: the retransmission joins the new reception.
@@ -3906,7 +3906,7 @@ class SessionCoreTest {
 
         // Act: write observation precedes budget release; neither event loses the waiting head.
         for (int i = 0; i < 100; i++) {
-            sut.written(1, port.ackTickets.get(i));
+            sut.written(1, port.ackTickets.get(i), 0);
             port.ackSlots++;
             sut.sendCapacityAvailable(1);
         }
@@ -3928,7 +3928,7 @@ class SessionCoreTest {
 
         // Act
         port.ackSlots = 14;
-        sut.written(1, port.ackTickets.getFirst());
+        sut.written(1, port.ackTickets.getFirst(), 0);
         sut.sendCapacityAvailable(1);
 
         // Assert
@@ -4032,7 +4032,7 @@ class SessionCoreTest {
             public void run() {
                 int position = pubAckIds().indexOf(packetId);
                 if (position >= 0) {
-                    sut.written(1, port.ackTickets.get(position));
+                    sut.written(1, port.ackTickets.get(position), 0);
                 } else if (sut.state() == CONNECTED && ++attempts < 1_000) {
                     // An earlier reception or the full reserved quota still holds the PUBACK.
                     chain.addFirst(this);
@@ -4231,7 +4231,7 @@ class SessionCoreTest {
 
         // Act: the first delivery is done, and its PUBACK reaches the send queue and the wire.
         mqtt5.deliveryReady(port.deliveries.getFirst().token());
-        mqtt5.written(1, port.ticket);
+        mqtt5.written(1, port.ticket, 0);
         mqtt5.received(1, qosOnePublication(announced + 1, "a/b", false), 0, 0);
 
         // Assert
@@ -4281,10 +4281,10 @@ class SessionCoreTest {
                 1,
                 EMPTY
         ), 0, 0);
-        mqtt5.written(1, port.ticket);
+        mqtt5.written(1, port.ticket, 0);
         if (released) {
             mqtt5.received(1, new Packet.PubRel(1, ReasonCode.SUCCESS, EMPTY), 0, 0);
-            mqtt5.written(1, port.ticket);
+            mqtt5.written(1, port.ticket, 0);
         }
 
         // Act: as many QoS 1 publications as the client announced.
@@ -4312,7 +4312,7 @@ class SessionCoreTest {
                 1,
                 EMPTY
         ), 0, 0);
-        mqtt5.written(1, port.ticket);
+        mqtt5.written(1, port.ticket, 0);
         mqtt5.failed(1, new IOException("connection lost"));
         mqtt5.connect(attempt(3), 0);
         mqtt5.opened(2);

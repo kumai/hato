@@ -26,6 +26,8 @@ import java.util.function.Predicate;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.ClientStats.DropReason;
+import org.mqtt4j.hato.ClientStats.Usage;
 import org.mqtt4j.hato.FailurePolicy;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
@@ -116,7 +118,10 @@ final class DeliveryLanes {
     private long retainedBytes;
 
     // Deliveries that left their subscriptions unprocessed, by reason, across all lanes.
-    private final long[] dropped = new long[Dropped.values().length];
+    private final long[] dropped = new long[DropReason.values().length];
+
+    // Deliveries that lanes took, over the client's lifetime.
+    private long admittedDeliveries;
 
     private long handledDeliveries;
 
@@ -609,7 +614,7 @@ final class DeliveryLanes {
                 if (lane.retained < lane.capacity) {
                     recipients.add(lane);
                 } else {
-                    overflows.add(overflow(lane, Dropped.SUBSCRIPTION_FULL));
+                    overflows.add(overflow(lane, DropReason.SUBSCRIPTION_FULL));
                 }
             }
             if (!recipients.isEmpty()) {
@@ -631,7 +636,7 @@ final class DeliveryLanes {
                     }
                 } else {
                     for (Lane lane : recipients) {
-                        overflows.add(overflow(lane, Dropped.CLIENT_FULL));
+                        overflows.add(overflow(lane, DropReason.CLIENT_FULL));
                     }
                 }
             }
@@ -653,6 +658,7 @@ final class DeliveryLanes {
     /// Caller holds lock. Queues a new view on `lane` and wakes the lane's dispatcher, receiver,
     /// or the hand-off worker.
     private void enqueue(Lane lane, DeliveryView view) {
+        admittedDeliveries++;
         view.sequence = ++enqueued;
         view.delivery.views.add(view);
         view.recipient.queued = true;
@@ -663,7 +669,7 @@ final class DeliveryLanes {
 
     /// Caller holds lock. Counts a QoS 0 delivery that overflow kept from `lane`. The lane's first
     /// one for `reason` is logged at warning level.
-    private Overflow overflow(Lane lane, Dropped reason) {
+    private Overflow overflow(Lane lane, DropReason reason) {
         drop(lane, reason);
         return new Overflow(lane.id, reason, lane.warned.add(reason));
     }
@@ -770,10 +776,9 @@ final class DeliveryLanes {
         }
     }
 
-    /// Counts deliveries that left their subscriptions unprocessed for `reason`, for tests until
-    /// applications get statistics. The count changes under the same lock as the delivery's
-    /// acknowledgement condition and capacity.
-    long dropped(Dropped reason) {
+    /// Counts deliveries that left their subscriptions unprocessed for `reason`, for tests. The
+    /// count changes under the same lock as the delivery's acknowledgement condition and capacity.
+    long dropped(DropReason reason) {
         lock.lock();
         try {
             return dropped[reason.ordinal()];
@@ -782,9 +787,10 @@ final class DeliveryLanes {
         }
     }
 
-    /// Counts deliveries that left the lane `id` unprocessed for `reason`, as [#dropped(Dropped)]
-    /// does for all lanes. A lane that has left the routing map counts nothing.
-    long dropped(long id, Dropped reason) {
+    /// Counts deliveries that left the lane `id` unprocessed for `reason`, as
+    /// [#dropped(DropReason)] does for all lanes. A lane that has left the routing map counts
+    /// nothing.
+    long dropped(long id, DropReason reason) {
         lock.lock();
         try {
             Lane lane = lanes.get(id);
@@ -792,6 +798,62 @@ final class DeliveryLanes {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// The values of every lane in the routing map, and of the client, read under one hold of
+    /// the lock. A deliberate simplification: telling a lane's running deliveries from its
+    /// processed ones scans the views that QoS 1 and QoS 2 deliveries keep, up to
+    /// [#DELIVERY_LIMIT] held ones and the accepted hand-off views whose ack() is due, while the
+    /// lanes wait for the lock. Counters kept per lane would end the scan but add work to every
+    /// delivery; switch to them if snapshots of large backlogs delay deliveries.
+    Values values() {
+        lock.lock();
+        try {
+            // By lane: the views that finished their local processing but still hold the lane's
+            // capacity, and the MANUAL views, held or accepted by a hand-off, whose ack() is due.
+            var processed = new HashMap<Long, Long>();
+            var unacknowledged = new HashMap<Long, Long>();
+            for (RetainedDelivery delivery : acknowledging.values()) {
+                for (DeliveryView view : delivery.views) {
+                    if (view.localDone) {
+                        processed.merge(view.recipient.id, 1L, Long::sum);
+                        if (awaitsAck(view)) {
+                            unacknowledged.merge(view.recipient.id, 1L, Long::sum);
+                        }
+                    }
+                }
+                for (DeliveryView view : delivery.accepted) {
+                    if (awaitsAck(view)) {
+                        unacknowledged.merge(view.recipient.id, 1L, Long::sum);
+                    }
+                }
+            }
+            var values = new HashMap<Long, LaneValues>();
+            for (Lane lane : lanes.values()) {
+                long waiting = lane.queue.size() + lane.queuedInSublanes;
+                values.put(lane.id, new LaneValues(
+                        waiting,
+                        lane.retained - waiting - processed.getOrDefault(lane.id, 0L),
+                        unacknowledged.getOrDefault(lane.id, 0L),
+                        ClientSnapshot.counts(lane.dropped, DropReason.class)
+                ));
+            }
+            return new Values(
+                    values,
+                    admittedDeliveries,
+                    new Usage(retainedDeliveries, DELIVERY_LIMIT),
+                    new Usage(retainedBytes, byteLimit),
+                    new Usage(retainedLanes, laneLimit),
+                    ClientSnapshot.counts(dropped, DropReason.class)
+            );
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Caller holds lock. Whether `view` is a MANUAL delivery whose ack() is still due.
+    private boolean awaitsAck(DeliveryView view) {
+        return view.acknowledgement != null && holdsAcknowledgement(view);
     }
 
     /// Counts handler runs that returned normally, including MANUAL deliveries not yet acked.
@@ -1411,7 +1473,7 @@ final class DeliveryLanes {
             try {
                 view.offered = false;
                 view.localDone = true;
-                overflow = overflow(lane, Dropped.REFUSED);
+                overflow = overflow(lane, DropReason.REFUSED);
                 releaseView(view);
                 finishAccepting(lane);
             } finally {
@@ -1423,7 +1485,7 @@ final class DeliveryLanes {
             try {
                 view.offered = false;
                 view.localDone = true;
-                drop(lane, Dropped.REFUSED);
+                drop(lane, DropReason.REFUSED);
                 view.released = true;
                 invalidate(view);
                 finishAccepting(lane);
@@ -1492,7 +1554,7 @@ final class DeliveryLanes {
         boolean firstSkip = false;
         lock.lock();
         try {
-            drop(lane, Dropped.FAILED);
+            drop(lane, DropReason.FAILED);
             view.localDone = true;
             stops = holdsAcknowledgement(view)
                     && (refused || lane.failurePolicy == FailurePolicy.STOP);
@@ -1501,7 +1563,7 @@ final class DeliveryLanes {
             } else {
                 ready = markReady(view);
                 releaseView(view);
-                firstSkip = lane.warned.add(Dropped.FAILED);
+                firstSkip = lane.warned.add(DropReason.FAILED);
             }
         } finally {
             lock.unlock();
@@ -1548,7 +1610,7 @@ final class DeliveryLanes {
 
     /// Caller holds lock. Counts a delivery that left `lane` unprocessed, for the subscription and
     /// for the client.
-    private void drop(Lane lane, Dropped reason) {
+    private void drop(Lane lane, DropReason reason) {
         lane.dropped[reason.ordinal()]++;
         dropped[reason.ordinal()]++;
     }
@@ -1668,7 +1730,7 @@ final class DeliveryLanes {
         while (!queue.isEmpty()) {
             DeliveryView view = queue.removeFirst();
             view.recipient.queued = false;
-            drop(lane, Dropped.SUBSCRIPTION_STOPPED);
+            drop(lane, DropReason.SUBSCRIPTION_STOPPED);
             view.localDone = true;
             ready |= markReady(view);
             releaseView(view);
@@ -1682,7 +1744,7 @@ final class DeliveryLanes {
         while (!queue.isEmpty()) {
             DeliveryView view = queue.removeFirst();
             view.recipient.queued = false;
-            drop(lane, Dropped.CONNECTION_ENDED);
+            drop(lane, DropReason.CONNECTION_ENDED);
             view.localDone = true;
             view.released = true;
             invalidate(view);
@@ -1911,7 +1973,7 @@ final class DeliveryLanes {
         // numbers, because Java shares the boxed objects only for numbers from -128 to 127.
         final Map<Object, Sublane> sublanes;
         // Deliveries that left this lane unprocessed, by reason.
-        final long[] dropped = new long[Dropped.values().length];
+        final long[] dropped = new long[DropReason.values().length];
         int retained;
         int queuedInSublanes;
         // Drain tasks running on an executor's thread, from their start until they return.
@@ -1926,7 +1988,7 @@ final class DeliveryLanes {
         boolean accepting;
         // Reasons whose first drop from this lane has been logged at warning level; later drops
         // for the same reason are logged at debug level.
-        final Set<Dropped> warned = EnumSet.noneOf(Dropped.class);
+        final Set<DropReason> warned = EnumSet.noneOf(DropReason.class);
         @Nullable Throwable failure;
 
         Lane(
@@ -2033,31 +2095,45 @@ final class DeliveryLanes {
         }
     }
 
-    /// Why a delivery left its subscription unprocessed. The counts are internal until
-    /// applications get statistics.
-    enum Dropped {
+    /// The values of the lanes and of the client that [#values()] reads at once.
+    ///
+    /// @param lanes the values of each lane in the routing map, by its subscription's id
+    /// @param admitted the deliveries that lanes took, over the client's lifetime
+    /// @param deliveries the deliveries that the client holds, against its limit
+    /// @param bytes the bytes of those deliveries, against the client's limit
+    /// @param retainedLanes the lanes, including stopped ones whose handlers have not returned
+    /// @param dropped the deliveries that left any lane unprocessed, by reason
+    record Values(
+            Map<Long, LaneValues> lanes,
+            long admitted,
+            Usage deliveries,
+            Usage bytes,
+            Usage retainedLanes,
+            Map<DropReason, Long> dropped
+    ) {}
 
-        /// Its handler threw, the lane selector failed for it, or its executor refused it.
-        FAILED,
+    /// @param waiting deliveries in the lane's queue or in its sublanes
+    /// @param running deliveries that a handler or an acceptor is processing
+    /// @param awaitingAck processed MANUAL deliveries whose ack() is due
+    /// @param dropped the lane's deliveries that left it unprocessed, by reason
+    record LaneValues(
+            long waiting,
+            long running,
+            long awaitingAck,
+            Map<DropReason, Long> dropped
+    ) {
 
-        /// A connection's end discarded it while it waited.
-        CONNECTION_ENDED,
-
-        /// A stop of its subscription discarded it while it waited.
-        SUBSCRIPTION_STOPPED,
-
-        /// A QoS 0 delivery found its subscription's buffer full.
-        SUBSCRIPTION_FULL,
-
-        /// A QoS 0 delivery did not fit the client's limits on deliveries and bytes.
-        CLIENT_FULL,
-
-        /// Its hand-off acceptor refused it.
-        REFUSED
+        /// The values of a subscription whose lane has not been registered yet.
+        static final LaneValues UNREGISTERED = new LaneValues(
+                0,
+                0,
+                0,
+                ClientSnapshot.counts(new long[DropReason.values().length], DropReason.class)
+        );
     }
 
     /// A QoS 0 delivery that overflow kept from the lane `id`, logged after the lock is released.
-    private record Overflow(long id, Dropped reason, boolean first) {}
+    private record Overflow(long id, DropReason reason, boolean first) {}
 
     /// A delivery taken from its lane's queue. `ready` says whether taking it met the last
     /// acknowledgement condition of its receipt, which `execute` announces without the lock.
