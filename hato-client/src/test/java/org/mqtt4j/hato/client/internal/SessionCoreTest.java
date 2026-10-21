@@ -2316,6 +2316,26 @@ class SessionCoreTest {
     }
 
     @Test
+    void a_publication_reaches_each_registration_once_in_registration_order() {
+        // Arrange: overlapping registrations with identifiers 1 to 3, the last one matching
+        // every topic.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/b"));
+        mqtt5.subscribe(3, subscription("a/+"));
+        mqtt5.subscribe(4, subscription("#"));
+
+        // Act: identifiers out of order and one of them twice, then none.
+        mqtt5.received(1, publication("a/b", 3, 1, 3), 0, 0);
+        mqtt5.received(1, publication("a/b"), 0, 0);
+
+        // Assert
+        assertThat(port.deliveries).extracting(Received::ids).containsExactly(
+                List.of(2L, 4L),
+                List.of(2L, 3L, 4L)
+        );
+    }
+
+    @Test
     void a_publication_whose_identifiers_name_no_live_registration_is_acknowledged_unmatched() {
         // Arrange: the registration with identifier 1 awaits its UNSUBACK.
         SessionCore mqtt5 = connectedMqtt5();
@@ -2328,14 +2348,23 @@ class SessionCoreTest {
                 0
         );
         mqtt5.unsubscribe(3, 2);
+        var unsubscribe = (Packet.Unsubscribe) port.sent.getLast();
 
-        // Act: one names the registration being removed, the other an unknown identifier.
+        // Act: one names the registration being removed, another an unknown identifier, and the
+        // last the registration once its removal is confirmed.
         mqtt5.received(1, qosOnePublication(7, "a/b", identifierProperties(1)), 0, 0);
         mqtt5.received(1, qosOnePublication(8, "a/b", identifierProperties(99)), 0, 0);
+        mqtt5.received(
+                1,
+                new Packet.UnsubAck(unsubscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+        mqtt5.received(1, qosOnePublication(9, "a/b", identifierProperties(1)), 0, 0);
 
         // Assert
         assertThat(port.deliveries).isEmpty();
-        assertThat(pubAckIds()).containsExactly(7, 8);
+        assertThat(pubAckIds()).containsExactly(7, 8, 9);
     }
 
     @Test

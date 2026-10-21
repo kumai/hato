@@ -2,6 +2,7 @@ package org.mqtt4j.hato.client.internal;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -72,8 +73,14 @@ final class Subscriptions {
     // releases. The mailbox bounds registrations still queued for the actor by the same limit.
     private final int registrationLimit;
 
-    // The client's registrations by id, in registration order.
+    // The client's registrations by id, in registration order. The indexes below hold the same
+    // registrations, so that routing a publication does not scan them all.
     private final Map<Long, LocalSubscription> registry = new LinkedHashMap<>();
+
+    private final Map<Integer, LocalSubscription> byIdentifier = new HashMap<>();
+
+    // The registrations by the filter that they match topics with.
+    private final FilterTree<LocalSubscription> byTopic = new FilterTree<>();
 
     // Where the search for the next registration's Subscription Identifier starts.
     private int nextIdentifier = 1;
@@ -144,7 +151,7 @@ final class Subscriptions {
                 registered.orElseThrow(),
                 allocateIdentifier()
         );
-        registry.put(operation, local);
+        register(local);
         if (core.state() == State.CONNECTED) {
             window.registrations.addLast(local);
             core.drain();
@@ -194,22 +201,34 @@ final class Subscriptions {
                 ? identifiers(publish.properties())
                 : List.of();
         Topic topic = publish.topic();
-        var matches = new ArrayList<Long>();
-        // Matching is O(subscriptions). Replace with a topic tree if 0.4 measurements show
-        // this scan dominates, keeping TopicFilter.matches as the reference implementation.
-        for (var local : registry.values()) {
-            if (local.removal != null) {
-                continue;
+        var matches = new ArrayList<LocalSubscription>();
+        if (identifiers.isEmpty()) {
+            byTopic.match(topic, matches::add);
+        } else {
+            for (int identifier : identifiers) {
+                LocalSubscription named = byIdentifier.get(identifier);
+                if (named != null) {
+                    matches.add(named);
+                }
             }
             // A broker that sends one copy for overlapping subscriptions names only those that
             // it holds with an identifier, so the others still need their filters matched.
-            boolean byTopic = identifiers.isEmpty() || local.heldWithoutIdentifier;
-            if (identifiers.contains(local.identifier)
-                    || byTopic && local.matchingFilter.matches(topic)) {
-                matches.add(local.id);
+            byTopic.match(topic, local -> {
+                if (local.heldWithoutIdentifier) {
+                    matches.add(local);
+                }
+            });
+        }
+        // Registration order, which is the order of the ids, decides the order in which the
+        // lanes take their copies; a registration named twice, or named and matched, goes once.
+        matches.sort(Comparator.comparingLong(local -> local.id));
+        var ids = new ArrayList<Long>(matches.size());
+        for (LocalSubscription local : matches) {
+            if (local.removal == null && (ids.isEmpty() || ids.getLast() != local.id)) {
+                ids.add(local.id);
             }
         }
-        return matches;
+        return ids;
     }
 
     /// Reconciles the registry with the broker after a successful CONNACK and before the core
@@ -403,7 +422,7 @@ final class Subscriptions {
         if (!local.confirmed) {
             removeSubscription(local, refusal);
         } else {
-            registry.remove(local.id);
+            unregister(local);
             port.resubscribeFailed(local.handle, refusal);
         }
         finishRemoval(local);
@@ -531,8 +550,24 @@ final class Subscriptions {
         return candidate;
     }
 
+    /// Records `local` in the registry and in the indexes that find it by identifier and topic.
+    private void register(LocalSubscription local) {
+        registry.put(local.id, local);
+        byIdentifier.put(local.identifier, local);
+        byTopic.add(local.matchingFilter, local);
+    }
+
+    /// Removes `local` from the registry and its indexes, if it is still there.
+    private void unregister(LocalSubscription local) {
+        if (registry.remove(local.id) == null) {
+            return;
+        }
+        byIdentifier.remove(local.identifier);
+        byTopic.remove(local.matchingFilter, local);
+    }
+
     private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
-        registry.remove(local.id);
+        unregister(local);
         window.registrations.remove(local);
         port.removeSubscription(local.id, local.handle, cause);
     }
