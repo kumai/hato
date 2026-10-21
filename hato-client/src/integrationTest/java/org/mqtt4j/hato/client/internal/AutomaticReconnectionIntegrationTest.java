@@ -16,6 +16,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIf;
@@ -66,6 +67,13 @@ class AutomaticReconnectionIntegrationTest {
 
     private final LinkedBlockingQueue<Disconnection> failures = new LinkedBlockingQueue<>();
 
+    // WebSocket transports wrapped for fault injection, whose HttpClient the test releases
+    // itself, because the client sees only the wrapper.
+    private final WebSocketTransports webSockets = new WebSocketTransports(
+            "reconnection",
+            DefaultTimerScheduler.instance
+    );
+
     private final ConnectionListener listener = new ConnectionListener() {
         @Override
         public void onDisconnected(Disconnection disconnection) {
@@ -77,6 +85,13 @@ class AutomaticReconnectionIntegrationTest {
             failures.add(failure);
         }
     };
+
+    @AfterEach
+    void releaseHttpClient() throws InterruptedException {
+        var released = new CountDownLatch(1);
+        webSockets.release(released::countDown);
+        assertThat(released.await(10, SECONDS)).isTrue();
+    }
 
     @Test
     void automatic_attempts_retry_missing_authorization_but_stop_at_an_identifier_rejection()
@@ -243,6 +258,23 @@ class AutomaticReconnectionIntegrationTest {
         try (GenericContainer<?> broker = Mosquitto.container()) {
             Docker.start(broker);
             continueAcrossAutomaticReconnection(mosquittoEndpoint(broker), version);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    @Timeout(60)
+    @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
+    void mosquitto_continues_a_session_across_automatic_reconnection_over_websocket(
+            MqttVersion version
+    ) throws Exception {
+        try (GenericContainer<?> broker = Mosquitto.container()) {
+            Docker.start(broker);
+            continueAcrossAutomaticReconnection(
+                    URI.create("ws://" + broker.getHost() + ":"
+                            + broker.getMappedPort(Mosquitto.WEBSOCKET_PORT) + "/mqtt"),
+                    version
+            );
         }
     }
 
@@ -498,7 +530,12 @@ class AutomaticReconnectionIntegrationTest {
                 .reconnectPolicy(ReconnectPolicy.exponentialBackoff(DELAY, DELAY))
                 .connectionListener(notifications)
                 .transportFactory(id -> {
-                    var transport = new FaultyTransport(Transport.tcp(id), faults);
+                    var transport = new FaultyTransport(
+                            "ws".equals(broker.getScheme())
+                                    ? webSockets.create(id)
+                                    : Transport.tcp(id),
+                            faults
+                    );
                     transports.add(transport);
                     return transport;
                 })
