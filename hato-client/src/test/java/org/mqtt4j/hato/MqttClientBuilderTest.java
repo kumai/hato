@@ -112,6 +112,52 @@ class MqttClientBuilderTest {
                 .hasNoCause();
     }
 
+    @ParameterizedTest(name = "accepts {0}")
+    @ValueSource(ints = {1, 64, 65_535})
+    void inflight_publish_limits_from_1_to_65535_are_accepted(int limit) {
+        MqttClientBuilder sut = configuredBuilder();
+
+        assertThatCode(() -> sut.maxInflightPublishes(limit).build().close())
+                .doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest(name = "rejects {0}")
+    @ValueSource(ints = {-1, 0, 65_536})
+    void inflight_publish_limits_outside_1_to_65535_are_rejected(int limit) {
+        MqttClientBuilder sut = configuredBuilder();
+
+        assertThatThrownBy(() -> sut.maxInflightPublishes(limit))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest(name = "accepts {0}")
+    @ValueSource(ints = {1, 256})
+    void subscription_limits_from_1_to_256_are_accepted(int limit) {
+        MqttClientBuilder sut = configuredBuilder();
+
+        assertThatCode(() -> sut.maxSubscriptions(limit).build().close())
+                .doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest(name = "rejects {0}")
+    @ValueSource(ints = {-1, 0, 257})
+    void subscription_limits_outside_1_to_256_are_rejected(int limit) {
+        MqttClientBuilder sut = configuredBuilder();
+
+        assertThatThrownBy(() -> sut.maxSubscriptions(limit))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void a_client_holds_64_publications_and_256_subscriptions_by_default() throws Exception {
+        assertLimitsHold(configuredBuilder(), 64, 256);
+    }
+
+    @Test
+    void a_client_holds_as_many_publications_and_subscriptions_as_configured() throws Exception {
+        assertLimitsHold(configuredBuilder().maxInflightPublishes(2).maxSubscriptions(1), 2, 1);
+    }
+
     @Test
     void a_server_is_required() {
         assertThatThrownBy(() -> MqttClient.builder().build())
@@ -725,6 +771,46 @@ class MqttClientBuilderTest {
         return MqttMessage.of(new Topic("status"), new byte[0], Qos.AT_LEAST_ONCE, false);
     }
 
+    /// Fills a client from `builder` with `publications` unfinished QoS 1 publications and
+    /// `subscriptions` unestablished subscriptions, against a broker that accepts the connection
+    /// and answers nothing else, and checks that one more of each fails for capacity.
+    private static void assertLimitsHold(
+            MqttClientBuilder builder,
+            int publications,
+            int subscriptions
+    ) throws Exception {
+        // Arrange
+        try (MqttClient sut = builder.transportFactory(_ -> new SilentBroker()).build()) {
+            sut.connect().get(5, SECONDS);
+            for (int i = 0; i < publications; i++) {
+                CompletableFuture<PublishResult> _ = sut.publish(qosOneMessage());
+            }
+            for (int i = 0; i < subscriptions; i++) {
+                Subscription _ = sut.subscribe(
+                        Subscribe.of(new TopicFilter("held/" + i), Qos.AT_MOST_ONCE)
+                );
+            }
+
+            // Act
+            CompletableFuture<PublishResult> publication = sut.publish(qosOneMessage());
+            Subscription subscription = sut.subscribe(request());
+
+            // Assert
+            assertThatThrownBy(() -> publication.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttCapacityException.class);
+            assertThatThrownBy(() -> subscription.established().get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttCapacityException.class);
+        }
+    }
+
+    private static MqttMessage qosOneMessage() {
+        return MqttMessage.of(new Topic("limits"), new byte[] {1}, Qos.AT_LEAST_ONCE, false);
+    }
+
+    private static Subscribe request() {
+        return Subscribe.of(new TopicFilter("limits/next"), Qos.AT_MOST_ONCE);
+    }
+
     /// The CONNECT that a client from `builder` sends first, read without answering it.
     private static Packet.Connect sentConnect(MqttClientBuilder builder) throws Exception {
         var transport = new ConnectCapture();
@@ -766,6 +852,38 @@ class MqttClientBuilderTest {
         @Override
         public SendResult send(long ticket, byte[] bytes) {
             boolean _ = connect.complete(bytes);
+            return SendResult.ACCEPTED;
+        }
+
+        @Override
+        public synchronized void close() {
+            Listener receiver = listener;
+            listener = null;
+            if (receiver != null) {
+                receiver.onClosed(new IOException("Closed"));
+            }
+        }
+    }
+
+    /// Connects at once, completes every send, and answers only CONNECT, with an MQTT 3.1.1
+    /// CONNACK that accepts the connection, so publications and subscriptions stay unfinished.
+    private static final class SilentBroker implements Transport {
+
+        private @Nullable Listener listener;
+
+        @Override
+        public synchronized void start(URI endpoint, Duration timeout, Listener receiver) {
+            listener = receiver;
+            receiver.onConnected();
+        }
+
+        @Override
+        public synchronized SendResult send(long ticket, byte[] bytes) {
+            Listener receiver = requireNonNull(listener);
+            receiver.onSent(ticket);
+            if ((bytes[0] & 0xF0) == 0x10) {
+                receiver.onBytes(new byte[] {0x20, 0x02, 0x00, 0x00});
+            }
             return SendResult.ACCEPTED;
         }
 

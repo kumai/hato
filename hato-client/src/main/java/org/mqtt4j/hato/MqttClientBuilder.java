@@ -69,6 +69,13 @@ public final class MqttClientBuilder {
 
     private static final int MAX_PACKET_SIZE = 268_435_460;
 
+    // QoS 1 and QoS 2 exchanges need distinct packet identifiers.
+    private static final int MAX_INFLIGHT_PUBLISHES = 65_535;
+
+    // A deliberate ceiling: matching and fan-out are not yet measured with more subscriptions.
+    // Raise it once they are.
+    private static final int MAX_SUBSCRIPTIONS = 256;
+
     private static final int GENERATED_CLIENT_ID_LENGTH = 23;
 
     private static final String CLIENT_ID_PREFIX = "hato";
@@ -90,6 +97,10 @@ public final class MqttClientBuilder {
     private Duration sessionExpiry = Duration.ZERO;
 
     private int maxPacketSize = DEFAULT_MAX_PACKET_SIZE;
+
+    private int maxInflightPublishes = ClientLimits.DEFAULT.inflightPublishes();
+
+    private int maxSubscriptions = ClientLimits.DEFAULT.subscriptions();
 
     private TimerScheduler scheduler = DefaultTimerScheduler.instance;
 
@@ -337,6 +348,43 @@ public final class MqttClientBuilder {
         return this;
     }
 
+    /// Limits the QoS 1 and QoS 2 publications whose exchanges are unfinished, from 1 to 65535;
+    /// defaults to 64. A publication counts from [MqttPublisher#publish(MqttMessage)] until its
+    /// PUBACK for QoS 1 or its PUBCOMP for QoS 2, including while it waits for the broker's
+    /// Receive Maximum and, in a persistent session, while its exchange waits for the next
+    /// connection. A publication beyond the limit fails with [MqttCapacityException]; QoS 0
+    /// publications do not count. Publications share packet identifiers with subscription
+    /// requests, so one can also fail below the limit when no identifier is free. With MQTT 5.0,
+    /// at most the smaller of this limit and the broker's Receive Maximum are in progress on one
+    /// connection.
+    ///
+    /// The client keeps its other limits internal, and they may change: the bytes that unfinished
+    /// publications keep, the operation and send capacity that publications use, which grow with
+    /// this limit, and the capacity for incoming QoS 1 and QoS 2 exchanges.
+    public MqttClientBuilder maxInflightPublishes(int value) {
+        if (value < 1 || value > MAX_INFLIGHT_PUBLISHES) {
+            throw new IllegalArgumentException(
+                    "Inflight publishes must be 1.." + MAX_INFLIGHT_PUBLISHES
+            );
+        }
+        maxInflightPublishes = value;
+        return this;
+    }
+
+    /// Limits the subscriptions that the client holds, from 1 to 256; defaults to 256. A
+    /// subscription counts from its request through [MqttSubscriber], including while it awaits
+    /// establishment, until the broker has removed it, and its delivery lane counts until its
+    /// handlers have returned. A subscription beyond the limit ends its handle, and
+    /// [Subscription#established()] fails with [MqttCapacityException]. The client keeps the
+    /// deliveries that it holds across all subscriptions within an internal limit.
+    public MqttClientBuilder maxSubscriptions(int value) {
+        if (value < 1 || value > MAX_SUBSCRIPTIONS) {
+            throw new IllegalArgumentException("Subscriptions must be 1.." + MAX_SUBSCRIPTIONS);
+        }
+        maxSubscriptions = value;
+        return this;
+    }
+
     /// Supplies monotonic time and delayed callbacks. Defaults to a shared daemon timer with
     /// [System#nanoTime]. The scheduler is borrowed and is not closed with the client.
     /// The default transports use it for connection deadlines, including the TLS handshake and
@@ -491,7 +539,7 @@ public final class MqttClientBuilder {
                 reconnectPolicy.rules(),
                 responseTimeout,
                 DeliveryOptions::execution,
-                ClientLimits.DEFAULT
+                new ClientLimits(maxInflightPublishes, maxSubscriptions)
         );
     }
 

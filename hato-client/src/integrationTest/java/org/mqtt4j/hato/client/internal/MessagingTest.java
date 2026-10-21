@@ -301,6 +301,40 @@ abstract class MessagingTest {
     }
 
     @Test
+    void a_large_inflight_limit_carries_a_burst_of_qos_one_publications_on_one_connection()
+            throws Exception {
+        // Arrange: the client admits two thousand unfinished publications.
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        try (MqttClient sut = MqttClient.builder()
+                .server(endpoint())
+                .version(version)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .connectionListener(ended::add)
+                .maxInflightPublishes(2000)
+                .build()) {
+            sut.connect().get(5, SECONDS);
+            var topic = new Topic(uniqueTopic());
+
+            // Act: publish them all without waiting for earlier acknowledgements.
+            var publications = new ArrayList<CompletableFuture<PublishResult>>();
+            for (int i = 0; i < 2000; i++) {
+                publications.add(sut.publish(MqttMessage.of(
+                        topic,
+                        new byte[] {(byte) i},
+                        Qos.AT_LEAST_ONCE,
+                        false
+                )));
+            }
+
+            // Assert: every publication completes, and the connection lasts.
+            CompletableFuture.allOf(publications.toArray(CompletableFuture[]::new))
+                    .get(30, SECONDS);
+            assertThat(ended).isEmpty();
+            sut.disconnect().get(5, SECONDS);
+        }
+    }
+
+    @Test
     void a_connection_lost_before_puback_leaves_the_publication_outcome_unknown()
             throws Exception {
         // Arrange: this scheduler controls only delayed inbound transport bytes.

@@ -121,6 +121,11 @@ they use, such as a database connection or an injected `TimerScheduler`.
 Use `Qos.EXACTLY_ONCE` in the [publishing example](../README.md#publishing)
 to publish at QoS 2.
 
+A client keeps up to 64 QoS 1 and QoS 2 publications unfinished at once, including those that
+wait for the broker to take them; a publication beyond that fails with `MqttCapacityException`.
+Set `maxInflightPublishes(n)` on the builder to keep more or fewer. Likewise,
+`maxSubscriptions(n)` lowers the 256 subscriptions that a client holds by default.
+
 With MQTT 5.0, a message can also carry properties, such as a content type, a lifetime, and
 name-value pairs of your own:
 
@@ -374,7 +379,7 @@ and registration capacity fail `established()` and end only the returned handle.
 | `MqttConnectException` | `connect()` gave up: the broker could not be reached, refused the connection, did not answer in time, or still reported a session after the client discarded it, or `disconnect()`, `close()`, or a failing handler withdrew the request first. |
 | `MqttNotConnectedException` | The client was not connected, for example while it was reconnecting. |
 | `MqttConnectionLostException` | The connection ended before the result was known. A publication may or may not have reached the broker. |
-| `MqttCapacityException` | The client reached an admission limit. The connection stays up; let outstanding work drain before retrying. |
+| `MqttCapacityException` | The client reached an admission limit, such as `maxInflightPublishes` or `maxSubscriptions`. The connection stays up; let outstanding work drain before retrying. |
 | `MqttProtocolException` | The broker accepted a QoS 2 publication only at QoS 1, so it may be delivered more than once. The connection stays up. |
 | `MqttPublicationRefusedException` | An MQTT 5.0 broker refused the publication, or the publication exceeds a limit that the broker announced. The connection stays up. |
 | `MqttSubscriptionRefusedException` | The broker refused the subscription or does not support it. |
