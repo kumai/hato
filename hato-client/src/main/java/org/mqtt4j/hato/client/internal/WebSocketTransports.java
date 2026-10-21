@@ -7,6 +7,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.UnaryOperator;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 
 import org.jspecify.annotations.Nullable;
 
@@ -25,6 +27,8 @@ public final class WebSocketTransports implements Transport.Factory {
 
     private final TimerScheduler timer;
 
+    private final @Nullable Tls tls;
+
     // Wraps each WebSocket that opens; tests use it to hold or fail writes.
     private final UnaryOperator<WebSocket> opened;
 
@@ -38,19 +42,43 @@ public final class WebSocketTransports implements Transport.Factory {
 
     private boolean released;
 
+    /// The transports of a client that connects to a `ws` URI.
     public WebSocketTransports(String clientId, TimerScheduler timer) {
-        this(clientId, timer, UnaryOperator.identity());
+        this(clientId, timer, null, UnaryOperator.identity());
     }
 
-    WebSocketTransports(String clientId, TimerScheduler timer, UnaryOperator<WebSocket> opened) {
+    /// The transports of a client that connects to a `wss` URI, whose HttpClient uses `context`
+    /// and a copy of `parameters`. HttpClient applies only part of the parameters; the builder
+    /// rejects the rest.
+    public WebSocketTransports(
+            String clientId,
+            TimerScheduler timer,
+            SSLContext context,
+            SSLParameters parameters
+    ) {
+        this(clientId, timer, new Tls(context, parameters), UnaryOperator.identity());
+    }
+
+    WebSocketTransports(
+            String clientId,
+            TimerScheduler timer,
+            @Nullable Tls tls,
+            UnaryOperator<WebSocket> opened
+    ) {
         threadName = "hato-" + requireNonNull(clientId, "clientId");
         this.timer = timer;
+        this.tls = tls;
         this.opened = opened;
     }
 
     @Override
     public Transport create(String clientId) {
         return new WebSocketTransport(clientId, this, timer, opened);
+    }
+
+    /// The URI scheme of these transports: `wss` with TLS settings, and `ws` without.
+    String scheme() {
+        return tls == null ? "ws" : "wss";
     }
 
     /// The client's HttpClient, created by its first WebSocket connection. It connects directly,
@@ -67,10 +95,13 @@ public final class WebSocketTransports implements Transport.Factory {
                 ExecutorService work = Executors.newThreadPerTaskExecutor(
                         Thread.ofVirtual().name(threadName + "-http-", 0).factory()
                 );
-                client = HttpClient.newBuilder()
+                HttpClient.Builder builder = HttpClient.newBuilder()
                         .executor(work)
-                        .proxy(HttpClient.Builder.NO_PROXY)
-                        .build();
+                        .proxy(HttpClient.Builder.NO_PROXY);
+                if (tls != null) {
+                    builder.sslContext(tls.context()).sslParameters(tls.parameters());
+                }
+                client = builder.build();
                 executor = work;
                 http = client;
             }
@@ -118,4 +149,7 @@ public final class WebSocketTransports implements Transport.Factory {
             }
         });
     }
+
+    /// The TLS settings of a `wss` client's HttpClient.
+    record Tls(SSLContext context, SSLParameters parameters) {}
 }

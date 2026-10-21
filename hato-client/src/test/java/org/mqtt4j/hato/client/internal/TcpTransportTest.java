@@ -50,7 +50,10 @@ class TcpTransportTest {
     private final ManualTimerScheduler clock = new ManualTimerScheduler();
 
     @ParameterizedTest(name = "{0} transport rejects {1}")
-    @CsvSource({"mqtt, mqtts", "mqtts, mqtt", "mqtt, tcp", "mqtts, ssl", "mqtts, tls"})
+    @CsvSource({
+            "mqtt, mqtts", "mqtts, mqtt", "mqtt, tcp", "mqtts, ssl", "mqtts, tls",
+            "mqtt, ws", "mqtts, wss"
+    })
     void unsupported_schemes_are_rejected_before_starting_a_connection(
             String transportScheme,
             String endpointScheme

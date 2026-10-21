@@ -20,6 +20,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.function.LongConsumer;
+import java.util.function.UnaryOperator;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
@@ -138,7 +139,13 @@ class TransportContractTest {
             "WS, true, false, false, false", "WS, true, false, true, false",
             "WS, true, true, false, false", "WS, true, true, true, false",
             "WS, true, false, false, true", "WS, true, false, true, true",
-            "WS, true, true, false, true", "WS, true, true, true, true"
+            "WS, true, true, false, true", "WS, true, true, true, true",
+            "WSS, false, false, false, false", "WSS, false, false, true, false",
+            "WSS, false, true, false, false", "WSS, false, true, true, false",
+            "WSS, true, false, false, false", "WSS, true, false, true, false",
+            "WSS, true, true, false, false", "WSS, true, true, true, false",
+            "WSS, true, false, false, true", "WSS, true, false, true, true",
+            "WSS, true, true, false, true", "WSS, true, true, true, true"
     })
     void shutdown_preserves_the_local_write_result(
             Kind kind,
@@ -249,7 +256,8 @@ class TransportContractTest {
     @CsvSource({
             "TCP, false, false", "TCP, true, false", "TCP, true, true",
             "TLS, false, false", "TLS, true, false", "TLS, true, true",
-            "WS, false, false", "WS, true, false", "WS, true, true"
+            "WS, false, false", "WS, true, false", "WS, true, true",
+            "WSS, false, false", "WSS, true, false", "WSS, true, true"
     })
     void ordered_bytes_write_completions_and_a_single_terminal_event(
             Kind kind,
@@ -334,7 +342,8 @@ class TransportContractTest {
     @CsvSource({
             "TCP, close", "TCP, disconnect", "TCP, peer EOF",
             "TLS, close", "TLS, disconnect", "TLS, peer EOF",
-            "WS, close", "WS, disconnect", "WS, peer EOF"
+            "WS, close", "WS, disconnect", "WS, peer EOF",
+            "WSS, close", "WSS, disconnect", "WSS, peer EOF"
     })
     void ending_a_delayed_send_returns_ownership_without_writing(Kind kind, String ending)
             throws Exception {
@@ -380,7 +389,10 @@ class TransportContractTest {
     }
 
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
-    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true", "WS, false", "WS, true"})
+    @CsvSource({
+            "TCP, false", "TCP, true", "TLS, false", "TLS, true",
+            "WS, false", "WS, true", "WSS, false", "WSS, true"
+    })
     void stalled_writes_allow_reads_and_close_without_waiting(Kind kind, boolean faulty)
             throws Exception {
         // Arrange
@@ -423,7 +435,10 @@ class TransportContractTest {
     }
 
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
-    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true", "WS, false", "WS, true"})
+    @CsvSource({
+            "TCP, false", "TCP, true", "TLS, false", "TLS, true",
+            "WS, false", "WS, true", "WSS, false", "WSS, true"
+    })
     void a_large_write_completes_for_a_peer_that_only_reads(Kind kind, boolean faulty)
             throws Exception {
         // Arrange: the write exceeds the socket buffers, and the peer never sends anything.
@@ -450,7 +465,10 @@ class TransportContractTest {
     }
 
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
-    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true", "WS, false", "WS, true"})
+    @CsvSource({
+            "TCP, false", "TCP, true", "TLS, false", "TLS, true",
+            "WS, false", "WS, true", "WSS, false", "WSS, true"
+    })
     void close_before_start_never_establishes_a_connection(Kind kind, boolean faulty)
             throws Exception {
         // Arrange
@@ -478,9 +496,10 @@ class TransportContractTest {
     /// exercise and the local peer that they connect to.
     enum Kind {
         TCP("mqtt", "127.0.0.1"),
-        // The test server certificate names localhost, so TLS connects by that name.
+        // The test server certificate names localhost, so TLS and WSS connect by that name.
         TLS("mqtts", "localhost"),
-        WS("ws", "127.0.0.1");
+        WS("ws", "127.0.0.1"),
+        WSS("wss", "localhost");
 
         final String scheme;
 
@@ -509,6 +528,7 @@ class TransportContractTest {
                     );
                 }
                 case WS -> webSockets.create("contract");
+                case WSS -> webSocketOwner(UnaryOperator.identity()).create("contract");
             };
             return faulty ? new FaultyTransport(transport, clock) : transport;
         }
@@ -535,11 +555,8 @@ class TransportContractTest {
                             DefaultTimerScheduler.instance
                     );
                 }
-                case WS -> owned(new WebSocketTransports(
-                        "contract",
-                        DefaultTimerScheduler.instance,
-                        socket -> delayedWebSocket(socket, writeFails)
-                )).create("contract");
+                case WS, WSS -> webSocketOwner(socket -> delayedWebSocket(socket, writeFails))
+                        .create("contract");
             };
             return faulty ? new FaultyTransport(transport, clock) : transport;
         }
@@ -561,10 +578,36 @@ class TransportContractTest {
                             parameters
                     );
                 }
-                case WS -> throw new UnsupportedOperationException(
+                case WS, WSS -> throw new UnsupportedOperationException(
                         "A WebSocket transport has no TCP connector"
                 );
             };
+        }
+
+        /// A client's owner of the kind's WebSocket transports, which wraps each WebSocket that
+        /// opens with `opened`. Its HttpClient is released after every case has run.
+        WebSocketTransports webSocketOwner(UnaryOperator<WebSocket> opened) throws Exception {
+            WebSocketTransports owner = switch (this) {
+                case WS -> new WebSocketTransports(
+                        "contract",
+                        DefaultTimerScheduler.instance,
+                        null,
+                        opened
+                );
+                case WSS -> {
+                    SSLContext context = Tls.clientContext();
+                    yield new WebSocketTransports(
+                            "contract",
+                            DefaultTimerScheduler.instance,
+                            new WebSocketTransports.Tls(context, verifyingParameters(context)),
+                            opened
+                    );
+                }
+                case TCP, TLS -> throw new UnsupportedOperationException(
+                        "A TCP transport has no WebSocket owner"
+                );
+            };
+            return owned(owner);
         }
 
         /// A listening peer for the kind's transports.
@@ -573,6 +616,7 @@ class TransportContractTest {
                 case TCP -> socketPeers(loopbackServer());
                 case TLS -> socketPeers(Tls.serverSocket());
                 case WS -> new WebSocketPeerServer(WebSocketPeer.listen());
+                case WSS -> new WebSocketPeerServer(WebSocketPeer.listen(Tls.serverSocket()));
             };
         }
 

@@ -100,8 +100,9 @@ final class WebSocketTransport implements Transport {
                     "Connect timeout must be positive and at most 2147483647 milliseconds"
             );
         }
-        if (!"ws".equals(endpoint.getScheme())) {
-            throw new IllegalArgumentException("Transport requires ws scheme");
+        String scheme = owner.scheme();
+        if (!scheme.equals(endpoint.getScheme())) {
+            throw new IllegalArgumentException("Transport requires " + scheme + " scheme");
         }
         synchronized (callbacks) {
             if (started) {

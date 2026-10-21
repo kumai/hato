@@ -20,6 +20,9 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocket;
 
 import org.jspecify.annotations.Nullable;
 
@@ -29,7 +32,8 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 /// A WebSocket server for tests, with only what they need of RFC 6455: the opening handshake, the
 /// client's masked frames, and the frames that a test sends. A test drives each connection on its
 /// own thread and chooses the handshake's answer, how data is split into frames, and how the
-/// connection ends. It listens on the loopback address, without TLS or extensions.
+/// connection ends. It listens on the loopback address, with or without TLS, and without
+/// extensions.
 final class WebSocketPeer implements AutoCloseable {
 
     static final int CONTINUATION = 0x0;
@@ -49,15 +53,25 @@ final class WebSocketPeer implements AutoCloseable {
 
     private final ServerSocket server;
 
-    private WebSocketPeer(ServerSocket server) {
+    // The start of this server's URIs, up to the port.
+    private final String origin;
+
+    private WebSocketPeer(ServerSocket server, String origin) {
         this.server = server;
+        this.origin = origin;
     }
 
     /// Listens on an ephemeral loopback port. Accepting waits at most five seconds.
     static WebSocketPeer listen() throws IOException {
         var server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
         server.setSoTimeout(5000);
-        return new WebSocketPeer(server);
+        return new WebSocketPeer(server, "ws://127.0.0.1:");
+    }
+
+    /// Serves `wss` on `server`, a loopback TLS socket such as the one from Tls.serverSocket(),
+    /// whose certificate names `localhost`; the server's URIs use that name.
+    static WebSocketPeer listen(SSLServerSocket server) {
+        return new WebSocketPeer(server, "wss://localhost:");
     }
 
     /// Limits the receive buffer of the connections accepted afterward, so that a server that
@@ -66,13 +80,18 @@ final class WebSocketPeer implements AutoCloseable {
         server.setReceiveBufferSize(bytes);
     }
 
-    /// The `ws` URI of this server with `target`, the path and query of the request.
+    /// The URI of this server with `target`, the path and query of the request.
     URI uri(String target) {
-        return URI.create("ws://127.0.0.1:" + server.getLocalPort() + target);
+        return URI.create(origin + port() + target);
+    }
+
+    int port() {
+        return server.getLocalPort();
     }
 
     /// Accepts the next connection and reads its opening handshake, which the test then answers.
-    /// Reads on the connection wait at most five seconds.
+    /// With TLS, reading the opening handshake first completes the TLS handshake. Reads on the
+    /// connection wait at most five seconds.
     Connection accept() throws IOException {
         Socket socket = server.accept();
         try {
@@ -247,6 +266,11 @@ final class WebSocketPeer implements AutoCloseable {
         /// Sends each write as one binary message in a single frame.
         OutputStream binaryOutput() {
             return binaryOutput;
+        }
+
+        /// The TLS session of a connection to a `wss` server.
+        SSLSession tlsSession() {
+            return ((SSLSocket) socket).getSession();
         }
 
         boolean isClosed() {
