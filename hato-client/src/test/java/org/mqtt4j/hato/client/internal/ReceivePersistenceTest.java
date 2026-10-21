@@ -74,8 +74,8 @@ class ReceivePersistenceTest {
                         .find(PropertyId.RECEIVE_MAXIMUM)
                         .orElseThrow())
                 .containsExactly(
-                        new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4096),
-                        new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4094)
+                        new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4080),
+                        new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4078)
                 );
     }
 

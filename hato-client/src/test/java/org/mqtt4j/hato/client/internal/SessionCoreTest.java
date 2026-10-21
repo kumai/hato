@@ -4124,10 +4124,11 @@ class SessionCoreTest {
         mqtt5.connect(attempt(1), 0);
         mqtt5.opened(1);
 
-        // Assert: no requests for problem or response information.
+        // Assert: room for 4,096 receptions, less 16 acknowledgements that can await their write,
+        // and no requests for problem or response information.
         var connect = (Packet.Connect) port.sent.getLast();
         assertThat(connect.properties().entries()).containsExactly(
-                new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4096),
+                new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, 4080),
                 new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 1024),
                 new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16)
         );
@@ -4201,6 +4202,27 @@ class SessionCoreTest {
                 .isEqualTo(new Packet.Disconnect(ReasonCode.RECEIVE_MAXIMUM_EXCEEDED, EMPTY));
     }
 
+    @Test
+    void publications_after_acknowledgements_that_await_their_write_still_fit_the_receive_table() {
+        // Arrange: the broker uses its whole quota, and the send queue accepts 16 PUBACKs whose
+        // write completions have not reached the core.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        int announced = announcedReceiveMaximum();
+        receiveQosOne(mqtt5, 1, 1, announced);
+        for (int index = 0; index < 16; index++) {
+            mqtt5.deliveryReady(port.deliveries.get(index).token());
+        }
+
+        // Act: the broker uses the quota that those PUBACKs returned.
+        receiveQosOne(mqtt5, 1, announced + 1, 16);
+
+        // Assert
+        assertThat(pubAckIds()).hasSize(16);
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
+        assertThat(port.ends).isEmpty();
+    }
+
     @ParameterizedTest(name = "released before the QoS 1 publications: {0}")
     @ValueSource(booleans = {false, true})
     void a_qos_2_reception_holds_its_place_until_its_pubcomp_reaches_the_send_queue(
@@ -4262,7 +4284,7 @@ class SessionCoreTest {
 
         // Assert: the receive table keeps the reception aside, and the broker's quota does not
         // count it.
-        assertThat(announced).isEqualTo(4095);
+        assertThat(announced).isEqualTo(4079);
         assertThat(port.sent).noneMatch(Packet.Disconnect.class::isInstance);
     }
 

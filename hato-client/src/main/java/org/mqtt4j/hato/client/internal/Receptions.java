@@ -74,12 +74,16 @@ final class Receptions {
     }
 
     /// The Receive Maximum that the next CONNECT announces, which the receptions of its
-    /// connection must stay within: the room left in the session's receive table, at least 1.
+    /// connection must stay within: the room left in the session's receive table, less the
+    /// acknowledgements that can await their write, and at least 1.
     int announceReceiveMaximum() {
         // Receptions that a continued session carries over can still await PUBREL, and the
-        // broker's new quota does not count them (MQTT 5.0 section 4.9). Announcing only the
-        // room left in the receive table keeps a conforming broker within it.
-        receiveMaximum = Math.max(1, received.room());
+        // broker's new quota does not count them (MQTT 5.0 section 4.9). An acknowledgement that
+        // the send queue accepted returns the broker's quota as soon as the broker receives it,
+        // but holds its reception until its write completion reaches the actor, which can come
+        // after the broker's next publication. Announcing only the room left for both keeps a
+        // conforming broker within the receive table.
+        receiveMaximum = Math.max(1, received.room() - ACK_WRITE_LIMIT);
         return receiveMaximum;
     }
 
