@@ -17,8 +17,9 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /// The client's MQTT 5.0 connections, shared by Mosquitto, EMQX, HiveMQ CE, and the embedded
-/// broker: publications at every QoS, message properties, a persistent session that keeps
-/// messages while the client is away, and a session that another client takes over.
+/// broker: publications at every QoS, message properties, overlapping subscriptions, a persistent
+/// session that keeps messages while the client is away, and a session that another client takes
+/// over.
 @Timeout(30)
 abstract class Mqtt5RoundTripTest {
 
@@ -133,6 +134,41 @@ abstract class Mqtt5RoundTripTest {
 
             // Assert: a broker may answer No matching subscribers or success.
             assertThat(result).isEqualTo(PublishResult.of(unmatchedPublicationReason(qos)));
+        }
+    }
+
+    @Test
+    void overlapping_subscriptions_each_receive_one_copy_of_a_publication() throws Exception {
+        var topic = new Topic("hato/mqtt5/overlap/a");
+        var broad = new LinkedBlockingQueue<MqttMessage>();
+        var narrow = new LinkedBlockingQueue<MqttMessage>();
+        try (
+                MqttClient sut = client("mqtt5-overlap", Duration.ZERO);
+                MqttClient publisher = client("mqtt5-overlap-publisher", Duration.ZERO)
+        ) {
+            // Arrange
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter("hato/mqtt5/overlap/#"), Qos.AT_LEAST_ONCE),
+                    delivery -> broad.add(delivery.message())
+            ).established().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic.name()), Qos.AT_LEAST_ONCE),
+                    delivery -> narrow.add(delivery.message())
+            ).established().get(5, SECONDS);
+            var first = MqttMessage.of(topic, new byte[] {1}, Qos.AT_LEAST_ONCE, false);
+            var second = MqttMessage.of(topic, new byte[] {2}, Qos.AT_LEAST_ONCE, false);
+
+            // Act
+            publisher.publish(first).get(5, SECONDS);
+            publisher.publish(second).get(5, SECONDS);
+
+            // Assert: a second copy of the first publication would arrive before the second.
+            assertThat(List.of(broad.poll(5, SECONDS), broad.poll(5, SECONDS)))
+                    .containsExactly(first, second);
+            assertThat(List.of(narrow.poll(5, SECONDS), narrow.poll(5, SECONDS)))
+                    .containsExactly(first, second);
         }
     }
 
