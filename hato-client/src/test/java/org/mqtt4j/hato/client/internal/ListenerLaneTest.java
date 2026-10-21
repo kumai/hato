@@ -64,17 +64,12 @@ class ListenerLaneTest {
         logger.setUseParentHandlers(false);
         logger.addHandler(handler);
         try {
-            var sut = new ListenerLane(
-                    URI.create("mqtt://localhost"),
-                    "listener-test",
-                    listener,
-                    () -> { }
-            );
+            ListenerLane sut = lane();
             var ending = Disconnection.of(null, true, 1);
 
             // Act
-            sut.connected(ConnAck.of(false, 1));
-            sut.disconnected(ending);
+            sut.submit(() -> listener.onConnected(ConnAck.of(false, 1)));
+            sut.submit(() -> listener.onDisconnected(ending));
 
             // Assert: the second callback still runs, and nothing remains pending.
             assertThat(endings.poll(5, SECONDS)).isSameAs(ending);
@@ -119,16 +114,11 @@ class ListenerLaneTest {
                 throw new IllegalStateException("Listener failed");
             }
         };
-        var sut = new ListenerLane(
-                URI.create("mqtt://localhost"),
-                "listener-test",
-                listener,
-                () -> { }
-        );
-        sut.connected(ConnAck.of(false, 1));
+        ListenerLane sut = lane();
+        sut.submit(() -> listener.onConnected(ConnAck.of(false, 1)));
         assertThat(entered.await(5, SECONDS)).isTrue();
-        sut.disconnected(Disconnection.of(null, true, 1));
-        sut.connected(ConnAck.of(true, 2));
+        sut.submit(() -> listener.onDisconnected(Disconnection.of(null, true, 1)));
+        sut.submit(() -> listener.onConnected(ConnAck.of(true, 2)));
 
         // Act: returning the first callback runs the queued ones on the same thread.
         release.countDown();
@@ -169,19 +159,14 @@ class ListenerLaneTest {
                 attempts.add(failure.connectionAttempt());
             }
         };
-        var sut = new ListenerLane(
-                URI.create("mqtt://localhost"),
-                "listener-test",
-                listener,
-                () -> { }
-        );
-        sut.connected(ConnAck.of(false, 1));
+        ListenerLane sut = lane();
+        sut.submit(() -> listener.onConnected(ConnAck.of(false, 1)));
         assertThat(entered.await(5, SECONDS)).isTrue();
 
         // Act
         for (long attempt = 2; attempt <= 71; attempt++) {
-            var refusal = new IllegalStateException("refused");
-            sut.connectFailed(Disconnection.of(refusal, false, attempt));
+            var failure = Disconnection.of(new IllegalStateException("refused"), false, attempt);
+            sut.submit(() -> listener.onConnectFailed(failure));
         }
 
         // Assert: 64 notifications wait behind the running one; the 6 oldest were dropped.
@@ -198,5 +183,17 @@ class ListenerLaneTest {
         await().pollInterval(Duration.ofMillis(1))
                 .untilAsserted(() -> assertThat(sut.usage()).isZero());
         assertThat(attempts).isEmpty();
+    }
+
+    /// A lane like a client's connection listener lane, which keeps 64 waiting callbacks.
+    private static ListenerLane lane() {
+        return new ListenerLane(
+                URI.create("mqtt://localhost"),
+                "listener-test",
+                "Connection listener",
+                "listener",
+                64,
+                () -> { }
+        );
     }
 }

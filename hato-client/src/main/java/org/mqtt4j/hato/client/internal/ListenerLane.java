@@ -3,35 +3,33 @@ package org.mqtt4j.hato.client.internal;
 import java.net.URI;
 import java.util.ArrayDeque;
 
-import org.mqtt4j.hato.ConnAck;
-import org.mqtt4j.hato.ConnectionListener;
-import org.mqtt4j.hato.Disconnection;
-import org.mqtt4j.hato.MqttSubscriptionRefusedException;
-import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 
-/// Runs connection notifications serially, independently of I/O and operation completion.
-/// Notifications wait in one bounded FIFO. When it is full, the oldest notification that has
-/// not started is dropped and counted, so a slow listener delays only later notifications and
-/// never an attempt or an operation.
+/// Runs one listener's callbacks serially, independently of I/O, operation completion, and the
+/// threads that submit them. Callbacks wait in one bounded FIFO. When it is full, the oldest
+/// callback that has not started is dropped and counted, so a slow listener delays only its own
+/// later callbacks and never an attempt or an operation.
 final class ListenerLane {
 
     private static final Log log = Log.of(ListenerLane.class);
-
-    // Waiting notifications, excluding the one running. Attempt numbers reveal what a listener
-    // that fell this far behind has lost.
-    private static final int QUEUE_LIMIT = 64;
 
     private final URI endpoint;
 
     private final String clientId;
 
-    private final ConnectionListener listener;
+    // How logs name the listener, such as "Connection listener".
+    private final String name;
 
-    // Called without the lock each time the lane runs out of notifications.
+    // The role in the name of the lane's thread.
+    private final String threadRole;
+
+    // Waiting callbacks, excluding the one running.
+    private final int queueLimit;
+
+    // Called without the lock each time the lane runs out of callbacks.
     private final Runnable onIdle;
 
-    private final ArrayDeque<Event> events = new ArrayDeque<>();
+    private final ArrayDeque<Runnable> callbacks = new ArrayDeque<>();
 
     private boolean running;
 
@@ -40,114 +38,87 @@ final class ListenerLane {
 
     private long dropped;
 
-    ListenerLane(URI endpoint, String clientId, ConnectionListener listener, Runnable onIdle) {
+    ListenerLane(
+            URI endpoint,
+            String clientId,
+            String name,
+            String threadRole,
+            int queueLimit,
+            Runnable onIdle
+    ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
-        this.listener = listener;
+        this.name = name;
+        this.threadRole = threadRole;
+        this.queueLimit = queueLimit;
         this.onIdle = onIdle;
     }
 
-    void connected(ConnAck connAck) {
-        submit(new Event.Connected(connAck));
-    }
-
-    void disconnected(Disconnection disconnection) {
-        submit(new Event.Disconnected(disconnection));
-    }
-
-    void connectFailed(Disconnection failure) {
-        submit(new Event.ConnectFailed(failure));
-    }
-
-    void resubscribeFailed(Subscription subscription, MqttSubscriptionRefusedException failure) {
-        submit(new Event.ResubscribeFailed(subscription, failure));
-    }
-
-    private void submit(Event event) {
+    /// Queues `callback` behind the earlier ones; a full queue drops its oldest waiting callback.
+    void submit(Runnable callback) {
         boolean firstDrop = false;
-        synchronized (events) {
-            if (events.size() == QUEUE_LIMIT) {
-                events.removeFirst();
+        synchronized (callbacks) {
+            if (callbacks.size() == queueLimit) {
+                callbacks.removeFirst();
                 firstDrop = dropped++ == 0;
             }
-            events.addLast(event);
+            callbacks.addLast(callback);
             if (!running) {
                 running = true;
-                Thread.ofVirtual().name("hato-" + clientId + "-listener").start(this::run);
+                Thread.ofVirtual().name("hato-" + clientId + "-" + threadRole).start(this::run);
             }
         }
         if (firstDrop) {
-            log.warn("Connection listener for {} at {} fell behind; dropping oldest notifications",
-                    clientId, endpoint);
+            log.warn("{} for {} at {} fell behind; dropping oldest notifications",
+                    name, clientId, endpoint);
         }
     }
 
-    /// Notifications not yet returned from the listener, including a running one.
+    /// Callbacks not yet returned, including a running one.
     int usage() {
-        synchronized (events) {
-            return events.size() + (delivering ? 1 : 0);
+        synchronized (callbacks) {
+            return callbacks.size() + (delivering ? 1 : 0);
         }
     }
 
-    /// Notifications dropped because the listener fell behind.
+    /// Callbacks dropped because the listener fell behind.
     long dropped() {
-        synchronized (events) {
+        synchronized (callbacks) {
             return dropped;
         }
     }
 
-    /// No notification is queued or running.
+    /// No callback is queued or running.
     boolean idle() {
-        synchronized (events) {
+        synchronized (callbacks) {
             return !running;
         }
     }
 
     private void run() {
         while (true) {
-            Event event;
-            synchronized (events) {
+            Runnable callback;
+            synchronized (callbacks) {
                 delivering = false;
-                event = events.pollFirst();
-                if (event == null) {
+                callback = callbacks.pollFirst();
+                if (callback == null) {
                     running = false;
                 } else {
                     delivering = true;
                 }
             }
-            if (event == null) {
+            if (callback == null) {
                 onIdle.run();
                 return;
             }
             try {
-                switch (event) {
-                    case Event.Connected(var connAck) -> listener.onConnected(connAck);
-                    case Event.Disconnected(var disconnection) ->
-                            listener.onDisconnected(disconnection);
-                    case Event.ConnectFailed(var failure) -> listener.onConnectFailed(failure);
-                    case Event.ResubscribeFailed(var subscription, var failure) ->
-                            listener.onResubscribeFailed(subscription, failure);
-                }
+                callback.run();
             } catch (Throwable t) {
-                log.warn("Connection listener failed for {} at {}", clientId, endpoint, t);
+                log.warn("{} failed for {} at {}", name, clientId, endpoint, t);
             } finally {
                 // Interrupt state left by a callback must not reach the next queued callback.
                 boolean _ = Thread.interrupted();
             }
         }
-    }
-
-    private sealed interface Event {
-
-        record Connected(ConnAck connAck) implements Event {}
-
-        record Disconnected(Disconnection disconnection) implements Event {}
-
-        record ConnectFailed(Disconnection failure) implements Event {}
-
-        record ResubscribeFailed(
-                Subscription subscription,
-                MqttSubscriptionRefusedException failure
-        ) implements Event {}
     }
 }

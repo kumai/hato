@@ -70,6 +70,10 @@ public final class ClientActor implements MqttClient {
 
     private static final int WAITER_LIMIT = 1024;
 
+    // Connection notifications waiting for the listener, excluding the one running. Attempt
+    // numbers reveal what a listener that fell this far behind has lost.
+    private static final int LISTENER_QUEUE_LIMIT = 64;
+
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
     // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
     // each when measured); the byte limit bounds the packets themselves.
@@ -91,6 +95,8 @@ public final class ClientActor implements MqttClient {
     private final URI endpoint;
 
     private final String clientId;
+
+    private final ConnectionListener listener;
 
     // MQTT 3.1.1 cannot carry message properties, so publish() refuses them before admission.
     private final MqttVersion version;
@@ -286,7 +292,15 @@ public final class ClientActor implements MqttClient {
                 commandLimit,
                 () -> refused(CapacityLimit.OBSERVATIONS)
         );
-        listenerLane = new ListenerLane(endpoint, clientId, listener, termination::check);
+        this.listener = listener;
+        listenerLane = new ListenerLane(
+                endpoint,
+                clientId,
+                "Connection listener",
+                "listener",
+                LISTENER_QUEUE_LIMIT,
+                termination::check
+        );
         mailbox = createMailbox(maxPacketSize, limits);
         lanes = new DeliveryLanes(
                 clientId,
@@ -1206,7 +1220,7 @@ public final class ClientActor implements MqttClient {
                     completeWaiters(connectionWaiters, ack, null);
                 }
             }
-            listenerLane.connected(ack);
+            listenerLane.submit(() -> listener.onConnected(ack));
             log.info("Connected {} to {}", clientId, endpoint);
         }
 
@@ -1236,7 +1250,7 @@ public final class ClientActor implements MqttClient {
                 }
                 retire(subscription, failure);
             }
-            listenerLane.resubscribeFailed(subscription, failure);
+            listenerLane.submit(() -> listener.onResubscribeFailed(subscription, failure));
             // Operators see the refusal even when the listener does not override the callback.
             log.warn("Re-creation of subscription {} for {} at {} was refused",
                     subscription.filter().pattern(), clientId, endpoint, failure);
@@ -1452,10 +1466,10 @@ public final class ClientActor implements MqttClient {
             Map<Long, Boolean> handed = lanes.connectionEnded(preserveSession, stopped);
             io.close();
             if (established) {
-                listenerLane.disconnected(disconnection);
+                listenerLane.submit(() -> listener.onDisconnected(disconnection));
                 log.info("Disconnected {} from {}", clientId, endpoint, cause);
             } else {
-                listenerLane.connectFailed(disconnection);
+                listenerLane.submit(() -> listener.onConnectFailed(disconnection));
                 if (activeAttempt != null) {
                     log.info("Connection failed for {} at {}", clientId, endpoint, cause);
                 } else {
