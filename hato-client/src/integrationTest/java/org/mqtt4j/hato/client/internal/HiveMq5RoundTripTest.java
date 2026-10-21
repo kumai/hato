@@ -24,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         value = "dockerIsAvailableOrRequired",
         disabledReason = "Docker explicitly optional"
 )
-class HiveMq5RoundTripTest extends Mqtt5RoundTripTest {
+class HiveMq5RoundTripTest extends Mqtt5ProductRoundTripTest {
 
     private static final GenericContainer<?> broker = HiveMq.container();
 
@@ -89,6 +89,11 @@ class HiveMq5RoundTripTest extends Mqtt5RoundTripTest {
     @Override
     ReasonCode unmatchedPublicationReason(Qos qos) {
         return ReasonCode.NO_MATCHING_SUBSCRIBERS;
+    }
+
+    @Override
+    boolean takesTurns(MqttVersion version) {
+        return false;
     }
 
     @Override

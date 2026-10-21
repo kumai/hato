@@ -24,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         value = "dockerIsAvailableOrRequired",
         disabledReason = "Docker explicitly optional"
 )
-class Emqx5RoundTripTest extends Mqtt5RoundTripTest {
+class Emqx5RoundTripTest extends Mqtt5ProductRoundTripTest {
 
     private static final GenericContainer<?> broker = Emqx.container();
 
@@ -92,6 +92,11 @@ class Emqx5RoundTripTest extends Mqtt5RoundTripTest {
     @Override
     ReasonCode unmatchedPublicationReason(Qos qos) {
         return ReasonCode.NO_MATCHING_SUBSCRIBERS;
+    }
+
+    @Override
+    boolean takesTurns(MqttVersion version) {
+        return true;
     }
 
     @Override
