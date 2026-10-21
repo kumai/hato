@@ -1,8 +1,10 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttMessage;
@@ -14,6 +16,7 @@ import org.mqtt4j.hato.client.internal.ReceiveTable.Stage;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 
 import static org.mqtt4j.hato.client.internal.SessionCore.protocolError;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
@@ -37,20 +40,47 @@ final class Receptions {
 
     private final String clientId;
 
+    // Whether CONNECT announces a Receive Maximum that the broker must stay within: MQTT 5.0.
+    private final boolean receiveMaximumAnnounced;
+
     // The session's receptions; a new session replaces them.
     private ReceiveTable received = new ReceiveTable(ACKNOWLEDGEMENT_LIMIT);
 
     // The connection's acknowledgement order; a connection end replaces it.
     private AckSequencer acknowledgements = new AckSequencer();
 
+    // The Receive Maximum that the current connection's CONNECT announced.
+    private int receiveMaximum;
+
+    // The packet identifiers of the QoS 1 and QoS 2 publications that the current connection
+    // delivered and whose PUBACK or PUBCOMP the send queue has not accepted yet: the broker's
+    // send quota in use (MQTT 5.0 section 4.9). A connection end replaces them.
+    private Set<Integer> quota = new HashSet<>();
+
     private long nextDelivery;
 
     private boolean reusedIdentifierLogged;
 
-    Receptions(SessionCore.Port port, SessionCore.Context core, String clientId) {
+    Receptions(
+            SessionCore.Port port,
+            SessionCore.Context core,
+            String clientId,
+            boolean receiveMaximumAnnounced
+    ) {
         this.port = port;
         this.core = core;
         this.clientId = clientId;
+        this.receiveMaximumAnnounced = receiveMaximumAnnounced;
+    }
+
+    /// The Receive Maximum that the next CONNECT announces, which the receptions of its
+    /// connection must stay within: the room left in the session's receive table, at least 1.
+    int announceReceiveMaximum() {
+        // Receptions that a continued session carries over can still await PUBREL, and the
+        // broker's new quota does not count them (MQTT 5.0 section 4.9). Announcing only the
+        // room left in the receive table keeps a conforming broker within it.
+        receiveMaximum = Math.max(1, received.room());
+        return receiveMaximum;
     }
 
     void deliver(Packet.Publish publish, int bytes) {
@@ -58,6 +88,16 @@ final class Receptions {
         boolean continued = false;
         if (publish.qos() != Qos.AT_MOST_ONCE) {
             int packetId = publish.packetId();
+            // A broker that sends more than the announced number is in violation, even when the
+            // receive table could still hold the publication.
+            if (receiveMaximumAnnounced && quota.add(packetId) && quota.size() > receiveMaximum) {
+                core.fail(new PacketDecodeException(
+                        ReasonCode.RECEIVE_MAXIMUM_EXCEEDED,
+                        "More unacknowledged QoS 1 and QoS 2 publications than "
+                                + receiveMaximum
+                ));
+                return;
+            }
             Kind kind = switch (publish.qos()) {
                 case AT_MOST_ONCE -> throw new IllegalStateException("QoS 0 is not acknowledged");
                 case AT_LEAST_ONCE -> Kind.PUBACK;
@@ -236,6 +276,10 @@ final class Receptions {
             core.acknowledgementAdmitted();
             acknowledgements.submitted(ticket);
             entry.submitted(receipt);
+            if (acknowledgement.kind() != Kind.PUBREC) {
+                // PUBACK and PUBCOMP end the exchange, which returns the broker's send quota.
+                quota.remove(entry.packetId());
+            }
             if (entry.stage() == Stage.RECEIVING) {
                 port.releaseDelivery(entry.token());
             }
@@ -269,11 +313,6 @@ final class Receptions {
         }
     }
 
-    /// How many more receptions the session's receive table can hold.
-    int room() {
-        return received.room();
-    }
-
     /// A permanent or nonpersistent end keeps no reception.
     void clear() {
         received.clear();
@@ -281,6 +320,7 @@ final class Receptions {
 
     void connectionEnded() {
         acknowledgements = new AckSequencer();
+        quota = new HashSet<>();
     }
 
     void sessionDiscarded() {

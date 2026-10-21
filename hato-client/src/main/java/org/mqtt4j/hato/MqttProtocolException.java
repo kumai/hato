@@ -5,8 +5,10 @@ import java.io.Serial;
 import static java.util.Objects.requireNonNull;
 
 /// A locally detected failure to process an incoming MQTT packet.
-/// The reason distinguishes malformed input, protocol rule violations, and receive size limits.
-/// [ReasonCode#PACKET_TOO_LARGE] can indicate a local limit rather than a peer protocol violation.
+/// The reason distinguishes malformed input, protocol rule violations, receive size limits, and
+/// more unacknowledged MQTT 5.0 QoS 1 and QoS 2 publications than the client's Receive Maximum
+/// ([ReasonCode#RECEIVE_MAXIMUM_EXCEEDED]). [ReasonCode#PACKET_TOO_LARGE] can indicate a local
+/// limit rather than a peer protocol violation.
 ///
 /// Reported as [Disconnection#cause] or as the cause of [MqttConnectException] or
 /// [MqttConnectionLostException]. Before such a failure closes an established MQTT 5.0
@@ -25,7 +27,8 @@ public final class MqttProtocolException extends MqttException {
     private final ReasonCode reasonCode;
 
     /// @throws IllegalArgumentException if the reason is not `MALFORMED_PACKET`,
-    ///         `PROTOCOL_ERROR`, `PACKET_TOO_LARGE`, or `TOPIC_ALIAS_INVALID`
+    ///         `PROTOCOL_ERROR`, `PACKET_TOO_LARGE`, `TOPIC_ALIAS_INVALID`, or
+    ///         `RECEIVE_MAXIMUM_EXCEEDED`
     public MqttProtocolException(String message, ReasonCode reasonCode) {
         super(requireNonNull(message, "message must not be null"));
         this.reasonCode = requireNonNull(reasonCode, "reasonCode must not be null");
@@ -33,16 +36,18 @@ public final class MqttProtocolException extends MqttException {
                 && reasonCode != ReasonCode.PROTOCOL_ERROR
                 && reasonCode != ReasonCode.PACKET_TOO_LARGE
                 && reasonCode != ReasonCode.TOPIC_ALIAS_INVALID
+                && reasonCode != ReasonCode.RECEIVE_MAXIMUM_EXCEEDED
         ) {
             throw new IllegalArgumentException(
                     "Expected MALFORMED_PACKET, PROTOCOL_ERROR, PACKET_TOO_LARGE, "
-                            + "or TOPIC_ALIAS_INVALID"
+                            + "TOPIC_ALIAS_INVALID, or RECEIVE_MAXIMUM_EXCEEDED"
             );
         }
     }
 
     /// @throws IllegalArgumentException if the reason is not `MALFORMED_PACKET`,
-    ///         `PROTOCOL_ERROR`, `PACKET_TOO_LARGE`, or `TOPIC_ALIAS_INVALID`
+    ///         `PROTOCOL_ERROR`, `PACKET_TOO_LARGE`, `TOPIC_ALIAS_INVALID`, or
+    ///         `RECEIVE_MAXIMUM_EXCEEDED`
     public MqttProtocolException(
             String message,
             ReasonCode reasonCode,

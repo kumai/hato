@@ -19,6 +19,22 @@ class MqttProtocolExceptionTest {
     }
 
     @ParameterizedTest
+    @EnumSource(value = ReasonCode.class, names = {
+            "MALFORMED_PACKET",
+            "PROTOCOL_ERROR",
+            "PACKET_TOO_LARGE",
+            "TOPIC_ALIAS_INVALID",
+            "RECEIVE_MAXIMUM_EXCEEDED"
+    })
+    void keeps_the_reason_code_of_each_local_packet_failure(ReasonCode reasonCode) {
+        // Act
+        var sut = new MqttProtocolException("Invalid packet", reasonCode);
+
+        // Assert
+        assertThat(sut.reasonCode()).isEqualTo(reasonCode);
+    }
+
+    @ParameterizedTest
     @EnumSource(value = ReasonCode.class, names = {"SUCCESS", "NOT_AUTHORIZED"})
     void rejects_reason_codes_outside_local_packet_failures(ReasonCode reasonCode) {
         // Act & Assert

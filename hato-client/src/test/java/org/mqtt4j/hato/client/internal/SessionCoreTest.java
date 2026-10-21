@@ -4155,6 +4155,144 @@ class SessionCoreTest {
     }
 
     @Test
+    void a_broker_beyond_the_announced_receive_maximum_ends_the_connection_with_0x93() {
+        // Arrange: a subscription holds every delivery, so no PUBACK returns the broker's quota.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        int announced = announcedReceiveMaximum();
+        receiveQosOne(mqtt5, 1, 1, announced);
+        assertThat(port.sent).noneMatch(Packet.Disconnect.class::isInstance);
+
+        // Act
+        mqtt5.received(1, qosOnePublication(announced + 1, "a/b", false), 0, 0);
+
+        // Assert: the client found the violation itself, so it may connect again.
+        assertThat(port.sent).last()
+                .isEqualTo(new Packet.Disconnect(ReasonCode.RECEIVE_MAXIMUM_EXCEEDED, EMPTY));
+        mqtt5.sent(1, port.ticket, 0);
+        assertThat(port.ends).singleElement().satisfies(end -> {
+            assertThat(end.cause()).get().isInstanceOfSatisfying(
+                    MqttProtocolException.class,
+                    cause -> assertThat(cause.reasonCode())
+                            .isEqualTo(ReasonCode.RECEIVE_MAXIMUM_EXCEEDED)
+            );
+            assertThat(ConnectionRequest.reconnectable(end.cause().orElseThrow())).isTrue();
+        });
+    }
+
+    @Test
+    void a_puback_that_the_send_queue_accepts_returns_its_place_in_the_receive_maximum() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        int announced = announcedReceiveMaximum();
+        receiveQosOne(mqtt5, 1, 1, announced);
+
+        // Act: the first delivery is done, and its PUBACK reaches the send queue and the wire.
+        mqtt5.deliveryReady(port.deliveries.getFirst().token());
+        mqtt5.written(1, port.ticket);
+        mqtt5.received(1, qosOnePublication(announced + 1, "a/b", false), 0, 0);
+
+        // Assert
+        assertThat(pubAckIds()).containsExactly(1);
+        assertThat(port.sent).noneMatch(Packet.Disconnect.class::isInstance);
+        mqtt5.received(1, qosOnePublication(announced + 2, "a/b", false), 0, 0);
+        assertThat(port.sent).last()
+                .isEqualTo(new Packet.Disconnect(ReasonCode.RECEIVE_MAXIMUM_EXCEEDED, EMPTY));
+    }
+
+    @ParameterizedTest(name = "released before the QoS 1 publications: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_qos_2_reception_holds_its_place_until_its_pubcomp_reaches_the_send_queue(
+            boolean released
+    ) {
+        // Arrange: no subscription takes the QoS 2 publication, so its PUBREC goes at once.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        int announced = announcedReceiveMaximum();
+        mqtt5.received(1, new Packet.Publish(
+                new Topic("other"),
+                new byte[] {1},
+                Qos.EXACTLY_ONCE,
+                false,
+                false,
+                1,
+                EMPTY
+        ), 0, 0);
+        mqtt5.written(1, port.ticket);
+        if (released) {
+            mqtt5.received(1, new Packet.PubRel(1, ReasonCode.SUCCESS, EMPTY), 0, 0);
+            mqtt5.written(1, port.ticket);
+        }
+
+        // Act: as many QoS 1 publications as the client announced.
+        receiveQosOne(mqtt5, 1, 2, announced);
+
+        // Assert: until PUBCOMP, the QoS 2 reception still takes one place.
+        assertThat(port.sent.stream().anyMatch(Packet.Disconnect.class::isInstance))
+                .isEqualTo(!released);
+    }
+
+    @Test
+    void a_continued_session_announces_the_room_left_and_counts_no_pubrel_that_it_awaits() {
+        // Arrange: a QoS 2 reception awaits PUBREL when the connection ends.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(), 0, 0);
+        mqtt5.subscribe(2, subscription("a/#"));
+        mqtt5.received(1, new Packet.Publish(
+                new Topic("other"),
+                new byte[] {1},
+                Qos.EXACTLY_ONCE,
+                false,
+                false,
+                1,
+                EMPTY
+        ), 0, 0);
+        mqtt5.written(1, port.ticket);
+        mqtt5.failed(1, new IOException("connection lost"));
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        int announced = announcedReceiveMaximum();
+
+        // Act
+        receiveQosOne(mqtt5, 2, 2, announced);
+
+        // Assert: the receive table keeps the reception aside, and the broker's quota does not
+        // count it.
+        assertThat(announced).isEqualTo(4095);
+        assertThat(port.sent).noneMatch(Packet.Disconnect.class::isInstance);
+    }
+
+    @Test
+    void a_resent_publication_counts_toward_the_receive_maximum_of_the_new_connection() {
+        // Arrange: a QoS 1 delivery is still being processed when the connection ends.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(), 0, 0);
+        mqtt5.subscribe(2, subscription("a/#"));
+        mqtt5.received(1, qosOnePublication(1, "a/b", false), 0, 0);
+        mqtt5.failed(1, new IOException("connection lost"));
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        int announced = announcedReceiveMaximum();
+        mqtt5.received(2, qosOnePublication(1, "a/b", true), 0, 0);
+        receiveQosOne(mqtt5, 2, 2, announced - 1);
+        assertThat(port.sent).noneMatch(Packet.Disconnect.class::isInstance);
+
+        // Act
+        mqtt5.received(2, qosOnePublication(announced + 1, "a/b", false), 0, 0);
+
+        // Assert
+        assertThat(port.sent).last()
+                .isEqualTo(new Packet.Disconnect(ReasonCode.RECEIVE_MAXIMUM_EXCEEDED, EMPTY));
+    }
+
+    @Test
     void session_present_in_answer_to_mqtt_5_clean_start_breaks_the_protocol() {
         // Arrange
         SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
@@ -4551,6 +4689,25 @@ class SessionCoreTest {
     /// The CONNACK property with which the broker takes up to `aliases` Topic Aliases.
     private static Property topicAliasMaximum(int aliases) {
         return new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, aliases);
+    }
+
+    /// The Receive Maximum that the last CONNECT announced.
+    private int announcedReceiveMaximum() {
+        Packet.Connect connect = port.sent.stream()
+                .filter(Packet.Connect.class::isInstance)
+                .map(Packet.Connect.class::cast)
+                .reduce((earlier, later) -> later)
+                .orElseThrow();
+        return ((Property.TwoByteValue) connect.properties()
+                .find(PropertyId.RECEIVE_MAXIMUM)
+                .orElseThrow()).value();
+    }
+
+    /// Receives `count` QoS 1 publications on `a/b` over `connection`, from `firstId` on.
+    private static void receiveQosOne(SessionCore core, long connection, int firstId, int count) {
+        for (int id = firstId; id < firstId + count; id++) {
+            core.received(connection, qosOnePublication(id, "a/b", false), 0, 0);
+        }
     }
 
     private static ConnectionAttempt attempt(long operation) {

@@ -121,13 +121,13 @@ final class ConnectionEstablishment {
     }
 
     /// The CONNECT of a connection at `step` that sends the attempt's `credentials`, if any.
-    /// `sessionEstablished` tells whether this client object has started a session, and
-    /// `receiveRoom` how many more receptions the session's receive table can hold.
+    /// `sessionEstablished` tells whether this client object has started a session, and an
+    /// MQTT 5.0 CONNECT announces `receiveMaximum`.
     Packet.Connect connect(
             Step step,
             @Nullable MqttCredentials credentials,
             boolean sessionEstablished,
-            int receiveRoom
+            int receiveMaximum
     ) {
         return switch (version) {
             case V3_1_1 -> {
@@ -147,7 +147,7 @@ final class ConnectionEstablishment {
                     cleanStart || !sessionEstablished,
                     will,
                     credentials,
-                    connectProperties(receiveRoom)
+                    connectProperties(receiveMaximum)
             );
         };
     }
@@ -173,7 +173,7 @@ final class ConnectionEstablishment {
     /// The MQTT 5.0 CONNECT properties: the expiry of a persistent session, how many QoS 1 and
     /// QoS 2 publications the broker may send before their acknowledgements, the largest packet
     /// that the client accepts, and how many Topic Aliases the broker may set.
-    private Properties connectProperties(int receiveRoom) {
+    private Properties connectProperties(int receiveMaximum) {
         var properties = new ArrayList<Property>();
         if (!cleanStart) {
             properties.add(new Property.FourByteValue(
@@ -181,13 +181,7 @@ final class ConnectionEstablishment {
                     sessionExpirySeconds
             ));
         }
-        // Receptions that a continued session carries over can still await PUBREL, and the
-        // broker's new quota does not count them (MQTT 5.0 section 4.9). Announcing only the
-        // room left in the receive table keeps a conforming broker within it.
-        properties.add(new Property.TwoByteValue(
-                PropertyId.RECEIVE_MAXIMUM,
-                Math.max(1, receiveRoom)
-        ));
+        properties.add(new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, receiveMaximum));
         properties.add(new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, maxPacketSize));
         properties.add(new Property.TwoByteValue(
                 PropertyId.TOPIC_ALIAS_MAXIMUM,

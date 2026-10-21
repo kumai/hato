@@ -340,7 +340,7 @@ final class SessionCore {
                 will
         );
         var context = new PartContext();
-        receptions = new Receptions(port, context, clientId);
+        receptions = new Receptions(port, context, clientId, version == MqttVersion.V5);
         subscriptions = new Subscriptions(port, context, clientId, cleanStart);
         publications = new Publications(
                 port,
@@ -485,7 +485,7 @@ final class SessionCore {
                     current.step,
                     attemptCredentials,
                     session.established,
-                    receptions.room()
+                    receptions.announceReceiveMaximum()
             ));
         }
     }
