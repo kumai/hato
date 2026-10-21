@@ -5,6 +5,9 @@ module org.mqtt4j.hato.client {
     // consumers to have org.jspecify at compile time.
     requires static org.jspecify;
 
+    // WebSocket transports use the JDK's HTTP client.
+    requires java.net.http;
+
     exports org.mqtt4j.hato;
     exports org.mqtt4j.hato.spi;
 }

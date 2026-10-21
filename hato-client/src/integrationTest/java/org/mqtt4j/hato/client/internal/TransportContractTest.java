@@ -9,9 +9,14 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
+import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.function.LongConsumer;
@@ -19,6 +24,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -50,6 +56,23 @@ import static org.mqtt4j.hato.spi.Transport.SendResult.CLOSED;
 /// sees the peer only as the byte stream that carries MQTT packets.
 @SuppressWarnings("try") // Explicit close is the behavior under test; try still cleans up failures.
 class TransportContractTest {
+
+    // The HttpClients of the WebSocket transports, released after every case has run.
+    private static final List<WebSocketTransports> webSocketOwners = new CopyOnWriteArrayList<>();
+
+    private static final WebSocketTransports webSockets = owned(new WebSocketTransports(
+            "contract",
+            DefaultTimerScheduler.instance
+    ));
+
+    @AfterAll
+    static void releaseHttpClients() throws InterruptedException {
+        var released = new CountDownLatch(webSocketOwners.size());
+        for (WebSocketTransports owner : webSocketOwners) {
+            owner.release(released::countDown);
+        }
+        assertThat(released.await(10, SECONDS)).isTrue();
+    }
 
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
     @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
@@ -109,7 +132,13 @@ class TransportContractTest {
             "TLS, true, false, false, false", "TLS, true, false, true, false",
             "TLS, true, true, false, false", "TLS, true, true, true, false",
             "TLS, true, false, false, true", "TLS, true, false, true, true",
-            "TLS, true, true, false, true", "TLS, true, true, true, true"
+            "TLS, true, true, false, true", "TLS, true, true, true, true",
+            "WS, false, false, false, false", "WS, false, false, true, false",
+            "WS, false, true, false, false", "WS, false, true, true, false",
+            "WS, true, false, false, false", "WS, true, false, true, false",
+            "WS, true, true, false, false", "WS, true, true, true, false",
+            "WS, true, false, false, true", "WS, true, false, true, true",
+            "WS, true, true, false, true", "WS, true, true, true, true"
     })
     void shutdown_preserves_the_local_write_result(
             Kind kind,
@@ -219,7 +248,8 @@ class TransportContractTest {
     @ParameterizedTest(name = "{displayName}, {0}, wrapper: {1}, delayed: {2}")
     @CsvSource({
             "TCP, false, false", "TCP, true, false", "TCP, true, true",
-            "TLS, false, false", "TLS, true, false", "TLS, true, true"
+            "TLS, false, false", "TLS, true, false", "TLS, true, true",
+            "WS, false, false", "WS, true, false", "WS, true, true"
     })
     void ordered_bytes_write_completions_and_a_single_terminal_event(
             Kind kind,
@@ -303,7 +333,8 @@ class TransportContractTest {
     @ParameterizedTest(name = "{displayName}, {0}, ending: {1}")
     @CsvSource({
             "TCP, close", "TCP, disconnect", "TCP, peer EOF",
-            "TLS, close", "TLS, disconnect", "TLS, peer EOF"
+            "TLS, close", "TLS, disconnect", "TLS, peer EOF",
+            "WS, close", "WS, disconnect", "WS, peer EOF"
     })
     void ending_a_delayed_send_returns_ownership_without_writing(Kind kind, String ending)
             throws Exception {
@@ -349,7 +380,7 @@ class TransportContractTest {
     }
 
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
-    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
+    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true", "WS, false", "WS, true"})
     void stalled_writes_allow_reads_and_close_without_waiting(Kind kind, boolean faulty)
             throws Exception {
         // Arrange
@@ -392,7 +423,7 @@ class TransportContractTest {
     }
 
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
-    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
+    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true", "WS, false", "WS, true"})
     void a_large_write_completes_for_a_peer_that_only_reads(Kind kind, boolean faulty)
             throws Exception {
         // Arrange: the write exceeds the socket buffers, and the peer never sends anything.
@@ -419,7 +450,7 @@ class TransportContractTest {
     }
 
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
-    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true"})
+    @CsvSource({"TCP, false", "TCP, true", "TLS, false", "TLS, true", "WS, false", "WS, true"})
     void close_before_start_never_establishes_a_connection(Kind kind, boolean faulty)
             throws Exception {
         // Arrange
@@ -448,7 +479,8 @@ class TransportContractTest {
     enum Kind {
         TCP("mqtt", "127.0.0.1"),
         // The test server certificate names localhost, so TLS connects by that name.
-        TLS("mqtts", "localhost");
+        TLS("mqtts", "localhost"),
+        WS("ws", "127.0.0.1");
 
         final String scheme;
 
@@ -476,6 +508,7 @@ class TransportContractTest {
                             DefaultTimerScheduler.instance
                     );
                 }
+                case WS -> webSockets.create("contract");
             };
             return faulty ? new FaultyTransport(transport, clock) : transport;
         }
@@ -487,18 +520,27 @@ class TransportContractTest {
                 boolean writeFails,
                 ManualTimerScheduler clock
         ) throws Exception {
-            TcpTransport.Connector connector = connector();
-            var transport = new TcpTransport(
-                    "contract",
-                    scheme,
-                    new Semaphore(1),
-                    InetAddress::getByName,
-                    (host, address, timeout) -> delayedConnection(
-                            connector.connect(host, address, timeout),
-                            writeFails
-                    ),
-                    DefaultTimerScheduler.instance
-            );
+            Transport transport = switch (this) {
+                case TCP, TLS -> {
+                    TcpTransport.Connector connector = connector();
+                    yield new TcpTransport(
+                            "contract",
+                            scheme,
+                            new Semaphore(1),
+                            InetAddress::getByName,
+                            (host, address, timeout) -> delayedConnection(
+                                    connector.connect(host, address, timeout),
+                                    writeFails
+                            ),
+                            DefaultTimerScheduler.instance
+                    );
+                }
+                case WS -> owned(new WebSocketTransports(
+                        "contract",
+                        DefaultTimerScheduler.instance,
+                        socket -> delayedWebSocket(socket, writeFails)
+                )).create("contract");
+            };
             return faulty ? new FaultyTransport(transport, clock) : transport;
         }
 
@@ -519,15 +561,22 @@ class TransportContractTest {
                             parameters
                     );
                 }
+                case WS -> throw new UnsupportedOperationException(
+                        "A WebSocket transport has no TCP connector"
+                );
             };
         }
 
         /// A listening peer for the kind's transports.
         PeerServer listen() throws Exception {
-            ServerSocket server = switch (this) {
-                case TCP -> loopbackServer();
-                case TLS -> Tls.serverSocket();
+            return switch (this) {
+                case TCP -> socketPeers(loopbackServer());
+                case TLS -> socketPeers(Tls.serverSocket());
+                case WS -> new WebSocketPeerServer(WebSocketPeer.listen());
             };
+        }
+
+        private PeerServer socketPeers(ServerSocket server) {
             return new SocketPeerServer(server, endpoint(server.getLocalPort()));
         }
     }
@@ -641,6 +690,134 @@ class TransportContractTest {
         var server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
         server.setSoTimeout(5000);
         return server;
+    }
+
+    private static WebSocketTransports owned(WebSocketTransports owner) {
+        webSocketOwners.add(owner);
+        return owner;
+    }
+
+    // A WebSocket whose DISCONNECT write reports its result only once the transport aborts it,
+    // and then fails if `writeFails`, as delayedConnection does for TCP.
+    private static WebSocket delayedWebSocket(WebSocket socket, boolean writeFails) {
+        var aborted = new CompletableFuture<Void>();
+        return new WebSocket() {
+            @Override
+            public CompletableFuture<WebSocket> sendText(CharSequence data, boolean last) {
+                return socket.sendText(data, last);
+            }
+
+            @Override
+            public CompletableFuture<WebSocket> sendBinary(ByteBuffer data, boolean last) {
+                boolean disconnect = data.remaining() == 2
+                        && data.get(data.position()) == (byte) 0xE0;
+                CompletableFuture<WebSocket> written = socket.sendBinary(data, last);
+                if (!disconnect) {
+                    return written;
+                }
+                return written.thenCombine(aborted, (open, _) -> open)
+                        .thenCompose(open -> writeFails
+                                ? CompletableFuture.failedFuture(
+                                        new IOException("Injected write failure")
+                                )
+                                : CompletableFuture.completedFuture(open));
+            }
+
+            @Override
+            public CompletableFuture<WebSocket> sendPing(ByteBuffer message) {
+                return socket.sendPing(message);
+            }
+
+            @Override
+            public CompletableFuture<WebSocket> sendPong(ByteBuffer message) {
+                return socket.sendPong(message);
+            }
+
+            @Override
+            public CompletableFuture<WebSocket> sendClose(int statusCode, String reason) {
+                return socket.sendClose(statusCode, reason);
+            }
+
+            @Override
+            public void request(long n) {
+                socket.request(n);
+            }
+
+            @Override
+            public String getSubprotocol() {
+                return socket.getSubprotocol();
+            }
+
+            @Override
+            public boolean isOutputClosed() {
+                return socket.isOutputClosed();
+            }
+
+            @Override
+            public boolean isInputClosed() {
+                return socket.isInputClosed();
+            }
+
+            @Override
+            public void abort() {
+                socket.abort();
+                aborted.complete(null);
+            }
+        };
+    }
+
+    private record WebSocketPeerServer(WebSocketPeer server) implements PeerServer {
+
+        @Override
+        public URI endpoint() {
+            return server.uri("/mqtt");
+        }
+
+        @Override
+        public void receiveBufferSize(int bytes) throws IOException {
+            server.receiveBufferSize(bytes);
+        }
+
+        @Override
+        public Peer accept() throws IOException {
+            WebSocketPeer.Connection connection = server.accept();
+            connection.open("mqtt");
+            return new WebSocketPeerConnection(connection);
+        }
+
+        @Override
+        public void close() throws IOException {
+            server.close();
+        }
+    }
+
+    // The peer's end of its stream is its Close frame.
+    private record WebSocketPeerConnection(WebSocketPeer.Connection connection) implements Peer {
+
+        @Override
+        public InputStream input() {
+            return connection.binaryInput();
+        }
+
+        @Override
+        public OutputStream output() {
+            return connection.binaryOutput();
+        }
+
+        @Override
+        public void shutdownOutput() throws IOException {
+            connection.sendClose(1000, "");
+        }
+
+        @Override
+        public boolean isClosed() {
+            return connection.isClosed();
+        }
+
+        @Override
+        public void close() throws IOException {
+            connection.close();
+        }
     }
 
     private record SocketPeerServer(ServerSocket server, URI endpoint) implements PeerServer {

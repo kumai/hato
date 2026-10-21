@@ -32,7 +32,8 @@ final class ClientTermination {
         /// A credentials supplier call that has not returned.
         CREDENTIALS,
 
-        /// A started transport that has not reported its close, or the I/O sender.
+        /// A started transport that has not reported its close, the I/O sender, or the HttpClient
+        /// that WebSocket transports share.
         TRANSPORTS,
 
         /// A future that the client completes, until its synchronous continuations return.
@@ -119,7 +120,8 @@ final class ClientTermination {
         check();
     }
 
-    /// Every started transport has reported its close, and the I/O sender has exited.
+    /// Every started transport has reported its close, the I/O sender has exited, and the
+    /// HttpClient of WebSocket transports, if any, has ended with its threads.
     void transportsClosed() {
         synchronized (this) {
             transportsClosed = true;

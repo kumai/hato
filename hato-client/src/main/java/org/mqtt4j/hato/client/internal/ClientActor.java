@@ -118,6 +118,9 @@ public final class ClientActor implements MqttClient {
 
     private final ClientIo io;
 
+    // The HttpClient that the client's WebSocket transports share, which ends after them.
+    private final @Nullable WebSocketTransports webSockets;
+
     private final @Nullable CredentialsEvaluator credentials;
 
     private final Mailbox mailbox;
@@ -266,6 +269,7 @@ public final class ClientActor implements MqttClient {
                 this::deliveryReady,
                 this::laneTerminated
         );
+        webSockets = transportFactory instanceof WebSocketTransports owner ? owner : null;
         io = new ClientIo(
                 endpoint,
                 clientId,
@@ -1338,7 +1342,14 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void closed() {
-            termination.transportsClosed();
+            // The HttpClient of WebSocket transports is released once none uses it, and
+            // termination waits for its threads too.
+            WebSocketTransports shared = webSockets;
+            if (shared == null) {
+                termination.transportsClosed();
+            } else {
+                shared.release(termination::transportsClosed);
+            }
         }
     }
 
