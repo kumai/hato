@@ -14,6 +14,9 @@ public final class Mosquitto {
 
     public static final int MQTT_PORT = 1883;
 
+    /// The [#container()] listener for MQTT over WebSocket, which serves every path.
+    public static final int WEBSOCKET_PORT = 8080;
+
     /// The [#tlsContainer()] listener that authenticates only the broker, with the certificate
     /// that [Tls#clientContext()] trusts.
     public static final int MQTTS_PORT = 8883;
@@ -30,13 +33,14 @@ public final class Mosquitto {
     private Mosquitto() {
     }
 
+    /// Mosquitto on [#MQTT_PORT] and on [#WEBSOCKET_PORT].
     public static GenericContainer<?> container() {
         return new GenericContainer<>(IMAGE)
                 .withCopyFileToContainer(
                         MountableFile.forClasspathResource("mosquitto.conf"),
                         CONFIGURATION
                 )
-                .withExposedPorts(MQTT_PORT);
+                .withExposedPorts(MQTT_PORT, WEBSOCKET_PORT);
     }
 
     /// Mosquitto on [#MQTT_PORT] that announces smaller limits than the defaults: Maximum QoS 1,
