@@ -2208,6 +2208,234 @@ class SessionCoreTest {
     }
 
     @Test
+    void each_registration_keeps_its_own_identifier_when_it_is_made_again() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        mqtt5.subscribe(3, subscription("b/#"));
+        List<Optional<Integer>> first = port.sent.stream()
+                .filter(Packet.Subscribe.class::isInstance)
+                .map(SessionCoreTest::identifierOf)
+                .toList();
+
+        // Act: the next connection resumes no session, so the client makes both again.
+        mqtt5.failed(1, new IOException("connection lost"));
+        port.sent.clear();
+        mqtt5.connect(attempt(4), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, connAck(), 0, 0);
+
+        // Assert
+        assertThat(first).containsExactly(Optional.of(1), Optional.of(2));
+        assertThat(port.sent)
+                .filteredOn(Packet.Subscribe.class::isInstance)
+                .extracting(SessionCoreTest::identifierOf)
+                .containsExactly(Optional.of(1), Optional.of(2));
+    }
+
+    @Test
+    void a_new_registration_does_not_reuse_the_identifier_of_a_removed_one() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        var subscribe = (Packet.Subscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.SubAck(subscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+        mqtt5.unsubscribe(3, 2);
+        var unsubscribe = (Packet.Unsubscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.UnsubAck(unsubscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+
+        // Act
+        mqtt5.subscribe(4, subscription("a/#"));
+
+        // Assert: a message that the broker kept for the removed subscription names only it.
+        assertThat(identifierOf(subscribe)).contains(1);
+        assertThat(identifierOf(port.sent.getLast())).contains(2);
+    }
+
+    @ParameterizedTest(name = "Subscription Identifier Available {0}")
+    @ValueSource(ints = {0, 1})
+    void a_subscribe_carries_the_identifier_only_when_the_broker_accepts_identifiers(
+            int available
+    ) {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(
+                new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, available)
+        );
+
+        // Act
+        mqtt5.subscribe(2, subscription("a/#"));
+
+        // Assert
+        assertThat(identifierOf(port.sent.getLast()).isPresent()).isEqualTo(available == 1);
+    }
+
+    @Test
+    void an_mqtt_3_1_1_subscribe_carries_no_identifier() {
+        // Arrange
+        connected();
+
+        // Act
+        sut.subscribe(2, subscription("a/#"));
+
+        // Assert
+        assertThat(identifierOf(port.sent.getLast())).isEmpty();
+    }
+
+    @Test
+    void a_publication_with_identifiers_goes_only_to_the_registrations_that_they_name() {
+        // Arrange: two overlapping registrations, with identifiers 1 and 2, await SUBACK.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        mqtt5.subscribe(3, subscription("a/b"));
+
+        // Act
+        mqtt5.received(1, publication("a/b", 1), 0, 0);
+        mqtt5.received(1, publication("a/b", 2, 1), 0, 0);
+        mqtt5.received(1, publication("a/b", 2, 2), 0, 0);
+        mqtt5.received(1, publication("x/y", 1), 0, 0);
+
+        // Assert: the identifiers decide, even for a topic that the filter does not match.
+        assertThat(port.deliveries).extracting(Received::ids).containsExactly(
+                List.of(2L),
+                List.of(2L, 3L),
+                List.of(3L),
+                List.of(2L)
+        );
+    }
+
+    @Test
+    void a_publication_whose_identifiers_name_no_live_registration_is_acknowledged_unmatched() {
+        // Arrange: the registration with identifier 1 awaits its UNSUBACK.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        var subscribe = (Packet.Subscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.SubAck(subscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+        mqtt5.unsubscribe(3, 2);
+
+        // Act: one names the registration being removed, the other an unknown identifier.
+        mqtt5.received(1, qosOnePublication(7, "a/b", identifierProperties(1)), 0, 0);
+        mqtt5.received(1, qosOnePublication(8, "a/b", identifierProperties(99)), 0, 0);
+
+        // Assert
+        assertThat(port.deliveries).isEmpty();
+        assertThat(pubAckIds()).containsExactly(7, 8);
+    }
+
+    @Test
+    void a_publication_without_identifiers_goes_to_every_registration_whose_filter_matches() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("a/#"));
+        mqtt5.subscribe(3, subscription("a/b"));
+
+        // Act
+        mqtt5.received(1, publication("a/b"), 0, 0);
+
+        // Assert
+        assertThat(port.deliveries).singleElement()
+                .extracting(Received::ids)
+                .isEqualTo(List.of(2L, 3L));
+    }
+
+    @Test
+    void a_connection_without_identifiers_matches_filters_whatever_the_publication_carries() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(
+                new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0)
+        );
+        mqtt5.subscribe(2, subscription("a/#"));
+        mqtt5.subscribe(3, subscription("a/b"));
+
+        // Act
+        mqtt5.received(1, publication("a/b", 1), 0, 0);
+
+        // Assert
+        assertThat(port.deliveries).singleElement()
+                .extracting(Received::ids)
+                .isEqualTo(List.of(2L, 3L));
+    }
+
+    @Test
+    void a_registration_that_the_broker_holds_without_an_identifier_still_matches_by_topic() {
+        // Arrange: a persistent session starts on a connection without identifiers, and
+        // continues on one with them.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(
+                1,
+                connAck(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0)),
+                0,
+                0
+        );
+        mqtt5.subscribe(2, subscription("a/#"));
+        var held = (Packet.Subscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.SubAck(held.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+        mqtt5.failed(1, new IOException("connection lost"));
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        mqtt5.subscribe(4, subscription("a/b"));
+
+        // Act: a broker that sends one copy names only the subscription with an identifier.
+        mqtt5.received(2, publication("a/b", 2), 0, 0);
+
+        // Assert
+        assertThat(identifierOf(held)).isEmpty();
+        assertThat(port.deliveries).singleElement()
+                .extracting(Received::ids)
+                .isEqualTo(List.of(2L, 4L));
+    }
+
+    @Test
+    void a_new_session_holds_no_subscription_that_it_has_not_made_again() {
+        // Arrange: the subscription was made on a connection without identifiers.
+        SessionCore mqtt5 = connectedMqtt5(
+                new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0)
+        );
+        mqtt5.subscribe(2, subscription("a/#"));
+        var subscribe = (Packet.Subscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.SubAck(subscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+
+        // Act: the next connection starts a new session, and the send queue holds back the
+        // subscription's SUBSCRIBE.
+        mqtt5.failed(1, new IOException("connection lost"));
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        port.sendResult = SendQueue.OfferResult.FULL;
+        mqtt5.received(2, connAck(), 0, 0);
+        mqtt5.received(2, publication("a/b", 99), 0, 0);
+
+        // Assert
+        assertThat(port.deliveries).isEmpty();
+    }
+
+    @Test
     void a_continued_publication_beyond_the_new_brokers_limits_is_not_replayed() {
         // Arrange: a QoS 2 publication waits for PUBREC when the connection ends.
         SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
@@ -3671,6 +3899,51 @@ class SessionCoreTest {
 
     private static Subscribe subscription(String filter) {
         return Subscribe.of(new TopicFilter(filter), Qos.AT_MOST_ONCE).withBufferCapacity(4);
+    }
+
+    /// A QoS 0 publication on `topic` that carries `identifiers` as Subscription Identifiers.
+    private static Packet.Publish publication(String topic, int... identifiers) {
+        return new Packet.Publish(
+                new Topic(topic),
+                new byte[] {1, 2},
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                identifierProperties(identifiers)
+        );
+    }
+
+    private static Packet.Publish qosOnePublication(
+            int packetId,
+            String topic,
+            Properties properties
+    ) {
+        return new Packet.Publish(
+                new Topic(topic),
+                new byte[] {1, 2},
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                packetId,
+                properties
+        );
+    }
+
+    private static Properties identifierProperties(int... identifiers) {
+        return new Properties(IntStream.of(identifiers)
+                .<Property>mapToObj(identifier -> new Property.VariableByteValue(
+                        PropertyId.SUBSCRIPTION_IDENTIFIER,
+                        identifier
+                ))
+                .toList());
+    }
+
+    /// The Subscription Identifier that `packet`, a SUBSCRIBE, carries, or empty without one.
+    private static Optional<Integer> identifierOf(Packet packet) {
+        return ((Packet.Subscribe) packet).properties()
+                .find(PropertyId.SUBSCRIPTION_IDENTIFIER)
+                .map(property -> ((Property.VariableByteValue) property).value());
     }
 
     @ParameterizedTest(name = "session expiry {0} is sent as {1}")

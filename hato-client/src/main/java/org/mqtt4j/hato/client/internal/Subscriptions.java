@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.function.IntPredicate;
 
 import org.jspecify.annotations.Nullable;
 
@@ -27,6 +28,8 @@ import org.mqtt4j.hato.client.internal.SessionCore.State;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
 import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.client.internal.common.protocol.SharedTopicFilter;
 
@@ -56,6 +59,9 @@ final class Subscriptions {
     // removals, so many retained subscriptions cannot flood the actor.
     private static final int SUBSCRIBE_INFLIGHT_LIMIT = 16;
 
+    // The largest Subscription Identifier, a variable byte integer of at most four bytes.
+    static final int MAX_SUBSCRIPTION_IDENTIFIER = 268_435_455;
+
     private final SessionCore.Port port;
 
     private final SessionCore.Context core;
@@ -66,6 +72,9 @@ final class Subscriptions {
 
     // The client's registrations by id, in registration order.
     private final Map<Long, LocalSubscription> registry = new LinkedHashMap<>();
+
+    // Where the search for the next registration's Subscription Identifier starts.
+    private int nextIdentifier = 1;
 
     // The current connection's exchanges; a connection end replaces them.
     private Window window = new Window();
@@ -126,7 +135,8 @@ final class Subscriptions {
                 request,
                 shared,
                 matchingFilter,
-                registered.orElseThrow()
+                registered.orElseThrow(),
+                allocateIdentifier()
         );
         registry.put(operation, local);
         if (core.state() == State.CONNECTED) {
@@ -168,13 +178,28 @@ final class Subscriptions {
         core.drain();
     }
 
-    /// The registrations whose filter matches `topic`, except those being removed.
-    List<Long> matching(Topic topic) {
+    /// The registrations to which `publish` goes, except those being removed. On a connection
+    /// with Subscription Identifiers, a publication that carries identifiers goes to the
+    /// registrations that they name, without matching their filters, and to those that the
+    /// broker holds without an identifier and whose filter matches its topic. Any other
+    /// publication goes to the registrations whose filter matches its topic.
+    List<Long> matching(Packet.Publish publish) {
+        List<Integer> identifiers = core.subscriptionIdentifiers()
+                ? identifiers(publish.properties())
+                : List.of();
+        Topic topic = publish.topic();
         var matches = new ArrayList<Long>();
         // Matching is O(subscriptions). Replace with a topic tree if 0.4 measurements show
         // this scan dominates, keeping TopicFilter.matches as the reference implementation.
         for (var local : registry.values()) {
-            if (local.removal == null && local.matchingFilter.matches(topic)) {
+            if (local.removal != null) {
+                continue;
+            }
+            // A broker that sends one copy for overlapping subscriptions names only those that
+            // it holds with an identifier, so the others still need their filters matched.
+            boolean byTopic = identifiers.isEmpty() || local.heldWithoutIdentifier;
+            if (identifiers.contains(local.identifier)
+                    || byTopic && local.matchingFilter.matches(topic)) {
                 matches.add(local.id);
             }
         }
@@ -187,6 +212,10 @@ final class Subscriptions {
     void connectionEstablished(boolean sessionPresent) {
         window.sessionPresent = sessionPresent;
         for (LocalSubscription local : List.copyOf(registry.values())) {
+            if (!sessionPresent) {
+                // A new session holds none of the client's subscriptions yet.
+                local.heldWithoutIdentifier = false;
+            }
             if (local.removal != null) {
                 if (sessionPresent) {
                     local.established = true;
@@ -290,6 +319,7 @@ final class Subscriptions {
             if (result == SendQueue.OfferResult.ACCEPTED) {
                 core.responses().add(ticket, ResponseDeadlines.Kind.SUBACK, id);
             }
+            local.heldWithoutIdentifier = !core.subscriptionIdentifiers();
             window.registrations.removeFirst();
             window.subscribingInFlight++;
         }
@@ -436,19 +466,63 @@ final class Subscriptions {
         return true;
     }
 
-    private static Packet.Subscribe subscriptionPacket(LocalSubscription local, int id) {
+    private Packet.Subscribe subscriptionPacket(LocalSubscription local, int id) {
         int retainHandling = switch (local.retainHandling) {
             case SEND -> 0;
             case SEND_IF_NEW_SUBSCRIPTION -> 1;
             case DO_NOT_SEND -> 2;
         };
+        // The broker returns the identifier with each message for the subscription, which tells
+        // apart the copies that it sends for overlapping subscriptions.
+        Properties properties = core.subscriptionIdentifiers()
+                ? new Properties(List.of(new Property.VariableByteValue(
+                        PropertyId.SUBSCRIPTION_IDENTIFIER,
+                        local.identifier
+                )))
+                : EMPTY;
         return new Packet.Subscribe(id, List.of(new Packet.Subscription(
                 local.filter,
                 local.requestedQos,
                 local.noLocal,
                 local.retainAsPublished,
                 retainHandling
-        )), EMPTY);
+        )), properties);
+    }
+
+    /// The Subscription Identifiers that `properties` carry, in their order.
+    private static List<Integer> identifiers(Properties properties) {
+        var identifiers = new ArrayList<Integer>();
+        for (Property property : properties.entries()) {
+            if (property instanceof Property.VariableByteValue(var id, var value)
+                    && id == PropertyId.SUBSCRIPTION_IDENTIFIER) {
+                identifiers.add(value);
+            }
+        }
+        return identifiers;
+    }
+
+    /// Takes the next Subscription Identifier that no registration uses. Identifiers only
+    /// increase, so a message that the broker still holds for a removed registration does not
+    /// reach a newer one.
+    private int allocateIdentifier() {
+        int identifier = freeIdentifier(
+                nextIdentifier,
+                candidate -> registry.values().stream()
+                        .anyMatch(local -> local.identifier == candidate)
+        );
+        nextIdentifier = identifier == MAX_SUBSCRIPTION_IDENTIFIER ? 1 : identifier + 1;
+        return identifier;
+    }
+
+    /// The first identifier that is not `inUse`, searching from `start` on and continuing from 1
+    /// past the largest. At most 256 registrations hold an identifier, so the search ends
+    /// quickly.
+    static int freeIdentifier(int start, IntPredicate inUse) {
+        int candidate = start;
+        while (inUse.test(candidate)) {
+            candidate = candidate == MAX_SUBSCRIPTION_IDENTIFIER ? 1 : candidate + 1;
+        }
+        return candidate;
     }
 
     private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
@@ -538,8 +612,15 @@ final class Subscriptions {
         final RetainHandling retainHandling;
         final boolean shared;
         final Subscription handle;
+        // Sent in every SUBSCRIBE for this registration on a connection with Subscription
+        // Identifiers, and unique among the registrations.
+        final int identifier;
         boolean confirmed;
         boolean established;
+        // Whether the session's broker holds the subscription without the identifier: its last
+        // SUBSCRIBE went on a connection without Subscription Identifiers. A later connection
+        // that accepts them can continue the session with it.
+        boolean heldWithoutIdentifier;
         Qos granted = Qos.AT_MOST_ONCE;
         @Nullable UnsubscribeOperation removal;
 
@@ -548,7 +629,8 @@ final class Subscriptions {
                 Subscribe request,
                 boolean shared,
                 TopicFilter matchingFilter,
-                Subscription handle
+                Subscription handle,
+                int identifier
         ) {
             this.id = id;
             filter = request.filter();
@@ -559,6 +641,7 @@ final class Subscriptions {
             this.shared = shared;
             this.matchingFilter = matchingFilter;
             this.handle = handle;
+            this.identifier = identifier;
         }
     }
 

@@ -95,15 +95,19 @@ class MosquittoMessagingTest extends MessagingTest {
             sut.publish(publication).get(5, SECONDS);
             sut.publish(message(base + "/barrier", (byte) 4)).get(5, SECONDS);
 
-            // Assert: without Subscription Identifiers, no copy names its intended filter.
-            for (int i = 0; i < 2; i++) {
+            // Assert: an MQTT 5.0 copy names its subscription by the Subscription Identifier, so
+            // each subscription receives one. An MQTT 3.1.1 copy names none, so each copy
+            // reaches both subscriptions.
+            int copies = version() == MqttVersion.V5 ? 1 : 2;
+            for (int i = 0; i < copies; i++) {
                 assertThat(requireNonNull(wildcard.poll(5, SECONDS)).message())
                         .isEqualTo(publication);
                 assertThat(requireNonNull(exact.poll(5, SECONDS)).message())
                         .isEqualTo(publication);
             }
 
-            // FIFO delivery of the barrier proves no third copy preceded it in the wildcard lane.
+            // FIFO delivery of the barrier proves no further copy preceded it in the wildcard
+            // lane.
             assertThat(requireNonNull(wildcard.poll(5, SECONDS)).message())
                     .isEqualTo(message(base + "/barrier", (byte) 4));
             assertThat(exact).isEmpty();

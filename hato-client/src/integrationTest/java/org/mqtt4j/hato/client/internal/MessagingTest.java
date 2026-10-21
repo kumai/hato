@@ -1081,6 +1081,11 @@ abstract class MessagingTest {
         }
     }
 
+    /// The protocol version of this run's clients.
+    MqttVersion version() {
+        return version;
+    }
+
     MqttClient client() {
         return client(_ -> {});
     }

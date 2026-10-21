@@ -24,7 +24,6 @@ import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
-import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.client.internal.ConnectionEstablishment.Outcome;
 import org.mqtt4j.hato.client.internal.ConnectionEstablishment.Step;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
@@ -219,8 +218,9 @@ final class SessionCore {
         /// A PUBREL took the reserved send quota, so acknowledgements go first next time.
         void releaseAdmitted();
 
-        /// The registrations whose filter matches `topic`, except those being removed.
-        List<Long> matching(Topic topic);
+        /// The registrations to which `publish` goes, except those being removed; see
+        /// [Subscriptions#matching(Packet.Publish)].
+        List<Long> matching(Packet.Publish publish);
 
         /// The limits that the broker announced for the established connection. Only valid
         /// while a connection is established.
@@ -230,6 +230,11 @@ final class SessionCore {
         /// connection: its Receive Maximum, which is 65,535 when it announced none. Only valid
         /// while a connection is established.
         int receiveMaximum();
+
+        /// Whether the broker accepts Subscription Identifiers on the established connection:
+        /// an MQTT 5.0 connection whose broker did not announce them unavailable. Only valid
+        /// while a connection is established.
+        boolean subscriptionIdentifiers();
     }
 
     private static final Log log = Log.of(SessionCore.class);
@@ -501,8 +506,7 @@ final class SessionCore {
                 )) {
                     case Outcome.Failed(var cause) -> failed(connection, cause);
                     case Outcome.Abandoned(var refusal) -> abandon(refusal);
-                    case Outcome.Established(var result, var keepAlive, var receiveMaximum) ->
-                            establish(result, keepAlive, receiveMaximum, now);
+                    case Outcome.Established established -> establish(established, now);
                 }
             }
         } else if (packet instanceof Packet.PubAck ack) {
@@ -551,10 +555,10 @@ final class SessionCore {
         drainDeferred();
     }
 
-    /// Establishes the current connection with `result`, which continues the session when it has
-    /// Session Present and otherwise starts a new one, and keeps the connection alive at
-    /// `keepAlive`. The broker takes up to `receiveMaximum` QoS 1 and QoS 2 publications at once.
-    private void establish(ConnAck result, Duration keepAlive, int receiveMaximum, long now) {
+    /// Establishes the current connection as `established` describes: its CONNACK continues the
+    /// session when it has Session Present and otherwise starts a new one.
+    private void establish(Outcome.Established established, long now) {
+        ConnAck result = established.ack();
         boolean sessionPresent = result.sessionPresent();
         if (!sessionPresent) {
             discardSession();
@@ -570,8 +574,9 @@ final class SessionCore {
             state = State.CONNECTED;
         }
         current.ack = result;
-        current.keepAlive = keepAlive;
-        current.receiveMaximum = receiveMaximum;
+        current.keepAlive = established.keepAlive();
+        current.receiveMaximum = established.receiveMaximum();
+        current.subscriptionIdentifiers = established.subscriptionIdentifiers();
         request.establish();
         port.admit(generation);
         // Reconcile before announcing, so connect() and onConnected already find continued
@@ -1192,8 +1197,8 @@ final class SessionCore {
         }
 
         @Override
-        public List<Long> matching(Topic topic) {
-            return subscriptions.matching(topic);
+        public List<Long> matching(Packet.Publish publish) {
+            return subscriptions.matching(publish);
         }
 
         @Override
@@ -1204,6 +1209,11 @@ final class SessionCore {
         @Override
         public int receiveMaximum() {
             return current.receiveMaximum;
+        }
+
+        @Override
+        public boolean subscriptionIdentifiers() {
+            return current.subscriptionIdentifiers;
         }
     }
 
@@ -1218,6 +1228,8 @@ final class SessionCore {
         Duration keepAlive = Duration.ZERO;
         // Set with the CONNACK: how many QoS 1 and QoS 2 publications the broker takes at once.
         int receiveMaximum;
+        // Set with the CONNACK: whether the broker accepts Subscription Identifiers.
+        boolean subscriptionIdentifiers;
         // Set when the client found this violation in what an MQTT 5.0 broker sent, and writes
         // DISCONNECT with its reason code before closing. It decides how the connection ends.
         @Nullable PacketDecodeException violation;

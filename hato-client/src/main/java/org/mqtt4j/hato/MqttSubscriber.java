@@ -61,10 +61,15 @@ public interface MqttSubscriber {
     /// most once, except that a delivery whose handler failure stopped the client is delivered
     /// again from the broker's retransmission; see [MqttDelivery#ack()].
     ///
-    /// Every matching subscription receives each incoming publication. The client does not tell
-    /// apart the copies that a broker sends for overlapping subscriptions, so each copy is
-    /// routed again.
-    /// A retransmission joining a continued QoS 1 or 2 reception goes only to its original matching
+    /// Every matching subscription receives each incoming publication. On an MQTT 5.0
+    /// connection whose broker accepts Subscription Identifiers, the client sends an identifier
+    /// with each subscription and delivers a copy that carries identifiers only to the
+    /// subscriptions that they name, so overlapping subscriptions do not receive the copies
+    /// meant for each other. A copy without identifiers, and every copy on other connections,
+    /// including MQTT 3.1.1, goes to every subscription whose filter matches its topic: there,
+    /// the client cannot tell apart the copies that a broker sends for overlapping
+    /// subscriptions.
+    /// A retransmission joining a continued QoS 1 or 2 reception goes only to its original
     /// subscriptions whose deliveries were discarded; handed-off deliveries keep their state.
     /// Shared subscriptions are matched against the filter after their shared group name.
     /// A shared subscription cannot overlap any other subscription on the same client, including

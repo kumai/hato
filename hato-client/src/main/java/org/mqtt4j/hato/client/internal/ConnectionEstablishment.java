@@ -64,11 +64,13 @@ final class ConnectionEstablishment {
         /// Session Present and otherwise starts a new one. The connection keeps alive at
         /// `keepAlive`: the configured interval, or the one that the broker set instead. The
         /// broker takes up to `receiveMaximum` QoS 1 and QoS 2 publications at once from this
-        /// client.
+        /// client, and accepts Subscription Identifiers when `subscriptionIdentifiers` is true:
+        /// on MQTT 5.0, unless it announced them unavailable.
         record Established(
                 ConnAck ack,
                 Duration keepAlive,
-                int receiveMaximum
+                int receiveMaximum,
+                boolean subscriptionIdentifiers
         ) implements Outcome {}
     }
 
@@ -235,7 +237,8 @@ final class ConnectionEstablishment {
         return new Outcome.Established(
                 ConnAck.of(ack.sessionPresent(), attempt),
                 keepAlive,
-                DEFAULT_RECEIVE_MAXIMUM
+                DEFAULT_RECEIVE_MAXIMUM,
+                false
         );
     }
 
@@ -270,7 +273,14 @@ final class ConnectionEstablishment {
                 : keepAlive;
         int receiveMaximum = (int) number(properties, PropertyId.RECEIVE_MAXIMUM)
                 .orElse(DEFAULT_RECEIVE_MAXIMUM);
-        return new Outcome.Established(connAck, connectionKeepAlive, receiveMaximum);
+        boolean subscriptionIdentifiers =
+                number(properties, PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE).orElse(1) == 1;
+        return new Outcome.Established(
+                connAck,
+                connectionKeepAlive,
+                receiveMaximum,
+                subscriptionIdentifiers
+        );
     }
 
     /// The value of the string property `id`, or empty when `properties` has none.

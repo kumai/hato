@@ -111,7 +111,7 @@ final class Receptions {
                 acknowledgements.add(added.orElseThrow(), kind);
             }
         }
-        List<Long> matches = core.matching(publish.topic());
+        List<Long> matches = core.matching(publish);
         if (matches.isEmpty() && !continued) {
             if (token != 0) {
                 // A reception that no subscription takes is ready for its acknowledgement now.
