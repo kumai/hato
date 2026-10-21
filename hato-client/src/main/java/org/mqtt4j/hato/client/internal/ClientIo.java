@@ -2,6 +2,7 @@ package org.mqtt4j.hato.client.internal;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
@@ -11,6 +12,9 @@ import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.spi.Transport;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -242,7 +246,8 @@ final class ClientIo {
             long ticket,
             MqttMessage message,
             int packetId,
-            @Nullable SendReceipt receipt
+            @Nullable SendReceipt receipt,
+            TopicAlias alias
     ) {
         // Measured outside the monitor: counting User Properties takes time in their length.
         int bodySize = MessageProperties.bodySize(message);
@@ -262,16 +267,7 @@ final class ClientIo {
                 return capacity;
             }
         }
-        // Encoding sets DUP from the transport receipt, which may change until the send starts.
-        byte[] header = codec.encodePublishHeader(
-                message.topic(),
-                message.qos(),
-                message.retain(),
-                false,
-                packetId,
-                MessageProperties.of(message),
-                message.payloadSize()
-        );
+        byte[] header = publishHeader(message, packetId, alias);
         return enqueue(
                 generation,
                 ticket,
@@ -280,6 +276,35 @@ final class ClientIo {
                 false,
                 "Publish",
                 false
+        );
+    }
+
+    // Encoding sets DUP from the transport receipt, which may change until the send starts.
+    private byte[] publishHeader(MqttMessage message, int packetId, TopicAlias alias) {
+        Properties properties = MessageProperties.of(message);
+        if (alias.value() != 0) {
+            var entries = new ArrayList<>(properties.entries());
+            entries.add(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, alias.value()));
+            properties = new Properties(entries);
+        }
+        if (!alias.withTopic()) {
+            return codec.encodeAliasPublishHeader(
+                    message.qos(),
+                    message.retain(),
+                    false,
+                    packetId,
+                    properties,
+                    message.payloadSize()
+            );
+        }
+        return codec.encodePublishHeader(
+                message.topic(),
+                message.qos(),
+                message.retain(),
+                false,
+                packetId,
+                properties,
+                message.payloadSize()
         );
     }
 

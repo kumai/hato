@@ -122,13 +122,15 @@ final class SessionCore {
         );
 
         /// Reports admission at the exact wire size, not write completion. The payload is copied
-        /// only after admission. DUP comes from `receipt` when the packet is encoded.
+        /// only after admission. DUP comes from `receipt` when the packet is encoded, and `alias`
+        /// decides whether the packet sets or uses a Topic Alias.
         SendQueue.OfferResult publish(
                 long generation,
                 long ticket,
                 MqttMessage message,
                 int packetId,
-                @Nullable SendReceipt receipt
+                @Nullable SendReceipt receipt,
+                TopicAlias alias
         );
 
         void schedule(long generation, Timer timer, Duration delay);
@@ -235,6 +237,11 @@ final class SessionCore {
         /// an MQTT 5.0 connection whose broker did not announce them unavailable. Only valid
         /// while a connection is established.
         boolean subscriptionIdentifiers();
+
+        /// How many Topic Aliases the client may set on the established connection: the
+        /// broker's Topic Alias Maximum, which is 0 when it announced none and on MQTT 3.1.1.
+        /// Only valid while a connection is established.
+        int topicAliasMaximum();
     }
 
     private static final Log log = Log.of(SessionCore.class);
@@ -571,6 +578,7 @@ final class SessionCore {
         current.keepAlive = established.keepAlive();
         current.receiveMaximum = established.receiveMaximum();
         current.subscriptionIdentifiers = established.subscriptionIdentifiers();
+        current.topicAliasMaximum = established.topicAliasMaximum();
         request.establish();
         port.admit(generation);
         // Reconcile before announcing, so connect() and onConnected already find continued
@@ -1209,6 +1217,11 @@ final class SessionCore {
         public boolean subscriptionIdentifiers() {
             return current.subscriptionIdentifiers;
         }
+
+        @Override
+        public int topicAliasMaximum() {
+            return current.topicAliasMaximum;
+        }
     }
 
     // State owned by one connection. Its attempt, the session, and the parts' own state can
@@ -1224,6 +1237,8 @@ final class SessionCore {
         int receiveMaximum;
         // Set with the CONNACK: whether the broker accepts Subscription Identifiers.
         boolean subscriptionIdentifiers;
+        // Set with the CONNACK: how many Topic Aliases the broker takes from the client.
+        int topicAliasMaximum;
         // Set when the client found this violation in what an MQTT 5.0 broker sent, and writes
         // DISCONNECT with its reason code before closing. It decides how the connection ends.
         @Nullable PacketDecodeException violation;

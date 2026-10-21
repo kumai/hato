@@ -363,11 +363,11 @@ class ClientIoTest {
         SingleWriteTransport transport = open(1);
         MqttMessage message = message(payloadSize);
         for (int i = 1; i <= admitted; i++) {
-            assertThat(sut.publish(1, i, message, 0, null)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, i, message, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         }
 
         // Act & Assert
-        assertThat(sut.publish(1, 2, message, 0, null)).isEqualTo(FULL);
+        assertThat(sut.publish(1, 2, message, 0, null, TopicAlias.NONE)).isEqualTo(FULL);
         assertThat(sut.send(1, 3, publish(), null)).isEqualTo(ACCEPTED);
         assertThat(sut.send(1, 4, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         transport.awaitActive();
@@ -387,20 +387,20 @@ class ClientIoTest {
         MqttMessage tooLarge = message(16 * 1024 * 1024);
 
         // Act & Assert: payload plus its header does not fit even in an empty queue.
-        assertThat(sut.publish(1, 1, tooLarge, 0, null)).isEqualTo(FULL);
+        assertThat(sut.publish(1, 1, tooLarge, 0, null, TopicAlias.NONE)).isEqualTo(FULL);
         assertThat(codec.prepared.get()).isZero();
         for (int i = 1; i <= 128; i++) {
-            assertThat(sut.publish(1, i, message(0), 0, null)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, i, message(0), 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         }
         transport.awaitActive();
-        assertThat(sut.publish(1, 129, message(0), 0, null)).isEqualTo(FULL);
+        assertThat(sut.publish(1, 129, message(0), 0, null, TopicAlias.NONE)).isEqualTo(FULL);
         assertThat(codec.prepared.get()).isEqualTo(1);
         assertThat(sut.send(1, 130, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
 
         // Act & Assert: closure takes precedence and keeps the transport's cause.
         var cause = new IOException("Connection ended");
         transport.end(cause);
-        assertThat(sut.publish(1, 131, tooLarge, 0, null)).isEqualTo(CLOSED);
+        assertThat(sut.publish(1, 131, tooLarge, 0, null, TopicAlias.NONE)).isEqualTo(CLOSED);
         assertThat(events.ends).containsExactly(cause);
         assertThat(events.failures).isEmpty();
     }
@@ -434,7 +434,7 @@ class ClientIoTest {
         var message = MqttMessage.of(new Topic("a"), new byte[] {1, 2}, Qos.AT_LEAST_ONCE, true);
 
         // Act
-        assertThat(sut.publish(1, 1, message, 7, null)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, message, 7, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
 
         // Assert
         Packet.Publish packet = observed.get(5, SECONDS);
@@ -453,7 +453,7 @@ class ClientIoTest {
         SingleWriteTransport old = open(1);
         var first = new CompletableFuture<Packet.Publish>();
         old.beforeReturn = bytes -> first.complete((Packet.Publish) codec.decode(bytes));
-        assertThat(sut.publish(1, 1, message, 7, receipt)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         await().until(receipt::accepted);
 
         // Act: the transport accepted the array, but it has not reported a successful write.
@@ -461,7 +461,7 @@ class ClientIoTest {
         SingleWriteTransport current = open(2);
         var retry = new CompletableFuture<Packet.Publish>();
         current.beforeReturn = bytes -> retry.complete((Packet.Publish) codec.decode(bytes));
-        assertThat(sut.publish(2, 2, message, 7, receipt)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(2, 2, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
 
         // Assert
         assertThat(first.get(5, SECONDS).dup()).isFalse();
@@ -487,9 +487,9 @@ class ClientIoTest {
         var message = MqttMessage.of(new Topic("a"), new byte[0], Qos.AT_LEAST_ONCE, false);
         SingleWriteTransport old = open(1);
         try {
-            assertThat(sut.publish(1, 1, message, 7, active)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 1, message, 7, active, TopicAlias.NONE)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
-            assertThat(sut.publish(1, 2, message, 8, queued)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 2, message, 8, queued, TopicAlias.NONE)).isEqualTo(ACCEPTED);
 
             // Act: enqueue both retries before the old encoder returns.
             sut.close();
@@ -498,8 +498,8 @@ class ClientIoTest {
             var packets = new CopyOnWriteArrayList<Packet.Publish>();
             current.completeInline = true;
             current.beforeReturn = bytes -> packets.add((Packet.Publish) codec.decode(bytes));
-            assertThat(sut.publish(2, 3, message, 7, active)).isEqualTo(ACCEPTED);
-            assertThat(sut.publish(2, 4, message, 8, queued)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(2, 3, message, 7, active, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(2, 4, message, 8, queued, TopicAlias.NONE)).isEqualTo(ACCEPTED);
 
             // Assert: queue admission and active encoding did not transfer either publication.
             assertThat(active.accepted()).isFalse();
@@ -533,14 +533,14 @@ class ClientIoTest {
         }
 
         // Act
-        assertThat(sut.publish(1, 1, message, 7, receipt)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         await().untilAsserted(() -> assertThat(events.ends).containsExactly(failure));
         assertThat(receipt.accepted()).isFalse();
         sut.close();
         SingleWriteTransport current = open(2);
         var retry = new CompletableFuture<Packet.Publish>();
         current.beforeReturn = bytes -> retry.complete((Packet.Publish) codec.decode(bytes));
-        assertThat(sut.publish(2, 2, message, 7, receipt)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(2, 2, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
 
         // Assert
         assertThat(retry.get(5, SECONDS).dup()).isFalse();
@@ -564,7 +564,7 @@ class ClientIoTest {
             waitFor(release);
         };
         try {
-            assertThat(sut.publish(1, 1, message, 7, receipt)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 1, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
             assertThat(events.ends).containsExactly(failure);
             assertThat(receipt.accepted()).isFalse();
@@ -574,7 +574,7 @@ class ClientIoTest {
             SingleWriteTransport current = open(2);
             var retry = new CompletableFuture<Packet.Publish>();
             current.beforeReturn = bytes -> retry.complete((Packet.Publish) codec.decode(bytes));
-            assertThat(sut.publish(2, 2, message, 7, receipt)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(2, 2, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
             assertThat(current.attempts).isEmpty();
             release.countDown();
 
@@ -702,7 +702,7 @@ class ClientIoTest {
         var receipt = new SendReceipt();
         var message = MqttMessage.of(new Topic("a"), new byte[0], Qos.AT_LEAST_ONCE, false);
         open(1);
-        assertThat(sut.publish(1, 1, message, 7, receipt)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         await().until(receipt::accepted);
         sut.close();
         SingleWriteTransport rejected = open(2);
@@ -711,13 +711,13 @@ class ClientIoTest {
         rejected.endInsideSend = failure;
 
         // Act
-        assertThat(sut.publish(2, 2, message, 7, receipt)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(2, 2, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         await().untilAsserted(() -> assertThat(events.ends).containsExactly(failure));
         sut.close();
         SingleWriteTransport current = open(3);
         var retry = new CompletableFuture<Packet.Publish>();
         current.beforeReturn = bytes -> retry.complete((Packet.Publish) codec.decode(bytes));
-        assertThat(sut.publish(3, 3, message, 7, receipt)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(3, 3, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
 
         // Assert
         assertThat(receipt.accepted()).isTrue();
@@ -742,9 +742,9 @@ class ClientIoTest {
         await().untilAsserted(() -> assertThat(transport.rejections.get()).isEqualTo(1));
         // A publication that never fits stays FULL until closure makes it CLOSED.
         MqttMessage tooLarge = message(16 * 1024 * 1024);
-        await().untilAsserted(
-                () -> assertThat(sut.publish(1, 4, tooLarge, 0, null)).isEqualTo(CLOSED)
-        );
+        await().untilAsserted(() -> assertThat(
+                sut.publish(1, 4, tooLarge, 0, null, TopicAlias.NONE)
+        ).isEqualTo(CLOSED));
         if (!inline) {
             assertThat(events.ends).isEmpty();
             transport.end(failure);
@@ -795,15 +795,15 @@ class ClientIoTest {
         MqttMessage large = message(8 * 1024 * 1024);
         SingleWriteTransport old = open(1);
         try {
-            assertThat(sut.publish(1, 1, large, 0, null)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 1, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
-            assertThat(sut.publish(1, 2, message(0), 0, null)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 2, message(0), 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
 
             // Act: even onClosed cannot release the payload still used by the encoder.
             sut.close();
             old.end(new IOException("Old connection ended"));
             SingleWriteTransport current = open(2);
-            assertThat(sut.publish(2, 3, large, 0, null)).isEqualTo(FULL);
+            assertThat(sut.publish(2, 3, large, 0, null, TopicAlias.NONE)).isEqualTo(FULL);
             assertThat(sut.send(2, 4, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
 
             // Assert: input and callbacks remain usable while the sender is occupied.
@@ -815,7 +815,7 @@ class ClientIoTest {
             // Act: discard the old encoding, then use its returned capacity in the new connection.
             release.countDown();
             current.awaitActive();
-            assertThat(sut.publish(2, 5, large, 0, null)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(2, 5, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
             current.completeInline = true;
             current.complete();
 
@@ -836,13 +836,13 @@ class ClientIoTest {
         // Arrange
         MqttMessage large = message(8 * 1024 * 1024);
         SingleWriteTransport old = open(1);
-        assertThat(sut.publish(1, 1, large, 0, null)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         old.awaitActive();
 
         // Act: close is asynchronous; the old transport still owns the encoded array.
         sut.close();
         SingleWriteTransport current = open(2);
-        assertThat(sut.publish(2, 2, large, 0, null)).isEqualTo(FULL);
+        assertThat(sut.publish(2, 2, large, 0, null, TopicAlias.NONE)).isEqualTo(FULL);
         assertThat(sut.send(2, 3, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
         current.awaitActive();
 
@@ -852,7 +852,7 @@ class ClientIoTest {
 
         // Act: termination returns only the old transport's capacity.
         old.end(new IOException("Old write released"));
-        assertThat(sut.publish(2, 4, large, 0, null)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(2, 4, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         current.completeInline = true;
         current.complete();
 
@@ -877,17 +877,17 @@ class ClientIoTest {
             waitFor(release);
         };
         try {
-            assertThat(sut.publish(1, 1, large, 0, null)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(1, 1, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
             assertThat(entered.await(5, SECONDS)).isTrue();
 
             // Act
             sut.close();
             SingleWriteTransport current = open(2);
-            assertThat(sut.publish(2, 2, large, 0, null)).isEqualTo(FULL);
+            assertThat(sut.publish(2, 2, large, 0, null, TopicAlias.NONE)).isEqualTo(FULL);
             assertThat(sut.send(2, 3, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
             release.countDown();
             current.awaitActive();
-            assertThat(sut.publish(2, 4, large, 0, null)).isEqualTo(ACCEPTED);
+            assertThat(sut.publish(2, 4, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
 
             // Assert
             assertThat(old.attempts).containsExactly(1L);
@@ -949,11 +949,11 @@ class ClientIoTest {
         transport.completeInline = inline;
         events.beforeSent = () -> {
             events.beforeSent = () -> { };
-            next.complete(sut.publish(1, 2, large, 0, null));
+            next.complete(sut.publish(1, 2, large, 0, null, TopicAlias.NONE));
         };
 
         // Act: admit the second publication as soon as the first completion is posted.
-        assertThat(sut.publish(1, 1, large, 0, null)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 1, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
         if (!inline) {
             transport.complete();
         }

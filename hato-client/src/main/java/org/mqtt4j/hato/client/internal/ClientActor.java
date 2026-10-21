@@ -1028,9 +1028,10 @@ public final class ClientActor implements MqttClient {
                 long ticket,
                 MqttMessage message,
                 int packetId,
-                @Nullable SendReceipt receipt
+                @Nullable SendReceipt receipt,
+                TopicAlias alias
         ) {
-            return io.publish(generation, ticket, message, packetId, receipt);
+            return io.publish(generation, ticket, message, packetId, receipt, alias);
         }
 
         @Override

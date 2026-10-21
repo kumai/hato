@@ -52,6 +52,7 @@ import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.client.internal.common.protocol.Property;
@@ -2436,6 +2437,143 @@ class SessionCoreTest {
     }
 
     @Test
+    void publications_set_topic_aliases_first_come_first_served_and_then_use_them_alone() {
+        // Arrange: the broker takes two aliases.
+        SessionCore mqtt5 = connectedMqtt5(topicAliasMaximum(2));
+
+        // Act
+        for (String topic : List.of("a", "b", "a", "c", "b")) {
+            mqtt5.publish(2, message().withTopic(new Topic(topic)));
+        }
+
+        // Assert
+        assertThat(port.aliases).containsExactly(
+                new TopicAlias(1, true),
+                new TopicAlias(2, true),
+                new TopicAlias(1, false),
+                TopicAlias.NONE,
+                new TopicAlias(2, false)
+        );
+    }
+
+    @Test
+    void the_client_sets_at_most_16_aliases_whatever_the_broker_allows() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(topicAliasMaximum(65_535));
+
+        // Act
+        for (int topic = 1; topic <= 17; topic++) {
+            mqtt5.publish(2, message().withTopic(new Topic("t/" + topic)));
+        }
+
+        // Assert
+        assertThat(port.aliases.get(15)).isEqualTo(new TopicAlias(16, true));
+        assertThat(port.aliases.getLast()).isEqualTo(TopicAlias.NONE);
+    }
+
+    @Test
+    void a_broker_that_announces_no_topic_alias_maximum_gets_no_aliases() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5();
+
+        // Act
+        mqtt5.publish(2, message());
+        mqtt5.publish(3, message());
+
+        // Assert
+        assertThat(port.aliases).containsOnly(TopicAlias.NONE);
+    }
+
+    @Test
+    void an_mqtt_3_1_1_publication_uses_no_alias() {
+        // Arrange
+        connected();
+
+        // Act
+        sut.publish(2, message());
+        sut.publish(3, message());
+
+        // Assert
+        assertThat(port.aliases).containsOnly(TopicAlias.NONE);
+    }
+
+    @Test
+    void a_publication_that_the_send_queue_refuses_sets_no_alias() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(topicAliasMaximum(2));
+        port.sendResult = SendQueue.OfferResult.FULL;
+        mqtt5.publish(2, message());
+        port.sendResult = SendQueue.OfferResult.ACCEPTED;
+
+        // Act
+        mqtt5.publish(3, message());
+        mqtt5.publish(4, message());
+
+        // Assert: the alias is set by the first publication that the queue accepted.
+        assertThat(port.aliases).containsExactly(
+                new TopicAlias(1, true),
+                new TopicAlias(1, true),
+                new TopicAlias(1, false)
+        );
+    }
+
+    @Test
+    void a_new_connection_sets_its_aliases_again_also_for_resent_publications() {
+        // Arrange: a QoS 1 publication that set an alias awaits PUBACK when the connection ends.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(topicAliasMaximum(2)), 0, 0);
+        mqtt5.publish(2, qosOneMessage());
+        mqtt5.failed(1, new IOException("connection lost"));
+
+        // Act: the session continues on a connection that knows no aliases yet.
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, new Properties(List.of(
+                topicAliasMaximum(2)
+        ))), 0, 0);
+        mqtt5.publish(4, message());
+
+        // Assert
+        assertThat(port.publications).hasSize(3);
+        assertThat(port.aliases).containsExactly(
+                new TopicAlias(1, true),
+                new TopicAlias(1, true),
+                new TopicAlias(1, false)
+        );
+    }
+
+    @ParameterizedTest(name = "Maximum Packet Size {0} bytes beyond the publication")
+    @CsvSource({"2, false", "3, true"})
+    void a_publication_uses_an_alias_only_when_the_alias_fits_the_maximum_packet_size(
+            int headroom,
+            boolean aliased
+    ) {
+        // Arrange
+        int size = PacketCodec.of(MqttVersion.V5).encode(new Packet.Publish(
+                new Topic("a/b"),
+                new byte[] {1, 2},
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                EMPTY
+        )).length;
+        SessionCore mqtt5 = connectedMqtt5(
+                topicAliasMaximum(2),
+                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, size + headroom)
+        );
+
+        // Act
+        mqtt5.publish(2, message());
+
+        // Assert: the publication itself fits either way and is sent.
+        assertThat(port.publications).hasSize(1);
+        assertThat(port.aliases.getLast() != TopicAlias.NONE).isEqualTo(aliased);
+    }
+
+    @Test
     void a_continued_publication_beyond_the_new_brokers_limits_is_not_replayed() {
         // Arrange: a QoS 2 publication waits for PUBREC when the connection ends.
         SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
@@ -4410,6 +4548,11 @@ class SessionCoreTest {
         return new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, publications);
     }
 
+    /// The CONNACK property with which the broker takes up to `aliases` Topic Aliases.
+    private static Property topicAliasMaximum(int aliases) {
+        return new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, aliases);
+    }
+
     private static ConnectionAttempt attempt(long operation) {
         return new ConnectionAttempt(operation);
     }
@@ -4518,6 +4661,8 @@ class SessionCoreTest {
 
         final List<Packet> sent = new ArrayList<>();
         final List<MqttMessage> publications = new ArrayList<>();
+        // The Topic Alias of each publication offer, in the order of the offers.
+        final List<TopicAlias> aliases = new ArrayList<>();
         final List<Integer> publicationIds = new ArrayList<>();
         final List<Disconnection> ends = new ArrayList<>();
         final List<Boolean> established = new ArrayList<>();
@@ -4645,11 +4790,13 @@ class SessionCoreTest {
                 long id,
                 MqttMessage message,
                 int packetId,
-                @Nullable SendReceipt receipt
+                @Nullable SendReceipt receipt,
+                TopicAlias alias
         ) {
             ticket = id;
             publications.add(message);
             publicationIds.add(packetId);
+            aliases.add(alias);
             return sendResult;
         }
 

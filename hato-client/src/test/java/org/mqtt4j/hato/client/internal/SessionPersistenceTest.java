@@ -1300,7 +1300,8 @@ class SessionPersistenceTest {
                 long id,
                 MqttMessage message,
                 int packetId,
-                @Nullable SendReceipt receipt
+                @Nullable SendReceipt receipt,
+                TopicAlias alias
         ) {
             ticket = id;
             var publication = new Publication(connection, id, message, packetId, receipt);

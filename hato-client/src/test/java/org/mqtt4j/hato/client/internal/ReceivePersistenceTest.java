@@ -764,7 +764,8 @@ class ReceivePersistenceTest {
                 long ticket,
                 MqttMessage message,
                 int packetId,
-                @Nullable SendReceipt receipt
+                @Nullable SendReceipt receipt,
+                TopicAlias alias
         ) {
             return SendQueue.OfferResult.ACCEPTED;
         }

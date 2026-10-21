@@ -145,7 +145,8 @@ abstract class Mqtt5RoundTripTest {
                 MqttClient subscriber = client("mqtt5-repeated-sub", Duration.ZERO);
                 MqttClient publisher = client("mqtt5-repeated-pub", Duration.ZERO)
         ) {
-            // Arrange: a broker that uses Topic Aliases sends the topic with the first only.
+            // Arrange: where the receiving side takes Topic Aliases, the publisher and the
+            // broker send the topic with the first publication only.
             subscriber.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
             subscriber.subscribe(

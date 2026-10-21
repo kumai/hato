@@ -4716,6 +4716,43 @@ class ClientActorTest {
     }
 
     @Test
+    void a_broker_that_takes_aliases_receives_a_topic_once_and_then_its_alias_alone()
+            throws Exception {
+        // Arrange: the broker takes two aliases.
+        try (MqttClient sut = mqtt5Client()) {
+            CompletableFuture<ConnAck> connection = sut.connect();
+            ScriptTransport transport = nextTransport();
+            transport.receive(new Packet.ConnAck(false, ReasonCode.SUCCESS, new Properties(List.of(
+                    new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 2)
+            ))));
+            connection.get(5, SECONDS);
+
+            // Act
+            sut.publish(message(new byte[] {1})).get(5, SECONDS);
+            sut.publish(message(new byte[] {2})).get(5, SECONDS);
+
+            // Assert
+            assertThat(transport.sent.poll(5, SECONDS)).isEqualTo(new Packet.Publish(
+                    new Topic("messages"),
+                    new byte[] {1},
+                    Qos.AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    topicAlias(1)
+            ));
+            assertThat(transport.sent.poll(5, SECONDS)).isEqualTo(new Packet.AliasPublish(
+                    new byte[] {2},
+                    Qos.AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    topicAlias(1)
+            ));
+        }
+    }
+
+    @Test
     void a_broker_topic_alias_delivers_its_topic_and_counts_it_in_receive_capacity()
             throws Exception {
         // Arrange: the broker sets alias 1 with its first publication and then sends it alone.

@@ -52,6 +52,9 @@ final class Publications {
 
     private static final long INFLIGHT_BYTE_LIMIT = 32L * 1024 * 1024;
 
+    // A Topic Alias property: its identifier and its two-byte value.
+    private static final int TOPIC_ALIAS_BYTES = 3;
+
     // A broker can repeat PUBREC at will, so PUBREC responses bound their completion events in
     // the same way. Replayed PUBRELs are already bounded by the session's exchanges.
     private static final int RELEASE_WRITE_LIMIT = 16;
@@ -170,14 +173,17 @@ final class Publications {
         if (packetId == 0) {
             window.publications.put(ticket, operation);
         }
+        TopicAlias alias = alias(message);
         SendQueue.OfferResult result = port.publish(
                 core.generation(),
                 ticket,
                 message,
                 packetId,
-                receipt
+                receipt,
+                alias
         );
         if (result == SendQueue.OfferResult.ACCEPTED) {
+            window.aliases.accepted(message.topic(), alias);
             awaitPublication(ticket, message.qos(), packetId);
         } else if (result == SendQueue.OfferResult.FULL) {
             if (packetId == 0) {
@@ -336,17 +342,20 @@ final class Publications {
                 continue;
             }
             long ticket = core.nextTicket();
+            TopicAlias alias = alias(message);
             SendQueue.OfferResult result = port.publish(
                     core.generation(),
                     ticket,
                     message,
                     next.packetId,
-                    next.receipt
+                    next.receipt,
+                    alias
             );
             if (result != SendQueue.OfferResult.ACCEPTED) {
                 window.stalled = true;
                 return false;
             }
+            window.aliases.accepted(message.topic(), alias);
             awaitPublication(ticket, next.qos, next.packetId);
             window.unsent.removeFirst();
             if (cleanStart) {
@@ -553,6 +562,27 @@ final class Publications {
         }
     }
 
+    /// The Topic Alias that a PUBLISH of `message` uses on this connection. It uses none when
+    /// the broker takes no aliases, or when the alias property could make it larger than the
+    /// broker accepts: whether a publication fits is decided without its alias, because aliases
+    /// differ from one connection to the next.
+    private TopicAlias alias(MqttMessage message) {
+        int maximum = core.topicAliasMaximum();
+        if (maximum == 0) {
+            return TopicAlias.NONE;
+        }
+        TopicAlias alias = window.aliases.choose(message.topic(), maximum);
+        int limit = core.limits().maximumPacketSize();
+        // Setting an alias adds it to the topic, which makes the longest form; the form that
+        // carries the alias alone is never longer.
+        if (alias != TopicAlias.NONE
+                && limit < ConnectionEstablishment.LARGEST_PACKET_SIZE
+                && exceeds(message, limit - TOPIC_ALIAS_BYTES)) {
+            return TopicAlias.NONE;
+        }
+        return alias;
+    }
+
     /// The size of the PUBLISH that carries `message`, including its fixed header and its
     /// properties.
     private int wireSize(MqttMessage message) {
@@ -641,6 +671,8 @@ final class Publications {
         final ArrayDeque<Publication> unsent = new ArrayDeque<>();
         // Set while a queued exchange waits for send capacity.
         boolean stalled;
+        // The Topic Aliases that this connection's PUBLISH packets set.
+        final OutgoingAliases aliases = new OutgoingAliases();
         // PUBREC responses have their own FIFO: an application's unready incoming
         // acknowledgement must not block its outgoing publication. Coalescing by id bounds even
         // unknown responses to the protocol's 65,535 identifiers.
