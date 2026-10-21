@@ -184,7 +184,7 @@ public final class ClientStats {
         RECEPTIONS,
 
         /// A QoS 1 or QoS 2 delivery did not fit a subscription's buffer or the client's limits
-        /// on deliveries and their bytes.
+        /// on deliveries, their bytes, and their acknowledgement conditions.
         DELIVERIES,
 
         /// A hand-off acceptor refused a QoS 1 or QoS 2 delivery.
@@ -300,6 +300,16 @@ public final class ClientStats {
         /// limit for all subscriptions.
         public Usage heldBytes() {
             return values.heldBytes();
+        }
+
+        /// The acknowledgement conditions that the client holds for unfinished QoS 1 and QoS 2
+        /// receptions, one for each subscription that took a copy, against its limit for all
+        /// subscriptions. A reception keeps them until it ends, also after its deliveries were
+        /// processed, so receptions that wait for an earlier one keep theirs. A reception that
+        /// would exceed the limit ends the connection, counted under
+        /// [OverloadCause#DELIVERIES].
+        public Usage heldConditions() {
+            return values.heldConditions();
         }
 
         /// Unfinished receptions whose acknowledgement awaits its conditions.

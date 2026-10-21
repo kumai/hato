@@ -59,6 +59,12 @@ final class DeliveryLanes {
     // buffer capacity in ordinary use.
     private static final int DELIVERY_LIMIT = 65_536;
 
+    /// The acknowledgement conditions that unfinished QoS 1 and QoS 2 receipts may hold across
+    /// all subscriptions: one for each subscription that took a copy, kept until the receipt
+    /// ends. The bound does not grow with the subscriptions, so fan-out over many of them cannot
+    /// multiply it; it is what the core's 4,096 receipts reach with 256 subscriptions each.
+    static final int CONDITION_LIMIT = 1_048_576;
+
     // One lock keeps fan-out reservations atomic; each lane's condition wakes only that lane's
     // dispatcher or receivers.
     private final ReentrantLock lock = new ReentrantLock();
@@ -77,6 +83,9 @@ final class DeliveryLanes {
 
     // The lanes that may be retained, including stopped lanes whose handlers have not returned.
     private final int laneLimit;
+
+    // The acknowledgement conditions that receipts may hold; see [#CONDITION_LIMIT].
+    private final int conditionLimit;
 
     // True when the failure ends the current connection or the client; the lane then runs
     // nothing more until connection cleanup or removal. An old receipt returns false.
@@ -121,6 +130,9 @@ final class DeliveryLanes {
 
     private long retainedBytes;
 
+    // The acknowledgement conditions that the receipts in acknowledging hold.
+    private int heldConditions;
+
     // Deliveries that left their subscriptions unprocessed, by reason, across all lanes.
     private final long[] dropped = new long[DropReason.values().length];
 
@@ -137,6 +149,7 @@ final class DeliveryLanes {
             String clientId,
             long byteLimit,
             int laneLimit,
+            int conditionLimit,
             BiPredicate<DeliveryToken, Throwable> onFailure,
             Consumer<DeliveryToken> onOverload,
             Runnable onReady,
@@ -146,6 +159,7 @@ final class DeliveryLanes {
         this.clientId = clientId;
         this.byteLimit = byteLimit;
         this.laneLimit = laneLimit;
+        this.conditionLimit = conditionLimit;
         this.onFailure = onFailure;
         this.onOverload = onOverload;
         this.onReady = onReady;
@@ -469,9 +483,11 @@ final class DeliveryLanes {
     /// Caller holds lock. A retired receipt meets no acknowledgement condition, so a late ack()
     /// completes nothing. Every view's ack() is still detached, including accepted hand-off
     /// views that returned their capacity already: a delivery the application keeps after its
-    /// receipt ends must not keep the client's lanes reachable through it.
+    /// receipt ends must not keep the client's lanes reachable through it. Callers retire each
+    /// receipt once, as it leaves acknowledging.
     private void retire(RetainedDelivery delivery) {
         delivery.retired = true;
+        heldConditions -= delivery.recipients.size();
         for (DeliveryView view : trackedViews(delivery)) {
             view.acknowledgement = null;
             view.released = true;
@@ -546,11 +562,14 @@ final class DeliveryLanes {
             RetainedDelivery retained = requireNonNull(delivery);
             long addedBytes = recipients.isEmpty() || !retained.views.isEmpty()
                     ? 0 : retained.bytes;
-            if (!fits(recipients.size(), addedBytes)) {
+            // A first copy adds a condition for each recipient; a retransmission reuses them.
+            if (!fits(recipients.size(), addedBytes)
+                    || (first && recipients.size() > conditionLimit - heldConditions)) {
                 return false;
             }
             if (first) {
                 acknowledging.put(token.acknowledgement(), retained);
+                heldConditions += recipients.size();
             }
             for (Recipient recipient : abandoned) {
                 recipient.ready = true;
@@ -849,6 +868,7 @@ final class DeliveryLanes {
                     admittedDeliveries,
                     new Usage(retainedDeliveries, DELIVERY_LIMIT),
                     new Usage(retainedBytes, byteLimit),
+                    new Usage(heldConditions, conditionLimit),
                     new Usage(retainedLanes, laneLimit),
                     ClientSnapshot.counts(dropped, DropReason.class)
             );
@@ -2130,6 +2150,7 @@ final class DeliveryLanes {
             long admitted,
             Usage deliveries,
             Usage bytes,
+            Usage conditions,
             Usage retainedLanes,
             Map<DropReason, Long> dropped
     ) {}
@@ -2175,7 +2196,7 @@ final class DeliveryLanes {
 
         final DeliveryToken token;
         final int bytes;
-        // Receipt metadata is bounded by the core's receipt limit and the 256 subscriptions.
+        // One condition for each recipient, counted against the client's condition limit.
         // Completed pull views leave only these IDs and conditions, without payload or lane.
         final Map<Long, Recipient> recipients = new LinkedHashMap<>();
         // Views that hold capacity; the payload stays counted until the last of them leaves.

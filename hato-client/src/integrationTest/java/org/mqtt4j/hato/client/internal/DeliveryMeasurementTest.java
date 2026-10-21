@@ -367,6 +367,7 @@ class DeliveryMeasurementTest {
                 "measure",
                 Long.MAX_VALUE,
                 256,
+                DeliveryLanes.CONDITION_LIMIT,
                 (_, _) -> true,
                 _ -> { },
                 () -> { },

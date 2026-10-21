@@ -84,6 +84,9 @@ public record ClientSnapshot(
     /// @param dropped the deliveries that left their subscription unprocessed, by reason
     /// @param heldDeliveries the deliveries that the client holds, against its limit
     /// @param heldBytes the bytes of those deliveries, against the client's limit
+    /// @param heldConditions the acknowledgement conditions that unfinished QoS 1 and QoS 2
+    ///     receptions hold, one for each subscription that took a copy, against the client's
+    ///     limit
     /// @param awaitingConditions QoS 1 and QoS 2 receptions whose acknowledgement waits for a
     ///     handler, an acceptor, or `ack()`
     /// @param awaitingTurn receptions whose acknowledgement is due but waits for an
@@ -104,6 +107,7 @@ public record ClientSnapshot(
             Map<DropReason, Long> dropped,
             Usage heldDeliveries,
             Usage heldBytes,
+            Usage heldConditions,
             long awaitingConditions,
             long awaitingTurn,
             long awaitingAcknowledgementWrite,

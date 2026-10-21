@@ -136,6 +136,7 @@ class ClientStatsTest {
             assertThat(find(running, idle).waiting()).isZero();
             assertThat(running.receiving().deliveries()).isEqualTo(3);
             assertThat(running.receiving().heldDeliveries()).isEqualTo(new Usage(3, 65_536));
+            assertThat(running.receiving().heldConditions()).isEqualTo(new Usage(3, 1_048_576));
 
             // Act: the first handler returns without ack(), and the second one starts.
             returns.release();

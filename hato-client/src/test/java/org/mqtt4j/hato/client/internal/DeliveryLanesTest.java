@@ -28,6 +28,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.ClientStats.DropReason;
+import org.mqtt4j.hato.ClientStats.Usage;
 import org.mqtt4j.hato.FailurePolicy;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
@@ -2165,6 +2166,38 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void a_fan_out_beyond_the_condition_limit_is_refused_until_a_receipt_ends()
+            throws Exception {
+        // Arrange: receipts may hold 2 acknowledgement conditions, and the first one, received
+        // by both lanes, holds both.
+        DeliveryLanes sut = conditionLimited(2);
+        DeliveryLanes.Receiver first = registerPull(sut, 1, request(8));
+        DeliveryLanes.Receiver second = registerPull(sut, 2, request(8));
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L), qosOneMessage(), false, 1))
+                .isTrue();
+        assertThat(first.receive()).isInstanceOf(ReceiveResult.Received.class);
+        assertThat(second.receive()).isInstanceOf(ReceiveResult.Received.class);
+
+        // Act & Assert: a received copy keeps its condition until its receipt ends.
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 1)).isFalse();
+        assertThat(sut.values().conditions()).isEqualTo(new Usage(2, 2));
+        sut.forget(10);
+        assertThat(sut.values().conditions()).isEqualTo(new Usage(0, 2));
+        assertThat(sut.deliver(token(1, 11), List.of(1L, 2L), qosOneMessage(), false, 1))
+                .isTrue();
+        assertThat(sut.values().conditions()).isEqualTo(new Usage(2, 2));
+
+        // Act & Assert: a retransmission after a connection's end reuses the conditions of the
+        // copy that it replaces, so it fits at the limit.
+        assertThat(second.receive()).isInstanceOf(ReceiveResult.Received.class);
+        assertThat(sut.connectionEnded(true, false)).containsKey(11L);
+        assertThat(sut.deliver(token(2, 11), List.of(1L, 2L), qosOneMessage(), true, 1))
+                .isTrue();
+        assertThat(sut.values().conditions()).isEqualTo(new Usage(2, 2));
+        assertThat(received(first.receive()).dup()).isTrue();
+    }
+
+    @Test
     void accepting_a_delivery_meets_its_on_receive_condition_and_returns_its_capacity()
             throws Exception {
         // Arrange: the application keeps what it accepts, and a push lane also holds the
@@ -2625,6 +2658,19 @@ class DeliveryLanesTest {
         return manager;
     }
 
+    /// Lanes whose receipts may hold at most `limit` acknowledgement conditions.
+    private DeliveryLanes conditionLimited(int limit) {
+        var owner = new AtomicReference<DeliveryLanes>();
+        DeliveryLanes manager = lanes(
+                BYTE_LIMIT,
+                limit,
+                () -> ready.addAll(requireNonNull(owner.get()).takeReady()),
+                (token, cause) -> failures.add(new Failure(token, cause))
+        );
+        owner.set(manager);
+        return manager;
+    }
+
     private DeliveryLanes lanes(long byteLimit, Runnable onReady) {
         return lanes(byteLimit, onReady, (token, cause) -> failures.add(new Failure(token, cause)));
     }
@@ -2634,10 +2680,20 @@ class DeliveryLanesTest {
             Runnable onReady,
             BiPredicate<DeliveryToken, Throwable> onFailure
     ) {
+        return lanes(byteLimit, DeliveryLanes.CONDITION_LIMIT, onReady, onFailure);
+    }
+
+    private DeliveryLanes lanes(
+            long byteLimit,
+            int conditionLimit,
+            Runnable onReady,
+            BiPredicate<DeliveryToken, Throwable> onFailure
+    ) {
         var manager = new DeliveryLanes(
                 "lane-test",
                 byteLimit,
                 256,
+                conditionLimit,
                 onFailure,
                 overloads::add,
                 onReady,
