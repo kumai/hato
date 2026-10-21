@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.BindException;
 import java.net.InetAddress;
@@ -10,10 +11,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
@@ -190,6 +193,37 @@ class BrokerConnectionTest {
             byte[] bytes = codec.encode(publication("slow", "x".repeat(8192), AT_MOST_ONCE, 0));
             // [MQTT-3.1.2-24]: only a complete packet resets the 1.5-second deadline.
             dripUntilClosed(client, bytes, Duration.ofMillis(2500));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void requests_sent_faster_than_their_responses_are_read_wait_without_closing_the_connection(
+            MqttVersion version
+    ) throws Exception {
+        // Arrange: the broker announces no Receive Maximum, so a client may send this many QoS 1
+        // publications at once, far more than the broker queues responses for. On one carrier,
+        // the broker's reader handles the whole burst before its writer runs, so the responses
+        // fill the queue; with more carriers the writer usually keeps up.
+        var burst = new ByteArrayOutputStream();
+        for (int id = 1; id <= 2000; id++) {
+            burst.writeBytes(PacketCodec.of(version).encode(
+                    publication("burst", "x", AT_LEAST_ONCE, id)
+            ));
+        }
+        try (var sut = MqttBroker.start();
+                RawSession client = version == MqttVersion.V5
+                        ? RawSession.connectedV5(sut.port(), "burst")
+                        : connected(sut.port(), "burst")) {
+
+            // Act
+            client.sendRaw(burst.toByteArray());
+
+            // Assert: every publication gets its PUBACK, in order, on the same connection.
+            for (int id = 1; id <= 2000; id++) {
+                assertThat(client.expect(Packet.PubAck.class).packetId()).isEqualTo(id);
+            }
+            client.ping();
         }
     }
 

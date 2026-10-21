@@ -61,7 +61,8 @@ public final class BrokerServer implements AutoCloseable {
     private static final int MAX_INFLIGHT = 128;
 
     // Responses to a client's requests queue apart from deliveries and PUBRELs, up to the 128
-    // the regular queue allowed them before sessions. Requests beyond that close the connection.
+    // the regular queue allowed them before sessions. While they are all waiting, the reader
+    // stops reading requests, so a client that does not read its responses is held back by TCP.
     private static final int RESERVED_COUNT = 128;
 
     private static final long RESERVED_BYTES = 1024 * 1024;
@@ -735,6 +736,10 @@ public final class BrokerServer implements AutoCloseable {
                     beforeProcess.accept(packet);
                     log.debug("Broker received {} from {}", packet.getClass().getSimpleName(),
                             socket.getRemoteSocketAddress());
+                    // Packets without a response, such as QoS 0 publications, never wait.
+                    if (answered(packet) && !awaitResponseRoom()) {
+                        return;
+                    }
                     synchronized (routing) {
                         Session owner = currentSession();
                         if (owner == null) {
@@ -1038,6 +1043,44 @@ public final class BrokerServer implements AutoCloseable {
             return result;
         }
 
+        /// Whether the broker answers `packet` with one response in the reserved quota.
+        private static boolean answered(Packet packet) {
+            return switch (packet) {
+                case Packet.Publish publish -> publish.qos() != Qos.AT_MOST_ONCE;
+                case Packet.Subscribe _,
+                     Packet.Unsubscribe _,
+                     Packet.PubRel _,
+                     Packet.PingReq _ -> true;
+                case Packet.Connect _,
+                     Packet.ConnAck _,
+                     Packet.AliasPublish _,
+                     Packet.PubAck _,
+                     Packet.PubRec _,
+                     Packet.PubComp _,
+                     Packet.SubAck _,
+                     Packet.UnsubAck _,
+                     Packet.PingResp _,
+                     Packet.Disconnect _,
+                     Packet.Auth _ -> false;
+            };
+        }
+
+        /// Holds the reader, outside the routing lock, until the reserved quota has room for one
+        /// more response, so that answering the next request never finds it full. Only this
+        /// reader queues responses, so the room stays until the response takes it. A deliberate
+        /// simplification: the wait counts responses, not their bytes. Only a backlog of SUBACKs
+        /// for SUBSCRIBE packets with many thousands of filters reaches the byte limit, which
+        /// still closes the connection; waiting for the size of each response would remove that
+        /// limit. Returns false once the connection has ended. A connection that is to end with
+        /// a last packet drops responses, so its reader does not wait.
+        private synchronized boolean awaitResponseRoom() throws InterruptedException {
+            while (lastPacket == null
+                    && outgoing.checkCapacity(0, true) == SendQueue.OfferResult.FULL) {
+                wait();
+            }
+            return !ended;
+        }
+
         private void send(Packet packet) {
             boolean accepted;
             synchronized (this) {
@@ -1117,6 +1160,8 @@ public final class BrokerServer implements AutoCloseable {
                         // Refusal and completion share this monitor, so no wakeup is lost.
                         resume = awaitingSpace;
                         awaitingSpace = false;
+                        // The reader may wait for room for its next response.
+                        notifyAll();
                     }
                     if (resume) {
                         synchronized (routing) {

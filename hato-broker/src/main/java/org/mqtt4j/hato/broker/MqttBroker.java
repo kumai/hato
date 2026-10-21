@@ -45,12 +45,14 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// identifier, the broker sends DISCONNECT with the reason code; a peer that stops reading may
 /// not receive it.
 ///
-/// QoS 1/2 deliveries wait when unacknowledged deliveries reach their count or size limit.
-/// Deliveries also wait while a subscriber's connection is slow to accept data. The number and
-/// total size of waiting deliveries are bounded. Exceeding either limit discards that session
-/// and closes its connection, if any; its next connection has Session Present false. A delivery
-/// too large for the broker's internal size limits also discards its target session, even an
-/// otherwise empty one.
+/// A client that sends requests faster than it reads the responses is held back: the broker
+/// stops reading from it until there is room for the next response, rather than closing its
+/// connection. QoS 1/2 deliveries wait when unacknowledged deliveries reach their count or size
+/// limit. Deliveries also wait while a subscriber's connection is slow to accept data. The
+/// number and total size of waiting deliveries are bounded. Exceeding either limit discards
+/// that session and closes its connection, if any; its next connection has Session Present
+/// false. A delivery too large for the broker's internal size limits also discards its target
+/// session, even an otherwise empty one.
 /// A new persistent session is refused with Server unavailable when the
 /// persistent-session limit is reached. These limits are provisional and may change.
 /// All state is lost when the broker stops. This experimental API is outside the compatibility
