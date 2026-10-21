@@ -77,6 +77,10 @@ MqttClient client = MqttClient.builder()
         .build();
 ```
 
+The client stays disconnected after an MQTT 5.0 broker ends the connection for an
+administrative action, and keeps retrying after an unspecified error. To reverse either,
+add `withAdministrativeActionRetry()` or `withoutUnspecifiedErrorRetry()` to the policy.
+
 `ReconnectPolicy.disabled()` reconnects only when you call `connect()` again.
 `whenConnected()` completes when the client is connected, without starting a connection.
 To check repeatedly, keep the returned future and call `whenConnected()` again only after it

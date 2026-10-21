@@ -17,7 +17,7 @@ final class ConnectionRequest {
 
     private final ReconnectBackoff backoff;
 
-    private final boolean initialRetry;
+    private final RetryRules rules;
 
     private boolean requested;
 
@@ -34,9 +34,9 @@ final class ConnectionRequest {
     // The number of the latest attempt. Attempts are numbered per client from one.
     private long attempts;
 
-    ConnectionRequest(ReconnectBackoff backoff, boolean initialRetry) {
+    ConnectionRequest(ReconnectBackoff backoff, RetryRules rules) {
         this.backoff = backoff;
-        this.initialRetry = initialRetry;
+        this.rules = rules;
     }
 
     boolean requested() {
@@ -100,8 +100,8 @@ final class ConnectionRequest {
     boolean retries(@Nullable Throwable cause) {
         return requested
                 && backoff.enabled()
-                && (established || initialRetry)
-                && reconnectable(cause);
+                && (established || rules.initialRetry())
+                && reconnectable(cause, rules);
     }
 
     Duration nextDelay() {
@@ -115,14 +115,15 @@ final class ConnectionRequest {
 
     /// Whether the client may connect again after `cause` ended a connection or an attempt. An
     /// ending without a failure stops; a broker's reason code, in a CONNACK refusal or an MQTT 5.0
-    /// DISCONNECT, decides by [#reconnects(ReasonCode)]; every other failure reconnects.
-    static boolean reconnectable(@Nullable Throwable cause) {
+    /// DISCONNECT, decides by [#reconnects(ReasonCode, RetryRules)]; every other failure
+    /// reconnects.
+    static boolean reconnectable(@Nullable Throwable cause, RetryRules rules) {
         return switch (cause) {
             case null -> false;
             case MqttConnectException refusal -> refusal.reasonCode()
-                    .map(ConnectionRequest::reconnects)
+                    .map(reason -> reconnects(reason, rules))
                     .orElse(true);
-            case MqttBrokerDisconnectException ending -> reconnects(ending.reasonCode());
+            case MqttBrokerDisconnectException ending -> reconnects(ending.reasonCode(), rules);
             default -> true;
         };
     }
@@ -132,9 +133,14 @@ final class ConnectionRequest {
     /// the same session would meet the refusal again, and when the broker asks it to keep away
     /// or to use another server. Every other reason, including one that a later MQTT version
     /// adds, reconnects: bad credentials and missing authorization too, because each attempt
-    /// asks for credentials again.
-    private static boolean reconnects(ReasonCode reason) {
+    /// asks for credentials again. The policy decides the two reasons whose answer depends on how
+    /// the application is run: by default, an administrative action keeps the client away,
+    /// because an administrator chose it, and an unspecified error reconnects, because it does
+    /// not say whether its cause lasts.
+    private static boolean reconnects(ReasonCode reason, RetryRules rules) {
         return switch (reason) {
+            case ADMINISTRATIVE_ACTION -> rules.administrativeActionRetry();
+            case UNSPECIFIED_ERROR -> rules.unspecifiedErrorRetry();
             case MALFORMED_PACKET,
                  PROTOCOL_ERROR,
                  UNSUPPORTED_PROTOCOL_VERSION,
@@ -147,7 +153,6 @@ final class ConnectionRequest {
                  RECEIVE_MAXIMUM_EXCEEDED,
                  TOPIC_ALIAS_INVALID,
                  PACKET_TOO_LARGE,
-                 ADMINISTRATIVE_ACTION,
                  PAYLOAD_FORMAT_INVALID,
                  RETAIN_NOT_SUPPORTED,
                  QOS_NOT_SUPPORTED,

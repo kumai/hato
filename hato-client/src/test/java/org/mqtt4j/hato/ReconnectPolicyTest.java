@@ -46,6 +46,47 @@ class ReconnectPolicyTest {
     }
 
     @Test
+    void classification_settings_take_part_in_equality_and_combine_in_any_order() {
+        // Arrange
+        var sut = ReconnectPolicy.exponentialBackoff(Duration.ofSeconds(1), Duration.ofMinutes(2));
+        var same = ReconnectPolicy.exponentialBackoff(Duration.ofSeconds(1), Duration.ofMinutes(2));
+
+        // Act
+        ReconnectPolicy administrative = sut.withAdministrativeActionRetry();
+        ReconnectPolicy unspecified = sut.withoutUnspecifiedErrorRetry();
+        ReconnectPolicy all = sut.withInitialRetry()
+                .withAdministrativeActionRetry()
+                .withoutUnspecifiedErrorRetry();
+        ReconnectPolicy reordered = same.withoutUnspecifiedErrorRetry()
+                .withAdministrativeActionRetry()
+                .withInitialRetry()
+                .withAdministrativeActionRetry();
+
+        // Assert
+        assertThat(administrative).isEqualTo(same.withAdministrativeActionRetry())
+                .hasSameHashCodeAs(same.withAdministrativeActionRetry())
+                .isNotEqualTo(sut)
+                .isNotEqualTo(unspecified)
+                .isNotEqualTo(administrative.withoutUnspecifiedErrorRetry());
+        assertThat(unspecified).isEqualTo(same.withoutUnspecifiedErrorRetry())
+                .hasSameHashCodeAs(same.withoutUnspecifiedErrorRetry())
+                .isNotEqualTo(sut)
+                .isNotEqualTo(unspecified.withInitialRetry());
+        // The settings combine in any order, and repeating one changes nothing.
+        assertThat(all).isEqualTo(reordered).hasSameHashCodeAs(reordered);
+        assertThat(sut.toString())
+                .contains("administrativeActionRetry=false", "unspecifiedErrorRetry=true");
+        // The settings keep the delays and each other.
+        assertThat(all.toString()).contains(
+                "PT1S",
+                "PT2M",
+                "initialRetry=true",
+                "administrativeActionRetry=true",
+                "unspecifiedErrorRetry=false"
+        );
+    }
+
+    @Test
     void equal_delays_and_the_largest_delay_are_accepted() {
         var largest = Duration.ofMillis(Integer.MAX_VALUE);
         assertThatCode(() -> ReconnectPolicy.exponentialBackoff(largest, largest))
@@ -78,8 +119,12 @@ class ReconnectPolicyTest {
     }
 
     @Test
-    void a_disabled_policy_cannot_retry_initial_failures() {
+    void a_disabled_policy_rejects_every_retry_setting() {
         assertThatIllegalStateException()
                 .isThrownBy(() -> ReconnectPolicy.disabled().withInitialRetry());
+        assertThatIllegalStateException()
+                .isThrownBy(() -> ReconnectPolicy.disabled().withAdministrativeActionRetry());
+        assertThatIllegalStateException()
+                .isThrownBy(() -> ReconnectPolicy.disabled().withoutUnspecifiedErrorRetry());
     }
 }

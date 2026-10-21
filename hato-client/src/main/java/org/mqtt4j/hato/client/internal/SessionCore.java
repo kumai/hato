@@ -319,7 +319,7 @@ final class SessionCore {
             Packet.@Nullable Will will,
             boolean credentialsRequired,
             ReconnectBackoff backoff,
-            boolean initialRetry,
+            RetryRules rules,
             Duration responseTimeout
     ) {
         this.port = port;
@@ -329,7 +329,7 @@ final class SessionCore {
         cleanStart = sessionExpiry.isZero();
         this.version = version;
         this.credentialsRequired = credentialsRequired;
-        request = new ConnectionRequest(backoff, initialRetry);
+        request = new ConnectionRequest(backoff, rules);
         current = new Connection(responseTimeout, Step.FIRST);
         establishment = new ConnectionEstablishment(
                 clientId,

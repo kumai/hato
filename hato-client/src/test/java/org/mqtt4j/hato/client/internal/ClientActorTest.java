@@ -8650,7 +8650,7 @@ class ClientActorTest {
                 null,
                 null,
                 ReconnectBackoff.disabled(),
-                false,
+                RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
                 DeliveryOptionsAccess::execution
         );

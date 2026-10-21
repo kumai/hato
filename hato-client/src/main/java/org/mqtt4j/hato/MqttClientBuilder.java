@@ -300,7 +300,8 @@ public final class MqttClientBuilder {
     /// Decides whether the client reconnects after an established connection ends without a
     /// request to stop, and how long it waits between attempts. Defaults to
     /// [ReconnectPolicy#exponentialBackoff(Duration, Duration)] from 1 second up to
-    /// 120 seconds, which does not retry the first failure of a connection request.
+    /// 120 seconds, which does not retry the first failure of a connection request and keeps the
+    /// default classification of broker reason codes that [ReconnectPolicy] describes.
     /// [ReconnectPolicy#disabled()] leaves a client disconnected until the next
     /// [MqttClient#connect()].
     public MqttClientBuilder reconnectPolicy(ReconnectPolicy value) {
@@ -445,7 +446,7 @@ public final class MqttClientBuilder {
                 credentials,
                 connectWill,
                 reconnectPolicy.backoff(),
-                reconnectPolicy.initialRetry(),
+                reconnectPolicy.rules(),
                 responseTimeout,
                 DeliveryOptions::execution
         );

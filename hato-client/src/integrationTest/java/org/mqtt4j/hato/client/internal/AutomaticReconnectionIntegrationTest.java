@@ -172,6 +172,58 @@ class AutomaticReconnectionIntegrationTest {
         }
     }
 
+    @Test
+    void a_policy_that_retries_administrative_actions_resumes_the_session_after_one()
+            throws Exception {
+        // Arrange: an MQTT 5.0 client with a persistent session reconnects on real time within
+        // ten milliseconds, also after an administrative action.
+        ReconnectPolicy policy = ReconnectPolicy
+                .exponentialBackoff(Duration.ofMillis(10), Duration.ofMillis(10))
+                .withAdministrativeActionRetry();
+        try (ServerSocket server = listen();
+                MqttClient sut = MqttClient.builder()
+                        .server(endpoint(server))
+                        .version(MqttVersion.V5)
+                        .clientId(clientId)
+                        .sessionExpiry(Duration.ofSeconds(30))
+                        .reconnectPolicy(policy)
+                        .connectionListener(listener)
+                        .build()) {
+            CompletableFuture<PublishResult> publication;
+            Packet.Publish original;
+            try (ScriptedBroker peer = ScriptedBroker.connect(server, sut, MqttVersion.V5)) {
+                publication = sut.publish(message("administered", Qos.AT_LEAST_ONCE));
+                original = assertInstanceOf(Packet.Publish.class, peer.receive());
+
+                // Act
+                peer.send(new Packet.Disconnect(ReasonCode.ADMINISTRATIVE_ACTION, EMPTY));
+
+                // Assert: the ending names the broker's reason and the next attempt's delay.
+                Disconnection end = requireNonNull(ends.poll(5, SECONDS));
+                assertThat(end.cause()).get().isInstanceOfSatisfying(
+                        MqttBrokerDisconnectException.class,
+                        ending -> assertThat(ending.reasonCode())
+                                .isEqualTo(ReasonCode.ADMINISTRATIVE_ACTION)
+                );
+                assertThat(end.reconnectDelay()).isPresent();
+                peer.expectClosed();
+            }
+            // The publication waits for the next connection of the session, as after other
+            // failures.
+            try (ScriptedBroker next = ScriptedBroker.accept(server, MqttVersion.V5)) {
+                Packet.Connect connect = assertInstanceOf(Packet.Connect.class, next.receive());
+                assertThat(connect.cleanStart()).isFalse();
+                next.send(new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY));
+                Packet.Publish replay = assertInstanceOf(Packet.Publish.class, next.receive());
+                assertThat(replay.packetId()).isEqualTo(original.packetId());
+                assertThat(replay.dup()).isTrue();
+                assertThat(publication).isNotDone();
+                next.send(new Packet.PubAck(replay.packetId(), ReasonCode.SUCCESS, EMPTY));
+                assertThat(publication.get(5, SECONDS)).isEqualTo(PublishResult.of());
+            }
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(MqttVersion.class)
     void the_embedded_broker_continues_a_session_across_automatic_reconnection(

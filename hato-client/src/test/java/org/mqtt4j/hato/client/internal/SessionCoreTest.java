@@ -86,7 +86,7 @@ class SessionCoreTest {
             null,
             false,
             ReconnectBackoff.disabled(),
-            false,
+            RetryRules.DEFAULT,
             Duration.ofSeconds(60)
     );
 
@@ -4177,7 +4177,10 @@ class SessionCoreTest {
                     cause -> assertThat(cause.reasonCode())
                             .isEqualTo(ReasonCode.RECEIVE_MAXIMUM_EXCEEDED)
             );
-            assertThat(ConnectionRequest.reconnectable(end.cause().orElseThrow())).isTrue();
+            assertThat(ConnectionRequest.reconnectable(
+                    end.cause().orElseThrow(),
+                    RetryRules.DEFAULT
+            )).isTrue();
         });
     }
 
@@ -4720,7 +4723,7 @@ class SessionCoreTest {
                 null,
                 false,
                 ReconnectBackoff.disabled(),
-                false,
+                RetryRules.DEFAULT,
                 Duration.ofSeconds(60)
         );
     }
@@ -4785,7 +4788,7 @@ class SessionCoreTest {
                 null,
                 true,
                 ReconnectBackoff.disabled(),
-                false,
+                RetryRules.DEFAULT,
                 Duration.ofSeconds(60)
         );
     }

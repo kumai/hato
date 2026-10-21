@@ -50,7 +50,7 @@ class Qos2ReceiveTest {
             null,
             false,
             ReconnectBackoff.disabled(),
-            false,
+            RetryRules.DEFAULT,
             Duration.ofSeconds(60)
     );
     private long nextOperation;

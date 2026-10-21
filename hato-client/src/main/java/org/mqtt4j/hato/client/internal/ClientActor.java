@@ -198,7 +198,7 @@ public final class ClientActor implements MqttClient {
             @Nullable Supplier<MqttCredentials> credentials,
             Packet.@Nullable Will will,
             ReconnectBackoff backoff,
-            boolean initialRetry,
+            RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf
     ) {
@@ -217,7 +217,7 @@ public final class ClientActor implements MqttClient {
                 credentials,
                 will,
                 backoff,
-                initialRetry,
+                rules,
                 responseTimeout,
                 executionOf
         );
@@ -238,7 +238,7 @@ public final class ClientActor implements MqttClient {
             @Nullable Supplier<MqttCredentials> credentials,
             Packet.@Nullable Will will,
             ReconnectBackoff backoff,
-            boolean initialRetry,
+            RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf
     ) {
@@ -285,7 +285,7 @@ public final class ClientActor implements MqttClient {
                 will,
                 credentials != null,
                 backoff,
-                initialRetry,
+                rules,
                 responseTimeout
         );
         this.credentials = credentials == null ? null : new CredentialsEvaluator(

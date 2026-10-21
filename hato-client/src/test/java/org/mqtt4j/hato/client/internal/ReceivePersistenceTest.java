@@ -554,7 +554,7 @@ class ReceivePersistenceTest {
                 null,
                 false,
                 ReconnectBackoff.disabled(),
-                false,
+                RetryRules.DEFAULT,
                 Duration.ofSeconds(60)
         );
     }

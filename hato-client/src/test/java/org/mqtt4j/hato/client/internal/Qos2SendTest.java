@@ -1031,7 +1031,7 @@ class Qos2SendTest {
                 null,
                 false,
                 backoff,
-                false,
+                RetryRules.DEFAULT,
                 Duration.ofSeconds(60)
         );
     }

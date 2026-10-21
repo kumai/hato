@@ -17,6 +17,7 @@ import javax.net.ssl.SSLHandshakeException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import org.mqtt4j.hato.Disconnection;
@@ -91,8 +92,42 @@ class ReconnectionTest {
         var ending = new MqttBrokerDisconnectException(reason, null, null);
 
         // Act & Assert
-        assertThat(ConnectionRequest.reconnectable(refusal)).isEqualTo(reconnects);
-        assertThat(ConnectionRequest.reconnectable(ending)).isEqualTo(reconnects);
+        assertThat(ConnectionRequest.reconnectable(refusal, RetryRules.DEFAULT))
+                .isEqualTo(reconnects);
+        assertThat(ConnectionRequest.reconnectable(ending, RetryRules.DEFAULT))
+                .isEqualTo(reconnects);
+    }
+
+    @ParameterizedTest
+    @EnumSource(ReasonCode.class)
+    void retrying_administrative_actions_changes_no_other_reason_code(ReasonCode reason) {
+        // Arrange: MQTT 5.0 brokers send 0x98 only in DISCONNECT.
+        var ending = new MqttBrokerDisconnectException(reason, null, null);
+        boolean byDefault = ConnectionRequest.reconnectable(ending, RetryRules.DEFAULT);
+
+        // Act
+        boolean reconnects = ConnectionRequest.reconnectable(
+                ending,
+                RetryRules.DEFAULT.withAdministrativeActionRetry()
+        );
+
+        // Assert
+        assertThat(reconnects).isEqualTo(reason == ReasonCode.ADMINISTRATIVE_ACTION || byDefault);
+    }
+
+    @ParameterizedTest
+    @EnumSource(ReasonCode.class)
+    void stopping_at_unspecified_errors_changes_no_other_reason_code(ReasonCode reason) {
+        // Arrange: MQTT 5.0 brokers send 0x80 in CONNACK and in DISCONNECT.
+        var refusal = new MqttConnectException("Refused", reason);
+        var ending = new MqttBrokerDisconnectException(reason, null, null);
+        boolean expected = reason != ReasonCode.UNSPECIFIED_ERROR
+                && ConnectionRequest.reconnectable(ending, RetryRules.DEFAULT);
+        RetryRules rules = RetryRules.DEFAULT.withoutUnspecifiedErrorRetry();
+
+        // Act & Assert
+        assertThat(ConnectionRequest.reconnectable(refusal, rules)).isEqualTo(expected);
+        assertThat(ConnectionRequest.reconnectable(ending, rules)).isEqualTo(expected);
     }
 
     @ParameterizedTest
@@ -116,6 +151,28 @@ class ReconnectionTest {
         assertThat(sut.state()).isEqualTo(retry ? RECONNECT_WAIT : DISCONNECTED);
         assertThat(port.timers.containsKey(RECONNECT)).isEqualTo(retry);
         assertThat(port.results.containsKey(1L)).isEqualTo(!retry);
+    }
+
+    @Test
+    void a_policy_that_stops_at_unspecified_errors_ends_even_an_initial_retry_request() {
+        // Arrange
+        SessionCore sut = core(
+                MqttVersion.V5,
+                RetryRules.DEFAULT.withInitialRetry().withoutUnspecifiedErrorRetry()
+        );
+        sut.connect(attempt(1), 0);
+        sut.opened(1);
+
+        // Act
+        sut.received(1, new Packet.ConnAck(false, ReasonCode.UNSPECIFIED_ERROR, EMPTY), 0, 4);
+
+        // Assert
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.timers).doesNotContainKey(RECONNECT);
+        assertThat(requireNonNull(port.results.get(1L)).failure()).isInstanceOfSatisfying(
+                MqttConnectException.class,
+                refusal -> assertThat(refusal.reasonCode()).contains(ReasonCode.UNSPECIFIED_ERROR)
+        );
     }
 
     @Test
@@ -161,6 +218,27 @@ class ReconnectionTest {
         assertThat(sut.state()).isEqualTo(RECONNECT_WAIT);
         assertThat(port.ends.getLast().reconnectDelay()).isPresent();
         assertThat(port.results).doesNotContainKey(2L);
+    }
+
+    @Test
+    void a_policy_that_stops_at_unspecified_errors_fails_the_waiting_publication() {
+        // Arrange: a persistent MQTT 5.0 session with a QoS 1 publication waiting for PUBACK.
+        SessionCore sut = core(MqttVersion.V5, RetryRules.DEFAULT.withoutUnspecifiedErrorRetry());
+        sut.connect(attempt(1), 0);
+        connected(sut, 1, 0);
+        sut.publish(2, message(Qos.AT_LEAST_ONCE));
+
+        // Act
+        sut.received(1, new Packet.Disconnect(ReasonCode.UNSPECIFIED_ERROR, EMPTY), 0, 4);
+
+        // Assert: no attempt follows, so the publication's outcome stays unknown.
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.timers).doesNotContainKey(RECONNECT);
+        Disconnection end = port.ends.getLast();
+        assertThat(end.reconnectDelay()).isEmpty();
+        assertThat(requireNonNull(port.results.get(2L)).failure())
+                .isInstanceOf(MqttConnectionLostException.class)
+                .hasCause(end.cause().orElseThrow());
     }
 
     @Test
@@ -228,7 +306,7 @@ class ReconnectionTest {
     @ParameterizedTest
     @MethodSource("retryableFailures")
     void local_connection_failures_allow_retry(Throwable failure) {
-        assertThat(ConnectionRequest.reconnectable(failure)).isTrue();
+        assertThat(ConnectionRequest.reconnectable(failure, RetryRules.DEFAULT)).isTrue();
     }
 
     private static Stream<Throwable> retryableFailures() {
@@ -453,7 +531,7 @@ class ReconnectionTest {
                         Duration.ofNanos(20),
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
-                false,
+                RetryRules.DEFAULT,
                 Duration.ofSeconds(60)
         );
         sut.connect(attempt(1), 0);
@@ -549,7 +627,7 @@ class ReconnectionTest {
                         Duration.ofNanos(20),
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
-                true,
+                RetryRules.DEFAULT.withInitialRetry(),
                 Duration.ofSeconds(60)
         );
         ConnectionAttempt first = attempt(1);
@@ -832,6 +910,13 @@ class ReconnectionTest {
 
     /// A core of a persistent session that reconnects after a nanosecond-scale backoff.
     private SessionCore core(MqttVersion version, boolean initialRetry) {
+        return core(
+                version,
+                initialRetry ? RetryRules.DEFAULT.withInitialRetry() : RetryRules.DEFAULT
+        );
+    }
+
+    private SessionCore core(MqttVersion version, RetryRules rules) {
         return new SessionCore(
                 port,
                 "client",
@@ -847,7 +932,7 @@ class ReconnectionTest {
                         Duration.ofNanos(20),
                         new ReconnectBackoffTest.MaximumRandom()
                 ),
-                initialRetry,
+                rules,
                 Duration.ofSeconds(60)
         );
     }
