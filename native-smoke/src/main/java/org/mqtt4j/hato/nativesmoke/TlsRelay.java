@@ -5,28 +5,28 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.URI;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
 
-/// Terminates TLS in front of the plain TCP broker with JDK classes only. It repeats the relay
-/// of test-support because depending on test-support would put Testcontainers on the image's
-/// classpath. Each accepted connection is relayed by its own virtual threads.
+/// Terminates TLS in front of a plain TCP server, the broker or the WebSocket relay, with JDK
+/// classes only. It repeats the relay of test-support because depending on test-support would
+/// put Testcontainers on the image's classpath. Each accepted connection is relayed by its own
+/// virtual threads.
 final class TlsRelay implements AutoCloseable {
 
     private final SSLContext context;
-    private final InetSocketAddress broker;
+    private final InetSocketAddress target;
     private final ServerSocket listener;
 
-    TlsRelay(int brokerPort, SSLContext context) throws IOException {
+    TlsRelay(int targetPort, SSLContext context) throws IOException {
         this.context = context;
-        broker = new InetSocketAddress(InetAddress.getLoopbackAddress(), brokerPort);
+        target = new InetSocketAddress(InetAddress.getLoopbackAddress(), targetPort);
         listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
         Thread.ofVirtual().name("hato-smoke-relay").start(this::accept);
     }
 
-    URI uri() {
-        return URI.create("mqtts://localhost:" + listener.getLocalPort());
+    int port() {
+        return listener.getLocalPort();
     }
 
     private void accept() {
@@ -37,7 +37,7 @@ final class TlsRelay implements AutoCloseable {
             }
         } catch (IOException failure) {
             // Closing the listener stops accepting. Relayed connections end with their client
-            // or the broker.
+            // or their target.
             if (!listener.isClosed()) {
                 System.err.println("TLS relay stopped accepting: " + failure);
             }
@@ -57,7 +57,7 @@ final class TlsRelay implements AutoCloseable {
             );
             tls.setUseClientMode(false);
             tls.startHandshake();
-            plain.connect(broker, 5000);
+            plain.connect(target, 5000);
             Thread.ofVirtual().start(() -> forward(tls, plain, raw, plain));
             forward(plain, tls, raw, plain);
         } catch (IOException failure) {

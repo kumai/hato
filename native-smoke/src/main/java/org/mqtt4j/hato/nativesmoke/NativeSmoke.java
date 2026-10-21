@@ -34,8 +34,10 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 
 /// Verifies that the packaged client and broker exchange messages at every QoS level in a native
 /// image, through a handler, through a striped handler, and through receiving on the caller's
-/// thread, in MQTT 3.1.1 and in MQTT 5.0 with message properties, over TCP and over TLS. For TLS,
-/// a relay in front of the broker presents the repository's test server identity.
+/// thread, in MQTT 3.1.1 and in MQTT 5.0 with message properties, over TCP, TLS, WebSocket, and
+/// WebSocket over TLS. A WebSocket relay in front of the broker serves WebSocket, and a TLS relay
+/// in front of the broker or of the WebSocket relay presents the repository's test server
+/// identity.
 /// The image reads the identities at run time from the directory given as the only argument,
 /// `test-support/src/main/resources/tls` in this repository: embedding them would take
 /// native-image resource metadata, which Hato itself does not need.
@@ -56,7 +58,9 @@ public final class NativeSmoke {
         }
         Path identities = Path.of(args[0]);
         try (MqttBroker broker = MqttBroker.start();
-                var relay = new TlsRelay(broker.port(), serverContext(identities))) {
+                var tls = new TlsRelay(broker.port(), serverContext(identities));
+                var webSocket = new WebSocketRelay(broker.port());
+                var secureWebSocket = new TlsRelay(webSocket.port(), serverContext(identities))) {
             for (MqttVersion version : MqttVersion.values()) {
                 roundTrip(
                         "TCP " + version,
@@ -69,7 +73,24 @@ public final class NativeSmoke {
                         "TLS " + version,
                         version,
                         MqttClient.builder()
-                                .server(relay.uri())
+                                .server(URI.create("mqtts://localhost:" + tls.port()))
+                                .version(version)
+                                .sslContext(clientContext(identities))
+                );
+                roundTrip(
+                        "WS " + version,
+                        version,
+                        MqttClient.builder()
+                                .server(URI.create("ws://localhost:" + webSocket.port() + "/mqtt"))
+                                .version(version)
+                );
+                roundTrip(
+                        "WSS " + version,
+                        version,
+                        MqttClient.builder()
+                                .server(URI.create(
+                                        "wss://localhost:" + secureWebSocket.port() + "/mqtt"
+                                ))
                                 .version(version)
                                 .sslContext(clientContext(identities))
                 );
@@ -77,7 +98,8 @@ public final class NativeSmoke {
         }
         System.out.println(
                 "hato native smoke: QoS 0/1/2 through handler, striped handler, and receive"
-                        + " in MQTT 3.1.1, and in MQTT 5.0 with properties, over TCP and TLS OK"
+                        + " in MQTT 3.1.1, and in MQTT 5.0 with properties, over TCP, TLS, WS,"
+                        + " and WSS OK"
         );
     }
 
