@@ -500,7 +500,7 @@ class TcpTransportTest {
 
     @Test
     void a_stalled_graceful_close_is_aborted_after_its_grace_period() throws Exception {
-        // Arrange: model a provider whose close cannot finish before its TCP socket is closed.
+        // Arrange: model a provider that cannot end its output before its TCP socket is closed.
         var connected = new CompletableFuture<Void>();
         var closing = new CompletableFuture<Void>();
         var aborted = new CompletableFuture<Void>();
@@ -528,9 +528,14 @@ class TcpTransportTest {
             }
 
             @Override
-            public void close() {
+            public void shutdownOutput() {
                 closing.complete(null);
                 aborted.join();
+            }
+
+            @Override
+            public void close() {
+                abort();
             }
 
             @Override
@@ -618,7 +623,7 @@ class TcpTransportTest {
             // Assert: even the first time read after connecting owns and releases the socket.
             assertThat(listener.closed.get(5, SECONDS)).isSameAs(failure);
             assertThat(socket.aborted).isDone();
-            assertThat(socket.closes).hasValue(0);
+            assertThat(socket.shutdowns).hasValue(0);
             assertThat(listener.endings).hasValue(1);
         } finally {
             socket.abort();
@@ -639,7 +644,7 @@ class TcpTransportTest {
             // Assert
             assertThat(listener.closed.get(5, SECONDS)).isSameAs(failure);
             assertThat(socket.aborted).isDone();
-            assertThat(socket.closes).hasValue(0);
+            assertThat(socket.shutdowns).hasValue(0);
             assertThat(listener.endings).hasValue(1);
         } finally {
             socket.abort();
@@ -710,7 +715,7 @@ class TcpTransportTest {
             assertThat(ended).hasMessage("Transport closed");
             assertThat(ended.getSuppressed()).containsExactly(failure);
             assertThat(socket.aborted).isDone();
-            assertThat(socket.closes).hasValue(0);
+            assertThat(socket.shutdowns).hasValue(0);
             assertThat(receiver.endings).hasValue(1);
         } finally {
             socket.abort();
@@ -720,9 +725,9 @@ class TcpTransportTest {
     @Test
     void failed_timer_cancellation_cannot_skip_abort_after_a_close_failure() throws Exception {
         // Arrange
-        var failure = new IOException("TLS close failed");
+        var failure = new IOException("TLS close_notify failed");
         var socket = new GracefulConnection();
-        socket.closeFailure = failure;
+        socket.shutdownFailure = failure;
         var timer = new FailingTimer();
         var receiver = new ConnectedListener();
         try (TcpTransport sut = transport(socket, timer)) {
@@ -738,7 +743,7 @@ class TcpTransportTest {
             assertThat(ended).hasMessage("Transport closed");
             assertThat(ended.getSuppressed()).containsExactly(failure);
             assertThat(socket.aborted).isDone();
-            assertThat(socket.closes).hasValue(1);
+            assertThat(socket.shutdowns).hasValue(1);
             assertThat(receiver.endings).hasValue(1);
         } finally {
             socket.abort();
@@ -759,10 +764,10 @@ class TcpTransportTest {
     private static final class GracefulConnection implements TcpTransport.Connection {
 
         final CompletableFuture<Void> aborted = new CompletableFuture<>();
-        final AtomicInteger closes = new AtomicInteger();
+        final AtomicInteger shutdowns = new AtomicInteger();
         Runnable handshakeAction = () -> { };
         @Nullable IOException handshakeFailure;
-        @Nullable IOException closeFailure;
+        @Nullable IOException shutdownFailure;
 
         @Override
         public void handshake() throws IOException {
@@ -794,11 +799,16 @@ class TcpTransportTest {
         }
 
         @Override
-        public void close() throws IOException {
-            closes.incrementAndGet();
-            if (closeFailure != null) {
-                throw closeFailure;
+        public void shutdownOutput() throws IOException {
+            shutdowns.incrementAndGet();
+            if (shutdownFailure != null) {
+                throw shutdownFailure;
             }
+        }
+
+        @Override
+        public void close() {
+            abort();
         }
 
         @Override

@@ -139,6 +139,21 @@ public final class TcpConnection implements Closeable {
         return output;
     }
 
+    /// Ends the output direction after the bytes already written, so the peer reads the end of
+    /// the stream, while the input stays readable until the peer ends its direction too.
+    /// Repeated calls before [#close] are harmless.
+    ///
+    /// Closing a socket whose input still holds unread bytes, or receives more, resets the
+    /// connection, and a peer that sees the reset can discard what it received but had not yet
+    /// read. Ending the output first and reading to the end of the stream avoids that.
+    ///
+    /// @throws IOException if the connection is closed or ending the output fails
+    public void shutdownOutput() throws IOException {
+        if (!socket.isOutputShutdown()) {
+            socket.shutdownOutput();
+        }
+    }
+
     /// Closes both directions and releases the socket. Repeated calls are harmless.
     ///
     /// May be called from any thread. A thread blocked in socket I/O is released with a

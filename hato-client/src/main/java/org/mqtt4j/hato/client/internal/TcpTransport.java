@@ -66,10 +66,16 @@ public final class TcpTransport implements Transport {
         default void handshake() throws IOException {
         }
 
-        // Only a close that does more than abort, such as sending a TLS close_notify, needs a
-        // separate closing worker and a grace period.
+        // Only a connection that can end its output while its input stays readable, as TCP and
+        // TLS can, closes gracefully, on a separate closing worker within a grace period: it
+        // ends the output, the reader reads to the end of the peer's stream, and abort then
+        // releases the socket.
         default boolean closesGracefully() {
             return false;
+        }
+
+        // Ends the output after what was written, with a TLS close_notify where TLS applies.
+        default void shutdownOutput() throws IOException {
         }
 
         // Abort must release blocking I/O without taking a TLS read/write lock.
@@ -292,10 +298,11 @@ public final class TcpTransport implements Transport {
         int count;
         while ((count = input.read(buffer)) != -1) {
             synchronized (callbacks) {
-                if (closed) {
-                    return;
+                // After a close, keep reading and drop what arrives until the peer ends its
+                // stream, so that closeGracefully can release a socket that receives nothing.
+                if (!closed) {
+                    receiver.onBytes(Arrays.copyOf(buffer, count));
                 }
-                receiver.onBytes(Arrays.copyOf(buffer, count));
             }
         }
         terminate(new EOFException("Peer closed the byte stream"));
@@ -394,12 +401,18 @@ public final class TcpTransport implements Transport {
     }
 
     private void closeGracefully(Connection socket, Throwable cause) {
-        // SSLSocket.close can wait on a peer or TLS I/O lock (JDK-8241239). Never run it
+        // Ending TLS output can wait on a peer or TLS I/O lock (JDK-8241239). Never run it
         // under the callback lock; the independent grace timer closes the plain socket.
         TimerScheduler.Cancellable deadline = null;
         try {
             deadline = timer.schedule(CLOSE_GRACE, () -> abort(socket, cause));
-            socket.close();
+            socket.shutdownOutput();
+            // Closing a socket that still receives resets the connection, and a peer that sees
+            // the reset can drop what it received but had not read yet, such as a DISCONNECT.
+            // So abort only once the reader has read to the end of the peer's stream, which
+            // ending the output lets the peer close. For a peer that keeps the connection open,
+            // the grace timer aborts, which ends the reader.
+            requireNonNull(reader).join();
         } catch (Throwable failure) {
             cause.addSuppressed(failure);
         } finally {
@@ -436,6 +449,16 @@ public final class TcpTransport implements Transport {
             @Override
             public OutputStream output() {
                 return socket.output();
+            }
+
+            @Override
+            public boolean closesGracefully() {
+                return true;
+            }
+
+            @Override
+            public void shutdownOutput() throws IOException {
+                socket.shutdownOutput();
             }
 
             @Override
@@ -485,6 +508,12 @@ public final class TcpTransport implements Transport {
                 @Override
                 public boolean closesGracefully() {
                     return true;
+                }
+
+                // Sends close_notify and ends the TCP output, while the input stays readable.
+                @Override
+                public void shutdownOutput() throws IOException {
+                    ssl.shutdownOutput();
                 }
 
                 @Override

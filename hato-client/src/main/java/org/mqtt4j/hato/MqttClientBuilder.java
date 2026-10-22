@@ -396,10 +396,10 @@ public final class MqttClientBuilder {
     /// Supplies monotonic time and delayed callbacks. Defaults to a shared daemon timer with
     /// [System#nanoTime]. The scheduler is borrowed and is not closed with the client.
     /// The default transports use it for connection deadlines, including the TLS handshake and
-    /// the WebSocket opening handshake, and for the grace periods of TLS close-notify and the
-    /// WebSocket closing handshake. JDK socket connection and name resolution waits, and the JDK's
-    /// own deadline for the WebSocket opening handshake, still use real time. Custom transports
-    /// manage their own clocks.
+    /// the WebSocket opening handshake, and for the grace periods of closing TCP and TLS
+    /// connections and the WebSocket closing handshake. JDK socket connection and name resolution
+    /// waits, and the JDK's own deadline for the WebSocket opening handshake, still use real time.
+    /// Custom transports manage their own clocks.
     public MqttClientBuilder timerScheduler(TimerScheduler value) {
         scheduler = requireNonNull(value, "timerScheduler");
         return this;

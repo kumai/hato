@@ -19,6 +19,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongConsumer;
 import java.util.function.UnaryOperator;
 import javax.net.ssl.SSLContext;
@@ -471,6 +473,82 @@ class TransportContractTest {
         }
     }
 
+    @ParameterizedTest(name = "{displayName}, {0}")
+    @EnumSource(value = Kind.class, names = {"TCP", "TLS"})
+    void closing_ends_the_stream_after_the_last_write_while_the_peer_keeps_sending(Kind kind)
+            throws Exception {
+        // Arrange: the peer sends without a pause, as a broker sends the messages of a resumed
+        // session, while the transport writes a DISCONNECT and closes.
+        byte[] packet = {(byte) 0xE0, 0x00};
+        try (
+                PeerServer server = kind.listen();
+                Transport sut = kind.transport(false, new ManualTimerScheduler())
+        ) {
+            var receiver = new Receiver();
+            sut.start(server.endpoint(), Duration.ofSeconds(5), receiver);
+            try (Peer peer = server.accept()) {
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+                var sending = new AtomicBoolean(true);
+                var sendFailure = new AtomicReference<IOException>();
+                Thread sender = Thread.ofVirtual().start(() -> {
+                    var chunk = new byte[1024];
+                    try {
+                        while (sending.get()) {
+                            peer.output().write(chunk);
+                        }
+                    } catch (IOException failure) {
+                        sendFailure.set(failure);
+                    }
+                });
+                assertThat(sut.send(1, packet)).isEqualTo(ACCEPTED);
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo(1L);
+
+                // Act
+                sut.close();
+
+                // Assert: the peer reads the DISCONNECT and then the end of the stream, and can go
+                // on sending, as a broker does until it has read the DISCONNECT. A socket closed
+                // while it still receives would reset the connection, which ends the peer's
+                // reading or sending with a failure.
+                assertThat(peer.input().readNBytes(packet.length)).isEqualTo(packet);
+                assertThat(peer.input().read()).isEqualTo(-1);
+                Thread.sleep(200);
+                sending.set(false);
+                sender.join();
+                assertThat(sendFailure.get()).isNull();
+                peer.close();
+                assertThat(receiver.events.poll(5, SECONDS)).isInstanceOf(IOException.class);
+                assertThat(receiver.events).isEmpty();
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "{displayName}, {0}")
+    @EnumSource(value = Kind.class, names = {"TCP", "TLS"})
+    void closing_gives_up_on_a_peer_that_keeps_the_connection_open(Kind kind) throws Exception {
+        // Arrange
+        try (
+                PeerServer server = kind.listen();
+                Transport sut = kind.transport(false, new ManualTimerScheduler())
+        ) {
+            var receiver = new Receiver();
+            sut.start(server.endpoint(), Duration.ofSeconds(5), receiver);
+            try (Peer peer = server.accept()) {
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+
+                // Act
+                sut.close();
+
+                // Assert: the peer reads the end of the stream but never ends its own, and the
+                // transport still closes once its grace period is over.
+                assertThat(peer.input().read()).isEqualTo(-1);
+                assertThat(receiver.events.poll(5, SECONDS)).isInstanceOf(IOException.class);
+                assertThat(receiver.events).isEmpty();
+                assertThat(peer.isClosed()).isFalse();
+            }
+        }
+    }
+
     @ParameterizedTest(name = "{displayName}, {0}, fault injection wrapper: {1}")
     @CsvSource({
             "TCP, false", "TCP, true", "TLS, false", "TLS, true",
@@ -684,6 +762,11 @@ class TransportContractTest {
             @Override
             public boolean closesGracefully() {
                 return connection.closesGracefully();
+            }
+
+            @Override
+            public void shutdownOutput() throws IOException {
+                connection.shutdownOutput();
             }
 
             @Override
