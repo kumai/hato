@@ -6,8 +6,8 @@ package org.mqtt4j.hato.common.value;
 /// Success in acknowledgements and AUTH, Normal disconnection in DISCONNECT, and Granted
 /// QoS 0 in SUBACK. The packet determines which meaning applies.
 ///
-/// Packet-specific restrictions and mappings from MQTT 3.1.1 return codes are the codec's
-/// responsibility. A value defined here is not necessarily valid for every packet type.
+/// A value defined here is not necessarily valid for every packet type. An MQTT 3.1.1
+/// connection reports its return codes as the corresponding values here.
 ///
 /// See [MQTT 5.0, section 2.4, Table 2-6: Reason Codes](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html).
 public enum ReasonCode {

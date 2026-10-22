@@ -74,7 +74,8 @@ public final class ClientStats {
     /// The values of each subscription that the client holds, in no particular order. A
     /// subscription joins the list when its handle is returned, before the client processes its
     /// registration, and leaves it once its removal completes or it is closed; a handler that
-    /// still runs then keeps its lane counted in [Subscribing#lanes()].
+    /// still runs then keeps its lane counted in [Subscribing#lanes()]. Every snapshot collects
+    /// these values, so [MqttClient#stats()] takes time in proportion to the subscriptions held.
     public List<SubscriptionStats> subscriptions() {
         return subscriptions;
     }
@@ -423,8 +424,10 @@ public final class ClientStats {
             return values.removing();
         }
 
-        /// The delivery lanes, including the lanes of stopped subscriptions whose handlers have
-        /// not returned, against [MqttClientBuilder#maxSubscriptions(int)].
+        /// The delivery lanes, one for each subscription, including the lanes of stopped
+        /// subscriptions whose handlers have not returned, against
+        /// [MqttClientBuilder#maxSubscriptions(int)]. These are not the application lanes that
+        /// [DeliveryOptions#lanes(java.util.function.Function)] chooses.
         public Usage lanes() {
             return values.lanes();
         }
