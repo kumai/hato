@@ -29,6 +29,7 @@ import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
@@ -37,14 +38,20 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.mqtt4j.hato.client.internal.Measurements.median;
+import static org.mqtt4j.hato.client.internal.Measurements.percentile;
+import static org.mqtt4j.hato.client.internal.Measurements.print;
+import static org.mqtt4j.hato.client.internal.Measurements.runtime;
+import static org.mqtt4j.hato.client.internal.Measurements.sorted;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// Measures the delivery modes and prints the results instead of asserting limits: how a slow
 /// handler backs up deliveries and their acknowledgements under serial and striped delivery, how
 /// long finished deliveries wait behind slower ones in the one receive-order acknowledgement
 /// queue, what handing deliveries from the dispatcher to drain tasks costs, and what receiving a
-/// publication through the whole client costs. Runs only with `-Phato.measure=true`; the
-/// integrationTestSingleCarrier task measures the worst case of one carrier thread.
+/// publication through the whole client costs for each way of receiving, with and without a
+/// metrics listener. Runs only with `-Phato.measure=true`; the integrationTestSingleCarrier task
+/// measures the worst case of one carrier thread.
 @EnabledIfSystemProperty(named = "hato.measure", matches = "true")
 @Timeout(600)
 class DeliveryMeasurementTest {
@@ -91,7 +98,7 @@ class DeliveryMeasurementTest {
     void a_slow_handler_backs_up_deliveries_and_acknowledgements() throws Exception {
         print(
                 "%s: %d QoS 1 messages over %d topics, one every %.1f ms, %d ms per handler",
-                carriers(),
+                runtime(),
                 SLOW_MESSAGES,
                 SLOW_TOPICS,
                 millis(ARRIVAL.toNanos()),
@@ -123,7 +130,7 @@ class DeliveryMeasurementTest {
         print(
                 "%s: %d messages, QoS 1 and 2 in turn, over %d topics; handlers take %d ms, one in"
                         + " %d takes %d ms",
-                carriers(),
+                runtime(),
                 MIXED_MESSAGES,
                 MIXED_TOPICS,
                 FAST_HANDLER.toMillis(),
@@ -162,7 +169,7 @@ class DeliveryMeasurementTest {
         print(
                 "%s: nanoseconds per delivery copy, median of %d runs of %d deliveries, no-op"
                         + " handlers",
-                carriers(),
+                runtime(),
                 RUNS,
                 HAND_OFFS
         );
@@ -185,14 +192,11 @@ class DeliveryMeasurementTest {
                         ),
                         new Execution("parallel(8)", new HandlerExecution.Parallel(8, null))
                 )) {
-                    var samples = new long[RUNS];
-                    // The first run warms up the code paths.
-                    long _ = handOffNanos(execution.execution(), subscriptions);
-                    for (int run = 0; run < RUNS; run++) {
-                        samples[run] = handOffNanos(execution.execution(), subscriptions);
-                    }
-                    print("%-36s | %13d | %d", execution.name(), subscriptions,
-                            percentile(sorted(samples), 50));
+                    long nanos = median(
+                            RUNS,
+                            () -> handOffNanos(execution.execution(), subscriptions)
+                    );
+                    print("%-36s | %13d | %d", execution.name(), subscriptions, nanos);
                 }
             }
         }
@@ -202,26 +206,49 @@ class DeliveryMeasurementTest {
     void receiving_publications_through_the_client_costs() throws Exception {
         print(
                 "%s: nanoseconds per publication received through the client, median of %d runs"
-                        + " of %d publications, no-op handler",
-                carriers(),
+                        + " of %d publications, no-op handlers",
+                runtime(),
                 RUNS,
                 RECEPTIONS
         );
-        print("%-14s | %s", "qos", "ns per publication");
-        for (Qos qos : Qos.values()) {
-            var samples = new long[RUNS];
-            // The first run warms up the code paths.
-            long _ = receiveNanos(qos);
-            for (int run = 0; run < RUNS; run++) {
-                samples[run] = receiveNanos(qos);
+        print(
+                "%-24s | %12s | %13s | %12s",
+                "receiver",
+                Qos.AT_MOST_ONCE,
+                Qos.AT_LEAST_ONCE,
+                Qos.EXACTLY_ONCE
+        );
+        for (Receiver receiver : List.of(
+                new Receiver("serial", false, DeliveryMeasurementTest::serial),
+                new Receiver("serial, metrics listener", true, DeliveryMeasurementTest::serial),
+                new Receiver("striped(4)", false, DeliveryMeasurementTest::striped),
+                new Receiver("parallel(4)", false, DeliveryMeasurementTest::parallel),
+                new Receiver("hand-off", false, DeliveryMeasurementTest::handOff),
+                new Receiver("pull", false, DeliveryMeasurementTest::pull)
+        )) {
+            var nanos = new long[Qos.values().length];
+            for (Qos qos : Qos.values()) {
+                nanos[qos.ordinal()] = median(RUNS, () -> receiveNanos(qos, receiver));
             }
-            print("%-14s | %d", qos, percentile(sorted(samples), 50));
+            print("%-24s | %12d | %13d | %12d", receiver.name(), nanos[0], nanos[1], nanos[2]);
         }
     }
 
     private record Mode(String name, DeliveryOptions options) {}
 
     private record Execution(String name, HandlerExecution execution) {}
+
+    /// A way of receiving: `subscriber` subscribes, and `metrics` says whether the client reports
+    /// its timings to a metrics listener.
+    private record Receiver(String name, boolean metrics, Subscriber subscriber) {}
+
+    @FunctionalInterface
+    private interface Subscriber {
+
+        /// Subscribes `request` on `client`, counting in `handled` each delivery once application
+        /// code has it.
+        Subscription subscribe(MqttClient client, Subscribe request, AtomicLong handled);
+    }
 
     private record SlowRun(long total, int mostWaiting, long[] delays) {}
 
@@ -344,7 +371,7 @@ class DeliveryMeasurementTest {
         var oneQueue = new long[MIXED_MESSAGES];
         var perType = new long[MIXED_MESSAGES];
         long latest = 0;
-        long[] latestOfType = new long[Qos.values().length];
+        var latestOfType = new long[Qos.values().length];
         for (int id = 1; id <= MIXED_MESSAGES; id++) {
             long done = returned.get(id);
             latest = Math.max(latest, done);
@@ -407,11 +434,12 @@ class DeliveryMeasurementTest {
         return elapsed / copies;
     }
 
-    /// Sends [#RECEPTIONS] publications at `qos` from a raw peer and returns the time per
-    /// publication until each has finished: QoS 0 once its no-op handler has run, QoS 1 at
-    /// PUBACK, and QoS 2 at PUBCOMP, after the peer has answered PUBREC. The publications are
-    /// encoded before the clock starts, so the time is mostly the client's.
-    private static long receiveNanos(Qos qos) throws Exception {
+    /// Sends [#RECEPTIONS] publications at `qos` from a raw peer to a subscription of
+    /// `receiver`, and returns the time per publication until each has finished: QoS 0 once
+    /// application code has it, QoS 1 at PUBACK, and QoS 2 at PUBCOMP, after the peer has
+    /// answered PUBREC. The publications are encoded before the clock starts, so the time is
+    /// mostly the client's.
+    private static long receiveNanos(Qos qos, Receiver receiver) throws Exception {
         var codec = PacketCodec.of(MqttVersion.V3_1_1);
         var batches = new byte[RECEPTIONS / RECEIVE_BATCH][];
         for (int batch = 0; batch < batches.length; batch++) {
@@ -433,11 +461,14 @@ class DeliveryMeasurementTest {
         var acknowledged = new AtomicLong();
         AtomicLong finished = qos == Qos.AT_MOST_ONCE ? handled : acknowledged;
         try (ServerSocket server = ScriptedBroker.listen();
-                MqttClient sut = ScriptedBroker.client(server);
+                MqttClient sut = receiver.metrics()
+                        ? ScriptedBroker.client(server, Measurements.countingListener())
+                        : ScriptedBroker.client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = sut.subscribe(
+            Subscription subscription = receiver.subscriber().subscribe(
+                    sut,
                     Subscribe.of(new TopicFilter("receive/+"), qos),
-                    _ -> handled.incrementAndGet()
+                    handled
             );
             establish(peer, subscription, qos);
             // The reader answers PUBREC on the socket that the sender writes, so they write in
@@ -477,6 +508,61 @@ class DeliveryMeasurementTest {
         }
     }
 
+    private static Subscription serial(MqttClient client, Subscribe request, AtomicLong handled) {
+        return client.subscribe(request, _ -> handled.incrementAndGet());
+    }
+
+    private static Subscription striped(MqttClient client, Subscribe request, AtomicLong handled) {
+        return client.subscribe(
+                request,
+                DeliveryOptions.striped(4),
+                _ -> handled.incrementAndGet()
+        );
+    }
+
+    private static Subscription parallel(
+            MqttClient client,
+            Subscribe request,
+            AtomicLong handled
+    ) {
+        return client.subscribe(
+                request,
+                DeliveryOptions.parallel(4),
+                _ -> handled.incrementAndGet()
+        );
+    }
+
+    private static Subscription handOff(MqttClient client, Subscribe request, AtomicLong handled) {
+        return client.handOff(request, _ -> {
+            handled.incrementAndGet();
+            return true;
+        });
+    }
+
+    /// A pull subscription whose own virtual thread receives every delivery until the
+    /// subscription ends.
+    private static Subscription pull(MqttClient client, Subscribe request, AtomicLong handled) {
+        Subscription subscription = client.subscribe(request);
+        Thread.ofVirtual().start(() -> {
+            try {
+                while (true) {
+                    switch (subscription.receive(Duration.ofSeconds(1))) {
+                        case ReceiveResult.Received _ -> handled.incrementAndGet();
+                        case ReceiveResult.TimedOut _ -> {
+                            // The next receive waits on.
+                        }
+                        case ReceiveResult.Ended _ -> {
+                            return;
+                        }
+                    }
+                }
+            } catch (InterruptedException _) {
+                // Nothing interrupts the receiver.
+            }
+        });
+        return subscription;
+    }
+
     private static void send(ScriptedBroker peer, byte[] bytes) {
         synchronized (peer) {
             try {
@@ -512,24 +598,6 @@ class DeliveryMeasurementTest {
         return (payload[0] & 0xFF) << 8 | payload[1] & 0xFF;
     }
 
-    private static String carriers() {
-        return "carriers " + System.getProperty(
-                "jdk.virtualThreadScheduler.parallelism",
-                String.valueOf(Runtime.getRuntime().availableProcessors())
-        );
-    }
-
-    private static long[] sorted(long[] values) {
-        long[] copy = values.clone();
-        Arrays.sort(copy);
-        return copy;
-    }
-
-    /// The value below which `percent` percent of the values in `sorted` lie.
-    private static long percentile(long[] sorted, int percent) {
-        return sorted[Math.min(sorted.length - 1, sorted.length * percent / 100)];
-    }
-
     private static double mean(long[] values) {
         return Arrays.stream(values).average().orElse(0);
     }
@@ -545,9 +613,5 @@ class DeliveryMeasurementTest {
             Thread.currentThread().interrupt();
             throw new AssertionError(cause);
         }
-    }
-
-    private static void print(String format, Object... arguments) {
-        System.out.println(String.format(format, arguments));
     }
 }

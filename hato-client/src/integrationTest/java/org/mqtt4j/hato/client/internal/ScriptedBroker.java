@@ -16,6 +16,7 @@ import org.mqtt4j.hato.client.internal.common.io.FrameReader;
 import org.mqtt4j.hato.client.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.spi.MetricsListener;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -33,6 +34,16 @@ final class ScriptedBroker implements AutoCloseable {
                 .build();
     }
 
+    /// A client like [#client(ServerSocket)] that reports its timings to `metrics`.
+    static MqttClient client(ServerSocket server, MetricsListener metrics) {
+        return MqttClient.builder()
+                .server(endpoint(server))
+                .version(MqttVersion.V3_1_1)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .metricsListener(metrics)
+                .build();
+    }
+
     static ServerSocket listen() throws IOException {
         var server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
         server.setSoTimeout(5000);
@@ -44,6 +55,7 @@ final class ScriptedBroker implements AutoCloseable {
     }
 
     private final Socket socket;
+    private final BufferedInputStream input;
     private final FrameReader reader;
     private final FrameWriter writer;
     private final PacketCodec codec;
@@ -55,7 +67,8 @@ final class ScriptedBroker implements AutoCloseable {
         // buffered, so that the client's small acknowledgements cost no system call for each
         // byte of their headers.
         socket.setTcpNoDelay(true);
-        reader = new FrameReader(new BufferedInputStream(socket.getInputStream()), 1024 * 1024);
+        input = new BufferedInputStream(socket.getInputStream());
+        reader = new FrameReader(input, 1024 * 1024);
         writer = new FrameWriter(socket.getOutputStream());
         codec = PacketCodec.of(version);
     }
@@ -207,6 +220,12 @@ final class ScriptedBroker implements AutoCloseable {
         return codec.decode(reader.read().orElseThrow(() -> new AssertionError(
                 "The client closed the connection before sending the expected packet"
         )));
+    }
+
+    /// Whether bytes from the client have already arrived, so that [#receive()] would not wait
+    /// for the start of the next packet.
+    boolean hasPending() throws IOException {
+        return input.available() > 0;
     }
 
     void send(Packet packet) throws IOException {
