@@ -458,7 +458,7 @@ class SessionCoreTest {
         assertThat(port.removed).isEmpty();
         assertThat(port.registered).containsExactly(2L, 3L);
         assertThat(port.sent).hasSize(2).allMatch(Packet.Subscribe.class::isInstance);
-        assertThat(requireNonNull(handle).grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+        assertThat(requireNonNull(handle).grantedQos()).contains(Qos.AT_MOST_ONCE);
 
         // Act: recreation updates the original grant; the other SUBACK establishes its handle.
         var recreated = (Packet.Subscribe) port.sent.getFirst();
@@ -472,7 +472,7 @@ class SessionCoreTest {
 
         // Assert: RecordingPort rejects duplicate operation completion.
         assertThat(requireNonNull(port.outcomes.get(2L)).value()).isSameAs(handle);
-        assertThat(handle.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+        assertThat(handle.grantedQos()).contains(Qos.AT_LEAST_ONCE);
         assertThat(port.grants).containsExactly(
                 handle,
                 handle,
@@ -1464,7 +1464,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.outcomes.get(2L)).value())
                 .isInstanceOfSatisfying(Subscription.class, value -> {
                     assertThat(value.filter()).isEqualTo(new TopicFilter("a/#"));
-                    assertThat(value.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+                    assertThat(value.grantedQos()).contains(Qos.AT_MOST_ONCE);
                 });
 
         // Act: later deliveries still reach the established subscription.
@@ -3664,7 +3664,7 @@ class SessionCoreTest {
         // Assert
         assertThat(requireNonNull(port.outcomes.get(2L)).value())
                 .isInstanceOfSatisfying(Subscription.class, value ->
-                        assertThat(value.grantedQos()).isEqualTo(granted));
+                        assertThat(value.grantedQos()).contains(granted));
     }
 
     @Test
@@ -4937,13 +4937,13 @@ class SessionCoreTest {
         }
 
         @Override
-        public Qos grantedQos() {
-            return granted;
+        public Optional<Qos> grantedQos() {
+            return Optional.of(granted);
         }
 
         @Override
         public CompletableFuture<Qos> established() {
-            return CompletableFuture.completedFuture(grantedQos());
+            return CompletableFuture.completedFuture(grantedQos().orElseThrow());
         }
 
         @Override

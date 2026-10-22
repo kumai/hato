@@ -162,7 +162,7 @@ class SessionPersistenceIntegrationTest {
                         subscription.receive(Duration.ofSeconds(5))
                 );
                 assertThat(received.delivery().message().payload()).containsExactly((byte) 1);
-                assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+                assertThat(subscription.grantedQos()).contains(Qos.AT_LEAST_ONCE);
                 peer.expectAcknowledgements(7, 1);
                 peer.roundTripBarrier(sut);
             }

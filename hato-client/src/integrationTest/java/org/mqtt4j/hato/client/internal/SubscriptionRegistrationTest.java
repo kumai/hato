@@ -279,7 +279,7 @@ class SubscriptionRegistrationTest {
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut, true, _ -> { })) {
                 assertThat(established.get(5, SECONDS)).isEqualTo(Qos.AT_MOST_ONCE);
                 assertThat(subscription.established().get(5, SECONDS)).isEqualTo(Qos.AT_MOST_ONCE);
-                assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+                assertThat(subscription.grantedQos()).contains(Qos.AT_MOST_ONCE);
                 peer.expectPublicationBarrier(sut);
             }
         }

@@ -34,7 +34,7 @@ class Qos2ReceptionTest {
                     AckMode.MANUAL,
                     2
             );
-            assertThat(subscription.grantedQos()).isEqualTo(Qos.EXACTLY_ONCE);
+            assertThat(subscription.grantedQos()).contains(Qos.EXACTLY_ONCE);
             peer.send(publication(7, (byte) 1, false));
             MqttDelivery original = received(subscription.receive(Duration.ofSeconds(5)));
 

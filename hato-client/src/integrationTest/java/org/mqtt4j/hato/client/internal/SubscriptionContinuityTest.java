@@ -228,7 +228,7 @@ class SubscriptionContinuityTest {
             PullSubscription subscription;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
-                assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+                assertThat(subscription.grantedQos()).contains(Qos.AT_LEAST_ONCE);
                 sut.disconnect().get(5, SECONDS);
             }
 
@@ -241,7 +241,7 @@ class SubscriptionContinuityTest {
                 peer.roundTripBarrier(sut);
 
                 // Assert
-                assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+                assertThat(subscription.grantedQos()).contains(Qos.AT_MOST_ONCE);
                 var publication = new Packet.Publish(new Topic("data"), new byte[] {2},
                         Qos.AT_MOST_ONCE, false, false, 0, EMPTY);
                 peer.send(publication);

@@ -97,7 +97,7 @@ class SubscriptionObservationTest {
             PullSubscription subscription = sut.subscribe(REQUEST);
             assertThat(subscription.receive(Duration.ZERO))
                     .isInstanceOf(ReceiveResult.TimedOut.class);
-            assertThatThrownBy(subscription::grantedQos).isInstanceOf(IllegalStateException.class);
+            assertThat(subscription.grantedQos()).isEmpty();
             subscription.close();
             assertThat(subscription.receive(Duration.ZERO)).isInstanceOf(ReceiveResult.Ended.class);
             assertThatThrownBy(() -> subscription.established().get(5, SECONDS))
@@ -156,7 +156,7 @@ class SubscriptionObservationTest {
             // Act & Assert: caller completion neither grants QoS nor frees Hato's pending slot.
             assertThatThrownBy(() -> subscription.established().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class);
-            assertThatThrownBy(subscription::grantedQos).isInstanceOf(IllegalStateException.class);
+            assertThat(subscription.grantedQos()).isEmpty();
             assertThat(sut.usage().operations()).isZero();
             CompletableFuture<ConnAck> connected = sut.connect();
             ScriptTransport transport = requireNonNull(transports.poll(5, SECONDS));
@@ -170,7 +170,7 @@ class SubscriptionObservationTest {
             assertThat(entered.await(5, SECONDS)).isTrue();
             assertThat(observers.get(2).get(5, SECONDS)).isEqualTo(Qos.AT_LEAST_ONCE);
             assertThat(overwritten.join()).isEqualTo(Qos.EXACTLY_ONCE);
-            assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+            assertThat(subscription.grantedQos()).contains(Qos.AT_LEAST_ONCE);
             await().untilAsserted(() -> assertThat(sut.usage().waiters()).isEqualTo(1));
             assertThat(continuation).isNotDone();
             release.countDown();
@@ -209,7 +209,7 @@ class SubscriptionObservationTest {
             transport.completeSend();
             disconnected.get(5, SECONDS);
             assertThat(next).isNotDone();
-            assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+            assertThat(subscription.grantedQos()).contains(Qos.AT_LEAST_ONCE);
             CompletableFuture<ConnAck> reconnected = sut.connect();
             ScriptTransport second = requireNonNull(transports.poll(5, SECONDS));
             accept(second, reconnected);

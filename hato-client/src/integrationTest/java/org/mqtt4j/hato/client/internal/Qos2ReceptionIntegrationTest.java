@@ -236,7 +236,7 @@ abstract class Qos2ReceptionIntegrationTest {
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
             );
             subscription.established().get(5, SECONDS);
-            assertThat(subscription.grantedQos()).isEqualTo(Qos.EXACTLY_ONCE);
+            assertThat(subscription.grantedQos()).contains(Qos.EXACTLY_ONCE);
             FaultyTransport transport = requireNonNull(transports.poll(5, SECONDS));
             if (cut == Cut.BEFORE_PUBLISH) {
                 transport.receiveDelay(DELAY);

@@ -1,5 +1,6 @@
 package org.mqtt4j.hato;
 
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /// One subscription registration, which can await its first connection or SUBACK.
@@ -14,11 +15,9 @@ public interface Subscription extends AutoCloseable {
     TopicFilter filter();
 
     /// The maximum QoS granted by the most recent successful SUBACK, which can be lower than
-    /// requested. Re-creation can update this value; it retains its last value while disconnected
-    /// or after the subscription ends.
-    ///
-    /// @throws IllegalStateException if no successful SUBACK has granted a QoS yet
-    Qos grantedQos();
+    /// requested, or empty until a successful SUBACK has granted one. Re-creation can update
+    /// this value; it retains its last value while disconnected or after the subscription ends.
+    Optional<Qos> grantedQos();
 
     /// Observes establishment on the current or next connection without starting a connection.
     /// Returns an already completed future with the granted QoS when this subscription is

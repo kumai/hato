@@ -248,7 +248,7 @@ abstract class MessagingTest {
 
             // Assert
             assertThat(result).isEqualTo(PublishResult.of());
-            assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
+            assertThat(subscription.grantedQos()).contains(Qos.AT_LEAST_ONCE);
             assertThat(delivery.message()).isEqualTo(publication);
             assertThat(delivery.dup()).isFalse();
             subscription.unsubscribe().get(5, SECONDS);
@@ -396,7 +396,7 @@ abstract class MessagingTest {
 
             // Assert
             assertThat(first.filter()).isEqualTo(new TopicFilter(topic));
-            assertThat(first.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+            assertThat(first.grantedQos()).contains(Qos.AT_MOST_ONCE);
 
             // Act: deliver a message before removing the subscription.
             sut.publish(message(topic, (byte) 1)).get(5, SECONDS);

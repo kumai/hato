@@ -1110,13 +1110,13 @@ class SessionPersistenceTest {
         }
 
         @Override
-        public Qos grantedQos() {
-            return granted;
+        public Optional<Qos> grantedQos() {
+            return Optional.of(granted);
         }
 
         @Override
         public CompletableFuture<Qos> established() {
-            return CompletableFuture.completedFuture(grantedQos());
+            return CompletableFuture.completedFuture(grantedQos().orElseThrow());
         }
 
         @Override

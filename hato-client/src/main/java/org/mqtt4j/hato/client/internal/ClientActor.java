@@ -1853,12 +1853,8 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
-        public Qos grantedQos() {
-            Qos value = granted;
-            if (value == null) {
-                throw new IllegalStateException("Subscription has not been established");
-            }
-            return value;
+        public Optional<Qos> grantedQos() {
+            return Optional.ofNullable(granted);
         }
 
         @Override

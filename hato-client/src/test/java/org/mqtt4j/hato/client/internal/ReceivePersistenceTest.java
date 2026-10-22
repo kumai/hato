@@ -651,13 +651,13 @@ class ReceivePersistenceTest {
         }
 
         @Override
-        public Qos grantedQos() {
-            return Qos.AT_LEAST_ONCE;
+        public Optional<Qos> grantedQos() {
+            return Optional.of(Qos.AT_LEAST_ONCE);
         }
 
         @Override
         public CompletableFuture<Qos> established() {
-            return CompletableFuture.completedFuture(grantedQos());
+            return CompletableFuture.completedFuture(grantedQos().orElseThrow());
         }
 
         @Override

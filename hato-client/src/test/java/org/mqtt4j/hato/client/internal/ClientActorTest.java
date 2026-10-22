@@ -524,7 +524,7 @@ class ClientActorTest {
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Disconnect.class);
             assertThat(transport.sent).isEmpty();
             assertThat(establishing).isNotDone();
-            assertThatThrownBy(subscription::grantedQos).isInstanceOf(IllegalStateException.class);
+            assertThat(subscription.grantedQos()).isEmpty();
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
 
             ScriptTransport current = connect(sut);
@@ -538,7 +538,7 @@ class ClientActorTest {
             // Assert: the durable registration establishes on the next connection instead.
             assertThat(establishing.get(5, SECONDS)).isEqualTo(Qos.AT_MOST_ONCE);
             assertThat(subscription.established().get(5, SECONDS)).isEqualTo(Qos.AT_MOST_ONCE);
-            assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+            assertThat(subscription.grantedQos()).contains(Qos.AT_MOST_ONCE);
             assertThat(ends).isEmpty();
         }
     }
@@ -577,7 +577,7 @@ class ClientActorTest {
                 // Assert: the same handle observes the new grant and receives the new delivery.
                 assertThat(received(waiting.get(5, SECONDS)).message().payload())
                         .containsExactly((byte) 9);
-                assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+                assertThat(subscription.grantedQos()).contains(Qos.AT_MOST_ONCE);
                 assertThat(ends).isEmpty();
             } finally {
                 waiting.cancel(true);
@@ -3287,7 +3287,7 @@ class ClientActorTest {
                     Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.MANUAL)
             );
-            assertThat(subscription.grantedQos()).isEqualTo(Qos.EXACTLY_ONCE);
+            assertThat(subscription.grantedQos()).contains(Qos.EXACTLY_ONCE);
             transport.receive(acknowledgedPublication("messages", 7, Qos.EXACTLY_ONCE, false));
             MqttDelivery delivery = received(subscription.receive(Duration.ofSeconds(5)));
             assertThat(delivery.message().qos()).isEqualTo(Qos.EXACTLY_ONCE);
@@ -3754,7 +3754,7 @@ class ClientActorTest {
                     EMPTY
             ));
             subscribing.get(5, SECONDS);
-            assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+            assertThat(subscription.grantedQos()).contains(Qos.AT_MOST_ONCE);
 
             // Act & Assert: new delivery stops before the broker acknowledges removal.
             CompletableFuture<Void> unsubscribing = subscription.unsubscribe();
@@ -5619,7 +5619,7 @@ class ClientActorTest {
             assertThat(observed).isCompletedWithValue(Qos.AT_MOST_ONCE);
             assertThat(((ClientActor) sut).usage().waiters()).isEqualTo(1024);
             established.close();
-            assertThat(established.grantedQos()).isEqualTo(Qos.AT_MOST_ONCE);
+            assertThat(established.grantedQos()).contains(Qos.AT_MOST_ONCE);
             assertThat(observers).allMatch(observer -> !observer.isDone());
         }
     }
