@@ -9,6 +9,7 @@ import java.util.concurrent.Semaphore;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.CapacityLimit;
 import org.mqtt4j.hato.MqttCapacityException;
 
 /// Completes a client's termination observations once, after close, nothing remains through
@@ -111,7 +112,10 @@ final class ClientTermination {
         }
         if (!waiterSlots.tryAcquire()) {
             observationRefused.run();
-            return CompletableFuture.failedFuture(new MqttCapacityException("Waiter capacity"));
+            return CompletableFuture.failedFuture(new MqttCapacityException(
+                    "Waiter capacity",
+                    CapacityLimit.OBSERVATIONS
+            ));
         }
         var future = new CompletableFuture<Void>();
         waiters.add(future);

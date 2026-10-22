@@ -467,7 +467,7 @@ final class Publications {
 
     private void capacityFailure(long operation, CapacityLimit limit, String message) {
         core.refused(limit);
-        port.complete(operation, null, new MqttCapacityException(message));
+        port.complete(operation, null, new MqttCapacityException(message, limit));
     }
 
     /// The publications' values in [ClientSnapshot.Sending] that the core knows. Publications

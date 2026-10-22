@@ -2026,7 +2026,10 @@ final class DeliveryLanes {
                 throw new IllegalStateException(rejection.getMessage(), rejection);
             }
             if (lane.failure instanceof MqttCapacityException rejection) {
-                throw new MqttCapacityException(requireNonNull(rejection.getMessage()));
+                String message = requireNonNull(rejection.getMessage());
+                throw rejection.limit()
+                        .map(limit -> new MqttCapacityException(message, limit))
+                        .orElseGet(() -> new MqttCapacityException(message));
             }
             if (lane.failure instanceof MqttSubscriptionRefusedException rejection) {
                 // Concurrent receivers must not share one throwable's trace and suppressions.

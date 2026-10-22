@@ -525,7 +525,10 @@ public final class ClientActor implements MqttClient {
             ));
             if (admitted == Mailbox.OfferResult.FULL) {
                 refused(CapacityLimit.REGISTRATION_QUEUE);
-                rejection = new MqttCapacityException("Registration mailbox capacity");
+                rejection = new MqttCapacityException(
+                        "Registration mailbox capacity",
+                        CapacityLimit.REGISTRATION_QUEUE
+                );
                 retire(subscription, rejection);
             }
         }
@@ -574,7 +577,10 @@ public final class ClientActor implements MqttClient {
                 slot = acquireSlot(kind);
                 if (slot == null) {
                     refused(CapacityLimit.OPERATIONS);
-                    refusal = new MqttCapacityException("Operation capacity");
+                    refusal = new MqttCapacityException(
+                            "Operation capacity",
+                            CapacityLimit.OPERATIONS
+                    );
                 }
             }
             if (refusal != null) {
@@ -609,7 +615,10 @@ public final class ClientActor implements MqttClient {
             if (admitted == Mailbox.OfferResult.FULL) {
                 refused(CapacityLimit.OPERATION_QUEUE);
                 completeOperation(token, null,
-                        new MqttCapacityException("Command mailbox capacity"));
+                        new MqttCapacityException(
+                                "Command mailbox capacity",
+                                CapacityLimit.OPERATION_QUEUE
+                        ));
             }
             return operation.future;
         }
@@ -2017,7 +2026,10 @@ public final class ClientActor implements MqttClient {
     private <T> CompletableFuture<T> observeFuture(List<CompletableFuture<T>> observers) {
         if (!waiterSlots.tryAcquire()) {
             refused(CapacityLimit.OBSERVATIONS);
-            return CompletableFuture.failedFuture(new MqttCapacityException("Waiter capacity"));
+            return CompletableFuture.failedFuture(new MqttCapacityException(
+                    "Waiter capacity",
+                    CapacityLimit.OBSERVATIONS
+            ));
         }
         var future = new CompletableFuture<T>();
         observers.add(future);

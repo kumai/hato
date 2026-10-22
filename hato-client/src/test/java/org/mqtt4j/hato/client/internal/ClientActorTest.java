@@ -1209,8 +1209,10 @@ class ClientActorTest {
                     Qos.AT_LEAST_ONCE, false, false, 4097, EMPTY));
 
             // Assert: it is the bounded wire receipt metadata, not the one-slot buffer, that fills.
+            // An overload names no limit; the connection's end reports it instead.
             assertThat(requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow())
-                    .isInstanceOf(MqttCapacityException.class)
+                    .isInstanceOfSatisfying(MqttCapacityException.class, overload ->
+                            assertThat(overload.limit()).isEmpty())
                     .hasMessage("Acknowledgement capacity");
         }
     }

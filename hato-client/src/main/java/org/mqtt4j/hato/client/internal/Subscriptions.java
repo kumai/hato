@@ -141,7 +141,11 @@ final class Subscriptions {
         }
         if (registry.size() >= registrationLimit) {
             core.refused(CapacityLimit.SUBSCRIPTIONS);
-            port.complete(operation, null, new MqttCapacityException("Subscription capacity"));
+            port.complete(
+                    operation,
+                    null,
+                    new MqttCapacityException("Subscription capacity", CapacityLimit.SUBSCRIPTIONS)
+            );
             return;
         }
 
@@ -149,7 +153,11 @@ final class Subscriptions {
         Optional<Subscription> registered = port.registerSubscription(operation);
         if (registered.isEmpty()) {
             core.refused(CapacityLimit.SUBSCRIPTIONS);
-            port.complete(operation, null, new MqttCapacityException("Subscription capacity"));
+            port.complete(
+                    operation,
+                    null,
+                    new MqttCapacityException("Subscription capacity", CapacityLimit.SUBSCRIPTIONS)
+            );
             return;
         }
         var local = new LocalSubscription(

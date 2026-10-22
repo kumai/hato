@@ -33,6 +33,7 @@ import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReconnectPolicy;
@@ -513,16 +514,22 @@ class ClientStatsTest {
                     Subscribe.of(new TopicFilter("more"), Qos.AT_LEAST_ONCE),
                     _ -> { }
             );
+            // The registration queue holds as many registrations as the client holds
+            // subscriptions, one here, so the next one waits until this one is refused.
+            CompletableFuture<Qos> refusedSubscription = overSubscriptions.established();
+            await().until(refusedSubscription::isDone);
+            PullSubscription overPulled = sut.subscribe(
+                    Subscribe.of(new TopicFilter("pulled"), Qos.AT_LEAST_ONCE)
+            );
 
-            // Assert
-            for (CompletableFuture<?> refused : List.of(
-                    overOperations,
-                    overInflight,
-                    overSubscriptions.established()
-            )) {
-                assertThatThrownBy(() -> refused.get(5, SECONDS))
-                        .hasCauseInstanceOf(MqttCapacityException.class);
-            }
+            // Assert: each refusal names the limit that refused it, also to a receiver.
+            assertRefusedBy(overOperations, CapacityLimit.OPERATIONS);
+            assertRefusedBy(overInflight, CapacityLimit.INFLIGHT_PUBLISHES);
+            assertRefusedBy(refusedSubscription, CapacityLimit.SUBSCRIPTIONS);
+            assertRefusedBy(overPulled.established(), CapacityLimit.SUBSCRIPTIONS);
+            assertThatThrownBy(() -> overPulled.receive(Duration.ZERO))
+                    .isInstanceOfSatisfying(MqttCapacityException.class, refusal ->
+                            assertThat(refusal.limit()).contains(CapacityLimit.SUBSCRIPTIONS));
             ClientStats stats = stats(sut);
             assertThat(stats.sending().publications()).isEqualTo(new Usage(1, 1));
             assertThat(stats.subscribing().registrations()).isEqualTo(new Usage(1, 1));
@@ -530,7 +537,7 @@ class ClientStatsTest {
             assertThat(refusals).containsOnlyKeys(CapacityLimit.values());
             assertThat(refusals).containsEntry(CapacityLimit.OPERATIONS, 1L)
                     .containsEntry(CapacityLimit.INFLIGHT_PUBLISHES, 1L)
-                    .containsEntry(CapacityLimit.SUBSCRIPTIONS, 1L)
+                    .containsEntry(CapacityLimit.SUBSCRIPTIONS, 2L)
                     .containsEntry(CapacityLimit.SEND_QUEUE, 0L);
         }
     }
@@ -801,6 +808,13 @@ class ClientStatsTest {
                 .filter(values -> values.subscription() == subscription)
                 .findFirst()
                 .orElseThrow();
+    }
+
+    private static void assertRefusedBy(CompletableFuture<?> refused, CapacityLimit limit) {
+        assertThatThrownBy(() -> refused.get(5, SECONDS))
+                .cause()
+                .isInstanceOfSatisfying(MqttCapacityException.class, refusal ->
+                        assertThat(refusal.limit()).contains(limit));
     }
 
     private static Subscription subscribe(

@@ -1,6 +1,7 @@
 package org.mqtt4j.hato;
 
 /// A limit that refuses operations with [MqttCapacityException] when it is full.
+/// [MqttCapacityException#limit()] names it, and [ClientStats#refusals()] counts its refusals.
 public enum CapacityLimit {
 
     /// The operation capacity that publications share with concurrent [MqttClient#connect()]
