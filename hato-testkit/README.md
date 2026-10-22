@@ -79,4 +79,5 @@ try (MqttBroker broker = MqttBroker.start()) {
   response before checking the result.
 
 `FaultyTransport` is experimental: its API may change as it gains kinds of
-faults.
+faults. `BrokerControls`, `ResponseKind`, and `HeldResponse` are experimental,
+like the broker that they control.

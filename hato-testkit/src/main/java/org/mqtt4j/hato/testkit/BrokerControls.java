@@ -10,8 +10,10 @@ import org.mqtt4j.hato.broker.internal.control.ControlPort;
 
 import static java.util.Objects.requireNonNull;
 
-/// Test controls for an embedded broker: rules that refuse subscriptions or grant them a lower
-/// QoS, responses held back until the test releases them, and the clients connected now.
+/// Experimental test controls for an embedded broker: rules that refuse subscriptions or grant
+/// them a lower QoS, responses held back until the test releases them, and the clients connected
+/// now. Like the broker API, the controls are outside the compatibility promise until
+/// productization.
 ///
 /// The test starts and closes the broker through the broker's own API, and the controls act on
 /// it; the controls that [#of(MqttBroker)] returns for one broker share its state. Each method

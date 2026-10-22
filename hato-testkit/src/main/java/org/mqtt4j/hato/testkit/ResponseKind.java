@@ -1,7 +1,7 @@
 package org.mqtt4j.hato.testkit;
 
 /// A kind of response that [BrokerControls] can hold back: the acknowledgements that a client
-/// waits for after its requests.
+/// waits for after its requests. Experimental, like [BrokerControls].
 public enum ResponseKind {
     /// The answer to SUBSCRIBE.
     SUBACK,
