@@ -86,7 +86,8 @@ public final class BrokerControls {
         port.holdResponses(responseOf(kind), clientId);
     }
 
-    /// The responses that the broker holds back now, for each connection in the order held.
+    /// The responses that the broker holds back now, for each connection in the order held, as an
+    /// unmodifiable list that later changes do not affect.
     public List<HeldResponse> heldResponses() {
         return port.heldResponses().stream()
                 .map(held -> new HeldResponse(
@@ -107,7 +108,8 @@ public final class BrokerControls {
         port.releaseResponses(responseOf(kind), clientId);
     }
 
-    /// The identifiers of the clients that have an open connection now.
+    /// The identifiers of the clients that have an open connection now, as an unmodifiable set
+    /// that later changes do not affect.
     public Set<String> connectedClients() {
         return port.connectedClients();
     }
