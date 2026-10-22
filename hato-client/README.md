@@ -501,6 +501,25 @@ Pass it with `metricsListener(timings)` when building the client. Its callbacks 
 thread of their own, so a slow listener never delays publications or deliveries. Without a
 listener, the client takes no timings.
 
+## How fast it is
+
+On a MacBook Pro with an Apple M1 Max and Java 25, against a broker stand-in on the same
+machine that answers at once, with messages of a few bytes and handlers that do nothing, a
+client takes per message:
+
+| | QoS 0 | QoS 1 | QoS 2 |
+| --- | ---: | ---: | ---: |
+| Receiving | 0.9 µs | 6 µs | 11 µs |
+| Publishing, 64 at a time | 2.3 µs | 3.7 µs | 7 µs |
+
+That is over a million QoS 0 messages a second received, or about 170,000 at QoS 1. Striped
+and parallel handlers add about a microsecond to run messages on other threads, and a
+`MetricsListener` adds under a microsecond to a publication. Routing a message takes as long
+with 100,000 subscriptions as with one.
+
+These figures are a baseline to compare against, not a promise: your network, your broker,
+and your handlers set the pace that you will see.
+
 ## Passing the client to your code
 
 Code that only publishes can take an `MqttPublisher`, and code that only subscribes
