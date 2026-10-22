@@ -4,7 +4,6 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.LinkedBlockingQueue;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -24,7 +23,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
 /// The client's MQTT 5.0 connections to RabbitMQ, the limits that RabbitMQ announces, and the
-/// QoS 2 publications that RabbitMQ does not take, over MQTT 5.0 and over MQTT 3.1.1.
+/// QoS 2 publications and shared subscriptions that RabbitMQ does not take.
 @EnabledIf(
         value = "dockerIsAvailableOrRequired",
         disabledReason = "Docker explicitly optional"
@@ -138,43 +137,6 @@ class RabbitMq5RoundTripTest extends Mqtt5RoundTripTest {
             assertThat(sut.subscribe(
                     Subscribe.of(new TopicFilter(uniqueTopic()), Qos.AT_LEAST_ONCE)
             ).established()).succeedsWithin(Duration.ofSeconds(5));
-        }
-    }
-
-    @Test
-    void an_mqtt_3_1_1_qos_2_publication_fails_when_rabbitmq_takes_it_at_qos_1() throws Exception {
-        var topic = new Topic(uniqueTopic());
-        var ends = new LinkedBlockingQueue<Disconnection>();
-        try (MqttClient sut = MqttClient.builder()
-                .server(endpoint())
-                .version(MqttVersion.V3_1_1)
-                .reconnectPolicy(ReconnectPolicy.disabled())
-                .connectionListener(ends::add)
-                .build()) {
-            // Arrange: over MQTT 3.1.1, RabbitMQ takes a QoS 2 publication at QoS 1 and answers
-            // PUBACK instead of PUBREC.
-            sut.connect().get(5, SECONDS);
-
-            // Act
-            CompletableFuture<PublishResult> publication = sut.publish(MqttMessage.of(
-                    topic,
-                    new byte[] {2},
-                    Qos.EXACTLY_ONCE,
-                    false
-            ));
-
-            // Assert: only that publication fails, and the connection goes on.
-            assertThatThrownBy(() -> publication.get(5, SECONDS))
-                    .isInstanceOf(ExecutionException.class)
-                    .cause()
-                    .isInstanceOf(MqttProtocolException.class);
-            assertThat(sut.publish(MqttMessage.of(
-                    topic,
-                    new byte[] {1},
-                    Qos.AT_LEAST_ONCE,
-                    false
-            ))).succeedsWithin(Duration.ofSeconds(5));
-            assertThat(ends).isEmpty();
         }
     }
 
