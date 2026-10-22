@@ -50,9 +50,7 @@ class Mosquitto5RoundTripTest extends Mqtt5ProductRoundTripTest {
 
             // Assert: recorded from the pinned Mosquitto 2.1.2 image, whose only announced limit
             // that ConnAck reports is a maximum packet size of 2,000,000 bytes.
-            assertThat(ack).isEqualTo(
-                    ConnAck.of(false, 1, Qos.EXACTLY_ONCE, true, true, true, 2_000_000)
-            );
+            assertThat(ack).isEqualTo(ConnAck.of(false, 1).withMaximumPacketSize(2_000_000));
             sut.disconnect().get(5, SECONDS);
         }
     }

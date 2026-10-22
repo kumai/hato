@@ -50,9 +50,7 @@ class Emqx5RoundTripTest extends Mqtt5ProductRoundTripTest {
 
             // Assert: recorded from the pinned EMQX 6.3.2 image, whose only announced limit that
             // ConnAck reports is a maximum packet size of 1,048,576 bytes.
-            assertThat(ack).isEqualTo(
-                    ConnAck.of(false, 1, Qos.EXACTLY_ONCE, true, true, true, 1_048_576)
-            );
+            assertThat(ack).isEqualTo(ConnAck.of(false, 1).withMaximumPacketSize(1_048_576));
             sut.disconnect().get(5, SECONDS);
         }
     }

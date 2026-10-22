@@ -260,19 +260,22 @@ final class ConnectionEstablishment {
                 log.debug("CONNACK reason for {}: {}", clientId, reason));
         // An Assigned Client Identifier answers only an empty client identifier, which this
         // client never sends, so it is not read.
-        var connAck = ConnAck.of(
-                ack.sessionPresent(),
-                attempt,
-                Qos.of((int) number(properties, PropertyId.MAXIMUM_QOS).orElse(2)),
-                number(properties, PropertyId.RETAIN_AVAILABLE).orElse(1) == 1,
-                number(properties, PropertyId.WILDCARD_SUBSCRIPTION_AVAILABLE).orElse(1) == 1,
-                number(properties, PropertyId.SHARED_SUBSCRIPTION_AVAILABLE).orElse(1) == 1,
-                (int) Math.min(
+        ConnAck connAck = ConnAck.of(ack.sessionPresent(), attempt)
+                .withMaximumQos(Qos.of((int) number(properties, PropertyId.MAXIMUM_QOS).orElse(2)))
+                .withRetainAvailable(number(properties, PropertyId.RETAIN_AVAILABLE).orElse(1) == 1)
+                .withWildcardSubscriptionAvailable(
+                        number(properties, PropertyId.WILDCARD_SUBSCRIPTION_AVAILABLE)
+                                .orElse(1) == 1
+                )
+                .withSharedSubscriptionAvailable(
+                        number(properties, PropertyId.SHARED_SUBSCRIPTION_AVAILABLE)
+                                .orElse(1) == 1
+                )
+                .withMaximumPacketSize((int) Math.min(
                         number(properties, PropertyId.MAXIMUM_PACKET_SIZE)
                                 .orElse(LARGEST_PACKET_SIZE),
                         LARGEST_PACKET_SIZE
-                )
-        );
+                ));
         // Server Keep Alive replaces the configured interval for this connection only.
         OptionalLong serverKeepAlive = number(properties, PropertyId.SERVER_KEEP_ALIVE);
         Duration connectionKeepAlive = serverKeepAlive.isPresent()

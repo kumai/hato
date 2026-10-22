@@ -49,11 +49,15 @@ public final class ConnAck {
     }
 
     /// Describes a successful acknowledgement of connection attempt number `connectionAttempt`,
-    /// and whether the broker resumed a session, from a broker that announced no limits.
+    /// and whether the broker resumed a session, from a broker that announced no limits. The
+    /// `with` methods describe the limits that a broker announced.
     ///
     /// @throws IllegalArgumentException if `connectionAttempt` is not positive
     public static ConnAck of(boolean sessionPresent, long connectionAttempt) {
-        return of(
+        if (connectionAttempt < 1) {
+            throw new IllegalArgumentException("Attempt numbers start at 1");
+        }
+        return new ConnAck(
                 sessionPresent,
                 connectionAttempt,
                 Qos.EXACTLY_ONCE,
@@ -64,24 +68,65 @@ public final class ConnAck {
         );
     }
 
-    /// Like [#of(boolean, long)], from a broker that announced these limits.
+    /// Returns a copy with a different highest QoS at which the broker accepts publications.
+    public ConnAck withMaximumQos(Qos maximumQos) {
+        return new ConnAck(
+                sessionPresent,
+                connectionAttempt,
+                requireNonNull(maximumQos, "maximumQos"),
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                sharedSubscriptionAvailable,
+                maximumPacketSize
+        );
+    }
+
+    /// Returns a copy with a different answer to whether the broker accepts retained
+    /// publications.
+    public ConnAck withRetainAvailable(boolean retainAvailable) {
+        return new ConnAck(
+                sessionPresent,
+                connectionAttempt,
+                maximumQos,
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                sharedSubscriptionAvailable,
+                maximumPacketSize
+        );
+    }
+
+    /// Returns a copy with a different answer to whether the broker accepts wildcard
+    /// subscriptions.
+    public ConnAck withWildcardSubscriptionAvailable(boolean wildcardSubscriptionAvailable) {
+        return new ConnAck(
+                sessionPresent,
+                connectionAttempt,
+                maximumQos,
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                sharedSubscriptionAvailable,
+                maximumPacketSize
+        );
+    }
+
+    /// Returns a copy with a different answer to whether the broker accepts shared
+    /// subscriptions.
+    public ConnAck withSharedSubscriptionAvailable(boolean sharedSubscriptionAvailable) {
+        return new ConnAck(
+                sessionPresent,
+                connectionAttempt,
+                maximumQos,
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                sharedSubscriptionAvailable,
+                maximumPacketSize
+        );
+    }
+
+    /// Returns a copy with a different largest packet that the broker accepts.
     ///
-    /// @throws IllegalArgumentException if `connectionAttempt` is not positive, or
-    ///     `maximumPacketSize` is not between 1 and 268435460
-    /// @throws NullPointerException if `maximumQos` is null
-    public static ConnAck of(
-            boolean sessionPresent,
-            long connectionAttempt,
-            Qos maximumQos,
-            boolean retainAvailable,
-            boolean wildcardSubscriptionAvailable,
-            boolean sharedSubscriptionAvailable,
-            int maximumPacketSize
-    ) {
-        if (connectionAttempt < 1) {
-            throw new IllegalArgumentException("Attempt numbers start at 1");
-        }
-        requireNonNull(maximumQos, "maximumQos");
+    /// @throws IllegalArgumentException if `maximumPacketSize` is not between 1 and 268435460
+    public ConnAck withMaximumPacketSize(int maximumPacketSize) {
         if (maximumPacketSize < 1 || maximumPacketSize > LARGEST_PACKET_SIZE) {
             throw new IllegalArgumentException(
                     "Maximum packet size must be 1.." + LARGEST_PACKET_SIZE + " bytes"

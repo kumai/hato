@@ -35,15 +35,12 @@ abstract class Mqtt5RestrictedTest {
             ConnAck ack = sut.connect().get(5, SECONDS);
 
             // Assert
-            assertThat(ack).isEqualTo(ConnAck.of(
-                    false,
-                    1,
-                    Qos.AT_LEAST_ONCE,
-                    false,
-                    wildcardSubscriptionAvailable(),
-                    sharedSubscriptionAvailable(),
-                    512
-            ));
+            assertThat(ack).isEqualTo(ConnAck.of(false, 1)
+                    .withMaximumQos(Qos.AT_LEAST_ONCE)
+                    .withRetainAvailable(false)
+                    .withWildcardSubscriptionAvailable(wildcardSubscriptionAvailable())
+                    .withSharedSubscriptionAvailable(sharedSubscriptionAvailable())
+                    .withMaximumPacketSize(512));
         }
     }
 

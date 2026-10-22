@@ -4473,7 +4473,12 @@ class SessionCoreTest {
         ), 0, 0);
 
         // Assert
-        var expected = ConnAck.of(false, 1, Qos.AT_LEAST_ONCE, false, false, false, 2048);
+        ConnAck expected = ConnAck.of(false, 1)
+                .withMaximumQos(Qos.AT_LEAST_ONCE)
+                .withRetainAvailable(false)
+                .withWildcardSubscriptionAvailable(false)
+                .withSharedSubscriptionAvailable(false)
+                .withMaximumPacketSize(2048);
         assertThat(port.results.get(1L)).isEqualTo(new Result(expected, null));
         assertThat(port.connections).containsExactly(new Connection(1, expected));
     }

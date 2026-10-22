@@ -51,7 +51,11 @@ class ConnAckTest {
     @Test
     void preserves_announced_limits_and_compares_them_by_value() {
         // Act
-        var sut = ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, false, true, 1024);
+        ConnAck sut = ConnAck.of(true, 2)
+                .withMaximumQos(Qos.AT_LEAST_ONCE)
+                .withRetainAvailable(false)
+                .withWildcardSubscriptionAvailable(false)
+                .withMaximumPacketSize(1024);
 
         // Assert
         assertThat(sut.maximumQos()).isEqualTo(Qos.AT_LEAST_ONCE);
@@ -59,15 +63,20 @@ class ConnAckTest {
         assertThat(sut.wildcardSubscriptionAvailable()).isFalse();
         assertThat(sut.sharedSubscriptionAvailable()).isTrue();
         assertThat(sut.maximumPacketSize()).isEqualTo(1024);
-        var same = ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, false, true, 1024);
-        assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same);
         assertThat(List.of(
-                ConnAck.of(true, 2, Qos.EXACTLY_ONCE, false, false, true, 1024),
-                ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, true, false, true, 1024),
-                ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, true, true, 1024),
-                ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, false, false, 1024),
-                ConnAck.of(true, 2, Qos.AT_LEAST_ONCE, false, false, true, 1025)
+                sut.withMaximumQos(Qos.EXACTLY_ONCE),
+                sut.withRetainAvailable(true),
+                sut.withWildcardSubscriptionAvailable(true),
+                sut.withSharedSubscriptionAvailable(false),
+                sut.withMaximumPacketSize(1025)
         )).doesNotContain(sut);
+        // The copies leave the original as it was.
+        ConnAck same = ConnAck.of(true, 2)
+                .withMaximumQos(Qos.AT_LEAST_ONCE)
+                .withRetainAvailable(false)
+                .withWildcardSubscriptionAvailable(false)
+                .withMaximumPacketSize(1024);
+        assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same);
         assertThat(sut.toString()).contains(
                 "maximumQos=AT_LEAST_ONCE",
                 "retainAvailable=false",
@@ -81,7 +90,7 @@ class ConnAckTest {
     @ValueSource(ints = {0, 268_435_461})
     void packet_sizes_outside_what_mqtt_carries_are_rejected(int size) {
         assertThatIllegalArgumentException().isThrownBy(
-                () -> ConnAck.of(false, 1, Qos.EXACTLY_ONCE, true, true, true, size)
+                () -> ConnAck.of(false, 1).withMaximumPacketSize(size)
         );
     }
 
@@ -89,7 +98,7 @@ class ConnAckTest {
     @SuppressWarnings("NullAway") // Deliberately violates the non-null contract.
     void the_maximum_qos_cannot_be_null() {
         assertThatNullPointerException().isThrownBy(
-                () -> ConnAck.of(false, 1, null, true, true, true, 1024)
+                () -> ConnAck.of(false, 1).withMaximumQos(null)
         );
     }
 }
