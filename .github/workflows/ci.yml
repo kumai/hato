@@ -22,11 +22,39 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
         with:
           validate-wrappers: true
-      - run: ./gradlew build :build-logic:check
+      # The tests against EMQX, HiveMQ CE, NanoMQ, and RabbitMQ run in the interop job.
+      - run: ./gradlew build :build-logic:check -Phato.interop=none
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+
+  interop:
+    name: Interoperability with ${{ matrix.broker }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        broker: [emqx, hivemq, nanomq, rabbitmq]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          validate-wrappers: true
+      - run: >-
+          ./gradlew :hato-common:integrationTest :hato-client:integrationTest
+          :hato-client:integrationTestSingleCarrier -Phato.interop=${{ matrix.broker }}
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: test-reports-${{ matrix.broker }}
           path: |
             **/build/reports/tests/
             **/build/test-results/
