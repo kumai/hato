@@ -21,6 +21,7 @@ import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttClientBuilder;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.Subscribe;
@@ -120,7 +121,7 @@ public final class NativeSmoke {
                     Subscribe.of(new TopicFilter("smoke/push"), Qos.EXACTLY_ONCE),
                     delivery -> handled.add(delivery.message())
             );
-            Subscription pull = client.subscribe(
+            PullSubscription pull = client.subscribe(
                     Subscribe.of(new TopicFilter("smoke/pull"), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.MANUAL)
             );

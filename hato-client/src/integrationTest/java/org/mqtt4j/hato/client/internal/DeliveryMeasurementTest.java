@@ -27,6 +27,7 @@ import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReceiveResult;
@@ -542,7 +543,7 @@ class DeliveryMeasurementTest {
     /// A pull subscription whose own virtual thread receives every delivery until the
     /// subscription ends.
     private static Subscription pull(MqttClient client, Subscribe request, AtomicLong handled) {
-        Subscription subscription = client.subscribe(request);
+        PullSubscription subscription = client.subscribe(request);
         Thread.ofVirtual().start(() -> {
             try {
                 while (true) {

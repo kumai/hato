@@ -130,19 +130,19 @@ final class ScriptedBroker implements AutoCloseable {
         return subscribe(sut, topic, ackMode, 256, handler);
     }
 
-    Subscription subscribePull(MqttClient sut, String topic, AckMode mode, int capacity)
+    PullSubscription subscribePull(MqttClient sut, String topic, AckMode mode, int capacity)
             throws Exception {
         return subscribePull(sut, topic, Qos.AT_LEAST_ONCE, mode, capacity);
     }
 
-    Subscription subscribePull(
+    PullSubscription subscribePull(
             MqttClient sut,
             String topic,
             Qos qos,
             AckMode mode,
             int capacity
     ) throws Exception {
-        Subscription subscription = sut.subscribe(
+        PullSubscription subscription = sut.subscribe(
                 Subscribe.of(new TopicFilter(topic), qos)
                         .withAckMode(mode)
                         .withBufferCapacity(capacity)

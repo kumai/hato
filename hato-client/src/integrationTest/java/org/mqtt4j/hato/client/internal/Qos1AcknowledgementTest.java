@@ -37,7 +37,7 @@ class Qos1AcknowledgementTest {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 512);
+            PullSubscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 512);
             peer.publish("data", 1);
             MqttDelivery first = received(subscription.receive(Duration.ofSeconds(5)));
             for (int queued = 0; queued < 320; queued += 64) {
@@ -69,7 +69,7 @@ class Qos1AcknowledgementTest {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("data"), Qos.AT_LEAST_ONCE)
             );
             var subscribe = (Packet.Subscribe) peer.receive();
@@ -97,7 +97,7 @@ class Qos1AcknowledgementTest {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 128);
+            PullSubscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 128);
             peer.publishBurst("data", 1, 100, false);
             var deliveries = new ArrayList<MqttDelivery>();
             for (int i = 0; i < 100; i++) {
@@ -122,8 +122,8 @@ class Qos1AcknowledgementTest {
         // Arrange: a two-slot pull queue drains while another subscription holds all PUBACKs.
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription head = peer.subscribePull(sut, "head", AckMode.MANUAL, 1);
-            Subscription tail = peer.subscribePull(sut, "tail", AckMode.ON_RECEIVE, 2);
+            PullSubscription head = peer.subscribePull(sut, "head", AckMode.MANUAL, 1);
+            PullSubscription tail = peer.subscribePull(sut, "tail", AckMode.ON_RECEIVE, 2);
             peer.publish("head", 1);
             MqttDelivery first = received(head.receive(Duration.ofSeconds(5)));
 
@@ -147,7 +147,7 @@ class Qos1AcknowledgementTest {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 2);
+            PullSubscription subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 2);
             peer.publish("data", 7);
             MqttDelivery first = received(subscription.receive(Duration.ofSeconds(5)));
 

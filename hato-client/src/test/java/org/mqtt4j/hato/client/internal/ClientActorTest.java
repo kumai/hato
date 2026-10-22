@@ -68,6 +68,7 @@ import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReceiveResult;
@@ -549,7 +550,7 @@ class ClientActorTest {
         var receiver = new AtomicReference<Thread>();
         try (MqttClient sut = client(); var workers = Executors.newVirtualThreadPerTaskExecutor()) {
             ScriptTransport old = connect(sut);
-            Subscription subscription = subscribePull(sut, old,
+            PullSubscription subscription = subscribePull(sut, old,
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE));
             Future<ReceiveResult> waiting = workers.submit(() -> {
                 receiver.set(Thread.currentThread());
@@ -650,7 +651,7 @@ class ClientActorTest {
     void closing_a_subscription_from_the_end_listener_prevents_its_resubscription()
             throws Exception {
         // Arrange: the listener disposes the same public handle that existed before disconnect.
-        var handle = new AtomicReference<Subscription>();
+        var handle = new AtomicReference<PullSubscription>();
         var removing = new AtomicReference<CompletableFuture<Void>>();
         try (MqttClient sut = client(end -> {
             Subscription subscription = requireNonNull(handle.get());
@@ -671,7 +672,7 @@ class ClientActorTest {
             // Assert: a fresh clean session needs neither recreation nor remote removal.
             assertThat(current.sent).isEmpty();
             assertThat(requireNonNull(handle.get()).receive()).isEqualTo(new ReceiveResult.Ended());
-            Subscription replacement = subscribePull(sut, current, request());
+            PullSubscription replacement = subscribePull(sut, current, request());
             requireNonNull(handle.get()).unsubscribe().get(5, SECONDS);
             current.receive(publication(new byte[] {9}));
             assertThat(received(replacement.receive(Duration.ofSeconds(5))).message().payload())
@@ -734,7 +735,7 @@ class ClientActorTest {
         var failure = new IOException("Peer reset the connection");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
             transport.receive(publication(new byte[] {7}));
             // An outgoing command confirms the incoming publication has reached the actor.
             sut.publish(message(new byte[0])).get(5, SECONDS);
@@ -760,7 +761,7 @@ class ClientActorTest {
         // Arrange
         try (MqttClient sut = client(); var workers = Executors.newVirtualThreadPerTaskExecutor()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
             var waiting = ConcurrentHashMap.<Thread>newKeySet();
             var jobs = new ArrayList<Future<Boolean>>();
             try {
@@ -794,7 +795,7 @@ class ClientActorTest {
         // Arrange: an unreceived QoS 1 delivery fills the subscription's only slot.
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(
+            PullSubscription subscription = subscribePull(
                     sut, transport, qosOneRequest().withBufferCapacity(1)
             );
             transport.receive(qosOnePublication("messages", 1, false));
@@ -815,7 +816,7 @@ class ClientActorTest {
         // Arrange: an unreceived delivery fills the subscription's only slot.
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(
+            PullSubscription subscription = subscribePull(
                     sut, transport, request().withBufferCapacity(1)
             );
             transport.receive(publication(new byte[] {1}));
@@ -845,7 +846,7 @@ class ClientActorTest {
             ScriptTransport first = connect(sut);
             Subscription push = sut.subscribe(request(), handled::add);
             establish(first, push);
-            Subscription pull = subscribePull(
+            PullSubscription pull = subscribePull(
                     sut,
                     first,
                     Subscribe.of(new TopicFilter("#"), Qos.AT_MOST_ONCE)
@@ -878,7 +879,7 @@ class ClientActorTest {
         // Arrange
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
             transport.receive(publication(new byte[] {7}));
             // An outgoing command confirms the incoming publication has reached the actor.
             sut.publish(message(new byte[0])).get(5, SECONDS);
@@ -999,7 +1000,7 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
             transport.completeSends = false;
             CompletableFuture<PublishResult> stalled = sut.publish(MqttMessage.of(
                     new Topic("a"), new byte[16 * 1024 * 1024 - 8], Qos.AT_MOST_ONCE, false
@@ -1070,7 +1071,7 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
             if (beforeStart) {
                 holdActor(transport, entered, release);
             }
@@ -1106,7 +1107,7 @@ class ClientActorTest {
         // Arrange: local disposal persists while there is no connection to observe removal on.
         try (MqttClient sut = client()) {
             ScriptTransport old = connect(sut);
-            Subscription subscription = subscribePull(sut, old, request());
+            PullSubscription subscription = subscribePull(sut, old, request());
             sut.disconnect().get(5, SECONDS);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             await().until(() -> ((ClientActor) sut).usage().operations() == 0);
@@ -1143,7 +1144,7 @@ class ClientActorTest {
         var failure = new IOException("connection ended before removal was confirmed");
         try (MqttClient sut = client()) {
             ScriptTransport old = connect(sut);
-            var subscriptions = new ArrayList<Subscription>();
+            var subscriptions = new ArrayList<PullSubscription>();
             for (int i = 0; i < registrations; i++) {
                 subscriptions.add(subscribePull(sut, old,
                         Subscribe.of(new TopicFilter("closed/" + i), Qos.AT_MOST_ONCE)));
@@ -1170,7 +1171,7 @@ class ClientActorTest {
             }
             await().until(() -> ((ClientActor) sut).usage().waiters() == 0);
             ScriptTransport current = connect(sut);
-            for (Subscription subscription : subscriptions) {
+            for (PullSubscription subscription : subscriptions) {
                 assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
                 subscription.unsubscribe().get(5, SECONDS);
             }
@@ -1189,7 +1190,7 @@ class ClientActorTest {
             ScriptTransport transport = connect(sut);
             subscribePull(sut, transport, Subscribe.of(new TopicFilter("head"), Qos.AT_LEAST_ONCE)
                     .withAckMode(AckMode.MANUAL));
-            Subscription tail = subscribePull(sut, transport,
+            PullSubscription tail = subscribePull(sut, transport,
                     Subscribe.of(new TopicFilter("messages"), Qos.AT_LEAST_ONCE)
                             .withBufferCapacity(1));
             transport.receive(new Packet.Publish(new Topic("head"), new byte[] {1},
@@ -1222,14 +1223,14 @@ class ClientActorTest {
         // Arrange: half the receive table is occupied before reconnect, with local capacity one.
         try (MqttClient sut = client(false)) {
             ScriptTransport old = connect(sut);
-            Subscription head = subscribePull(
+            PullSubscription head = subscribePull(
                     sut,
                     old,
                     Subscribe.of(new TopicFilter("head"), Qos.AT_LEAST_ONCE)
                             .withAckMode(AckMode.MANUAL)
                             .withBufferCapacity(1)
             );
-            Subscription tail = subscribePull(
+            PullSubscription tail = subscribePull(
                     sut,
                     old,
                     Subscribe.of(new TopicFilter("tail"), Qos.AT_LEAST_ONCE)
@@ -1324,17 +1325,22 @@ class ClientActorTest {
 
     @Test
     @Timeout(10)
-    void handler_subscriptions_reject_receive() throws Exception {
-        // Arrange
+    void handler_and_hand_off_subscriptions_are_not_pull_subscriptions() throws Exception {
         try (MqttClient sut = client()) {
-            ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribe(sut, transport);
+            // Act
+            Subscription handled = sut.subscribe(request(), _ -> { });
+            Subscription handedOff = sut.handOff(
+                    Subscribe.of(new TopicFilter("handed-off"), Qos.AT_MOST_ONCE),
+                    _ -> true
+            );
+            Subscription pulled = sut.subscribe(
+                    Subscribe.of(new TopicFilter("pulled"), Qos.AT_MOST_ONCE)
+            );
 
-            // Act & Assert
-            assertThatThrownBy(subscription::receive)
-                    .isInstanceOf(UnsupportedOperationException.class);
-            assertThatThrownBy(() -> subscription.receive(Duration.ZERO))
-                    .isInstanceOf(UnsupportedOperationException.class);
+            // Assert: a handle that cannot receive is no pull subscription at run time either.
+            assertThat(handled).isNotInstanceOf(PullSubscription.class);
+            assertThat(handedOff).isNotInstanceOf(PullSubscription.class);
+            assertThat(pulled).isInstanceOf(PullSubscription.class);
         }
     }
 
@@ -1344,7 +1350,7 @@ class ClientActorTest {
         // Arrange
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
 
             // Act & Assert
             assertTimeoutPreemptively(Duration.ofSeconds(5), () ->
@@ -1363,7 +1369,7 @@ class ClientActorTest {
         // Arrange
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
 
             // Act & Assert
             Thread.currentThread().interrupt();
@@ -2472,8 +2478,8 @@ class ClientActorTest {
         jul.setUseParentHandlers(false);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription observed = sut.subscribe(request());
-            Subscription closed = sut.subscribe(
+            PullSubscription observed = sut.subscribe(request());
+            PullSubscription closed = sut.subscribe(
                     Subscribe.of(new TopicFilter("closed"), Qos.AT_MOST_ONCE)
             );
             CompletableFuture<Qos> waiting = observed.established();
@@ -2780,7 +2786,7 @@ class ClientActorTest {
         try (MqttClient client = client(listener)) {
             var sut = (ClientActor) client;
             ScriptTransport first = connect(sut);
-            Subscription subscription = subscribePull(sut, first, request());
+            PullSubscription subscription = subscribePull(sut, first, request());
             sut.disconnect().get(5, SECONDS);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             ScriptTransport current = connect(sut);
@@ -3275,7 +3281,7 @@ class ClientActorTest {
         // Arrange
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(
+            PullSubscription subscription = subscribePull(
                     sut,
                     transport,
                     Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE)
@@ -3308,7 +3314,7 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(
+            PullSubscription subscription = subscribePull(
                     sut,
                     transport,
                     Subscribe.of(new TopicFilter("messages"), Qos.EXACTLY_ONCE)
@@ -4522,7 +4528,7 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(
+            PullSubscription subscription = subscribePull(
                     sut, transport, request().withBufferCapacity(65_536)
             );
             holdActor(transport, entered, release);
@@ -4630,7 +4636,7 @@ class ClientActorTest {
         })) {
             var actor = (ClientActor) sut;
             ScriptTransport transport = connect(sut);
-            Subscription manual = subscribePull(sut, transport,
+            PullSubscription manual = subscribePull(sut, transport,
                     Subscribe.of(new TopicFilter("manual"), Qos.AT_LEAST_ONCE)
                             .withAckMode(AckMode.MANUAL));
             transport.receive(new Packet.Publish(new Topic("manual"), new byte[] {1},
@@ -4989,7 +4995,7 @@ class ClientActorTest {
         var mqtt5 = PacketCodec.of(MqttVersion.V5);
         try (MqttClient sut = mqtt5Client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, qosOneRequest());
+            PullSubscription subscription = subscribePull(sut, transport, qosOneRequest());
 
             // Act
             transport.receive(first);
@@ -5013,7 +5019,7 @@ class ClientActorTest {
         // Arrange
         try (MqttClient sut = mqtt5Client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(
+            PullSubscription subscription = subscribePull(
                     sut,
                     transport,
                     Subscribe.of(new TopicFilter("#"), Qos.AT_MOST_ONCE)
@@ -5255,7 +5261,7 @@ class ClientActorTest {
         var failure = new IOException("Peer reset during unsubscribe");
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
             CompletableFuture<Void> first = subscription.unsubscribe();
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Unsubscribe.class);
             CompletableFuture<Void> observer = subscription.unsubscribe();
@@ -5430,7 +5436,7 @@ class ClientActorTest {
         // Arrange: the SUBSCRIBE still awaits its SUBACK when removal is requested.
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = sut.subscribe(request());
+            PullSubscription subscription = sut.subscribe(request());
             var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             CompletableFuture<Void> removing = subscription.unsubscribe();
 
@@ -5456,7 +5462,7 @@ class ClientActorTest {
         // Arrange: a delivery arrives before SUBACK, and removal is requested while it waits.
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = sut.subscribe(request());
+            PullSubscription subscription = sut.subscribe(request());
             var subscribe = (Packet.Subscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(publication(new byte[] {1}));
             await().until(() -> ((ClientActor) sut).usage().deliveries() == 1);
@@ -5500,7 +5506,7 @@ class ClientActorTest {
         try (MqttClient client = client(listener)) {
             var sut = (ClientActor) client;
             ScriptTransport first = connect(sut);
-            Subscription subscription = subscribePull(sut, first, request());
+            PullSubscription subscription = subscribePull(sut, first, request());
             sut.disconnect().get(5, SECONDS);
             assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
             ScriptTransport current = connect(sut);
@@ -5533,7 +5539,7 @@ class ClientActorTest {
         // Arrange: a persistent client finds the broker's session again after discarding it,
         // and keeps the refusing DISCONNECT write outstanding.
         try (MqttClient sut = client(false)) {
-            Subscription subscription = sut.subscribe(request());
+            PullSubscription subscription = sut.subscribe(request());
             CompletableFuture<Qos> establishing = subscription.established();
             CompletableFuture<ConnAck> connection = sut.connect();
             ScriptTransport transport = discardBrokerSession(nextTransport());
@@ -5564,7 +5570,7 @@ class ClientActorTest {
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = sut.subscribe(request());
+            PullSubscription subscription = sut.subscribe(request());
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
             beforeActorTime = () -> {
                 entered.countDown();
@@ -5704,7 +5710,7 @@ class ClientActorTest {
         var releaseActor = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
             transport.receive(publication(new byte[] {1}));
             await().until(() -> ((ClientActor) sut).usage().deliveries() == 1);
             holdActor(transport, actorHeld, releaseActor);
@@ -5797,7 +5803,7 @@ class ClientActorTest {
         // Arrange: two deliveries wait in a pull subscription when removal is requested.
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
-            Subscription subscription = subscribePull(sut, transport, request());
+            PullSubscription subscription = subscribePull(sut, transport, request());
             transport.receive(publication(new byte[] {1}));
             transport.receive(publication(new byte[] {2}));
             await().until(() -> ((ClientActor) sut).usage().deliveries() == 2);
@@ -8376,8 +8382,8 @@ class ClientActorTest {
         };
         try (MqttClient sut = client("fatal-establishment", ends::add, 16 * 1024 * 1024, encoder)) {
             ScriptTransport transport = connect(sut);
-            Subscription observed = sut.subscribe(request());
-            Subscription closed = sut.subscribe(
+            PullSubscription observed = sut.subscribe(request());
+            PullSubscription closed = sut.subscribe(
                     Subscribe.of(new TopicFilter("closed"), Qos.AT_MOST_ONCE)
             );
             CompletableFuture<Qos> waiting = observed.established();
@@ -8510,12 +8516,12 @@ class ClientActorTest {
         return subscription;
     }
 
-    private static Subscription subscribePull(
+    private static PullSubscription subscribePull(
             MqttClient client,
             ScriptTransport transport,
             Subscribe request
     ) throws Exception {
-        Subscription subscription = client.subscribe(request);
+        PullSubscription subscription = client.subscribe(request);
         establish(transport, subscription);
         return subscription;
     }
@@ -8588,7 +8594,7 @@ class ClientActorTest {
     /// in that window still ends with it.
     private static void assertInternalFailureBeforeCleanup(
             Subscription observed,
-            Subscription closed,
+            PullSubscription closed,
             Throwable failure
     ) {
         closed.close();
@@ -8601,7 +8607,7 @@ class ClientActorTest {
 
     /// After cleanup, the waiting observer, a later observer, and receiving all report the failure.
     private static void assertInternalFailureAfterCleanup(
-            Subscription subscription,
+            PullSubscription subscription,
             CompletableFuture<Qos> waiting,
             Throwable failure
     ) {

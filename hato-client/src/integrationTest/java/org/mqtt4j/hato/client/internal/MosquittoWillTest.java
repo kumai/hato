@@ -63,7 +63,7 @@ class MosquittoWillTest {
                         .will(will)
                         .build()) {
             subscriber.connect().get(5, SECONDS);
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             sut.connect().get(5, SECONDS);
 
             // Act
@@ -77,7 +77,7 @@ class MosquittoWillTest {
                     false
             ));
             later.connect().get(5, SECONDS);
-            Subscription lateSubscription = subscribe(later, topic);
+            PullSubscription lateSubscription = subscribe(later, topic);
             assertThat(receive(lateSubscription)).isEqualTo(will);
         }
     }
@@ -109,7 +109,7 @@ class MosquittoWillTest {
                         })
                         .build()) {
             subscriber.connect().get(5, SECONDS);
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             sut.connect().get(5, SECONDS);
 
             // Act
@@ -136,7 +136,7 @@ class MosquittoWillTest {
                         .will(message(topic, (byte) 1))
                         .build()) {
             subscriber.connect().get(5, SECONDS);
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             sut.connect().get(5, SECONDS);
 
             // Act
@@ -180,7 +180,7 @@ class MosquittoWillTest {
                         })
                         .build()) {
             subscriber.connect().get(5, SECONDS);
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             // The broker sends these right after the first CONNACK, more than its inflight
             // window at once, so the client closes that connection with unread input.
             for (int value = 0; value < 25; value++) {
@@ -201,7 +201,7 @@ class MosquittoWillTest {
     private static void assertNoWillAfterReplacement(
             String clientId,
             String topic,
-            Subscription subscription
+            PullSubscription subscription
     ) throws Exception {
         // Reusing the id makes Mosquitto finish the previous connection before accepting this
         // one. Its publication follows any Will caused by that connection's termination.
@@ -224,7 +224,7 @@ class MosquittoWillTest {
         return MqttMessage.of(new Topic(topic), new byte[] {value}, Qos.AT_LEAST_ONCE, false);
     }
 
-    private static MqttMessage receive(Subscription subscription) throws Exception {
+    private static MqttMessage receive(PullSubscription subscription) throws Exception {
         ReceiveResult.Received received = assertInstanceOf(
                 ReceiveResult.Received.class,
                 subscription.receive(Duration.ofSeconds(5))
@@ -232,8 +232,9 @@ class MosquittoWillTest {
         return received.delivery().message();
     }
 
-    private static Subscription subscribe(MqttClient subscriber, String topic) throws Exception {
-        Subscription subscription = subscriber.subscribe(
+    private static PullSubscription subscribe(MqttClient subscriber, String topic)
+            throws Exception {
+        PullSubscription subscription = subscriber.subscribe(
                 Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
         );
         subscription.established().get(5, SECONDS);

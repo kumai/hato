@@ -86,7 +86,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// not wait for replay or SUBACK; a re-creation refusal ends only the affected subscription
     /// and is reported by
     /// [ConnectionListener#onResubscribeFailed(Subscription, MqttSubscriptionRefusedException)].
-    /// A pull subscription also reports it through [Subscription#receive()].
+    /// A pull subscription also reports it through [PullSubscription#receive()].
     /// Registrations still awaiting their first SUBACK are sent after CONNACK as well.
     /// [Subscription#established()] can observe each subscription independently of this future.
     ///
@@ -197,7 +197,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     ///
     /// It does not wait for work that application code started, such as tasks submitted to the
     /// application's own executors, nor for the application's own calls into the client, such as
-    /// a waiting [Subscription#receive()], which closing ends promptly. Code that never returns
+    /// a waiting [PullSubscription#receive()], which closing ends promptly. Code that never returns
     /// keeps the future pending; it never completes on a timeout.
     ///
     /// Each call returns an independent future; after termination, a completed one. Pending

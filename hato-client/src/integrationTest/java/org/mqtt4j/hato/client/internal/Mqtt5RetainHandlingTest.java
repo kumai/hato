@@ -30,7 +30,7 @@ abstract class Mqtt5RetainHandlingTest extends Mqtt5SubscriptionOptionsTest {
             publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
 
             // Act
-            Subscription subscription = subscribe(
+            PullSubscription subscription = subscribe(
                     sut,
                     request(topic).withRetainHandling(handling)
             );
@@ -54,7 +54,7 @@ abstract class Mqtt5RetainHandlingTest extends Mqtt5SubscriptionOptionsTest {
             publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
 
             // Act
-            Subscription subscription = subscribe(
+            PullSubscription subscription = subscribe(
                     sut,
                     request(topic).withRetainHandling(RetainHandling.DO_NOT_SEND)
             );

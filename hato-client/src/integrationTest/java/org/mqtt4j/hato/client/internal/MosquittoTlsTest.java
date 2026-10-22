@@ -96,7 +96,7 @@ class MosquittoTlsTest {
                 .connectionListener(listener)
                 .build()) {
             ConnAck connAck = sut.connect().get(5, SECONDS);
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
             );
             subscription.established().get(5, SECONDS);

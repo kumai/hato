@@ -30,6 +30,7 @@ import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttClientBuilder;
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.ReconnectPolicy;
@@ -283,7 +284,7 @@ class EnduranceMeasurementTest {
 
         private final AtomicLong deliveries = new AtomicLong();
 
-        private final Subscription pull;
+        private final PullSubscription pull;
 
         private final Thread receiver;
 

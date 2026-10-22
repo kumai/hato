@@ -94,7 +94,7 @@ class SubscriptionObservationTest {
             assertThat(entered.await(5, SECONDS)).isTrue();
 
             // Act & Assert
-            Subscription subscription = sut.subscribe(REQUEST);
+            PullSubscription subscription = sut.subscribe(REQUEST);
             assertThat(subscription.receive(Duration.ZERO))
                     .isInstanceOf(ReceiveResult.TimedOut.class);
             assertThatThrownBy(subscription::grantedQos).isInstanceOf(IllegalStateException.class);
@@ -122,7 +122,7 @@ class SubscriptionObservationTest {
             sut.subscribe(REQUEST);
 
             // Act
-            Subscription rejected = sut.subscribe(REQUEST);
+            PullSubscription rejected = sut.subscribe(REQUEST);
 
             // Assert
             assertThatThrownBy(() -> rejected.established().get(5, SECONDS))

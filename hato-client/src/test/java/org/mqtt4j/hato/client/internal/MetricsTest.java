@@ -32,6 +32,7 @@ import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReceiveResult;
@@ -172,7 +173,7 @@ class MetricsTest {
             // Act
             transport.receive(qosOnePublish("readings", 1));
             if (mode.pull()) {
-                assertThat(subscription.receive(Duration.ofSeconds(5)))
+                assertThat(((PullSubscription) subscription).receive(Duration.ofSeconds(5)))
                         .isInstanceOf(ReceiveResult.Received.class);
             }
 

@@ -33,7 +33,7 @@ abstract class WebSocketRoundTripTest {
             // Arrange: the subscription grants QoS 2, so every level arrives with its own QoS.
             String topic = uniqueTopic();
             sut.connect().get(5, SECONDS);
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
             );
             subscription.established().get(5, SECONDS);

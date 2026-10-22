@@ -6,9 +6,9 @@ import java.util.function.Predicate;
 /// The subscribing role of a client, without access to its connection lifecycle.
 public interface MqttSubscriber {
 
-    /// Registers a pull subscription, whose deliveries are consumed by the application's
-    /// receiving threads. Returns the handle immediately; [Subscription#established()] observes
-    /// broker acceptance. Publications received before SUBACK are buffered within the
+    /// Registers a pull subscription, whose deliveries the application's threads take with
+    /// [PullSubscription#receive()]. Returns the handle immediately; [Subscription#established()]
+    /// observes broker acceptance. Publications received before SUBACK are buffered within the
     /// subscription's capacity.
     ///
     /// [AckMode#AFTER_HANDLER] throws [IllegalArgumentException]. Other registration
@@ -17,7 +17,7 @@ public interface MqttSubscriber {
     ///
     /// The default implementation throws [UnsupportedOperationException], so implementations
     /// of the subscribing role that only provide handlers need not implement pull delivery.
-    default Subscription subscribe(Subscribe request) {
+    default PullSubscription subscribe(Subscribe request) {
         throw new UnsupportedOperationException("Pull subscriptions are not supported");
     }
 

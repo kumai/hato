@@ -51,7 +51,7 @@ class Mosquitto5SubscriptionOptionsTest extends Mqtt5RetainHandlingTest {
         ) {
             // Arrange
             publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
-            Subscription subscription = subscribe(
+            PullSubscription subscription = subscribe(
                     sut,
                     request(topic).withRetainHandling(RetainHandling.SEND_IF_NEW_SUBSCRIPTION)
             );
@@ -80,7 +80,7 @@ class Mosquitto5SubscriptionOptionsTest extends Mqtt5RetainHandlingTest {
         ) {
             // Arrange
             publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
-            Subscription subscription = subscribe(
+            PullSubscription subscription = subscribe(
                     sut,
                     request(topic).withRetainHandling(RetainHandling.SEND_IF_NEW_SUBSCRIPTION)
             );

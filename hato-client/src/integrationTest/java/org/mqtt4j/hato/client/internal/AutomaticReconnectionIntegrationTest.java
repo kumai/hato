@@ -287,7 +287,7 @@ class AutomaticReconnectionIntegrationTest {
             int port = broker.port();
             assertThat(sut.connect().get(5, SECONDS).sessionPresent()).isFalse();
             String topic = uniqueTopic();
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
             );
             subscription.established().get(5, SECONDS);
@@ -413,13 +413,13 @@ class AutomaticReconnectionIntegrationTest {
                 MqttClient sut = reconnectingClient(broker, version, listener)) {
             // Arrange: a subscriber of the client's publications, and a subscription of its own.
             subscriber.connect().get(5, SECONDS);
-            Subscription received = subscriber.subscribe(
+            PullSubscription received = subscriber.subscribe(
                     Subscribe.of(new TopicFilter(outbound), Qos.EXACTLY_ONCE)
             );
             received.established().get(5, SECONDS);
             other.connect().get(5, SECONDS);
             assertThat(sut.connect().get(5, SECONDS).sessionPresent()).isFalse();
-            Subscription inbox = sut.subscribe(
+            PullSubscription inbox = sut.subscribe(
                     Subscribe.of(new TopicFilter(inbound), Qos.EXACTLY_ONCE)
             );
             inbox.established().get(5, SECONDS);
@@ -572,7 +572,7 @@ class AutomaticReconnectionIntegrationTest {
     }
 
     /// Receives into `seen` until `payload` arrives.
-    private static void receiveUntil(Subscription subscription, List<Byte> seen, byte payload)
+    private static void receiveUntil(PullSubscription subscription, List<Byte> seen, byte payload)
             throws Exception {
         while (!seen.contains(payload)) {
             MqttMessage message = received(subscription.receive(Duration.ofSeconds(5))).message();

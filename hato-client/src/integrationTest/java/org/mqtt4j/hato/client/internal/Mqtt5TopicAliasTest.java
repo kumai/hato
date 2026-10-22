@@ -36,7 +36,7 @@ class Mqtt5TopicAliasTest {
                 var connect = (Packet.Connect) peer.receive();
                 peer.send(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
                 connected.get(5, SECONDS);
-                Subscription subscription = peer.subscribePull(
+                PullSubscription subscription = peer.subscribePull(
                         sut,
                         "sensors/#",
                         Qos.AT_MOST_ONCE,
@@ -131,7 +131,7 @@ class Mqtt5TopicAliasTest {
         );
     }
 
-    private static MqttMessage receive(Subscription subscription) throws Exception {
+    private static MqttMessage receive(PullSubscription subscription) throws Exception {
         ReceiveResult.Received received = assertInstanceOf(
                 ReceiveResult.Received.class,
                 subscription.receive(Duration.ofSeconds(5))

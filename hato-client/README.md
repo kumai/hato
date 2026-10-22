@@ -341,7 +341,7 @@ Omit the handler to create a pull subscription. Call `receive()` from one or mor
 application threads:
 
 ```java
-Subscription subscription = client.subscribe(
+PullSubscription subscription = client.subscribe(
         Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_LEAST_ONCE)
                 .withAckMode(AckMode.MANUAL)
 );

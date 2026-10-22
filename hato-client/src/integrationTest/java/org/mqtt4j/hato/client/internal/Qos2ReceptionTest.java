@@ -27,7 +27,7 @@ class Qos2ReceptionTest {
         // Arrange: the manual condition prevents the initial PUBREC from being admitted.
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = peer.subscribePull(
+            PullSubscription subscription = peer.subscribePull(
                     sut,
                     "data",
                     Qos.EXACTLY_ONCE,
@@ -76,7 +76,7 @@ class Qos2ReceptionTest {
         // Arrange: the first manual delivery blocks the later PUBACK, but not PUBCOMP.
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = peer.subscribePull(
+            PullSubscription subscription = peer.subscribePull(
                     sut,
                     "data",
                     Qos.EXACTLY_ONCE,
@@ -109,7 +109,7 @@ class Qos2ReceptionTest {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = peer.subscribePull(
+            PullSubscription subscription = peer.subscribePull(
                     sut,
                     "data",
                     Qos.EXACTLY_ONCE,

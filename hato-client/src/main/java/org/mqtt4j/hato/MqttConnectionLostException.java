@@ -13,7 +13,7 @@ import java.io.Serial;
 /// local exchanges.
 ///
 /// Subscription registrations and removals survive connection termination: their observations
-/// do not fail when a connection ends, and [Subscription#receive()] keeps waiting.
+/// do not fail when a connection ends, and [PullSubscription#receive()] keeps waiting.
 /// [Subscription#established()], [Subscription#unsubscribe()], and pull receives report this
 /// exception only when an internal failure closes the client, carrying that failure as its cause.
 /// Locally detected packet failures carry [MqttProtocolException] as their cause, and a

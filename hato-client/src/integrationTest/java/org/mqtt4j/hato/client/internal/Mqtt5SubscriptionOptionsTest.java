@@ -28,7 +28,7 @@ abstract class Mqtt5SubscriptionOptionsTest {
                 MqttClient other = connected(Duration.ZERO)
         ) {
             // Arrange
-            Subscription subscription = subscribe(sut, request(topic).withNoLocal(true));
+            PullSubscription subscription = subscribe(sut, request(topic).withNoLocal(true));
 
             // Act: a broker has matched a publication with the subscriptions once it
             // acknowledges it.
@@ -49,8 +49,11 @@ abstract class Mqtt5SubscriptionOptionsTest {
                 MqttClient publisher = connected(Duration.ZERO)
         ) {
             // Arrange
-            Subscription asPublished = subscribe(sut, request(topic).withRetainAsPublished(true));
-            Subscription cleared = subscribe(plain, request(topic));
+            PullSubscription asPublished = subscribe(
+                    sut,
+                    request(topic).withRetainAsPublished(true)
+            );
+            PullSubscription cleared = subscribe(plain, request(topic));
 
             // Act
             publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
@@ -90,13 +93,13 @@ abstract class Mqtt5SubscriptionOptionsTest {
         );
     }
 
-    static Subscription subscribe(MqttClient client, Subscribe request) throws Exception {
-        Subscription subscription = client.subscribe(request);
+    static PullSubscription subscribe(MqttClient client, Subscribe request) throws Exception {
+        PullSubscription subscription = client.subscribe(request);
         subscription.established().get(5, SECONDS);
         return subscription;
     }
 
-    static MqttMessage receive(Subscription subscription) throws Exception {
+    static MqttMessage receive(PullSubscription subscription) throws Exception {
         ReceiveResult.Received received = assertInstanceOf(
                 ReceiveResult.Received.class,
                 subscription.receive(Duration.ofSeconds(5))

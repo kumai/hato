@@ -19,6 +19,7 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
+import java.util.function.LongFunction;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
@@ -46,6 +47,7 @@ import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.RetainHandling;
@@ -432,7 +434,11 @@ public final class ClientActor implements MqttClient {
     ) {
         requireNonNull(request, "request");
         requireNonNull(handler, "handler");
-        return subscribeInternal(request, new HandlerExecution.Internal(), handler, null);
+        var execution = new HandlerExecution.Internal();
+        return subscribeInternal(
+                request,
+                id -> new ClientSubscription(id, request, execution, handler, null)
+        );
     }
 
     @Override
@@ -444,11 +450,15 @@ public final class ClientActor implements MqttClient {
         requireNonNull(request, "request");
         requireNonNull(options, "options");
         requireNonNull(handler, "handler");
-        return subscribeInternal(request, executionOf.apply(options), handler, null);
+        HandlerExecution execution = executionOf.apply(options);
+        return subscribeInternal(
+                request,
+                id -> new ClientSubscription(id, request, execution, handler, null)
+        );
     }
 
     @Override
-    public Subscription subscribe(Subscribe request) {
+    public PullSubscription subscribe(Subscribe request) {
         requireNonNull(request, "request");
         if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
             throw new IllegalArgumentException(
@@ -460,7 +470,11 @@ public final class ClientActor implements MqttClient {
                     "A pull subscription has no handler whose failures to skip"
             );
         }
-        return subscribeInternal(request, new HandlerExecution.Internal(), null, null);
+        // The creation below makes a pull subscription, so the result is one.
+        return (PullSubscription) subscribeInternal(
+                request,
+                id -> new PullClientSubscription(id, request)
+        );
     }
 
     @Override
@@ -472,14 +486,18 @@ public final class ClientActor implements MqttClient {
                     "A hand-off subscription cannot see when its deliveries are processed"
             );
         }
-        return subscribeInternal(request, new HandlerExecution.Internal(), null, acceptor);
+        var execution = new HandlerExecution.Internal();
+        return subscribeInternal(
+                request,
+                id -> new ClientSubscription(id, request, execution, null, acceptor)
+        );
     }
 
-    private Subscription subscribeInternal(
+    /// Registers the subscription that `creation` makes from its id, of the kind that the caller
+    /// chose.
+    private ClientSubscription subscribeInternal(
             Subscribe request,
-            HandlerExecution execution,
-            @Nullable Consumer<MqttDelivery> handler,
-            @Nullable Predicate<MqttDelivery> acceptor
+            LongFunction<ClientSubscription> creation
     ) {
         // MQTT 3.1.1 has no subscription options, so a request that sets one is an argument
         // error, decided by the version of the client.
@@ -496,7 +514,7 @@ public final class ClientActor implements MqttClient {
                 throw new IllegalStateException("Client is closed");
             }
             long id = sequence.incrementAndGet();
-            subscription = new ClientSubscription(id, request, execution, handler, acceptor);
+            subscription = creation.apply(id);
             subscriptions.put(id, subscription);
             unterminated.put(id, subscription);
             Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
@@ -1756,7 +1774,7 @@ public final class ClientActor implements MqttClient {
         }
     }
 
-    private final class ClientSubscription implements Subscription {
+    private class ClientSubscription implements Subscription {
 
         private final long id;
 
@@ -1916,22 +1934,9 @@ public final class ClientActor implements MqttClient {
             return locallyClosed || unsubscription != null;
         }
 
-        @Override
-        public ReceiveResult receive() throws InterruptedException {
-            return pullReceiver().receive();
-        }
-
-        @Override
-        public ReceiveResult receive(Duration timeout) throws InterruptedException {
-            return pullReceiver().receive(timeout);
-        }
-
-        private DeliveryLanes.Receiver pullReceiver() {
-            DeliveryLanes.Receiver receiving = receiver;
-            if (receiving == null) {
-                throw new UnsupportedOperationException("Only a pull subscription receives");
-            }
-            return receiving;
+        /// The receiver of a pull subscription, which is the only kind that has one.
+        DeliveryLanes.Receiver pullReceiver() {
+            return requireNonNull(receiver);
         }
 
         @Override
@@ -1966,6 +1971,25 @@ public final class ClientActor implements MqttClient {
                     requestRemoval(this);
                 }
             }
+        }
+    }
+
+    /// A pull subscription, which the application drains through its receiver.
+    private final class PullClientSubscription extends ClientSubscription
+            implements PullSubscription {
+
+        PullClientSubscription(long id, Subscribe request) {
+            super(id, request, new HandlerExecution.Internal(), null, null);
+        }
+
+        @Override
+        public ReceiveResult receive() throws InterruptedException {
+            return pullReceiver().receive();
+        }
+
+        @Override
+        public ReceiveResult receive(Duration timeout) throws InterruptedException {
+            return pullReceiver().receive(timeout);
         }
     }
 

@@ -64,7 +64,7 @@ abstract class Qos2ReceptionIntegrationTest {
                 MqttClient sut = persistentClient(clientId(), scheduler, transports, ended)) {
             publisher.connect().get(5, SECONDS);
             sut.connect().get(5, SECONDS);
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.MANUAL)
             );
@@ -190,11 +190,11 @@ abstract class Qos2ReceptionIntegrationTest {
         try (MqttClient sut = client(ended); MqttClient publisher = client()) {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
-            Subscription replies = publisher.subscribe(
+            PullSubscription replies = publisher.subscribe(
                     Subscribe.of(new TopicFilter(base + "/reply"), Qos.EXACTLY_ONCE)
             );
             replies.established().get(5, SECONDS);
-            Subscription manual = sut.subscribe(
+            PullSubscription manual = sut.subscribe(
                     Subscribe.of(new TopicFilter(base + "/head"), Qos.EXACTLY_ONCE)
                             .withAckMode(AckMode.MANUAL)
             );
@@ -232,7 +232,7 @@ abstract class Qos2ReceptionIntegrationTest {
                 MqttClient sut = persistentClient(id, scheduler, transports, ended)) {
             publisher.connect().get(5, SECONDS);
             assertSession(sut.connect().get(5, SECONDS), false, 1);
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.EXACTLY_ONCE)
             );
             subscription.established().get(5, SECONDS);

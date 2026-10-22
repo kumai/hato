@@ -42,7 +42,7 @@ abstract class Mqtt5WillTest {
                 MqttClient sut = builder(clientId(), Duration.ZERO).will(will).build()
         ) {
             // Arrange
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             sut.connect().get(5, SECONDS);
 
             // Act
@@ -65,7 +65,7 @@ abstract class Mqtt5WillTest {
                         .build()
         ) {
             // Arrange
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             sut.connect().get(5, SECONDS);
 
             // Act: closing without DISCONNECT ends the connection and a session without expiry.
@@ -91,7 +91,7 @@ abstract class Mqtt5WillTest {
                         .build()
         ) {
             // Arrange
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             sut.connect().get(5, SECONDS);
 
             // Act
@@ -137,7 +137,7 @@ abstract class Mqtt5WillTest {
                         .build()
         ) {
             // Arrange
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             sut.connect().get(5, SECONDS);
             assertThat(connections.poll(5, SECONDS)).isNotNull();
 
@@ -169,7 +169,7 @@ abstract class Mqtt5WillTest {
                 MqttClient sut = builder(clientId, Duration.ofMinutes(1)).build()
         ) {
             // Arrange: the previous client object, as before an application restart.
-            Subscription subscription = subscribe(subscriber, topic);
+            PullSubscription subscription = subscribe(subscriber, topic);
             previous.connect().get(5, SECONDS);
             previous.close();
 
@@ -225,15 +225,16 @@ abstract class Mqtt5WillTest {
                 .withUserProperties(List.of(new UserProperty("reason", "connection lost")));
     }
 
-    private static Subscription subscribe(MqttClient subscriber, String topic) throws Exception {
-        Subscription subscription = subscriber.subscribe(
+    private static PullSubscription subscribe(MqttClient subscriber, String topic)
+            throws Exception {
+        PullSubscription subscription = subscriber.subscribe(
                 Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
         );
         subscription.established().get(5, SECONDS);
         return subscription;
     }
 
-    private static MqttMessage receive(Subscription subscription, Duration timeout)
+    private static MqttMessage receive(PullSubscription subscription, Duration timeout)
             throws Exception {
         ReceiveResult.Received received = assertInstanceOf(
                 ReceiveResult.Received.class,

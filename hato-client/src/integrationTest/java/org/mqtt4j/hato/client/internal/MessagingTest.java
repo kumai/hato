@@ -88,7 +88,8 @@ abstract class MessagingTest {
             sut.publish(message).get(5, SECONDS);
 
             // Assert
-            MqttDelivery delivery = pull ? received(subscription.receive(Duration.ofSeconds(5)))
+            MqttDelivery delivery = pull
+                    ? received(((PullSubscription) subscription).receive(Duration.ofSeconds(5)))
                     : requireNonNull(handled.poll(5, SECONDS));
             assertThat(delivery.message()).isEqualTo(message);
             subscription.unsubscribe().get(5, SECONDS);
@@ -124,7 +125,7 @@ abstract class MessagingTest {
 
             // Assert: UNSUBACK released every filter, and new subscriptions can receive QoS 1.
             for (Subscription subscription : subscriptions) {
-                Subscription replacement = sut.subscribe(
+                PullSubscription replacement = sut.subscribe(
                         Subscribe.of(subscription.filter(), Qos.AT_LEAST_ONCE)
                 );
                 replacement.established().get(5, SECONDS);
@@ -149,7 +150,9 @@ abstract class MessagingTest {
         var publication = MqttMessage.of(new Topic(topic), new byte[] {1, 2, 3}, qos, false);
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
-            Subscription subscription = sut.subscribe(Subscribe.of(new TopicFilter(topic), qos));
+            PullSubscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), qos)
+            );
             subscription.established().get(5, SECONDS);
 
             // Act
@@ -176,7 +179,7 @@ abstract class MessagingTest {
                 var workers = Executors.newVirtualThreadPerTaskExecutor()) {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
                             .withAckMode(mode)
                             .withBufferCapacity(64)
@@ -508,7 +511,7 @@ abstract class MessagingTest {
         String topic = uniqueTopic();
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
             );
             subscription.established().get(5, SECONDS);
@@ -591,7 +594,8 @@ abstract class MessagingTest {
                     : sut.subscribe(request, received::add);
             subscription.established().get(5, SECONDS);
             sut.publish(message(topic, (byte) 1)).get(5, SECONDS);
-            MqttDelivery first = pull ? received(subscription.receive(Duration.ofSeconds(5)))
+            MqttDelivery first = pull
+                    ? received(((PullSubscription) subscription).receive(Duration.ofSeconds(5)))
                     : requireNonNull(received.poll(5, SECONDS));
             assertThat(first.message().payload()).containsExactly((byte) 1);
 
@@ -610,13 +614,15 @@ abstract class MessagingTest {
             sut.publish(next).get(5, SECONDS);
 
             // Assert: the original registration receives again without another subscribe call.
-            MqttDelivery resumed = pull ? received(subscription.receive(Duration.ofSeconds(5)))
+            MqttDelivery resumed = pull
+                    ? received(((PullSubscription) subscription).receive(Duration.ofSeconds(5)))
                     : requireNonNull(received.poll(5, SECONDS));
             assertThat(resumed.message()).isEqualTo(next);
             assertThat(subscription.filter()).isEqualTo(new TopicFilter(topic));
             subscription.unsubscribe().get(5, SECONDS);
             if (pull) {
-                assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
+                assertThat(((PullSubscription) subscription).receive())
+                        .isEqualTo(new ReceiveResult.Ended());
             }
             assertThat(ended).isEmpty();
         }

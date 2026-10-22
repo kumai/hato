@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Timeout;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReceiveResult;
@@ -57,7 +58,7 @@ class ManySubscriptionsTest {
                 })
                 .build()) {
             ScriptTransport first = connect(sut);
-            var pulled = new ArrayList<Subscription>();
+            var pulled = new ArrayList<PullSubscription>();
             for (int device = 0; device < SUBSCRIPTIONS - 2; device++) {
                 pulled.add(sut.subscribe(request(device)));
             }
@@ -101,7 +102,7 @@ class ManySubscriptionsTest {
     private static void assertRouted(
             MqttClient client,
             ScriptTransport transport,
-            List<Subscription> pulled,
+            List<PullSubscription> pulled,
             LinkedBlockingQueue<Topic> handled,
             LinkedBlockingQueue<Topic> handedOff
     ) throws Exception {

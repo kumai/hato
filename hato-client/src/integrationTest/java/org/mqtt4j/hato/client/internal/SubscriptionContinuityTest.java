@@ -62,8 +62,8 @@ class SubscriptionContinuityTest {
                         .reconnectPolicy(ReconnectPolicy.disabled())
                         .connectionListener(listener)
                         .build()) {
-            Subscription rejected;
-            Subscription survivor;
+            PullSubscription rejected;
+            PullSubscription survivor;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 rejected = peer.subscribePull(sut, "refused", AckMode.ON_RECEIVE, 4);
                 survivor = peer.subscribePull(sut, "survivor", AckMode.ON_RECEIVE, 4);
@@ -144,7 +144,7 @@ class SubscriptionContinuityTest {
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .connectionListener(ended::add)
                 .build()) {
-            Subscription subscription;
+            PullSubscription subscription;
             var receiving = new CountDownLatch(1);
             CompletableFuture<ReceiveResult> received = new CompletableFuture<>();
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
@@ -188,7 +188,7 @@ class SubscriptionContinuityTest {
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            Subscription subscription;
+            PullSubscription subscription;
             MqttDelivery previous;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 4);
@@ -225,7 +225,7 @@ class SubscriptionContinuityTest {
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            Subscription subscription;
+            PullSubscription subscription;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
                 assertThat(subscription.grantedQos()).isEqualTo(Qos.AT_LEAST_ONCE);
@@ -265,7 +265,7 @@ class SubscriptionContinuityTest {
                 .sessionExpiry(Duration.ofMinutes(1))
                 .connectionListener(ended::add)
                 .build()) {
-            Subscription subscription;
+            PullSubscription subscription;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
                 // The connect completion thread returns its operation slot after the future.
@@ -305,7 +305,12 @@ class SubscriptionContinuityTest {
                     observer.get(5, SECONDS);
                 }
                 peer.expectPublicationBarrier(sut);
-                Subscription replacement = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
+                PullSubscription replacement = peer.subscribePull(
+                        sut,
+                        "data",
+                        AckMode.ON_RECEIVE,
+                        4
+                );
                 peer.publish("data", 7);
                 assertThat(replacement.receive(Duration.ofSeconds(5)))
                         .isInstanceOf(ReceiveResult.Received.class);
@@ -322,7 +327,7 @@ class SubscriptionContinuityTest {
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            Subscription subscription;
+            PullSubscription subscription;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
                 sut.disconnect().get(5, SECONDS);
@@ -357,7 +362,7 @@ class SubscriptionContinuityTest {
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = client(server)) {
-            Subscription subscription;
+            PullSubscription subscription;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
                 sut.disconnect().get(5, SECONDS);
@@ -378,7 +383,12 @@ class SubscriptionContinuityTest {
                 // Assert: the requested removal owns the result; the refusal only confirms it.
                 assertThat(subscription.receive()).isEqualTo(new ReceiveResult.Ended());
                 peer.expectPublicationBarrier(sut);
-                Subscription replacement = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
+                PullSubscription replacement = peer.subscribePull(
+                        sut,
+                        "data",
+                        AckMode.ON_RECEIVE,
+                        4
+                );
                 subscription.close();
                 peer.publish("data", 7);
                 assertThat(replacement.receive(Duration.ofSeconds(5)))

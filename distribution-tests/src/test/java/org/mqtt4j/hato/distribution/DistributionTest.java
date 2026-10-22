@@ -189,7 +189,7 @@ class DistributionTest {
                             ),
                             delivery -> handled.add(delivery.message())
                     );
-                    org.mqtt4j.hato.Subscription pull = subscriber.subscribe(
+                    org.mqtt4j.hato.PullSubscription pull = subscriber.subscribe(
                             org.mqtt4j.hato.Subscribe.of(
                                     new org.mqtt4j.hato.TopicFilter("probe/pull"),
                                     org.mqtt4j.hato.Qos.EXACTLY_ONCE
@@ -428,6 +428,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.MqttSubscriptionRefusedException",
                 "org.mqtt4j.hato.MqttVersion",
                 "org.mqtt4j.hato.PublishResult",
+                "org.mqtt4j.hato.PullSubscription",
                 "org.mqtt4j.hato.Qos",
                 "org.mqtt4j.hato.ReasonCode",
                 "org.mqtt4j.hato.ReconnectPolicy",

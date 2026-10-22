@@ -149,7 +149,7 @@ class Qos2PersistenceIntegrationTest {
                             })
                             .build()) {
                 subscriber.connect().get(5, SECONDS);
-                Subscription subscription = subscriber.subscribe(
+                PullSubscription subscription = subscriber.subscribe(
                         Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
                 );
                 subscription.established().get(5, SECONDS);
@@ -210,7 +210,7 @@ class Qos2PersistenceIntegrationTest {
                         })
                         .build()) {
             subscriber.connect().get(5, SECONDS);
-            Subscription subscription = subscriber.subscribe(
+            PullSubscription subscription = subscriber.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
             );
             subscription.established().get(5, SECONDS);
@@ -290,7 +290,7 @@ class Qos2PersistenceIntegrationTest {
                         })
                         .build()) {
             subscriber.connect().get(5, SECONDS);
-            Subscription subscription = subscriber.subscribe(
+            PullSubscription subscription = subscriber.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
             );
             subscription.established().get(5, SECONDS);
@@ -383,7 +383,8 @@ class Qos2PersistenceIntegrationTest {
         return MqttMessage.of(new Topic(topic), new byte[] {value}, Qos.EXACTLY_ONCE, false);
     }
 
-    private static void assertPayload(Subscription subscription, byte expected) throws Exception {
+    private static void assertPayload(PullSubscription subscription, byte expected)
+            throws Exception {
         ReceiveResult.Received received = assertInstanceOf(
                 ReceiveResult.Received.class,
                 subscription.receive(Duration.ofSeconds(5))

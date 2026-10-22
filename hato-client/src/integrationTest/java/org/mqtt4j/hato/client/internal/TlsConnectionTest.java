@@ -35,11 +35,11 @@ import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
-import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.Transport;
@@ -134,7 +134,7 @@ class TlsConnectionTest {
                         .build()
         ) {
             assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("tls/round-trip"), Qos.AT_LEAST_ONCE)
             );
             subscription.established().get(5, SECONDS);

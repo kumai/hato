@@ -8,6 +8,7 @@ import java.util.concurrent.CountDownLatch;
 import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.Subscribe;
@@ -37,7 +38,7 @@ public final class Hello {
                         readingShown.countDown();
                     }
             );
-            Subscription alarms = client.subscribe(
+            PullSubscription alarms = client.subscribe(
                     Subscribe.of(new TopicFilter("alarms/#"), Qos.AT_LEAST_ONCE)
                             .withAckMode(AckMode.MANUAL)
             );

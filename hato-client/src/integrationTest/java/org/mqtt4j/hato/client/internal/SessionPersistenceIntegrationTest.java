@@ -32,6 +32,7 @@ import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
+import org.mqtt4j.hato.PullSubscription;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReceiveResult;
@@ -147,7 +148,7 @@ class SessionPersistenceIntegrationTest {
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (ServerSocket server = listen();
                 MqttClient sut = persistentClient(endpoint(server), ended::add)) {
-            Subscription subscription;
+            PullSubscription subscription;
             try (ScriptedBroker peer = connect(server, sut, false)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
             }
@@ -177,7 +178,7 @@ class SessionPersistenceIntegrationTest {
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (ServerSocket server = listen();
                 MqttClient sut = persistentClient(endpoint(server), ended::add)) {
-            Subscription subscription;
+            PullSubscription subscription;
             MqttDelivery first;
             MqttDelivery second;
             try (ScriptedBroker peer = connect(server, sut, false)) {
@@ -315,8 +316,8 @@ class SessionPersistenceIntegrationTest {
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (ServerSocket server = listen();
                 MqttClient sut = persistentClient(endpoint(server), ended::add)) {
-            Subscription completed;
-            Subscription queued;
+            PullSubscription completed;
+            PullSubscription queued;
             try (ScriptedBroker peer = connect(server, sut, false)) {
                 completed = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 2);
                 queued = peer.subscribePull(sut, "#", AckMode.MANUAL, 2);
@@ -409,7 +410,7 @@ class SessionPersistenceIntegrationTest {
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (ServerSocket server = listen();
                 MqttClient sut = persistentClient(endpoint(server), ended::add)) {
-            Subscription subscription;
+            PullSubscription subscription;
             MqttDelivery old;
             try (ScriptedBroker peer = connect(server, sut, false)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.MANUAL, 1);
@@ -451,9 +452,9 @@ class SessionPersistenceIntegrationTest {
         try (ServerSocket server = listen();
                 MqttClient sut = persistentClient(endpoint(server), ended::add)) {
             MqttDelivery first;
-            Subscription tail;
+            PullSubscription tail;
             try (ScriptedBroker peer = connect(server, sut, false)) {
-                Subscription head = peer.subscribePull(sut, "head", AckMode.MANUAL, 1);
+                PullSubscription head = peer.subscribePull(sut, "head", AckMode.MANUAL, 1);
                 tail = peer.subscribePull(sut, "tail", mode, 1);
                 peer.publish("head", 1);
                 first = received(head.receive(Duration.ofSeconds(5)));
@@ -488,7 +489,7 @@ class SessionPersistenceIntegrationTest {
             boolean cleanStart,
             int subscriptionCount
     ) throws Exception {
-        var subscriptions = new ArrayList<Subscription>();
+        var subscriptions = new ArrayList<PullSubscription>();
         try (ServerSocket server = listen(); MqttClient sut = MqttClient.builder()
                 .server(endpoint(server))
                 .version(MqttVersion.V3_1_1)
@@ -588,7 +589,7 @@ class SessionPersistenceIntegrationTest {
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (ServerSocket server = listen();
                 MqttClient sut = persistentClient(endpoint(server), ended::add)) {
-            Subscription subscription;
+            PullSubscription subscription;
             try (ScriptedBroker peer = connect(server, sut, false)) {
                 subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
             }
@@ -608,7 +609,12 @@ class SessionPersistenceIntegrationTest {
                 removed.get(5, SECONDS);
                 // SP=0 needs no wire removal; SP=1 needs no further removal after UNSUBACK.
                 peer.roundTripBarrier(sut);
-                Subscription replacement = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
+                PullSubscription replacement = peer.subscribePull(
+                        sut,
+                        "data",
+                        AckMode.ON_RECEIVE,
+                        4
+                );
                 peer.publish("data", 8);
                 assertThat(replacement.receive(Duration.ofSeconds(5)))
                         .isInstanceOf(ReceiveResult.Received.class);
@@ -636,7 +642,7 @@ class SessionPersistenceIntegrationTest {
                         .will(will)
                         .connectionListener(recording(notifications))
                         .build()) {
-            Subscription stored = sut.subscribe(
+            PullSubscription stored = sut.subscribe(
                     Subscribe.of(new TopicFilter("stored"), Qos.AT_LEAST_ONCE)
             );
 
@@ -768,7 +774,7 @@ class SessionPersistenceIntegrationTest {
                         .build()) {
             assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
             publisher.connect().get(5, SECONDS);
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
                             .withAckMode(AckMode.ON_RECEIVE)
             );
@@ -892,7 +898,7 @@ class SessionPersistenceIntegrationTest {
                         return Transport.tcp(id);
                     })
                     .build()) {
-                Subscription subscription = sut.subscribe(
+                PullSubscription subscription = sut.subscribe(
                         Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
                 );
 

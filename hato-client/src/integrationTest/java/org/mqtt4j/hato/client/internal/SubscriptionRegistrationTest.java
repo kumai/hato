@@ -44,7 +44,7 @@ class SubscriptionRegistrationTest {
 
             // Act: MQTT permits the broker to deliver before confirming the subscription.
             peer.publish("data", 7);
-            MqttDelivery delivery = pull ? receive(subscription)
+            MqttDelivery delivery = pull ? receive((PullSubscription) subscription)
                     : requireNonNull(handled.poll(5, SECONDS));
 
             // Assert: the already returned handle can consume the delivery without a SUBACK.
@@ -65,7 +65,7 @@ class SubscriptionRegistrationTest {
         // Arrange: establish a persistent MQTT session, but withhold the subscription's reply.
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (ServerSocket server = listen(); MqttClient sut = persistentClient(server, ended)) {
-            Subscription subscription;
+            PullSubscription subscription;
             CompletableFuture<Qos> established;
             try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
                 subscription = sut.subscribe(
@@ -104,7 +104,7 @@ class SubscriptionRegistrationTest {
     void a_registration_survives_a_failed_connection_attempt() throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = ScriptedBroker.client(server)) {
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("data"), Qos.AT_LEAST_ONCE)
             );
             CompletableFuture<Qos> established = subscription.established();
@@ -135,7 +135,7 @@ class SubscriptionRegistrationTest {
         // Arrange
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (ServerSocket server = listen(); MqttClient sut = persistentClient(server, ended)) {
-            Subscription subscription = subscribeThenDisconnect(server, sut, ended);
+            PullSubscription subscription = subscribeThenDisconnect(server, sut, ended);
 
             // Act
             CompletableFuture<Void> removed = subscription.unsubscribe();
@@ -157,7 +157,7 @@ class SubscriptionRegistrationTest {
         // Arrange
         var ended = new LinkedBlockingQueue<Disconnection>();
         try (ServerSocket server = listen(); MqttClient sut = persistentClient(server, ended)) {
-            Subscription subscription = subscribeThenDisconnect(server, sut, ended);
+            PullSubscription subscription = subscribeThenDisconnect(server, sut, ended);
 
             // Act
             CompletableFuture<Void> removed = subscription.unsubscribe();
@@ -229,7 +229,7 @@ class SubscriptionRegistrationTest {
             throws Exception {
         // Arrange
         try (ServerSocket server = listen(); MqttClient sut = ScriptedBroker.client(server)) {
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("data"), Qos.AT_LEAST_ONCE)
             );
             if (previouslyConnected) {
@@ -292,7 +292,7 @@ class SubscriptionRegistrationTest {
         try (ServerSocket server = listen();
                 MqttClient sut = ScriptedBroker.client(server);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = sut.subscribe(
+            PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("data"), Qos.AT_LEAST_ONCE)
             );
             CompletableFuture<Qos> established = subscription.established();
@@ -315,12 +315,12 @@ class SubscriptionRegistrationTest {
     }
 
     /// Establishes a persistent pull subscription, then ends its connection with DISCONNECT.
-    private static Subscription subscribeThenDisconnect(
+    private static PullSubscription subscribeThenDisconnect(
             ServerSocket server,
             MqttClient sut,
             LinkedBlockingQueue<Disconnection> ended
     ) throws Exception {
-        Subscription subscription;
+        PullSubscription subscription;
         try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
             subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
             disconnect(peer, sut);
@@ -338,7 +338,7 @@ class SubscriptionRegistrationTest {
     ) throws Exception {
         PendingRemoval pending;
         try (ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Subscription subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
+            PullSubscription subscription = peer.subscribePull(sut, "data", AckMode.ON_RECEIVE, 4);
             pending = new PendingRemoval(subscription, subscription.unsubscribe());
             assertThat(peer.receive()).isInstanceOf(Packet.Unsubscribe.class);
         }
@@ -385,7 +385,7 @@ class SubscriptionRegistrationTest {
         peer.expectClosed();
     }
 
-    private static MqttDelivery receive(Subscription subscription) throws Exception {
+    private static MqttDelivery receive(PullSubscription subscription) throws Exception {
         ReceiveResult.Received received = assertInstanceOf(
                 ReceiveResult.Received.class,
                 subscription.receive(Duration.ofSeconds(5))
@@ -393,6 +393,6 @@ class SubscriptionRegistrationTest {
         return received.delivery();
     }
 
-    private record PendingRemoval(Subscription subscription, CompletableFuture<Void> removed) {
+    private record PendingRemoval(PullSubscription subscription, CompletableFuture<Void> removed) {
     }
 }
