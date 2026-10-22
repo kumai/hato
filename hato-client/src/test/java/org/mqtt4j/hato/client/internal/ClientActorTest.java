@@ -7767,14 +7767,16 @@ class ClientActorTest {
             );
             establish(transport, b);
 
-            // Act
+            // Act: b's publication waits for a's PUBACK. An overload end goes ahead of work still
+            // queued, so a PUBACK not yet written when b's refusal ends the connection is never
+            // sent.
             transport.receive(qosOnePublication("a", 7, false));
+            Packet acknowledged = requireNonNull(transport.sent.poll(5, SECONDS));
             transport.receive(qosOnePublication("b", 8, false));
 
             // Assert: the acceptance lets the first ack count. The refusal drops the second and
             // ends the connection as overloaded.
-            assertThat(transport.sent.poll(5, SECONDS))
-                    .isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 7));
+            assertThat(acknowledged).isEqualTo(acknowledgement(Qos.AT_LEAST_ONCE, 7));
             assertThat(requireNonNull(ends.poll(5, SECONDS)).cause().orElseThrow())
                     .isInstanceOf(MqttCapacityException.class)
                     .hasMessage("Hand-off capacity");
