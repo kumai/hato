@@ -1,0 +1,2 @@
+% Enable MQTT over TCP and over WebSocket, in place of the image's Prometheus plugin.
+[rabbitmq_mqtt,rabbitmq_web_mqtt].
