@@ -327,10 +327,10 @@ public final class ClientStats {
             this.values = values;
         }
 
-        /// The operation capacity in use, against its limit. A publication holds a slot until its
-        /// future has completed and the future's synchronous continuations have returned, and so
-        /// does each concurrent [MqttClient#connect()] or [MqttClient#disconnect()] call beyond
-        /// the first of each.
+        /// The operation capacity in use, against its limit. A publication holds a slot until just
+        /// before its future completes, so its continuations can start another operation in its
+        /// place, and so does each concurrent [MqttClient#connect()] or [MqttClient#disconnect()]
+        /// call beyond the first of each.
         public Usage operations() {
             return values.operations();
         }

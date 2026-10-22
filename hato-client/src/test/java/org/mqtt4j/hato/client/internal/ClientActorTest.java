@@ -2511,53 +2511,33 @@ class ClientActorTest {
     }
 
     @Test
-    void blocked_continuations_hold_their_slots_but_disconnect_keeps_its_own()
+    void publications_holding_every_operation_slot_cannot_refuse_disconnect()
             throws Exception {
         // Arrange
-        var release = new CountDownLatch(1);
-        var entered = new AtomicInteger();
-        var continuations = new ArrayList<CompletableFuture<Void>>();
         try (MqttClient sut = client()) {
-            // Act: retain the connect slot and every operation slot with blocked continuations.
-            // The previous operation's completion thread may still be returning its slot, so
-            // retry refusals.
-            for (int i = 0; i < 65; i++) {
-                CompletableFuture<ConnAck> connection = await()
-                        .pollInterval(Duration.ofMillis(1))
-                        .until(sut::connect, attempt -> !attempt.isCompletedExceptionally());
-                continuations.add(connection.thenRun(() -> {
-                    entered.incrementAndGet();
-                    waitFor(release);
-                }));
-                ScriptTransport transport = nextTransport();
-                transport.accept();
-                int expected = i + 1;
-                await().pollInterval(Duration.ofMillis(1)).untilAtomic(entered, is(expected));
-                if (i < 64) {
-                    await().pollInterval(Duration.ofMillis(1))
-                            .until(sut::disconnect, attempt -> !attempt.isCompletedExceptionally())
-                            .get(5, SECONDS);
-                    requireNonNull(ends.poll(5, SECONDS));
-                }
+            ScriptTransport transport = connect(sut);
+            var publications = new ArrayList<CompletableFuture<PublishResult>>();
+
+            // Act: QoS 1 publications that await PUBACK hold every operation slot.
+            for (int i = 0; i < 64; i++) {
+                publications.add(sut.publish(MqttMessage.of(
+                        new Topic("messages"),
+                        new byte[] {(byte) i},
+                        Qos.AT_LEAST_ONCE,
+                        false
+                )));
+                assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
             }
 
-            // Assert: saturation refuses connect and publish, but not disconnect.
-            CompletableFuture<ConnAck> refusedConnect = sut.connect();
-            assertThat(refusedConnect).isCompletedExceptionally();
-            assertThatThrownBy(refusedConnect::join)
-                    .hasCauseInstanceOf(MqttCapacityException.class);
-            CompletableFuture<PublishResult> refusedPublish = sut.publish(message(new byte[0]));
-            assertThatThrownBy(refusedPublish::join)
-                    .hasCauseInstanceOf(MqttCapacityException.class);
+            // Assert: saturation refuses another publication, but not disconnect.
+            CompletableFuture<PublishResult> refused = sut.publish(message(new byte[0]));
+            assertThatThrownBy(refused::join).hasCauseInstanceOf(MqttCapacityException.class);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 65));
-            release.countDown();
-            CompletableFuture.allOf(continuations.toArray(CompletableFuture[]::new))
-                    .get(5, SECONDS);
-            await().untilAsserted(() -> assertThat(sut.connect().isCompletedExceptionally())
-                    .isFalse());
-        } finally {
-            release.countDown();
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            for (CompletableFuture<PublishResult> publication : publications) {
+                assertThatThrownBy(() -> publication.get(5, SECONDS))
+                        .hasCauseInstanceOf(MqttConnectionLostException.class);
+            }
         }
     }
 
@@ -4698,7 +4678,8 @@ class ClientActorTest {
             transport.finishClose();
 
             // Assert: both subscriptions remain; only the running handler retains a delivery.
-            var held = new ClientActor.Usage(1, 1, 0, 0, 0, 0, 2, 1, 13, 0);
+            // The blocked continuation holds no operation slot.
+            var held = new ClientActor.Usage(0, 1, 0, 0, 0, 0, 2, 1, 13, 0);
             await().untilAsserted(() -> assertThat(actor.usage()).isEqualTo(held));
 
             // Act
@@ -4714,7 +4695,7 @@ class ClientActorTest {
     }
 
     @Test
-    void publish_continuations_retain_operation_capacity_until_they_return() throws Exception {
+    void publish_continuations_hold_no_operation_capacity() throws Exception {
         // Arrange
         var entered = new AtomicInteger();
         var release = new CountDownLatch(1);
@@ -4723,7 +4704,7 @@ class ClientActorTest {
             ScriptTransport transport = connect(sut);
             transport.completeSends = false;
 
-            // Act: hold every operation slot in a blocked completion callback.
+            // Act: block the completion callbacks of as many publications as there are slots.
             for (int i = 0; i < 64; i++) {
                 CompletableFuture<PublishResult> publication = sut.publish(message(new byte[0]));
                 continuations.add(publication.thenRun(() -> {
@@ -4735,11 +4716,13 @@ class ClientActorTest {
                 int expected = i + 1;
                 await().pollInterval(Duration.ofMillis(1)).untilAtomic(entered, is(expected));
             }
+            CompletableFuture<PublishResult> next = sut.publish(message(new byte[0]));
 
-            // Assert: no new operation is admitted while the callbacks retain all slots.
-            CompletableFuture<PublishResult> refused = sut.publish(message(new byte[0]));
-            assertThat(refused).isCompletedExceptionally();
-            assertThatThrownBy(refused::join).hasCauseInstanceOf(MqttCapacityException.class);
+            // Assert: each publication returned its slot before its callback ran, so the next
+            // one is admitted while every callback still runs.
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            transport.completeSend();
+            next.get(5, SECONDS);
             assertThat(ends).isEmpty();
         } finally {
             release.countDown();

@@ -35,9 +35,10 @@ import java.util.concurrent.CompletableFuture;
 /// is held in memory, so this does not guarantee exactly-once application processing.
 ///
 /// The client completes operations independently of I/O and listener callbacks. One blocked
-/// continuation does not prevent another operation from completing. Slow continuations
-/// retain capacity until they return, so further operations may be rejected; slow listeners
-/// lose their oldest notifications instead; see [ConnectionListener].
+/// continuation does not prevent another operation from completing. Slow continuations of
+/// observations, such as [Subscription#established()], retain their slots until they return,
+/// so further observations may be rejected; slow listeners lose their oldest notifications
+/// instead; see [ConnectionListener].
 /// A returned future may already be complete; subsequently attached continuations follow the
 /// usual [CompletableFuture] execution rules and may run on the attaching application thread.
 ///

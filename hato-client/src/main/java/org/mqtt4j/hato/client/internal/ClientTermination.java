@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.jspecify.annotations.Nullable;
 
@@ -47,10 +48,14 @@ final class ClientTermination {
 
     private final int waiterLimit;
 
-    // Operation slots, including those of connect() and disconnect(), return once their
-    // future's synchronous continuations have run; so do waiter slots. After the cleanup has
-    // completed every pending future, held slots therefore count completions still running.
+    // Operation slots, including those of connect() and disconnect(), return just before their
+    // future completes, and completing counts those completions until their synchronous
+    // continuations have run; a completion takes the count before its slot returns. Waiter
+    // slots return once their continuations have run. After the cleanup has completed every
+    // pending future, held slots and the count therefore cover the completions still running.
     private final List<Semaphore> operationSlots;
+
+    private final AtomicInteger completing = new AtomicInteger();
 
     private final int operationLimit;
 
@@ -146,6 +151,17 @@ final class ClientTermination {
         check();
     }
 
+    /// Counts an operation's completion until its future's synchronous continuations return.
+    /// Call it before the operation slot returns, then [#completionFinished()] once they have.
+    void completionStarted() {
+        completing.incrementAndGet();
+    }
+
+    void completionFinished() {
+        completing.decrementAndGet();
+        check();
+    }
+
     /// Completes the observations once nothing is pending. Parts call this without holding their
     /// own locks whenever they may have become idle, including before close.
     void check() {
@@ -187,7 +203,7 @@ final class ClientTermination {
         if (!transportsClosed) {
             pending.add(Pending.TRANSPORTS);
         }
-        if (heldOperations() != 0 || heldWaiters() != waiters.size()) {
+        if (heldOperations() != 0 || completing.get() != 0 || heldWaiters() != waiters.size()) {
             pending.add(Pending.COMPLETIONS);
         }
         return pending;

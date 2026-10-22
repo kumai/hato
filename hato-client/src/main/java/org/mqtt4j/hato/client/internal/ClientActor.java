@@ -944,13 +944,15 @@ public final class ClientActor implements MqttClient {
             return;
         }
         Thread.ofVirtual().name(threadName("complete-" + token)).start(() -> {
+            termination.completionStarted();
             try {
-                // Reported before the slot returns, so that termination waits for the report.
+                // The slot returns before the future completes, so that its continuations can
+                // start an operation in its place. Termination waits for them through the count.
+                operation.slot.release();
                 reportPublication(operation.timing, failure);
                 operation.finish(result, failure);
             } finally {
-                operation.slot.release();
-                termination.check();
+                termination.completionFinished();
             }
         });
     }
@@ -1741,8 +1743,8 @@ public final class ClientActor implements MqttClient {
         }
     }
 
-    /// Operation slots, including those of connect() and disconnect(), stay held until application
-    /// continuations return, and notifications until the listener returns or the lane drops them;
+    /// Operation slots, including those of connect() and disconnect(), stay held until just before
+    /// their future completes, and notifications until the listener returns or the lane drops them;
     /// lanes and deliveries until handlers return and acknowledgements are released.
     record Usage(
             int operations,
@@ -2080,7 +2082,7 @@ public final class ClientActor implements MqttClient {
 
         final CompletableFuture<T> future = new CompletableFuture<>();
 
-        // Returned once the future's synchronous continuations have run.
+        // Returned just before the future completes.
         final Semaphore slot;
 
         // Present for connect(). The core starts it unless the call joins the current attempt or
