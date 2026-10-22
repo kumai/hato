@@ -704,6 +704,10 @@ class ReceivePersistenceTest {
         }
 
         @Override
+        public void finishConnection() {
+        }
+
+        @Override
         public void connectionRequested(boolean requested) {
         }
 

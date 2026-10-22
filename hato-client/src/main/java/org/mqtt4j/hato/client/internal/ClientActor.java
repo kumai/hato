@@ -1317,6 +1317,11 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
+        public void finishConnection() {
+            io.finish();
+        }
+
+        @Override
         public void connectionRequested(boolean requested) {
             synchronized (lifecycleLock) {
                 mailbox.connectionRequested(requested && !stopping.get());

@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -175,6 +176,93 @@ class BrokerSessionReplacementTest {
         assertThat(port.timers).containsOnlyKeys(DISCONNECT);
         assertThat(port.timers.get(DISCONNECT)).isEqualTo(TIMEOUT);
         assertThat(port.timerGenerations.get(DISCONNECT)).isEqualTo(port.generation);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = Abandoned.class, names = {"FIRST", "DISCARDING"})
+    void the_next_connection_waits_until_the_broker_has_closed_the_replaced_one(
+            Abandoned abandoned
+    ) {
+        // Arrange
+        SessionCore sut = core(false, false);
+        beginConnect(sut);
+        reach(sut, abandoned);
+        receive(sut, connAck(abandoned.sessionPresent));
+        long replaced = port.generation;
+        int opened = port.transportTimeouts.size();
+
+        // Act
+        sut.sent(replaced, port.ticket, 0);
+
+        // Assert: the client closes the connection, and the broker has yet to close it too.
+        assertThat(port.finished).last().isEqualTo(replaced);
+        assertThat(port.generation).isEqualTo(replaced);
+        assertThat(port.transportTimeouts).hasSize(opened);
+        assertThat(port.timers).containsOnlyKeys(DISCONNECT);
+    }
+
+    @Test
+    void the_end_of_the_replaced_connection_opens_the_next_one() {
+        // Arrange
+        SessionCore sut = core(false, false);
+        beginConnect(sut);
+        receive(sut, connAck(true));
+        long replaced = port.generation;
+        sut.sent(replaced, port.ticket, 0);
+
+        // Act
+        sut.failed(replaced, brokerClosed());
+
+        // Assert
+        assertThat(port.continuations).containsExactly(replaced + 1);
+        assertThat(port.transportTimeouts).containsExactly(TIMEOUT, TIMEOUT);
+        assertThat(port.timers).containsOnlyKeys(CONNECT);
+        assertThat(port.ends).isEmpty();
+    }
+
+    @Test
+    void a_replaced_connection_that_stays_open_gives_way_at_its_disconnect_deadline() {
+        // Arrange
+        SessionCore sut = core(false, false);
+        beginConnect(sut);
+        receive(sut, connAck(true));
+        long replaced = port.generation;
+        sut.sent(replaced, port.ticket, 0);
+
+        // Act
+        sut.timer(replaced, DISCONNECT, TIMEOUT.toNanos());
+
+        // Assert: the attempt goes on without the broker's close.
+        assertThat(port.continuations).containsExactly(replaced + 1);
+        assertThat(port.transportTimeouts).containsExactly(TIMEOUT, TIMEOUT);
+        assertThat(port.ends).isEmpty();
+    }
+
+    @Test
+    void a_disconnect_while_the_replaced_connection_closes_ends_the_attempt_at_its_end() {
+        // Arrange
+        SessionCore sut = core(false, false);
+        long operation = beginConnect(sut);
+        receive(sut, connAck(true));
+        long replaced = port.generation;
+        sut.sent(replaced, port.ticket, 0);
+        long disconnect = operation();
+        sut.disconnect(disconnect);
+        assertThat(port.results).doesNotContainKey(disconnect);
+
+        // Act
+        sut.failed(replaced, brokerClosed());
+
+        // Assert: the written DISCONNECT satisfies the disconnect(), and no further connection
+        // opens.
+        assertThat(result(disconnect).failure()).isNull();
+        assertThat(result(operation).failure()).isInstanceOf(MqttConnectException.class)
+                .hasMessage("Connection request withdrawn");
+        assertThat(port.ends).singleElement()
+                .satisfies(end -> assertThat(end.userRequested()).isTrue());
+        assertThat(port.continuations).isEmpty();
+        assertThat(sut.state()).isEqualTo(DISCONNECTED);
+        assertThat(port.timers).isEmpty();
     }
 
     @Test
@@ -555,12 +643,14 @@ class BrokerSessionReplacementTest {
         SessionCore sut = core(false, true);
         long operation = beginConnect(sut);
         receive(sut, connAck(true));
+        sut.sent(port.generation, port.ticket, 0);
         port.failingTimer = CONNECT;
 
-        // Act: the shell reports the scheduler's failure for the next connection.
+        // Act: the shell reports the scheduler's failure for the next connection, which opens
+        // once the broker has closed the replaced one.
         SpiException thrown = catchThrowableOfType(
                 SpiException.class,
-                () -> sut.sent(port.generation, port.ticket, 0)
+                () -> sut.failed(port.generation, brokerClosed())
         );
         sut.schedulerFailed(thrown.generation(), requireNonNull(thrown.getCause()));
 
@@ -633,9 +723,11 @@ class BrokerSessionReplacementTest {
         List<Runnable> steps = List.of(
                 () -> receive(sut, connAck(true)),
                 () -> sut.sent(port.generation, port.ticket, 0),
+                () -> closeFinished(sut),
                 () -> sut.opened(port.generation),
                 () -> receive(sut, connAck(false)),
                 () -> sut.sent(port.generation, port.ticket, 0),
+                () -> closeFinished(sut),
                 () -> sut.opened(port.generation),
                 () -> receive(sut, connAck(false))
         );
@@ -660,9 +752,14 @@ class BrokerSessionReplacementTest {
                 runSome(late, random);
             }
         }
-        // A disconnect() after the last CONNACK waits for this write.
+        // A disconnect() after the last CONNACK waits for this write, and one while a replaced
+        // connection closes waits for its end.
         if (sut.state() == DISCONNECTING) {
-            sut.sent(port.generation, port.ticket, 0);
+            if (port.finished.contains(port.generation)) {
+                sut.failed(port.generation, brokerClosed());
+            } else {
+                sut.sent(port.generation, port.ticket, 0);
+            }
         }
         late.forEach(Runnable::run);
 
@@ -715,6 +812,14 @@ class BrokerSessionReplacementTest {
                 () -> sut.timer(generation, DISCONNECT, TIMEOUT.toNanos()),
                 () -> sut.failed(generation, new IOException("seed " + seed))
         );
+    }
+
+    /// The broker closes the latest connection that the client closed after its DISCONNECT, if
+    /// the core has asked to close one. A connection that has already ended ignores it.
+    private void closeFinished(SessionCore sut) {
+        if (!port.finished.isEmpty()) {
+            sut.failed(port.finished.getLast(), brokerClosed());
+        }
     }
 
     /// Joins the attempt with another connect() while it is still connecting.
@@ -817,14 +922,22 @@ class BrokerSessionReplacementTest {
         writeDisconnect(sut, 0);
     }
 
-    /// Completes the write of the latest DISCONNECT. When the attempt continues, its next
-    /// connection opens at once.
+    /// Completes the write of the latest DISCONNECT. When the attempt continues, the broker then
+    /// closes the connection that the client closed, and the next connection opens.
     private void writeDisconnect(SessionCore sut, long now) {
         long replaced = port.generation;
         sut.sent(replaced, port.ticket, now);
+        if (port.finished.contains(replaced)) {
+            sut.failed(replaced, brokerClosed());
+        }
         if (port.generation != replaced) {
             sut.opened(port.generation);
         }
+    }
+
+    /// The end that a gracefully closing transport reports once the broker has closed too.
+    private static EOFException brokerClosed() {
+        return new EOFException("Peer closed the byte stream");
     }
 
     private List<ConnectFlags> connectFlags() {

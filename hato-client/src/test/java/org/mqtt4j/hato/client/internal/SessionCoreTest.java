@@ -5016,6 +5016,11 @@ class SessionCoreTest {
         }
 
         @Override
+        public void finishConnection() {
+            throw new AssertionError("A clean session never replaces a broker session");
+        }
+
+        @Override
         public void connectionRequested(boolean requested) {
         }
 

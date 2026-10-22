@@ -90,6 +90,12 @@ final class SessionCore {
         /// application, so none of the cleanup that [#end] performs is due.
         void continueAttempt(long generation);
 
+        /// Closes the current connection, which the attempt gave up and whose DISCONNECT is
+        /// written, while its end still reaches the core through [SessionCore#failed] once its
+        /// transport has closed. A transport that closes gracefully does so after the broker
+        /// has closed the connection too.
+        void finishConnection();
+
         void connectionRequested(boolean requested);
 
         void evaluateCredentials(ConnectionAttempt attempt);
@@ -704,22 +710,32 @@ final class SessionCore {
                 return;
             }
             MqttConnectException refusal = current.sessionRefusal;
-            // Unless a disconnect() was requested meanwhile, the attempt goes on.
+            // Unless a disconnect() was requested meanwhile, the attempt goes on once the broker
+            // has closed this connection too. A broker that took the next connection's CONNECT
+            // before this DISCONNECT would end this connection as taken over and publish its
+            // Will; one that sees it closed has handled the DISCONNECT. The DISCONNECT deadline
+            // still bounds the wait.
             if (current.abandoned && refusal == null && state == State.CONNECTING) {
-                openNextConnection(now);
+                current.closing = true;
+                port.finishConnection();
                 return;
             }
-            // The written DISCONNECT satisfies a pending disconnect(), even with a refusal.
-            List<Long> operations = request.takeDisconnections();
-            if (refusal != null) {
-                // The refusal fails the attempt, which the policy may retry like other failures.
-                end(refusal, EndReason.CONNECTION_FAILURE);
-            } else {
-                end(null, EndReason.DISCONNECT_WRITTEN);
-            }
-            for (long operation : operations) {
-                port.complete(operation, null, null);
-            }
+            disconnectWritten(refusal);
+        }
+    }
+
+    /// Ends the connection whose DISCONNECT is written: the refusal, if any, fails the attempt,
+    /// and the written DISCONNECT satisfies a pending disconnect(), even with a refusal.
+    private void disconnectWritten(@Nullable MqttConnectException refusal) {
+        List<Long> operations = request.takeDisconnections();
+        if (refusal != null) {
+            // The refusal fails the attempt, which the policy may retry like other failures.
+            end(refusal, EndReason.CONNECTION_FAILURE);
+        } else {
+            end(null, EndReason.DISCONNECT_WRITTEN);
+        }
+        for (long operation : operations) {
+            port.complete(operation, null, null);
         }
     }
 
@@ -975,6 +991,17 @@ final class SessionCore {
 
     void failed(long connection, Throwable cause) {
         if (connection != generation || !connectionActive()) {
+            return;
+        }
+        if (current.closing) {
+            // The connection that the attempt gave up has ended after its DISCONNECT, or its
+            // DISCONNECT deadline has expired first. The attempt goes on, unless a disconnect()
+            // arrived meanwhile.
+            if (state == State.CONNECTING) {
+                openNextConnection(eventTime);
+            } else {
+                disconnectWritten(null);
+            }
             return;
         }
         PacketDecodeException reported = current.violation;
@@ -1383,6 +1410,9 @@ final class SessionCore {
         // its next connection unless a disconnect() is pending. Only an abandoned connection
         // has a refusal.
         boolean abandoned;
+        // Set once the DISCONNECT of an abandoned connection without a refusal is written, while
+        // the attempt waits for the connection to end before it opens the next one.
+        boolean closing;
         @Nullable MqttConnectException sessionRefusal;
         final ResponseDeadlines responses;
         // This connection's place in its attempt. Ending a connection replaces it with a first

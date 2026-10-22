@@ -599,6 +599,27 @@ final class ClientIo {
         }
     }
 
+    /// Closes the current connection like [#close()], but goes on handing over what it receives
+    /// and reports its end through [Events#ended] once its transport has closed.
+    void finish() {
+        Connection connection;
+        synchronized (sending) {
+            connection = current;
+            current = null;
+            if (connection != null) {
+                connection.queue.close();
+            }
+            sending.notifyAll();
+        }
+        if (connection != null) {
+            try {
+                connection.transport.close();
+            } catch (Throwable failure) {
+                log.warn("Transport close failed for {} at {}", clientId, endpoint, failure);
+            }
+        }
+    }
+
     void close() {
         Connection connection;
         synchronized (sending) {

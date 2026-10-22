@@ -1157,6 +1157,8 @@ class SessionPersistenceTest {
         final List<Long> attempts = new ArrayList<>();
         // The generation of each connection that continued an attempt.
         final List<Long> continuations = new ArrayList<>();
+        // The generation of each given-up connection that the core asked to close.
+        final List<Long> finished = new ArrayList<>();
         final List<Duration> transportTimeouts = new ArrayList<>();
         final List<Duration> reconnectDelays = new ArrayList<>();
         final List<Boolean> requests = new ArrayList<>();
@@ -1196,6 +1198,11 @@ class SessionPersistenceTest {
         public void continueAttempt(long connection) {
             generation = connection;
             continuations.add(connection);
+        }
+
+        @Override
+        public void finishConnection() {
+            finished.add(generation);
         }
 
         @Override
