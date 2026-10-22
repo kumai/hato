@@ -8,6 +8,7 @@ import java.net.Socket;
 import java.net.URI;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -41,7 +42,9 @@ class KeepAliveBacklogTest {
     void a_backlog_for_256_overlapping_subscriptions_does_not_hold_back_keep_alive()
             throws Exception {
         // Arrange: every publication matches all 256 filters, so the backlog outlasts the
-        // broker's allowance of 1.5 seconds for a one-second keep-alive.
+        // broker's allowance of 1.5 seconds for a one-second keep-alive. Where the handlers fall
+        // behind the fan-out, the client drops QoS 0 deliveries once its buffers are full, and
+        // the backlog still drains.
         var ended = new LinkedBlockingQueue<Disconnection>();
         var handled = new AtomicLong();
         try (
@@ -86,17 +89,27 @@ class KeepAliveBacklogTest {
                 synchronized (writer) {
                     socket.getOutputStream().write(burst.toByteArray());
                 }
+                long deliveries = (long) PUBLICATIONS * SUBSCRIPTIONS;
                 await().atMost(Duration.ofSeconds(30)).until(() ->
-                        handled.get() == (long) PUBLICATIONS * SUBSCRIPTIONS || !ended.isEmpty());
+                        handled.get() + overflows(sut) == deliveries || !ended.isEmpty());
                 // One more interval shows that keep-alive continues after the backlog.
                 Thread.sleep(1_200);
 
                 // Assert
                 assertThat(ended).isEmpty();
-                assertThat(handled).hasValue((long) PUBLICATIONS * SUBSCRIPTIONS);
+                assertThat(handled.get() + overflows(sut)).isEqualTo(deliveries);
                 assertThat(silence.longest()).isLessThanOrEqualTo(Duration.ofMillis(1_500));
             }
         }
+    }
+
+    /// The QoS 0 deliveries that the client dropped because its buffers or a subscription's buffer
+    /// were full. A delivery dropped for any other reason does not count, so it fails the test.
+    private static long overflows(MqttClient client) throws Exception {
+        Map<ClientStats.DropReason, Long> dropped =
+                client.stats().get(5, SECONDS).receiving().dropped();
+        return dropped.getOrDefault(ClientStats.DropReason.CLIENT_FULL, 0L)
+                + dropped.getOrDefault(ClientStats.DropReason.SUBSCRIPTION_FULL, 0L);
     }
 
     /// Each of the 256 filters keeps or replaces each of eight levels with +.
