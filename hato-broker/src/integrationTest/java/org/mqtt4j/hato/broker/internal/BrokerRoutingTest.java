@@ -98,29 +98,6 @@ class BrokerRoutingTest {
     }
 
     @Test
-    void retain_publications_are_forwarded_without_retaining_or_replaying_them() throws Exception {
-        try (var sut = MqttBroker.start();
-                var subscriber = connected(sut.port(), "subscriber");
-                var publisher = connected(sut.port(), "publisher")) {
-            subscriber.subscribe("transient", AT_MOST_ONCE);
-            Packet.Publish message = publication("transient", "current", AT_LEAST_ONCE, 7);
-            publisher.send(new Packet.Publish(
-                    message.topic(), message.payload(), message.qos(), true, false, 7, EMPTY
-            ));
-            assertThat(publisher.expect(Packet.PubAck.class))
-                    .isEqualTo(new Packet.PubAck(7, SUCCESS, EMPTY));
-            assertThat(subscriber.expect(Packet.Publish.class))
-                    .isEqualTo(publication("transient", "current", AT_MOST_ONCE, 0));
-
-            // Version 0.2 forwards the message but intentionally has no retained storage.
-            try (var later = connected(sut.port(), "later")) {
-                later.subscribe("transient", AT_MOST_ONCE);
-                later.ping();
-            }
-        }
-    }
-
-    @Test
     void overlapping_subscriptions_receive_one_copy_at_the_highest_matching_qos() throws Exception {
         try (var sut = MqttBroker.start();
                 var subscriber = connected(sut.port(), "subscriber");

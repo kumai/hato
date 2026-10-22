@@ -11,7 +11,7 @@ import org.mqtt4j.hato.broker.MqttBroker;
 
 import static java.util.Objects.requireNonNull;
 
-/// No Local and Retain As Published on the embedded broker.
+/// The MQTT 5.0 subscription options on the embedded broker.
 class EmbeddedBroker5SubscriptionOptionsTest extends Mqtt5SubscriptionOptionsTest {
 
     private static @Nullable MqttBroker broker;

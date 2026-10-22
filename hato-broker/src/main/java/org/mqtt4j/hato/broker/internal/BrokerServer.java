@@ -38,6 +38,7 @@ import org.mqtt4j.hato.broker.internal.common.protocol.UnsupportedProtocolVersio
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
+import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 import static java.util.Objects.requireNonNull;
@@ -71,6 +72,10 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int MAX_SESSIONS = 1024;
 
+    // Retained messages are bounded like the other state that the broker keeps: by count, as
+    // sessions are, and by size, as each session's waiting deliveries are.
+    private static final int MAX_RETAINED = 1024;
+
     // The framing format bounds packet size; a configurable broker cap comes later.
     private static final int MAX_PACKET_SIZE = 268_435_460;
 
@@ -90,6 +95,10 @@ public final class BrokerServer implements AutoCloseable {
 
     private final int maxSessions;
 
+    private final int maxRetained;
+
+    private final long maxRetainedBytes;
+
     private final Timer scheduler;
 
     private final Consumer<Packet> beforeProcess;
@@ -106,6 +115,16 @@ public final class BrokerServer implements AutoCloseable {
 
     private final Map<String, Session> sessions = new HashMap<>();
 
+    // The retained message of each topic, guarded by routing, in the order they were stored.
+    // A new subscription scans them all, which the retained limits keep short; an index by topic
+    // level would replace the scan if productization needs it.
+    private final Map<Topic, Retained> retained = new LinkedHashMap<>();
+
+    private long retainedBytes;
+
+    // Whether the retained limits have refused a message yet; only the first refusal warns.
+    private boolean retainedLimitReached;
+
     private boolean closed;
 
     private BrokerServer(ServerSocket listener, Builder settings) {
@@ -117,6 +136,8 @@ public final class BrokerServer implements AutoCloseable {
         this.maxQueued = settings.maxQueued;
         this.maxQueuedBytes = settings.maxQueuedBytes;
         this.maxSessions = settings.maxSessions;
+        this.maxRetained = settings.maxRetained;
+        this.maxRetainedBytes = settings.maxRetainedBytes;
         this.scheduler = settings.scheduler;
         this.beforeProcess = settings.beforeProcess;
         this.beforeDeliveryWrite = settings.beforeDeliveryWrite;
@@ -147,6 +168,10 @@ public final class BrokerServer implements AutoCloseable {
         private long maxQueuedBytes = SEND_BYTES;
 
         private int maxSessions = MAX_SESSIONS;
+
+        private int maxRetained = MAX_RETAINED;
+
+        private long maxRetainedBytes = SEND_BYTES;
 
         private Timer scheduler = TimerService.instance;
 
@@ -192,6 +217,16 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder maxRetained(int value) {
+            maxRetained = value;
+            return this;
+        }
+
+        Builder maxRetainedBytes(long value) {
+            maxRetainedBytes = value;
+            return this;
+        }
+
         Builder scheduler(Timer value) {
             scheduler = requireNonNull(value, "scheduler must not be null");
             return this;
@@ -219,6 +254,8 @@ public final class BrokerServer implements AutoCloseable {
                 || maxQueued <= 0
                 || maxQueuedBytes <= 0
                 || maxSessions <= 0
+                || maxRetained <= 0
+                || maxRetainedBytes <= 0
             ) {
                 throw new IllegalArgumentException(
                         "Broker limits must be positive and window fit queue"
@@ -313,7 +350,68 @@ public final class BrokerServer implements AutoCloseable {
             }
             sessions.values().forEach(Session::clear);
             sessions.clear();
+            retained.clear();
+            retainedBytes = 0;
         }
+    }
+
+    // Delivers `publication` from `publisher`'s client to every matching subscription, after
+    // making it the retained message of its topic if its RETAIN flag asks for that. Called under
+    // routing.
+    private void route(Packet.Publish publication, Session publisher) {
+        if (publication.retain()) {
+            retain(publication);
+        }
+        // Snapshot permits an overloaded target to remove itself during delivery.
+        for (Session target : List.copyOf(sessions.values())) {
+            target.deliverMatching(publication, publisher);
+        }
+    }
+
+    // Makes `publication` the retained message of its topic in place of the previous one
+    // [MQTT-3.3.1-5]. An empty payload only removes the previous one [MQTT-3.3.1-6]
+    // [MQTT-3.3.1-7]. A message beyond the retained limits is not kept either, which leaves its
+    // topic without a retained message rather than with an outdated one.
+    private void retain(Packet.Publish publication) {
+        Retained previous = retained.remove(publication.topic());
+        if (previous != null) {
+            retainedBytes -= previous.byteCount();
+        }
+        if (publication.payload().length == 0) {
+            return;
+        }
+        // A retained message counts as the MQTT 5.0 PUBLISH that carries it with its properties.
+        byte[] header = PacketCodec.of(MqttVersion.V5).encodePublishHeader(
+                publication.topic(),
+                publication.qos(),
+                true,
+                false,
+                (publication.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
+                publication.properties(),
+                publication.payload().length
+        );
+        var entry = new Retained(publication, header.length + publication.payload().length);
+        if (retained.size() >= maxRetained
+                || entry.byteCount() > maxRetainedBytes - retainedBytes) {
+            if (!retainedLimitReached) {
+                retainedLimitReached = true;
+                log.warn(
+                        "Broker on port {} reached its retained message limits and keeps no"
+                                + " retained message for topic {}; later refusals log at DEBUG",
+                        port(),
+                        publication.topic().name()
+                );
+            } else {
+                log.debug(
+                        "Broker on port {} keeps no retained message for topic {}: limits reached",
+                        port(),
+                        publication.topic().name()
+                );
+            }
+            return;
+        }
+        retained.put(publication.topic(), entry);
+        retainedBytes += entry.byteCount();
     }
 
     // Every session field, including the active connection, belongs to routing.
@@ -330,8 +428,7 @@ public final class BrokerServer implements AutoCloseable {
         // sets it again from its own CONNECT.
         private boolean kept;
 
-        // Each filter's subscription with the options that the client requested. Retain Handling
-        // has no effect, because retained publications are not stored.
+        // Each filter's subscription with the options that the client requested.
         private final Map<TopicFilter, Packet.Subscription> subscriptions = new HashMap<>();
 
         private final PacketIds packetIds = new PacketIds();
@@ -390,6 +487,31 @@ public final class BrokerServer implements AutoCloseable {
             } else if (asPublished >= 0 || cleared >= 0) {
                 Qos qos = Qos.of(Math.min(Math.max(asPublished, cleared), published));
                 deliver(publication, qos, publication.retain() && asPublished >= 0);
+            }
+        }
+
+        // Sends the retained messages that match `subscription`, which the client has just made
+        // or replaced. Each one arrives with RETAIN 1, whatever Retain As Published says, at the
+        // lower of its QoS and the granted one ([MQTT-3.3.1-8] in MQTT 3.1.1). No Local does not
+        // withhold the retained messages of the subscriber's own client: brokers differ here,
+        // and Mosquitto and HiveMQ CE send them while EMQX withholds them.
+        //
+        // Retained messages take the window and the queue of every other delivery, so a
+        // subscription that matches more of them than those hold discards the session like any
+        // other overflow. A deliberate simplification: sending them as the window frees up would
+        // lift that ceiling, if productization needs it.
+        private void deliverRetained(Packet.Subscription subscription) {
+            for (Retained entry : retained.values()) {
+                Packet.Publish publication = entry.publication();
+                if (!subscription.filter().matches(publication.topic())) {
+                    continue;
+                }
+                // An overflow discarded the session; the rest would only fill a dead one.
+                if (sessions.get(clientId) != this) {
+                    return;
+                }
+                int level = Math.min(subscription.qos().level(), publication.qos().level());
+                deliver(publication, Qos.of(level), true);
             }
         }
 
@@ -578,6 +700,10 @@ public final class BrokerServer implements AutoCloseable {
         public Packet.PubRel packet() {
             return new Packet.PubRel(packetId, ReasonCode.SUCCESS, Properties.EMPTY);
         }
+    }
+
+    // A retained message and its share of the retained size limit.
+    private record Retained(Packet.Publish publication, long byteCount) {
     }
 
     private static final class Delivery implements Outgoing {
@@ -908,16 +1034,35 @@ public final class BrokerServer implements AutoCloseable {
                         return;
                     }
                     var grants = new ArrayList<ReasonCode>();
+                    // The subscriptions that receive retained messages after SUBACK.
+                    var retaining = new ArrayList<Packet.Subscription>();
                     for (Packet.Subscription subscription : request.subscriptions()) {
-                        owner.subscriptions.put(subscription.filter(), subscription);
+                        Packet.Subscription replaced = owner.subscriptions.put(
+                                subscription.filter(),
+                                subscription
+                        );
                         ReasonCode granted = switch (subscription.qos()) {
                             case AT_MOST_ONCE -> ReasonCode.SUCCESS;
                             case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
                             case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
                         };
                         grants.add(granted);
+                        // Retain Handling 0 sends retained messages for every SUBSCRIBE, 1 only
+                        // for a new subscription, and 2, the only other value, never
+                        // [MQTT-3.3.1-9] [MQTT-3.3.1-10] [MQTT-3.3.1-11]. MQTT 3.1.1 uses 0.
+                        boolean sendsRetained = switch (subscription.retainHandling()) {
+                            case 0 -> true;
+                            case 1 -> replaced == null;
+                            default -> false;
+                        };
+                        if (sendsRetained) {
+                            retaining.add(subscription);
+                        }
                     }
                     send(new Packet.SubAck(request.packetId(), grants, Properties.EMPTY));
+                    for (Packet.Subscription subscription : retaining) {
+                        owner.deliverRetained(subscription);
+                    }
                 }
                 case Packet.Unsubscribe request -> {
                     var results = new ArrayList<ReasonCode>();
@@ -965,10 +1110,7 @@ public final class BrokerServer implements AutoCloseable {
                         // forwarded on PUBLISH, so nothing is lost.
                         owner.received.clear(publish.packetId());
                     }
-                    // Snapshot permits an overloaded target to remove itself during delivery.
-                    for (Session target : List.copyOf(sessions.values())) {
-                        target.deliverMatching(publish, owner);
-                    }
+                    route(publish, owner);
                     // Acknowledge only after every delivery was enqueued or its target closed.
                     if (publish.qos() == Qos.AT_LEAST_ONCE) {
                         send(new Packet.PubAck(

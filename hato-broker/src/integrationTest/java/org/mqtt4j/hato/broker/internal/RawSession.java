@@ -188,8 +188,14 @@ final class RawSession implements AutoCloseable {
     }
 
     void publish(String topic, String payload, Qos qos, int packetId) throws Exception {
-        send(publication(topic, payload, qos, packetId));
-        switch (qos) {
+        publish(publication(topic, payload, qos, packetId));
+    }
+
+    /// Publishes and completes the acknowledgement that the publication's QoS calls for.
+    void publish(Packet.Publish publication) throws Exception {
+        send(publication);
+        int packetId = publication.packetId();
+        switch (publication.qos()) {
             case AT_MOST_ONCE -> { }
             case AT_LEAST_ONCE -> assertThat(expect(Packet.PubAck.class))
                     .isEqualTo(new Packet.PubAck(packetId, SUCCESS, EMPTY));

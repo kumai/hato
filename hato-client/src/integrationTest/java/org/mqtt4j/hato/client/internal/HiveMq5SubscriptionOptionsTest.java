@@ -15,7 +15,7 @@ import org.mqtt4j.hato.testsupport.HiveMq;
         value = "dockerIsAvailableOrRequired",
         disabledReason = "Docker explicitly optional"
 )
-class HiveMq5SubscriptionOptionsTest extends Mqtt5RetainHandlingTest {
+class HiveMq5SubscriptionOptionsTest extends Mqtt5SubscriptionOptionsTest {
 
     private static final GenericContainer<?> broker = HiveMq.container();
 

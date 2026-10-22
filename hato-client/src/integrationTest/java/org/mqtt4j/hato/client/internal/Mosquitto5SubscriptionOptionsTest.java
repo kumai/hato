@@ -23,7 +23,7 @@ import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
         value = "dockerIsAvailableOrRequired",
         disabledReason = "Docker explicitly optional"
 )
-class Mosquitto5SubscriptionOptionsTest extends Mqtt5RetainHandlingTest {
+class Mosquitto5SubscriptionOptionsTest extends Mqtt5SubscriptionOptionsTest {
 
     private static final GenericContainer<?> broker = Mosquitto.container();
 
