@@ -1,12 +1,13 @@
 package org.mqtt4j.hato.common.io;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
-import org.jspecify.annotations.Nullable;
-
 /// A single FIFO whose regular and reserved quotas come from a possibly shared [Budget].
-/// Active sends retain their quota until completed or ended, even after close.
+/// Active sends retain their quota until completed or ended, even after close. A consumer takes
+/// one send at a time, or a batch of them that it writes together.
 public final class SendQueue<T> {
 
     public enum OfferResult {
@@ -87,7 +88,8 @@ public final class SendQueue<T> {
 
     private boolean closed;
 
-    private @Nullable Send<T> active;
+    // The sends that the consumer has taken and not completed, in queue order; empty when none.
+    private final List<Send<T>> active = new ArrayList<>();
 
     public SendQueue(int regularCount, long regularBytes, int reservedCount, long reservedBytes) {
         this(new Budget(regularCount, regularBytes, reservedCount, reservedBytes));
@@ -131,7 +133,7 @@ public final class SendQueue<T> {
 
     /// Reports whether a pending send can start without taking it or changing its quota.
     public synchronized boolean hasReady() {
-        return !closed && active == null && !pending.isEmpty();
+        return !closed && active.isEmpty() && !pending.isEmpty();
     }
 
     /// Starts the next send only when open and no other send is outstanding. Never waits.
@@ -140,38 +142,52 @@ public final class SendQueue<T> {
             return Optional.empty();
         }
         Send<T> send = pending.removeFirst();
-        active = send;
+        active.add(send);
         return Optional.of(send);
     }
 
-    /// Releases the active send. Once closed, an unknown ticket is ignored instead of rejected.
+    /// Starts the waiting sends as one batch, in order: the next one, and those after it while
+    /// their bytes stay within `byteLimit` in all, so a send larger than the limit goes alone.
+    /// Empty when closed, when nothing waits, or while another send is outstanding. Never waits.
+    /// The batch completes as one, through the ticket of its last send.
+    public synchronized List<Send<T>> pollBatch(long byteLimit) {
+        if (!hasReady()) {
+            return List.of();
+        }
+        long bytes = 0;
+        do {
+            Send<T> send = pending.removeFirst();
+            active.add(send);
+            bytes += send.byteCount();
+        } while (!pending.isEmpty() && pending.getFirst().byteCount() <= byteLimit - bytes);
+        return List.copyOf(active);
+    }
+
+    /// Releases the active sends, named by the ticket of the last one. Once closed, an unknown
+    /// ticket is ignored instead of rejected.
     public synchronized void completed(long ticket) {
-        Send<T> send = active;
-        if (send == null || send.ticket() != ticket) {
+        if (active.isEmpty() || active.getLast().ticket() != ticket) {
             if (!closed) {
                 throw new IllegalStateException("Unexpected send completion: " + ticket);
             }
             return;
         }
-        active = null;
-        release(send);
+        active.forEach(this::release);
+        active.clear();
     }
 
-    /// Stops admission and discards waiting sends. The active send stays with its consumer.
+    /// Stops admission and discards waiting sends. The active sends stay with their consumer.
     public synchronized void close() {
         closed = true;
         pending.forEach(this::release);
         pending.clear();
     }
 
-    /// Releases the active send only after its consumer has stopped using the value.
+    /// Releases the active sends only after their consumer has stopped using the values.
     public synchronized void ended() {
         close();
-        Send<T> send = active;
-        if (send != null) {
-            active = null;
-            release(send);
-        }
+        active.forEach(this::release);
+        active.clear();
     }
 
     private void release(Send<T> send) {

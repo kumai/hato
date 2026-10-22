@@ -2116,7 +2116,12 @@ class ClientActorTest {
             while (written.size() < 64 + 20 + 1) {
                 Packet packet = requireNonNull(second.sent.poll(5, SECONDS));
                 written.add(packet);
-                second.completeSend();
+                // A write can carry several packets, which the transport adds one at a time.
+                // Complete the outstanding write once everything added so far is read; its
+                // later packets then find no write to complete.
+                if (second.pendingTicket != 0 && second.sent.isEmpty()) {
+                    second.completeSend();
+                }
                 if (packet instanceof Packet.PingReq) {
                     second.receive(new Packet.PingResp());
                 }

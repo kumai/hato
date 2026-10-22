@@ -3,6 +3,7 @@ package org.mqtt4j.hato.client.internal;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
@@ -75,6 +76,11 @@ final class ClientIo {
 
     private static final int ACKNOWLEDGEMENT_BYTE_HEADROOM = 64 * 1024;
 
+    // Sends that wait together go out in one write, up to this many bytes, rather than one write
+    // each: every write passes to the transport's writer and back, which costs more than a small
+    // packet itself. A larger send goes alone.
+    static final int BATCH_BYTE_LIMIT = 64 * 1024;
+
     private final URI endpoint;
 
     private final String clientId;
@@ -90,6 +96,9 @@ final class ClientIo {
     private final SendQueue.Budget budget;
 
     private final int regularSendLimit;
+
+    // The most bytes of waiting sends that one write carries together; see [#BATCH_BYTE_LIMIT].
+    private final int batchByteLimit;
 
     // Guards current, shutdown, and each Connection's mutable state. Never call Transport while
     // holding this monitor: its callbacks may acquire it inline.
@@ -114,6 +123,7 @@ final class ClientIo {
             String clientId,
             int maxPacketSize,
             int regularSendLimit,
+            int batchByteLimit,
             Transport.Factory factory,
             Events events,
             PacketCodec codec
@@ -125,6 +135,7 @@ final class ClientIo {
         this.events = events;
         this.codec = codec;
         this.regularSendLimit = regularSendLimit;
+        this.batchByteLimit = batchByteLimit;
         budget = new SendQueue.Budget(
                 regularSendLimit,
                 REGULAR_SEND_BYTE_LIMIT,
@@ -194,7 +205,7 @@ final class ClientIo {
             @Override
             public void onSent(long ticket) {
                 boolean notify;
-                boolean notifyWritten;
+                List<SendQueue.Send<Outbound>> written;
                 synchronized (sending) {
                     if (connection.activeTicket != ticket || !connection.transportOwnsActive) {
                         if (!connection.closed) {
@@ -205,20 +216,23 @@ final class ClientIo {
                         return;
                     }
                     notify = !connection.closed;
-                    notifyWritten = connection.activeNotifyWritten;
+                    written = connection.activeSends;
                 }
-                Runnable completion = null;
+                // One write carried every send of the batch, so each completes now, in order.
+                var completions = new ArrayList<Runnable>(written.size());
                 try {
                     if (notify) {
-                        log.debug("Written ticket {}", ticket);
-                        if (notifyWritten) {
-                            events.written(generation, ticket);
+                        for (SendQueue.Send<Outbound> send : written) {
+                            log.debug("Written ticket {}", send.ticket());
+                            if (send.value().notifyWritten()) {
+                                events.written(generation, send.ticket());
+                            }
+                            completions.add(events.prepareSent(generation, send.ticket()));
                         }
-                        completion = events.prepareSent(generation, ticket);
                     }
                 } finally {
                     synchronized (sending) {
-                        connection.sendCompletion = completion;
+                        connection.sendCompletions = completions;
                         connection.transportOwnsActive = false;
                         releaseCompleted(connection);
                     }
@@ -413,13 +427,14 @@ final class ClientIo {
             while (!shutdown) {
                 Connection connection = current;
                 if (connection != null) {
-                    Optional<SendQueue.Send<Outbound>> next = connection.queue.poll();
-                    if (next.isPresent()) {
-                        SendQueue.Send<Outbound> send = next.orElseThrow();
-                        connection.activeTicket = send.ticket();
-                        connection.activeNotifyWritten = send.value().notifyWritten();
+                    List<SendQueue.Send<Outbound>> batch =
+                            connection.queue.pollBatch(batchByteLimit);
+                    if (!batch.isEmpty()) {
+                        // The transport reports the batch's write by the ticket of its last send.
+                        connection.activeTicket = batch.getLast().ticket();
+                        connection.activeSends = batch;
                         connection.senderOwnsActive = true;
-                        return Optional.of(new Write(connection, send));
+                        return Optional.of(new Write(connection, batch));
                     }
                 }
                 sending.wait();
@@ -430,15 +445,9 @@ final class ClientIo {
 
     private void prepareAndSend(Write write) {
         Connection connection = write.connection();
-        SendQueue.Send<Outbound> send = write.send();
+        List<SendQueue.Send<Outbound>> sends = write.sends();
         try {
-            byte[] bytes = send.value().encode(codec);
-            if (send.value().redacted()) {
-                log.trace("Write attempt for ticket {}: {} bytes (redacted)",
-                        send.ticket(), bytes.length);
-            } else {
-                log.trace("Write attempt for ticket {}: {}", send.ticket(), bytes);
-            }
+            byte[] bytes = encode(sends);
             synchronized (sending) {
                 if (connection.closed) {
                     return;
@@ -447,13 +456,15 @@ final class ClientIo {
                 connection.transportOwnsActive = true;
             }
             Transport.SendResult result;
-            SendReceipt receipt = send.value().receipt();
-            if (receipt != null) {
-                // The peer can reply before send returns or reports its write completion.
-                receipt.markStarted();
+            for (SendQueue.Send<Outbound> send : sends) {
+                SendReceipt receipt = send.value().receipt();
+                if (receipt != null) {
+                    // The peer can reply before send returns or reports its write completion.
+                    receipt.markStarted();
+                }
             }
             try {
-                result = connection.transport.send(send.ticket(), bytes);
+                result = connection.transport.send(sends.getLast().ticket(), bytes);
             } catch (RuntimeException failure) {
                 ended(connection, failure);
                 return;
@@ -461,8 +472,13 @@ final class ClientIo {
                 rejectActive(connection);
                 throw failure;
             }
-            if (result == Transport.SendResult.ACCEPTED && receipt != null) {
-                receipt.markAccepted();
+            if (result == Transport.SendResult.ACCEPTED) {
+                for (SendQueue.Send<Outbound> send : sends) {
+                    SendReceipt receipt = send.value().receipt();
+                    if (receipt != null) {
+                        receipt.markAccepted();
+                    }
+                }
             } else if (result == Transport.SendResult.CLOSED) {
                 rejectActive(connection);
             }
@@ -472,6 +488,38 @@ final class ClientIo {
                 releaseCompleted(connection);
             }
         }
+    }
+
+    /// The bytes of `sends`, one after another, as the one write that carries them.
+    private byte[] encode(List<SendQueue.Send<Outbound>> sends) {
+        if (sends.size() == 1) {
+            return encode(sends.getFirst());
+        }
+        var parts = new ArrayList<byte[]>(sends.size());
+        int length = 0;
+        for (SendQueue.Send<Outbound> send : sends) {
+            byte[] part = encode(send);
+            parts.add(part);
+            length += part.length;
+        }
+        var bytes = new byte[length];
+        int offset = 0;
+        for (byte[] part : parts) {
+            System.arraycopy(part, 0, bytes, offset, part.length);
+            offset += part.length;
+        }
+        return bytes;
+    }
+
+    private byte[] encode(SendQueue.Send<Outbound> send) {
+        byte[] bytes = send.value().encode(codec);
+        if (send.value().redacted()) {
+            log.trace("Write attempt for ticket {}: {} bytes (redacted)",
+                    send.ticket(), bytes.length);
+        } else {
+            log.trace("Write attempt for ticket {}: {}", send.ticket(), bytes);
+        }
+        return bytes;
     }
 
     private void rejectActive(Connection connection) {
@@ -500,16 +548,15 @@ final class ClientIo {
                 && connection.activeTicket != 0) {
             connection.queue.completed(connection.activeTicket);
             connection.activeTicket = 0;
+            connection.activeSends = List.of();
             notifySendCapacity();
-            Runnable completion = connection.sendCompletion;
-            connection.sendCompletion = null;
-            if (completion != null) {
-                // Return capacity before success is observable, and post before the next send.
-                completion.run();
-            }
+            List<Runnable> completions = connection.sendCompletions;
+            connection.sendCompletions = List.of();
+            // Return capacity before success is observable, and post before the next send.
+            completions.forEach(Runnable::run);
             wakeSender(connection);
         }
-        if (connection.sendCompletion == null && connection.pendingEnd != null) {
+        if (connection.sendCompletions.isEmpty() && connection.pendingEnd != null) {
             // A successful inline write precedes EOF even if send has not returned yet.
             // Without a success to preserve, termination never waits for the sender.
             Throwable cause = connection.pendingEnd;
@@ -640,8 +687,8 @@ final class ClientIo {
         }
     }
 
-    /// activeTicket names the queue's active send, or 0; its capacity returns only after neither
-    /// the sender nor the transport still uses it.
+    /// activeTicket names the queue's active batch by its last send, or 0; their capacity returns
+    /// only after neither the sender nor the transport still uses them.
     private static final class Connection {
 
         final long generation;
@@ -649,10 +696,11 @@ final class ClientIo {
         final SendQueue<Outbound> queue;
         boolean closed;
         long activeTicket;
-        boolean activeNotifyWritten;
+        List<SendQueue.Send<Outbound>> activeSends = List.of();
         boolean senderOwnsActive;
         boolean transportOwnsActive;
-        @Nullable Runnable sendCompletion;
+        // The completions of a written batch, which run once its capacity has returned.
+        List<Runnable> sendCompletions = List.of();
         @Nullable Throwable pendingEnd;
         // Admitted PINGREQs that no PINGRESP has answered yet.
         int pings;
@@ -693,6 +741,6 @@ final class ClientIo {
         }
     }
 
-    private record Write(Connection connection, SendQueue.Send<Outbound> send) {
+    private record Write(Connection connection, List<SendQueue.Send<Outbound>> sends) {
     }
 }

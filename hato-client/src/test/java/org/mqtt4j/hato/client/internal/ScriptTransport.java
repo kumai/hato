@@ -2,7 +2,11 @@ package org.mqtt4j.hato.client.internal;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.Consumer;
 
@@ -12,15 +16,16 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.RemainingLength;
 import org.mqtt4j.hato.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
-/// A scripted transport for client tests: it records decoded sends, completes them unless told
-/// not to, and lets a test feed packets and connection events to the client. Like a real
-/// transport, a started one reports its close once; received bytes and that report are
-/// serialized.
+/// A scripted transport for client tests: it records the packets of each send, completes sends
+/// unless told not to, and lets a test feed packets and connection events to the client. A send
+/// carries several packets when the client writes them together. Like a real transport, a
+/// started one reports its close once; received bytes and that report are serialized.
 final class ScriptTransport implements Transport {
 
     private final PacketCodec codec;
@@ -100,15 +105,29 @@ final class ScriptTransport implements Transport {
             throw new IllegalStateException("A send is already outstanding");
         }
         pendingTicket = ticket;
-        Packet packet = codec.decode(bytes);
+        List<Packet> packets = decodeAll(codec, bytes);
         // Decide before a test can observe this send and change the flag for later sends.
         boolean complete = completeSends;
-        sent.add(packet);
+        sent.addAll(packets);
         if (complete) {
             completeSend();
         }
-        afterSend.accept(packet);
+        packets.forEach(afterSend);
         return SendResult.ACCEPTED;
+    }
+
+    /// The packets that the bytes of one send carry, in order.
+    static List<Packet> decodeAll(PacketCodec codec, byte[] bytes) {
+        var packets = new ArrayList<Packet>();
+        var input = ByteBuffer.wrap(bytes);
+        while (input.hasRemaining()) {
+            int start = input.position();
+            input.get();
+            int end = RemainingLength.read(input) + input.position();
+            packets.add(codec.decode(Arrays.copyOfRange(bytes, start, end)));
+            input.position(end);
+        }
+        return packets;
     }
 
     @Override

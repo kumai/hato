@@ -342,6 +342,7 @@ public final class ClientActor implements MqttClient {
                 clientId,
                 maxPacketSize,
                 limits.regularSends(),
+                ClientIo.BATCH_BYTE_LIMIT,
                 transportFactory,
                 new IoEvents(),
                 codec

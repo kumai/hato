@@ -1,11 +1,14 @@
 package org.mqtt4j.hato.common.io;
 
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import static org.mqtt4j.hato.common.io.SendQueue.OfferResult.ACCEPTED;
 import static org.mqtt4j.hato.common.io.SendQueue.OfferResult.CLOSED;
 import static org.mqtt4j.hato.common.io.SendQueue.OfferResult.FULL;
@@ -69,6 +72,67 @@ class SendQueueTest {
         assertThat(sut.offer(6, "closed", 1, true)).isEqualTo(CLOSED);
         sut.ended();
         assertThat(sut.hasReady()).isFalse();
+    }
+
+    @Test
+    void a_batch_takes_the_waiting_sends_within_its_byte_limit_and_completes_as_one() {
+        // Arrange: sends of 3, 4, 3, 1, and 9 bytes wait in turn.
+        var budget = new SendQueue.Budget(8, 100, 0, 0);
+        var sut = new SendQueue<String>(budget);
+        assertThat(sut.offer(1, "first", 3, false)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(2, "second", 4, false)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(3, "third", 3, false)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(4, "fourth", 1, false)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(5, "fifth", 9, false)).isEqualTo(ACCEPTED);
+
+        // Act: the first three fill a 10-byte batch exactly, so the fourth waits.
+        List<SendQueue.Send<String>> batch = sut.pollBatch(10);
+
+        // Assert: nothing else starts until the batch completes through its last ticket.
+        assertThat(batch).extracting(SendQueue.Send::ticket).containsExactly(1L, 2L, 3L);
+        assertThat(sut.hasReady()).isFalse();
+        assertThat(sut.pollBatch(10)).isEmpty();
+        assertThatIllegalStateException().isThrownBy(() -> sut.completed(2));
+        sut.completed(3);
+        assertThat(budget.count()).isEqualTo(2);
+        assertThat(sut.pollBatch(10)).extracting(SendQueue.Send::ticket).containsExactly(4L, 5L);
+        sut.completed(5);
+        assertThat(budget.count()).isZero();
+        assertThat(budget.bytes()).isZero();
+    }
+
+    @Test
+    void a_send_larger_than_the_batch_limit_goes_alone() {
+        // Arrange
+        var sut = new SendQueue<String>(8, 100, 0, 0);
+        assertThat(sut.offer(1, "large", 50, false)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(2, "small", 1, false)).isEqualTo(ACCEPTED);
+
+        // Act & Assert
+        assertThat(sut.pollBatch(10)).extracting(SendQueue.Send::ticket).containsExactly(1L);
+        sut.completed(1);
+        assertThat(sut.pollBatch(10)).extracting(SendQueue.Send::ticket).containsExactly(2L);
+        sut.ended();
+    }
+
+    @Test
+    void an_ended_batch_returns_the_capacity_of_every_send_in_it() {
+        // Arrange
+        var budget = new SendQueue.Budget(4, 100, 1, 10);
+        var sut = new SendQueue<String>(budget);
+        assertThat(sut.offer(1, "first", 3, false)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(2, "reserved", 2, true)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(3, "third", 4, false)).isEqualTo(ACCEPTED);
+        assertThat(sut.pollBatch(100)).hasSize(3);
+
+        // Act: the connection ends while the batch is written.
+        sut.ended();
+
+        // Assert: a late completion of the closed batch is ignored.
+        assertThat(budget.count()).isZero();
+        assertThat(budget.bytes()).isZero();
+        sut.completed(3);
+        assertThat(budget.count()).isZero();
     }
 
     @Test

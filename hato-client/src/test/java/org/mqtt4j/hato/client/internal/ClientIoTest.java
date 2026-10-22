@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -63,11 +64,14 @@ class ClientIoTest {
     // The next created transport throws this from start.
     private volatile @Nullable RuntimeException nextStartFailure;
 
+    // Writes one send at a time, so that the transport sees the ticket of each; the tests of
+    // batched writes make their own.
     private final ClientIo sut = new ClientIo(
             URI.create("mqtt://localhost"),
             "io-test",
             16 * 1024 * 1024,
             128,
+            0,
             _ -> {
                 var transport = new SingleWriteTransport();
                 transport.startFailure = nextStartFailure;
@@ -79,9 +83,150 @@ class ClientIoTest {
             codec
     );
 
+    // The I/Os that the tests of batched writes make.
+    private final List<ClientIo> batching = new ArrayList<>();
+
     @AfterEach
     void close() {
         sut.shutdown();
+        batching.forEach(ClientIo::shutdown);
+    }
+
+    @Test
+    void sends_that_wait_together_go_out_in_one_write_and_each_completes() throws Exception {
+        // Arrange: four acknowledgements wait while a PINGREQ is written.
+        ClientIo sut = batching();
+        sut.open(1, Duration.ofSeconds(30));
+        SingleWriteTransport transport = transports.getLast();
+        var writes = new LinkedBlockingQueue<byte[]>();
+        transport.beforeReturn = writes::add;
+        assertThat(sut.send(1, 1, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        transport.awaitActive();
+        for (int id = 1; id <= 4; id++) {
+            var acknowledgement = new Packet.PubAck(id, ReasonCode.SUCCESS, EMPTY);
+            assertThat(sut.send(1, id + 1, acknowledgement, null)).isEqualTo(ACCEPTED);
+        }
+
+        // Act
+        transport.complete();
+        transport.awaitActive();
+        transport.complete();
+
+        // Assert: one write, named by its last ticket, carried the four in order.
+        assertThat(transport.attempts).containsExactly(1L, 5L);
+        assertThat(ScriptTransport.decodeAll(codec, requireNonNull(writes.poll(5, SECONDS))))
+                .singleElement()
+                .isInstanceOf(Packet.PingReq.class);
+        assertThat(ScriptTransport.decodeAll(codec, requireNonNull(writes.poll(5, SECONDS))))
+                .extracting(packet -> ((Packet.PubAck) packet).packetId())
+                .containsExactly(1, 2, 3, 4);
+        await().untilAsserted(() -> assertThat(events.tickets)
+                .containsExactly(1L, 2L, 3L, 4L, 5L));
+        assertThat(events.written).containsExactly(2L, 3L, 4L, 5L);
+        await().untilAsserted(() -> assertThat(sut.sends()).isZero());
+    }
+
+    @Test
+    void a_send_larger_than_a_batch_goes_alone() {
+        // Arrange: a large publication and two acknowledgements wait while a PINGREQ is written.
+        ClientIo sut = batching();
+        sut.open(1, Duration.ofSeconds(30));
+        SingleWriteTransport transport = transports.getLast();
+        assertThat(sut.send(1, 1, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        transport.awaitActive();
+        MqttMessage large = message(ClientIo.BATCH_BYTE_LIMIT);
+        assertThat(sut.publish(1, 2, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 3, new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 4, new Packet.PubAck(2, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+
+        // Act
+        for (int write = 0; write < 3; write++) {
+            transport.complete();
+        }
+
+        // Assert
+        assertThat(transport.attempts).containsExactly(1L, 2L, 4L);
+        await().untilAsserted(() -> assertThat(events.tickets)
+                .containsExactly(1L, 2L, 3L, 4L));
+    }
+
+    @Test
+    void a_batch_that_its_connection_ends_returns_every_send_and_reports_none_written() {
+        // Arrange: two acknowledgements go out together after a PINGREQ.
+        ClientIo sut = batching();
+        sut.open(1, Duration.ofSeconds(30));
+        SingleWriteTransport transport = transports.getLast();
+        assertThat(sut.send(1, 1, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        transport.awaitActive();
+        assertThat(sut.send(1, 2, new Packet.PubAck(1, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+        assertThat(sut.send(1, 3, new Packet.PubAck(2, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+        transport.complete();
+        transport.awaitActive();
+
+        // Act: the connection ends before the batch's write completes.
+        transport.end(new IOException("connection lost"));
+
+        // Assert
+        await().untilAsserted(() -> assertThat(events.ends).hasSize(1));
+        assertThat(transport.attempts).containsExactly(1L, 3L);
+        assertThat(events.tickets).containsExactly(1L);
+        assertThat(events.written).isEmpty();
+        await().untilAsserted(() -> assertThat(sut.sends()).isZero());
+    }
+
+    @Test
+    void every_publication_in_an_admitted_batch_is_marked_for_its_retry() throws Exception {
+        // Arrange: two QoS 1 publications wait together while a PINGREQ is written.
+        ClientIo sut = batching();
+        sut.open(1, Duration.ofSeconds(30));
+        SingleWriteTransport transport = transports.getLast();
+        var first = new SendReceipt();
+        var second = new SendReceipt();
+        var message = MqttMessage.of(new Topic("a"), new byte[] {1}, Qos.AT_LEAST_ONCE, false);
+        assertThat(sut.send(1, 1, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        transport.awaitActive();
+        assertThat(sut.publish(1, 2, message, 7, first, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+        assertThat(sut.publish(1, 3, message, 8, second, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+        // A peer may answer before send returns, so both writes count as started by then.
+        var startedInSend = new CopyOnWriteArrayList<Boolean>();
+        transport.beforeReturn = _ -> {
+            startedInSend.add(first.started());
+            startedInSend.add(second.started());
+        };
+
+        // Act: the transport admits the batch without reporting its write.
+        transport.complete();
+        transport.awaitActive();
+
+        // Assert
+        assertThat(transport.attempts).containsExactly(1L, 3L);
+        assertThat(startedInSend).containsExactly(true, true);
+        // The sender marks acceptance after send returns.
+        await().until(() -> first.accepted() && second.accepted());
+    }
+
+    /// An I/O that writes the sends waiting together in one write, as the client's does.
+    private ClientIo batching() {
+        var io = new ClientIo(
+                URI.create("mqtt://localhost"),
+                "io-test",
+                16 * 1024 * 1024,
+                128,
+                ClientIo.BATCH_BYTE_LIMIT,
+                _ -> {
+                    var transport = new SingleWriteTransport();
+                    transports.add(transport);
+                    return transport;
+                },
+                events,
+                codec
+        );
+        batching.add(io);
+        return io;
     }
 
     @Test
