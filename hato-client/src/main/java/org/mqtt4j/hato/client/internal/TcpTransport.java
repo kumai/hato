@@ -295,6 +295,7 @@ public final class TcpTransport implements Transport {
     private void read(Connection socket, Listener receiver) throws IOException {
         var buffer = new byte[READ_BUFFER_SIZE];
         InputStream input = socket.input();
+        long busySince = System.nanoTime();
         int count;
         while ((count = input.read(buffer)) != -1) {
             synchronized (callbacks) {
@@ -303,6 +304,12 @@ public final class TcpTransport implements Transport {
                 if (!closed) {
                     receiver.onBytes(Arrays.copyOf(buffer, count));
                 }
+            }
+            // A peer that never pauses keeps every read from blocking, and the reader from
+            // freeing its carrier for the writer, the closing worker, and the client. Whether
+            // the next read blocks is unknown, so the reader parks once a slice is over.
+            if (CarrierShare.due(busySince)) {
+                busySince = CarrierShare.share();
             }
         }
         terminate(new EOFException("Peer closed the byte stream"));

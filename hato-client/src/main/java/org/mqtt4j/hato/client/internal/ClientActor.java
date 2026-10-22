@@ -15,7 +15,6 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
-import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -88,15 +87,6 @@ public final class ClientActor implements MqttClient {
     private static final int MAILBOX_COMMAND_BYTE_LIMIT = 32 * 1024 * 1024;
 
     private static final int RECEIVE_BYTE_LIMIT = 32 * 1024 * 1024;
-
-    // Virtual threads are not preempted, so a busy actor keeps its carrier until it blocks. With
-    // a single carrier, the sender, the transport's workers, and delivery lanes would wait out a
-    // whole receive backlog, and a PINGREQ queued in time would not be written in time. Parking
-    // after this much continuous work lets them run; Thread.yield() alone did not when measured
-    // with one carrier. With 250 microseconds, a one-carrier burst of small publications stayed
-    // within the default queue of a fast handler; with one millisecond, it overflowed. Real time
-    // measures carrier use, which TimerScheduler time cannot express.
-    private static final long CARRIER_SLICE_NANOS = 250_000;
 
     private final URI endpoint;
 
@@ -670,7 +660,11 @@ public final class ClientActor implements MqttClient {
                         core.failed(cause.generation(), requireNonNull(cause.getCause()));
                     }
                 }
-                busySince = shareCarrier(busySince);
+                if (CarrierShare.due(busySince)) {
+                    // The actor blocks next when its mailbox is empty, which frees the carrier
+                    // without parking.
+                    busySince = mailbox.size() == 0 ? System.nanoTime() : CarrierShare.share();
+                }
             }
         } catch (Throwable cause) {
             failure = cause;
@@ -734,20 +728,6 @@ public final class ClientActor implements MqttClient {
                 }
             }
         }
-    }
-
-    /// Returns when the current slice of continuous work began.
-    private long shareCarrier(long busySince) {
-        long now = System.nanoTime();
-        if (now - busySince < CARRIER_SLICE_NANOS) {
-            return busySince;
-        }
-        if (mailbox.size() == 0) {
-            // The actor blocks next, which frees the carrier without parking.
-            return now;
-        }
-        LockSupport.parkNanos(1);
-        return System.nanoTime();
     }
 
     private void deliveryReady() {
