@@ -30,12 +30,17 @@ testing {
                 implementation(project(":test-support"))
             }
             // Measurements run only when asked for, with -Phato.measure=true, and print their
-            // results instead of asserting limits. Other runs leave them out rather than skip
-            // them, so a build still skips no test.
+            // results instead of asserting limits; -Phato.measure.minutes sets the length of the
+            // endurance runs. Other runs leave them out rather than skip them, so a build still
+            // skips no test.
             targets.configureEach {
                 testTask.configure {
                     val measure = providers.gradleProperty("hato.measure").orElse("false").get()
                     systemProperty("hato.measure", measure)
+                    systemProperty(
+                        "hato.measure.minutes",
+                        providers.gradleProperty("hato.measure.minutes").orElse("30").get()
+                    )
                     if (measure != "true") {
                         filter {
                             excludeTestsMatching("*MeasurementTest")
