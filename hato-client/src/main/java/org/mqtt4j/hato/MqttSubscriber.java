@@ -87,7 +87,7 @@ public interface MqttSubscriber {
     /// handle ends, and [Subscription#established()] fails with [IllegalStateException] for
     /// duplicates or overlap, or [MqttCapacityException] for capacity. Pull receive methods
     /// report the same registration failure. The client permits as many registrations as
-    /// [MqttClientBuilder#maxSubscriptions(int)] sets, 256 by default, including ones awaiting
+    /// [MqttClientBuilder#maxSubscriptions(int)] sets, 4,096 by default, including ones awaiting
     /// establishment or broker removal. Registration does not consume operation capacity.
     /// The same original filter remains reserved while pending, active, or awaiting removal.
     ///

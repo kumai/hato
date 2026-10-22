@@ -898,8 +898,9 @@ class ClientActorTest {
     @Test
     void all_closed_registrations_are_retained_within_capacity_and_removed_when_writes_resume()
             throws Exception {
-        // Arrange: establish the full registration budget without starting any delivery workers.
-        try (MqttClient sut = client()) {
+        // Arrange: establish the full registration budget of a client of 256 subscriptions
+        // without starting any delivery workers.
+        try (MqttClient sut = client(new ClientLimits(64, 256))) {
             ScriptTransport transport = connect(sut);
             var subscriptions = new ArrayList<Subscription>();
             for (int i = 0; i < 256; i++) {
@@ -3110,11 +3111,12 @@ class ClientActorTest {
     @Test
     void a_registration_refused_by_the_lanes_leaves_its_filter_available()
             throws Exception {
-        // Arrange: an unsubscribed push lane stays retained while its handler runs, so 256 lanes
-        // are held while only 255 subscriptions remain registered.
+        // Arrange: in a client of 256 subscriptions, an unsubscribed push lane stays retained
+        // while its handler runs, so 256 lanes are held while only 255 subscriptions remain
+        // registered.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        try (MqttClient client = client()) {
+        try (MqttClient client = client(new ClientLimits(64, 256))) {
             var sut = (ClientActor) client;
             ScriptTransport transport = connect(sut);
             for (int i = 0; i < 255; i++) {

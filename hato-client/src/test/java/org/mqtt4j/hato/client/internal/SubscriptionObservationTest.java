@@ -37,10 +37,10 @@ class SubscriptionObservationTest {
         // Arrange: hold connection startup so no registration can leave the mailbox.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        try (MqttClient sut = client(() -> {
+        try (MqttClient sut = builder(() -> {
             entered.countDown();
             waitFor(release);
-        })) {
+        }).maxSubscriptions(256).build()) {
             CompletableFuture<ConnAck> connected = sut.connect();
             assertThat(entered.await(5, SECONDS)).isTrue();
             var subscriptions = new ArrayList<Subscription>();
@@ -224,6 +224,10 @@ class SubscriptionObservationTest {
     }
 
     private MqttClient client(Runnable onStart) {
+        return builder(onStart).build();
+    }
+
+    private MqttClientBuilder builder(Runnable onStart) {
         return MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
                 .version(MqttVersion.V3_1_1)
@@ -234,8 +238,7 @@ class SubscriptionObservationTest {
                     transport.onStart = onStart;
                     transports.add(transport);
                     return transport;
-                })
-                .build();
+                });
     }
 
     private static void accept(ScriptTransport transport, CompletableFuture<ConnAck> connected)

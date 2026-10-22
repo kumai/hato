@@ -341,7 +341,7 @@ class ClientStatsTest {
                     .containsExactly(removed);
             assertThat(removing.subscribing().removing()).isEqualTo(2);
             assertThat(removing.subscribing().registrations())
-                    .isEqualTo(new Usage(2, 256));
+                    .isEqualTo(new Usage(2, 4_096));
 
             // Act
             transport.receive(new Packet.UnsubAck(first.packetId(), List.of(), EMPTY));
@@ -592,9 +592,10 @@ class ClientStatsTest {
 
     @Test
     void registrations_beyond_the_registration_queue_are_refused_and_counted() throws Exception {
-        // Arrange: 256 registrations wait behind the snapshot that holds the actor.
+        // Arrange: a client of 256 subscriptions, whose 256 registrations wait behind the
+        // snapshot that holds the actor.
         var release = new CountDownLatch(1);
-        try (MqttClient sut = builder().build()) {
+        try (MqttClient sut = builder().maxSubscriptions(256).build()) {
             CompletableFuture<ClientStats> pending = holdActorInStats(sut, release);
             for (int i = 0; i < 256; i++) {
                 sut.subscribe(

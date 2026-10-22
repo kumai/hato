@@ -12,7 +12,7 @@ package org.mqtt4j.hato.client.internal;
 public record ClientLimits(int inflightPublishes, int subscriptions) {
 
     /// The builder's defaults.
-    public static final ClientLimits DEFAULT = new ClientLimits(64, 256);
+    public static final ClientLimits DEFAULT = new ClientLimits(64, 4_096);
 
     // QoS 0 publications share the operation slots with QoS 1 and QoS 2, so a small inflight
     // limit still leaves them this many.

@@ -1306,29 +1306,32 @@ class SessionCoreTest {
 
     @Test
     void offline_registrations_are_bounded_and_share_the_pending_suback_window() {
-        // Arrange: every registration exists before a connection is requested.
-        for (int i = 0; i < 256; i++) {
+        // Arrange: every registration that the default limit allows exists before a connection
+        // is requested.
+        int limit = ClientLimits.DEFAULT.subscriptions();
+        for (int i = 0; i < limit; i++) {
             sut.subscribe(2 + i, subscription("offline/" + i));
         }
-        sut.subscribe(300, subscription("overflow"));
+        long overflow = 2 + limit;
+        sut.subscribe(overflow, subscription("overflow"));
         assertThat(port.sent).isEmpty();
-        assertThat(port.registered).hasSize(256);
-        assertThat(requireNonNull(port.results.get(300L)).failure())
+        assertThat(port.registered).hasSize(limit);
+        assertThat(requireNonNull(port.results.get(overflow)).failure())
                 .isInstanceOf(MqttCapacityException.class);
 
         // Act
         connected();
 
         // Assert: initial registrations use the same bounded window as recreated ones.
-        for (int i = 0; i < 256; i++) {
-            assertThat(port.sent).hasSize(Math.min(256, i + 16));
+        for (int i = 0; i < limit; i++) {
+            assertThat(port.sent).hasSize(Math.min(limit, i + 16));
             var packet = (Packet.Subscribe) port.sent.get(i);
             assertThat(packet.subscriptions().getFirst().filter())
                     .isEqualTo(new TopicFilter("offline/" + i));
             receive(1, new Packet.SubAck(packet.packetId(), List.of(ReasonCode.SUCCESS), EMPTY), 0);
         }
-        assertThat(port.registered).hasSize(256).doesNotHaveDuplicates();
-        assertThat(port.grants).hasSize(256);
+        assertThat(port.registered).hasSize(limit).doesNotHaveDuplicates();
+        assertThat(port.grants).hasSize(limit);
         assertThat(port.removed).isEmpty();
     }
 

@@ -149,8 +149,8 @@ class MqttClientBuilderTest {
     }
 
     @Test
-    void a_client_holds_64_publications_and_256_subscriptions_by_default() throws Exception {
-        assertLimitsHold(configuredBuilder(), 64, 256);
+    void a_client_holds_64_publications_and_4096_subscriptions_by_default() throws Exception {
+        assertLimitsHold(configuredBuilder(), 64, 4_096);
     }
 
     @Test
@@ -160,7 +160,7 @@ class MqttClientBuilderTest {
 
     @Test
     void a_client_holds_more_subscriptions_than_the_default_when_configured() throws Exception {
-        assertLimitsHold(configuredBuilder().maxSubscriptions(1_000), 64, 1_000);
+        assertLimitsHold(configuredBuilder().maxSubscriptions(10_000), 64, 10_000);
     }
 
     @Test
@@ -787,8 +787,9 @@ class MqttClientBuilderTest {
         // Arrange
         try (MqttClient sut = builder.transportFactory(_ -> new SilentBroker()).build()) {
             sut.connect().get(5, SECONDS);
+            var heldPublications = new ArrayList<CompletableFuture<PublishResult>>();
             for (int i = 0; i < publications; i++) {
-                CompletableFuture<PublishResult> _ = sut.publish(qosOneMessage());
+                heldPublications.add(sut.publish(qosOneMessage()));
             }
             for (int i = 0; i < subscriptions; i++) {
                 Subscription _ = sut.subscribe(
@@ -800,11 +801,16 @@ class MqttClientBuilderTest {
             CompletableFuture<PublishResult> publication = sut.publish(qosOneMessage());
             Subscription subscription = sut.subscribe(request());
 
-            // Assert
+            // Assert: the one beyond each limit is refused, after none within it was. The stats
+            // count the subscriptions, as waiting for thousands of them would exceed the
+            // client's waiters.
             assertThatThrownBy(() -> publication.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class);
             assertThatThrownBy(() -> subscription.established().get(5, SECONDS))
                     .hasCauseInstanceOf(MqttCapacityException.class);
+            assertThat(heldPublications).noneMatch(CompletableFuture::isCompletedExceptionally);
+            assertThat(sut.stats().get(5, SECONDS).subscribing().registrations())
+                    .isEqualTo(new ClientStats.Usage(subscriptions, subscriptions));
         }
     }
 
