@@ -2,7 +2,9 @@ package org.mqtt4j.hato.client.internal;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -14,9 +16,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The client against a broker's own WebSocket listener: the round trip at every QoS level, in
-/// both protocol versions, and the end after `disconnect()`. Each product's subclass starts its
-/// broker and names the listener.
+/// The client against a broker's own WebSocket listener: the round trip at every QoS level that
+/// the broker takes, in both protocol versions, and the end after `disconnect()`. Each product's
+/// subclass starts its broker and names the listener.
 abstract class WebSocketRoundTripTest {
 
     @ParameterizedTest
@@ -38,7 +40,10 @@ abstract class WebSocketRoundTripTest {
             );
             subscription.established().get(5, SECONDS);
 
-            for (Qos qos : Qos.values()) {
+            List<Qos> levels = Stream.of(Qos.values())
+                    .filter(qos -> qos.level() <= maximumQos().level())
+                    .toList();
+            for (Qos qos : levels) {
                 var message = MqttMessage.of(
                         new Topic(topic),
                         new byte[] {(byte) qos.level()},
@@ -62,4 +67,9 @@ abstract class WebSocketRoundTripTest {
 
     /// The `ws` URI of the broker's WebSocket listener.
     abstract URI endpoint();
+
+    /// The highest QoS that the broker takes, as recorded for it.
+    Qos maximumQos() {
+        return Qos.EXACTLY_ONCE;
+    }
 }
