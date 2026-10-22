@@ -10,13 +10,16 @@ import java.security.KeyStore;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.ClientStats;
 import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.MetricsListener;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttClientBuilder;
 import org.mqtt4j.hato.MqttMessage;
@@ -36,9 +39,9 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 /// Verifies that the packaged client and broker exchange messages at every QoS level in a native
 /// image, through a handler, through a striped handler, and through receiving on the caller's
 /// thread, in MQTT 3.1.1 and in MQTT 5.0 with message properties, over TCP, TLS, WebSocket, and
-/// WebSocket over TLS. A WebSocket relay in front of the broker serves WebSocket, and a TLS relay
-/// in front of the broker or of the WebSocket relay presents the repository's test server
-/// identity.
+/// WebSocket over TLS, with limits other than the defaults, statistics, and metrics events. A
+/// WebSocket relay in front of the broker serves WebSocket, and a TLS relay in front of the broker
+/// or of the WebSocket relay presents the repository's test server identity.
 /// The image reads the identities at run time from the directory given as the only argument,
 /// `test-support/src/main/resources/tls` in this repository: embedding them would take
 /// native-image resource metadata, which Hato itself does not need.
@@ -46,6 +49,11 @@ public final class NativeSmoke {
 
     // Like the identities themselves, their password is public test data.
     private static final String PASSWORD = "hato-test-only";
+
+    // Limits other than the defaults, which the statistics then show.
+    private static final int MAX_INFLIGHT_PUBLISHES = 8;
+
+    private static final int MAX_SUBSCRIPTIONS = 16;
 
     private NativeSmoke() {
     }
@@ -100,18 +108,35 @@ public final class NativeSmoke {
         System.out.println(
                 "hato native smoke: QoS 0/1/2 through handler, striped handler, and receive"
                         + " in MQTT 3.1.1, and in MQTT 5.0 with properties, over TCP, TLS, WS,"
-                        + " and WSS OK"
+                        + " and WSS, with limits, statistics, and metrics events OK"
         );
     }
 
+    // Closing before the end of the block lets termination deliver the metrics events first.
+    @SuppressWarnings("try")
     private static void roundTrip(
             String route,
             MqttVersion version,
             MqttClientBuilder builder
     ) throws Exception {
         var ended = new LinkedBlockingQueue<Disconnection>();
+        var completions = new AtomicInteger();
+        var starts = new AtomicInteger();
         try (MqttClient client = builder
                 .connectionListener(ended::add)
+                .maxInflightPublishes(MAX_INFLIGHT_PUBLISHES)
+                .maxSubscriptions(MAX_SUBSCRIPTIONS)
+                .metricsListener(new MetricsListener() {
+                    @Override
+                    public void onPublishCompleted(PublishCompletion completion) {
+                        completions.incrementAndGet();
+                    }
+
+                    @Override
+                    public void onDeliveryStarted(DeliveryStart start) {
+                        starts.incrementAndGet();
+                    }
+                })
                 .build()) {
             if (client.connect().get(5, SECONDS).sessionPresent()) {
                 throw new AssertionError(route + " clean connection resumed a session");
@@ -167,6 +192,17 @@ public final class NativeSmoke {
                 }
             }
 
+            // The statistics show the limits set on the builder, the three subscriptions, the
+            // finished publications, and the nine deliveries that the subscriptions took.
+            ClientStats stats = client.stats().get(5, SECONDS);
+            var registrations = new ClientStats.Usage(3, MAX_SUBSCRIPTIONS);
+            var publications = new ClientStats.Usage(0, MAX_INFLIGHT_PUBLISHES);
+            if (!stats.subscribing().registrations().equals(registrations)
+                    || !stats.sending().publications().equals(publications)
+                    || stats.receiving().deliveries() != 9) {
+                throw new AssertionError(route + " statistics are " + stats);
+            }
+
             push.unsubscribe().get(5, SECONDS);
             pull.unsubscribe().get(5, SECONDS);
             stripes.unsubscribe().get(5, SECONDS);
@@ -178,6 +214,16 @@ public final class NativeSmoke {
             // shows that the connection lasted until the requested disconnect.
             if (!Disconnection.of(null, true, 1).equals(ended.poll(5, SECONDS))) {
                 throw new AssertionError(route + " connection ended before the disconnect");
+            }
+            // Termination waits for the queued metrics events: one for each of the nine
+            // publications and one for each of the nine deliveries.
+            client.close();
+            client.terminated().get(5, SECONDS);
+            if (completions.get() != 9 || starts.get() != 9) {
+                throw new AssertionError(
+                        route + " metrics events: " + completions + " publications, "
+                                + starts + " deliveries"
+                );
             }
         }
     }
