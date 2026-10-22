@@ -327,8 +327,9 @@ Subscription subscription = client.handOff(
 - Return `false` when your mailbox is full. The client treats that as a full subscription
   queue: a QoS 0 message is dropped, and a QoS 1 or 2 message ends the connection.
 - One thread of the client offers the messages of all its hand-off subscriptions in the order
-  they arrive, so your mailbox sees one order across them. Never wait in the acceptor: use
-  `offer`, not `put`, or the other hand-off subscriptions wait too.
+  they arrive, so your mailbox sees one order across them, and `delivery.filter()` tells which
+  subscription each message came through. Never wait in the acceptor: use `offer`, not `put`,
+  or the other hand-off subscriptions wait too.
 - To stop, close the subscription, wait for `subscription.terminated()`, and then drain or
   discard your mailbox: nothing is offered after that. Each message reports
   `delivery.connectionAttempt()`, so messages kept across a reconnection can be told apart

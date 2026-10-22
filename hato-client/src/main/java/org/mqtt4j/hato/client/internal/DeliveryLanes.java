@@ -38,6 +38,7 @@ import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.Subscribe;
+import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 
 import static java.util.Objects.requireNonNull;
@@ -192,6 +193,7 @@ final class DeliveryLanes {
     ) {
         return registerLane(new Lane(
                 id,
+                request.filter(),
                 request.bufferCapacity(),
                 request.ackMode().orElse(AckMode.AFTER_HANDLER),
                 request.failurePolicy(),
@@ -206,6 +208,7 @@ final class DeliveryLanes {
     boolean registerHandOff(long id, Subscribe request, Predicate<MqttDelivery> acceptor) {
         return registerLane(new Lane(
                 id,
+                request.filter(),
                 request.bufferCapacity(),
                 request.ackMode().orElse(AckMode.ON_RECEIVE),
                 request.failurePolicy(),
@@ -223,6 +226,7 @@ final class DeliveryLanes {
         }
         return new Receiver(new Lane(
                 id,
+                request.filter(),
                 request.bufferCapacity(),
                 request.ackMode().orElse(AckMode.ON_RECEIVE),
                 FailurePolicy.STOP,
@@ -2043,6 +2047,8 @@ final class DeliveryLanes {
     private static final class Lane {
 
         final long id;
+        // The subscription's original filter, which each of its deliveries reports.
+        final TopicFilter filter;
         final int capacity;
         final AckMode ackMode;
         final FailurePolicy failurePolicy;
@@ -2082,6 +2088,7 @@ final class DeliveryLanes {
 
         Lane(
                 long id,
+                TopicFilter filter,
                 int capacity,
                 AckMode ackMode,
                 FailurePolicy failurePolicy,
@@ -2091,6 +2098,7 @@ final class DeliveryLanes {
                 Condition ready
         ) {
             this.id = id;
+            this.filter = filter;
             this.capacity = capacity;
             this.ackMode = ackMode;
             this.failurePolicy = failurePolicy;
@@ -2283,6 +2291,8 @@ final class DeliveryLanes {
         final RetainedDelivery delivery;
         final Recipient recipient;
         final MqttMessage message;
+        // Copied from the lane, which a released view drops.
+        final TopicFilter filter;
         final boolean dup;
         // The token of the arrival that delivered this copy. For a retransmission, its
         // connection and attempt can be later than the receipt's first.
@@ -2313,6 +2323,7 @@ final class DeliveryLanes {
             this.message = message;
             this.dup = dup;
             this.arrival = arrival;
+            filter = lane.filter;
             released = delivery.token.acknowledgement() == 0;
         }
 
@@ -2329,6 +2340,11 @@ final class DeliveryLanes {
         @Override
         public long connectionAttempt() {
             return arrival.attempt();
+        }
+
+        @Override
+        public TopicFilter filter() {
+            return filter;
         }
 
         @Override

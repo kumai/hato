@@ -16,6 +16,18 @@ public interface MqttDelivery {
     /// connection ends can tell them from the current connection's by comparing the two.
     long connectionAttempt();
 
+    /// The original filter of the subscription that received this delivery, including any shared
+    /// group name, as [Subscription#filter()] returns it. A handler or hand-off acceptor shared
+    /// by several subscriptions can tell their deliveries apart by it, because the client
+    /// reserves a filter for one subscription while it is pending, active, or awaiting removal.
+    /// Deliveries that a removed subscription accepted can still run or be received after the
+    /// same filter is registered again; the deliveries of both subscriptions then name that
+    /// filter. A copy that reaches overlapping subscriptions becomes one delivery for each of
+    /// them, each naming its own subscription. Where the client cannot tell which subscription a
+    /// broker meant a copy for, as described in [MqttSubscriber], this names the subscription that
+    /// the copy reached.
+    TopicFilter filter();
+
     /// Acknowledges this subscription's QoS 1 or QoS 2 delivery in [AckMode#MANUAL] mode.
     /// Safe to call from any thread, including before the handler returns. Repeated calls,
     /// QoS 0, other acknowledgement modes, and calls after the receiving session ends have no

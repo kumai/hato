@@ -77,17 +77,19 @@ class MosquittoMessagingTest extends MessagingTest {
     void broker_copies_for_overlapping_filters_reach_each_matching_subscription() throws Exception {
         // Arrange
         String base = uniqueTopic();
+        var wildcardFilter = new TopicFilter(base + "/#");
+        var exactFilter = new TopicFilter(base + "/data");
         var wildcard = new LinkedBlockingQueue<MqttDelivery>();
         var exact = new LinkedBlockingQueue<MqttDelivery>();
         MqttMessage publication = message(base + "/data", (byte) 3);
         try (MqttClient sut = client()) {
             sut.connect().get(5, SECONDS);
             sut.subscribe(
-                    Subscribe.of(new TopicFilter(base + "/#"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(wildcardFilter, Qos.AT_MOST_ONCE),
                     wildcard::add
             ).established().get(5, SECONDS);
             sut.subscribe(
-                    Subscribe.of(new TopicFilter(base + "/data"), Qos.AT_MOST_ONCE),
+                    Subscribe.of(exactFilter, Qos.AT_MOST_ONCE),
                     exact::add
             ).established().get(5, SECONDS);
 
@@ -97,13 +99,16 @@ class MosquittoMessagingTest extends MessagingTest {
 
             // Assert: an MQTT 5.0 copy names its subscription by the Subscription Identifier, so
             // each subscription receives one. An MQTT 3.1.1 copy names none, so each copy
-            // reaches both subscriptions.
+            // reaches both subscriptions. Either way, each delivery names the subscription that
+            // received it.
             int copies = version() == MqttVersion.V5 ? 1 : 2;
             for (int i = 0; i < copies; i++) {
-                assertThat(requireNonNull(wildcard.poll(5, SECONDS)).message())
-                        .isEqualTo(publication);
-                assertThat(requireNonNull(exact.poll(5, SECONDS)).message())
-                        .isEqualTo(publication);
+                MqttDelivery broad = requireNonNull(wildcard.poll(5, SECONDS));
+                assertThat(broad.message()).isEqualTo(publication);
+                assertThat(broad.filter()).isEqualTo(wildcardFilter);
+                MqttDelivery narrow = requireNonNull(exact.poll(5, SECONDS));
+                assertThat(narrow.message()).isEqualTo(publication);
+                assertThat(narrow.filter()).isEqualTo(exactFilter);
             }
 
             // FIFO delivery of the barrier proves no further copy preceded it in the wildcard

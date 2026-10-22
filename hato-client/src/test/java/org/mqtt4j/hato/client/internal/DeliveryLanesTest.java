@@ -203,6 +203,41 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void each_delivered_copy_names_the_filter_of_the_subscription_that_received_it()
+            throws Exception {
+        // Arrange: a push, a hand-off, and a pull subscription whose filters all match "a".
+        var exact = new TopicFilter("a");
+        var level = new TopicFilter("+");
+        var everything = new TopicFilter("#");
+        var pushed = new LinkedBlockingQueue<MqttDelivery>();
+        var handedOff = new LinkedBlockingQueue<MqttDelivery>();
+        assertThat(sut.register(1, Subscribe.of(exact, Qos.AT_LEAST_ONCE), pushed::add)).isTrue();
+        assertThat(sut.registerHandOff(
+                2,
+                Subscribe.of(level, Qos.AT_LEAST_ONCE),
+                handedOff::add
+        )).isTrue();
+        DeliveryLanes.Receiver pulled = registerPull(
+                sut,
+                3,
+                Subscribe.of(everything, Qos.AT_LEAST_ONCE)
+        );
+
+        // Act: a QoS 1 and a QoS 0 publication, which take separate admission paths, reach all
+        // three subscriptions.
+        assertThat(sut.deliver(token(1, 10), List.of(1L, 2L, 3L), qosOneMessage(), false, 10))
+                .isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L, 2L, 3L), message(2), false, 1)).isTrue();
+
+        // Assert
+        for (int copy = 0; copy < 2; copy++) {
+            assertThat(requireNonNull(pushed.poll(5, SECONDS)).filter()).isEqualTo(exact);
+            assertThat(requireNonNull(handedOff.poll(5, SECONDS)).filter()).isEqualTo(level);
+            assertThat(received(pulled.receive()).filter()).isEqualTo(everything);
+        }
+    }
+
+    @Test
     void a_duplicate_of_queued_work_does_not_reserve_or_queue_another_view() throws Exception {
         DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(1));
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();

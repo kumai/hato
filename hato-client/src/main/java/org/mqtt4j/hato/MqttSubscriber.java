@@ -68,7 +68,8 @@ public interface MqttSubscriber {
     /// meant for each other. A copy without identifiers, and every copy on other connections,
     /// including MQTT 3.1.1, goes to every subscription whose filter matches its topic: there,
     /// the client cannot tell apart the copies that a broker sends for overlapping
-    /// subscriptions.
+    /// subscriptions. Each delivery names the subscription that received it in
+    /// [MqttDelivery#filter()].
     /// A retransmission joining a continued QoS 1 or 2 reception goes only to its original
     /// subscriptions whose deliveries were discarded; handed-off deliveries keep their state.
     /// Shared subscriptions are matched against the filter after their shared group name.
