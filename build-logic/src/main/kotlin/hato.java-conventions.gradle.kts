@@ -61,6 +61,22 @@ tasks.withType<Javadoc>().configureEach {
     (options as StandardJavadocDocletOptions).addBooleanOption("Xdoclint:all,-missing", true)
 }
 
+// The integration tests against EMQX, HiveMQ CE, NanoMQ, and RabbitMQ are the classes named after
+// them. CI runs them in a job of their own, one broker at a time, so that the main job stays
+// within its time budget: -Phato.interop=none leaves them all out, and -Phato.interop=emqx
+// (hivemq, nanomq, rabbitmq) runs only the classes of that broker. Without the property, every
+// integration test runs.
+val interopBrokers = mapOf(
+    "emqx" to "Emqx",
+    "hivemq" to "HiveMq",
+    "nanomq" to "NanoMq",
+    "rabbitmq" to "RabbitMq",
+)
+val interop = providers.gradleProperty("hato.interop").orNull
+require(interop == null || interop == "none" || interop in interopBrokers) {
+    "hato.interop must be none or one of ${interopBrokers.keys}, not $interop"
+}
+
 testing {
     suites {
         withType<JvmTestSuite>().configureEach {
@@ -98,6 +114,19 @@ testing {
                         "hato.docker.required",
                         providers.gradleProperty("hato.docker.required").orElse("true").get()
                     )
+                    filter {
+                        when (interop) {
+                            null -> {}
+                            "none" -> interopBrokers.values.forEach {
+                                excludeTestsMatching("*.$it*")
+                            }
+                            else -> {
+                                includeTestsMatching("*.${interopBrokers.getValue(interop)}*")
+                                // Projects without tests against that broker run none.
+                                isFailOnNoMatchingTests = false
+                            }
+                        }
+                    }
                 }
             }
         }

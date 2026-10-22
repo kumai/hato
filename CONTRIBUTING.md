@@ -94,6 +94,12 @@ in `~/.gradle/gradle.properties` to skip them in every build. Skipped tests are
 listed in the build output, and CI always runs them. A GraalVM JDK is needed only
 for the native-image smoke test, which CI runs on every pull request.
 
+`./gradlew build` also runs the tests against EMQX, HiveMQ CE, NanoMQ, and
+RabbitMQ, the classes named after each broker. CI runs them in a job of their own,
+one broker at a time. To do the same, add `-Phato.interop=emqx` (or `hivemq`,
+`nanomq`, `rabbitmq`) to the integration test tasks; `-Phato.interop=none` leaves
+them out, as the main CI job does.
+
 CI runs the checks below on every pull request, and all of them must pass
 before merge. Run the ones that match what you changed.
 
