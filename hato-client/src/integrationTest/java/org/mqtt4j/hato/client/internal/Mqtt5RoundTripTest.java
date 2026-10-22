@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.EOFException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -16,10 +17,10 @@ import org.mqtt4j.hato.*;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/// The client's MQTT 5.0 connections, shared by Mosquitto, EMQX, HiveMQ CE, and the embedded
-/// broker: publications at every QoS, message properties, repeated publications on one topic,
-/// overlapping subscriptions, a persistent session that keeps messages while the client is away,
-/// and a session that another client takes over.
+/// The client's MQTT 5.0 connections, shared by Mosquitto, EMQX, HiveMQ CE, NanoMQ, RabbitMQ,
+/// and the embedded broker: publications at every QoS, message properties, repeated publications
+/// on one topic, overlapping subscriptions, a persistent session that keeps messages while the
+/// client is away, and a session that another client takes over.
 @Timeout(30)
 abstract class Mqtt5RoundTripTest {
 
@@ -207,7 +208,8 @@ abstract class Mqtt5RoundTripTest {
     }
 
     @Test
-    void a_persistent_session_keeps_messages_while_the_client_is_away() throws Exception {
+    void a_persistent_session_keeps_messages_while_the_client_is_away_unless_the_broker_drops_it()
+            throws Exception {
         var topic = new Topic("hato/mqtt5/persistent");
         var received = new LinkedBlockingQueue<MqttMessage>();
         try (
@@ -228,14 +230,21 @@ abstract class Mqtt5RoundTripTest {
             // Act
             ConnAck resumed = subscriber.connect().get(5, SECONDS);
 
-            // Assert
-            assertThat(resumed.sessionPresent()).isTrue();
-            assertThat(received.poll(5, SECONDS)).isEqualTo(message);
+            // Assert: a broker that drops the session leaves the client to start a new one, and
+            // the message is lost.
+            if (keepsSessionsThatCleanStartBegan()) {
+                assertThat(resumed.sessionPresent()).isTrue();
+                assertThat(received.poll(5, SECONDS)).isEqualTo(message);
+            } else {
+                assertThat(resumed.sessionPresent()).isFalse();
+                assertThat(received.poll(1, SECONDS)).isNull();
+            }
         }
     }
 
     @Test
-    void a_client_whose_session_another_client_takes_over_stays_disconnected() throws Exception {
+    void a_taken_over_client_stays_disconnected_unless_the_broker_closes_without_a_reason()
+            throws Exception {
         var endings = new LinkedBlockingQueue<Disconnection>();
         try (
                 MqttClient first = MqttClient.builder()
@@ -252,16 +261,22 @@ abstract class Mqtt5RoundTripTest {
             // Act
             second.connect().get(5, SECONDS);
 
-            // Assert: the broker ends the first connection, which leaves the session to the
-            // second.
+            // Assert: a broker that reports the takeover leaves the session to the second
+            // client. Closing the connection without a reason, which MQTT 5.0 allows, looks like
+            // a lost connection, and the first client reconnects.
             Disconnection end = endings.poll(5, SECONDS);
             assertThat(end).isNotNull();
-            assertThat(end.reconnectDelay()).isEmpty();
-            assertThat(end.cause()).get().isInstanceOfSatisfying(
-                    MqttBrokerDisconnectException.class,
-                    ending -> assertThat(ending.reasonCode())
-                            .isEqualTo(ReasonCode.SESSION_TAKEN_OVER)
-            );
+            if (reportsTakeover()) {
+                assertThat(end.reconnectDelay()).isEmpty();
+                assertThat(end.cause()).get().isInstanceOfSatisfying(
+                        MqttBrokerDisconnectException.class,
+                        ending -> assertThat(ending.reasonCode())
+                                .isEqualTo(ReasonCode.SESSION_TAKEN_OVER)
+                );
+            } else {
+                assertThat(end.reconnectDelay()).isPresent();
+                assertThat(end.cause()).get().isInstanceOf(EOFException.class);
+            }
         }
     }
 
@@ -298,6 +313,19 @@ abstract class Mqtt5RoundTripTest {
     /// The reason code with which the broker acknowledges a publication at `qos` that no
     /// subscription matches, as recorded for it.
     abstract ReasonCode unmatchedPublicationReason(Qos qos);
+
+    /// Whether the broker sends a connection that another one takes over a DISCONNECT with
+    /// Session taken over before closing it, as recorded for it.
+    boolean reportsTakeover() {
+        return true;
+    }
+
+    /// Whether the broker keeps a session that began with Clean Start and a Session Expiry
+    /// Interval after the connection ends, as MQTT 5.0 requires and as recorded for it. The
+    /// client starts its first connection with Clean Start.
+    boolean keepsSessionsThatCleanStartBegan() {
+        return true;
+    }
 
     abstract URI endpoint();
 }

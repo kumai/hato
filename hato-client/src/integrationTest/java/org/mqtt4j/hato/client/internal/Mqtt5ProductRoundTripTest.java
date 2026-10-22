@@ -16,9 +16,9 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-/// The round trips of [Mqtt5RoundTripTest], and those that only Mosquitto, EMQX, and HiveMQ CE
-/// support: shared subscriptions, with members on MQTT 5.0 and on MQTT 3.1.1. The embedded
-/// broker has no shared subscriptions.
+/// The round trips of [Mqtt5RoundTripTest], and those that only Mosquitto, EMQX, HiveMQ CE, and
+/// NanoMQ support: shared subscriptions, with members on MQTT 5.0 and on MQTT 3.1.1. The embedded
+/// broker and RabbitMQ have no shared subscriptions.
 abstract class Mqtt5ProductRoundTripTest extends Mqtt5RoundTripTest {
 
     @ParameterizedTest
