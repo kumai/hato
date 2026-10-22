@@ -16,9 +16,9 @@ import java.util.function.UnaryOperator;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.TimerScheduler;
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.log.Log;
-import org.mqtt4j.hato.spi.TimerScheduler;
-import org.mqtt4j.hato.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
 

@@ -69,10 +69,10 @@ class DistributionTest {
             if (!client.connect().isCompletedExceptionally()) {
                 throw new AssertionError("Closed client accepted a connection");
             }
-            var transport = org.mqtt4j.hato.spi.Transport.tcp("probe");
+            var transport = org.mqtt4j.hato.Transport.tcp("probe");
             transport.close();
             if (transport.send(1, new byte[0])
-                    != org.mqtt4j.hato.spi.Transport.SendResult.CLOSED) {
+                    != org.mqtt4j.hato.Transport.SendResult.CLOSED) {
                 throw new AssertionError("Closed transport accepted a write");
             }
             var cause = new org.mqtt4j.hato.MqttProtocolException(
@@ -407,6 +407,9 @@ class DistributionTest {
                 "org.mqtt4j.hato.DeliveryOptions",
                 "org.mqtt4j.hato.Disconnection",
                 "org.mqtt4j.hato.FailurePolicy",
+                "org.mqtt4j.hato.MetricsListener",
+                "org.mqtt4j.hato.MetricsListener$DeliveryStart",
+                "org.mqtt4j.hato.MetricsListener$PublishCompletion",
                 "org.mqtt4j.hato.MqttBrokerDisconnectException",
                 "org.mqtt4j.hato.MqttCapacityException",
                 "org.mqtt4j.hato.MqttClient",
@@ -435,18 +438,15 @@ class DistributionTest {
                 "org.mqtt4j.hato.RetainHandling",
                 "org.mqtt4j.hato.Subscribe",
                 "org.mqtt4j.hato.Subscription",
+                "org.mqtt4j.hato.TimerScheduler",
+                "org.mqtt4j.hato.TimerScheduler$Cancellable",
                 "org.mqtt4j.hato.Topic",
                 "org.mqtt4j.hato.TopicFilter",
-                "org.mqtt4j.hato.UserProperty",
-                "org.mqtt4j.hato.spi.MetricsListener",
-                "org.mqtt4j.hato.spi.MetricsListener$DeliveryStart",
-                "org.mqtt4j.hato.spi.MetricsListener$PublishCompletion",
-                "org.mqtt4j.hato.spi.TimerScheduler",
-                "org.mqtt4j.hato.spi.TimerScheduler$Cancellable",
-                "org.mqtt4j.hato.spi.Transport",
-                "org.mqtt4j.hato.spi.Transport$Factory",
-                "org.mqtt4j.hato.spi.Transport$Listener",
-                "org.mqtt4j.hato.spi.Transport$SendResult"
+                "org.mqtt4j.hato.Transport",
+                "org.mqtt4j.hato.Transport$Factory",
+                "org.mqtt4j.hato.Transport$Listener",
+                "org.mqtt4j.hato.Transport$SendResult",
+                "org.mqtt4j.hato.UserProperty"
         );
         assertThat(publicTypes(BROKER)).containsExactly("org.mqtt4j.hato.broker.MqttBroker");
         assertThat(publicTypes(testkitJar())).containsExactlyInAnyOrder(
@@ -460,8 +460,8 @@ class DistributionTest {
             "Disconnection", "ConnAck", "PublishResult", "MqttMessage", "MqttCredentials",
             "DeliveryOptions", "Subscribe", "ClientStats", "ClientStats$Connection",
             "ClientStats$Receiving", "ClientStats$Sending", "ClientStats$Subscribing",
-            "ClientStats$SubscriptionStats", "spi/MetricsListener$PublishCompletion",
-            "spi/MetricsListener$DeliveryStart"
+            "ClientStats$SubscriptionStats", "MetricsListener$PublishCompletion",
+            "MetricsListener$DeliveryStart"
     })
     void evolving_value_types_are_final_classes_with_private_constructors(String type)
             throws Exception {

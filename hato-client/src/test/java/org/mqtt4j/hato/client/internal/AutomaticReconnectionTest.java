@@ -24,7 +24,6 @@ import org.junit.jupiter.api.Timeout;
 import org.mqtt4j.hato.*;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
-import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.Objects.requireNonNull;

@@ -1,4 +1,4 @@
-package org.mqtt4j.hato.spi;
+package org.mqtt4j.hato;
 
 import java.net.URI;
 import java.time.Duration;
@@ -59,7 +59,7 @@ public interface Transport extends AutoCloseable {
 
     /// Creates a plain TCP transport accepting only `mqtt` URIs (default port 1883).
     /// The client identifier is used for diagnostics. Its deadlines use real time, not the
-    /// scheduler passed to [org.mqtt4j.hato.MqttClientBuilder#timerScheduler(TimerScheduler)].
+    /// scheduler passed to [MqttClientBuilder#timerScheduler(TimerScheduler)].
     static Transport tcp(String clientId) {
         return new TcpTransport(clientId, DefaultTimerScheduler.instance);
     }

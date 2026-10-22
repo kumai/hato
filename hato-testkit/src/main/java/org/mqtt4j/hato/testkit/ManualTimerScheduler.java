@@ -4,7 +4,7 @@ import java.time.Duration;
 import java.util.Comparator;
 import java.util.PriorityQueue;
 
-import org.mqtt4j.hato.spi.TimerScheduler;
+import org.mqtt4j.hato.TimerScheduler;
 
 import static java.util.Objects.requireNonNull;
 

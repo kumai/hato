@@ -25,8 +25,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import org.mqtt4j.hato.spi.TimerScheduler;
-import org.mqtt4j.hato.spi.Transport;
+import org.mqtt4j.hato.TimerScheduler;
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;

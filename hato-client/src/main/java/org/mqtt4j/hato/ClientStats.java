@@ -20,10 +20,9 @@ import org.mqtt4j.hato.client.internal.ClientSnapshot;
 /// called before the client has processed it.
 ///
 /// Counts described as lifetime counts cover the client's whole life and only grow. Durations
-/// are measured with the client's [org.mqtt4j.hato.spi.TimerScheduler]. Maps contain every
-/// key of their enum, in its order, with zero for what never happened. A limit shown with a
-/// value is the one in force when the snapshot was taken; the client may change the internal
-/// ones in later versions.
+/// are measured with the client's [TimerScheduler]. Maps contain every key of their enum, in its
+/// order, with zero for what never happened. A limit shown with a value is the one in force when
+/// the snapshot was taken; the client may change the internal ones in later versions.
 public final class ClientStats {
 
     private final ClientSnapshot snapshot;
@@ -92,8 +91,7 @@ public final class ClientStats {
         return snapshot.overloads();
     }
 
-    /// A lifetime count of [org.mqtt4j.hato.spi.MetricsListener] events dropped because the
-    /// listener fell behind.
+    /// A lifetime count of [MetricsListener] events dropped because the listener fell behind.
     public long droppedMetricEvents() {
         return snapshot.droppedMetricEvents();
     }

@@ -2,9 +2,9 @@ package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
 
+import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.client.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.client.internal.common.concurrent.TimerService;
-import org.mqtt4j.hato.spi.TimerScheduler;
 
 /// One daemon timer shared by all clients. Tasks only enqueue events for their owners.
 public final class DefaultTimerScheduler implements TimerScheduler {

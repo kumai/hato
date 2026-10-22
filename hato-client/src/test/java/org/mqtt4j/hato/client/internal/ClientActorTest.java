@@ -75,6 +75,7 @@ import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.RetainHandling;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
+import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.UserProperty;
@@ -84,7 +85,6 @@ import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.client.internal.common.protocol.Property;
 import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
-import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.Objects.requireNonNull;
@@ -96,9 +96,9 @@ import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.mqtt4j.hato.Transport.SendResult.CLOSED;
 import static org.mqtt4j.hato.client.internal.SessionPersistenceTest.userPropertiesOf;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
-import static org.mqtt4j.hato.spi.Transport.SendResult.CLOSED;
 
 class ClientActorTest {
 

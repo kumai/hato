@@ -9,5 +9,4 @@ module org.mqtt4j.hato.client {
     requires java.net.http;
 
     exports org.mqtt4j.hato;
-    exports org.mqtt4j.hato.spi;
 }

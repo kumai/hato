@@ -5,7 +5,7 @@ import java.util.ArrayList;
 
 import org.junit.jupiter.api.Test;
 
-import org.mqtt4j.hato.spi.TimerScheduler;
+import org.mqtt4j.hato.TimerScheduler;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;

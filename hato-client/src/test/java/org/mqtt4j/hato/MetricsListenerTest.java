@@ -1,16 +1,12 @@
-package org.mqtt4j.hato.spi;
+package org.mqtt4j.hato;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
 import org.junit.jupiter.api.Test;
 
-import org.mqtt4j.hato.MqttConnectionLostException;
-import org.mqtt4j.hato.Qos;
-import org.mqtt4j.hato.Subscription;
-import org.mqtt4j.hato.TopicFilter;
-import org.mqtt4j.hato.spi.MetricsListener.DeliveryStart;
-import org.mqtt4j.hato.spi.MetricsListener.PublishCompletion;
+import org.mqtt4j.hato.MetricsListener.DeliveryStart;
+import org.mqtt4j.hato.MetricsListener.PublishCompletion;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;

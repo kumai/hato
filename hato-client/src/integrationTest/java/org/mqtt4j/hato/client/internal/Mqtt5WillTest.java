@@ -13,7 +13,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import org.mqtt4j.hato.*;
-import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 

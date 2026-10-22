@@ -16,9 +16,8 @@ import static java.util.Objects.requireNonNull;
 /// An attempt that discarded a broker session without local state and then finds a session
 /// again, as [MqttClient#connect()] describes, fails with neither a reason code nor a cause;
 /// its message tells this case apart. A failure while closing the connection that found the
-/// session is attached as a suppressed exception. If the client's
-/// [org.mqtt4j.hato.spi.TimerScheduler] fails meanwhile, that failure is the cause instead,
-/// and the refusal is attached as a suppressed exception.
+/// session is attached as a suppressed exception. If the client's [TimerScheduler] fails meanwhile,
+/// that failure is the cause instead, and the refusal is attached as a suppressed exception.
 @SuppressWarnings("exports") // Nullness annotations are compile-time only.
 public final class MqttConnectException extends MqttException {
 

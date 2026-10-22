@@ -23,14 +23,14 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.MqttCapacityException;
-import org.mqtt4j.hato.spi.TimerScheduler;
-import org.mqtt4j.hato.spi.Transport;
+import org.mqtt4j.hato.TimerScheduler;
+import org.mqtt4j.hato.Transport;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mqtt4j.hato.spi.Transport.SendResult.ACCEPTED;
-import static org.mqtt4j.hato.spi.Transport.SendResult.CLOSED;
+import static org.mqtt4j.hato.Transport.SendResult.ACCEPTED;
+import static org.mqtt4j.hato.Transport.SendResult.CLOSED;
 
 class FaultyTransportTest {
 

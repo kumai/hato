@@ -27,10 +27,9 @@ import static java.util.Objects.requireNonNull;
 /// client with the same identifier, an administrative action, a redirection, and the reason
 /// codes for malformed packets, protocol errors, invalid topics or payloads, and broker limits
 /// or features that the client exceeded (0x81, 0x82, 0x8F, 0x90, 0x93 to 0x95, 0x99 to 0x9B,
-/// 0x9E, 0xA1, and 0xA2). It also stops when the client's
-/// [timer scheduler][org.mqtt4j.hato.spi.TimerScheduler] fails. Other refusals and failures
-/// are retried, including bad credentials, missing authorization, an unspecified error, and a
-/// reason code that this client does not know.
+/// 0x9E, 0xA1, and 0xA2). It also stops when the client's [timer scheduler][TimerScheduler] fails.
+/// Other refusals and failures are retried, including bad credentials, missing authorization, an
+/// unspecified error, and a reason code that this client does not know.
 /// [ConnectionListener#onConnectFailed(Disconnection)] reports each failed attempt, so an
 /// application that wants to stop on a particular cause can call [MqttClient#disconnect()].
 ///

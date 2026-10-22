@@ -72,12 +72,12 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// The future fails with [MqttConnectException] when the client gives up the request:
     /// when the first attempt of a request fails, unless the policy retries initial failures;
     /// when the broker refuses the connection with a reason that reconnecting cannot change;
-    /// when the client's [org.mqtt4j.hato.spi.TimerScheduler] fails; or when [#disconnect()],
-    /// [#close()], or a handler failure withdraws the request first. Its message or cause tells
-    /// which, as for [ConnectionListener#onConnectFailed(Disconnection)]. With
-    /// [ReconnectPolicy#withInitialRetry()], and for a call that joins an automatic
-    /// reconnection, the future can wait without a deadline. Timing out the returned future
-    /// does not stop the attempts; [#disconnect()] does.
+    /// when the client's [TimerScheduler] fails; or when [#disconnect()], [#close()], or a handler
+    /// failure withdraws the request first. Its message or cause tells which, as for
+    /// [ConnectionListener#onConnectFailed(Disconnection)]. With
+    /// [ReconnectPolicy#withInitialRetry()], and for a call that joins an automatic reconnection,
+    /// the future can wait without a deadline. Timing out the returned future does not stop the
+    /// attempts; [#disconnect()] does.
     ///
     /// With an existing local persistent session, [ConnAck#sessionPresent()] true continues
     /// pending QoS 1 and QoS 2 exchanges and established subscriptions. False discards the old
@@ -191,10 +191,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// because it fell behind never arrive; a credentials supplier call, which closing
     /// interrupts, has returned; every transport has finished closing; and the synchronous
     /// continuations of the futures that the client completes have returned, except those of
-    /// this method. Afterwards the client calls no handler, executor chosen with
-    /// [DeliveryOptions], listener, supplier, [org.mqtt4j.hato.spi.TimerScheduler],
-    /// [org.mqtt4j.hato.spi.Transport], or continuation, and a reconnection timer that fires
-    /// late does nothing.
+    /// this method. Afterwards the client calls no handler, executor chosen with [DeliveryOptions],
+    /// listener, supplier, [TimerScheduler], [Transport], or continuation, and a reconnection timer
+    /// that fires late does nothing.
     ///
     /// It does not wait for work that application code started, such as tasks submitted to the
     /// application's own executors, nor for the application's own calls into the client, such as
@@ -206,11 +205,10 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// described by [Subscription#established()], and a full limit returns a future already
     /// failed with [MqttCapacityException]; the future fails in no other way.
     ///
-    /// Release what the client's callbacks use, such as an injected
-    /// [org.mqtt4j.hato.spi.TimerScheduler] or the resources of a custom transport, from a
-    /// continuation of this future or after it completes. Waiting for it inside a handler,
-    /// listener, supplier, or continuation that the client runs, or on a thread that such code
-    /// needs in order to return, never completes.
+    /// Release what the client's callbacks use, such as an injected [TimerScheduler] or the
+    /// resources of a custom transport, from a continuation of this future or after it completes.
+    /// Waiting for it inside a handler, listener, supplier, or continuation that the client runs,
+    /// or on a thread that such code needs in order to return, never completes.
     CompletableFuture<Void> terminated();
 
     /// Takes a snapshot of what this client holds and has counted, which only the client can
@@ -222,10 +220,10 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// Each call returns an independent future. Pending calls share the client-wide limit
     /// described by [Subscription#established()], and a full limit returns a future already
     /// failed with [MqttCapacityException]. A runtime exception from the time read of the
-    /// client's [org.mqtt4j.hato.spi.TimerScheduler] fails the pending calls with that
-    /// exception and affects the connection as that interface describes. A client that keeps
-    /// no statistics, such as an application's test double, returns a future failed with
-    /// [UnsupportedOperationException], as this default method does.
+    /// client's [TimerScheduler] fails the pending calls with that exception and affects the
+    /// connection as that interface describes. A client that keeps no statistics, such as an
+    /// application's test double, returns a future failed with [UnsupportedOperationException], as
+    /// this default method does.
     default CompletableFuture<ClientStats> stats() {
         return CompletableFuture.failedFuture(
                 new UnsupportedOperationException("This client keeps no statistics")

@@ -26,7 +26,6 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.*;
-import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 

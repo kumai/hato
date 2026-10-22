@@ -51,5 +51,5 @@ If you only need a broker, you can depend on `hato-broker` directly.
   timers. Advancing time runs due timers; wait separately for the client's
   response before checking the result.
 
-`FaultyTransport` is experimental, like the `Transport` SPI it wraps. Its API may
-change as that SPI evolves.
+`FaultyTransport` is experimental, like `Transport`, which it wraps. Its API may
+change as `Transport` evolves.

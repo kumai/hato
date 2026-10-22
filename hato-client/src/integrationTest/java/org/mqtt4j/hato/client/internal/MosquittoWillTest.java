@@ -17,7 +17,6 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.*;
-import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 import org.mqtt4j.hato.testsupport.Docker;

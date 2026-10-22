@@ -17,11 +17,11 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
-import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.concurrent.TimeUnit.SECONDS;

@@ -16,7 +16,7 @@ import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttClientBuilder;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReconnectPolicy;
-import org.mqtt4j.hato.spi.TimerScheduler;
+import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 import org.mqtt4j.hato.testsupport.Tls;
 

@@ -21,8 +21,8 @@ import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
-import org.mqtt4j.hato.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;

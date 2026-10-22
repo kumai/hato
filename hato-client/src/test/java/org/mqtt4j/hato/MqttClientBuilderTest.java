@@ -29,7 +29,6 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.Property;
 import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
-import org.mqtt4j.hato.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;

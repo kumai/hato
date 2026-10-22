@@ -26,9 +26,6 @@ import org.mqtt4j.hato.client.internal.WebSocketTransports;
 import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
-import org.mqtt4j.hato.spi.MetricsListener;
-import org.mqtt4j.hato.spi.TimerScheduler;
-import org.mqtt4j.hato.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;

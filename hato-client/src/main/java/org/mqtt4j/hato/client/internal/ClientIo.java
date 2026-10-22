@@ -9,6 +9,7 @@ import java.util.Optional;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
@@ -16,7 +17,6 @@ import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.client.internal.common.protocol.Property;
 import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
-import org.mqtt4j.hato.spi.Transport;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 

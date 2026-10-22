@@ -38,11 +38,11 @@ import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
+import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
-import org.mqtt4j.hato.spi.TimerScheduler;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.Objects.requireNonNull;

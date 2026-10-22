@@ -1,4 +1,4 @@
-package org.mqtt4j.hato.spi;
+package org.mqtt4j.hato;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -6,32 +6,27 @@ import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
 
-import org.mqtt4j.hato.Qos;
-import org.mqtt4j.hato.Subscription;
-
 import static java.util.Objects.requireNonNull;
 
 /// Receives timings that only the client can measure: how long each publication takes from its
 /// admission to the completion of its future, and how long each delivery waits from its
 /// reception until application code receives it. Register one with
-/// [org.mqtt4j.hato.MqttClientBuilder#metricsListener(MetricsListener)]; without one, the client
-/// reads no time and creates no event for these timings.
+/// [MqttClientBuilder#metricsListener(MetricsListener)]; without one, the client reads no time
+/// and creates no event for these timings.
 ///
 /// Callbacks run serially, on a thread of their own, never on a thread that the client needs for
 /// I/O, publications, or deliveries. Events wait in a queue of 1,024: when a slow callback lets
 /// it fill, the oldest event not yet delivered is dropped and counted in
-/// [org.mqtt4j.hato.ClientStats#droppedMetricEvents()], so the listener never delays the
-/// client. Durations are measured with the client's [TimerScheduler]; an event whose times the
-/// scheduler fails to read is not reported. Listener exceptions are logged and do not affect the
-/// client, and interrupt status left by a callback is cleared before the next one.
-/// [org.mqtt4j.hato.MqttClient#terminated()] completes only after the queued events have been
-/// delivered. The default methods do nothing.
+/// [ClientStats#droppedMetricEvents()], so the listener never delays the client. Durations are
+/// measured with the client's [TimerScheduler]; an event whose times the scheduler fails to read
+/// is not reported. Listener exceptions are logged and do not affect the client, and interrupt
+/// status left by a callback is cleared before the next one. [MqttClient#terminated()]
+/// completes only after the queued events have been delivered. The default methods do nothing.
 public interface MetricsListener {
 
     /// Called once for each publication that the client admitted, when its future completes,
     /// whether it succeeded or failed. A publication refused at once, whose future has already
-    /// failed when [org.mqtt4j.hato.MqttPublisher#publish(org.mqtt4j.hato.MqttMessage)]
-    /// returns, produces none.
+    /// failed when [MqttPublisher#publish(MqttMessage)] returns, produces none.
     default void onPublishCompleted(PublishCompletion completion) {
     }
 

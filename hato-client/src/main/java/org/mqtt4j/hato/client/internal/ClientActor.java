@@ -34,6 +34,7 @@ import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.FailurePolicy;
+import org.mqtt4j.hato.MetricsListener;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectException;
@@ -50,14 +51,13 @@ import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.RetainHandling;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
+import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
-import org.mqtt4j.hato.spi.MetricsListener;
-import org.mqtt4j.hato.spi.TimerScheduler;
-import org.mqtt4j.hato.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
 

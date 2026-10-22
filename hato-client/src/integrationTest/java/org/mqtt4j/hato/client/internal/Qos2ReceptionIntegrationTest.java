@@ -16,7 +16,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.*;
-import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 

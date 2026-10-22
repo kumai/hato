@@ -16,7 +16,6 @@ import org.mqtt4j.hato.client.internal.common.io.FrameReader;
 import org.mqtt4j.hato.client.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
-import org.mqtt4j.hato.spi.MetricsListener;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;

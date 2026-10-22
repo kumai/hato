@@ -35,10 +35,10 @@ import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReconnectPolicy;
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.io.FrameReader;
 import org.mqtt4j.hato.client.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.client.internal.common.io.TcpConnection;
-import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 import org.mqtt4j.hato.testsupport.Tls;
@@ -49,8 +49,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
-import static org.mqtt4j.hato.spi.Transport.SendResult.ACCEPTED;
-import static org.mqtt4j.hato.spi.Transport.SendResult.CLOSED;
+import static org.mqtt4j.hato.Transport.SendResult.ACCEPTED;
+import static org.mqtt4j.hato.Transport.SendResult.CLOSED;
 
 /// The same ownership, ordering, and termination contract for every transport kind and its fault
 /// wrapper. Each kind makes its transports and the local peer that they connect to, so a test

@@ -6,7 +6,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
-import org.mqtt4j.hato.spi.MetricsListener;
+import org.mqtt4j.hato.MetricsListener;
 
 /// What the measurement tests share. They print their results instead of asserting limits.
 final class Measurements {

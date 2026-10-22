@@ -26,8 +26,8 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.WebSocketPeer.Frame;
-import org.mqtt4j.hato.spi.Transport;
 import org.mqtt4j.hato.testsupport.Tls;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -35,9 +35,9 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.mqtt4j.hato.Transport.SendResult.ACCEPTED;
 import static org.mqtt4j.hato.client.internal.WebSocketPeer.BINARY;
 import static org.mqtt4j.hato.client.internal.WebSocketPeer.CLOSE;
-import static org.mqtt4j.hato.spi.Transport.SendResult.ACCEPTED;
 
 /// What only the WebSocket transport has, beyond the transport contract that it shares with TCP
 /// in TransportContractTest: the handshake, the kinds of frames, the closing handshake, the

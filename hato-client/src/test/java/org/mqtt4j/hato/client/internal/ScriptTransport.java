@@ -14,10 +14,10 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.RemainingLength;
-import org.mqtt4j.hato.spi.Transport;
 
 import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;

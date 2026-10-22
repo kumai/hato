@@ -22,7 +22,7 @@ import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Topic;
-import org.mqtt4j.hato.spi.Transport;
+import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.testkit.FaultyTransport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
