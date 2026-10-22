@@ -19,7 +19,6 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
-import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -145,19 +144,6 @@ class BrokerConnectionTest {
             try (RawSession resumed = connected(sut.port(), "persistent", false, true)) {
                 resumed.ping();
             }
-        }
-    }
-
-    @Test
-    void will_requests_are_refused_until_will_publication_is_supported() throws Exception {
-        var will = new Packet.Will(new Topic("will"), new byte[] {1}, AT_MOST_ONCE, false, EMPTY);
-        try (var sut = MqttBroker.start(); var client = RawSession.open(sut.port())) {
-            client.send(new Packet.Connect(
-                    "with-will", MqttVersion.V3_1_1, true, 0, will, null, null, EMPTY
-            ));
-            assertThat(client.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(false, ReasonCode.SERVER_UNAVAILABLE, EMPTY));
-            client.expectClosed();
         }
     }
 

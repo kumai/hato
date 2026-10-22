@@ -501,7 +501,9 @@ public final class BrokerServer implements AutoCloseable {
         // other overflow. A deliberate simplification: sending them as the window frees up would
         // lift that ceiling, if productization needs it.
         private void deliverRetained(Packet.Subscription subscription) {
-            for (Retained entry : retained.values()) {
+            // A copy, because a delivery that overflows closes the connection, and the Will that
+            // its end publishes can change the retained messages.
+            for (Retained entry : List.copyOf(retained.values())) {
                 Packet.Publish publication = entry.publication();
                 if (!subscription.filter().matches(publication.topic())) {
                     continue;
@@ -783,6 +785,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private String clientId = "";
 
+        // The Will of the accepted connection, until the connection's end publishes it or a
+        // normal DISCONNECT discards it. Like the session reference, it belongs to routing.
+        private Packet.@Nullable Will will;
+
         // Remaining state is guarded by this connection's monitor.
 
         // The version of the connection's CONNECT. Until CONNECT selects one, a refusal of an
@@ -906,10 +912,19 @@ public final class BrokerServer implements AutoCloseable {
                 );
                 return false;
             }
-            if (request.will() != null) {
+            // The broker publishes a Will as its connection ends, so it cannot keep one for a
+            // delay that a new connection of the session would cancel [MQTT-3.1.3-9]. Only
+            // whether the delay is positive matters.
+            Packet.Will requestedWill = request.will();
+            boolean delayed = requestedWill != null && requestedWill.properties()
+                    .find(PropertyId.WILL_DELAY_INTERVAL)
+                    .filter(delay -> delay instanceof Property.FourByteValue value
+                            && value.value() > 0)
+                    .isPresent();
+            if (delayed) {
                 refuse(
                         ReasonCode.SERVER_UNAVAILABLE,
-                        "a Will for client '" + request.clientId() + "'"
+                        "a delayed Will for client '" + request.clientId() + "'"
                 );
                 return false;
             }
@@ -971,6 +986,7 @@ public final class BrokerServer implements AutoCloseable {
                     }
                     clientId = id;
                     session = accepted;
+                    will = requestedWill;
                     accepted.connection = this;
                     Properties properties = switch (request.version()) {
                         case V3_1_1 -> Properties.EMPTY;
@@ -985,8 +1001,12 @@ public final class BrokerServer implements AutoCloseable {
                             "taken over by " + socket.getRemoteSocketAddress()
                     );
                 }
-                // CONNACK, retransmissions, and queued deliveries stay ahead of later publications.
+                // CONNACK, retransmissions, and queued deliveries stay ahead of later publications,
+                // including the Will of the connection that this one took over.
                 accepted.resume();
+                if (previous != null) {
+                    previous.publishWill();
+                }
             }
             log.info("Broker accepted client {} from {} on port {}",
                     id, socket.getRemoteSocketAddress(), port());
@@ -1010,6 +1030,35 @@ public final class BrokerServer implements AutoCloseable {
             return (owner != null && owner.connection == this && !isEnded())
                     ? owner
                     : null;
+        }
+
+        // Publishes the Will of this connection, which ended without a DISCONNECT that discards
+        // it, as its client would have published the message. Called under routing; taking the
+        // Will means that no later end publishes it again. A closing broker publishes none,
+        // because every session goes with it.
+        private void publishWill() {
+            Packet.Will last = will;
+            Session owner = session;
+            will = null;
+            if (last == null || owner == null || closed) {
+                return;
+            }
+            // The Will properties travel as the publication's, without the delay, which only
+            // the Will has; User Properties keep their order [MQTT-3.1.3-10]. The packet
+            // identifier is a placeholder, because every delivery takes its own.
+            var properties = new Properties(last.properties().entries().stream()
+                    .filter(property -> property.id() != PropertyId.WILL_DELAY_INTERVAL)
+                    .toList());
+            var publication = new Packet.Publish(
+                    last.topic(),
+                    last.payload(),
+                    last.qos(),
+                    last.retain(),
+                    false,
+                    (last.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
+                    properties
+            );
+            route(publication, owner);
         }
 
         private void refuse(ReasonCode reason, String request) {
@@ -1134,11 +1183,20 @@ public final class BrokerServer implements AutoCloseable {
                 }
                 case Packet.PubComp ack -> owner.acknowledge(ack.packetId(), true);
                 case Packet.PingReq _ -> send(new Packet.PingResp());
-                case Packet.Disconnect disconnect -> close(
-                        disconnect.reasonCode() == ReasonCode.SUCCESS
-                                ? "client sent DISCONNECT"
-                                : "client sent DISCONNECT with " + disconnect.reasonCode()
-                );
+                case Packet.Disconnect disconnect -> {
+                    // Only a normal disconnection discards the Will [MQTT-3.14.4-3]; MQTT 5.0
+                    // publishes it for any other reason code, Disconnect with Will Message
+                    // among them (MQTT 5.0 section 3.1.2.5).
+                    boolean normal = disconnect.reasonCode() == ReasonCode.SUCCESS;
+                    if (normal) {
+                        will = null;
+                    }
+                    close(
+                            normal
+                                    ? "client sent DISCONNECT"
+                                    : "client sent DISCONNECT with " + disconnect.reasonCode()
+                    );
+                }
                 case Packet.AliasPublish _ -> throw new PacketDecodeException(
                         ReasonCode.TOPIC_ALIAS_INVALID,
                         "Topic Alias without an announced maximum"
@@ -1505,6 +1563,10 @@ public final class BrokerServer implements AutoCloseable {
                 if (owner != null) {
                     owner.detach(this);
                 }
+                // The Will follows the end of the network connection ([MQTT-3.1.2-8] in MQTT
+                // 3.1.1), so a persistent session that subscribes to it receives it as an
+                // absent client.
+                publishWill();
             }
         }
     }

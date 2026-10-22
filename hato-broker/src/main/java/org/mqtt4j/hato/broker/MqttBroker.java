@@ -20,15 +20,22 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// Incoming QoS 2 publications are forwarded on PUBLISH; repeated PUBLISH packets with the same
 /// identifier before PUBREL are acknowledged without forwarding again. A QoS 1 PUBLISH that
 /// reuses such an identifier ends that wait, as a client that lost its session state does.
-/// Offline QoS 0 deliveries are discarded. Wills are refused with Server unavailable; an empty
-/// identifier with Clean Session false is refused with Identifier rejected. Overlapping
-/// subscriptions of a session receive one copy at their highest QoS. Credentials are not
-/// checked. `$share/` filters are matched literally, without shared routing.
+/// Offline QoS 0 deliveries are discarded. An empty identifier with Clean Session false is
+/// refused with Identifier rejected. Overlapping subscriptions of a session receive one copy at
+/// their highest QoS. Credentials are not checked. `$share/` filters are matched literally,
+/// without shared routing.
 ///
 /// A retained publication becomes the retained message of its topic in place of the previous
 /// one, and a retained publication with an empty payload removes it; both reach current
 /// subscribers with the retain flag cleared. A new subscription receives the retained messages
 /// that match it, with the retain flag set, at the lower of their QoS and its own.
+///
+/// A connection's Will is published when the connection ends without a DISCONNECT: when the
+/// network connection closes or fails, when the keep-alive expires, when the client breaks the
+/// protocol, and when another connection with the same client identifier takes over, after that
+/// connection's CONNACK. A DISCONNECT discards the Will, unless it is an MQTT 5.0 DISCONNECT
+/// with a reason code other than Normal disconnection. A retained Will is handled as a retained
+/// publication.
 ///
 /// MQTT 5.0 support covers what client tests need. A positive Session Expiry Interval makes a
 /// session persistent, as Clean Session false does, but the session never expires; Clean Start
@@ -40,7 +47,9 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// client published. A Retain As Published subscription receives the publisher's retain flag;
 /// when only some overlapping subscriptions use it, a retained publication arrives once with
 /// each flag. Retain Handling sends the retained messages for every SUBSCRIBE, only for a new
-/// subscription, or never. CONNACK announces only that Subscription Identifiers are not
+/// subscription, or never. A Will with a positive Will Delay Interval is refused with Server
+/// unavailable; the properties of other Wills, except the delay, reach MQTT 5.0 subscribers as
+/// publication properties. CONNACK announces only that Subscription Identifiers are not
 /// supported, and the broker ignores the client's Receive Maximum and Maximum Packet Size. An
 /// Authentication Method is refused with Bad authentication method. AUTH, a PUBLISH with a Topic
 /// Alias or a Subscription Identifier, or a SUBSCRIBE with a Subscription Identifier closes the
@@ -92,8 +101,8 @@ public final class MqttBroker implements AutoCloseable {
     }
 
     /// Stops accepting connections, closes all peers, and discards their session state and the
-    /// retained messages. Repeated calls are harmless. Does not wait for peer I/O or send MQTT
-    /// packets.
+    /// retained messages, without publishing Wills. Repeated calls are harmless. Does not wait
+    /// for peer I/O or send MQTT packets.
     @Override
     public void close() {
         server.close();

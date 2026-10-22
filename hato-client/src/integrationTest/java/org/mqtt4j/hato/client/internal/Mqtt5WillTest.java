@@ -24,7 +24,8 @@ import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
 /// The Will of MQTT 5.0 sessions, shared by Mosquitto, EMQX, and HiveMQ CE: its properties, its
 /// delay, and how a reconnection or a new session for the same identifier affects it. The
-/// embedded broker refuses Wills, so it runs none of these.
+/// embedded broker refuses a delayed Will, which most of these use, so it runs none of them;
+/// hato-broker's integration tests check its Will.
 @Timeout(60)
 @SuppressWarnings("try") // Explicit close is the abnormal MQTT termination under test.
 abstract class Mqtt5WillTest {

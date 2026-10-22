@@ -62,10 +62,11 @@ port. The default listens only on loopback. Starting the broker throws
 ## Choosing where to use it
 
 Use the broker in local or trusted environments. It does not check credentials.
-It supports MQTT 3.1.1, MQTT 5.0 as far as client tests need it, QoS 0/1/2, and
-retained messages, which do not expire. Wills are refused with Server unavailable.
-`$share/` filters are matched literally, without shared routing. MQTT 5.0
-subscriptions honor No Local, Retain As Published, and Retain Handling.
+It supports MQTT 3.1.1, MQTT 5.0 as far as client tests need it, QoS 0/1/2,
+retained messages, and Wills. It refuses an MQTT 5.0 Will with a delay, and
+retained messages do not expire. `$share/` filters are matched literally, without
+shared routing. MQTT 5.0 subscriptions honor No Local, Retain As Published, and
+Retain Handling.
 The broker does not support Subscription Identifiers, and tells MQTT 5.0 clients
 so when they connect.
 
