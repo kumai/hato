@@ -75,6 +75,12 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// promise.
 public final class MqttBroker implements AutoCloseable {
 
+    static {
+        // The testkit's controls reach a broker's server through the internal control port,
+        // which the module exports to the testkit alone.
+        BrokerServer.serversOf(broker -> broker.server);
+    }
+
     private final BrokerServer server;
 
     private MqttBroker(BrokerServer server) {

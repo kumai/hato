@@ -353,7 +353,16 @@ class DistributionTest {
             assertThat(descriptor.requires())
                     .anyMatch(DistributionTest::isCompileTimeOnlyAnnotations);
             assertThat(descriptor.exports())
+                    .filteredOn(e -> !e.isQualified())
                     .noneMatch(e -> List.of(e.source().split("\\.")).contains("internal"));
+            // The one export to a single module: the broker's test controls, for the testkit.
+            assertThat(descriptor.exports())
+                    .filteredOn(ModuleDescriptor.Exports::isQualified)
+                    .extracting(e -> e.source() + " to " + e.targets())
+                    .containsExactlyElementsOf(jar.equals(BROKER)
+                            ? List.of("org.mqtt4j.hato.broker.internal.control"
+                                    + " to [org.mqtt4j.hato.testkit]")
+                            : List.of());
             assertThat(descriptor.packages())
                     .noneMatch(p -> p.startsWith("org.mqtt4j.hato.common"));
         }
@@ -384,6 +393,24 @@ class DistributionTest {
             assertThat(result.exitCode()).isNotZero();
             assertThat(result.output()).contains("compiler.err.package.not.visible");
         }
+        Path controls = write(root.resolve("src/probe/Probe.java"), """
+                package probe;
+                import org.mqtt4j.hato.broker.internal.control.ControlPort;
+                public class Probe { ControlPort value; }
+                """);
+        ProcessResult result = execute(
+                root,
+                "javac",
+                "-XDrawDiagnostics",
+                "--module-path",
+                TESTKIT_JARS,
+                "-d",
+                root.resolve("classes").toString(),
+                descriptor.toString(),
+                controls.toString()
+        );
+        assertThat(result.exitCode()).isNotZero();
+        assertThat(result.output()).contains("compiler.err.package.not.visible");
     }
 
     @Test
@@ -451,9 +478,44 @@ class DistributionTest {
         );
         assertThat(publicTypes(BROKER)).containsExactly("org.mqtt4j.hato.broker.MqttBroker");
         assertThat(publicTypes(testkitJar())).containsExactlyInAnyOrder(
+                "org.mqtt4j.hato.testkit.BrokerControls",
                 "org.mqtt4j.hato.testkit.FaultyTransport",
-                "org.mqtt4j.hato.testkit.ManualTimerScheduler"
+                "org.mqtt4j.hato.testkit.HeldResponse",
+                "org.mqtt4j.hato.testkit.ManualTimerScheduler",
+                "org.mqtt4j.hato.testkit.ResponseKind"
         );
+    }
+
+    @Test
+    void testkit_signatures_name_no_internal_type() throws Exception {
+        // The testkit reaches the broker's test controls, but hands applications only public
+        // types of the client, the broker, the testkit, and the JDK.
+        Path testkit = testkitJar();
+        try (var archive = new JarFile(testkit.toFile())) {
+            for (String type : publicTypes(testkit)) {
+                JarEntry entry = archive.getJarEntry(type.replace('.', '/') + ".class");
+                ClassModel model = ClassFile.of()
+                        .parse(archive.getInputStream(entry).readAllBytes());
+                var signatures = new ArrayList<String>();
+                for (var method : model.methods()) {
+                    if (method.flags().has(AccessFlag.PUBLIC)
+                            || method.flags().has(AccessFlag.PROTECTED)) {
+                        signatures.add(method.methodType().stringValue());
+                        method.findAttribute(Attributes.signature())
+                                .ifPresent(signature -> signatures.add(
+                                        signature.signature().stringValue()
+                                ));
+                    }
+                }
+                for (var field : model.fields()) {
+                    if (field.flags().has(AccessFlag.PUBLIC)
+                            || field.flags().has(AccessFlag.PROTECTED)) {
+                        signatures.add(field.fieldType().stringValue());
+                    }
+                }
+                assertThat(signatures).as(type).noneMatch(name -> name.contains("/internal/"));
+            }
+        }
     }
 
     @ParameterizedTest
@@ -612,6 +674,7 @@ class DistributionTest {
                     .descriptor();
             String modulePrefix = descriptor.name() + "/";
             Set<String> packages = descriptor.exports().stream()
+                    .filter(export -> !export.isQualified())
                     .map(export -> export.source().replace('.', '/'))
                     .collect(Collectors.toSet());
             try (var archive = new ZipFile(javadoc.toFile())) {
@@ -755,6 +818,7 @@ class DistributionTest {
     private static Set<String> publicTypes(Path jar) throws IOException {
         Set<String> exported = ModuleFinder.of(jar).findAll().iterator().next().descriptor()
                 .exports().stream()
+                .filter(export -> !export.isQualified())
                 .map(ModuleDescriptor.Exports::source)
                 .collect(Collectors.toSet());
         var types = new HashSet<String>();

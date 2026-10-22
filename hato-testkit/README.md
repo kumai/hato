@@ -1,8 +1,9 @@
 # Hato test kit
 
-Test how your application handles interrupted connections and timeouts. The test
-kit includes the [client](../hato-client/README.md) and
-[embedded broker](../hato-broker/README.md) as dependencies.
+Test how your application handles interrupted connections, timeouts, and a broker
+that refuses or holds back its answers. The test kit includes the
+[client](../hato-client/README.md) and [embedded broker](../hato-broker/README.md) as
+dependencies.
 
 ## Getting it
 
@@ -32,6 +33,32 @@ For JPMS, the module name is `org.mqtt4j.hato.testkit`.
 Start an embedded broker for each test and close it afterward with
 try-with-resources. See the [broker example](../hato-broker/README.md#starting-and-stopping).
 If you only need a broker, you can depend on `hato-broker` directly.
+
+## Controlling the broker
+
+[BrokerControls](src/main/java/org/mqtt4j/hato/testkit/BrokerControls.java) lets a
+test make the embedded broker refuse, hold back, or disconnect:
+
+```java
+try (MqttBroker broker = MqttBroker.start()) {
+    BrokerControls controls = BrokerControls.of(broker);
+    controls.refuseSubscriptions(new TopicFilter("alarms/#"));
+    controls.holdResponses(ResponseKind.PUBACK, "device-1");
+    // Run the code under test, and check what it does while it waits.
+    controls.releaseResponses(ResponseKind.PUBACK, "device-1");
+}
+```
+
+- `refuseSubscriptions(filter)` refuses subscriptions to that exact filter, and
+  `grantAtMost(filter, qos)` grants them a lower QoS. `clearSubscriptionRule(filter)`
+  lets them through again, so a test can refuse a subscription for a while.
+- `holdResponses(kind, clientId)` holds back SUBACK, UNSUBACK, PUBACK, PUBREC, or
+  PUBCOMP for one client until `releaseResponses(kind, clientId)` sends them in
+  order, for example to see the application time out. `heldResponses()` lists what
+  the broker holds, so wait for an entry before you act.
+- `connectedClients()` lists the clients with an open connection, and
+  `disconnect(clientId)` closes one from the broker's side, which publishes the
+  client's Will.
 
 ## Simulating failures and timeouts
 

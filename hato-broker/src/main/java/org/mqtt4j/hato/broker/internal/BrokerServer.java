@@ -11,6 +11,7 @@ import java.util.BitSet;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -18,9 +19,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.concurrent.TimerService;
 import org.mqtt4j.hato.broker.internal.common.io.FrameReader;
@@ -47,6 +50,10 @@ import static java.util.Objects.requireNonNull;
 public final class BrokerServer implements AutoCloseable {
 
     private static final Log log = Log.of(BrokerServer.class);
+
+    // How the test controls find the server of a broker. MqttBroker, which alone can reach its
+    // server, sets it once as its class initializes.
+    private static volatile @Nullable Function<MqttBroker, BrokerServer> servers;
 
     private static final Set<MqttVersion> SUPPORTED_VERSIONS = EnumSet.of(
             MqttVersion.V3_1_1,
@@ -76,6 +83,10 @@ public final class BrokerServer implements AutoCloseable {
     // sessions are, and by size, as each session's waiting deliveries are.
     private static final int MAX_RETAINED = 1024;
 
+    // Every response that a test holds takes one of the client's packet identifiers, so a client
+    // that follows the protocol never holds more.
+    private static final int MAX_HELD = 65_535;
+
     // The framing format bounds packet size; a configurable broker cap comes later.
     private static final int MAX_PACKET_SIZE = 268_435_460;
 
@@ -98,6 +109,8 @@ public final class BrokerServer implements AutoCloseable {
     private final int maxRetained;
 
     private final long maxRetainedBytes;
+
+    private final int maxHeld;
 
     private final Timer scheduler;
 
@@ -125,6 +138,15 @@ public final class BrokerServer implements AutoCloseable {
     // Whether the retained limits have refused a message yet; only the first refusal warns.
     private boolean retainedLimitReached;
 
+    // The test controls, guarded by routing like the packets they act on. Until a test sets
+    // them, they change nothing.
+
+    // Rules for later subscriptions to exactly these filters.
+    private final Map<TopicFilter, SubscriptionRule> subscriptionRules = new HashMap<>();
+
+    // The kinds of response that the connections of these clients hold back.
+    private final Set<Hold> holds = new HashSet<>();
+
     private boolean closed;
 
     private BrokerServer(ServerSocket listener, Builder settings) {
@@ -138,6 +160,7 @@ public final class BrokerServer implements AutoCloseable {
         this.maxSessions = settings.maxSessions;
         this.maxRetained = settings.maxRetained;
         this.maxRetainedBytes = settings.maxRetainedBytes;
+        this.maxHeld = settings.maxHeld;
         this.scheduler = settings.scheduler;
         this.beforeProcess = settings.beforeProcess;
         this.beforeDeliveryWrite = settings.beforeDeliveryWrite;
@@ -145,6 +168,17 @@ public final class BrokerServer implements AutoCloseable {
 
     public static BrokerServer start(InetSocketAddress address) throws IOException {
         return builder().start(address);
+    }
+
+    /// Lets [#of(MqttBroker)] find the server of each broker. MqttBroker calls this once.
+    public static void serversOf(Function<MqttBroker, BrokerServer> lookup) {
+        servers = requireNonNull(lookup, "lookup must not be null");
+    }
+
+    /// The server of `broker`, for the test controls.
+    public static BrokerServer of(MqttBroker broker) {
+        // A broker exists, so MqttBroker has initialized and set the lookup.
+        return requireNonNull(servers, "MqttBroker sets the lookup").apply(broker);
     }
 
     static Builder builder() {
@@ -172,6 +206,8 @@ public final class BrokerServer implements AutoCloseable {
         private int maxRetained = MAX_RETAINED;
 
         private long maxRetainedBytes = SEND_BYTES;
+
+        private int maxHeld = MAX_HELD;
 
         private Timer scheduler = TimerService.instance;
 
@@ -227,6 +263,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder maxHeld(int value) {
+            maxHeld = value;
+            return this;
+        }
+
         Builder scheduler(Timer value) {
             scheduler = requireNonNull(value, "scheduler must not be null");
             return this;
@@ -256,6 +297,7 @@ public final class BrokerServer implements AutoCloseable {
                 || maxSessions <= 0
                 || maxRetained <= 0
                 || maxRetainedBytes <= 0
+                || maxHeld <= 0
             ) {
                 throw new IllegalArgumentException(
                         "Broker limits must be positive and window fit queue"
@@ -352,6 +394,103 @@ public final class BrokerServer implements AutoCloseable {
             sessions.clear();
             retained.clear();
             retainedBytes = 0;
+        }
+    }
+
+    /// Refuses later subscriptions to exactly `filter`: SUBACK answers them with failure 0x80,
+    /// and they subscribe to nothing.
+    ///
+    /// @throws IllegalArgumentException if `filter` is not a valid topic filter
+    public void refuseSubscriptions(String filter) {
+        var rule = new SubscriptionRule(null);
+        var key = new TopicFilter(filter);
+        synchronized (routing) {
+            subscriptionRules.put(key, rule);
+        }
+    }
+
+    /// Grants later subscriptions to exactly `filter` at most the QoS of `maximumLevel`.
+    ///
+    /// @throws IllegalArgumentException if `filter` is not a valid topic filter or the level is
+    ///         not 0, 1, or 2
+    public void grantAtMost(String filter, int maximumLevel) {
+        var rule = new SubscriptionRule(Qos.of(maximumLevel));
+        var key = new TopicFilter(filter);
+        synchronized (routing) {
+            subscriptionRules.put(key, rule);
+        }
+    }
+
+    /// Lets later subscriptions to exactly `filter` follow no rule again.
+    ///
+    /// @throws IllegalArgumentException if `filter` is not a valid topic filter
+    public void clearSubscriptionRule(String filter) {
+        var key = new TopicFilter(filter);
+        synchronized (routing) {
+            subscriptionRules.remove(key);
+        }
+    }
+
+    /// Holds back the responses of `type` to every connection of `clientId`, from now until
+    /// [#releaseResponses(Class, String)].
+    public void holdResponses(Class<? extends Packet> type, String clientId) {
+        var hold = new Hold(type, clientId);
+        synchronized (routing) {
+            holds.add(hold);
+        }
+    }
+
+    /// Stops holding back the responses of `type` to `clientId`, and sends those held in the
+    /// order they were held, ahead of later responses.
+    public void releaseResponses(Class<? extends Packet> type, String clientId) {
+        var hold = new Hold(type, clientId);
+        synchronized (routing) {
+            holds.remove(hold);
+            for (Connection connection : connections) {
+                if (connection.clientId.equals(clientId)) {
+                    connection.release(type);
+                }
+            }
+        }
+    }
+
+    /// The responses that connections hold back now, each connection's in the order held.
+    public List<Held> heldResponses() {
+        synchronized (routing) {
+            var all = new ArrayList<Held>();
+            for (Connection connection : connections) {
+                for (Packet response : connection.held) {
+                    all.add(new Held(connection.clientId, response));
+                }
+            }
+            return List.copyOf(all);
+        }
+    }
+
+    /// The identifiers of the clients whose connections are open.
+    public Set<String> connectedClients() {
+        synchronized (routing) {
+            var clients = new HashSet<String>();
+            for (Session session : sessions.values()) {
+                Connection peer = session.connection;
+                if (peer != null && !peer.isEnded()) {
+                    clients.add(session.clientId);
+                }
+            }
+            return Set.copyOf(clients);
+        }
+    }
+
+    /// Ends the open connection of `clientId` for an administrative reason, which an MQTT 5.0
+    /// client learns from DISCONNECT. The client did not disconnect, so its Will goes out. Does
+    /// nothing when the client has no open connection.
+    public void disconnect(String clientId) {
+        synchronized (routing) {
+            Session session = sessions.get(clientId);
+            Connection peer = (session == null) ? null : session.connection;
+            if (peer != null) {
+                peer.disconnect(ReasonCode.ADMINISTRATIVE_ACTION, "disconnected by a test");
+            }
         }
     }
 
@@ -708,6 +847,19 @@ public final class BrokerServer implements AutoCloseable {
     private record Retained(Packet.Publish publication, long byteCount) {
     }
 
+    // A test rule for subscriptions to one filter: they are refused without a maximum, and
+    // granted at most the maximum otherwise.
+    private record SubscriptionRule(@Nullable Qos maximum) {
+    }
+
+    // One kind of response that the connections of one client hold back.
+    private record Hold(Class<? extends Packet> type, String clientId) {
+    }
+
+    /// A response that a connection of `clientId` holds back.
+    public record Held(String clientId, Packet response) {
+    }
+
     private static final class Delivery implements Outgoing {
 
         private final Packet.Publish publication;
@@ -789,7 +941,15 @@ public final class BrokerServer implements AutoCloseable {
         // normal DISCONNECT discards it. Like the session reference, it belongs to routing.
         private Packet.@Nullable Will will;
 
+        // The responses that a test holds back from this connection, in the order held. They
+        // belong to routing too, and end with the connection.
+        private final ArrayDeque<Packet> held = new ArrayDeque<>();
+
         // Remaining state is guarded by this connection's monitor.
+
+        // Responses that a test released, waiting for room in the reserved quota in order. Later
+        // responses queue behind them, so that none overtakes a released one.
+        private final ArrayDeque<Packet> released = new ArrayDeque<>();
 
         // The version of the connection's CONNECT. Until CONNECT selects one, a refusal of an
         // unsupported protocol level uses the MQTT 3.1.1 form, which every client can read.
@@ -1085,7 +1245,26 @@ public final class BrokerServer implements AutoCloseable {
                     var grants = new ArrayList<ReasonCode>();
                     // The subscriptions that receive retained messages after SUBACK.
                     var retaining = new ArrayList<Packet.Subscription>();
-                    for (Packet.Subscription subscription : request.subscriptions()) {
+                    for (Packet.Subscription requested : request.subscriptions()) {
+                        // A test rule can refuse the filter, which then subscribes to nothing
+                        // and leaves an earlier subscription to it as it was, or grant it less
+                        // than the requested QoS.
+                        SubscriptionRule rule = subscriptionRules.get(requested.filter());
+                        Qos maximum = (rule == null) ? requested.qos() : rule.maximum();
+                        if (maximum == null) {
+                            grants.add(ReasonCode.UNSPECIFIED_ERROR);
+                            continue;
+                        }
+                        boolean lowered = maximum.level() < requested.qos().level();
+                        Packet.Subscription subscription = lowered
+                                ? new Packet.Subscription(
+                                        requested.filter(),
+                                        maximum,
+                                        requested.noLocal(),
+                                        requested.retainAsPublished(),
+                                        requested.retainHandling()
+                                )
+                                : requested;
                         Packet.Subscription replaced = owner.subscriptions.put(
                                 subscription.filter(),
                                 subscription
@@ -1274,21 +1453,88 @@ public final class BrokerServer implements AutoCloseable {
         /// limit. Returns false once the connection has ended. A connection that is to end with
         /// a last packet drops responses, so its reader does not wait.
         private synchronized boolean awaitResponseRoom() throws InterruptedException {
-            while (lastPacket == null
-                    && outgoing.checkCapacity(0, true) == SendQueue.OfferResult.FULL) {
+            while (lastPacket == null && responseRoomTaken()) {
                 wait();
             }
             return !ended;
         }
 
+        // Whether a response now would find no room: the reserved quota is full, or responses
+        // that a test released wait for it first. Called under the connection monitor.
+        private boolean responseRoomTaken() {
+            return !released.isEmpty()
+                    || outgoing.checkCapacity(0, true) == SendQueue.OfferResult.FULL;
+        }
+
+        // Called under routing, which guards the test controls.
         private void send(Packet packet) {
+            // A response that a test holds back waits outside the send queue, and so do the later
+            // ones of its kind, until the test releases them.
+            if (holds.contains(new Hold(packet.getClass(), clientId))) {
+                if (held.size() >= maxHeld) {
+                    close("held responses over their limit");
+                } else {
+                    held.addLast(packet);
+                }
+                return;
+            }
             boolean accepted;
             synchronized (this) {
                 // A connection that ends with a last packet drops later responses.
-                accepted = lastPacket != null || enqueue(packet);
+                if (lastPacket != null) {
+                    return;
+                }
+                if (!released.isEmpty()) {
+                    released.addLast(packet);
+                    return;
+                }
+                accepted = enqueue(packet);
             }
             if (!accepted) {
                 close("send queue full");
+            }
+        }
+
+        // Moves the held responses of `type` behind any released before, in the order held, and
+        // sends what fits. Called under routing.
+        private void release(Class<? extends Packet> type) {
+            synchronized (this) {
+                for (Iterator<Packet> responses = held.iterator(); responses.hasNext(); ) {
+                    Packet response = responses.next();
+                    if (type.isInstance(response)) {
+                        responses.remove();
+                        released.addLast(response);
+                    }
+                }
+                sendReleased();
+            }
+        }
+
+        // Sends released responses while the reserved quota has room; the writer calls this
+        // again each time it frees room. A connection that is ending drops them. Called under
+        // the connection monitor.
+        private void sendReleased() {
+            Packet next;
+            while ((next = released.peekFirst()) != null) {
+                if (ended || lastPacket != null) {
+                    released.clear();
+                    return;
+                }
+                byte[] bytes = PacketCodec.of(version).encode(next);
+                if (outgoing.checkCapacity(bytes.length, true) != SendQueue.OfferResult.ACCEPTED) {
+                    return;
+                }
+                SendQueue.OfferResult result = outgoing.offer(
+                        ++ticket,
+                        new Outbound(bytes, null),
+                        bytes.length,
+                        true
+                );
+                if (result != SendQueue.OfferResult.ACCEPTED) {
+                    return;
+                }
+                released.removeFirst();
+                notifyAll();
             }
         }
 
@@ -1357,6 +1603,7 @@ public final class BrokerServer implements AutoCloseable {
                     boolean resume;
                     synchronized (this) {
                         outgoing.completed(send.ticket());
+                        sendReleased();
                         // Refusal and completion share this monitor, so no wakeup is lost.
                         resume = awaitingSpace;
                         awaitingSpace = false;
