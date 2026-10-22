@@ -209,6 +209,42 @@ abstract class MqttRawExchangeTest {
     record Resumption(boolean sessionPresent, int keptMessages) {
     }
 
+    /// Publishes a retained message at `qos`, 0 or 1, to a topic that a connection has already
+    /// subscribed to, and returns the RETAIN flag of the copy that the subscription receives.
+    /// MQTT clears it for an established subscription [MQTT-3.3.1-9].
+    boolean retainOfForwardedRetainedMessage(Qos qos) throws Exception {
+        var topic = new Topic("hato/three/forwarded/" + qos.level());
+        try (
+                RawSession subscriber = connected("hato-three-forwarded-sub-" + qos.level());
+                RawSession publisher = connected("hato-three-forwarded-pub-" + qos.level())
+        ) {
+            subscriber.send(new Packet.Subscribe(
+                    1,
+                    List.of(new Packet.Subscription(
+                            new TopicFilter(topic.name()),
+                            Qos.AT_LEAST_ONCE,
+                            false,
+                            false,
+                            0
+                    )),
+                    EMPTY
+            ));
+            subscriber.expect(Packet.SubAck.class);
+            publisher.send(new Packet.Publish(
+                    topic,
+                    RETAINED,
+                    qos,
+                    true,
+                    false,
+                    qos == Qos.AT_MOST_ONCE ? 0 : 1,
+                    EMPTY
+            ));
+            return subscriber.expect(Packet.Publish.class).retain();
+        } finally {
+            retain(topic, new byte[0]);
+        }
+    }
+
     /// Connects with the client identifier of an open connection that has a QoS 0 Will, and
     /// records what the broker does with the open connection.
     Takeover takeOver(String clientId) throws Exception {

@@ -92,6 +92,14 @@ class NanoMqRawExchangeTest extends MqttRawExchangeTest {
     }
 
     @Test
+    void a_retained_qos_0_publication_reaches_an_established_subscription_still_retained()
+            throws Exception {
+        // Assert: NanoMQ clears RETAIN for an established subscription at QoS 1 only.
+        assertThat(retainOfForwardedRetainedMessage(Qos.AT_MOST_ONCE)).isTrue();
+        assertThat(retainOfForwardedRetainedMessage(Qos.AT_LEAST_ONCE)).isFalse();
+    }
+
+    @Test
     void a_taken_over_connection_is_closed_and_its_will_published() throws Exception {
         // Act
         Takeover takeover = takeOver("hato-nanomq-taken-over");

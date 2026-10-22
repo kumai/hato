@@ -95,6 +95,13 @@ class RabbitMqRawExchangeTest extends MqttRawExchangeTest {
         assertThat(resume(qos)).isEqualTo(new Resumption(true, 1));
     }
 
+    @ParameterizedTest
+    @EnumSource(value = Qos.class, names = {"AT_MOST_ONCE", "AT_LEAST_ONCE"})
+    void a_retained_publication_reaches_an_established_subscription_with_retain_cleared(Qos qos)
+            throws Exception {
+        assertThat(retainOfForwardedRetainedMessage(qos)).isFalse();
+    }
+
     @Test
     void a_taken_over_connection_is_closed_and_its_will_published() throws Exception {
         // Act
