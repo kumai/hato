@@ -17,6 +17,7 @@ import org.mqtt4j.hato.common.protocol.Properties;
 import org.mqtt4j.hato.common.protocol.Property;
 import org.mqtt4j.hato.common.value.MqttVersion;
 import org.mqtt4j.hato.common.value.Qos;
+import org.mqtt4j.hato.common.value.ReasonCode;
 import org.mqtt4j.hato.common.value.Topic;
 import org.mqtt4j.hato.common.value.TopicFilter;
 
@@ -27,10 +28,10 @@ import static org.mqtt4j.hato.common.protocol.PropertyId.CORRELATION_DATA;
 import static org.mqtt4j.hato.common.protocol.PropertyId.MESSAGE_EXPIRY_INTERVAL;
 import static org.mqtt4j.hato.common.protocol.PropertyId.PAYLOAD_FORMAT_INDICATOR;
 import static org.mqtt4j.hato.common.protocol.PropertyId.RESPONSE_TOPIC;
+import static org.mqtt4j.hato.common.protocol.PropertyId.SESSION_EXPIRY_INTERVAL;
 import static org.mqtt4j.hato.common.protocol.PropertyId.SUBSCRIPTION_IDENTIFIER;
 import static org.mqtt4j.hato.common.protocol.PropertyId.TOPIC_ALIAS;
 import static org.mqtt4j.hato.common.protocol.PropertyId.TOPIC_ALIAS_MAXIMUM;
-import static org.mqtt4j.hato.common.value.ReasonCode.GRANTED_QOS_2;
 import static org.mqtt4j.hato.common.value.ReasonCode.SUCCESS;
 
 /// Exchanges raw MQTT 5.0 packets with a pinned broker image through the common codec alone.
@@ -39,9 +40,10 @@ import static org.mqtt4j.hato.common.value.ReasonCode.SUCCESS;
 /// its broker answers what the client's MQTT 5.0 features rely on: the CONNACK, Topic Aliases
 /// towards a client that allows them, the copies for overlapping subscriptions and their
 /// Subscription Identifiers, a publication that no subscription matches, an unsubscription from
-/// a filter that was never subscribed, a shared subscription, and publications beyond the
-/// broker's Receive Maximum. The client's tests take their expectations from these records, so
-/// a new image that answers differently fails the record of that answer as well.
+/// a filter that was never subscribed, a shared subscription, publications beyond the broker's
+/// Receive Maximum, a session that a client resumes, and a connection that another one with the
+/// same client identifier takes over. The client's tests take their expectations from these
+/// records, so a new image that answers differently fails the record of that answer as well.
 ///
 /// The records about routing subscribe with maximum QoS 0, so deliveries need no
 /// acknowledgement and each subscriber reads them in the order the broker sends them.
@@ -56,15 +58,33 @@ abstract class Mqtt5RawExchangeTest {
     /// The messages that [#recipientsOfSharedMessages] publishes.
     static final int SHARED_MESSAGES = 10;
 
+    /// How long [#deliveriesBefore] waits for each later publication from a broker that does not
+    /// keep the order of topics.
+    private static final Duration STRAGGLER_WAIT = Duration.ofMillis(300);
+
     /// Opens a connection to the broker under test.
     abstract RawSession open() throws IOException;
+
+    /// The highest QoS that the broker grants and accepts, as recorded for it: QoS 2 unless its
+    /// CONNACK announces a lower Maximum QoS.
+    Qos maximumQos() {
+        return Qos.EXACTLY_ONCE;
+    }
+
+    /// Whether the broker forwards publications on different topics in the order they arrived,
+    /// as recorded for it. MQTT requires that order within a topic only. Records that read up to
+    /// a publication on another topic wait for later ones when the broker does not keep it.
+    boolean keepsOrderAcrossTopics() {
+        return true;
+    }
 
     @ParameterizedTest
     @EnumSource(Qos.class)
     void publications_and_properties_cross_the_broker_at_every_qos(Qos qos) throws Exception {
         // Arrange: the publisher and subscriber use separate connections and packet identifiers.
         // The payload is not UTF-8 although its format indicator says so, and the broker
-        // forwards it as it is.
+        // forwards it as it is. The subscription asks for QoS 2, and the broker grants its
+        // maximum.
         var topic = new Topic("hato/five/" + qos.level());
         var filter = new TopicFilter(topic.name());
         List<Property> messageProperties = List.of(
@@ -91,8 +111,11 @@ abstract class Mqtt5RawExchangeTest {
                     identifier(7)
             );
             subscriber.send(subscribe);
-            assertThat(subscriber.expect(Packet.SubAck.class))
-                    .isEqualTo(new Packet.SubAck(1, List.of(GRANTED_QOS_2), EMPTY));
+            assertThat(subscriber.expect(Packet.SubAck.class)).isEqualTo(new Packet.SubAck(
+                    1,
+                    List.of(ReasonCode.of(maximumQos().level())),
+                    EMPTY
+            ));
 
             // Act
             var publication = new Packet.Publish(
@@ -358,8 +381,89 @@ abstract class Mqtt5RawExchangeTest {
         }
     }
 
+    /// Starts a session with a Session Expiry Interval of a minute, with Clean Start set as
+    /// `cleanStart`, disconnects, and returns whether the broker resumes the session.
+    boolean resumesSession(boolean cleanStart) throws Exception {
+        String clientId = "hato-five-resume-" + cleanStart;
+        Properties expiry = properties(new Property.FourByteValue(SESSION_EXPIRY_INTERVAL, 60));
+        try (RawSession first = open()) {
+            first.send(new Packet.Connect(
+                    clientId,
+                    MqttVersion.V5,
+                    cleanStart,
+                    60,
+                    null,
+                    null,
+                    null,
+                    expiry
+            ));
+            assertThat(first.expect(Packet.ConnAck.class).reasonCode()).isEqualTo(SUCCESS);
+            first.send(new Packet.Disconnect(SUCCESS, EMPTY));
+            first.expectEndOfStream();
+        }
+        try (RawSession resumed = open()) {
+            resumed.send(new Packet.Connect(
+                    clientId,
+                    MqttVersion.V5,
+                    false,
+                    60,
+                    null,
+                    null,
+                    null,
+                    expiry
+            ));
+            boolean sessionPresent = resumed.expect(Packet.ConnAck.class).sessionPresent();
+            // End the session, so that no copy of it remains for a later run.
+            resumed.send(new Packet.Disconnect(
+                    SUCCESS,
+                    properties(new Property.FourByteValue(SESSION_EXPIRY_INTERVAL, 0))
+            ));
+            return sessionPresent;
+        }
+    }
+
+    /// Connects with the client identifier of an open connection that has a QoS 0 Will, and
+    /// records what the broker does with the open connection.
+    Takeover takeOver(String clientId) throws Exception {
+        var willTopic = new Topic("hato/takeover/" + clientId);
+        var will = new Packet.Will(willTopic, new byte[] {9}, Qos.AT_MOST_ONCE, false, EMPTY);
+        try (
+                RawSession watcher = connected(clientId + "-watcher");
+                RawSession first = open()
+        ) {
+            subscribe(watcher, 1, new TopicFilter(willTopic.name()), EMPTY);
+            first.send(new Packet.Connect(
+                    clientId,
+                    MqttVersion.V5,
+                    true,
+                    60,
+                    will,
+                    null,
+                    null,
+                    EMPTY
+            ));
+            assertThat(first.expect(Packet.ConnAck.class).reasonCode()).isEqualTo(SUCCESS);
+
+            try (RawSession _ = connected(clientId)) {
+                var received = new ArrayList<Packet>();
+                Optional<Packet> packet = first.next();
+                while (packet.isPresent()) {
+                    received.add(packet.get());
+                    packet = first.next();
+                }
+                boolean willPublished = watcher.poll(Duration.ofSeconds(2)).isPresent();
+                return new Takeover(received, willPublished);
+            }
+        }
+    }
+
+    /// What a broker sent a connection that another connection took over, before closing it,
+    /// and whether it published the Will of the connection that it closed.
+    record Takeover(List<Packet> toTakenOverConnection, boolean willPublished) {
+    }
+
     /// Subscribes `session` to `filter` with maximum QoS 0.
-    private static void subscribe(
+    static void subscribe(
             RawSession session,
             int packetId,
             TopicFilter filter,
@@ -372,7 +476,7 @@ abstract class Mqtt5RawExchangeTest {
     }
 
     /// A QoS 0 publication whose one-byte payload is `number`.
-    private static Packet.Publish publication(Topic topic, int number) {
+    static Packet.Publish publication(Topic topic, int number) {
         return new Packet.Publish(
                 topic,
                 new byte[] {(byte) number},
@@ -397,17 +501,13 @@ abstract class Mqtt5RawExchangeTest {
     }
 
     /// Reads what `subscriber` receives until a publication for `end` arrives, and returns the
-    /// packets before it, in order.
-    private static List<Packet> deliveriesBefore(RawSession subscriber, Topic end)
-            throws Exception {
-        var deliveries = new ArrayList<Packet>();
-        while (true) {
-            Packet delivery = subscriber.expect(Packet.class);
-            if (delivery instanceof Packet.Publish publish && publish.topic().equals(end)) {
-                return deliveries;
-            }
-            deliveries.add(delivery);
-        }
+    /// packets before it, in order. For a broker that does not keep the order of topics, they
+    /// also include the publications that arrive soon after it.
+    private List<Packet> deliveriesBefore(RawSession subscriber, Topic end) throws Exception {
+        return subscriber.packetsBefore(
+                end,
+                keepsOrderAcrossTopics() ? Duration.ZERO : STRAGGLER_WAIT
+        );
     }
 
     /// Describes a delivery of [#aliasesForTopicsSentTwice]. A topic name tells the number of its

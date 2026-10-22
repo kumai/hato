@@ -2,6 +2,8 @@ package org.mqtt4j.hato.common.io;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -13,6 +15,7 @@ import org.testcontainers.containers.GenericContainer;
 
 import org.mqtt4j.hato.common.protocol.Packet;
 import org.mqtt4j.hato.common.protocol.PacketCodec;
+import org.mqtt4j.hato.common.value.Topic;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -77,6 +80,40 @@ final class RawSession implements AutoCloseable {
         Packet packet = codec.decode(frame);
         assertThat(packet).isInstanceOf(type);
         return type.cast(packet);
+    }
+
+    /// Returns the next packet, or empty when the broker closes the connection instead.
+    Optional<Packet> next() throws Exception {
+        Optional<byte[]> frame = read();
+        if (frame.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(codec.decode(frame.get()));
+    }
+
+    /// Reads until a publication to `end` arrives, and returns the packets before it, in order.
+    ///
+    /// MQTT keeps the order of publications within a topic only. A broker that does not keep
+    /// it across topics can send publications after the one to `end` that were published before
+    /// it, so with a positive `stragglers` this also takes the packets that follow it, until none
+    /// arrives for that long.
+    List<Packet> packetsBefore(Topic end, Duration stragglers) throws Exception {
+        var packets = new ArrayList<Packet>();
+        while (true) {
+            Packet packet = expect(Packet.class);
+            if (packet instanceof Packet.Publish publish && publish.topic().equals(end)) {
+                break;
+            }
+            packets.add(packet);
+        }
+        if (stragglers.isPositive()) {
+            Optional<Packet> late = poll(stragglers);
+            while (late.isPresent()) {
+                packets.add(late.get());
+                late = poll(stragglers);
+            }
+        }
+        return packets;
     }
 
     /// Returns the next packet if it arrives within `wait`, and otherwise empty, leaving the
