@@ -50,11 +50,16 @@ testing {
             }
             // Virtual threads are not preempted, so on a single carrier, as in a one-CPU
             // container, one busy virtual thread holds up all others. Run the suite that way too.
+            // The I/O pollers run as virtual threads, as they do by default on Linux, where they
+            // compete for that carrier; macOS polls on platform threads by default.
             // Brokers configured with smaller limits check the client's decisions against what
             // they announce, which a single carrier does not change, so they run once.
             targets.register("integrationTestSingleCarrier") {
                 testTask.configure {
-                    jvmArgs("-Djdk.virtualThreadScheduler.parallelism=1")
+                    jvmArgs(
+                        "-Djdk.virtualThreadScheduler.parallelism=1",
+                        "-Djdk.pollerMode=2"
+                    )
                     filter {
                         excludeTestsMatching("*5RestrictedTest")
                     }
