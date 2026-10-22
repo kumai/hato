@@ -109,9 +109,13 @@ class TransportContractTest {
                 writer.write(new byte[] {0x20, 0x02, 0x00, 0x00});
                 connected.get(5, SECONDS);
 
-                // Act: close immediately after receiving the entire DISCONNECT frame.
+                // Act: end the connection immediately after receiving the entire DISCONNECT
+                // frame. A WebSocket peer sends its Close frame first, because the JDK's client
+                // can miss a dropped connection that arrives before its listener has asked for
+                // the message after the CONNACK.
                 CompletableFuture<Void> disconnected = sut.disconnect();
                 assertThat(reader.read().orElseThrow()).containsExactly((byte) 0xE0, (byte) 0x00);
+                peer.shutdownOutput();
                 peer.close();
 
                 // Assert: onSent must reach the core before onClosed for this to succeed.
