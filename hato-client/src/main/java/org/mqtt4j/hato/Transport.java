@@ -6,8 +6,7 @@ import java.time.Duration;
 import org.mqtt4j.hato.client.internal.DefaultTimerScheduler;
 import org.mqtt4j.hato.client.internal.TcpTransport;
 
-/// An experimental, single-use, ordered byte connection. This contract may evolve as other
-/// transport implementations are exercised. It has no knowledge of MQTT packets.
+/// A single-use, ordered byte connection. It has no knowledge of MQTT packets.
 ///
 /// All methods and listener callbacks must return promptly without waiting for I/O or capacity.
 /// Callbacks may occur inline. Received arrays transfer ownership to the listener; they must
