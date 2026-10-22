@@ -25,8 +25,8 @@ import java.util.function.Supplier;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.CapacityLimit;
 import org.mqtt4j.hato.ClientStats;
-import org.mqtt4j.hato.ClientStats.CapacityLimit;
 import org.mqtt4j.hato.ClientStats.ConnectionState;
 import org.mqtt4j.hato.ClientStats.OverloadCause;
 import org.mqtt4j.hato.ConnAck;

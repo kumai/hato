@@ -17,7 +17,7 @@ import java.util.function.IntPredicate;
 
 import org.jspecify.annotations.Nullable;
 
-import org.mqtt4j.hato.ClientStats.CapacityLimit;
+import org.mqtt4j.hato.CapacityLimit;
 import org.mqtt4j.hato.ClientStats.Usage;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttCapacityException;

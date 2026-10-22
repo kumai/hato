@@ -391,8 +391,8 @@ class DistributionTest {
         // A change here is a change to the public API; update the list only on purpose.
         assertThat(publicTypes(CLIENT)).containsExactlyInAnyOrder(
                 "org.mqtt4j.hato.AckMode",
+                "org.mqtt4j.hato.CapacityLimit",
                 "org.mqtt4j.hato.ClientStats",
-                "org.mqtt4j.hato.ClientStats$CapacityLimit",
                 "org.mqtt4j.hato.ClientStats$Connection",
                 "org.mqtt4j.hato.ClientStats$ConnectionState",
                 "org.mqtt4j.hato.ClientStats$DropReason",
