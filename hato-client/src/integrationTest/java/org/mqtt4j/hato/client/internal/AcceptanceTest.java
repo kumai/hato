@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -326,9 +327,16 @@ abstract class AcceptanceTest {
     void replacing_an_unknown_broker_session_publishes_no_will() throws Exception {
         // The first connection receives what the broker kept for the old session while it
         // closes, which is when a reset connection lost its DISCONNECT. Repeat to make such a
-        // loss show.
-        for (int run = 0; run < REPLACEMENTS; run++) {
-            replaceAnUnknownBrokerSession();
+        // loss show. A replacement that the broker refused does not count.
+        int replaced = 0;
+        int refused = 0;
+        while (replaced < REPLACEMENTS) {
+            if (replaceAnUnknownBrokerSession()) {
+                replaced++;
+            } else {
+                refused++;
+                assertThat(refused).as("refused replacements").isLessThan(REPLACEMENTS / 10);
+            }
         }
     }
 
@@ -427,12 +435,20 @@ abstract class AcceptanceTest {
         return true;
     }
 
+    /// Whether the broker may refuse a connection with Server unavailable while it still releases
+    /// the client identifier of the connection before it, as seen for it under load. Replacing a
+    /// session that the client does not know opens three connections in a row.
+    boolean mayRefuseWhileReleasingClientIdentifiers() {
+        return false;
+    }
+
     abstract URI endpoint();
 
     /// Leaves a broker session with a subscription and stored messages behind, then connects
     /// without its local state, so the client replaces the session, and checks that no Will
-    /// follows.
-    private void replaceAnUnknownBrokerSession() throws Exception {
+    /// follows. Returns false when the broker refused the replacement, as it may while it releases
+    /// the client identifier of an earlier connection.
+    private boolean replaceAnUnknownBrokerSession() throws Exception {
         var topic = new Topic(uniqueTopic());
         var storedTopic = new Topic(uniqueTopic());
         String clientId = clientId();
@@ -461,14 +477,30 @@ abstract class AcceptanceTest {
             }
 
             // Act
-            ConnAck connAck = sut.connect().get(5, SECONDS);
+            ConnAck connAck;
+            try {
+                connAck = sut.connect().get(5, SECONDS);
+            } catch (ExecutionException failure) {
+                if (!mayRefuseWhileReleasingClientIdentifiers() || !refusedAsUnavailable(failure)) {
+                    throw failure;
+                }
+                // Checking for a Will would take the identifier over again, which the broker
+                // may refuse just as well; the replacements that succeed check it.
+                return false;
+            }
             sut.disconnect().get(5, SECONDS);
 
             // Assert: the connections before the new session ended with DISCONNECT.
             assertThat(connAck).isEqualTo(ConnAck.of(false, 1));
             assertThat(connections).hasValue(3);
             assertNoWillAfterReplacement(sut, clientId, topic, subscription);
+            return true;
         }
+    }
+
+    private static boolean refusedAsUnavailable(ExecutionException failure) {
+        return failure.getCause() instanceof MqttConnectException refusal
+                && refusal.reasonCode().equals(Optional.of(ReasonCode.SERVER_UNAVAILABLE));
     }
 
     /// Closes `ended`, which disconnected with `clientId`, then connects another client with that

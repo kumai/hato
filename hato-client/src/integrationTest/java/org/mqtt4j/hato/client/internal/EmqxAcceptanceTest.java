@@ -30,6 +30,14 @@ class EmqxAcceptanceTest extends AcceptanceTest {
         broker.stop();
     }
 
+    // Under load, EMQX refuses a connection with Server unavailable while it still releases the
+    // client identifier of the connection before it, even after that connection has closed, as
+    // a CI run showed.
+    @Override
+    boolean mayRefuseWhileReleasingClientIdentifiers() {
+        return true;
+    }
+
     @Override
     URI endpoint() {
         return URI.create(
