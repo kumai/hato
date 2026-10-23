@@ -1525,8 +1525,8 @@ class ClientIoTest {
         }
 
         @Override
-        public Packet decode(byte[] packet) {
-            return delegate.decode(packet);
+        public Packet decode(byte[] bytes, int offset, int length) {
+            return delegate.decode(bytes, offset, length);
         }
     }
 

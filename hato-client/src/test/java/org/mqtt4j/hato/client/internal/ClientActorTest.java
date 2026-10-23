@@ -9078,8 +9078,8 @@ class ClientActorTest {
         }
 
         @Override
-        public Packet decode(byte[] bytes) {
-            return codec.decode(bytes);
+        public Packet decode(byte[] bytes, int offset, int length) {
+            return codec.decode(bytes, offset, length);
         }
 
         @Override

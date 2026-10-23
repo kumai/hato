@@ -100,7 +100,20 @@ public interface PacketCodec {
     /// @throws PacketDecodeException if the packet is malformed, violates a checked rule, or
     ///         carries more than [#MAX_PROPERTIES] properties
     /// @throws UnsupportedProtocolVersionException if CONNECT requests an unsupported level
-    Packet decode(byte[] packet);
+    default Packet decode(byte[] packet) {
+        requireNonNull(packet, "packet must not be null");
+        return decode(packet, 0, packet.length);
+    }
+
+    /// Decodes the one complete packet in the `length` bytes of `bytes` from `offset`, as
+    /// [#decode(byte[])] decodes a whole array, without reading the rest of the array. This lets
+    /// a packet that arrived together with others be decoded where it lies.
+    ///
+    /// @throws PacketDecodeException if the packet is malformed, violates a checked rule, or
+    ///         carries more than [#MAX_PROPERTIES] properties
+    /// @throws UnsupportedProtocolVersionException if CONNECT requests an unsupported level
+    /// @throws IndexOutOfBoundsException if the range does not lie within `bytes`
+    Packet decode(byte[] bytes, int offset, int length);
 
     /// Decodes the first CONNECT before the connection's MQTT version has been selected.
     ///
