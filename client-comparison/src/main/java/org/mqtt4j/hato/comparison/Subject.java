@@ -11,7 +11,8 @@ import java.util.logging.Logger;
 /// that starts with [#RESULT_PREFIX], for the driver to read.
 ///
 /// Arguments, as `key=value` words: `library`, `port`, `filter`, `qos`, `expected`, and
-/// `warmup`.
+/// `warmup`, and optionally `threads=true` to print, ahead of the result, where the CPU time of
+/// the measured stretch went by thread.
 public final class Subject {
 
     static final String RESULT_PREFIX = "RESULT ";
@@ -27,7 +28,11 @@ public final class Subject {
     public static void main(String[] args) throws Exception {
         Arguments arguments = Arguments.parse(Arrays.asList(args));
         Library library = Library.of(arguments.text("library"));
-        var reception = new Reception(arguments.number("expected"), arguments.number("warmup"));
+        var reception = new Reception(
+                arguments.number("expected"),
+                arguments.number("warmup"),
+                Boolean.parseBoolean(arguments.text("threads", "false"))
+        );
 
         // Paho and Hato log through java.util.logging, and HiveMQ finds no logging library on
         // the class path. Logging stays off so that no client pays for output that the others do
@@ -46,6 +51,9 @@ public final class Subject {
                     reception::handle
             );
             Reception.Result result = reception.await(IDLE, LIMIT);
+            for (String line : reception.threadReport(result)) {
+                System.out.println(line);
+            }
             System.out.println(
                     RESULT_PREFIX + result.format() + " connectionsLost=" + client.connectionsLost()
             );

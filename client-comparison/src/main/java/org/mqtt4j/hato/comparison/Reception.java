@@ -4,6 +4,8 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.jspecify.annotations.Nullable;
@@ -53,14 +55,21 @@ final class Reception {
 
     private volatile long firstHandled;
 
-    // Written after the two fields above, so that a thread that reads it sees them.
+    private final boolean reportThreads;
+
+    // Each platform thread's CPU time when the stretch started, when the run reports threads.
+    private volatile @Nullable Map<Long, ThreadUsage.Times> threadsAtStart;
+
+    // Written after the fields above, so that a thread that reads it sees them.
     private volatile @Nullable ProcessUsage start;
 
     private volatile @Nullable ProcessUsage end;
 
     /// @param expected the messages that the broker sends
     /// @param warmup the leading messages that are not measured, at least one
-    Reception(long expected, long warmup) {
+    /// @param reportThreads whether to take each thread's CPU time for [#threadReport]; taking it
+    ///     holds up the message that starts the stretch
+    Reception(long expected, long warmup, boolean reportThreads) {
         if (warmup < 1 || warmup >= expected - 1) {
             throw new IllegalArgumentException(
                     "Warm-up must be at least 1 and below " + (expected - 1) + ": " + warmup
@@ -68,6 +77,7 @@ final class Reception {
         }
         this.expected = expected;
         this.warmup = warmup;
+        this.reportThreads = reportThreads;
         this.latencies = new long[Math.toIntExact(expected - warmup)];
         Arrays.fill(latencies, NOT_HANDLED);
     }
@@ -85,6 +95,9 @@ final class Reception {
             firstSequence = sequence;
             firstHandled = count;
             threads.resetPeakThreadCount();
+            if (reportThreads) {
+                threadsAtStart = ThreadUsage.now();
+            }
             start = ProcessUsage.now();
         }
         if (sequence == expected - 1) {
@@ -128,6 +141,22 @@ final class Reception {
                 used,
                 threads.getPeakThreadCount(),
                 Latency.of(latencies)
+        );
+    }
+
+    /// The CPU time of the measured stretch of `result`, broken down by thread as
+    /// [ThreadUsage#report] does it, or nothing when the run does not report threads or measured
+    /// nothing. Call it after [#await].
+    List<String> threadReport(Result result) {
+        Map<Long, ThreadUsage.Times> first = threadsAtStart;
+        if (first == null || result.arrived() == 0) {
+            return List.of();
+        }
+        return ThreadUsage.report(
+                first,
+                ThreadUsage.now(),
+                result.used().cpuNanos(),
+                result.arrived()
         );
     }
 

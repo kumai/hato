@@ -32,8 +32,10 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 ///   the handler and which rates each client keeps up with. `seconds` and `warmupSeconds` set the
 ///   time at each rate, and `qos0Rates` and `qos1Rates` the rates.
 ///
-/// Both take `runs`, `window`, `libraries`, `qos`, and `sizes`, and `verbose=true` to print each
-/// run's result as well. Lists are comma-separated. For example,
+/// Both take `runs`, `window`, `libraries`, `qos`, and `sizes`, `verbose=true` to print each
+/// run's result as well, `threads=true` to print where each run's CPU time went by thread, and
+/// `subjectOptions` for JVM options to add to every subject JVM, such as
+/// `-Djdk.virtualThreadScheduler.parallelism=1`. Lists are comma-separated. For example,
 /// `./gradlew :client-comparison:run --args="scenario=latency qos=1 runs=5"`.
 public final class Driver {
 
@@ -71,7 +73,11 @@ public final class Driver {
                 arguments.list("libraries", "paho,hato,hivemq").stream()
                         .map(Library::of)
                         .toList(),
-                Boolean.parseBoolean(arguments.text("verbose", "false"))
+                Boolean.parseBoolean(arguments.text("verbose", "false")),
+                Boolean.parseBoolean(arguments.text("threads", "false")),
+                arguments.text("subjectOptions", "").isEmpty()
+                        ? List.of()
+                        : arguments.list("subjectOptions", "")
         );
         System.out.printf(
                 "Receiving from a stub broker on loopback; Java %s, %d processors%n",
@@ -86,9 +92,17 @@ public final class Driver {
         }
     }
 
-    /// What every scenario takes: the runs per library, the QoS 1 window, the libraries, and
-    /// whether to print each run's result.
-    private record Settings(int runs, int window, List<Library> libraries, boolean verbose) {}
+    /// What every scenario takes: the runs per library, the QoS 1 window, the libraries, whether
+    /// to print each run's result, whether to print where each run's CPU time went by thread, and
+    /// the JVM options to add to every subject JVM.
+    private record Settings(
+            int runs,
+            int window,
+            List<Library> libraries,
+            boolean verbose,
+            boolean threads,
+            List<String> subjectOptions
+    ) {}
 
     /// One configuration of the stub broker and the subscriber: what the stub broker sends, and
     /// how many of the leading messages the subscriber does not measure.
@@ -167,7 +181,7 @@ public final class Driver {
             var order = new ArrayList<>(settings.libraries());
             Collections.rotate(order, -run);
             for (Library library : order) {
-                Arguments result = runOnce(measured, library);
+                Arguments result = runOnce(measured, library, settings);
                 if (settings.verbose()) {
                     System.out.println(library.label() + ": " + result.values());
                 }
@@ -177,14 +191,15 @@ public final class Driver {
         return results;
     }
 
-    private static Arguments runOnce(Case measured, Library library) throws Exception {
+    private static Arguments runOnce(Case measured, Library library, Settings settings)
+            throws Exception {
         try (var broker = new StubBroker(measured.traffic())) {
             var serving = new FutureTask<Boolean>(() -> {
                 broker.serve();
                 return true;
             });
             Thread.ofPlatform().name("stub-broker").daemon().start(serving);
-            Process subject = startSubject(measured, library, broker.port());
+            Process subject = startSubject(measured, library, broker.port(), settings);
             String result = readResult(subject, library);
             if (!subject.waitFor(1, TimeUnit.MINUTES)) {
                 subject.destroyForcibly();
@@ -200,11 +215,16 @@ public final class Driver {
         }
     }
 
-    private static Process startSubject(Case measured, Library library, int port)
-            throws IOException {
+    private static Process startSubject(
+            Case measured,
+            Library library,
+            int port,
+            Settings settings
+    ) throws IOException {
         var command = new ArrayList<String>();
         command.add(ProcessHandle.current().info().command().orElseThrow());
         command.addAll(SUBJECT_JVM_OPTIONS);
+        command.addAll(settings.subjectOptions());
         command.add("-cp");
         command.add(System.getProperty("java.class.path"));
         command.add(Subject.class.getName());
@@ -214,6 +234,7 @@ public final class Driver {
         command.add("qos=" + measured.traffic().qos());
         command.add("expected=" + measured.traffic().count());
         command.add("warmup=" + measured.warmup());
+        command.add("threads=" + settings.threads());
         return new ProcessBuilder(command)
                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                 .start();
