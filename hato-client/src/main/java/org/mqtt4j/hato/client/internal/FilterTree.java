@@ -25,6 +25,12 @@ final class FilterTree<T> {
 
     private final Node<T> root = new Node<>();
 
+    // The nodes that match() advances level by level, kept for its next call: it runs for every
+    // received publication, and only the actor calls it.
+    private ArrayList<Node<T>> reached = new ArrayList<>();
+
+    private ArrayList<Node<T>> spare = new ArrayList<>();
+
     /// Adds `value` under `filter`.
     void add(TopicFilter filter, T value) {
         Node<T> node = root;
@@ -74,23 +80,33 @@ final class FilterTree<T> {
     /// order.
     void match(Topic topic, Consumer<? super T> sink) {
         String name = topic.name();
-        String[] levels = levels(name);
         // [MQTT-4.7.2-1]: a leading wildcard does not select a topic whose name starts with $.
         boolean system = name.startsWith("$");
         // The nodes whose filters' levels select the topic's levels so far, advanced one level
         // at a time rather than recursively, so a deep topic cannot exhaust the stack. Every
         // node is reached by one path only, so each holds its values at one depth.
-        var current = new ArrayList<Node<T>>();
-        var next = new ArrayList<Node<T>>();
+        ArrayList<Node<T>> current = reached;
+        ArrayList<Node<T>> next = spare;
+        current.clear();
+        next.clear();
         current.add(root);
-        for (int depth = 0; depth < levels.length && !current.isEmpty(); depth++) {
+        // Each level ends at a / or at the end of the name, so "a/" has the levels "a" and "".
+        int start = 0;
+        for (int depth = 0; start <= name.length() && !current.isEmpty(); depth++) {
+            int end = name.indexOf('/', start);
+            if (end < 0) {
+                end = name.length();
+            }
+            String level = name.substring(start, end);
+            start = end + 1;
             boolean leading = depth == 0 && system;
-            for (Node<T> node : current) {
+            for (int i = 0; i < current.size(); i++) {
+                Node<T> node = current.get(i);
                 // A final # here takes this level and the rest.
                 if (!leading) {
                     node.multiLevel.forEach(sink);
                 }
-                Node<T> literal = node.children.get(levels[depth]);
+                Node<T> literal = node.children.get(level);
                 if (literal != null) {
                     next.add(literal);
                 }
@@ -99,11 +115,13 @@ final class FilterTree<T> {
                     next.add(any);
                 }
             }
-            ArrayList<Node<T>> reached = next;
+            ArrayList<Node<T>> advanced = next;
             next = current;
-            current = reached;
+            current = advanced;
             next.clear();
         }
+        reached = current;
+        spare = next;
         // The topic has no level left: the filters that end here select it, and so does a final
         // # that takes no level.
         for (Node<T> node : current) {
