@@ -3,6 +3,7 @@ package org.mqtt4j.hato.client.internal;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -13,6 +14,7 @@ import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -211,6 +213,87 @@ class TcpTransportTest {
             assertThat(events).containsExactly("connected", "bytes", "closed");
         } finally {
             finishHandshake.complete(null);
+        }
+    }
+
+    @Test
+    void a_paused_transport_reads_nothing_more_until_it_resumes() throws Exception {
+        // Arrange: a peer stream that hands over one byte per read, and a client that pauses
+        // in the callback for the first, as the client does once it has fallen behind.
+        var peer = new LinkedBlockingQueue<Integer>();
+        var received = new LinkedBlockingQueue<Byte>();
+        var input = new InputStream() {
+            @Override
+            public int read() throws IOException {
+                try {
+                    return peer.take();
+                } catch (InterruptedException _) {
+                    throw new InterruptedIOException();
+                }
+            }
+
+            @Override
+            public int read(byte[] bytes, int offset, int length) throws IOException {
+                int value = read();
+                if (value < 0) {
+                    return -1;
+                }
+                bytes[offset] = (byte) value;
+                return 1;
+            }
+        };
+        var socket = new TcpTransport.Connection() {
+            @Override
+            public InputStream input() {
+                return input;
+            }
+
+            @Override
+            public OutputStream output() {
+                return OutputStream.nullOutputStream();
+            }
+
+            @Override
+            public void close() {
+                peer.add(-1);
+            }
+        };
+        var connected = new CompletableFuture<Void>();
+        try (TcpTransport sut = transport(socket, clock)) {
+            sut.start(SERVER, TIMEOUT, new Transport.Listener() {
+                @Override
+                public void onConnected() {
+                    connected.complete(null);
+                }
+
+                @Override
+                public void onBytes(byte[] bytes) {
+                    received.add(bytes[0]);
+                    sut.pauseReading();
+                }
+
+                @Override
+                public void onSent(long ticket) {
+                    throw new AssertionError("Unexpected send completion");
+                }
+
+                @Override
+                public void onClosed(Throwable cause) {
+                    // The test ends by closing the transport.
+                }
+            });
+            connected.get(5, SECONDS);
+            peer.add(1);
+            assertThat(received.poll(5, SECONDS)).isEqualTo((byte) 1);
+
+            // Act
+            peer.add(2);
+
+            // Assert: the second byte stays with the peer until the client resumes.
+            assertThat(received.poll(200, MILLISECONDS)).isNull();
+            assertThat(peer).containsExactly(2);
+            sut.resumeReading();
+            assertThat(received.poll(5, SECONDS)).isEqualTo((byte) 2);
         }
     }
 

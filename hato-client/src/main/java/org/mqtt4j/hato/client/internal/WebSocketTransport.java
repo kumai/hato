@@ -26,7 +26,7 @@ import static java.util.Objects.requireNonNull;
 /// stream in binary messages. The JDK calls its listener and completes its sends on threads that
 /// it chooses, sometimes at the same time, so one monitor serializes the callbacks to the client,
 /// as in TcpTransport. The client's [WebSocketTransports] owns the HttpClient that opens it.
-final class WebSocketTransport implements Transport {
+final class WebSocketTransport implements Transport, PausableTransport {
 
     private static final Log log = Log.of(WebSocketTransport.class);
 
@@ -76,6 +76,12 @@ final class WebSocketTransport implements Transport {
 
     // A graceful close that waits for the peer's Close.
     private boolean closing;
+
+    // While paused, the request for the next message waits until the client resumes, which
+    // leaves the peer to TCP flow control.
+    private boolean readingPaused;
+
+    private boolean requestWithheld;
 
     WebSocketTransport(
             String clientId,
@@ -178,6 +184,27 @@ final class WebSocketTransport implements Transport {
         terminate(new IOException("Transport closed"), true);
     }
 
+    @Override
+    public void pauseReading() {
+        synchronized (callbacks) {
+            readingPaused = true;
+        }
+    }
+
+    @Override
+    public void resumeReading() {
+        WebSocket raw;
+        synchronized (callbacks) {
+            readingPaused = false;
+            if (!requestWithheld || closed) {
+                return;
+            }
+            requestWithheld = false;
+            raw = requireNonNull(attached);
+        }
+        raw.request(1);
+    }
+
     // The upgrade's result. A failure ends the transport; a WebSocket that opens is attached
     // here or by onOpen, whichever comes first.
     private void established(@Nullable WebSocket raw, @Nullable Throwable failure) {
@@ -263,6 +290,7 @@ final class WebSocketTransport implements Transport {
 
     private void end(Throwable cause, boolean graceful, boolean onlyConnecting) {
         WebSocket open;
+        WebSocket withheld;
         boolean waits;
         synchronized (callbacks) {
             if (closed || (onlyConnecting && connected)) {
@@ -274,10 +302,16 @@ final class WebSocketTransport implements Transport {
             open = socket;
             waits = graceful && open != null && !sending && startGrace(cause);
             closing = waits;
+            // The peer's Close needs the request that a pause held back.
+            withheld = waits && requestWithheld ? attached : null;
+            requestWithheld = false;
         }
         if (open != null) {
             if (waits) {
                 sendClose(open);
+                if (withheld != null) {
+                    withheld.request(1);
+                }
             } else {
                 open.abort();
             }
@@ -389,6 +423,11 @@ final class WebSocketTransport implements Transport {
                 }
                 if (bytes.length > 0) {
                     receiver.onBytes(bytes);
+                }
+                // A pause, which onBytes may have asked for, holds the next request back.
+                if (readingPaused && !closed) {
+                    requestWithheld = true;
+                    return null;
                 }
             }
             webSocket.request(1);

@@ -669,6 +669,9 @@ public final class ClientActor implements MqttClient {
             long busySince = System.nanoTime();
             while ((next = mailbox.take(stopping::get)).isPresent()) {
                 Mailbox.Event event = next.orElseThrow();
+                if (event.kind().received() && mailbox.resumeDue()) {
+                    io.resumeReading(event.generation());
+                }
                 try {
                     event.action().run();
                 } catch (SpiException cause) {
@@ -1479,6 +1482,11 @@ public final class ClientActor implements MqttClient {
                 timers.remove(timer);
                 throw SpiException.scheduler(generation, failure);
             }
+            // The PINGRESP that this deadline waits for overtakes the received packets only once
+            // it has been read, so the transport reads on until the deadline is cancelled.
+            if (timer == SessionCore.Timer.PING && mailbox.pingResponseDue(true)) {
+                io.resumeReading(generation);
+            }
         }
 
         // Wakes are coalesced, so the actor checks the current timer. A late callback of a
@@ -1493,6 +1501,9 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void cancel(SessionCore.Timer timer) {
+            if (timer == SessionCore.Timer.PING) {
+                mailbox.pingResponseDue(false);
+            }
             TimerEntry entry = timers.remove(timer);
             if (entry != null && entry.cancellation != null) {
                 try {
@@ -1694,6 +1705,9 @@ public final class ClientActor implements MqttClient {
                             : Mailbox.Kind.INCOMING,
                     size
             );
+            if (mailbox.pauseDue(generation)) {
+                io.pauseReading(generation);
+            }
         }
 
         @Override

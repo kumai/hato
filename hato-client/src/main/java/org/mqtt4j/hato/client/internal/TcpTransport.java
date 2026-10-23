@@ -29,7 +29,7 @@ import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 /// Socket ownership and named reader/writer threads. Closing never waits for either worker.
-public final class TcpTransport implements Transport {
+public final class TcpTransport implements Transport, PausableTransport {
 
     private static final Log log = Log.of(TcpTransport.class);
 
@@ -105,6 +105,8 @@ public final class TcpTransport implements Transport {
     private boolean closed;
     private boolean started;
     private boolean connected;
+    // The reader waits before its next read while set, and a close ends the wait.
+    private boolean readingPaused;
 
     public TcpTransport(String clientId, TimerScheduler timer) {
         this(
@@ -292,7 +294,23 @@ public final class TcpTransport implements Transport {
         return Duration.ofNanos(nanos);
     }
 
-    private void read(Connection socket, Listener receiver) throws IOException {
+    @Override
+    public void pauseReading() {
+        synchronized (callbacks) {
+            readingPaused = true;
+        }
+    }
+
+    @Override
+    public void resumeReading() {
+        synchronized (callbacks) {
+            readingPaused = false;
+            callbacks.notifyAll();
+        }
+    }
+
+    private void read(Connection socket, Listener receiver)
+            throws IOException, InterruptedException {
         var buffer = new byte[READ_BUFFER_SIZE];
         InputStream input = socket.input();
         long busySince = System.nanoTime();
@@ -303,6 +321,14 @@ public final class TcpTransport implements Transport {
                 // stream, so that closeGracefully can release a socket that receives nothing.
                 if (!closed) {
                     receiver.onBytes(Arrays.copyOf(buffer, count));
+                }
+                // A pause, which onBytes may have asked for, leaves the peer to TCP flow control
+                // until the client resumes. Waiting frees the carrier.
+                if (readingPaused && !closed) {
+                    while (readingPaused && !closed) {
+                        callbacks.wait();
+                    }
+                    busySince = System.nanoTime();
                 }
             }
             // A peer that never pauses keeps every read from blocking, and the reader from

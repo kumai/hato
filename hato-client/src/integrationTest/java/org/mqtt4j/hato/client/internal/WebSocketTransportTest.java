@@ -212,6 +212,54 @@ class WebSocketTransportTest {
     }
 
     @Test
+    void a_paused_transport_takes_no_more_messages_until_it_resumes() throws Exception {
+        try (WebSocketPeer server = WebSocketPeer.listen(); Transport sut = owner.create("ws")) {
+            // Arrange: the client pauses in the callback for each message, as it does once it
+            // has fallen behind.
+            receiver.received = ((PausableTransport) sut)::pauseReading;
+            sut.start(server.uri("/"), Duration.ofSeconds(5), receiver);
+            try (WebSocketPeer.Connection peer = server.accept()) {
+                peer.open("mqtt");
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+                peer.sendBinary(new byte[] {1});
+                assertThat(receiver.bytes.poll(5, SECONDS)).containsExactly(1);
+
+                // Act
+                peer.sendBinary(new byte[] {2});
+
+                // Assert
+                assertThat(receiver.bytes.poll(300, MILLISECONDS)).isNull();
+                ((PausableTransport) sut).resumeReading();
+                assertThat(receiver.bytes.poll(5, SECONDS)).containsExactly(2);
+            }
+        }
+    }
+
+    @Test
+    void a_close_while_paused_still_ends_as_soon_as_the_broker_answers_it() throws Exception {
+        try (WebSocketPeer server = WebSocketPeer.listen(); Transport sut = owner.create("ws")) {
+            // Arrange: a message has paused reading.
+            receiver.received = ((PausableTransport) sut)::pauseReading;
+            sut.start(server.uri("/"), Duration.ofSeconds(5), receiver);
+            try (WebSocketPeer.Connection peer = server.accept()) {
+                peer.open("mqtt");
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+                peer.sendBinary(new byte[] {1});
+                assertThat(receiver.bytes.poll(5, SECONDS)).containsExactly(1);
+
+                // Act
+                sut.close();
+                assertThat(peer.receive().opcode()).isEqualTo(CLOSE);
+                peer.sendClose(1000, "");
+
+                // Assert: the broker's Close ends the close well before its grace period.
+                assertThat(receiver.events.poll(500, MILLISECONDS))
+                        .isInstanceOf(IOException.class);
+            }
+        }
+    }
+
+    @Test
     void a_close_aborts_after_its_grace_period_when_the_broker_does_not_answer()
             throws Exception {
         try (WebSocketPeer server = WebSocketPeer.listen(); Transport sut = owner.create("ws")) {
@@ -536,6 +584,8 @@ class WebSocketTransportTest {
 
         volatile LongConsumer sent = _ -> { };
 
+        volatile Runnable received = () -> { };
+
         @Override
         public void onConnected() {
             enter();
@@ -547,6 +597,7 @@ class WebSocketTransportTest {
         public void onBytes(byte[] value) {
             enter();
             bytes.add(value);
+            received.run();
             leave();
         }
 

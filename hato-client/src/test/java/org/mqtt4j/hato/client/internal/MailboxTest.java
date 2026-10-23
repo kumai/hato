@@ -98,6 +98,88 @@ class MailboxTest {
     }
 
     @Test
+    void received_packets_pause_the_reader_at_half_an_allowance_and_resume_it_at_a_quarter()
+            throws Exception {
+        // Arrange: allowances of 8 packets, which both kinds of received packet count against.
+        var sut = new Mailbox(1, 10, 256, 8, 800, 1);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 1);
+        var publication = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 1);
+        sut.activate(1);
+        for (int i = 0; i < 3; i++) {
+            sut.offer(i == 0 ? incoming : publication);
+            assertThat(sut.pauseDue(1)).isFalse();
+        }
+
+        // Act & Assert: the fourth pauses the reader, once.
+        sut.offer(incoming);
+        assertThat(sut.pauseDue(1)).isTrue();
+        assertThat(sut.pauseDue(1)).isFalse();
+
+        // Act & Assert: the reader resumes once the actor has taken all but two, once.
+        sut.take(() -> false);
+        assertThat(sut.resumeDue()).isFalse();
+        sut.take(() -> false);
+        assertThat(sut.resumeDue()).isTrue();
+        assertThat(sut.resumeDue()).isFalse();
+    }
+
+    @Test
+    void received_bytes_pause_the_reader_as_received_packets_do() throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 8, 800, 1);
+        var large = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 400);
+        sut.activate(1);
+
+        // Act & Assert: half of the byte allowance pauses, and taking it back resumes.
+        sut.offer(large);
+        assertThat(sut.pauseDue(1)).isTrue();
+        sut.take(() -> false);
+        assertThat(sut.resumeDue()).isTrue();
+    }
+
+    @Test
+    void a_due_pingresp_resumes_a_paused_reader_and_keeps_it_reading() throws Exception {
+        // Arrange: received packets have paused the reader.
+        var sut = new Mailbox(1, 10, 256, 8, 800, 1);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 1);
+        sut.activate(1);
+        for (int i = 0; i < 4; i++) {
+            sut.offer(incoming);
+        }
+        assertThat(sut.pauseDue(1)).isTrue();
+
+        // Act & Assert: the reader resumes for the PINGRESP and keeps reading until it arrives.
+        assertThat(sut.pingResponseDue(true)).isTrue();
+        sut.offer(incoming);
+        assertThat(sut.pauseDue(1)).isFalse();
+        assertThat(sut.pingResponseDue(false)).isFalse();
+        assertThat(sut.pauseDue(1)).isTrue();
+    }
+
+    @Test
+    void a_new_connection_reads_unpaused_and_ignores_its_predecessors_reader() throws Exception {
+        // Arrange: the old connection's reader is paused while a PINGRESP is due.
+        var sut = new Mailbox(1, 10, 256, 8, 800, 1);
+        sut.activate(1);
+        for (int i = 0; i < 4; i++) {
+            sut.offer(new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 1));
+        }
+        assertThat(sut.pauseDue(1)).isTrue();
+        sut.pingResponseDue(true);
+
+        // Act
+        sut.discard(1);
+        sut.activate(2);
+        for (int i = 0; i < 4; i++) {
+            sut.offer(new Mailbox.Event(2, () -> { }, Mailbox.Kind.INCOMING, 1));
+        }
+
+        // Assert: neither the old pause nor the old PINGRESP holds back the new reader.
+        assertThat(sut.pauseDue(1)).isFalse();
+        assertThat(sut.pauseDue(2)).isTrue();
+    }
+
+    @Test
     void qos_0_publications_and_other_incoming_packets_have_independent_capacity_in_one_fifo()
             throws Exception {
         // Arrange
