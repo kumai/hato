@@ -1135,6 +1135,55 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void qos_0_publications_handed_over_together_queue_in_the_order_given() throws Exception {
+        // Arrange
+        DeliveryLanes.Receiver first = registerPull(sut, 1, request(4));
+        DeliveryLanes.Receiver second = registerPull(sut, 2, request(4));
+
+        // Act
+        sut.deliverAtMostOnce(List.of(
+                arrival(List.of(1L, 2L), message(1), 10),
+                arrival(List.of(2L), message(2), 10),
+                arrival(List.of(1L), message(3), 10)
+        ));
+
+        // Assert: each lane holds its publications in the order given.
+        assertThat(received(first.receive(Duration.ZERO)).message()).isEqualTo(message(1));
+        assertThat(received(first.receive(Duration.ZERO)).message()).isEqualTo(message(3));
+        assertThat(first.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+        assertThat(received(second.receive(Duration.ZERO)).message()).isEqualTo(message(1));
+        assertThat(received(second.receive(Duration.ZERO)).message()).isEqualTo(message(2));
+        assertThat(second.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+    }
+
+    @Test
+    void each_qos_0_publication_handed_over_together_meets_the_limits_in_turn() throws Exception {
+        // Arrange: the client holds at most 25 bytes, and the second lane one delivery.
+        DeliveryLanes sut = lanes(25);
+        DeliveryLanes.Receiver first = registerPull(sut, 1, request(4));
+        DeliveryLanes.Receiver second = registerPull(sut, 2, request(1));
+
+        // Act
+        sut.deliverAtMostOnce(List.of(
+                arrival(List.of(1L), message(1), 10),
+                arrival(List.of(1L), message(2), 20),
+                arrival(List.of(1L), message(3), 10),
+                arrival(List.of(2L), message(4), 1),
+                arrival(List.of(2L), message(5), 1)
+        ));
+
+        // Assert: a publication that does not fit is dropped, and later ones that fit are
+        // queued, as though each had been delivered alone.
+        assertThat(sut.dropped(1, DropReason.CLIENT_FULL)).isEqualTo(1);
+        assertThat(sut.dropped(2, DropReason.SUBSCRIPTION_FULL)).isEqualTo(1);
+        assertThat(received(first.receive(Duration.ZERO)).message()).isEqualTo(message(1));
+        assertThat(received(first.receive(Duration.ZERO)).message()).isEqualTo(message(3));
+        assertThat(first.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+        assertThat(received(second.receive(Duration.ZERO)).message()).isEqualTo(message(4));
+        assertThat(second.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
+    }
+
+    @Test
     void stopped_handlers_keep_the_lane_limit_across_reconnections() throws Exception {
         // Arrange: every lane has a running handler.
         var entered = new CountDownLatch(256);
@@ -2801,6 +2850,10 @@ class DeliveryLanesTest {
 
     private static MqttMessage message(int value) {
         return MqttMessage.of(new Topic("a"), new byte[] {(byte) value}, Qos.AT_MOST_ONCE, false);
+    }
+
+    private DeliveryLanes.Arrival arrival(List<Long> ids, MqttMessage message, int bytes) {
+        return new DeliveryLanes.Arrival(token(1, 0), ids, message, false, bytes);
     }
 
     private static void waitFor(CountDownLatch latch) {
