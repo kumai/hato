@@ -12,6 +12,8 @@ errorprone = "2.50.0"
 nullaway = "0.14.2"
 errorprone-plugin = "5.1.1"
 checkstyle = "14.3.0"
+paho = "1.2.5"
+hivemq-client = "1.4.1"
 
 [libraries]
 # Nullness annotations. Build-time only: never a runtime or POM dependency of the published jars.
@@ -27,6 +29,10 @@ awaitility = { module = "org.awaitility:awaitility", version.ref = "awaitility" 
 # Real brokers in Docker for the integrationTest suites. Only the core library is used: each test
 # class decides whether a missing Docker skips it or, in CI, fails the build.
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
+# Other Java MQTT clients that client-comparison measures Hato against. Only that unpublished
+# project uses them.
+paho-mqttv3 = { module = "org.eclipse.paho:org.eclipse.paho.client.mqttv3", version.ref = "paho" }
+hivemq-mqtt-client = { module = "com.hivemq:hivemq-mqtt-client", version.ref = "hivemq-client" }
 
 [plugins]
 graalvm-native = { id = "org.graalvm.buildtools.native", version.ref = "graalvm-native" }

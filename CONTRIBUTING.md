@@ -56,6 +56,7 @@ vulnerability reporting for this repository instead.
 | `distribution-tests` | Final jar, JPMS, sources, and publication metadata checks | no |
 | `examples` | Usage examples | no |
 | `native-smoke` | GraalVM native-image smoke test | no |
+| `client-comparison` | Measurements of Hato against other Java MQTT clients, run on request | no |
 | `release-tools` | Release version and bundle checks, and the upload to Maven Central, run by the release workflow | no |
 | `build-logic` | Convention plugins and the source-embedding tasks | no |
 
@@ -212,6 +213,7 @@ better split.
 | `io` | `io` in `hato-common`: TCP, TLS, WebSocket, and framing |
 | `common` | the other layers of `hato-common`, and changes that span several of its layers |
 | `build` | the Gradle build, `build-logic`, dependency versions, `distribution-tests`, and `native-smoke` |
+| `bench` | `client-comparison`: measurements of Hato against other MQTT clients |
 | `ci` | GitHub Actions, the `release-tools` they run, and Dependabot |
 | `docs` | the README, this guide, the code conventions, and `examples` |
 
