@@ -2,7 +2,6 @@ package org.mqtt4j.hato.common.protocol;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
-import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
@@ -55,23 +54,45 @@ public final class MqttString {
     ///         or exceeds 65535 bytes in UTF-8
     public static void write(ByteArrayOutputStream output, String value) {
         requireNonNull(output, "output must not be null");
+        validate(value);
+        // getBytes would replace an unpaired surrogate, but validation has rejected them all.
+        BinaryData.write(output, value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /// Checks that `value` can be written as an MQTT UTF-8 string, without encoding it.
+    ///
+    /// @throws IllegalArgumentException if `value` contains U+0000 or an unpaired surrogate,
+    ///         or exceeds 65535 bytes in UTF-8
+    public static void validate(String value) {
         requireNonNull(value, "value must not be null");
         // Shared text constraints also appear in value.TopicText; that layer cannot use protocol.
-        // [MQTT-1.5.3-2]
-        if (value.indexOf('\0') >= 0) {
-            throw new IllegalArgumentException("MQTT string must not contain NUL");
+        // One scan counts the UTF-8 length: a char below U+0080 takes one byte, below U+0800
+        // two, and any other three, except that a surrogate pair takes four for its two chars.
+        long bytes = 0;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 0x80) {
+                // [MQTT-1.5.3-2]
+                if (c == '\0') {
+                    throw new IllegalArgumentException("MQTT string must not contain NUL");
+                }
+                bytes += 1;
+            } else if (c < 0x800) {
+                bytes += 2;
+            } else if (!Character.isSurrogate(c)) {
+                bytes += 3;
+            } else if (Character.isHighSurrogate(c)
+                    && i + 1 < value.length()
+                    && Character.isLowSurrogate(value.charAt(i + 1))) {
+                bytes += 4;
+                i++;
+            } else {
+                // [MQTT-1.5.3-1]: an unpaired surrogate has no UTF-8 encoding.
+                throw new IllegalArgumentException("MQTT string contains an unpaired surrogate");
+            }
         }
-        try {
-            // [MQTT-1.5.3-1]: reject unpaired UTF-16 surrogates instead of replacing them.
-            ByteBuffer encoded = StandardCharsets.UTF_8.newEncoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)
-                    .encode(CharBuffer.wrap(value));
-            var bytes = new byte[encoded.remaining()];
-            encoded.get(bytes);
-            BinaryData.write(output, bytes);
-        } catch (CharacterCodingException e) {
-            throw new IllegalArgumentException("MQTT string contains an unpaired surrogate", e);
+        if (bytes > 65535) {
+            throw new IllegalArgumentException("MQTT string exceeds 65535 bytes in UTF-8");
         }
     }
 }

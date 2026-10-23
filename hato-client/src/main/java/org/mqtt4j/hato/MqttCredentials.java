@@ -1,6 +1,5 @@
 package org.mqtt4j.hato;
 
-import java.io.ByteArrayOutputStream;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Optional;
@@ -24,7 +23,7 @@ public final class MqttCredentials {
 
     private MqttCredentials(String username, byte @Nullable [] password) {
         requireNonNull(username, "username");
-        MqttString.write(new ByteArrayOutputStream(), username);
+        MqttString.validate(username);
         if (password != null && password.length > 65_535) {
             throw new IllegalArgumentException("Password exceeds 65535 bytes");
         }

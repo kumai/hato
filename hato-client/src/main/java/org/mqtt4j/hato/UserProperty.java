@@ -1,7 +1,5 @@
 package org.mqtt4j.hato;
 
-import java.io.ByteArrayOutputStream;
-
 import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
 
 import static java.util.Objects.requireNonNull;
@@ -21,7 +19,7 @@ public record UserProperty(String name, String value) {
     public UserProperty {
         requireNonNull(name, "User Property name must not be null");
         requireNonNull(value, "User Property value must not be null");
-        MqttString.write(new ByteArrayOutputStream(), name);
-        MqttString.write(new ByteArrayOutputStream(), value);
+        MqttString.validate(name);
+        MqttString.validate(value);
     }
 }

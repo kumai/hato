@@ -1,6 +1,5 @@
 package org.mqtt4j.hato;
 
-import java.io.ByteArrayOutputStream;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
@@ -214,7 +213,7 @@ public final class MqttMessage {
     ///     surrogate, or exceeds 65535 bytes in UTF-8
     public MqttMessage withContentType(String contentType) {
         requireNonNull(contentType, "Content type must not be null");
-        MqttString.write(new ByteArrayOutputStream(), contentType);
+        MqttString.validate(contentType);
         return new MqttMessage(
                 topic,
                 payload,

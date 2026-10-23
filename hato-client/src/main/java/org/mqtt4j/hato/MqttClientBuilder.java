@@ -1,6 +1,5 @@
 package org.mqtt4j.hato;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
@@ -179,7 +178,7 @@ public final class MqttClientBuilder {
     /// see [MqttClient#connect()].
     public MqttClientBuilder clientId(String value) {
         requireNonNull(value, "clientId");
-        MqttString.write(new ByteArrayOutputStream(), value);
+        MqttString.validate(value);
         if (value.isEmpty()) {
             throw new IllegalArgumentException("Client identifier must not be empty");
         }
