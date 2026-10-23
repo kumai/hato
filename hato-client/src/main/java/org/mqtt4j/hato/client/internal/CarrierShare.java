@@ -26,6 +26,13 @@ final class CarrierShare {
         return System.nanoTime() - busySince >= SLICE_NANOS;
     }
 
+    /// Whether a thread that has worked for `workedNanos` since it last blocked or shared its
+    /// carrier has used up its slice. For a thread that cannot tell whether it blocked, such as
+    /// one reading a socket, which counts only the time spent on what it read.
+    static boolean spent(long workedNanos) {
+        return workedNanos >= SLICE_NANOS;
+    }
+
     /// Parks for a moment, which lets the other virtual threads run, and returns when the next
     /// slice begins.
     static long share() {

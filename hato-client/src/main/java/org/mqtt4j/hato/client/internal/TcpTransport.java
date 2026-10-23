@@ -313,29 +313,34 @@ public final class TcpTransport implements Transport, PausableTransport {
             throws IOException, InterruptedException {
         var buffer = new byte[READ_BUFFER_SIZE];
         InputStream input = socket.input();
-        long busySince = System.nanoTime();
+        // The time spent on what arrived since the reader last let others run. A read that waits
+        // for the peer frees the carrier, so only the work on the bytes counts.
+        long worked = 0;
         int count;
         while ((count = input.read(buffer)) != -1) {
             synchronized (callbacks) {
+                long started = System.nanoTime();
                 // After a close, keep reading and drop what arrives until the peer ends its
                 // stream, so that closeGracefully can release a socket that receives nothing.
                 if (!closed) {
                     receiver.onBytes(Arrays.copyOf(buffer, count));
                 }
+                worked += System.nanoTime() - started;
                 // A pause, which onBytes may have asked for, leaves the peer to TCP flow control
                 // until the client resumes. Waiting frees the carrier.
                 if (readingPaused && !closed) {
                     while (readingPaused && !closed) {
                         callbacks.wait();
                     }
-                    busySince = System.nanoTime();
+                    worked = 0;
                 }
             }
             // A peer that never pauses keeps every read from blocking, and the reader from
-            // freeing its carrier for the writer, the closing worker, and the client. Whether
-            // the next read blocks is unknown, so the reader parks once a slice is over.
-            if (CarrierShare.due(busySince)) {
-                busySince = CarrierShare.share();
+            // freeing its carrier for the writer, the closing worker, and the client, so the
+            // reader parks once its work fills a slice.
+            if (CarrierShare.spent(worked)) {
+                CarrierShare.share();
+                worked = 0;
             }
         }
         terminate(new EOFException("Peer closed the byte stream"));
