@@ -6,6 +6,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
+import com.sun.management.OperatingSystemMXBean;
+import com.sun.management.ThreadMXBean;
+
 import org.mqtt4j.hato.MetricsListener;
 
 /// What the measurement tests share. They print their results instead of asserting limits.
@@ -68,6 +71,19 @@ final class Measurements {
             Thread.sleep(50);
         }
         return ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
+    }
+
+    /// The heap bytes that every thread of the JVM has allocated so far. A virtual thread's
+    /// allocation counts on the carrier that runs it.
+    static long allocatedBytes() {
+        return ManagementFactory.getPlatformMXBean(ThreadMXBean.class)
+                .getTotalThreadAllocatedBytes();
+    }
+
+    /// The processor time that the whole JVM process has used so far, in nanoseconds.
+    static long processorNanos() {
+        return ManagementFactory.getPlatformMXBean(OperatingSystemMXBean.class)
+                .getProcessCpuTime();
     }
 
     /// A metrics listener that only counts its events, as a listener that records them cheaply
