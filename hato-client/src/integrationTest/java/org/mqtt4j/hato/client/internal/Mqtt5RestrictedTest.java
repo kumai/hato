@@ -70,6 +70,15 @@ abstract class Mqtt5RestrictedTest {
     }
 
     @Test
+    void a_subscription_beyond_the_maximum_packet_size_is_refused_and_the_connection_goes_on()
+            throws Exception {
+        assertRefusedWhileTheConnectionGoesOn(
+                uniqueTopic() + "/" + "a".repeat(600),
+                ReasonCode.PACKET_TOO_LARGE
+        );
+    }
+
+    @Test
     void publications_beyond_the_receive_maximum_wait_for_room() throws Exception {
         var topic = new Topic(uniqueTopic());
         try (MqttClient sut = client()) {
@@ -162,6 +171,32 @@ abstract class Mqtt5RestrictedTest {
                     Qos.AT_LEAST_ONCE,
                     false
             ))).succeedsWithin(Duration.ofSeconds(5));
+        }
+    }
+
+    /// Refusing a subscription to `filter` with `reason` leaves the connection to another one.
+    void assertRefusedWhileTheConnectionGoesOn(String filter, ReasonCode reason)
+            throws Exception {
+        try (MqttClient sut = client()) {
+            // Arrange
+            sut.connect().get(5, SECONDS);
+
+            // Act
+            Subscription refused = sut.subscribe(
+                    Subscribe.of(new TopicFilter(filter), Qos.AT_LEAST_ONCE)
+            );
+
+            // Assert
+            assertThatThrownBy(() -> refused.established().get(5, SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .cause()
+                    .isInstanceOfSatisfying(
+                            MqttSubscriptionRefusedException.class,
+                            refusal -> assertThat(refusal.reasonCode()).isEqualTo(reason)
+                    );
+            assertThat(sut.subscribe(
+                    Subscribe.of(new TopicFilter(uniqueTopic()), Qos.AT_LEAST_ONCE)
+            ).established()).succeedsWithin(Duration.ofSeconds(5));
         }
     }
 }

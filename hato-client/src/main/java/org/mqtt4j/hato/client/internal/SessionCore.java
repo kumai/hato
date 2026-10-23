@@ -400,12 +400,14 @@ final class SessionCore {
                 will
         );
         var context = new PartContext();
+        PacketCodec codec = PacketCodec.of(version);
         receptions = new Receptions(port, context, clientId, version == MqttVersion.V5);
         subscriptions = new Subscriptions(
                 port,
                 context,
                 clientId,
                 cleanStart,
+                codec,
                 limits.subscriptions()
         );
         publications = new Publications(
@@ -413,7 +415,7 @@ final class SessionCore {
                 context,
                 clientId,
                 cleanStart,
-                PacketCodec.of(version),
+                codec,
                 limits.inflightPublishes()
         );
     }

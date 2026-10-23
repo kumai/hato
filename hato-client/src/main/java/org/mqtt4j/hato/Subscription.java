@@ -61,7 +61,11 @@ public interface Subscription extends AutoCloseable {
     /// waits for a later connection: UNSUBACK confirms removal when the broker retained the
     /// session, and a CONNACK with [ConnAck#sessionPresent()] false confirms it otherwise.
     /// Removal waits for send capacity. When SUBACK is pending, removal waits for that response
-    /// before sending UNSUBSCRIBE; a refusal also confirms removal.
+    /// before sending UNSUBSCRIBE; a refusal also confirms removal. An UNSUBSCRIBE larger than
+    /// [ConnAck#maximumPacketSize()] is not sent, and removal is confirmed locally; only a
+    /// continued session whose broker announces a smaller limit than the one that took the
+    /// SUBSCRIBE comes to this. That broker may still hold the subscription, and the messages
+    /// that it sends for it are acknowledged without being delivered.
     ///
     /// If [MqttClient#close()] finds removal pending, a nonpersistent session confirms it,
     /// because the broker discards that session, while a persistent session fails it with

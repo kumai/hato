@@ -34,6 +34,7 @@ import org.mqtt4j.hato.client.internal.SessionCore.State;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.client.internal.common.protocol.Property;
 import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
@@ -71,6 +72,10 @@ final class Subscriptions {
 
     private final boolean cleanStart;
 
+    // The connection's codec, which sizes SUBSCRIBE and UNSUBSCRIBE against the largest packet
+    // that the broker announced.
+    private final PacketCodec codec;
+
     // Broker registrations outlive locally closed handles until UNSUBACK or a CONNACK without
     // Session Present, so they are bounded apart from the delivery lanes that local closure
     // releases. The mailbox bounds registrations still queued for the actor by the same limit.
@@ -101,12 +106,14 @@ final class Subscriptions {
             SessionCore.Context core,
             String clientId,
             boolean cleanStart,
+            PacketCodec codec,
             int registrationLimit
     ) {
         this.port = port;
         this.core = core;
         this.clientId = clientId;
         this.cleanStart = cleanStart;
+        this.codec = codec;
         this.registrationLimit = registrationLimit;
     }
 
@@ -319,6 +326,20 @@ final class Subscriptions {
             if (!removal.subscription.established) {
                 continue;
             }
+            LocalSubscription local = removal.subscription;
+            if (exceedsLimit(unsubscribePacket(local, 1))) {
+                // The UNSUBSCRIBE for a filter is smaller than its SUBSCRIBE, which an earlier
+                // connection sent, so only a continued session whose broker announced a smaller
+                // limit gets here. As after a refusing UNSUBACK, the broker may still hold the
+                // subscription, and its messages then match no registration.
+                log.warn("Removing the subscription to {} for {} locally: its UNSUBSCRIBE exceeds "
+                        + "the broker's Maximum Packet Size, and the broker may still hold it",
+                        local.filter.pattern(), clientId);
+                removals.remove();
+                removeSubscription(local, null);
+                finishRemoval(local);
+                continue;
+            }
             if (!sendUnsubscribe(removal)) {
                 return;
             }
@@ -340,7 +361,7 @@ final class Subscriptions {
                 window.registrations.removeFirst();
                 continue;
             }
-            Optional<ReasonCode> refusal = refusal(local.filter);
+            Optional<ReasonCode> refusal = refusal(local);
             if (refusal.isPresent()) {
                 window.registrations.removeFirst();
                 refuse(local, refusal.orElseThrow(), null);
@@ -451,23 +472,37 @@ final class Subscriptions {
         finishRemoval(local);
     }
 
-    /// The reason code with which the broker would refuse a subscription to `filter`, by the
-    /// limits that it announced for the connection, or empty when it would accept it. A broker
-    /// that receives such a SUBSCRIBE ends the connection with the same reason code (MQTT 5.0
-    /// sections 3.2.2.3.11 and 3.2.2.3.13).
-    private Optional<ReasonCode> refusal(TopicFilter filter) {
+    /// The reason code with which the broker would refuse the subscription `local`, by the limits
+    /// that it announced for the connection, or empty when it would accept it. A broker that
+    /// receives such a SUBSCRIBE ends the connection with the same reason code (MQTT 5.0 sections
+    /// 3.2.2.3.6, 3.2.2.3.11, and 3.2.2.3.13).
+    private Optional<ReasonCode> refusal(LocalSubscription local) {
         ConnAck limits = core.limits();
-        Optional<SharedTopicFilter> shared = SharedTopicFilter.parse(filter);
+        Optional<SharedTopicFilter> shared = SharedTopicFilter.parse(local.filter);
         if (shared.isPresent() && !limits.sharedSubscriptionAvailable()) {
             return Optional.of(ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED);
         }
         String pattern = shared.map(subscription -> subscription.filter().pattern())
-                .orElse(filter.pattern());
+                .orElse(local.filter.pattern());
         if (!limits.wildcardSubscriptionAvailable()
                 && (pattern.contains("+") || pattern.contains("#"))) {
             return Optional.of(ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED);
         }
+        // The packet identifier takes two bytes whatever its value.
+        if (exceedsLimit(subscriptionPacket(local, 1))) {
+            return Optional.of(ReasonCode.PACKET_TOO_LARGE);
+        }
         return Optional.empty();
+    }
+
+    /// Whether `packet` is larger than the largest packet that the broker announced for the
+    /// connection; MQTT 3.1.1 brokers announce none. Only the packets whose size the application
+    /// decides are compared with the limit: PUBLISH in [Publications], and SUBSCRIBE and
+    /// UNSUBSCRIBE here. The others take a few bytes, and the client could not refuse them.
+    private boolean exceedsLimit(Packet packet) {
+        int limit = core.limits().maximumPacketSize();
+        return limit < ConnectionEstablishment.LARGEST_PACKET_SIZE
+                && codec.encode(packet).length > limit;
     }
 
     /// A SUBACK that violates the protocol ends its registration as well as the connection, so
@@ -500,9 +535,13 @@ final class Subscriptions {
         }
         int id = allocated.getAsInt();
         window.unsubscribing.put(id, removal);
-        var packet = new Packet.Unsubscribe(id, List.of(removal.subscription.filter), EMPTY);
         long ticket = core.nextTicket();
-        SendQueue.OfferResult result = port.send(core.generation(), ticket, packet, null);
+        SendQueue.OfferResult result = port.send(
+                core.generation(),
+                ticket,
+                unsubscribePacket(removal.subscription, id),
+                null
+        );
         if (result == SendQueue.OfferResult.FULL) {
             window.unsubscribing.remove(id);
             core.releasePacketId(id);
@@ -535,6 +574,10 @@ final class Subscriptions {
                 local.retainAsPublished,
                 retainHandling
         )), properties);
+    }
+
+    private static Packet.Unsubscribe unsubscribePacket(LocalSubscription local, int id) {
+        return new Packet.Unsubscribe(id, List.of(local.filter), EMPTY);
     }
 
     /// The Subscription Identifiers that `properties` carry, in their order.

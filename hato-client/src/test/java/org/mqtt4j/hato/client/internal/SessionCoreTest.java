@@ -2096,7 +2096,13 @@ class SessionCoreTest {
                 "without Shared Subscription Available",
                 new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0)
         );
+        Named<Property> smallPackets = Named.of(
+                "with a Maximum Packet Size of 32",
+                maximumPacketSize(32)
+        );
         return Stream.of(
+                // The SUBSCRIBE takes 33 bytes with its Subscription Identifier and 31 without.
+                Arguments.of("sensors/kitchen/heating", smallPackets, ReasonCode.PACKET_TOO_LARGE),
                 Arguments.of("a/#", noWildcards, ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED),
                 Arguments.of("a/+/c", noWildcards, ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED),
                 Arguments.of(
@@ -2125,6 +2131,91 @@ class SessionCoreTest {
         // Assert
         assertThat(port.sent).last().isInstanceOf(Packet.Subscribe.class);
         assertThat(port.outcomes).doesNotContainKey(2L);
+    }
+
+    @Test
+    void a_subscribe_that_takes_the_brokers_maximum_packet_size_exactly_is_sent() {
+        // Arrange
+        SessionCore mqtt5 = connectedMqtt5(maximumPacketSize(32));
+
+        // Act
+        mqtt5.subscribe(2, subscription("sensors/kitchen/lights"));
+
+        // Assert
+        assertThat(port.sent).last().isInstanceOfSatisfying(
+                Packet.Subscribe.class,
+                subscribe -> assertThat(PacketCodec.of(MqttVersion.V5).encode(subscribe))
+                        .hasSize(32)
+        );
+        assertThat(port.outcomes).doesNotContainKey(2L);
+    }
+
+    @Test
+    void a_recreation_beyond_a_smaller_maximum_packet_size_is_reported_as_refused() {
+        // Arrange: a subscription established on a connection whose broker announced no limit.
+        SessionCore mqtt5 = connectedMqtt5();
+        mqtt5.subscribe(2, subscription("sensors/kitchen/heating"));
+        var subscribe = (Packet.Subscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.SubAck(subscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+        mqtt5.failed(1, new IOException("connection lost"));
+        port.sent.clear();
+
+        // Act: the next connection's broker takes packets of at most 32 bytes.
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, connAck(maximumPacketSize(32)), 0, 0);
+
+        // Assert
+        assertThat(port.sent).noneMatch(Packet.Subscribe.class::isInstance);
+        assertThat(port.resubscriptionFailures).singleElement().satisfies(failure ->
+                assertThat(failure.cause()).isInstanceOfSatisfying(
+                        MqttSubscriptionRefusedException.class,
+                        refusal -> assertThat(refusal.reasonCode())
+                                .isEqualTo(ReasonCode.PACKET_TOO_LARGE)
+                ));
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
+    }
+
+    @Test
+    void a_removal_beyond_a_continued_sessions_maximum_packet_size_completes_locally() {
+        // Arrange: a persistent session's subscription, established without a limit, continues
+        // on a connection whose broker takes packets of at most 29 bytes. The UNSUBSCRIBE for
+        // its filter takes 30.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(), 0, 0);
+        mqtt5.subscribe(2, subscription("sensors/kitchen/heating"));
+        var subscribe = (Packet.Subscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.SubAck(subscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+        mqtt5.failed(1, new IOException("connection lost"));
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(
+                true,
+                ReasonCode.SUCCESS,
+                new Properties(List.of(maximumPacketSize(29)))
+        ), 0, 0);
+        port.sent.clear();
+
+        // Act
+        mqtt5.unsubscribe(4, 2);
+
+        // Assert
+        assertThat(port.sent).noneMatch(Packet.Unsubscribe.class::isInstance);
+        assertThat(requireNonNull(port.results.get(4L)).failure()).isNull();
+        assertThat(port.removed).containsExactly(2L);
+        assertThat(mqtt5.state()).isEqualTo(CONNECTED);
     }
 
     @ParameterizedTest(name = "{0} travels as {1}")
@@ -4832,6 +4923,11 @@ class SessionCoreTest {
     /// The CONNACK property with which the broker takes `publications` at once.
     private static Property receiveMaximum(int publications) {
         return new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, publications);
+    }
+
+    /// The CONNACK property with which the broker takes packets of at most `bytes`.
+    private static Property maximumPacketSize(int bytes) {
+        return new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, bytes);
     }
 
     /// The CONNACK property with which the broker takes up to `aliases` Topic Aliases.

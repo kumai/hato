@@ -14,8 +14,9 @@ import static java.util.Objects.requireNonNull;
 /// [ReasonCode#WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED] without
 /// [ConnAck#wildcardSubscriptionAvailable()], and
 /// [ReasonCode#SHARED_SUBSCRIPTIONS_NOT_SUPPORTED] without
-/// [ConnAck#sharedSubscriptionAvailable()]. Either way the failed subscription is removed
-/// locally, and the connection goes on.
+/// [ConnAck#sharedSubscriptionAvailable()], and [ReasonCode#PACKET_TOO_LARGE] when its SUBSCRIBE
+/// would be larger than [ConnAck#maximumPacketSize()]. Either way the failed subscription is
+/// removed locally, and the connection goes on.
 @SuppressWarnings("exports") // Nullness annotations are compile-time only.
 public final class MqttSubscriptionRefusedException extends MqttException {
 
