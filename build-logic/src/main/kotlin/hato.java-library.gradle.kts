@@ -24,6 +24,10 @@ for (taskName in listOf("jar", "sourcesJar")) {
 
 tasks.named<Javadoc>("javadoc") {
     exclude("**/internal/**")
+    // Javadoc writes its labels in the default locale of the JVM that runs it, so a machine with
+    // another language would build different pages from a release tag. -locale cannot fix this:
+    // English is the base bundle, and the lookup tries the default locale before it.
+    options.jFlags("-Duser.language=en", "-Duser.country=US")
     // Public signatures may refer to internal supertypes. Resolve those sources without
     // including their pages in the published API documentation.
     inputs.files(sourceSets.main.map { it.allJava })
