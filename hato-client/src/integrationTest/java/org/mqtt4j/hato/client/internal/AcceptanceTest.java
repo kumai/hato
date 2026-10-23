@@ -362,14 +362,16 @@ abstract class AcceptanceTest {
             second.connect().get(5, SECONDS);
             publisher.publish(retained).get(5, SECONDS);
 
-            // Act
+            // Act: take the retained message before removing it. A broker can look up what it
+            // retains for a new subscription after a later publication, here the removal.
             PullSubscription kept = subscribe(first, topic, Qos.AT_LEAST_ONCE);
+            MqttMessage keptMessage = receive(kept);
             clearRetained(publisher, topic);
             PullSubscription removed = subscribe(second, topic, Qos.AT_LEAST_ONCE);
 
-            // Assert: a broker can send a retained message after a later publication, so the
-            // subscription after the removal waits a while past the marker for anything retained.
-            assertThat(receive(kept)).isEqualTo(retained);
+            // Assert: for the same reason, the subscription after the removal waits a while
+            // past the marker for anything retained.
+            assertThat(keptMessage).isEqualTo(retained);
             MqttMessage marker = message(topic, (byte) 2);
             publisher.publish(marker).get(5, SECONDS);
             assertThat(receive(removed)).isEqualTo(marker);
