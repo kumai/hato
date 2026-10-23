@@ -9,7 +9,7 @@ Gradle:
 
 ```kotlin
 dependencies {
-    implementation("org.mqtt4j:hato-broker:x.y.z")
+    implementation("org.mqtt4j:hato-broker:0.7.0")
 }
 ```
 
@@ -19,7 +19,7 @@ Maven:
 <dependency>
     <groupId>org.mqtt4j</groupId>
     <artifactId>hato-broker</artifactId>
-    <version>x.y.z</version>
+    <version>0.7.0</version>
 </dependency>
 ```
 
@@ -68,7 +68,8 @@ retained messages do not expire. `$share/` filters are matched literally, withou
 shared routing. MQTT 5.0 subscriptions honor No Local, Retain As Published, and
 Retain Handling.
 The broker does not support Subscription Identifiers, and tells MQTT 5.0 clients
-so when they connect.
+so when they connect. Persistent sessions do not expire, and the broker does not
+keep to the Receive Maximum and Maximum Packet Size that MQTT 5.0 clients announce.
 
 With Clean Session false, or a positive session expiry in MQTT 5.0, subscriptions
 and QoS 1/2 deliveries survive a disconnect, and reconnecting with the same client

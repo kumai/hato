@@ -19,7 +19,7 @@ Gradle:
 
 ```kotlin
 dependencies {
-    implementation("org.mqtt4j:hato-client:x.y.z")
+    implementation("org.mqtt4j:hato-client:0.7.0")
 }
 ```
 
@@ -29,7 +29,7 @@ Maven:
 <dependency>
     <groupId>org.mqtt4j</groupId>
     <artifactId>hato-client</artifactId>
-    <version>x.y.z</version>
+    <version>0.7.0</version>
 </dependency>
 ```
 
@@ -110,6 +110,12 @@ void show(MqttMessage message) {
   connection failures, and control time in your tests.
 - [Examples](examples/README.md): compile and run the examples above, or try a
   complete round trip with the embedded broker.
+
+## Compatibility
+
+Hato follows semantic versioning; before 1.0, a minor release can change the API.
+The client and the test kit are covered. The embedded broker, `FaultyTransport`, and
+the broker controls in the test kit are experimental and can change in any release.
 
 ## Contributing
 
