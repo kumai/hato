@@ -50,6 +50,7 @@ import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.UserProperty;
+import org.mqtt4j.hato.UserPropertyAccess;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
@@ -5155,12 +5156,17 @@ class SessionCoreTest {
         public boolean deliver(
                 DeliveryToken token,
                 List<Long> ids,
-                MqttMessage message,
-                boolean dup,
+                Packet.Publish publish,
                 int bytes
         ) {
             if (acceptDelivery) {
-                deliveries.add(new Received(token, List.copyOf(ids), message, dup, bytes));
+                deliveries.add(new Received(
+                        token,
+                        List.copyOf(ids),
+                        MessageProperties.received(publish, UserPropertyAccess::received),
+                        publish.dup(),
+                        bytes
+                ));
             }
 
             return acceptDelivery;

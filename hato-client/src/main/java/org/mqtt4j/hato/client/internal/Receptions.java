@@ -12,7 +12,6 @@ import org.jspecify.annotations.Nullable;
 import org.mqtt4j.hato.ClientStats.OverloadCause;
 import org.mqtt4j.hato.ClientStats.Usage;
 import org.mqtt4j.hato.MqttCapacityException;
-import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.client.internal.AckSequencer.Acknowledgement;
@@ -186,15 +185,6 @@ final class Receptions {
             }
             return;
         }
-        MqttMessage message = MessageProperties.received(
-                MqttMessage.of(
-                        publish.topic(),
-                        publish.payload(),
-                        publish.qos(),
-                        publish.retain()
-                ),
-                publish.properties()
-        );
         if (!port.deliver(
                 new DeliveryToken(
                         core.sessionNumber(),
@@ -204,8 +194,7 @@ final class Receptions {
                         receivedAt
                 ),
                 matches,
-                message,
-                publish.dup(),
+                publish,
                 bytes
         )) {
             core.overloaded(

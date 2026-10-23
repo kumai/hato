@@ -153,11 +153,12 @@ final class SessionCore {
 
         void subscribed(Subscription handle, Qos granted);
 
+        /// Delivers the application message that `publish` carries to the subscriptions `ids`.
+        /// The actor builds the message, with the factories that the builder handed it.
         boolean deliver(
                 DeliveryToken token,
                 List<Long> ids,
-                MqttMessage message,
-                boolean dup,
+                Packet.Publish publish,
                 int bytes
         );
 

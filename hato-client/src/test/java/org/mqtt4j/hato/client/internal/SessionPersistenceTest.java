@@ -1374,8 +1374,7 @@ class SessionPersistenceTest {
         public boolean deliver(
                 DeliveryToken token,
                 List<Long> ids,
-                MqttMessage message,
-                boolean dup,
+                Packet.Publish publish,
                 int bytes
         ) {
             deliveries.add(List.copyOf(ids));

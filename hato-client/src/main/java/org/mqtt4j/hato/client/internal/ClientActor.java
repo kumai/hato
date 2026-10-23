@@ -55,10 +55,12 @@ import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.Transport;
+import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
 
 import static java.util.Objects.requireNonNull;
 
@@ -114,6 +116,10 @@ public final class ClientActor implements MqttClient {
     // Delivery options keep their choice out of the public API; the builder passes their
     // package-private accessor.
     private final Function<DeliveryOptions, HandlerExecution> executionOf;
+
+    // Received User Properties skip the check of their strings, which the codec validated; only
+    // the builder can pass the package-private factory that does so.
+    private final Function<Property.UserProperty, UserProperty> userPropertyOf;
 
     private final ClientTermination termination;
 
@@ -230,6 +236,7 @@ public final class ClientActor implements MqttClient {
             RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf,
+            Function<Property.UserProperty, UserProperty> userPropertyOf,
             Function<ClientSnapshot, ClientStats> statsOf,
             ClientLimits limits
     ) {
@@ -252,6 +259,7 @@ public final class ClientActor implements MqttClient {
                 rules,
                 responseTimeout,
                 executionOf,
+                userPropertyOf,
                 statsOf,
                 limits
         );
@@ -276,6 +284,7 @@ public final class ClientActor implements MqttClient {
             RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf,
+            Function<Property.UserProperty, UserProperty> userPropertyOf,
             Function<ClientSnapshot, ClientStats> statsOf,
             ClientLimits limits
     ) {
@@ -284,6 +293,7 @@ public final class ClientActor implements MqttClient {
         this.version = version;
         this.scheduler = scheduler;
         this.executionOf = executionOf;
+        this.userPropertyOf = userPropertyOf;
         this.statsOf = statsOf;
         this.limits = limits;
         cleanStart = sessionExpiry.isZero();
@@ -1497,11 +1507,11 @@ public final class ClientActor implements MqttClient {
         public boolean deliver(
                 DeliveryToken token,
                 List<Long> ids,
-                MqttMessage message,
-                boolean dup,
+                Packet.Publish publish,
                 int bytes
         ) {
-            return lanes.deliver(token, ids, message, dup, bytes);
+            MqttMessage message = MessageProperties.received(publish, userPropertyOf);
+            return lanes.deliver(token, ids, message, publish.dup(), bytes);
         }
 
         @Override

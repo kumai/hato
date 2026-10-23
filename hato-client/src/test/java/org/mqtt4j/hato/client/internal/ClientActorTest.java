@@ -80,6 +80,7 @@ import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.UserProperty;
+import org.mqtt4j.hato.UserPropertyAccess;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
@@ -8893,6 +8894,7 @@ class ClientActorTest {
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
                 DeliveryOptionsAccess::execution,
+                UserPropertyAccess::received,
                 ClientStatsAccess::of,
                 limits
         );

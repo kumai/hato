@@ -555,6 +555,7 @@ public final class MqttClientBuilder {
                 reconnectPolicy.rules(),
                 responseTimeout,
                 DeliveryOptions::execution,
+                UserProperty::received,
                 ClientStats::of,
                 new ClientLimits(maxInflightPublishes, maxSubscriptions)
         );

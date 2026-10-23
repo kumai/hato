@@ -42,6 +42,19 @@ class UserPropertyTest {
     }
 
     @Test
+    void user_properties_with_the_same_name_and_value_are_equal() {
+        // Arrange
+        var sut = new UserProperty("name", "value");
+
+        // Act & Assert
+        assertThat(sut)
+                .isEqualTo(new UserProperty("name", "value"))
+                .hasSameHashCodeAs(new UserProperty("name", "value"))
+                .isNotEqualTo(new UserProperty("name", "other"))
+                .isNotEqualTo(new UserProperty("other", "value"));
+    }
+
+    @Test
     @SuppressWarnings("NullAway") // Deliberately violates the non-null component contracts.
     void requires_a_name_and_a_value() {
         // Act & Assert
