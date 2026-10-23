@@ -479,6 +479,8 @@ class DistributionTest {
         assertThat(publicTypes(BROKER)).containsExactly("org.mqtt4j.hato.broker.MqttBroker");
         assertThat(publicTypes(testkitJar())).containsExactlyInAnyOrder(
                 "org.mqtt4j.hato.testkit.BrokerControls",
+                "org.mqtt4j.hato.testkit.FakeMqttPublisher",
+                "org.mqtt4j.hato.testkit.FakeMqttPublisher$HeldPublication",
                 "org.mqtt4j.hato.testkit.FaultyTransport",
                 "org.mqtt4j.hato.testkit.HeldResponse",
                 "org.mqtt4j.hato.testkit.ManualTimerScheduler",
@@ -493,27 +495,30 @@ class DistributionTest {
         Path testkit = testkitJar();
         try (var archive = new JarFile(testkit.toFile())) {
             for (String type : publicTypes(testkit)) {
-                JarEntry entry = archive.getJarEntry(type.replace('.', '/') + ".class");
-                ClassModel model = ClassFile.of()
-                        .parse(archive.getInputStream(entry).readAllBytes());
-                var signatures = new ArrayList<String>();
-                for (var method : model.methods()) {
-                    if (method.flags().has(AccessFlag.PUBLIC)
-                            || method.flags().has(AccessFlag.PROTECTED)) {
-                        signatures.add(method.methodType().stringValue());
-                        method.findAttribute(Attributes.signature())
-                                .ifPresent(signature -> signatures.add(
-                                        signature.signature().stringValue()
-                                ));
-                    }
+                assertThat(publicSignatures(archive, type))
+                        .as(type)
+                        .noneMatch(name -> name.contains("/internal/"));
+            }
+        }
+    }
+
+    @Test
+    void testkit_types_in_the_compatibility_promise_name_no_broker_type() throws Exception {
+        // Only the testkit types that are experimental like the broker may show broker types;
+        // showing one would tie the promised types to the broker's experimental API.
+        var likeTheBroker = Set.of(
+                "org.mqtt4j.hato.testkit.BrokerControls",
+                "org.mqtt4j.hato.testkit.HeldResponse",
+                "org.mqtt4j.hato.testkit.ResponseKind"
+        );
+        Path testkit = testkitJar();
+        try (var archive = new JarFile(testkit.toFile())) {
+            for (String type : publicTypes(testkit)) {
+                if (!likeTheBroker.contains(type)) {
+                    assertThat(publicSignatures(archive, type))
+                            .as(type)
+                            .noneMatch(name -> name.contains("org/mqtt4j/hato/broker/"));
                 }
-                for (var field : model.fields()) {
-                    if (field.flags().has(AccessFlag.PUBLIC)
-                            || field.flags().has(AccessFlag.PROTECTED)) {
-                        signatures.add(field.fieldType().stringValue());
-                    }
-                }
-                assertThat(signatures).as(type).noneMatch(name -> name.contains("/internal/"));
             }
         }
     }
@@ -842,6 +847,33 @@ class DistributionTest {
             }
         }
         return types;
+    }
+
+    /// The descriptors and generic signatures of the public and protected methods and fields of
+    /// `type`, one of the public types in `archive`.
+    private static List<String> publicSignatures(JarFile archive, String type)
+            throws IOException {
+        JarEntry entry = archive.getJarEntry(type.replace('.', '/') + ".class");
+        ClassModel model = ClassFile.of()
+                .parse(archive.getInputStream(entry).readAllBytes());
+        var signatures = new ArrayList<String>();
+        for (var method : model.methods()) {
+            if (method.flags().has(AccessFlag.PUBLIC)
+                    || method.flags().has(AccessFlag.PROTECTED)) {
+                signatures.add(method.methodType().stringValue());
+                method.findAttribute(Attributes.signature())
+                        .ifPresent(signature -> signatures.add(
+                                signature.signature().stringValue()
+                        ));
+            }
+        }
+        for (var field : model.fields()) {
+            if (field.flags().has(AccessFlag.PUBLIC)
+                    || field.flags().has(AccessFlag.PROTECTED)) {
+                signatures.add(field.fieldType().stringValue());
+            }
+        }
+        return signatures;
     }
 
     /// A nested type's declared access is recorded in the InnerClasses attribute. Enclosing
