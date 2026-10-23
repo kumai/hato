@@ -57,8 +57,9 @@ final class DeliveryLanes {
     private static final Log log = Log.of(DeliveryLanes.class);
 
     // Bounds per-delivery overhead across all subscriptions (about 240 bytes each when measured);
-    // the byte limit bounds payloads. Keep it high enough not to override a subscription's own
-    // buffer capacity in ordinary use.
+    // the byte limit bounds the packets, with the allowance for their properties
+    // (ClientIo.PROPERTY_COST). Keep it high enough not to override a subscription's own buffer
+    // capacity in ordinary use.
     private static final int DELIVERY_LIMIT = 65_536;
 
     /// The acknowledgement conditions that unfinished QoS 1 and QoS 2 receipts may hold across

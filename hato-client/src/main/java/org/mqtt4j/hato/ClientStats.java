@@ -260,8 +260,9 @@ public final class ClientStats {
             return values.heldDeliveries();
         }
 
-        /// The payload and property bytes of the deliveries that the client holds, against its
-        /// limit for all subscriptions.
+        /// The bytes that the deliveries the client holds count against its limit for all
+        /// subscriptions: the size of each received PUBLISH and an allowance for each of its
+        /// properties, which take more memory than their encoding.
         public Usage heldBytes() {
             return values.heldBytes();
         }

@@ -11,6 +11,8 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.client.internal.Mailbox.OfferResult.ACCEPTED;
 import static org.mqtt4j.hato.client.internal.Mailbox.OfferResult.FULL;
@@ -612,12 +614,13 @@ class MailboxTest {
             64 * 1024 * 1024,
             268435460
     })
-    void an_empty_client_mailbox_accepts_the_configured_maximum_packet_size(int maxPacketSize)
+    void an_empty_client_mailbox_accepts_the_largest_packet_that_decoding_admits(int maxPacketSize)
             throws Exception {
-        // Arrange
+        // Arrange: a packet of the configured maximum size that also carries the most properties.
         Mailbox sut = ClientActor.createMailbox(maxPacketSize, ClientLimits.DEFAULT);
         sut.activate(1);
-        var packet = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, maxPacketSize);
+        int largest = maxPacketSize + PacketCodec.MAX_PROPERTIES * ClientIo.PROPERTY_COST;
+        var packet = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, largest);
 
         // Act & Assert: account for the full size without allocating a large payload.
         assertThat(sut.offer(packet)).isEqualTo(ACCEPTED);

@@ -83,7 +83,8 @@ public final class ClientActor implements MqttClient {
 
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
     // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
-    // each when measured); the byte limit bounds the packets themselves.
+    // each when measured); the byte limit bounds the packets themselves, with the allowance for
+    // their properties (ClientIo.PROPERTY_COST).
     private static final int MAILBOX_INCOMING_LIMIT = 65_536;
 
     private static final int MAILBOX_COMMAND_BYTE_LIMIT = 32 * 1024 * 1024;
@@ -1271,9 +1272,13 @@ public final class ClientActor implements MqttClient {
         return limits.operations() + 2;
     }
 
-    /// An empty mailbox or set of lanes must admit one packet up to the configured maximum.
+    /// An empty mailbox or set of lanes must admit one packet up to the configured maximum, with
+    /// as many properties as decoding admits.
     private static long receiveByteLimit(int maxPacketSize) {
-        return Math.max(RECEIVE_BYTE_LIMIT, maxPacketSize);
+        return Math.max(
+                RECEIVE_BYTE_LIMIT,
+                maxPacketSize + PacketCodec.MAX_PROPERTIES * ClientIo.PROPERTY_COST
+        );
     }
 
     /// Called only by the core on the actor thread. Owns the actor's timer registrations.

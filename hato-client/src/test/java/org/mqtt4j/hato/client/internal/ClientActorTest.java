@@ -5001,6 +5001,44 @@ class ClientActorTest {
     }
 
     @Test
+    void each_received_property_counts_in_receive_capacity_beyond_its_bytes() throws Exception {
+        // Arrange: decoded, a User Property takes more memory than its few bytes on the wire.
+        var properties = new Properties(
+                List.of(
+                        new Property.UserProperty("a", "1"),
+                        new Property.UserProperty("b", "2")
+                )
+        );
+        var publish = new Packet.Publish(
+                new Topic("messages"),
+                new byte[] {1},
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                1,
+                properties
+        );
+        var mqtt5 = PacketCodec.of(MqttVersion.V5);
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+            PullSubscription subscription = subscribePull(sut, transport, qosOneRequest());
+
+            // Act
+            transport.receive(publish);
+
+            // Assert
+            long counted = mqtt5.encode(publish).length + 2L * ClientIo.PROPERTY_COST;
+            await().untilAsserted(() -> assertThat(((ClientActor) sut).usage().deliveryBytes())
+                    .isEqualTo(counted));
+            MqttMessage delivered = received(subscription.receive(Duration.ofSeconds(5))).message();
+            assertThat(delivered.userProperties()).containsExactly(
+                    new UserProperty("a", "1"),
+                    new UserProperty("b", "2")
+            );
+        }
+    }
+
+    @Test
     void a_later_topic_for_an_alias_replaces_the_earlier_one() throws Exception {
         // Arrange
         try (MqttClient sut = mqtt5Client()) {

@@ -25,6 +25,10 @@ import static java.util.Objects.requireNonNull;
 /// - [MQTT 5.0, section 3: Control Packets](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)
 public sealed interface Packet {
 
+    /// The MQTT 5.0 properties in wire order: empty in MQTT 3.1.1, and for PINGREQ and PINGRESP,
+    /// which carry none.
+    Properties properties();
+
     /// CONNECT — connection parameters.
     ///
     /// Null will, username, or password means the field is absent. String representations omit
@@ -370,10 +374,22 @@ public sealed interface Packet {
     }
 
     /// PINGREQ — a keep-alive request with no variable header or payload.
-    record PingReq() implements Packet {}
+    record PingReq() implements Packet {
+
+        @Override
+        public Properties properties() {
+            return Properties.EMPTY;
+        }
+    }
 
     /// PINGRESP — the response to PINGREQ, with no variable header or payload.
-    record PingResp() implements Packet {}
+    record PingResp() implements Packet {
+
+        @Override
+        public Properties properties() {
+            return Properties.EMPTY;
+        }
+    }
 
     /// DISCONNECT — closes the connection.
     ///

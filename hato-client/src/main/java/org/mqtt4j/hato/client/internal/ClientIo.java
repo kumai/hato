@@ -81,6 +81,14 @@ final class ClientIo {
     // packet itself. A larger send goes alone.
     static final int BATCH_BYTE_LIMIT = 64 * 1024;
 
+    // Receive capacity counts each property of a received packet with this many bytes beyond
+    // the packet's size. Decoded, a User Property takes up to 118 bytes of memory beyond its
+    // encoding, as measured with compressed references, the default for heaps under 32 GiB.
+    // Without them it takes about 150, which this undercounts; such heaps dwarf the receive
+    // limits anyway. Without this allowance, packets of many small properties would hold many
+    // times the memory that the receive limits admit.
+    static final int PROPERTY_COST = 128;
+
     private final URI endpoint;
 
     private final String clientId;
@@ -163,18 +171,20 @@ final class ClientIo {
                     if (packet instanceof Packet.PingResp && answersPing(connection)) {
                         events.pingResponse(generation, packet, size);
                     } else if (packet instanceof Packet.Publish publish) {
-                        events.received(generation, aliases.set(publish), size);
+                        Packet.Publish held = aliases.set(publish);
+                        events.received(generation, held, size + propertyCost(held));
                     } else if (packet instanceof Packet.AliasPublish publish) {
                         Packet.Publish resolved = aliases.resolve(publish);
                         // Receive capacity counts the topic as if the broker had sent it, so an
                         // alias saves bandwidth without changing what a delivery costs.
+                        int topicBytes = resolved.topic().name().getBytes(UTF_8).length;
                         events.received(
                                 generation,
                                 resolved,
-                                size + resolved.topic().name().getBytes(UTF_8).length
+                                size + topicBytes + propertyCost(resolved)
                         );
                     } else {
-                        events.received(generation, packet, size);
+                        events.received(generation, packet, size + propertyCost(packet));
                     }
                 }
         );
@@ -591,6 +601,11 @@ final class ClientIo {
             connection.pings--;
             return true;
         }
+    }
+
+    /// The receive capacity that the properties of `packet` take beyond its size.
+    private static int propertyCost(Packet packet) {
+        return PROPERTY_COST * packet.properties().entries().size();
     }
 
     private boolean isClosed(Connection connection) {
