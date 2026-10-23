@@ -193,7 +193,7 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
         ///
         /// @throws NullPointerException if `message` is null
         /// @throws IllegalStateException if this subscription has ended
-        public FakeDelivery deliver(MqttMessage message) {
+        public FakeMqttDelivery deliver(MqttMessage message) {
             requireNonNull(message, "message must not be null");
             synchronized (this) {
                 if (ending != null) {
@@ -203,7 +203,7 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
                 }
                 running++;
             }
-            var delivery = new FakeDelivery(message, filter());
+            var delivery = new FakeMqttDelivery(message, filter());
             try {
                 handler.accept(delivery);
             } catch (Throwable failure) {
@@ -288,14 +288,14 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
 
     /// A delivery that a test made with [FakeSubscription#deliver(MqttMessage)]. Besides the
     /// [MqttDelivery] methods that the handler calls, it shows what the handler did with it.
-    public static final class FakeDelivery implements MqttDelivery {
+    public static final class FakeMqttDelivery implements MqttDelivery {
 
         private final MqttMessage message;
         private final TopicFilter filter;
         private volatile boolean acked;
         private volatile @Nullable Throwable failure;
 
-        private FakeDelivery(MqttMessage message, TopicFilter filter) {
+        private FakeMqttDelivery(MqttMessage message, TopicFilter filter) {
             this.message = message;
             this.filter = filter;
         }

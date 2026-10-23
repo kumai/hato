@@ -44,7 +44,7 @@ var subscriber = new FakeMqttSubscriber();
 // The code under test subscribes to alarms and forwards each one.
 new AlarmForwarder(subscriber, publisher).start();
 
-FakeDelivery delivery = subscriber.subscription(new TopicFilter("sensors/+/alarm"))
+FakeMqttDelivery delivery = subscriber.subscription(new TopicFilter("sensors/+/alarm"))
         .orElseThrow()
         .deliver(MqttMessage.of(
                 new Topic("sensors/kitchen/alarm"),

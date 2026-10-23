@@ -482,7 +482,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.testkit.FakeMqttPublisher",
                 "org.mqtt4j.hato.testkit.FakeMqttPublisher$HeldPublication",
                 "org.mqtt4j.hato.testkit.FakeMqttSubscriber",
-                "org.mqtt4j.hato.testkit.FakeMqttSubscriber$FakeDelivery",
+                "org.mqtt4j.hato.testkit.FakeMqttSubscriber$FakeMqttDelivery",
                 "org.mqtt4j.hato.testkit.FakeMqttSubscriber$FakeSubscription",
                 "org.mqtt4j.hato.testkit.FaultyTransport",
                 "org.mqtt4j.hato.testkit.HeldResponse",

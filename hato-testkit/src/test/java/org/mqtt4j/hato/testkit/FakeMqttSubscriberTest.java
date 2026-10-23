@@ -20,7 +20,7 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
-import org.mqtt4j.hato.testkit.FakeMqttSubscriber.FakeDelivery;
+import org.mqtt4j.hato.testkit.FakeMqttSubscriber.FakeMqttDelivery;
 import org.mqtt4j.hato.testkit.FakeMqttSubscriber.FakeSubscription;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -51,7 +51,7 @@ class FakeMqttSubscriberTest {
         FakeSubscription subscription = sut.subscription(READINGS).orElseThrow();
 
         // Act
-        FakeDelivery delivery = subscription.deliver(READING);
+        FakeMqttDelivery delivery = subscription.deliver(READING);
 
         // Assert
         assertThat(subscription).isSameAs(returned);
@@ -74,7 +74,7 @@ class FakeMqttSubscriberTest {
         var sut = new FakeMqttSubscriber();
         var kept = new AtomicReference<MqttDelivery>();
         sut.subscribe(AT_LEAST_ONCE.withAckMode(AckMode.MANUAL), kept::set);
-        FakeDelivery delivery = sut.subscription(READINGS).orElseThrow().deliver(READING);
+        FakeMqttDelivery delivery = sut.subscription(READINGS).orElseThrow().deliver(READING);
         boolean ackedOnReturn = delivery.acked();
 
         // Act
@@ -96,8 +96,8 @@ class FakeMqttSubscriberTest {
         FakeSubscription subscription = sut.subscription(READINGS).orElseThrow();
 
         // Act
-        FakeDelivery first = subscription.deliver(READING);
-        FakeDelivery second = subscription.deliver(READING);
+        FakeMqttDelivery first = subscription.deliver(READING);
+        FakeMqttDelivery second = subscription.deliver(READING);
 
         // Assert
         assertThat(first.failure()).containsSame(failure);
