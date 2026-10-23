@@ -98,6 +98,26 @@ class MailboxTest {
     }
 
     @Test
+    void qos_0_publications_and_other_incoming_packets_have_independent_capacity_in_one_fifo()
+            throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 1, 10, 1);
+        var publication = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
+        sut.activate(1);
+
+        // Act & Assert: full QoS 0 publications leave room for the packets the client must not
+        // drop, which in turn take none of theirs.
+        assertThat(sut.offer(publication)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(publication)).isEqualTo(FULL);
+        assertThat(sut.offer(incoming)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(incoming)).isEqualTo(FULL);
+        assertThat(sut.take(() -> false)).containsSame(publication);
+        assertThat(sut.take(() -> false)).containsSame(incoming);
+        assertThat(sut.bytes()).isZero();
+    }
+
+    @Test
     void keep_alive_events_go_ahead_of_queued_input_but_not_of_termination() throws Exception {
         // Arrange
         var sut = new Mailbox(1, 10, 256, 1, 10, 1);
@@ -628,7 +648,7 @@ class MailboxTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = Mailbox.Kind.class, names = {"COMMAND", "INCOMING"})
+    @EnumSource(value = Mailbox.Kind.class, names = {"COMMAND", "INCOMING", "AT_MOST_ONCE"})
     void byte_capacity_is_enforced_even_when_event_slots_remain(Mailbox.Kind kind)
             throws Exception {
         // Arrange

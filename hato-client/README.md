@@ -389,7 +389,9 @@ and QoS 1 and 2 messages until they are acknowledged. Messages can arrive all at
 retained messages when you subscribe, so size the queue for them:
 `Subscribe.of(filter, qos).withBufferCapacity(4096)`. When the queue is full, a QoS 0 message
 is dropped and logged, and the subscription goes on. A QoS 1 or 2 message ends the connection
-instead of growing the queue without limit.
+instead of growing the queue without limit. The same holds before messages reach a queue: when
+a broker sends QoS 0 messages faster than the client can route them to subscriptions, the
+client drops the ones it cannot hold, logs and counts them, and goes on.
 
 Because acknowledgements keep arrival order across the connection, a message whose
 acknowledgement waits, in a queue or for slow processing, holds back the acknowledgements of

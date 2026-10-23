@@ -4489,10 +4489,11 @@ class ClientActorTest {
             holdActor(transport, entered, release);
             byte[] payload = new byte[11 * 1024 * 1024];
 
-            // Act: the third packet exceeds the 32 MiB incoming byte budget.
-            transport.receive(publication(payload));
-            transport.receive(publication(payload));
-            transport.receive(publication(payload));
+            // Act: the third packet exceeds the 32 MiB incoming byte budget. Unlike QoS 0, a
+            // QoS 1 publication cannot be dropped instead.
+            transport.receive(qosOnePublication(1, payload));
+            transport.receive(qosOnePublication(2, payload));
+            transport.receive(qosOnePublication(3, payload));
             release.countDown();
 
             // Assert

@@ -653,6 +653,34 @@ class ClientStatsTest {
     }
 
     @Test
+    void qos_0_publications_beyond_the_incoming_queue_are_dropped_and_counted() throws Exception {
+        // Arrange: the broker's publications pile up while the actor is held.
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = builder().build()) {
+            ScriptTransport transport = connect(sut);
+            CompletableFuture<ClientStats> pending = holdActorInStats(sut, release);
+
+            // Act: one QoS 0 publication more than the 65,536 that the client queues.
+            for (int i = 0; i <= 65_536; i++) {
+                transport.receive(publish("readings", 1));
+            }
+            release.countDown();
+
+            // Assert: unlike the packets above, the one that did not fit leaves the connection
+            // up; it counts as received, and the rest as matching no subscription.
+            pending.get(5, SECONDS);
+            ClientStats stats = stats(sut);
+            assertThat(stats.receiving().unrouted()).isOne();
+            assertThat(stats.receiving().publishes(Qos.AT_MOST_ONCE)).isEqualTo(65_537);
+            assertThat(stats.receiving().unmatched()).isEqualTo(65_536);
+            assertThat(stats.overloads()).containsEntry(OverloadCause.EVENTS, 0L);
+            assertThat(ends).isEmpty();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     @SuppressWarnings("try") // Explicit close is under test; the resource closes on failure.
     void after_close_calls_get_the_snapshot_taken_when_the_client_stopped() throws Exception {
         // Arrange

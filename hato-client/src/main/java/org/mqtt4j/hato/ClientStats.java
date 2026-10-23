@@ -154,7 +154,9 @@ public final class ClientStats {
         /// A hand-off acceptor refused a QoS 1 or QoS 2 delivery.
         HAND_OFF,
 
-        /// The client fell behind on incoming packets, control events, or keep-alive events.
+        /// The client fell behind on incoming packets, control events, or keep-alive events. It
+        /// drops the QoS 0 publications that it falls behind on instead, counted under
+        /// [Receiving#unrouted()].
         EVENTS,
 
         /// CONNECT, PINGREQ, or DISCONNECT found no room in the send capacity reserved for them.
@@ -239,6 +241,14 @@ public final class ClientStats {
         /// A lifetime count of received publications that matched no subscription.
         public long unmatched() {
             return values.unmatched();
+        }
+
+        /// A lifetime count of received QoS 0 publications that the client dropped before
+        /// routing them, because they arrived faster than it routes publications and found its
+        /// queue of incoming packets full. They reach no subscription, and [#publishes(Qos)]
+        /// counts them.
+        public long unrouted() {
+            return values.unrouted();
         }
 
         /// A lifetime count of the deliveries that subscriptions took: one for each copy of a

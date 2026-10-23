@@ -15,7 +15,10 @@ import org.jspecify.annotations.Nullable;
 /// PINGRESPs that answer admitted PINGREQs. Their outcome does not depend on the events they
 /// overtake, except that a send time not yet recorded can bring a PINGREQ forward. Termination has
 /// its own slot ahead of both, and a session's stop request precedes termination. Generation and
-/// session changes share the admission monitor so old callbacks cannot consume capacity.
+/// session changes share the admission monitor so old callbacks cannot consume capacity. QoS 0
+/// publications have an incoming allowance of their own, as large as that of the other incoming
+/// packets: the client drops the ones that do not fit, and they cannot take the room of a packet
+/// that the client must not drop.
 final class Mailbox {
 
     enum OfferResult {
@@ -28,6 +31,8 @@ final class Mailbox {
         COMMAND,
         REGISTRATION,
         INCOMING,
+        // A received QoS 0 publication, which the client may drop.
+        AT_MOST_ONCE,
         CONTROL,
         KEEP_ALIVE,
         DELIVERY_READY,
@@ -44,6 +49,7 @@ final class Mailbox {
                 case COMMAND,
                      REGISTRATION,
                      INCOMING,
+                     AT_MOST_ONCE,
                      CONTROL,
                      KEEP_ALIVE -> false;
                 case DELIVERY_READY,
@@ -98,6 +104,10 @@ final class Mailbox {
     private int incomingCount;
 
     private long incomingBytes;
+
+    private int atMostOnceCount;
+
+    private long atMostOnceBytes;
 
     private int controlCount;
 
@@ -166,6 +176,8 @@ final class Mailbox {
             case REGISTRATION -> registrationCount >= registrationLimit;
             case INCOMING -> incomingCount >= incomingLimit
                     || event.bytes() > incomingByteLimit - incomingBytes;
+            case AT_MOST_ONCE -> atMostOnceCount >= incomingLimit
+                    || event.bytes() > incomingByteLimit - atMostOnceBytes;
             case CONTROL -> controlCount >= controlLimit;
             case KEEP_ALIVE -> keepAlive.size() >= KEEP_ALIVE_LIMIT;
             case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE, CREDENTIALS_READY,
@@ -187,6 +199,10 @@ final class Mailbox {
             case INCOMING -> {
                 incomingCount++;
                 incomingBytes += event.bytes();
+            }
+            case AT_MOST_ONCE -> {
+                atMostOnceCount++;
+                atMostOnceBytes += event.bytes();
             }
             case CONTROL -> controlCount++;
             case KEEP_ALIVE -> {
@@ -291,7 +307,7 @@ final class Mailbox {
 
     /// Bytes of queued commands and incoming packets.
     synchronized long bytes() {
-        return commandBytes + incomingBytes;
+        return commandBytes + incomingBytes + atMostOnceBytes;
     }
 
     private void release(Event event) {
@@ -307,6 +323,10 @@ final class Mailbox {
             case INCOMING -> {
                 incomingCount--;
                 incomingBytes -= event.bytes();
+            }
+            case AT_MOST_ONCE -> {
+                atMostOnceCount--;
+                atMostOnceBytes -= event.bytes();
             }
             case CONTROL -> controlCount--;
             case KEEP_ALIVE -> {

@@ -84,7 +84,8 @@ public final class ClientActor implements MqttClient {
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
     // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
     // each when measured); the byte limit bounds the packets themselves, with the allowance for
-    // their properties (ClientIo.PROPERTY_COST).
+    // their properties (ClientIo.PROPERTY_COST). QoS 0 publications have a second allowance of
+    // both sizes, and what does not fit it is dropped rather than ending the connection.
     private static final int MAILBOX_INCOMING_LIMIT = 65_536;
 
     private static final int MAILBOX_COMMAND_BYTE_LIMIT = 32 * 1024 * 1024;
@@ -161,6 +162,12 @@ public final class ClientActor implements MqttClient {
     // Lifetime counts of operations refused for capacity on the callers' threads, by limit; the
     // core counts its own refusals.
     private final AtomicLongArray refusals = new AtomicLongArray(CapacityLimit.values().length);
+
+    // A lifetime count of QoS 0 publications that the transport's thread dropped because they did
+    // not fit the mailbox, and whether the first of them has been logged at warning level.
+    private final AtomicLong unrouted = new AtomicLong();
+
+    private final AtomicBoolean unroutedLogged = new AtomicBoolean();
 
     private final Function<ClientSnapshot, ClientStats> statsOf;
 
@@ -837,10 +844,15 @@ public final class ClientActor implements MqttClient {
                 new Mailbox.Event(generation, action, kind, bytes)
         );
         if (admitted == Mailbox.OfferResult.FULL) {
+            if (kind == Mailbox.Kind.AT_MOST_ONCE) {
+                // Like a full subscription buffer, a full mailbox drops QoS 0 and goes on.
+                droppedUnrouted();
+                return;
+            }
             String admission = switch (kind) {
                 case COMMAND -> "Command";
                 case REGISTRATION -> "Registration";
-                case INCOMING -> "Incoming";
+                case INCOMING, AT_MOST_ONCE -> "Incoming";
                 case KEEP_ALIVE -> "Keep-alive";
                 case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE,
                         CREDENTIALS_READY, RECONNECT, STATS -> "Control";
@@ -850,6 +862,20 @@ public final class ClientActor implements MqttClient {
                     OverloadCause.EVENTS,
                     new MqttCapacityException(admission + " mailbox capacity")
             );
+        }
+    }
+
+    /// Counts a QoS 0 publication that the mailbox had no room for, and logs the first one at
+    /// warning level. Called by the transport's thread.
+    private void droppedUnrouted() {
+        unrouted.incrementAndGet();
+        if (unroutedLogged.compareAndSet(false, true)) {
+            log.warn("Dropped a QoS 0 publication for {} at {}: it arrived faster than the client "
+                    + "routes publications; later ones are logged at debug level",
+                    clientId, endpoint);
+        } else {
+            log.debug("Dropped a QoS 0 publication for {} at {}: it arrived faster than the "
+                    + "client routes publications", clientId, endpoint);
         }
     }
 
@@ -1135,6 +1161,10 @@ public final class ClientActor implements MqttClient {
         Receptions.Values received = session.receiving();
         Publications.Values published = session.sending();
         Subscriptions.Values registered = session.subscribing();
+        // Publications that the mailbox dropped never reached the core, which counted the rest.
+        long dropped = unrouted.get();
+        var publishes = new EnumMap<Qos, Long>(received.publishes());
+        publishes.merge(Qos.AT_MOST_ONCE, dropped, Long::sum);
         return new ClientSnapshot(
                 new ClientSnapshot.Connection(
                         connectionState(session.state()),
@@ -1143,8 +1173,9 @@ public final class ClientActor implements MqttClient {
                         listenerLane.dropped()
                 ),
                 new ClientSnapshot.Receiving(
-                        received.publishes(),
+                        publishes,
                         received.unmatched(),
+                        dropped,
                         delivery.admitted(),
                         delivery.dropped(),
                         delivery.deliveries(),
@@ -1658,7 +1689,9 @@ public final class ClientActor implements MqttClient {
                             size,
                             receivedAt
                     ),
-                    Mailbox.Kind.INCOMING,
+                    packet instanceof Packet.Publish publish && publish.qos() == Qos.AT_MOST_ONCE
+                            ? Mailbox.Kind.AT_MOST_ONCE
+                            : Mailbox.Kind.INCOMING,
                     size
             );
         }
