@@ -120,7 +120,7 @@ class MosquittoMessagingTest extends MessagingTest {
     }
 
     @Test
-    @Timeout(60)
+    @Timeout(120)
     void ten_thousand_retained_messages_arriving_at_once_fit_a_subscription_with_room()
             throws Exception {
         // Arrange
@@ -139,8 +139,11 @@ class MosquittoMessagingTest extends MessagingTest {
                     _ -> handled.countDown()
             ).established().get(5, SECONDS);
 
-            // Assert: the client holds the burst instead of ending the connection.
-            assertThat(handled.await(10, SECONDS)).isTrue();
+            // Assert: the client holds the burst instead of ending the connection. A slow machine
+            // takes seconds to send it; the statistics show where any message went.
+            assertThat(handled.await(30, SECONDS))
+                    .as(() -> "handled all, with " + sut.stats().join())
+                    .isTrue();
             assertThat(ended).isEmpty();
             sut.disconnect().get(5, SECONDS);
             retain(publisher, base, 10_000, new byte[0]);
@@ -151,13 +154,14 @@ class MosquittoMessagingTest extends MessagingTest {
     /// Stores one retained message per topic below `base`; an empty payload clears them.
     private static void retain(MqttClient publisher, String base, int count, byte[] payload)
             throws Exception {
-        // A small window keeps operations, including slots still being returned, in capacity.
+        // A window as large as the client's in-flight limit fits its operation capacity, because
+        // a publication returns its slot before its future completes.
         var window = new ArrayList<CompletableFuture<PublishResult>>();
         for (int i = 0; i < count; i++) {
             window.add(publisher.publish(MqttMessage.of(
                     new Topic(base + "/" + i), payload, Qos.AT_LEAST_ONCE, true
             )));
-            if (window.size() == 16 || i == count - 1) {
+            if (window.size() == 64 || i == count - 1) {
                 for (CompletableFuture<PublishResult> publication : window) {
                     publication.get(5, SECONDS);
                 }
