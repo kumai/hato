@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.comparison;
 
+import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -13,6 +14,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
+import org.jspecify.annotations.Nullable;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.images.builder.Transferable;
 
@@ -48,10 +50,17 @@ import org.mqtt4j.hato.testsupport.RabbitMq;
 ///   then `seconds`, one in `every` of them to a second subscription on the same connection,
 ///   whose handler works `slowWorkMicros` on each in `workMode`. For each of `prefetches`, the
 ///   MQTT prefetch of the broker, this shows how much the slow subscription holds back the other.
+/// - `reconnect`: RabbitMQ relays QoS 1 messages at a steady `rate`, to the subject through a
+///   [CuttingRelay] that cuts its connection after `beforeSeconds`; the messages go on for
+///   `afterSeconds`. The subject subscribes to three topic filters and reconnects by itself. This
+///   shows how long each client leaves the application without messages, and how many it loses
+///   with a clean session. The libraries are, by default, `paho-blocking`, `paho`, `hato`, and
+///   `hivemq`.
 ///
 /// The scenarios through RabbitMQ send `size`-byte messages to `posts` topics, which the subject
 /// subscribes to with one wildcard filter, from a [RawPublisher] that keeps at most
-/// `publisherWindow` publications unacknowledged. `burst` and `stall` take `prefetch`.
+/// `publisherWindow` publications unacknowledged. `burst`, `stall`, and `reconnect` take
+/// `prefetch`.
 ///
 /// All scenarios take `runs`, `libraries`, `verbose=true` to print each run's result as well,
 /// `threads=true` to print where each run's CPU time went by thread, and `subjectOptions` for JVM
@@ -95,10 +104,15 @@ public final class Driver {
 
     public static void main(String[] args) throws Exception {
         Arguments arguments = Arguments.parse(Arrays.asList(args));
+        String scenario = arguments.text("scenario", "receive");
+        // Only the reconnect scenario tells Paho's blocking client apart.
+        String libraries = scenario.equals("reconnect")
+                ? "paho-blocking,paho,hato,hivemq"
+                : "paho,hato,hivemq";
         var settings = new Settings(
                 (int) arguments.number("runs", 3),
                 (int) arguments.number("window", 10),
-                arguments.list("libraries", "paho,hato,hivemq").stream()
+                arguments.list("libraries", libraries).stream()
                         .map(Library::of)
                         .toList(),
                 Boolean.parseBoolean(arguments.text("verbose", "false")),
@@ -112,13 +126,13 @@ public final class Driver {
                 Runtime.version(),
                 Runtime.getRuntime().availableProcessors()
         );
-        String scenario = arguments.text("scenario", "receive");
         switch (scenario) {
             case "receive" -> receive(arguments, settings);
             case "latency" -> latency(arguments, settings);
             case "burst" -> burst(arguments, settings);
             case "stall" -> stall(arguments, settings);
             case "slowSubscription" -> slowSubscription(arguments, settings);
+            case "reconnect" -> reconnect(arguments, settings);
             default -> throw new IllegalArgumentException("Unknown scenario: " + scenario);
         }
     }
@@ -378,6 +392,49 @@ public final class Driver {
         }
     }
 
+    /// A connection cut once through RabbitMQ, for each way of reconnecting.
+    private static void reconnect(Arguments arguments, Settings settings) throws Exception {
+        long rate = arguments.number("rate", 200);
+        long beforeSeconds = arguments.number("beforeSeconds", 10);
+        long afterSeconds = arguments.number("afterSeconds", 45);
+        var traffic = brokerTraffic(
+                arguments,
+                statusTopics(arguments.number("posts", 100)),
+                rate * (beforeSeconds + afterSeconds),
+                new Schedule.Steady(rate)
+        );
+        // The first half of the time before the cut warms the client up.
+        var cutting = new Case(traffic, rate * beforeSeconds / 2);
+        withRabbitMq(arguments.number("prefetch", 10), broker -> {
+            System.out.printf(
+                    "%nThrough RabbitMQ at QoS 1 with a clean session: %,d msg/s; the connection"
+                            + " is cut after %d s, and messages go on for %d s: median of %d"
+                            + " runs%n",
+                    rate,
+                    beforeSeconds,
+                    afterSeconds,
+                    settings.runs()
+            );
+            Tables.reconnect(measure(settings, (library, index) -> runOnBroker(
+                    broker,
+                    cutting,
+                    List.of(
+                            "filter=" + STATUS_FILTER,
+                            // Two filters without traffic, so that each client has three
+                            // subscriptions to make again after the cut.
+                            "extraFilters=" + RESPONSE_FILTER + ",comparison/+/will",
+                            "reconnect=true",
+                            // The application may receive nothing for a long while after the cut.
+                            "idleMillis=" + afterSeconds * 1_000
+                    ),
+                    library,
+                    index,
+                    settings,
+                    Duration.ofSeconds(beforeSeconds)
+            )));
+        });
+    }
+
     /// The topics of `posts` devices that report their status.
     private static List<String> statusTopics(long posts) {
         return IntStream.range(0, Math.toIntExact(posts))
@@ -494,9 +551,7 @@ public final class Driver {
         }
     }
 
-    /// Runs one subject against `broker`, publishing the case's traffic once it has subscribed,
-    /// and adds the most messages that its queue held to the result. Each run takes a client
-    /// identifier of its own, and with it a queue of its own.
+    /// Runs one subject against `broker`, publishing the case's traffic once it has subscribed.
     private static Arguments runOnBroker(
             Broker broker,
             Case measured,
@@ -505,15 +560,49 @@ public final class Driver {
             int index,
             Settings settings
     ) throws Exception {
+        return runOnBroker(broker, measured, subjectArguments, library, index, settings, null);
+    }
+
+    /// Runs one subject against `broker`, publishing the case's traffic once it has subscribed,
+    /// and cutting the subject's connection `cutAfter` publishing starts, if given. Each run takes
+    /// a client identifier of its own, and with it a queue of its own.
+    private static Arguments runOnBroker(
+            Broker broker,
+            Case measured,
+            List<String> subjectArguments,
+            Library library,
+            int index,
+            Settings settings,
+            @Nullable Duration cutAfter
+    ) throws Exception {
         String clientId = "comparison-" + library.label() + "-" + index;
-        var arguments = Stream.concat(
-                Stream.of(
-                        "host=" + broker.host(),
-                        "port=" + broker.port(),
-                        "clientId=" + clientId
-                ),
-                subjectArguments.stream()
-        ).toList();
+        // A run that cuts the connection reaches the broker through a relay that can cut it.
+        try (@Nullable CuttingRelay relay = cutAfter == null
+                ? null
+                : new CuttingRelay(broker.host(), broker.port())) {
+            var arguments = Stream.concat(
+                    Stream.of(
+                            "host=" + (relay == null
+                                    ? broker.host()
+                                    : InetAddress.getLoopbackAddress().getHostAddress()),
+                            "port=" + (relay == null ? broker.port() : relay.port()),
+                            "clientId=" + clientId
+                    ),
+                    subjectArguments.stream()
+            ).toList();
+            return runOnBroker(broker, measured, arguments, library, settings, relay, cutAfter);
+        }
+    }
+
+    private static Arguments runOnBroker(
+            Broker broker,
+            Case measured,
+            List<String> arguments,
+            Library library,
+            Settings settings,
+            @Nullable CuttingRelay relay,
+            @Nullable Duration cutAfter
+    ) throws Exception {
         // The publisher connects before the subject starts. Docker Desktop's port forwarding has
         // been seen to close the broker's side of a subscriber's connection when the publisher's
         // connection came tens of milliseconds after it, while the subscriber's side stayed open;
@@ -529,8 +618,22 @@ public final class Driver {
                     subjectArguments(measured, settings, arguments)
             )) {
                 subject.awaitReady(Duration.ofMinutes(1));
-                var publishing = new FutureTask<Long>(() -> publisher.publish(measured.traffic()));
+                // A cut takes away the subscriber's queue, and with it the acknowledgement of a
+                // message that the broker was routing to it.
+                var publishing = new FutureTask<Long>(
+                        () -> publisher.publish(measured.traffic(), relay == null)
+                );
                 Thread.ofPlatform().name("publisher").daemon().start(publishing);
+                if (relay != null && cutAfter != null) {
+                    Thread.ofPlatform().name("cut").daemon().start(() -> {
+                        try {
+                            Thread.sleep(cutAfter);
+                            relay.cut();
+                        } catch (InterruptedException _) {
+                            // The run ended first.
+                        }
+                    });
+                }
                 Arguments outcome = subject.awaitResult(RUN_TIMEOUT);
                 long late;
                 try {
@@ -546,8 +649,9 @@ public final class Driver {
                 // At QoS 1 a broker loses no message to a subscriber that keeps its connection.
                 // When the port forwarding closes the broker's side all the same, the client
                 // waits for nothing; such a run fails, with what the broker shows, and is tried
-                // again.
-                if (outcome.number("handled") < outcome.number("expected")) {
+                // again. A cut loses messages by design, but only after the warm-up.
+                long least = relay == null ? outcome.number("expected") : measured.warmup();
+                if (outcome.number("handled") < least) {
                     throw new IllegalStateException(String.format(
                             "%s handled %,d of %,d messages%n%s",
                             library.label(),

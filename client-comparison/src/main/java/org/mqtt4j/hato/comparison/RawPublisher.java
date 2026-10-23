@@ -43,9 +43,11 @@ final class RawPublisher implements AutoCloseable {
     }
 
     /// Publishes every message of `traffic`, and returns once the broker has acknowledged every
-    /// QoS 1 message, with the most that a message went out after it was due, in microseconds.
-    /// The broker holds the publisher back only through the traffic's window.
-    long publish(Traffic traffic) throws IOException, InterruptedException {
+    /// QoS 1 message, or with `awaitAcknowledgements` false once all are written, with the most
+    /// that a message went out after it was due, in microseconds. The broker holds the publisher
+    /// back only through the traffic's window.
+    long publish(Traffic traffic, boolean awaitAcknowledgements)
+            throws IOException, InterruptedException {
         var sending = new PacedSender(traffic, out, writing);
         sender = sending;
         Thread.ofPlatform()
@@ -53,7 +55,7 @@ final class RawPublisher implements AutoCloseable {
                 .daemon()
                 .start(() -> read(sending));
         try {
-            sending.send();
+            sending.send(awaitAcknowledgements);
         } catch (IOException e) {
             IOException failure = readFailure;
             throw failure != null ? failure : e;

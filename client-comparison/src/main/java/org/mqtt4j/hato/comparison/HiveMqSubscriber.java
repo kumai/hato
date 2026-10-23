@@ -4,6 +4,7 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicLong;
 
 import com.hivemq.client.mqtt.MqttClient;
+import com.hivemq.client.mqtt.MqttClientBuilder;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.mqtt3.Mqtt3AsyncClient;
 
@@ -23,9 +24,16 @@ final class HiveMqSubscriber implements SubscriberClient {
     // Set before close() disconnects, so that its own ending is not counted.
     private volatile boolean closing;
 
-    HiveMqSubscriber(String host, int port, String clientId, int keepAliveSeconds) {
-        client = MqttClient.builder()
-                .useMqttVersion3()
+    /// With `reconnect`, the client reconnects with its default delays, from one second up to two
+    /// minutes, and by default subscribes again when it finds its session gone.
+    HiveMqSubscriber(
+            String host,
+            int port,
+            String clientId,
+            int keepAliveSeconds,
+            boolean reconnect
+    ) {
+        MqttClientBuilder builder = MqttClient.builder()
                 .identifier(clientId)
                 .serverHost(host)
                 .serverPort(port)
@@ -34,8 +42,11 @@ final class HiveMqSubscriber implements SubscriberClient {
                         connectionsLost.incrementAndGet();
                         System.err.println("hivemq: disconnected: " + context.getCause());
                     }
-                })
-                .buildAsync();
+                });
+        if (reconnect) {
+            builder = builder.automaticReconnectWithDefaultConfig();
+        }
+        client = builder.useMqttVersion3().buildAsync();
         client.connectWith()
                 .cleanSession(true)
                 .keepAlive(keepAliveSeconds)

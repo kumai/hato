@@ -35,6 +35,9 @@ final class Reception {
     // How often the waiting thread checks for the end.
     private static final Duration POLL = Duration.ofMillis(5);
 
+    // How long the run waits, after the last message sent, for messages that it overtook.
+    private static final Duration STRAGGLERS = Duration.ofSeconds(2);
+
     // The handling time of a message that the handler has not received.
     static final long NOT_HANDLED = Long.MIN_VALUE;
 
@@ -125,11 +128,16 @@ final class Reception {
     /// @throws IllegalStateException if `limit` passed first
     Result await(Duration idle, Duration limit) throws InterruptedException {
         long deadline = System.nanoTime() + limit.toNanos();
-        // The last message sent ends the run once the messages before it have been handled too,
-        // which a subscription on a thread of its own can leave behind.
-        while (end == null || handled.get() < expected) {
+        while (true) {
             long now = System.nanoTime();
-            if (handled.get() > 0 && now - lastNanos > idle.toNanos()) {
+            long quiet = now - lastNanos;
+            // The last message sent ends the run once the messages before it have been handled
+            // too, which a subscription on a thread of its own can leave behind; those that do
+            // not come soon after it never come.
+            if (end != null && (handled.get() >= expected || quiet > STRAGGLERS.toNanos())) {
+                break;
+            }
+            if (handled.get() > 0 && quiet > idle.toNanos()) {
                 break;
             }
             if (now > deadline) {
@@ -142,7 +150,7 @@ final class Reception {
         ProcessUsage first = start;
         if (first == null) {
             var nothing = new ProcessUsage(0, 0, 0, 0, 0);
-            return new Result(expected, handled.get(), 0, 0, 0, nothing, 0, Latency.NONE, 0);
+            return new Result(expected, handled.get(), 0, 0, 0, nothing, 0, Latency.NONE, 0, 0);
         }
         long arrived = highestSequence.get() - firstSequence;
         ProcessUsage last = end;
@@ -156,8 +164,24 @@ final class Reception {
                 used,
                 threads.getPeakThreadCount(),
                 Latency.of(sentMicros, handledMicros),
-                peakBacklog(sentMicros, handledMicros)
+                peakBacklog(sentMicros, handledMicros),
+                longestGap(handledMicros)
         );
+    }
+
+    /// The longest time in which the handler received nothing, between two of the messages in
+    /// `handled` that it did receive, in microseconds: the time that a lost connection left the
+    /// application without messages. A handling time of [#NOT_HANDLED] leaves its message out.
+    static long longestGap(long[] handled) {
+        long[] times = Arrays.stream(handled)
+                .filter(time -> time != NOT_HANDLED)
+                .sorted()
+                .toArray();
+        long longest = 0;
+        for (int next = 1; next < times.length; next++) {
+            longest = Math.max(longest, times[next] - times[next - 1]);
+        }
+        return longest;
     }
 
     /// The most messages that were due but not yet handled at any one moment, among the messages
@@ -216,6 +240,8 @@ final class Reception {
     /// @param latency the latencies of the messages handled after the warm-up
     /// @param peakBacklog the most of those messages that were due but not yet handled at once,
     ///     as [Reception#peakBacklog] counts them
+    /// @param longestGapMicros the longest time without a message for the handler after the
+    ///     warm-up, as [Reception#longestGap] measures it
     record Result(
             long expected,
             long handled,
@@ -225,7 +251,8 @@ final class Reception {
             ProcessUsage used,
             int peakThreads,
             Latency latency,
-            long peakBacklog
+            long peakBacklog,
+            long longestGapMicros
     ) {
 
         /// The result as `key=value` words separated by spaces, which [Arguments] reads back.
@@ -245,7 +272,8 @@ final class Reception {
                     + " p99Micros=" + latency.p99()
                     + " p999Micros=" + latency.p999()
                     + " maxMicros=" + latency.max()
-                    + " peakBacklog=" + peakBacklog;
+                    + " peakBacklog=" + peakBacklog
+                    + " longestGapMicros=" + longestGapMicros;
         }
     }
 

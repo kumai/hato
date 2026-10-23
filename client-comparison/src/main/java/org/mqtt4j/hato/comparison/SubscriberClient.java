@@ -8,7 +8,7 @@ package org.mqtt4j.hato.comparison;
 /// MQTT 3.1.1, a clean session, session state in memory, and a QoS 1 message acknowledged once its
 /// handler has returned.
 sealed interface SubscriberClient extends AutoCloseable
-        permits HatoSubscriber, HiveMqSubscriber, PahoSubscriber {
+        permits HatoSubscriber, HiveMqSubscriber, PahoBlockingSubscriber, PahoSubscriber {
 
     /// Subscribes `filter` at `qos` and returns once the broker has granted it. The handler
     /// receives each message's payload header, read the way the library offers the payload.

@@ -137,6 +137,39 @@ final class Tables {
         ));
     }
 
+    /// The reconnect scenario.
+    ///
+    /// "gap s" is the longest time in which the handler received no message, which a lost
+    /// connection sets: the time to notice the loss, to reconnect, and to subscribe again, and any
+    /// time that the client then spends before it hands messages on. "lost" counts the messages
+    /// that never reached the handler, those that the broker had nowhere to send while no
+    /// subscription was in place. "conns" is the connections that each run lost, which should be
+    /// the one cut.
+    static void reconnect(Map<Library, List<Arguments>> results) {
+        System.out.printf(
+                "%-13s | %7s | %9s | %8s | %9s | %8s | %5s | %10s%n",
+                "client",
+                "gap s",
+                "lost",
+                "p99 ms",
+                "max ms",
+                "backlog",
+                "conns",
+                "CPU µs/msg"
+        );
+        results.forEach((library, runs) -> System.out.printf(
+                "%-13s | %7.2f | %,9.0f | %,8.1f | %,9.1f | %,8.0f | %5.0f | %10.2f%n",
+                library.label(),
+                measuredMedian(runs, result -> result.number("longestGapMicros") / 1e6),
+                median(runs, Tables::dropped),
+                measuredMedian(runs, result -> result.number("p99Micros") / 1e3),
+                measuredMedian(runs, result -> result.number("maxMicros") / 1e3),
+                measuredMedian(runs, result -> result.number("peakBacklog")),
+                median(runs, result -> result.number("connectionsLost")),
+                measuredMedian(runs, Tables::cpuMicrosPerMessage)
+        ));
+    }
+
     private static boolean keepsUp(Arguments result, long rate) {
         return dropped(result) == 0
                 && result.number("connectionsLost") == 0

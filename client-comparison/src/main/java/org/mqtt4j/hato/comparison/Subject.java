@@ -15,6 +15,9 @@ import java.util.logging.Logger;
 /// `warmup`; optionally:
 ///
 /// - `host`, `clientId`, and `keepAliveSeconds`, 60 by default.
+/// - `reconnect=true` to have the client reconnect and subscribe again by itself after it loses
+///   its connection, as [Library#connect] describes it.
+/// - `extraFilters`, more topic filters to subscribe to, whose messages count with the others.
 /// - `idleMillis`, 2,000 by default: a run whose client drops messages ends once none has arrived
 ///   for this long, which must outlast any pause that the run itself causes, such as a stall.
 /// - `workMicros` with `workMode` for what the handler does with each message beyond counting it,
@@ -61,7 +64,8 @@ public final class Subject {
                 arguments.text("host", "127.0.0.1"),
                 (int) arguments.number("port"),
                 arguments.text("clientId", "comparison-" + library.label()),
-                (int) arguments.number("keepAliveSeconds", 60)
+                (int) arguments.number("keepAliveSeconds", 60),
+                Boolean.parseBoolean(arguments.text("reconnect", "false"))
         )) {
             client.subscribe(arguments.text("filter"), qos, (sequence, sentMicros) -> {
                 reception.handle(sequence, sentMicros);
@@ -70,6 +74,11 @@ public final class Subject {
                     stall.run();
                 }
             });
+            if (!arguments.text("extraFilters", "").isEmpty()) {
+                for (String filter : arguments.list("extraFilters", "")) {
+                    client.subscribe(filter, qos, reception::handle);
+                }
+            }
             String slowFilter = arguments.text("slowFilter", "");
             if (!slowFilter.isEmpty()) {
                 Runnable slowWork = work(arguments.number("slowWorkMicros"), workMode);

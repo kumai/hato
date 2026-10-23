@@ -105,6 +105,14 @@ class ReceptionTest {
     }
 
     @Test
+    void the_longest_gap_is_the_longest_time_without_a_handled_message() {
+        // Arrange: every 10 µs, then nothing until 1,000 µs; one message never handled.
+        long[] handled = {0, 10, 20, 1_000, 1_010, Reception.NOT_HANDLED};
+        // Act & Assert
+        assertThat(Reception.longestGap(handled)).isEqualTo(980);
+    }
+
+    @Test
     void a_run_whose_connection_ends_during_the_warm_up_measures_nothing() throws Exception {
         // Arrange
         var sut = new Reception(10, 3, false);

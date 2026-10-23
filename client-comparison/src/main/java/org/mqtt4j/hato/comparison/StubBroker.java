@@ -79,7 +79,7 @@ final class StubBroker implements AutoCloseable {
                 .daemon()
                 .start(() -> read(in, out, sending));
         try {
-            sending.send();
+            sending.send(true);
         } catch (IOException e) {
             // A failed read explains a failed send better than the send does.
             IOException failure = readFailure;

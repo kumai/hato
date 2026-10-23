@@ -80,8 +80,11 @@ final class PacedSender {
         );
     }
 
-    /// Sends every message, and returns once all have been written and, at QoS 1, acknowledged.
-    void send() throws IOException, InterruptedException {
+    /// Sends every message, and returns once all have been written and, at QoS 1 and with
+    /// `awaitAcknowledgements`, acknowledged. A receiver may never acknowledge some, as RabbitMQ
+    /// does not for a message that it routed to a queue as the queue went away with its
+    /// connection; a sender to such a receiver need not wait for them.
+    void send(boolean awaitAcknowledgements) throws IOException, InterruptedException {
         Schedule schedule = traffic.schedule();
         var frames = traffic.topics().stream()
                 .map(topic -> new PublishFrame(topic, traffic.qos(), traffic.payloadSize()))
@@ -132,7 +135,7 @@ final class PacedSender {
             }
             flush();
         }
-        if (traffic.qos() > 0) {
+        if (traffic.qos() > 0 && awaitAcknowledgements) {
             // Every permit back means every message acknowledged.
             await(traffic.window());
         }
