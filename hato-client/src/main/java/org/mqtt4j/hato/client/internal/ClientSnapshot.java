@@ -80,6 +80,8 @@ public record ClientSnapshot(
 
     /// @param publishes the PUBLISH packets received, by QoS, over the client's lifetime
     /// @param unmatched the received publications that matched no subscription
+    /// @param unrouted the received QoS 0 publications that the client dropped before routing
+    ///     them, because they did not fit its queue of incoming packets
     /// @param deliveries the deliveries that subscriptions took
     /// @param dropped the deliveries that left their subscription unprocessed, by reason
     /// @param heldDeliveries the deliveries that the client holds, against its limit
@@ -103,6 +105,7 @@ public record ClientSnapshot(
     public record Receiving(
             Map<Qos, Long> publishes,
             long unmatched,
+            long unrouted,
             long deliveries,
             Map<DropReason, Long> dropped,
             Usage heldDeliveries,

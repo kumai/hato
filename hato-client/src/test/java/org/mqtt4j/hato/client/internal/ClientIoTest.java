@@ -552,6 +552,37 @@ class ClientIoTest {
     }
 
     @Test
+    void a_transport_that_lets_the_client_write_gets_each_write_from_the_sender()
+            throws Exception {
+        // Arrange: the transport takes writes only through write(), and reports each at once.
+        var transport = new BlockingTransport();
+        var io = new ClientIo(
+                URI.create("mqtt://localhost"),
+                "io-test",
+                16 * 1024 * 1024,
+                128,
+                0,
+                _ -> transport,
+                events,
+                codec
+        );
+        batching.add(io);
+        io.open(1, Duration.ofSeconds(30));
+
+        // Act
+        for (int ticket = 1; ticket <= 3; ticket++) {
+            assertThat(io.send(1, ticket, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        }
+
+        // Assert: the sender makes each write itself, one at a time, and each completes.
+        await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L, 3L));
+        assertThat(transport.writers).hasSize(3).allSatisfy(writer ->
+                assertThat(writer.getName()).endsWith("-sender"));
+        assertThat(transport.maximumDepth).isEqualTo(1);
+        assertThat(events.failures).isEmpty();
+    }
+
+    @Test
     void inline_completions_advance_writes_without_actor_work_or_recursive_sends() {
         // Arrange
         SingleWriteTransport transport = open(1);
@@ -1386,6 +1417,48 @@ class ClientIoTest {
         @Override
         public void close() {
             rejectSend = true;
+        }
+    }
+
+    /// Takes writes only through write(), which reports each before it returns, as TCP does.
+    private static final class BlockingTransport implements Transport, BlockingWriteTransport {
+
+        final List<Thread> writers = new CopyOnWriteArrayList<>();
+        @Nullable Listener listener;
+        volatile boolean closed;
+        int depth;
+        int maximumDepth;
+
+        @Override
+        public void start(URI endpoint, Duration timeout, Listener receiver) {
+            listener = receiver;
+            receiver.onConnected();
+        }
+
+        @Override
+        public SendResult send(long ticket, byte[] bytes) {
+            throw new AssertionError("The client writes through write()");
+        }
+
+        @Override
+        public synchronized SendResult write(long ticket, byte[] bytes) {
+            if (closed) {
+                return SendResult.CLOSED;
+            }
+            writers.add(Thread.currentThread());
+            depth++;
+            maximumDepth = Math.max(maximumDepth, depth);
+            try {
+                requireNonNull(listener).onSent(ticket);
+                return SendResult.ACCEPTED;
+            } finally {
+                depth--;
+            }
+        }
+
+        @Override
+        public void close() {
+            closed = true;
         }
     }
 

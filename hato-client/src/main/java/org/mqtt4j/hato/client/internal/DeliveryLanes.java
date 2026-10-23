@@ -533,7 +533,7 @@ final class DeliveryLanes {
     /// and overload must end the connection, which only a QoS 1 or 2 publication does: it
     /// reserves every matching lane together, so overload cannot deliver only part of a fan-out.
     /// A QoS 0 publication carries no acknowledgement token, and overflow drops it instead; see
-    /// [#deliverAtMostOnce].
+    /// [#deliverAtMostOnce(List)].
     boolean deliver(
             DeliveryToken token,
             List<Long> ids,
@@ -542,7 +542,7 @@ final class DeliveryLanes {
             int bytes
     ) {
         if (token.acknowledgement() == 0) {
-            deliverAtMostOnce(token, ids, message, dup, bytes);
+            deliverAtMostOnce(List.of(new Arrival(token, ids, message, dup, bytes)));
             return true;
         }
         boolean ready;
@@ -640,61 +640,65 @@ final class DeliveryLanes {
         return true;
     }
 
-    /// Admits a QoS 0 publication. It holds back no acknowledgement, so overflow drops it rather
-    /// than ending the connection: a full lane misses this arrival while the other lanes take it,
-    /// and an arrival that does not fit the client's limits reaches no lane, rather than only the
-    /// lanes that would fit. Deliveries already waiting are never evicted.
-    private void deliverAtMostOnce(
-            DeliveryToken token,
-            List<Long> ids,
-            MqttMessage message,
-            boolean dup,
-            int bytes
-    ) {
+    /// Admits QoS 0 publications in the order given, under one hold of the lock, so that the
+    /// dispatcher that the first of them wakes finds the rest queued. A QoS 0 publication holds
+    /// back no acknowledgement, so overflow drops it rather than ending the connection: a full
+    /// lane misses this arrival while the other lanes take it, and an arrival that does not fit
+    /// the client's limits reaches no lane, rather than only the lanes that would fit. Deliveries
+    /// already waiting are never evicted.
+    void deliverAtMostOnce(List<Arrival> arrivals) {
         var overflows = new ArrayList<Overflow>();
         lock.lock();
         try {
-            var recipients = new ArrayList<Lane>();
-            for (long id : ids) {
-                Lane lane = lanes.get(id);
-                // A lane awaiting removal admits nothing new.
-                if (lane == null || lane.paused) {
-                    continue;
-                }
-                if (lane.retained < lane.capacity) {
-                    recipients.add(lane);
-                } else {
-                    overflows.add(overflow(lane, DropReason.SUBSCRIPTION_FULL));
-                }
-            }
-            if (!recipients.isEmpty()) {
-                if (fits(recipients.size(), bytes)) {
-                    var delivery = new RetainedDelivery(token, bytes);
-                    delivery.message = message;
-                    retainedBytes += bytes;
-                    retainedDeliveries += recipients.size();
-                    for (Lane lane : recipients) {
-                        var view = new DeliveryView(
-                                delivery,
-                                new Recipient(lane.id),
-                                lane,
-                                message,
-                                dup,
-                                token
-                        );
-                        enqueue(lane, view);
-                    }
-                } else {
-                    for (Lane lane : recipients) {
-                        overflows.add(overflow(lane, DropReason.CLIENT_FULL));
-                    }
-                }
+            for (Arrival arrival : arrivals) {
+                admitAtMostOnce(arrival, overflows);
             }
         } finally {
             lock.unlock();
         }
         for (Overflow overflow : overflows) {
             logOverflow(overflow);
+        }
+    }
+
+    /// Caller holds lock. Admits `arrival` as [#deliverAtMostOnce(List)] describes, and adds the
+    /// lanes that it overflows to `overflows`.
+    private void admitAtMostOnce(Arrival arrival, List<Overflow> overflows) {
+        var recipients = new ArrayList<Lane>();
+        for (long id : arrival.ids()) {
+            Lane lane = lanes.get(id);
+            // A lane awaiting removal admits nothing new.
+            if (lane == null || lane.paused) {
+                continue;
+            }
+            if (lane.retained < lane.capacity) {
+                recipients.add(lane);
+            } else {
+                overflows.add(overflow(lane, DropReason.SUBSCRIPTION_FULL));
+            }
+        }
+        if (!recipients.isEmpty()) {
+            if (fits(recipients.size(), arrival.bytes())) {
+                var delivery = new RetainedDelivery(arrival.token(), arrival.bytes());
+                delivery.message = arrival.message();
+                retainedBytes += arrival.bytes();
+                retainedDeliveries += recipients.size();
+                for (Lane lane : recipients) {
+                    var view = new DeliveryView(
+                            delivery,
+                            new Recipient(lane.id),
+                            lane,
+                            arrival.message(),
+                            arrival.dup(),
+                            arrival.token()
+                    );
+                    enqueue(lane, view);
+                }
+            } else {
+                for (Lane lane : recipients) {
+                    overflows.add(overflow(lane, DropReason.CLIENT_FULL));
+                }
+            }
         }
     }
 
@@ -2242,6 +2246,16 @@ final class DeliveryLanes {
 
         void started(long id, long receivedAt);
     }
+
+    /// A received QoS 0 publication that the client routes to the lanes `ids`; see
+    /// [#deliverAtMostOnce(List)].
+    record Arrival(
+            DeliveryToken token,
+            List<Long> ids,
+            MqttMessage message,
+            boolean dup,
+            int bytes
+    ) {}
 
     /// A QoS 0 delivery that overflow kept from the lane `id`, logged after the lock is released.
     private record Overflow(long id, DropReason reason, boolean first) {}

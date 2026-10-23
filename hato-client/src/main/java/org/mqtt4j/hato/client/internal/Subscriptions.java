@@ -61,6 +61,9 @@ final class Subscriptions {
     // removals, so many retained subscriptions cannot flood the actor.
     private static final int SUBSCRIBE_INFLIGHT_LIMIT = 16;
 
+    private static final Comparator<LocalSubscription> REGISTRATION_ORDER =
+            Comparator.comparingLong(local -> local.id);
+
     // The largest Subscription Identifier, a variable byte integer of at most four bytes.
     static final int MAX_SUBSCRIPTION_IDENTIFIER = 268_435_455;
 
@@ -243,9 +246,14 @@ final class Subscriptions {
                 }
             });
         }
+        // Most publications match one registration, which needs no ordering.
+        if (matches.size() == 1) {
+            LocalSubscription only = matches.getFirst();
+            return only.removal == null ? List.of(only.id) : List.of();
+        }
         // Registration order, which is the order of the ids, decides the order in which the
         // lanes take their copies; a registration named twice, or named and matched, goes once.
-        matches.sort(Comparator.comparingLong(local -> local.id));
+        matches.sort(REGISTRATION_ORDER);
         var ids = new ArrayList<Long>(matches.size());
         for (LocalSubscription local : matches) {
             if (local.removal == null && (ids.isEmpty() || ids.getLast() != local.id)) {

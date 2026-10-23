@@ -20,16 +20,15 @@ final class CarrierShare {
     private CarrierShare() {
     }
 
-    /// Whether a thread that has worked without blocking since `busySince`, a
-    /// [System#nanoTime()] reading, has used up its slice and should let others run.
-    static boolean due(long busySince) {
-        return System.nanoTime() - busySince >= SLICE_NANOS;
+    /// Whether a thread that has worked for `workedNanos` since it last shared its carrier has
+    /// used up its slice and should let others run. The thread counts only its work, such as
+    /// handling what a socket read returned: waiting frees the carrier anyway.
+    static boolean spent(long workedNanos) {
+        return workedNanos >= SLICE_NANOS;
     }
 
-    /// Parks for a moment, which lets the other virtual threads run, and returns when the next
-    /// slice begins.
-    static long share() {
+    /// Parks for a moment, which lets the other virtual threads run.
+    static void share() {
         LockSupport.parkNanos(1);
-        return System.nanoTime();
     }
 }

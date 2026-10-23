@@ -10,8 +10,10 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -36,6 +38,9 @@ class KeepAliveBacklogTest {
     private static final int SUBSCRIPTIONS = 256;
 
     private static final int PUBLICATIONS = 16_384;
+
+    // Far more than the 32,768 received packets at which the client pauses reading.
+    private static final int LONG_BURST = 300_000;
 
     @Test
     @Timeout(60)
@@ -101,6 +106,83 @@ class KeepAliveBacklogTest {
                 assertThat(silence.longest()).isLessThanOrEqualTo(Duration.ofMillis(1_500));
             }
         }
+    }
+
+    @Test
+    @Timeout(60)
+    void a_backlog_that_pauses_reading_does_not_hold_back_keep_alive() throws Exception {
+        // Arrange: every publication matches 32 filters, so the client routes far more slowly
+        // than it reads and pauses reading, which leaves the broker's PINGRESP behind the rest of
+        // the burst. A QoS 1 publication after the burst marks its end.
+        var ended = new LinkedBlockingQueue<Disconnection>();
+        var marked = new CountDownLatch(1);
+        try (
+                ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+                MqttClient sut = MqttClient.builder()
+                        .server(URI.create("mqtt://127.0.0.1:" + server.getLocalPort()))
+                        .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
+                        .keepAlive(Duration.ofSeconds(1))
+                        .connectionListener(ended::add)
+                        .build()
+        ) {
+            CompletableFuture<ConnAck> connecting = sut.connect();
+            try (Socket socket = server.accept()) {
+                var reader = new FrameReader(socket.getInputStream(), 1024 * 1024);
+                var writer = new FrameWriter(socket.getOutputStream());
+                assertThat(receive(reader)).isInstanceOf(Packet.Connect.class);
+                writer.write(codec.encode(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY)));
+                connecting.get(5, SECONDS);
+                for (int i = 0; i < 32; i++) {
+                    subscribe(sut, reader, writer, filter(i), Qos.AT_MOST_ONCE, _ -> { });
+                }
+                subscribe(sut, reader, writer, "marker", Qos.AT_LEAST_ONCE,
+                        _ -> marked.countDown());
+                var silence = new Silence();
+                Thread.ofPlatform().daemon().start(() -> answerPings(reader, writer, silence));
+                var burst = new ByteArrayOutputStream();
+                byte[] publication = codec.encode(new Packet.Publish(new Topic("a/b/c/d/e/f/g/h"),
+                        new byte[1], Qos.AT_MOST_ONCE, false, false, 0, EMPTY));
+                for (int i = 0; i < LONG_BURST; i++) {
+                    burst.writeBytes(publication);
+                }
+                burst.writeBytes(codec.encode(new Packet.Publish(new Topic("marker"),
+                        new byte[1], Qos.AT_LEAST_ONCE, false, false, 1, EMPTY)));
+
+                // Act
+                synchronized (writer) {
+                    socket.getOutputStream().write(burst.toByteArray());
+                }
+                await().atMost(Duration.ofSeconds(30))
+                        .until(() -> marked.getCount() == 0 || !ended.isEmpty());
+                // One more interval shows that keep-alive continues after the backlog.
+                Thread.sleep(1_200);
+
+                // Assert
+                assertThat(ended).isEmpty();
+                assertThat(marked.getCount()).isZero();
+                assertThat(silence.longest()).isLessThanOrEqualTo(Duration.ofMillis(1_500));
+            }
+        }
+    }
+
+    private static void subscribe(
+            MqttClient sut,
+            FrameReader reader,
+            FrameWriter writer,
+            String filter,
+            Qos qos,
+            Consumer<MqttDelivery> handler
+    ) throws Exception {
+        Subscription subscription = sut.subscribe(
+                Subscribe.of(new TopicFilter(filter), qos),
+                handler
+        );
+        var subscribe = (Packet.Subscribe) receive(reader);
+        writer.write(codec.encode(new Packet.SubAck(
+                subscribe.packetId(), List.of(ReasonCode.of(qos.level())), EMPTY
+        )));
+        subscription.established().get(5, SECONDS);
     }
 
     /// The QoS 0 deliveries that the client dropped because its buffers or a subscription's buffer

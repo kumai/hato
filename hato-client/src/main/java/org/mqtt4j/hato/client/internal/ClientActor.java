@@ -84,12 +84,18 @@ public final class ClientActor implements MqttClient {
     // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
     // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
     // each when measured); the byte limit bounds the packets themselves, with the allowance for
-    // their properties (ClientIo.PROPERTY_COST).
+    // their properties (ClientIo.PROPERTY_COST). QoS 0 publications have a second allowance of
+    // both sizes, and what does not fit it is dropped rather than ending the connection.
     private static final int MAILBOX_INCOMING_LIMIT = 65_536;
 
     private static final int MAILBOX_COMMAND_BYTE_LIMIT = 32 * 1024 * 1024;
 
     private static final int RECEIVE_BYTE_LIMIT = 32 * 1024 * 1024;
+
+    // The QoS 0 publications in one run at most. The limit bounds how long the first of them
+    // waits for its lanes, how long the lanes' lock is held for them, and how long a keep-alive
+    // event waits behind them.
+    private static final int RUN_LIMIT = 64;
 
     private final URI endpoint;
 
@@ -139,6 +145,12 @@ public final class ClientActor implements MqttClient {
 
     private final DeliveryLanes lanes;
 
+    // The QoS 0 publications that the actor has routed in its current run and not yet handed to
+    // their lanes; only the actor touches them. The run hands them over at its end. Before then,
+    // ending a connection or a subscription through the core's port hands them over first, so
+    // that the ending finds them queued as though each had been handed over at once.
+    private final ArrayList<DeliveryLanes.Arrival> arrivals = new ArrayList<>();
+
     // Published under lifecycleLock before admitting commands for an established connection.
     private long connectedGeneration;
 
@@ -161,6 +173,12 @@ public final class ClientActor implements MqttClient {
     // Lifetime counts of operations refused for capacity on the callers' threads, by limit; the
     // core counts its own refusals.
     private final AtomicLongArray refusals = new AtomicLongArray(CapacityLimit.values().length);
+
+    // A lifetime count of QoS 0 publications that the transport's thread dropped because they did
+    // not fit the mailbox, and whether the first of them has been logged at warning level.
+    private final AtomicLong unrouted = new AtomicLong();
+
+    private final AtomicBoolean unroutedLogged = new AtomicBoolean();
 
     private final Function<ClientSnapshot, ClientStats> statsOf;
 
@@ -659,22 +677,25 @@ public final class ClientActor implements MqttClient {
         Throwable failure = null;
         try {
             Optional<Mailbox.Event> next;
-            long busySince = System.nanoTime();
+            // The time spent on events since the actor last let others run. Waiting for an event
+            // frees the carrier, so only the handling counts.
+            long worked = 0;
             while ((next = mailbox.take(stopping::get)).isPresent()) {
+                long started = System.nanoTime();
                 Mailbox.Event event = next.orElseThrow();
-                try {
-                    event.action().run();
-                } catch (SpiException cause) {
-                    if (cause.schedulerFailure()) {
-                        core.schedulerFailed(cause.generation(), requireNonNull(cause.getCause()));
-                    } else {
-                        core.failed(cause.generation(), requireNonNull(cause.getCause()));
-                    }
+                handle(event);
+                if (event.kind() == Mailbox.Kind.AT_MOST_ONCE) {
+                    continueRun();
                 }
-                if (CarrierShare.due(busySince)) {
+                deliverArrivals();
+                worked += System.nanoTime() - started;
+                if (CarrierShare.spent(worked)) {
                     // The actor blocks next when its mailbox is empty, which frees the carrier
                     // without parking.
-                    busySince = mailbox.size() == 0 ? System.nanoTime() : CarrierShare.share();
+                    if (mailbox.size() != 0) {
+                        CarrierShare.share();
+                    }
+                    worked = 0;
                 }
             }
         } catch (Throwable cause) {
@@ -738,6 +759,43 @@ public final class ClientActor implements MqttClient {
                     }
                 }
             }
+        }
+    }
+
+    private void handle(Mailbox.Event event) {
+        if (event.kind().received() && mailbox.resumeDue()) {
+            io.resumeReading(event.generation());
+        }
+        try {
+            event.action().run();
+        } catch (SpiException cause) {
+            if (cause.schedulerFailure()) {
+                core.schedulerFailed(cause.generation(), requireNonNull(cause.getCause()));
+            } else {
+                core.failed(cause.generation(), requireNonNull(cause.getCause()));
+            }
+        }
+    }
+
+    /// Handles the QoS 0 publications that wait next in the mailbox, without waiting for more, up
+    /// to [#RUN_LIMIT] with the one just handled. Their lanes take them together at the end of the
+    /// run, so that each lane's dispatcher wakes once for the run rather than once for each
+    /// publication.
+    private void continueRun() {
+        for (int taken = 1; taken < RUN_LIMIT; taken++) {
+            Mailbox.Event following = mailbox.takeAtMostOnce(stopping::get);
+            if (following == null) {
+                return;
+            }
+            handle(following);
+        }
+    }
+
+    /// Hands the publications of the current run to their lanes; see [#arrivals].
+    private void deliverArrivals() {
+        if (!arrivals.isEmpty()) {
+            lanes.deliverAtMostOnce(arrivals);
+            arrivals.clear();
         }
     }
 
@@ -837,10 +895,15 @@ public final class ClientActor implements MqttClient {
                 new Mailbox.Event(generation, action, kind, bytes)
         );
         if (admitted == Mailbox.OfferResult.FULL) {
+            if (kind == Mailbox.Kind.AT_MOST_ONCE) {
+                // Like a full subscription buffer, a full mailbox drops QoS 0 and goes on.
+                droppedUnrouted();
+                return;
+            }
             String admission = switch (kind) {
                 case COMMAND -> "Command";
                 case REGISTRATION -> "Registration";
-                case INCOMING -> "Incoming";
+                case INCOMING, AT_MOST_ONCE -> "Incoming";
                 case KEEP_ALIVE -> "Keep-alive";
                 case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE,
                         CREDENTIALS_READY, RECONNECT, STATS -> "Control";
@@ -850,6 +913,20 @@ public final class ClientActor implements MqttClient {
                     OverloadCause.EVENTS,
                     new MqttCapacityException(admission + " mailbox capacity")
             );
+        }
+    }
+
+    /// Counts a QoS 0 publication that the mailbox had no room for, and logs the first one at
+    /// warning level. Called by the transport's thread.
+    private void droppedUnrouted() {
+        unrouted.incrementAndGet();
+        if (unroutedLogged.compareAndSet(false, true)) {
+            log.warn("Dropped a QoS 0 publication for {} at {}: it arrived faster than the client "
+                    + "routes publications; later ones are logged at debug level",
+                    clientId, endpoint);
+        } else {
+            log.debug("Dropped a QoS 0 publication for {} at {}: it arrived faster than the "
+                    + "client routes publications", clientId, endpoint);
         }
     }
 
@@ -1135,6 +1212,10 @@ public final class ClientActor implements MqttClient {
         Receptions.Values received = session.receiving();
         Publications.Values published = session.sending();
         Subscriptions.Values registered = session.subscribing();
+        // Publications that the mailbox dropped never reached the core, which counted the rest.
+        long dropped = unrouted.get();
+        var publishes = new EnumMap<Qos, Long>(received.publishes());
+        publishes.merge(Qos.AT_MOST_ONCE, dropped, Long::sum);
         return new ClientSnapshot(
                 new ClientSnapshot.Connection(
                         connectionState(session.state()),
@@ -1143,8 +1224,9 @@ public final class ClientActor implements MqttClient {
                         listenerLane.dropped()
                 ),
                 new ClientSnapshot.Receiving(
-                        received.publishes(),
+                        publishes,
                         received.unmatched(),
+                        dropped,
                         delivery.admitted(),
                         delivery.dropped(),
                         delivery.deliveries(),
@@ -1376,6 +1458,8 @@ public final class ClientActor implements MqttClient {
                 Subscription handle,
                 MqttSubscriptionRefusedException failure
         ) {
+            // The subscription's end finds the current run queued; see arrivals.
+            deliverArrivals();
             var subscription = (ClientSubscription) handle;
             synchronized (lifecycleLock) {
                 if (subscription.retired || subscription.removalRequested()) {
@@ -1448,6 +1532,11 @@ public final class ClientActor implements MqttClient {
                 timers.remove(timer);
                 throw SpiException.scheduler(generation, failure);
             }
+            // The PINGRESP that this deadline waits for overtakes the received packets only once
+            // it has been read, so the transport reads on until the deadline is cancelled.
+            if (timer == SessionCore.Timer.PING && mailbox.pingResponseDue(true)) {
+                io.resumeReading(generation);
+            }
         }
 
         // Wakes are coalesced, so the actor checks the current timer. A late callback of a
@@ -1462,6 +1551,9 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void cancel(SessionCore.Timer timer) {
+            if (timer == SessionCore.Timer.PING) {
+                mailbox.pingResponseDue(false);
+            }
             TimerEntry entry = timers.remove(timer);
             if (entry != null && entry.cancellation != null) {
                 try {
@@ -1516,6 +1608,11 @@ public final class ClientActor implements MqttClient {
                 int bytes
         ) {
             MqttMessage message = MessageProperties.received(publish, userPropertyOf);
+            if (publish.qos() == Qos.AT_MOST_ONCE) {
+                // Its lanes take it at the end of the actor's run; see continueRun().
+                arrivals.add(new DeliveryLanes.Arrival(token, ids, message, publish.dup(), bytes));
+                return true;
+            }
             return lanes.deliver(token, ids, message, publish.dup(), bytes);
         }
 
@@ -1547,6 +1644,8 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
+            // The subscription's end finds the current run queued; see arrivals.
+            deliverArrivals();
             var subscription = (ClientSubscription) handle;
             boolean unrequested;
             synchronized (lifecycleLock) {
@@ -1589,6 +1688,9 @@ public final class ClientActor implements MqttClient {
                 boolean preserveSession,
                 boolean stopped
         ) {
+            // The connection's end discards the current run with the deliveries that wait; see
+            // arrivals.
+            deliverArrivals();
             Throwable cause = disconnection.cause().orElse(null);
             synchronized (lifecycleLock) {
                 connectedGeneration = 0;
@@ -1658,9 +1760,14 @@ public final class ClientActor implements MqttClient {
                             size,
                             receivedAt
                     ),
-                    Mailbox.Kind.INCOMING,
+                    packet instanceof Packet.Publish publish && publish.qos() == Qos.AT_MOST_ONCE
+                            ? Mailbox.Kind.AT_MOST_ONCE
+                            : Mailbox.Kind.INCOMING,
                     size
             );
+            if (mailbox.pauseDue(generation)) {
+                io.pauseReading(generation);
+            }
         }
 
         @Override

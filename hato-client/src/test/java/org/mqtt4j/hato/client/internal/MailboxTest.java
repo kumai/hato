@@ -98,6 +98,108 @@ class MailboxTest {
     }
 
     @Test
+    void received_packets_pause_the_reader_at_half_an_allowance_and_resume_it_at_a_quarter()
+            throws Exception {
+        // Arrange: allowances of 8 packets, which both kinds of received packet count against.
+        var sut = new Mailbox(1, 10, 256, 8, 800, 1);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 1);
+        var publication = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 1);
+        sut.activate(1);
+        for (int i = 0; i < 3; i++) {
+            sut.offer(i == 0 ? incoming : publication);
+            assertThat(sut.pauseDue(1)).isFalse();
+        }
+
+        // Act & Assert: the fourth pauses the reader, once.
+        sut.offer(incoming);
+        assertThat(sut.pauseDue(1)).isTrue();
+        assertThat(sut.pauseDue(1)).isFalse();
+
+        // Act & Assert: the reader resumes once the actor has taken all but two, once.
+        sut.take(() -> false);
+        assertThat(sut.resumeDue()).isFalse();
+        sut.take(() -> false);
+        assertThat(sut.resumeDue()).isTrue();
+        assertThat(sut.resumeDue()).isFalse();
+    }
+
+    @Test
+    void received_bytes_pause_the_reader_as_received_packets_do() throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 8, 800, 1);
+        var large = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 400);
+        sut.activate(1);
+
+        // Act & Assert: half of the byte allowance pauses, and taking it back resumes.
+        sut.offer(large);
+        assertThat(sut.pauseDue(1)).isTrue();
+        sut.take(() -> false);
+        assertThat(sut.resumeDue()).isTrue();
+    }
+
+    @Test
+    void a_due_pingresp_resumes_a_paused_reader_and_keeps_it_reading() throws Exception {
+        // Arrange: received packets have paused the reader.
+        var sut = new Mailbox(1, 10, 256, 8, 800, 1);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 1);
+        sut.activate(1);
+        for (int i = 0; i < 4; i++) {
+            sut.offer(incoming);
+        }
+        assertThat(sut.pauseDue(1)).isTrue();
+
+        // Act & Assert: the reader resumes for the PINGRESP and keeps reading until it arrives.
+        assertThat(sut.pingResponseDue(true)).isTrue();
+        sut.offer(incoming);
+        assertThat(sut.pauseDue(1)).isFalse();
+        assertThat(sut.pingResponseDue(false)).isFalse();
+        assertThat(sut.pauseDue(1)).isTrue();
+    }
+
+    @Test
+    void a_new_connection_reads_unpaused_and_ignores_its_predecessors_reader() throws Exception {
+        // Arrange: the old connection's reader is paused while a PINGRESP is due.
+        var sut = new Mailbox(1, 10, 256, 8, 800, 1);
+        sut.activate(1);
+        for (int i = 0; i < 4; i++) {
+            sut.offer(new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 1));
+        }
+        assertThat(sut.pauseDue(1)).isTrue();
+        sut.pingResponseDue(true);
+
+        // Act
+        sut.discard(1);
+        sut.activate(2);
+        for (int i = 0; i < 4; i++) {
+            sut.offer(new Mailbox.Event(2, () -> { }, Mailbox.Kind.INCOMING, 1));
+        }
+
+        // Assert: neither the old pause nor the old PINGRESP holds back the new reader.
+        assertThat(sut.pauseDue(1)).isFalse();
+        assertThat(sut.pauseDue(2)).isTrue();
+    }
+
+    @Test
+    void qos_0_publications_and_other_incoming_packets_have_independent_capacity_in_one_fifo()
+            throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 1, 10, 1);
+        var publication = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
+        sut.activate(1);
+
+        // Act & Assert: full QoS 0 publications leave room for the packets the client must not
+        // drop, which in turn take none of theirs.
+        assertThat(sut.offer(publication)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(publication)).isEqualTo(FULL);
+        assertThat(sut.offer(incoming)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(incoming)).isEqualTo(FULL);
+        assertThat(sut.take(() -> false)).containsSame(publication);
+        assertThat(sut.take(() -> false)).containsSame(incoming);
+        assertThat(sut.bytes()).isZero();
+    }
+
+    @Test
     void keep_alive_events_go_ahead_of_queued_input_but_not_of_termination() throws Exception {
         // Arrange
         var sut = new Mailbox(1, 10, 256, 1, 10, 1);
@@ -118,6 +220,63 @@ class MailboxTest {
         assertThat(sut.take(() -> false)).containsSame(timer);
         assertThat(sut.take(() -> false)).containsSame(response);
         assertThat(sut.take(() -> false)).containsSame(incoming);
+    }
+
+    @Test
+    void a_run_takes_the_qos_0_publications_that_lead_the_fifo_without_waiting()
+            throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 2, 20, 1);
+        var first = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var second = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
+        var later = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        sut.activate(1);
+        for (Mailbox.Event event : List.of(first, second, incoming)) {
+            assertThat(sut.offer(event)).isEqualTo(ACCEPTED);
+        }
+
+        // Act & Assert: a run stops before another kind of event, which take() returns next,
+        // and at the end of the queue.
+        assertThat(sut.take(() -> false)).containsSame(first);
+        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(second);
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        assertThat(sut.take(() -> false)).containsSame(incoming);
+        assertThat(sut.offer(later)).isEqualTo(ACCEPTED);
+        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(later);
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        // A publication taken in a run returns its allowance, as one that take() returns does.
+        assertThat(sut.bytes()).isZero();
+    }
+
+    @Test
+    void a_run_stops_before_an_event_that_goes_ahead_of_the_fifo_and_when_stopping()
+            throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 1, 10, 1);
+        var publication = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var timer = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
+        var end = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
+        sut.activate(1);
+        sut.activateSession(1);
+        sut.connectionRequested(true);
+        assertThat(sut.offer(publication)).isEqualTo(ACCEPTED);
+
+        // Act & Assert: a keep-alive event, a termination, and a stop request each come first.
+        assertThat(sut.offer(timer)).isEqualTo(ACCEPTED);
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        assertThat(sut.take(() -> false)).containsSame(timer);
+        sut.terminate(end);
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        assertThat(sut.take(() -> false)).containsSame(end);
+        assertThat(sut.stopSession(1, () -> { })).isTrue();
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        assertThat(sut.take(() -> false)).hasValueSatisfying(stop ->
+                assertThat(stop.kind()).isEqualTo(Mailbox.Kind.CONTROL));
+
+        // Act & Assert: stopping ends a run too, and leaves the publication queued.
+        assertThat(sut.takeAtMostOnce(() -> true)).isNull();
+        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(publication);
     }
 
     @Test
@@ -628,7 +787,7 @@ class MailboxTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = Mailbox.Kind.class, names = {"COMMAND", "INCOMING"})
+    @EnumSource(value = Mailbox.Kind.class, names = {"COMMAND", "INCOMING", "AT_MOST_ONCE"})
     void byte_capacity_is_enforced_even_when_event_slots_remain(Mailbox.Kind kind)
             throws Exception {
         // Arrange

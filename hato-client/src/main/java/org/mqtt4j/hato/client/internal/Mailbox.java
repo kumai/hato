@@ -15,7 +15,16 @@ import org.jspecify.annotations.Nullable;
 /// PINGRESPs that answer admitted PINGREQs. Their outcome does not depend on the events they
 /// overtake, except that a send time not yet recorded can bring a PINGREQ forward. Termination has
 /// its own slot ahead of both, and a session's stop request precedes termination. Generation and
-/// session changes share the admission monitor so old callbacks cannot consume capacity.
+/// session changes share the admission monitor so old callbacks cannot consume capacity. QoS 0
+/// publications have an incoming allowance of their own, as large as that of the other incoming
+/// packets: the client drops the ones that do not fit, and they cannot take the room of a packet
+/// that the client must not drop.
+///
+/// The mailbox also paces the transport that reads incoming packets. Its reader pauses once they
+/// fill half of an allowance and resumes once the actor has taken them back to a quarter, so that
+/// flow control rather than the allowances holds back a broker that sends faster than the actor
+/// routes. While a PINGRESP is due the reader goes on instead: it overtakes the queue only once
+/// it has been read, and what does not fit meanwhile meets the allowances.
 final class Mailbox {
 
     enum OfferResult {
@@ -28,6 +37,8 @@ final class Mailbox {
         COMMAND,
         REGISTRATION,
         INCOMING,
+        // A received QoS 0 publication, which the client may drop.
+        AT_MOST_ONCE,
         CONTROL,
         KEEP_ALIVE,
         DELIVERY_READY,
@@ -37,6 +48,24 @@ final class Mailbox {
         RECONNECT,
         STATS;
 
+        /// Whether the event carries a packet that the transport received, which paces it.
+        boolean received() {
+            return switch (this) {
+                case INCOMING,
+                     AT_MOST_ONCE -> true;
+                case COMMAND,
+                     REGISTRATION,
+                     CONTROL,
+                     KEEP_ALIVE,
+                     DELIVERY_READY,
+                     SEND_CAPACITY,
+                     CREDENTIALS_READY,
+                     SUBSCRIPTION_CLOSE,
+                     RECONNECT,
+                     STATS -> false;
+            };
+        }
+
         /// A wake keeps at most one queued event per generation and is never full. Admission,
         /// queueing, and release all ask this, so a new kind is classified in one place.
         boolean wake() {
@@ -44,6 +73,7 @@ final class Mailbox {
                 case COMMAND,
                      REGISTRATION,
                      INCOMING,
+                     AT_MOST_ONCE,
                      CONTROL,
                      KEEP_ALIVE -> false;
                 case DELIVERY_READY,
@@ -98,6 +128,15 @@ final class Mailbox {
     private int incomingCount;
 
     private long incomingBytes;
+
+    private int atMostOnceCount;
+
+    private long atMostOnceBytes;
+
+    // Written under the monitor; the actor reads it without, to skip resumeDue() when unpaused.
+    private volatile boolean readingPaused;
+
+    private boolean pingResponseDue;
 
     private int controlCount;
 
@@ -166,6 +205,8 @@ final class Mailbox {
             case REGISTRATION -> registrationCount >= registrationLimit;
             case INCOMING -> incomingCount >= incomingLimit
                     || event.bytes() > incomingByteLimit - incomingBytes;
+            case AT_MOST_ONCE -> atMostOnceCount >= incomingLimit
+                    || event.bytes() > incomingByteLimit - atMostOnceBytes;
             case CONTROL -> controlCount >= controlLimit;
             case KEEP_ALIVE -> keepAlive.size() >= KEEP_ALIVE_LIMIT;
             case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE, CREDENTIALS_READY,
@@ -188,6 +229,10 @@ final class Mailbox {
                 incomingCount++;
                 incomingBytes += event.bytes();
             }
+            case AT_MOST_ONCE -> {
+                atMostOnceCount++;
+                atMostOnceBytes += event.bytes();
+            }
             case CONTROL -> controlCount++;
             case KEEP_ALIVE -> {
                 // The keep-alive queue's size is its count.
@@ -195,6 +240,48 @@ final class Mailbox {
         }
         notifyAll();
         return OfferResult.ACCEPTED;
+    }
+
+    /// Whether the reader of `generation` should pause, because received packets fill half of an
+    /// allowance while no PINGRESP is due. True once, until [#resumeDue()] or the end of the
+    /// connection. Called by the reader after posting a received packet.
+    synchronized boolean pauseDue(long generation) {
+        if (readingPaused || pingResponseDue || generation != activeGeneration
+                || (incomingCount + atMostOnceCount < incomingLimit / 2
+                        && incomingBytes + atMostOnceBytes < incomingByteLimit / 2)) {
+            return false;
+        }
+        readingPaused = true;
+        return true;
+    }
+
+    /// Whether a paused reader should resume, because the actor has taken received packets back
+    /// to a quarter of an allowance. True once for each pause. Called by the actor after taking a
+    /// received packet.
+    boolean resumeDue() {
+        if (!readingPaused) {
+            return false;
+        }
+        synchronized (this) {
+            if (!readingPaused
+                    || incomingCount + atMostOnceCount > incomingLimit / 4
+                    || incomingBytes + atMostOnceBytes > incomingByteLimit / 4) {
+                return false;
+            }
+            readingPaused = false;
+            return true;
+        }
+    }
+
+    /// Records whether a PINGRESP is due on the active connection, and returns whether a paused
+    /// reader must resume at once to reach it.
+    synchronized boolean pingResponseDue(boolean due) {
+        pingResponseDue = due;
+        if (due && readingPaused) {
+            readingPaused = false;
+            return true;
+        }
+        return false;
     }
 
     /// Returns whether the ending belongs to the active connection, including when an earlier
@@ -233,28 +320,53 @@ final class Mailbox {
 
     /// Waits for the next event; returns empty when the actor is stopping.
     synchronized Optional<Event> take(BooleanSupplier stopping) throws InterruptedException {
-        while (events.isEmpty() && keepAlive.isEmpty() && termination == null && stop == null
-                && !stopping.getAsBoolean()) {
+        while (!stopping.getAsBoolean()) {
+            Event next = next();
+            if (next != null) {
+                return Optional.of(remove(next));
+            }
             wait();
         }
-        if (stopping.getAsBoolean()) {
-            return Optional.empty();
+        return Optional.empty();
+    }
+
+    /// Takes the next event without waiting when it is a received QoS 0 publication, so that the
+    /// actor can go on with a run of them; otherwise returns null and leaves the next event
+    /// queued. An event that goes ahead of the FIFO therefore ends the run, as stopping does.
+    synchronized @Nullable Event takeAtMostOnce(BooleanSupplier stopping) {
+        Event next = next();
+        if (next == null || next.kind() != Kind.AT_MOST_ONCE || stopping.getAsBoolean()) {
+            return null;
         }
-        Event request = stop;
-        if (request != null) {
+        return remove(next);
+    }
+
+    // The event to take next: a stop request, then a termination, then keep-alive events, then
+    // the FIFO.
+    private @Nullable Event next() {
+        if (stop != null) {
+            return stop;
+        }
+        if (termination != null) {
+            return termination;
+        }
+        Event alive = keepAlive.peekFirst();
+        return alive != null ? alive : events.peekFirst();
+    }
+
+    // Removes `next`, which next() has just returned.
+    private Event remove(Event next) {
+        if (next == stop) {
             stop = null;
             stopSession = 0;
             termination = null;
-            return Optional.of(request);
-        }
-        Event end = termination;
-        if (end != null) {
+        } else if (next == termination) {
             termination = null;
-            return Optional.of(end);
+        } else {
+            (keepAlive.isEmpty() ? events : keepAlive).removeFirst();
+            release(next);
         }
-        Event event = keepAlive.isEmpty() ? events.removeFirst() : keepAlive.removeFirst();
-        release(event);
-        return Optional.of(event);
+        return next;
     }
 
     /// Stops admission and removes queued work for this connection; zero clears all work.
@@ -262,6 +374,9 @@ final class Mailbox {
     synchronized void discard(long generation) {
         if (generation == 0 || generation == activeGeneration) {
             activeGeneration = 0;
+            // The next connection's transport starts reading unpaused.
+            readingPaused = false;
+            pingResponseDue = false;
         }
         if (termination != null && (generation == 0 || termination.generation() == generation)) {
             termination = null;
@@ -291,7 +406,7 @@ final class Mailbox {
 
     /// Bytes of queued commands and incoming packets.
     synchronized long bytes() {
-        return commandBytes + incomingBytes;
+        return commandBytes + incomingBytes + atMostOnceBytes;
     }
 
     private void release(Event event) {
@@ -307,6 +422,10 @@ final class Mailbox {
             case INCOMING -> {
                 incomingCount--;
                 incomingBytes -= event.bytes();
+            }
+            case AT_MOST_ONCE -> {
+                atMostOnceCount--;
+                atMostOnceBytes -= event.bytes();
             }
             case CONTROL -> controlCount--;
             case KEEP_ALIVE -> {

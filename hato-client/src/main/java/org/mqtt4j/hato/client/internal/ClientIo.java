@@ -474,7 +474,11 @@ final class ClientIo {
                 }
             }
             try {
-                result = connection.transport.send(sends.getLast().ticket(), bytes);
+                long ticket = sends.getLast().ticket();
+                // Writing here saves handing the write to a thread of the transport's own.
+                result = connection.transport instanceof BlockingWriteTransport direct
+                        ? direct.write(ticket, bytes)
+                        : connection.transport.send(ticket, bytes);
             } catch (RuntimeException failure) {
                 ended(connection, failure);
                 return;
@@ -606,6 +610,31 @@ final class ClientIo {
     /// The receive capacity that the properties of `packet` take beyond its size.
     private static int propertyCost(Packet packet) {
         return PROPERTY_COST * packet.properties().entries().size();
+    }
+
+    /// Stops reading the connection of `generation` until [#resumeReading(long)], where its
+    /// transport can pause. Called on any thread, including inside the transport's callbacks.
+    void pauseReading(long generation) {
+        PausableTransport transport = pausable(generation);
+        if (transport != null) {
+            transport.pauseReading();
+        }
+    }
+
+    void resumeReading(long generation) {
+        PausableTransport transport = pausable(generation);
+        if (transport != null) {
+            transport.resumeReading();
+        }
+    }
+
+    private @Nullable PausableTransport pausable(long generation) {
+        Connection connection;
+        synchronized (sending) {
+            connection = current;
+        }
+        return connection != null && connection.generation == generation
+                && connection.transport instanceof PausableTransport transport ? transport : null;
     }
 
     private boolean isClosed(Connection connection) {
