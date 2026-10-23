@@ -49,6 +49,12 @@ abstract class AcceptanceTest {
     /// How long a test waits for a retained message that should not come.
     private static final Duration QUIET = Duration.ofMillis(500);
 
+    /// How long a broker that may refuse an identifier while it releases it gets before the
+    /// identifier is used again, and how often a connection with it is tried.
+    private static final Duration RELEASE_PAUSE = Duration.ofMillis(500);
+
+    private static final int RELEASE_TRIES = 10;
+
     @Test
     void a_client_connects_disconnects_and_closes() throws Exception {
         var ends = new LinkedBlockingQueue<Disconnection>();
@@ -145,6 +151,7 @@ abstract class AcceptanceTest {
             publisher.publish(away).get(5, SECONDS);
 
             // Act
+            letTheBrokerRelease();
             ConnAck resumed = sut.connect().get(5, SECONDS);
             MqttMessage after = message(topic, (byte) 2);
             publisher.publish(after).get(5, SECONDS);
@@ -173,11 +180,12 @@ abstract class AcceptanceTest {
             PullSubscription subscription = subscribe(sut, topic, Qos.AT_LEAST_ONCE);
             sut.disconnect().get(5, SECONDS);
             try (MqttClient replacing = builder().clientId(clientId).build()) {
-                replacing.connect().get(5, SECONDS);
+                connectReusingIdentifier(replacing);
                 replacing.disconnect().get(5, SECONDS);
             }
 
             // Act
+            letTheBrokerRelease();
             ConnAck resumed = sut.connect().get(5, SECONDS);
 
             // Assert: the client subscribes again for the new session.
@@ -498,6 +506,33 @@ abstract class AcceptanceTest {
         }
     }
 
+    /// Gives a broker that may refuse an identifier while it releases it the time to do so,
+    /// before the client whose connection held it connects with it again. A new connection of
+    /// that client would count the refused attempt, so the test waits instead of trying again.
+    private void letTheBrokerRelease() throws InterruptedException {
+        if (mayRefuseWhileReleasingClientIdentifiers()) {
+            Thread.sleep(RELEASE_PAUSE.toMillis());
+        }
+    }
+
+    /// Connects `client` with an identifier that another connection held a moment ago. A broker
+    /// that may refuse it while it releases it gets a few tries, a pause apart.
+    private void connectReusingIdentifier(MqttClient client) throws Exception {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                client.connect().get(5, SECONDS);
+                return;
+            } catch (ExecutionException failure) {
+                if (!mayRefuseWhileReleasingClientIdentifiers()
+                        || !refusedAsUnavailable(failure)
+                        || attempt == RELEASE_TRIES) {
+                    throw failure;
+                }
+                Thread.sleep(RELEASE_PAUSE.toMillis());
+            }
+        }
+    }
+
     private static boolean refusedAsUnavailable(ExecutionException failure) {
         return failure.getCause() instanceof MqttConnectException refusal
                 && refusal.reasonCode().equals(Optional.of(ReasonCode.SERVER_UNAVAILABLE));
@@ -520,7 +555,7 @@ abstract class AcceptanceTest {
         ended.close();
         ended.terminated().get(5, SECONDS);
         try (MqttClient replacement = builder().clientId(clientId).build()) {
-            replacement.connect().get(5, SECONDS);
+            connectReusingIdentifier(replacement);
             MqttMessage marker = message(topic, (byte) 2);
             replacement.publish(marker).get(5, SECONDS);
             assertThat(receive(subscription)).isEqualTo(marker);
