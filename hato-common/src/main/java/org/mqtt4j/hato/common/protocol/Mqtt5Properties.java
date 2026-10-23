@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 
 import static org.mqtt4j.hato.common.value.ReasonCode.MALFORMED_PACKET;
+import static org.mqtt4j.hato.common.value.ReasonCode.PACKET_TOO_LARGE;
 import static org.mqtt4j.hato.common.value.ReasonCode.PROTOCOL_ERROR;
 import static org.mqtt4j.hato.common.value.ReasonCode.TOPIC_ALIAS_INVALID;
 
@@ -39,6 +40,12 @@ final class Mqtt5Properties {
         input.position(input.position() + length);
         var entries = new ArrayList<Property>();
         while (values.hasRemaining()) {
+            if (entries.size() == PacketCodec.MAX_PROPERTIES) {
+                throw new PacketDecodeException(
+                        PACKET_TOO_LARGE,
+                        "More than " + PacketCodec.MAX_PROPERTIES + " MQTT properties"
+                );
+            }
             PropertyId id;
             try {
                 id = PropertyId.of(RemainingLength.readMinimal(values));

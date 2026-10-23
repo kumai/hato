@@ -23,6 +23,12 @@ import static org.mqtt4j.hato.common.value.ReasonCode.PROTOCOL_ERROR;
 /// identifier allocation, session state, and connection closure belong to the connection owner.
 public interface PacketCodec {
 
+    /// The most MQTT 5.0 properties, counting each repeated one, that a decoded packet may carry.
+    /// Decoding refuses more with `PACKET_TOO_LARGE`. A decoded property takes far more memory
+    /// than its few bytes on the wire, so this bounds the memory of one packet whatever its
+    /// size; packets that applications exchange carry far fewer.
+    int MAX_PROPERTIES = 65_536;
+
     /// Returns the codec for `version`.
     static PacketCodec of(MqttVersion version) {
         requireNonNull(version, "version must not be null");
@@ -91,7 +97,8 @@ public interface PacketCodec {
     /// an empty client identifier with Clean Session false is retained so the server can
     /// send CONNACK Identifier Rejected, as required by `MQTT-3.1.3-8`.
     ///
-    /// @throws PacketDecodeException if the packet is malformed or violates a checked rule
+    /// @throws PacketDecodeException if the packet is malformed, violates a checked rule, or
+    ///         carries more than [#MAX_PROPERTIES] properties
     /// @throws UnsupportedProtocolVersionException if CONNECT requests an unsupported level
     Packet decode(byte[] packet);
 

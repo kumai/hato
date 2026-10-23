@@ -336,6 +336,10 @@ public final class MqttClientBuilder {
     /// to the broker, which then discards a message too large for this client instead of
     /// sending it. An MQTT 3.1.1 broker does not learn the limit, and a larger packet ends the
     /// connection with [MqttProtocolException].
+    ///
+    /// Whatever its size, an MQTT 5.0 packet with more than 65536 properties, such as User
+    /// Properties, also ends the connection with [MqttProtocolException] and
+    /// [ReasonCode#PACKET_TOO_LARGE]. Brokers do not learn this limit.
     public MqttClientBuilder maxPacketSize(int value) {
         if (value < MIN_PACKET_SIZE || value > MAX_PACKET_SIZE) {
             throw new IllegalArgumentException(

@@ -16,6 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mqtt4j.hato.common.value.ReasonCode.MALFORMED_PACKET;
+import static org.mqtt4j.hato.common.value.ReasonCode.PACKET_TOO_LARGE;
 import static org.mqtt4j.hato.common.value.ReasonCode.PROTOCOL_ERROR;
 import static org.mqtt4j.hato.common.value.ReasonCode.TOPIC_ALIAS_INVALID;
 
@@ -194,6 +195,32 @@ class Mqtt5PropertiesTest {
             ByteBuffer input = ByteBuffer.wrap(wire).limit(limit);
             assertMalformed(() -> Mqtt5Properties.read(input, PacketType.PUBLISH));
         }
+    }
+
+    @Test
+    void a_packet_may_carry_the_maximum_number_of_properties_but_no_more() {
+        // Arrange
+        byte[] largest = emptyUserProperties(PacketCodec.MAX_PROPERTIES);
+        byte[] beyond = emptyUserProperties(PacketCodec.MAX_PROPERTIES + 1);
+
+        // Act
+        Properties decoded = Mqtt5Properties.read(ByteBuffer.wrap(largest), PacketType.PUBLISH);
+
+        // Assert
+        assertThat(decoded.entries()).hasSize(PacketCodec.MAX_PROPERTIES);
+        assertThatExceptionOfType(PacketDecodeException.class)
+                .isThrownBy(() -> Mqtt5Properties.read(ByteBuffer.wrap(beyond), PacketType.PUBLISH))
+                .satisfies(error -> assertThat(error.reasonCode()).isSameAs(PACKET_TOO_LARGE));
+    }
+
+    // A property block, with its length, of `count` User Properties with empty names and values.
+    private static byte[] emptyUserProperties(int count) {
+        var block = new ByteArrayOutputStream();
+        RemainingLength.write(block, count * 5);
+        for (int i = 0; i < count; i++) {
+            block.writeBytes(new byte[] {0x26, 0, 0, 0, 0});
+        }
+        return block.toByteArray();
     }
 
     @Test
