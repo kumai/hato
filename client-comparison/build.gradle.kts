@@ -9,6 +9,8 @@ dependencies {
     implementation(project(":hato-client"))
     implementation(libs.paho.mqttv3)
     implementation(libs.hivemq.mqtt.client)
+    // The RabbitMQ fixture of the integration tests, for the runs against a real broker.
+    implementation(project(":test-support"))
 }
 
 // The comparison runs only when asked for, with `run`: it takes minutes and prints its results

@@ -20,17 +20,27 @@ final class Mqtt311 {
 
     static final int CONNECT = 1;
 
+    static final int CONNACK = 2;
+
     static final int PUBACK = 4;
 
     static final int SUBSCRIBE = 8;
 
     static final int PINGREQ = 12;
 
+    static final int PINGRESP = 13;
+
     static final int DISCONNECT = 14;
 
     private static final byte[] CONNACK_ACCEPTED = {0x20, 0x02, 0x00, 0x00};
 
-    private static final byte[] PINGRESP = {(byte) 0xd0, 0x00};
+    private static final byte[] PINGRESP_PACKET = {(byte) 0xd0, 0x00};
+
+    private static final byte[] DISCONNECT_PACKET = {(byte) 0xe0, 0x00};
+
+    // The variable header of a CONNECT for MQTT 3.1.1 with a clean session and keep-alive off: the
+    // protocol name, level 4, the clean session flag, and a keep-alive of 0.
+    private static final byte[] CONNECT_HEADER = {0, 4, 'M', 'Q', 'T', 'T', 4, 0x02, 0, 0};
 
     private Mqtt311() {
     }
@@ -87,7 +97,32 @@ final class Mqtt311 {
     }
 
     static void writePingResp(OutputStream out) throws IOException {
-        out.write(PINGRESP);
+        out.write(PINGRESP_PACKET);
+    }
+
+    /// Asks for a clean session with keep-alive off, so that a sender never has to ping.
+    static void writeConnect(OutputStream out, String clientId) throws IOException {
+        byte[] id = clientId.getBytes(UTF_8);
+        out.write(0x10);
+        out.write(remainingLength(CONNECT_HEADER.length + 2 + id.length));
+        out.write(CONNECT_HEADER);
+        out.write(id.length >>> 8);
+        out.write(id.length);
+        out.write(id);
+    }
+
+    /// Fails unless `packet` is a CONNACK that accepts the connection.
+    static void checkConnAck(Packet packet) throws IOException {
+        if (packet.type() != CONNACK || packet.body().length < 2 || packet.body()[1] != 0) {
+            throw new IOException(
+                    "Connection refused: packet type " + packet.type()
+                            + ", body " + Arrays.toString(packet.body())
+            );
+        }
+    }
+
+    static void writeDisconnect(OutputStream out) throws IOException {
+        out.write(DISCONNECT_PACKET);
     }
 
     /// The encoded remaining length: seven bits per byte, least significant first, with the high
