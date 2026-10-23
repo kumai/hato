@@ -29,6 +29,8 @@ final class RawPublisher implements AutoCloseable {
 
     private volatile @Nullable IOException readFailure;
 
+    private volatile @Nullable PacedSender sender;
+
     /// Connects to the broker at `host` and `port` with a clean session.
     RawPublisher(String host, int port, String clientId) throws IOException {
         socket = new Socket(host, port);
@@ -44,18 +46,28 @@ final class RawPublisher implements AutoCloseable {
     /// QoS 1 message, with the most that a message went out after it was due, in microseconds.
     /// The broker holds the publisher back only through the traffic's window.
     long publish(Traffic traffic) throws IOException, InterruptedException {
-        var sender = new PacedSender(traffic, out, writing);
+        var sending = new PacedSender(traffic, out, writing);
+        sender = sending;
         Thread.ofPlatform()
                 .name("raw-publisher-reader")
                 .daemon()
-                .start(() -> read(sender));
+                .start(() -> read(sending));
         try {
-            sender.send();
+            sending.send();
         } catch (IOException e) {
             IOException failure = readFailure;
             throw failure != null ? failure : e;
         }
-        return sender.maxLatenessMicros();
+        return sending.maxLatenessMicros();
+    }
+
+    /// How far publishing has got, as [PacedSender#progress()] tells it, with any failure to read
+    /// the broker's answers.
+    String progress() {
+        PacedSender sending = sender;
+        IOException failure = readFailure;
+        return (sending == null ? "not started" : sending.progress())
+                + (failure == null ? "" : ", reading failed: " + failure);
     }
 
     /// Reads the broker's packets until the connection closes.

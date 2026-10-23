@@ -22,7 +22,8 @@ final class PahoSubscriber implements SubscriberClient {
 
     private final AtomicLong connectionsLost = new AtomicLong();
 
-    PahoSubscriber(String host, int port, String clientId) throws MqttException {
+    PahoSubscriber(String host, int port, String clientId, int keepAliveSeconds)
+            throws MqttException {
         client = new MqttAsyncClient(
                 "tcp://" + host + ":" + port,
                 clientId,
@@ -47,6 +48,7 @@ final class PahoSubscriber implements SubscriberClient {
         var options = new MqttConnectOptions();
         options.setMqttVersion(MqttConnectOptions.MQTT_VERSION_3_1_1);
         options.setCleanSession(true);
+        options.setKeepAliveInterval(keepAliveSeconds);
         client.connect(options).waitForCompletion();
     }
 

@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.comparison;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.mqtt4j.hato.MqttClient;
@@ -24,11 +25,12 @@ final class HatoSubscriber implements SubscriberClient {
     // Set before close() disconnects, so that its own ending is not counted.
     private volatile boolean closing;
 
-    HatoSubscriber(String host, int port, String clientId) {
+    HatoSubscriber(String host, int port, String clientId, int keepAliveSeconds) {
         client = MqttClient.builder()
                 .server(URI.create("mqtt://" + host + ":" + port))
                 .clientId(clientId)
                 .version(MqttVersion.V3_1_1)
+                .keepAlive(Duration.ofSeconds(keepAliveSeconds))
                 .connectionListener(ending -> {
                     if (!closing) {
                         connectionsLost.incrementAndGet();

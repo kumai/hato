@@ -12,18 +12,25 @@ import java.util.logging.Logger;
 /// one line that starts with [#RESULT_PREFIX], for the driver to read.
 ///
 /// Arguments, as `key=value` words: `library`, `port`, `filter`, `qos`, `expected`, and
-/// `warmup`; optionally `host` and `clientId`; `workMicros` with `workMode` for what the handler
-/// does with each message beyond counting it, either `sleep` to block like a call to a database
-/// or `spin` to keep a processor busy; and `threads=true` to print, ahead of the result, where the
-/// CPU time of the measured stretch went by thread.
+/// `warmup`; optionally:
+///
+/// - `host`, `clientId`, and `keepAliveSeconds`, 60 by default.
+/// - `idleMillis`, 2,000 by default: a run whose client drops messages ends once none has arrived
+///   for this long, which must outlast any pause that the run itself causes, such as a stall.
+/// - `workMicros` with `workMode` for what the handler does with each message beyond counting it,
+///   either `sleep` to block like a call to a database or `spin` to keep a processor busy.
+/// - `stallAt` and `stallMillis` to have the handler block once, for that long, on the message
+///   with that number, as when a database stops answering for a while.
+/// - `slowFilter` and `slowWorkMicros` for a second subscription on the same connection, whose
+///   handler counts its messages with the first's and then works that long on each, in the same
+///   mode.
+/// - `threads=true` to print, ahead of the result, where the CPU time of the measured stretch went
+///   by thread.
 public final class Subject {
 
     static final String READY = "READY";
 
     static final String RESULT_PREFIX = "RESULT ";
-
-    // A client that drops messages ends its run once none has arrived for this long.
-    private static final Duration IDLE = Duration.ofSeconds(2);
 
     private static final Duration LIMIT = Duration.ofMinutes(10);
 
@@ -38,10 +45,11 @@ public final class Subject {
                 arguments.number("warmup"),
                 Boolean.parseBoolean(arguments.text("threads", "false"))
         );
-        Runnable work = work(
-                arguments.number("workMicros", 0),
-                arguments.text("workMode", "sleep")
-        );
+        String workMode = arguments.text("workMode", "sleep");
+        Runnable work = work(arguments.number("workMicros", 0), workMode);
+        long stallAt = arguments.number("stallAt", -1);
+        Runnable stall = work(arguments.number("stallMillis", 0) * 1_000, "sleep");
+        int qos = (int) arguments.number("qos");
 
         // Paho and Hato log through java.util.logging. HiveMQ and Netty find SLF4J on the class
         // path, which the driver needs, without a provider, and log nowhere. Logging stays off so
@@ -52,18 +60,29 @@ public final class Subject {
         try (SubscriberClient client = library.connect(
                 arguments.text("host", "127.0.0.1"),
                 (int) arguments.number("port"),
-                arguments.text("clientId", "comparison-" + library.label())
+                arguments.text("clientId", "comparison-" + library.label()),
+                (int) arguments.number("keepAliveSeconds", 60)
         )) {
-            client.subscribe(
-                    arguments.text("filter"),
-                    (int) arguments.number("qos"),
-                    (sequence, sentMicros) -> {
-                        reception.handle(sequence, sentMicros);
-                        work.run();
-                    }
-            );
+            client.subscribe(arguments.text("filter"), qos, (sequence, sentMicros) -> {
+                reception.handle(sequence, sentMicros);
+                work.run();
+                if (sequence == stallAt) {
+                    stall.run();
+                }
+            });
+            String slowFilter = arguments.text("slowFilter", "");
+            if (!slowFilter.isEmpty()) {
+                Runnable slowWork = work(arguments.number("slowWorkMicros"), workMode);
+                client.subscribe(slowFilter, qos, (sequence, sentMicros) -> {
+                    reception.handle(sequence, sentMicros);
+                    slowWork.run();
+                });
+            }
             System.out.println(READY);
-            Reception.Result result = reception.await(IDLE, LIMIT);
+            Reception.Result result = reception.await(
+                    Duration.ofMillis(arguments.number("idleMillis", 2_000)),
+                    LIMIT
+            );
             for (String line : reception.threadReport(result)) {
                 System.out.println(line);
             }

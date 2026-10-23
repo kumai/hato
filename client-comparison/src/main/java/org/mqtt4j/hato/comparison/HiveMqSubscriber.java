@@ -23,7 +23,7 @@ final class HiveMqSubscriber implements SubscriberClient {
     // Set before close() disconnects, so that its own ending is not counted.
     private volatile boolean closing;
 
-    HiveMqSubscriber(String host, int port, String clientId) {
+    HiveMqSubscriber(String host, int port, String clientId, int keepAliveSeconds) {
         client = MqttClient.builder()
                 .useMqttVersion3()
                 .identifier(clientId)
@@ -38,6 +38,7 @@ final class HiveMqSubscriber implements SubscriberClient {
                 .buildAsync();
         client.connectWith()
                 .cleanSession(true)
+                .keepAlive(keepAliveSeconds)
                 .send()
                 .join();
     }

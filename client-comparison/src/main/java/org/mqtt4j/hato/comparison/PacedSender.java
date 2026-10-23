@@ -43,6 +43,9 @@ final class PacedSender {
     // The most that a scheduled message went out after it was due, in microseconds.
     private volatile long maxLatenessMicros;
 
+    // The messages written so far.
+    private volatile long written;
+
     PacedSender(Traffic traffic, OutputStream out, ReentrantLock writing) {
         this.traffic = traffic;
         this.out = out;
@@ -64,6 +67,17 @@ final class PacedSender {
     /// measured the sender can account for.
     long maxLatenessMicros() {
         return maxLatenessMicros;
+    }
+
+    /// How far sending has got, for a sender that does not finish: the messages written and, at
+    /// QoS 1, those still unacknowledged.
+    String progress() {
+        return String.format(
+                "wrote %,d of %,d messages, %,d unacknowledged",
+                written,
+                traffic.count(),
+                traffic.qos() > 0 ? traffic.window() - unacknowledged.availablePermits() : 0
+        );
     }
 
     /// Sends every message, and returns once all have been written and, at QoS 1, acknowledged.
@@ -114,6 +128,7 @@ final class PacedSender {
                 } finally {
                     writing.unlock();
                 }
+                written = sequence + 1;
             }
             flush();
         }

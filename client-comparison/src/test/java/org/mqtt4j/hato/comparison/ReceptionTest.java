@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.comparison;
 
 import java.time.Duration;
+import java.util.concurrent.locks.LockSupport;
 
 import org.junit.jupiter.api.*;
 
@@ -57,6 +58,50 @@ class ReceptionTest {
         // Assert
         assertThat(result.latency().p50()).isGreaterThanOrEqualTo(2_000);
         assertThat(result.latency().max()).isLessThan(60_000_000);
+    }
+
+    @Test
+    void messages_handled_out_of_order_count_up_to_the_highest_number() throws Exception {
+        // Arrange
+        var sut = new Reception(10, 3, false);
+        // Act: a second subscription's thread handles 7 after 8 and 9.
+        for (long sequence : new long[] {0, 1, 2, 3, 4, 5, 6, 8, 9, 7}) {
+            sut.handle(sequence, 0);
+        }
+        Reception.Result result = sut.await(IDLE, LIMIT);
+        // Assert: the stretch runs from 3 to 9.
+        assertThat(result.arrived()).isEqualTo(6);
+        assertThat(result.measured()).isEqualTo(6);
+    }
+
+    @Test
+    void the_last_message_ends_the_run_only_once_the_messages_it_overtook_are_handled()
+            throws Exception {
+        // Arrange: 8 and 9 overtake 7, which arrives a moment later on another thread.
+        var sut = new Reception(10, 3, false);
+        for (long sequence : new long[] {0, 1, 2, 3, 4, 5, 6, 8, 9}) {
+            sut.handle(sequence, 0);
+        }
+        Thread.ofVirtual().start(() -> {
+            LockSupport.parkNanos(Duration.ofMillis(50).toNanos());
+            sut.handle(7, 0);
+        });
+        // Act
+        Reception.Result result = sut.await(Duration.ofSeconds(5), LIMIT);
+        // Assert
+        assertThat(result.handled()).isEqualTo(10);
+    }
+
+    @Test
+    void the_backlog_counts_the_messages_due_and_not_yet_handled_at_its_worst() {
+        // Arrange: due every 10 µs; the first handled at once, the rest after a stall, and one
+        // never handled.
+        long[] sent = {0, 10, 20, 30, 40};
+        long[] handled = {5, 100, 101, 102, Reception.NOT_HANDLED};
+        // Act
+        long peak = Reception.peakBacklog(sent, handled);
+        // Assert: at 30 µs, four were due and one handled; the unhandled one does not count.
+        assertThat(peak).isEqualTo(3);
     }
 
     @Test
