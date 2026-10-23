@@ -562,10 +562,12 @@ Code that only publishes can take an `MqttPublisher`, and code that only subscri
 
 ### Testing your code
 
-`MqttPublisher` has a single method, so a lambda can stand in for it in unit tests. For tests
-that need a broker, the [embedded broker](../hato-broker/README.md) runs one inside your test,
-and the [test kit](../hato-testkit/README.md) simulates interrupted connections, timeouts, and
-a broker that refuses or holds back its answers.
+In unit tests, the [test kit](../hato-testkit/README.md)'s `FakeMqttPublisher` and
+`FakeMqttSubscriber` stand in for the client: they record what your code publishes and
+subscribes, and let a test deliver messages to its handlers. For tests that need a broker, the
+[embedded broker](../hato-broker/README.md) runs one inside your test, and the test kit
+simulates interrupted connections, timeouts, and a broker that refuses or holds back its
+answers.
 
 ### Seeing it all together
 

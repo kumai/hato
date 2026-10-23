@@ -1,7 +1,8 @@
 # Hato test kit
 
-Test how your application handles interrupted connections, timeouts, and a broker
-that refuses or holds back its answers. The test kit includes the
+Test the code that publishes and subscribes without a broker, and how your
+application handles interrupted connections, timeouts, and a broker that refuses or
+holds back its answers. The test kit includes the
 [client](../hato-client/README.md) and [embedded broker](../hato-broker/README.md) as
 dependencies.
 
@@ -27,6 +28,50 @@ Maven:
 ```
 
 For JPMS, the module name is `org.mqtt4j.hato.testkit`.
+
+## Testing code that publishes or subscribes
+
+Code that takes an `MqttPublisher` or an `MqttSubscriber` can be tested without a
+client or a broker.
+[FakeMqttPublisher](src/main/java/org/mqtt4j/hato/testkit/FakeMqttPublisher.java)
+records what your code publishes, and
+[FakeMqttSubscriber](src/main/java/org/mqtt4j/hato/testkit/FakeMqttSubscriber.java)
+records its subscriptions and lets the test deliver messages to them:
+
+```java
+var publisher = new FakeMqttPublisher();
+var subscriber = new FakeMqttSubscriber();
+// The code under test subscribes to alarms and forwards each one.
+new AlarmForwarder(subscriber, publisher).start();
+
+FakeDelivery delivery = subscriber.subscription(new TopicFilter("sensors/+/alarm"))
+        .orElseThrow()
+        .deliver(MqttMessage.of(
+                new Topic("sensors/kitchen/alarm"),
+                "smoke".getBytes(UTF_8),
+                Qos.AT_LEAST_ONCE,
+                false
+        ));
+
+assertThat(publisher.published())
+        .extracting(MqttMessage::topic)
+        .containsExactly(new Topic("alarms/kitchen"));
+assertThat(delivery.failure()).isEmpty();
+```
+
+- `FakeMqttPublisher` completes each publication at once. `failPublications(failure)`
+  fails later ones, for example with `MqttNotConnectedException`, and
+  `holdPublications()` holds them until the test completes or fails each of
+  `heldPublications()`, so a test can see what your code does while it waits.
+- `FakeMqttSubscriber` grants each subscription the QoS it asks for, and
+  `refuseSubscriptions(filter)` and `grantAtMost(filter, qos)` work as they do on
+  the broker controls below. `deliver(message)` runs the handler on the test's
+  thread and returns the delivery, which shows whether your code called `ack()`
+  and what the handler threw.
+- The fakes stand in for the roles, not for a client: they neither connect nor run
+  handlers on other threads, and they do not support pull subscriptions, delivery
+  options, or hand-off subscriptions. To see how your code works with a real client,
+  test it with a broker.
 
 ## Testing with a broker
 

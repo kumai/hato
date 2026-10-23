@@ -106,8 +106,8 @@ void show(MqttMessage message) {
   failures, and fit the client into your application.
 - [Embedded broker](hato-broker/README.md): run a broker inside your application
   for tests, device simulators, and demos.
-- [Test kit](hato-testkit/README.md): simulate connection failures and control time
-  in your tests.
+- [Test kit](hato-testkit/README.md): stand in for the client in unit tests, simulate
+  connection failures, and control time in your tests.
 - [Examples](examples/README.md): compile and run the examples above, or try a
   complete round trip with the embedded broker.
 
