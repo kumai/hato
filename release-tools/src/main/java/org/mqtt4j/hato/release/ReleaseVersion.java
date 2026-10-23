@@ -1,6 +1,8 @@
 package org.mqtt4j.hato.release;
 
+import java.util.Arrays;
 import java.util.Locale;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /// The rules that decide which version a release run publishes.
@@ -10,13 +12,16 @@ final class ReleaseVersion {
             "[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?"
     );
 
-    /// The GitHub event and ref that started a release run. `trialVersion` is the version that a
-    /// manual trial asks for; it is empty for a tag push.
+    // The three numbers at the start of a version; any suffix, such as -SNAPSHOT, is ignored.
+    private static final Pattern NUMBERS = Pattern.compile(
+            "([0-9]+)\\.([0-9]+)\\.([0-9]+)(?:-.*)?"
+    );
+
+    /// The GitHub event and ref that started a release run.
     record Ref(
             String event,
             String type,
-            String name,
-            String trialVersion
+            String name
     ) {}
 
     private ReleaseVersion() {
@@ -33,12 +38,16 @@ final class ReleaseVersion {
         }
     }
 
-    /// Returns the version that a run started by `ref` publishes.
+    /// Returns the version that a run started by `ref` publishes, which its tag names.
     ///
-    /// A tag push publishes the committed version, which the tag must name. A manual trial
-    /// replaces the committed version with the pre-release version that its tag names. A trial
-    /// never takes a final version number, because Central may not accept that number again
-    /// after the trial is dropped.
+    /// The tag may name the committed version or an earlier one, such as `0.7.1` while
+    /// `gradle.properties` already has `0.8.0-SNAPSHOT`, but nothing above it: a typo in the tag
+    /// would otherwise publish a number that Central never removes. Only the three numbers
+    /// count, so `0.8.0` and `0.8.0-rc.1` are both within `0.8.0-SNAPSHOT`.
+    ///
+    /// A published GitHub Release can publish any such version. A manual trial takes only a
+    /// pre-release version, because Central may not accept a final version number again after
+    /// the trial is dropped.
     static String of(Ref ref, String committedVersion) {
         if (!ref.type().equals("tag") || !ref.name().startsWith("v")) {
             throw new ReleaseException("Select a v-prefixed tag, including for a manual trial");
@@ -46,26 +55,45 @@ final class ReleaseVersion {
         String version = ref.name().substring(1);
         check(version);
         switch (ref.event()) {
-            case "push" -> {
-                if (!version.equals(committedVersion)) {
-                    throw new ReleaseException("The tag must match version in gradle.properties");
-                }
+            case "release" -> {
+                // Any checked version, including a pre-release, can be published.
             }
             case "workflow_dispatch" -> {
-                if (!version.equals(ref.trialVersion())) {
-                    throw new ReleaseException("The trial version must match the selected tag");
-                }
                 if (!version.contains("-")) {
                     throw new ReleaseException(
                             "Manual trials need a pre-release version such as 0.3.0-rc.1"
                     );
                 }
             }
-            // No other event, such as a scheduled run, decides what to publish.
+            // No other event, such as a tag push or a scheduled run, decides what to publish.
             default -> throw new ReleaseException(
-                    "Releases start from a tag push or a manual trial, not " + ref.event()
+                    "Releases start from a published GitHub Release or a manual trial, not "
+                            + ref.event()
+            );
+        }
+        if (Arrays.compare(numbers(version), numbers(committedVersion)) > 0) {
+            throw new ReleaseException(
+                    "%s is above %s in gradle.properties; raise the version there to release it"
+                            .formatted(version, committedVersion)
             );
         }
         return version;
+    }
+
+    /// Returns the three numbers at the start of `version`, such as 0, 8, and 0 for
+    /// `0.8.0-SNAPSHOT`.
+    private static int[] numbers(String version) {
+        Matcher numbers = NUMBERS.matcher(version);
+        if (!numbers.matches()) {
+            throw new ReleaseException(
+                    "Expected a version such as 0.8.0-SNAPSHOT in gradle.properties, not "
+                            + version
+            );
+        }
+        return new int[] {
+                Integer.parseInt(numbers.group(1)),
+                Integer.parseInt(numbers.group(2)),
+                Integer.parseInt(numbers.group(3))
+        };
     }
 }

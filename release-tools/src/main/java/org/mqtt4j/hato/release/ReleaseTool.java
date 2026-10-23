@@ -11,6 +11,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
+import org.mqtt4j.hato.release.CentralUpload.PublishingType;
+
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.nio.file.StandardOpenOption.APPEND;
 import static java.nio.file.StandardOpenOption.CREATE;
@@ -20,8 +22,11 @@ import static java.nio.file.StandardOpenOption.CREATE;
 /// - `version <gradle.properties>` checks the GitHub ref of the run and writes the version to
 ///   publish to `GITHUB_OUTPUT`, or prints it outside GitHub Actions.
 /// - `bundle <version> <bundle.zip>` checks the signed bundle before the upload.
-/// - `upload <bundle.zip>` uploads the bundle for manual publication with the Portal user token
-///   in `CENTRAL_USERNAME` and `CENTRAL_PASSWORD`, and waits until the Portal validates it.
+/// - `upload <bundle.zip>` uploads the bundle with the Portal user token in `CENTRAL_USERNAME`
+///   and `CENTRAL_PASSWORD`. In a run started by a published GitHub Release, the Portal
+///   publishes the bundle once it passes validation, and the command waits until publishing
+///   starts. Any other run, such as a manual trial, leaves publishing to the maintainer and
+///   waits until the Portal validates the bundle.
 ///
 /// A failure that the maintainer can act on ends with exit status 1 and a message that says
 /// what to do.
@@ -78,8 +83,7 @@ public final class ReleaseTool {
         var ref = new ReleaseVersion.Ref(
                 required(environment, "GITHUB_EVENT_NAME"),
                 required(environment, "GITHUB_REF_TYPE"),
-                required(environment, "GITHUB_REF_NAME"),
-                environment.getOrDefault("INPUT_VERSION", "")
+                required(environment, "GITHUB_REF_NAME")
         );
         String version = ReleaseVersion.of(ref, committedVersion.strip());
         String output = environment.get("GITHUB_OUTPUT");
@@ -109,8 +113,17 @@ public final class ReleaseTool {
                     System.out,
                     summary == null ? null : Path.of(summary)
             );
-            central.upload(bundle);
+            central.upload(bundle, publishingType(environment));
         }
+    }
+
+    /// Returns how the Portal publishes the upload of the run in `environment`. Only a published
+    /// GitHub Release publishes without review; manual trials and runs outside GitHub Actions
+    /// leave the deployment to the maintainer.
+    static PublishingType publishingType(Map<String, String> environment) {
+        return "release".equals(environment.get("GITHUB_EVENT_NAME"))
+                ? PublishingType.AUTOMATIC
+                : PublishingType.USER_MANAGED;
     }
 
     private static String required(Map<String, String> environment, String name) {

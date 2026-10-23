@@ -1,14 +1,11 @@
 name: Release
 
 on:
-  push:
-    tags: ['v*']
+  # Publishing a GitHub Release publishes to Maven Central. A manual trial on a pre-release tag,
+  # such as v0.3.0-rc.1, stops for review in the Portal.
+  release:
+    types: [published]
   workflow_dispatch:
-    inputs:
-      version:
-        description: Pre-release trial version, such as 0.3.0-rc.1, matching the selected tag
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -36,8 +33,6 @@ jobs:
         with:
           validate-wrappers: true
       - id: release
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: ./gradlew :release-tools:checkReleaseTag
 
   checks:
@@ -45,7 +40,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   upload:
-    name: Sign and upload for manual publication
+    name: Sign and upload to Maven Central
     needs: [version, checks]
     runs-on: ubuntu-latest
     environment: release
@@ -79,7 +74,7 @@ jobs:
           path: distribution-tests/build/distributions/hato-${{ needs.version.outputs.version }}.zip
           if-no-files-found: error
       # The installed tool runs outside Gradle, so the Portal token reaches only this step.
-      - name: Upload and wait for validation
+      - name: Upload and wait for the Portal
         env:
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}

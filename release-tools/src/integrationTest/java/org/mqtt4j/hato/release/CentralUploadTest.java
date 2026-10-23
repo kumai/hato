@@ -24,6 +24,8 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.hato.release.CentralUpload.PublishingType;
+
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -61,7 +63,7 @@ class CentralUploadTest {
         CentralUpload sut = upload(summary);
 
         // Act
-        sut.upload(bundle());
+        sut.upload(bundle(), PublishingType.USER_MANAGED);
 
         // Assert: one multipart upload with the token, then status checks until VALIDATED.
         assertThat(portal.requests).hasSize(4);
@@ -88,16 +90,49 @@ class CentralUploadTest {
 
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {"FAILED", "PUBLISHING", "PUBLISHED", "UNKNOWN"})
-    void any_state_but_validation_stops_the_wait_for_the_maintainer(String state) {
+    void a_user_managed_upload_stops_on_any_state_but_validation(String state) {
         // Arrange
         portal.statuses.add(state(state));
         CentralUpload sut = upload(null);
 
         // Act & Assert
-        assertThatThrownBy(() -> sut.upload(bundle()))
+        assertThatThrownBy(() -> sut.upload(bundle(), PublishingType.USER_MANAGED))
                 .isInstanceOf(ReleaseException.class)
                 .hasMessageContaining("Unexpected deployment state: " + state);
         assertThat(portal.requests).hasSize(2);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"PUBLISHING", "PUBLISHED"})
+    void an_automatic_upload_waits_past_validation_until_publishing_starts(String state)
+            throws Exception {
+        // Arrange
+        portal.statuses.addAll(List.of(state("VALIDATING"), state("VALIDATED"), state(state)));
+        Path summary = directory.resolve("summary.md");
+        CentralUpload sut = upload(summary);
+
+        // Act
+        sut.upload(bundle(), PublishingType.AUTOMATIC);
+
+        // Assert
+        assertThat(portal.requests).hasSize(4);
+        assertThat(portal.requests.getFirst().target())
+                .isEqualTo("/api/v1/publisher/upload?publishingType=AUTOMATIC");
+        assertThat(Files.readString(summary)).contains(DEPLOYMENT).contains(state);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"FAILED", "UNKNOWN"})
+    void an_automatic_upload_stops_on_a_failure_or_an_unknown_state(String state) {
+        // Arrange
+        portal.statuses.addAll(List.of(state("VALIDATED"), state(state)));
+        CentralUpload sut = upload(null);
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.upload(bundle(), PublishingType.AUTOMATIC))
+                .isInstanceOf(ReleaseException.class)
+                .hasMessageContaining("Unexpected deployment state: " + state);
+        assertThat(portal.requests).hasSize(3);
     }
 
     @Test
@@ -107,7 +142,7 @@ class CentralUploadTest {
         CentralUpload sut = upload(null);
 
         // Act & Assert
-        assertThatThrownBy(() -> sut.upload(bundle()))
+        assertThatThrownBy(() -> sut.upload(bundle(), PublishingType.USER_MANAGED))
                 .isInstanceOf(ReleaseException.class)
                 .hasMessageContaining("thirty checks");
         assertThat(portal.requests).hasSize(31);
@@ -121,7 +156,7 @@ class CentralUploadTest {
         CentralUpload sut = upload(summary);
 
         // Act & Assert
-        assertThatThrownBy(() -> sut.upload(bundle()))
+        assertThatThrownBy(() -> sut.upload(bundle(), PublishingType.USER_MANAGED))
                 .isInstanceOf(ReleaseException.class)
                 .hasMessageContaining("did not return a deployment ID");
         assertThat(portal.requests).hasSize(1);
@@ -135,7 +170,7 @@ class CentralUploadTest {
         CentralUpload sut = upload(null);
 
         // Act & Assert
-        assertThatThrownBy(() -> sut.upload(bundle()))
+        assertThatThrownBy(() -> sut.upload(bundle(), PublishingType.USER_MANAGED))
                 .isInstanceOf(ReleaseException.class)
                 .hasMessageContaining("check the Portal before retrying")
                 .hasMessageContaining("HTTP 401")
@@ -153,7 +188,7 @@ class CentralUploadTest {
         CentralUpload sut = upload(summary);
 
         // Act & Assert
-        assertThatThrownBy(() -> sut.upload(bundle()))
+        assertThatThrownBy(() -> sut.upload(bundle(), PublishingType.USER_MANAGED))
                 .isInstanceOf(ReleaseException.class)
                 .hasMessageContaining("inspect the deployment in the Portal")
                 .hasMessageContaining("HTTP 503")
@@ -170,7 +205,7 @@ class CentralUploadTest {
         CentralUpload sut = upload(null);
 
         // Act & Assert
-        assertThatThrownBy(() -> sut.upload(bundle()))
+        assertThatThrownBy(() -> sut.upload(bundle(), PublishingType.USER_MANAGED))
                 .isInstanceOf(ReleaseException.class)
                 .hasMessageContaining("Unexpected status response")
                 .hasMessageContaining(body);

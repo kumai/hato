@@ -1,8 +1,20 @@
 # Releasing Hato
 
-Releases are uploaded to Maven Central for review. The release workflow never
-publishes or drops a deployment; the maintainer does that in the
-[Central Portal](https://central.sonatype.com/publishing).
+Publishing a GitHub Release publishes Hato to Maven Central. The release's tag, such
+as `v0.3.0`, names the version. The release workflow checks the tagged commit, signs
+the bundle, and uploads it to the
+[Central Portal](https://central.sonatype.com/publishing), which publishes it once it
+passes validation. A manual trial runs the same workflow but stops after validation,
+so the maintainer can review the deployment and drop it.
+
+## Versions
+
+`version` in `gradle.properties` is the next version planned, such as
+`0.8.0-SNAPSHOT`, and labels development builds. A release may name that version or
+an earlier one, such as `0.7.1`, but nothing above it, so a mistyped tag cannot
+publish a number that Central never removes. Only the three numbers count:
+`0.8.0-SNAPSHOT` allows `0.8.0` and `0.8.0-rc.1`. When a release reaches the
+committed version, raise it before the next release.
 
 ## Prepare the release environment
 
@@ -48,45 +60,57 @@ The workflow requires a signing key and runs the same task before upload.
 
 ## Trial upload
 
-The workflow must be present on the default branch for manual dispatch. Select
-a pre-release trial version such as `0.3.0-rc.1` and create its `v0.3.0-rc.1` tag on
-the commit to test. Manual trials reject final versions such as `0.3.0`, so a trial
-never takes a release number. If the commit still has `0.3.0-SNAPSHOT` in
-`gradle.properties`, pushing that tag starts a release run which rejects the version
-mismatch in its first job, before the full build. This is the normal release guard;
-it does not upload anything.
-
-Manually dispatch **Release** with that same tag as the ref and `0.3.0-rc.1` as
-the `version` input. For example, using GitHub CLI:
+Maven Central never removes a published version, so try the release first. The
+workflow must be present on the default branch for manual dispatch. Create and push
+a pre-release tag such as `v0.3.0-rc.1` on the commit to test, then manually
+dispatch **Release** with that tag as the ref. For example, using GitHub CLI:
 
 ```shell
-gh workflow run release.yml --ref v0.3.0-rc.1 -f version=0.3.0-rc.1
+gh workflow run release.yml --ref v0.3.0-rc.1
 ```
 
-Manual trials override the committed version for the bundle, but the input must
-still match the selected tag. Branch refs are rejected. The workflow runs the
-full build and native smoke test for that commit, signs the bundle, uploads it as
-`USER_MANAGED`, and waits for `VALIDATED`. Review the deployment in the Portal,
-then **Drop** the trial instead of publishing it.
+Manual trials reject final versions such as `0.3.0`, so a trial never takes a
+release number, and branch refs are rejected. The workflow runs the full build and
+native smoke test for that commit, signs the bundle, uploads it as `USER_MANAGED`,
+and waits for `VALIDATED`. Review the deployment in the Portal, then **Drop** the
+trial instead of publishing it.
 
 ## Publish a release
 
-Set `version` in `gradle.properties` to the release version, update README and
-CHANGELOG, and finish the release checks before creating the matching `v` tag.
-Push the tag to start **Release**. A tag/version mismatch or SNAPSHOT version stops
-the run before the full build. Otherwise, its reusable CI workflow checks the same
-commit before the upload job can run.
+Update the coordinates in the READMEs and finish the release checks. Then publish a
+GitHub Release with a new tag, such as `v0.3.0`, on the commit to release, and the
+release notes in its description. Publishing creates the tag; pushing a tag alone
+starts nothing. For example:
+
+```shell
+gh release create v0.3.0 --target main --title 0.3.0 --notes-file release-notes.md
+```
+
+A draft release starts nothing until it is published, so the notes can also be
+prepared in the GitHub UI. Publishing the release starts **Release**. A tag above
+the committed version, or a SNAPSHOT tag, stops the run before the full build.
+Otherwise, its reusable CI workflow checks the same commit before the upload job can
+run. The upload job uploads the bundle as `AUTOMATIC` and waits until the Portal
+starts publishing it.
 
 The workflow retains the signed ZIP as an Actions artifact and writes the
 deployment ID to its summary. It makes one upload attempt and at most thirty
-status requests. If upload times out, inspect the Portal before rerunning: the
-deployment may already exist. If validation fails or takes longer than the wait,
-inspect that deployment's status and errors in the Portal.
+status requests. If the run fails, the GitHub Release stays, but Maven Central has
+nothing until a deployment passes validation:
 
-After `VALIDATED`, inspect the coordinates and files, then choose **Publish** in
-the Portal. Use **Drop** if the contents are wrong. Finally, verify that a fresh
-consumer resolves the published version and compare the published artifacts'
-SHA-256 checksums with a rebuild from the tag using the same JDK.
+- If upload times out, inspect the Portal before rerunning: the deployment may
+  already exist and still be published.
+- If validation fails, the Portal publishes nothing; its errors are on the
+  deployment in the Portal.
+- Rerun the failed jobs when the cause lies outside the commit, such as a missing
+  secret. Otherwise, delete the release and its tag with
+  `gh release delete v0.3.0 --cleanup-tag`, fix the cause, and publish again.
+
+Once the Portal shows the deployment as published, verify that a fresh consumer
+resolves the published version and compare the published artifacts' SHA-256
+checksums with a rebuild from the tag using the same JDK. The tagged commit has the
+SNAPSHOT version, so pass the released version to the rebuild, as in
+`-Pversion=0.3.0`.
 
 The upload follows the
 [Central Publisher API](https://central.sonatype.org/publish/publish-portal-api/).

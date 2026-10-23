@@ -10,6 +10,8 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.hato.release.CentralUpload.PublishingType;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -22,21 +24,21 @@ class ReleaseToolTest {
     void the_version_command_passes_the_version_to_publish_to_later_jobs() throws Exception {
         // Arrange
         Path output = directory.resolve("github-output");
-        Map<String, String> environment = tagPush("v0.3.0", output);
+        Map<String, String> environment = publishedRelease("v0.3.0", output);
 
         // Act
-        ReleaseTool.run(List.of("version", properties("0.3.0").toString()), environment);
+        ReleaseTool.run(List.of("version", properties("0.3.0-SNAPSHOT").toString()), environment);
 
         // Assert
         assertThat(Files.readString(output)).isEqualTo("version=0.3.0\n");
     }
 
     @Test
-    void the_version_command_rejects_a_tag_of_another_committed_version() throws Exception {
+    void the_version_command_rejects_a_tag_above_the_committed_version() throws Exception {
         // Arrange
         Path output = directory.resolve("github-output");
-        Map<String, String> environment = tagPush("v0.3.0", output);
-        List<String> args = List.of("version", properties("0.3.0-SNAPSHOT").toString());
+        Map<String, String> environment = publishedRelease("v0.3.0", output);
+        List<String> args = List.of("version", properties("0.2.0-SNAPSHOT").toString());
 
         // Act & Assert
         assertThatThrownBy(() -> ReleaseTool.run(args, environment))
@@ -50,6 +52,15 @@ class ReleaseToolTest {
         assertThatThrownBy(() -> ReleaseTool.run(List.of("upload", "bundle.zip"), Map.of()))
                 .isInstanceOf(ReleaseException.class)
                 .hasMessage("Missing CENTRAL_USERNAME");
+    }
+
+    @Test
+    void only_a_published_release_is_published_without_review() {
+        assertThat(ReleaseTool.publishingType(Map.of("GITHUB_EVENT_NAME", "release")))
+                .isEqualTo(PublishingType.AUTOMATIC);
+        assertThat(ReleaseTool.publishingType(Map.of("GITHUB_EVENT_NAME", "workflow_dispatch")))
+                .isEqualTo(PublishingType.USER_MANAGED);
+        assertThat(ReleaseTool.publishingType(Map.of())).isEqualTo(PublishingType.USER_MANAGED);
     }
 
     @ParameterizedTest(name = "\"{0}\"")
@@ -69,9 +80,9 @@ class ReleaseToolTest {
         );
     }
 
-    private static Map<String, String> tagPush(String tag, Path output) {
+    private static Map<String, String> publishedRelease(String tag, Path output) {
         return Map.ofEntries(
-                Map.entry("GITHUB_EVENT_NAME", "push"),
+                Map.entry("GITHUB_EVENT_NAME", "release"),
                 Map.entry("GITHUB_REF_TYPE", "tag"),
                 Map.entry("GITHUB_REF_NAME", tag),
                 Map.entry("GITHUB_OUTPUT", output.toString())
