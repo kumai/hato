@@ -2574,6 +2574,39 @@ class ClientActorTest {
     }
 
     @Test
+    void qos_0_publications_taken_as_one_run_keep_their_order_around_a_qos_1_one()
+            throws Exception {
+        // Arrange: the actor is held while two QoS 0 publications, a QoS 1 one, and another
+        // QoS 0 one wait for it, so that it takes the first two as one run.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var handled = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(
+                    qosOneRequest(),
+                    delivery -> handled.add(delivery.message().payload()[0])
+            );
+            establish(transport, subscription);
+            holdActor(transport, entered, release);
+            transport.receive(publication("messages", 1));
+            transport.receive(publication("messages", 2));
+            transport.receive(qosOnePublication("messages", 3, false));
+            transport.receive(publication("messages", 4));
+
+            // Act
+            release.countDown();
+
+            // Assert: the run reaches the handler before the QoS 1 publication that followed it.
+            for (int value = 1; value <= 4; value++) {
+                assertThat(handled.poll(5, SECONDS)).isEqualTo((byte) value);
+            }
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void a_slow_throwing_listener_delays_no_attempt_and_loses_only_its_oldest_notifications()
             throws Exception {
         // Arrange: the first disconnection notification blocks, and every callback throws.

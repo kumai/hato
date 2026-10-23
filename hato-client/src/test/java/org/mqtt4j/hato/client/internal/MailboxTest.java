@@ -223,6 +223,63 @@ class MailboxTest {
     }
 
     @Test
+    void a_run_takes_the_qos_0_publications_that_lead_the_fifo_without_waiting()
+            throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 2, 20, 1);
+        var first = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var second = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var incoming = new Mailbox.Event(1, () -> { }, Mailbox.Kind.INCOMING, 10);
+        var later = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        sut.activate(1);
+        for (Mailbox.Event event : List.of(first, second, incoming)) {
+            assertThat(sut.offer(event)).isEqualTo(ACCEPTED);
+        }
+
+        // Act & Assert: a run stops before another kind of event, which take() returns next,
+        // and at the end of the queue.
+        assertThat(sut.take(() -> false)).containsSame(first);
+        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(second);
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        assertThat(sut.take(() -> false)).containsSame(incoming);
+        assertThat(sut.offer(later)).isEqualTo(ACCEPTED);
+        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(later);
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        // A publication taken in a run returns its allowance, as one that take() returns does.
+        assertThat(sut.bytes()).isZero();
+    }
+
+    @Test
+    void a_run_stops_before_an_event_that_goes_ahead_of_the_fifo_and_when_stopping()
+            throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 1, 10, 1);
+        var publication = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var timer = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
+        var end = new Mailbox.Event(1, () -> { }, Mailbox.Kind.CONTROL, 0);
+        sut.activate(1);
+        sut.activateSession(1);
+        sut.connectionRequested(true);
+        assertThat(sut.offer(publication)).isEqualTo(ACCEPTED);
+
+        // Act & Assert: a keep-alive event, a termination, and a stop request each come first.
+        assertThat(sut.offer(timer)).isEqualTo(ACCEPTED);
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        assertThat(sut.take(() -> false)).containsSame(timer);
+        sut.terminate(end);
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        assertThat(sut.take(() -> false)).containsSame(end);
+        assertThat(sut.stopSession(1, () -> { })).isTrue();
+        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        assertThat(sut.take(() -> false)).hasValueSatisfying(stop ->
+                assertThat(stop.kind()).isEqualTo(Mailbox.Kind.CONTROL));
+
+        // Act & Assert: stopping ends a run too, and leaves the publication queued.
+        assertThat(sut.takeAtMostOnce(() -> true)).isNull();
+        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(publication);
+    }
+
+    @Test
     void keep_alive_events_have_a_bounded_class_that_ends_with_its_connection() {
         // Arrange
         var sut = new Mailbox(1, 10, 256, 1, 10, 1);

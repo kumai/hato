@@ -10,6 +10,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -749,6 +750,61 @@ class ClientStatsTest {
             assertThatThrownBy(() -> failed.get(5, SECONDS)).hasCause(failure);
             assertThat(requireNonNull(ends.poll(5, SECONDS)).cause()).contains(failure);
             assertThat(stats(sut).connection().state()).isEqualTo(ConnectionState.DISCONNECTED);
+        }
+    }
+
+    @Test
+    void qos_0_publications_routed_before_a_clock_failure_are_discarded_with_the_connection()
+            throws Exception {
+        // Arrange: the handler holds the first publication, so the ones routed after it wait.
+        var started = new CountDownLatch(1);
+        var returns = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var handled = new LinkedBlockingQueue<Byte>();
+        var failure = new IllegalStateException("Clock unavailable");
+        try (MqttClient sut = builder().build()) {
+            ScriptTransport transport = connect(sut);
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter("readings"), Qos.AT_MOST_ONCE),
+                    delivery -> {
+                        handled.add(delivery.message().payload()[0]);
+                        started.countDown();
+                        waitFor(returns);
+                    }
+            );
+            acknowledgeSubscribes(transport, 1);
+            subscription.established().get(5, SECONDS);
+            transport.receive(publish("readings", 0));
+            assertThat(started.await(5, SECONDS)).isTrue();
+            // Three more wait for the held actor, which takes them as one run; the clock read
+            // for the third fails.
+            CompletableFuture<ClientStats> held = holdActorInStats(sut, release);
+            for (int value = 1; value <= 3; value++) {
+                transport.receive(publish("readings", value));
+            }
+            var reads = new AtomicInteger();
+            beforeActorTime = () -> {
+                if (reads.incrementAndGet() == 3) {
+                    throw failure;
+                }
+            };
+
+            // Act
+            release.countDown();
+
+            // Assert: the end of the connection discards the two that the run had routed, as it
+            // discards every delivery that waits, and the handler gets neither.
+            assertThat(requireNonNull(ends.poll(5, SECONDS)).cause()).contains(failure);
+            held.get(5, SECONDS);
+            assertThat(find(stats(sut), subscription).dropped())
+                    .containsEntry(DropReason.CONNECTION_ENDED, 2L);
+            returns.countDown();
+            await().untilAsserted(() -> assertThat(find(stats(sut), subscription).running())
+                    .isZero());
+            assertThat(handled).containsExactly((byte) 0);
+        } finally {
+            release.countDown();
+            returns.countDown();
         }
     }
 

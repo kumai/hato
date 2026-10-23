@@ -92,6 +92,11 @@ public final class ClientActor implements MqttClient {
 
     private static final int RECEIVE_BYTE_LIMIT = 32 * 1024 * 1024;
 
+    // The QoS 0 publications in one run at most. The limit bounds how long the first of them
+    // waits for its lanes, how long the lanes' lock is held for them, and how long a keep-alive
+    // event waits behind them.
+    private static final int RUN_LIMIT = 64;
+
     private final URI endpoint;
 
     private final String clientId;
@@ -139,6 +144,12 @@ public final class ClientActor implements MqttClient {
     private final Mailbox mailbox;
 
     private final DeliveryLanes lanes;
+
+    // The QoS 0 publications that the actor has routed in its current run and not yet handed to
+    // their lanes; only the actor touches them. The run hands them over at its end. Before then,
+    // ending a connection or a subscription through the core's port hands them over first, so
+    // that the ending finds them queued as though each had been handed over at once.
+    private final ArrayList<DeliveryLanes.Arrival> arrivals = new ArrayList<>();
 
     // Published under lifecycleLock before admitting commands for an established connection.
     private long connectedGeneration;
@@ -669,18 +680,11 @@ public final class ClientActor implements MqttClient {
             long busySince = System.nanoTime();
             while ((next = mailbox.take(stopping::get)).isPresent()) {
                 Mailbox.Event event = next.orElseThrow();
-                if (event.kind().received() && mailbox.resumeDue()) {
-                    io.resumeReading(event.generation());
+                handle(event);
+                if (event.kind() == Mailbox.Kind.AT_MOST_ONCE) {
+                    continueRun();
                 }
-                try {
-                    event.action().run();
-                } catch (SpiException cause) {
-                    if (cause.schedulerFailure()) {
-                        core.schedulerFailed(cause.generation(), requireNonNull(cause.getCause()));
-                    } else {
-                        core.failed(cause.generation(), requireNonNull(cause.getCause()));
-                    }
-                }
+                deliverArrivals();
                 if (CarrierShare.due(busySince)) {
                     // The actor blocks next when its mailbox is empty, which frees the carrier
                     // without parking.
@@ -748,6 +752,43 @@ public final class ClientActor implements MqttClient {
                     }
                 }
             }
+        }
+    }
+
+    private void handle(Mailbox.Event event) {
+        if (event.kind().received() && mailbox.resumeDue()) {
+            io.resumeReading(event.generation());
+        }
+        try {
+            event.action().run();
+        } catch (SpiException cause) {
+            if (cause.schedulerFailure()) {
+                core.schedulerFailed(cause.generation(), requireNonNull(cause.getCause()));
+            } else {
+                core.failed(cause.generation(), requireNonNull(cause.getCause()));
+            }
+        }
+    }
+
+    /// Handles the QoS 0 publications that wait next in the mailbox, without waiting for more, up
+    /// to [#RUN_LIMIT] with the one just handled. Their lanes take them together at the end of the
+    /// run, so that each lane's dispatcher wakes once for the run rather than once for each
+    /// publication.
+    private void continueRun() {
+        for (int taken = 1; taken < RUN_LIMIT; taken++) {
+            Mailbox.Event following = mailbox.takeAtMostOnce(stopping::get);
+            if (following == null) {
+                return;
+            }
+            handle(following);
+        }
+    }
+
+    /// Hands the publications of the current run to their lanes; see [#arrivals].
+    private void deliverArrivals() {
+        if (!arrivals.isEmpty()) {
+            lanes.deliverAtMostOnce(arrivals);
+            arrivals.clear();
         }
     }
 
@@ -1410,6 +1451,8 @@ public final class ClientActor implements MqttClient {
                 Subscription handle,
                 MqttSubscriptionRefusedException failure
         ) {
+            // The subscription's end finds the current run queued; see arrivals.
+            deliverArrivals();
             var subscription = (ClientSubscription) handle;
             synchronized (lifecycleLock) {
                 if (subscription.retired || subscription.removalRequested()) {
@@ -1558,6 +1601,11 @@ public final class ClientActor implements MqttClient {
                 int bytes
         ) {
             MqttMessage message = MessageProperties.received(publish, userPropertyOf);
+            if (publish.qos() == Qos.AT_MOST_ONCE) {
+                // Its lanes take it at the end of the actor's run; see continueRun().
+                arrivals.add(new DeliveryLanes.Arrival(token, ids, message, publish.dup(), bytes));
+                return true;
+            }
             return lanes.deliver(token, ids, message, publish.dup(), bytes);
         }
 
@@ -1589,6 +1637,8 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
+            // The subscription's end finds the current run queued; see arrivals.
+            deliverArrivals();
             var subscription = (ClientSubscription) handle;
             boolean unrequested;
             synchronized (lifecycleLock) {
@@ -1631,6 +1681,9 @@ public final class ClientActor implements MqttClient {
                 boolean preserveSession,
                 boolean stopped
         ) {
+            // The connection's end discards the current run with the deliveries that wait; see
+            // arrivals.
+            deliverArrivals();
             Throwable cause = disconnection.cause().orElse(null);
             synchronized (lifecycleLock) {
                 connectedGeneration = 0;

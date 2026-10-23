@@ -320,28 +320,53 @@ final class Mailbox {
 
     /// Waits for the next event; returns empty when the actor is stopping.
     synchronized Optional<Event> take(BooleanSupplier stopping) throws InterruptedException {
-        while (events.isEmpty() && keepAlive.isEmpty() && termination == null && stop == null
-                && !stopping.getAsBoolean()) {
+        while (!stopping.getAsBoolean()) {
+            Event next = next();
+            if (next != null) {
+                return Optional.of(remove(next));
+            }
             wait();
         }
-        if (stopping.getAsBoolean()) {
-            return Optional.empty();
+        return Optional.empty();
+    }
+
+    /// Takes the next event without waiting when it is a received QoS 0 publication, so that the
+    /// actor can go on with a run of them; otherwise returns null and leaves the next event
+    /// queued. An event that goes ahead of the FIFO therefore ends the run, as stopping does.
+    synchronized @Nullable Event takeAtMostOnce(BooleanSupplier stopping) {
+        Event next = next();
+        if (next == null || next.kind() != Kind.AT_MOST_ONCE || stopping.getAsBoolean()) {
+            return null;
         }
-        Event request = stop;
-        if (request != null) {
+        return remove(next);
+    }
+
+    // The event to take next: a stop request, then a termination, then keep-alive events, then
+    // the FIFO.
+    private @Nullable Event next() {
+        if (stop != null) {
+            return stop;
+        }
+        if (termination != null) {
+            return termination;
+        }
+        Event alive = keepAlive.peekFirst();
+        return alive != null ? alive : events.peekFirst();
+    }
+
+    // Removes `next`, which next() has just returned.
+    private Event remove(Event next) {
+        if (next == stop) {
             stop = null;
             stopSession = 0;
             termination = null;
-            return Optional.of(request);
-        }
-        Event end = termination;
-        if (end != null) {
+        } else if (next == termination) {
             termination = null;
-            return Optional.of(end);
+        } else {
+            (keepAlive.isEmpty() ? events : keepAlive).removeFirst();
+            release(next);
         }
-        Event event = keepAlive.isEmpty() ? events.removeFirst() : keepAlive.removeFirst();
-        release(event);
-        return Optional.of(event);
+        return next;
     }
 
     /// Stops admission and removes queued work for this connection; zero clears all work.
