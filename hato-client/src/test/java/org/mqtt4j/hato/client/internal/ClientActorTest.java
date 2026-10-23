@@ -63,6 +63,7 @@ import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttMessageAccess;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttSubscriptionRefusedException;
@@ -80,7 +81,6 @@ import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.UserProperty;
-import org.mqtt4j.hato.UserPropertyAccess;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
@@ -8966,7 +8966,8 @@ class ClientActorTest {
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
                 DeliveryOptionsAccess::execution,
-                UserPropertyAccess::received,
+                MqttMessageAccess::received,
+                MqttMessageAccess::payloadArray,
                 ClientStatsAccess::of,
                 limits
         );

@@ -1,6 +1,7 @@
 package org.mqtt4j.hato;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
@@ -9,6 +10,9 @@ import java.util.Optional;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
+import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.Property;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.util.Objects.requireNonNull;
 
@@ -48,7 +52,8 @@ public final class MqttMessage {
     private final List<UserProperty> userProperties;
 
     // Owns payload and correlationData. Only arrays supplied from outside are copied first, so
-    // the other with methods share the immutable arrays instead of copying them again.
+    // the other with methods share the immutable arrays instead of copying them again. A
+    // received message takes over the arrays that decoding made for it alone.
     private MqttMessage(
             Topic topic,
             byte[] payload,
@@ -93,6 +98,49 @@ public final class MqttMessage {
                 null,
                 null,
                 List.of()
+        );
+    }
+
+    /// The message that a received PUBLISH carries; the builder hands this to the client. It
+    /// takes over the payload and the Correlation Data, which decoding made for this PUBLISH
+    /// alone, and does not check again the strings that the codec validated while decoding them.
+    static MqttMessage received(Packet.Publish publish) {
+        boolean payloadUtf8 = false;
+        Duration messageExpiry = null;
+        String contentType = null;
+        Topic responseTopic = null;
+        byte[] correlationData = null;
+        var userProperties = new ArrayList<UserProperty>();
+        for (Property property : publish.properties().entries()) {
+            switch (property) {
+                case Property.ByteValue p when p.id() == PropertyId.PAYLOAD_FORMAT_INDICATOR ->
+                        payloadUtf8 = p.value() == 1;
+                case Property.FourByteValue p when p.id() == PropertyId.MESSAGE_EXPIRY_INTERVAL ->
+                        messageExpiry = Duration.ofSeconds(p.value());
+                case Property.StringValue p when p.id() == PropertyId.CONTENT_TYPE ->
+                        contentType = p.value();
+                case Property.StringValue p when p.id() == PropertyId.RESPONSE_TOPIC ->
+                        responseTopic = new Topic(p.value());
+                case Property.BinaryValue p when p.id() == PropertyId.CORRELATION_DATA ->
+                        correlationData = p.value();
+                case Property.UserProperty p -> userProperties.add(UserProperty.received(p));
+                // Topic Alias and Subscription Identifier steer how the client handles a
+                // connection, so a message never carries them; the codec admits no other
+                // property in PUBLISH.
+                default -> { }
+            }
+        }
+        return new MqttMessage(
+                publish.topic(),
+                publish.payload(),
+                publish.qos(),
+                publish.retain(),
+                payloadUtf8,
+                messageExpiry,
+                contentType,
+                responseTopic,
+                correlationData,
+                userProperties.isEmpty() ? List.of() : List.copyOf(userProperties)
         );
     }
 
@@ -296,6 +344,12 @@ public final class MqttMessage {
     /// A copy of the application bytes.
     public byte[] payload() {
         return payload.clone();
+    }
+
+    /// The payload array itself, which the client reads through its builder in this package
+    /// without copying it. The message never changes the array, and neither does the client.
+    byte[] payloadArray() {
+        return payload;
     }
 
     /// The requested or received quality of service.

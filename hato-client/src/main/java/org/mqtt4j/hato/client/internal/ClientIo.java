@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 
 import org.jspecify.annotations.Nullable;
 
@@ -101,6 +102,10 @@ final class ClientIo {
 
     private final PacketCodec codec;
 
+    // The payload array of a message itself, which the sender appends to its PUBLISH header
+    // without copying it first and never modifies.
+    private final Function<MqttMessage, byte[]> payloadOf;
+
     private final SendQueue.Budget budget;
 
     private final int regularSendLimit;
@@ -134,7 +139,8 @@ final class ClientIo {
             int batchByteLimit,
             Transport.Factory factory,
             Events events,
-            PacketCodec codec
+            PacketCodec codec,
+            Function<MqttMessage, byte[]> payloadOf
     ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
@@ -142,6 +148,7 @@ final class ClientIo {
         this.factory = factory;
         this.events = events;
         this.codec = codec;
+        this.payloadOf = payloadOf;
         this.regularSendLimit = regularSendLimit;
         this.batchByteLimit = batchByteLimit;
         budget = new SendQueue.Budget(
@@ -526,7 +533,7 @@ final class ClientIo {
     }
 
     private byte[] encode(SendQueue.Send<Outbound> send) {
-        byte[] bytes = send.value().encode(codec);
+        byte[] bytes = send.value().encode(codec, payloadOf);
         if (send.value().redacted()) {
             log.trace("Write attempt for ticket {}: {} bytes (redacted)",
                     send.ticket(), bytes.length);
@@ -779,7 +786,7 @@ final class ClientIo {
         }
     }
 
-    /// The complete packet, or a PUBLISH header whose payload the sender copies from the message.
+    /// The complete packet, or a PUBLISH header to which the sender appends the message's payload.
     private record Outbound(
             byte[] header,
             @Nullable MqttMessage message,
@@ -792,11 +799,11 @@ final class ClientIo {
             return header.length + (message == null ? 0 : message.payloadSize());
         }
 
-        byte[] encode(PacketCodec codec) {
+        byte[] encode(PacketCodec codec, Function<MqttMessage, byte[]> payloadOf) {
             if (message == null) {
                 return header;
             }
-            byte[] bytes = codec.encodePublish(header, message.payload());
+            byte[] bytes = codec.encodePublish(header, payloadOf.apply(message));
             if (receipt != null && receipt.accepted()) {
                 // The sole sender has returned from every earlier attempt before encoding this
                 // one, even if its queue admission preceded the old transport's send return.

@@ -32,6 +32,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttMessageAccess;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -80,7 +81,8 @@ class ClientIoTest {
                 return transport;
             },
             events,
-            codec
+            codec,
+            MqttMessageAccess::payloadArray
     );
 
     // The I/Os that the tests of batched writes make.
@@ -223,7 +225,8 @@ class ClientIoTest {
                     return transport;
                 },
                 events,
-                codec
+                codec,
+                MqttMessageAccess::payloadArray
         );
         batching.add(io);
         return io;
@@ -564,7 +567,8 @@ class ClientIoTest {
                 0,
                 _ -> transport,
                 events,
-                codec
+                codec,
+                MqttMessageAccess::payloadArray
         );
         batching.add(io);
         io.open(1, Duration.ofSeconds(30));

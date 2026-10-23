@@ -2,21 +2,18 @@ package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.function.Function;
 
 import org.mqtt4j.hato.MqttMessage;
-import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.UserProperty;
-import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.client.internal.common.protocol.Property;
 import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
-/// Maps the properties of an application message to MQTT 5.0 PUBLISH properties and back.
-/// Topic Alias and Subscription Identifier steer how the client handles a connection, so a
-/// message never carries them.
+/// Maps the properties of an application message to MQTT 5.0 PUBLISH properties. Topic Alias and
+/// Subscription Identifier steer how the client handles a connection, so a message never carries
+/// them. [MqttMessage] itself maps them back for a received PUBLISH.
 public final class MessageProperties {
 
     private MessageProperties() {}
@@ -98,40 +95,6 @@ public final class MessageProperties {
             bytes += 5L + utf8Length(property.name()) + utf8Length(property.value());
         }
         return (int) Math.min(bytes, Integer.MAX_VALUE);
-    }
-
-    /// The application message that a received PUBLISH carries. `userPropertyOf` wraps each User
-    /// Property, whose strings the codec validated while decoding them.
-    static MqttMessage received(
-            Packet.Publish publish,
-            Function<Property.UserProperty, UserProperty> userPropertyOf
-    ) {
-        MqttMessage result = MqttMessage.of(
-                publish.topic(),
-                publish.payload(),
-                publish.qos(),
-                publish.retain()
-        );
-        var userProperties = new ArrayList<UserProperty>();
-        for (Property property : publish.properties().entries()) {
-            switch (property) {
-                case Property.ByteValue p when p.id() == PropertyId.PAYLOAD_FORMAT_INDICATOR ->
-                        result = result.withPayloadUtf8(p.value() == 1);
-                case Property.FourByteValue p when p.id() == PropertyId.MESSAGE_EXPIRY_INTERVAL ->
-                        result = result.withMessageExpiry(Duration.ofSeconds(p.value()));
-                case Property.StringValue p when p.id() == PropertyId.CONTENT_TYPE ->
-                        result = result.withContentType(p.value());
-                case Property.StringValue p when p.id() == PropertyId.RESPONSE_TOPIC ->
-                        result = result.withResponseTopic(new Topic(p.value()));
-                case Property.BinaryValue p when p.id() == PropertyId.CORRELATION_DATA ->
-                        result = result.withCorrelationData(p.value());
-                case Property.UserProperty p -> userProperties.add(userPropertyOf.apply(p));
-                // Topic Alias and Subscription Identifier steer the client; the codec admits no
-                // other property in PUBLISH.
-                default -> { }
-            }
-        }
-        return userProperties.isEmpty() ? result : result.withUserProperties(userProperties);
     }
 
     // Rounding up never shortens the lifetime or the delay that the application asked for.

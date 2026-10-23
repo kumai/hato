@@ -40,7 +40,7 @@ public final class UserProperty {
         value = received.value();
     }
 
-    /// Wraps a User Property that the client received; the builder hands this to the client.
+    /// Wraps a User Property that the client received, for the message that carries it.
     static UserProperty received(Property.UserProperty property) {
         return new UserProperty(property);
     }

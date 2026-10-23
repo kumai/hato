@@ -55,12 +55,10 @@ import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.Transport;
-import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
-import org.mqtt4j.hato.client.internal.common.protocol.Property;
 
 import static java.util.Objects.requireNonNull;
 
@@ -124,9 +122,10 @@ public final class ClientActor implements MqttClient {
     // package-private accessor.
     private final Function<DeliveryOptions, HandlerExecution> executionOf;
 
-    // Received User Properties skip the check of their strings, which the codec validated; only
-    // the builder can pass the package-private factory that does so.
-    private final Function<Property.UserProperty, UserProperty> userPropertyOf;
+    // A received message takes over the arrays that decoding made for it and skips the check of
+    // the strings that the codec validated; only the builder can pass the package-private
+    // factory that does so.
+    private final Function<Packet.Publish, MqttMessage> messageOf;
 
     private final ClientTermination termination;
 
@@ -255,7 +254,8 @@ public final class ClientActor implements MqttClient {
             RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf,
-            Function<Property.UserProperty, UserProperty> userPropertyOf,
+            Function<Packet.Publish, MqttMessage> messageOf,
+            Function<MqttMessage, byte[]> payloadOf,
             Function<ClientSnapshot, ClientStats> statsOf,
             ClientLimits limits
     ) {
@@ -278,7 +278,8 @@ public final class ClientActor implements MqttClient {
                 rules,
                 responseTimeout,
                 executionOf,
-                userPropertyOf,
+                messageOf,
+                payloadOf,
                 statsOf,
                 limits
         );
@@ -303,7 +304,8 @@ public final class ClientActor implements MqttClient {
             RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf,
-            Function<Property.UserProperty, UserProperty> userPropertyOf,
+            Function<Packet.Publish, MqttMessage> messageOf,
+            Function<MqttMessage, byte[]> payloadOf,
             Function<ClientSnapshot, ClientStats> statsOf,
             ClientLimits limits
     ) {
@@ -312,7 +314,7 @@ public final class ClientActor implements MqttClient {
         this.version = version;
         this.scheduler = scheduler;
         this.executionOf = executionOf;
-        this.userPropertyOf = userPropertyOf;
+        this.messageOf = messageOf;
         this.statsOf = statsOf;
         this.limits = limits;
         cleanStart = sessionExpiry.isZero();
@@ -366,7 +368,8 @@ public final class ClientActor implements MqttClient {
                 ClientIo.BATCH_BYTE_LIMIT,
                 transportFactory,
                 new IoEvents(),
-                codec
+                codec,
+                payloadOf
         );
         core = new SessionCore(
                 new CorePort(),
@@ -1607,7 +1610,7 @@ public final class ClientActor implements MqttClient {
                 Packet.Publish publish,
                 int bytes
         ) {
-            MqttMessage message = MessageProperties.received(publish, userPropertyOf);
+            MqttMessage message = messageOf.apply(publish);
             if (publish.qos() == Qos.AT_MOST_ONCE) {
                 // Its lanes take it at the end of the actor's run; see continueRun().
                 arrivals.add(new DeliveryLanes.Arrival(token, ids, message, publish.dup(), bytes));
