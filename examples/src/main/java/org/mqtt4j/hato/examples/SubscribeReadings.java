@@ -10,13 +10,15 @@ import org.mqtt4j.hato.TopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
-/// Prints the sensor readings from the root README until Enter is pressed.
+/// Prints the sensor readings from the client guide until Enter is pressed.
 public final class SubscribeReadings {
 
     void main() {
-        try (MqttClient client = MqttClient.builder()
-                .server(URI.create("mqtt://localhost:1883"))
-                .build()) {
+        try (
+                MqttClient client = MqttClient.builder()
+                        .server(URI.create("mqtt://localhost:1883"))
+                        .build()
+        ) {
             client.connect().join();
             client.subscribe(
                     Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_MOST_ONCE),

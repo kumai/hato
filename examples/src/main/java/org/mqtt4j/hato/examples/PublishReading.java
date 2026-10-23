@@ -9,13 +9,15 @@ import org.mqtt4j.hato.Topic;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
-/// Publishes the temperature reading from the root README to a local broker.
+/// Publishes the temperature reading from the client guide to a local broker.
 public final class PublishReading {
 
     void main() {
-        try (MqttClient client = MqttClient.builder()
-                .server(URI.create("mqtt://localhost:1883"))
-                .build()) {
+        try (
+                MqttClient client = MqttClient.builder()
+                        .server(URI.create("mqtt://localhost:1883"))
+                        .build()
+        ) {
             client.connect().join();
             client.publish(MqttMessage.of(
                     new Topic("sensors/kitchen/temperature"),

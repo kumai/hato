@@ -1,4 +1,4 @@
-# Dependency and plugin versions. Only test and build-time dependencies appear here:
+# Dependency and plugin versions. Only example, test, and build-time dependencies appear here:
 # the published modules have no runtime dependencies by design.
 
 [versions]
@@ -12,6 +12,7 @@ errorprone = "2.50.0"
 nullaway = "0.14.2"
 errorprone-plugin = "5.1.1"
 checkstyle = "14.3.0"
+micrometer = "1.17.2"
 
 [libraries]
 # Nullness annotations. Build-time only: never a runtime or POM dependency of the published jars.
@@ -24,6 +25,8 @@ checkstyle = { module = "com.puppycrawl.tools:checkstyle", version.ref = "checks
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
 assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
 awaitility = { module = "org.awaitility:awaitility", version.ref = "awaitility" }
+# Monitoring example only; the client has no dependency on Micrometer.
+micrometer-core = { module = "io.micrometer:micrometer-core", version.ref = "micrometer" }
 # Real brokers in Docker for the integrationTest suites. Only the core library is used: each test
 # class decides whether a missing Docker skips it or, in CI, fails the build.
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
