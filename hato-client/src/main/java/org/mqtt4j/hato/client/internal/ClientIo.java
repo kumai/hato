@@ -474,7 +474,11 @@ final class ClientIo {
                 }
             }
             try {
-                result = connection.transport.send(sends.getLast().ticket(), bytes);
+                long ticket = sends.getLast().ticket();
+                // Writing here saves handing the write to a thread of the transport's own.
+                result = connection.transport instanceof BlockingWriteTransport direct
+                        ? direct.write(ticket, bytes)
+                        : connection.transport.send(ticket, bytes);
             } catch (RuntimeException failure) {
                 ended(connection, failure);
                 return;

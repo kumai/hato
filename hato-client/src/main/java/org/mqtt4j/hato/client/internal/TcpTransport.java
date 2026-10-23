@@ -28,8 +28,9 @@ import org.mqtt4j.hato.client.internal.common.log.Log;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
-/// Socket ownership and named reader/writer threads. Closing never waits for either worker.
-public final class TcpTransport implements Transport, PausableTransport {
+/// Socket ownership, a named reader thread, and writes: on the caller's thread through
+/// [#write], or on a named writer thread through [#send]. Closing waits for none of them.
+public final class TcpTransport implements Transport, PausableTransport, BlockingWriteTransport {
 
     private static final Log log = Log.of(TcpTransport.class);
 
@@ -101,6 +102,11 @@ public final class TcpTransport implements Transport, PausableTransport {
     private @Nullable Thread reader;
     private @Nullable Throwable terminalCause;
     private @Nullable Write pending;
+    // Writes the connection's frames, for the writer thread and for writes that the client makes.
+    private @Nullable FrameWriter frames;
+    // A write that the client makes through write() is under way.
+    private boolean writing;
+    private boolean writerStarted;
     private int ioWorkers;
     private boolean closed;
     private boolean started;
@@ -242,12 +248,13 @@ public final class TcpTransport implements Transport, PausableTransport {
                         if (closed) {
                             return;
                         }
+                        // Ready before onConnected, which may send at once. The writer thread
+                        // starts with the first send; a client that writes itself needs none.
+                        frames = new FrameWriter(socket.output());
                         receiver.onConnected();
                         if (closed) {
                             return;
                         }
-                        ioWorkers++;
-                        Thread.ofVirtual().name(threadName + "-writer").start(() -> write(socket));
                     }
                     read(socket, receiver);
                 } catch (Throwable failure) {
@@ -346,9 +353,8 @@ public final class TcpTransport implements Transport, PausableTransport {
         terminate(new EOFException("Peer closed the byte stream"));
     }
 
-    private void write(Connection socket) {
+    private void writeSends(FrameWriter writer) {
         try {
-            var writer = new FrameWriter(socket.output());
             while (true) {
                 Write send;
                 synchronized (callbacks) {
@@ -382,19 +388,65 @@ public final class TcpTransport implements Transport, PausableTransport {
     public SendResult send(long ticket, byte[] bytes) {
         requireNonNull(bytes, "bytes");
         synchronized (callbacks) {
-            if (closed) {
+            FrameWriter writer = admit();
+            if (writer == null) {
                 return SendResult.CLOSED;
             }
-            if (!connected) {
-                throw new IllegalStateException("Transport is not connected");
-            }
-            if (pending != null) {
-                throw new IllegalStateException("A send is already outstanding");
+            if (!writerStarted) {
+                writerStarted = true;
+                ioWorkers++;
+                Thread.ofVirtual().name(threadName + "-writer").start(() -> writeSends(writer));
             }
             pending = new Write(ticket, bytes);
             callbacks.notifyAll();
             return SendResult.ACCEPTED;
         }
+    }
+
+    @Override
+    public SendResult write(long ticket, byte[] bytes) {
+        requireNonNull(bytes, "bytes");
+        FrameWriter writer;
+        synchronized (callbacks) {
+            writer = admit();
+            if (writer == null) {
+                return SendResult.CLOSED;
+            }
+            writing = true;
+            // onClosed waits for this write, as it waits for the writer thread.
+            ioWorkers++;
+        }
+        try {
+            writer.write(bytes);
+            synchronized (callbacks) {
+                writing = false;
+                Listener receiver = listener;
+                // Report a finished write even while closing, as the writer thread does.
+                if (receiver != null) {
+                    receiver.onSent(ticket);
+                }
+            }
+        } catch (Throwable failure) {
+            terminate(failure);
+        } finally {
+            workerEnded();
+        }
+        return SendResult.ACCEPTED;
+    }
+
+    /// Caller holds callbacks. The frame writer for one more write, or null once closed.
+    private @Nullable FrameWriter admit() {
+        if (closed) {
+            return null;
+        }
+        FrameWriter writer = frames;
+        if (!connected || writer == null) {
+            throw new IllegalStateException("Transport is not connected");
+        }
+        if (pending != null || writing) {
+            throw new IllegalStateException("A send is already outstanding");
+        }
+        return writer;
     }
 
     @Override
@@ -417,7 +469,8 @@ public final class TcpTransport implements Transport, PausableTransport {
             Connection socket = connection;
             connection = null;
             if (socket != null) {
-                if (graceful && connected && pending == null && socket.closesGracefully()) {
+                if (graceful && connected && pending == null && !writing
+                        && socket.closesGracefully()) {
                     ioWorkers++;
                     Thread.ofVirtual().name(threadName + "-close").start(() -> {
                         try {

@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
@@ -14,6 +15,7 @@ import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
@@ -31,6 +33,7 @@ import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
+import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -756,6 +759,96 @@ class TcpTransportTest {
     }
 
     @Test
+    void a_write_made_by_the_caller_is_reported_on_its_thread_before_it_returns()
+            throws Exception {
+        // Arrange
+        var socket = new GracefulConnection();
+        var output = new ByteArrayOutputStream();
+        socket.output = output;
+        var receiver = new WritingListener();
+        try (TcpTransport sut = transport(socket, clock)) {
+            sut.start(SERVER, TIMEOUT, receiver);
+            receiver.connected.get(5, SECONDS);
+
+            // Act
+            Transport.SendResult result = sut.write(7, new byte[] {1, 2, 3});
+
+            // Assert: the bytes are written and reported on this thread, before write returns.
+            assertThat(result).isEqualTo(Transport.SendResult.ACCEPTED);
+            assertThat(output.toByteArray()).containsExactly(1, 2, 3);
+            assertThat(receiver.sent).containsExactly(7L);
+            assertThat(receiver.senders).containsExactly(Thread.currentThread());
+        } finally {
+            socket.abort();
+        }
+    }
+
+    @Test
+    void closing_during_a_write_made_by_the_caller_leaves_it_to_on_closed() throws Exception {
+        // Arrange: the socket takes no bytes until it is aborted.
+        var socket = new GracefulConnection();
+        var writing = new CountDownLatch(1);
+        socket.output = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                write(new byte[] {(byte) value}, 0, 1);
+            }
+
+            @Override
+            public void write(byte[] bytes, int offset, int length) throws IOException {
+                writing.countDown();
+                socket.aborted.join();
+                throw new IOException("Socket aborted");
+            }
+        };
+        var receiver = new WritingListener();
+        try (TcpTransport sut = transport(socket, clock)) {
+            sut.start(SERVER, TIMEOUT, receiver);
+            receiver.connected.get(5, SECONDS);
+            var result = new CompletableFuture<Transport.SendResult>();
+            Thread.ofVirtual().start(() -> result.complete(sut.write(1, new byte[] {1})));
+            assertThat(writing.await(5, SECONDS)).isTrue();
+
+            // Act
+            sut.close();
+
+            // Assert: close does not wait for the write, which onClosed releases once it ends.
+            assertThat(socket.aborted).isDone();
+            assertThat(result.get(5, SECONDS)).isEqualTo(Transport.SendResult.ACCEPTED);
+            assertThat(receiver.closed.get(5, SECONDS)).hasMessage("Transport closed");
+            assertThat(receiver.sent).isEmpty();
+            assertThat(receiver.endings).hasValue(1);
+            assertThat(sut.write(2, new byte[] {2})).isEqualTo(Transport.SendResult.CLOSED);
+        } finally {
+            socket.abort();
+        }
+    }
+
+    @Test
+    void a_send_is_written_by_a_writer_thread_that_the_first_send_starts() throws Exception {
+        // Arrange
+        var socket = new GracefulConnection();
+        var output = new ByteArrayOutputStream();
+        socket.output = output;
+        var receiver = new WritingListener();
+        try (TcpTransport sut = transport(socket, clock)) {
+            sut.start(SERVER, TIMEOUT, receiver);
+            receiver.connected.get(5, SECONDS);
+
+            // Act
+            Transport.SendResult result = sut.send(7, new byte[] {1, 2, 3});
+
+            // Assert: a transport wrapped by the application still writes without its caller.
+            assertThat(result).isEqualTo(Transport.SendResult.ACCEPTED);
+            assertThat(receiver.sent.poll(5, SECONDS)).isEqualTo(7L);
+            assertThat(requireNonNull(receiver.senders.poll()).getName()).endsWith("-writer");
+            assertThat(output.toByteArray()).containsExactly(1, 2, 3);
+        } finally {
+            socket.abort();
+        }
+    }
+
+    @Test
     void failed_timer_cancellation_does_not_end_a_successful_connection() throws Exception {
         // Arrange
         var socket = new GracefulConnection();
@@ -851,6 +944,7 @@ class TcpTransportTest {
         Runnable handshakeAction = () -> { };
         @Nullable IOException handshakeFailure;
         @Nullable IOException shutdownFailure;
+        OutputStream output = OutputStream.nullOutputStream();
 
         @Override
         public void handshake() throws IOException {
@@ -873,7 +967,7 @@ class TcpTransportTest {
 
         @Override
         public OutputStream output() {
-            return OutputStream.nullOutputStream();
+            return output;
         }
 
         @Override
@@ -971,6 +1065,25 @@ class TcpTransportTest {
         public void onClosed(Throwable cause) {
             endings.incrementAndGet();
             closed.complete(cause);
+        }
+    }
+
+    /// Records the writes that the transport reports, and the thread that reported each.
+    private static final class WritingListener extends RecordingListener {
+
+        final CompletableFuture<Void> connected = new CompletableFuture<>();
+        final LinkedBlockingQueue<Long> sent = new LinkedBlockingQueue<>();
+        final LinkedBlockingQueue<Thread> senders = new LinkedBlockingQueue<>();
+
+        @Override
+        public void onConnected() {
+            connected.complete(null);
+        }
+
+        @Override
+        public void onSent(long ticket) {
+            senders.add(Thread.currentThread());
+            sent.add(ticket);
         }
     }
 
