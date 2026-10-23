@@ -25,11 +25,17 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 /// A broker stand-in for one subscriber, so that the time measured is the client's alone.
 ///
 /// It accepts one connection, grants the subscriptions of its first SUBSCRIBE, and then sends
-/// `count` messages to `topic`, numbered from 0. QoS 1 messages go out with at most `window`
+/// the messages of its [Traffic], numbered from 0. QoS 1 messages go out with at most `window`
 /// unacknowledged, the way RabbitMQ sends them under its MQTT prefetch, which is 10 by default.
-/// QoS 0 messages go out as fast as the socket takes them, so a client that stops reading slows
-/// them down, and one that reads on regardless may drop some. The stand-in answers PINGREQ and
-/// does no other broker work.
+/// QoS 0 messages go out as the socket takes them, so a client that stops reading holds them back,
+/// and one that reads on regardless may drop some. The stand-in answers PINGREQ and does no other
+/// broker work.
+///
+/// Without a rate, the messages go out as fast as the subscriber takes them, each carrying the
+/// time that it was written. With a rate, message `n` is due `n / rate` seconds after the first
+/// and carries the time that it was due. A message that a full window or a client that stopped
+/// reading held back thus counts its wait as latency, as it would wait in a broker's queue,
+/// instead of hiding it.
 final class StubBroker implements AutoCloseable {
 
     // How long a subscriber may leave every message of the window unacknowledged.
@@ -37,15 +43,7 @@ final class StubBroker implements AutoCloseable {
 
     private final ServerSocket server;
 
-    private final String topic;
-
-    private final int qos;
-
-    private final int payloadSize;
-
-    private final int window;
-
-    private final long count;
+    private final Traffic traffic;
 
     // Sending thread and reading thread both write: messages and PINGRESP.
     private final ReentrantLock writing = new ReentrantLock();
@@ -54,17 +52,37 @@ final class StubBroker implements AutoCloseable {
 
     private volatile @Nullable IOException readFailure;
 
-    StubBroker(String topic, int qos, int payloadSize, int window, long count) throws IOException {
+    // The most that a paced message went out after it was due, in microseconds.
+    private volatile long maxLatenessMicros;
+
+    StubBroker(Traffic traffic) throws IOException {
         this.server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
-        this.topic = topic;
-        this.qos = qos;
-        this.payloadSize = payloadSize;
-        this.window = window;
-        this.count = count;
+        this.traffic = traffic;
+    }
+
+    /// What the stand-in sends: `count` messages of `payloadSize` bytes to `topic` at `qos`, with
+    /// at most `window` of them unacknowledged at QoS 1, at `rate` messages per second, or as fast
+    /// as the subscriber takes them when `rate` is 0.
+    record Traffic(String topic, int qos, int payloadSize, int window, long count, long rate) {
+
+        boolean paced() {
+            return rate > 0;
+        }
     }
 
     int port() {
         return server.getLocalPort();
+    }
+
+    /// The most that a paced message went out after it was due so far, in microseconds: 0 for
+    /// traffic without a rate.
+    ///
+    /// A message goes out late when the subscriber holds the stand-in back, through a full window
+    /// or by not reading, and also when the stand-in itself does not get to run. A QoS 0 run
+    /// against a client that keeps reading shows the stand-in alone, and so how much of the
+    /// latencies measured the stand-in can account for.
+    long maxLatenessMicros() {
+        return maxLatenessMicros;
     }
 
     /// Serves one subscriber: waits for it to connect and subscribe, then sends every message.
@@ -85,15 +103,15 @@ final class StubBroker implements AutoCloseable {
 
         // Each permit is room for one unacknowledged QoS 1 message. The subscriber's packets
         // arrive on a thread of their own, which returns a permit for each PUBACK.
-        var unacknowledged = new Semaphore(window);
+        var unacknowledged = new Semaphore(traffic.window());
         Thread.ofPlatform()
                 .name("stub-broker-reader")
                 .daemon()
                 .start(() -> read(in, out, unacknowledged));
         send(out, unacknowledged);
-        if (qos > 0) {
+        if (traffic.qos() > 0) {
             // Every permit back means every message acknowledged.
-            await(unacknowledged, window);
+            await(unacknowledged, traffic.window());
         }
         IOException failure = readFailure;
         if (failure != null) {
@@ -101,27 +119,57 @@ final class StubBroker implements AutoCloseable {
         }
     }
 
+    /// Sends every message. Each pass writes the messages that are due, all of them when the
+    /// traffic has no rate, and then flushes them, so that a paced message goes out when it is
+    /// due.
+    ///
+    /// Message `n` is due `n / rate` seconds after the start on the wall clock, the clock that
+    /// the subscriber reads latency from: a schedule kept on another clock and converted would
+    /// carry any delay between the two first readings into every latency. Between messages the
+    /// sender spins rather than parks, so that no message goes out late by however long the
+    /// scheduler oversleeps; with a rate, the stand-in keeps one processor busy.
     private void send(OutputStream out, Semaphore unacknowledged)
             throws IOException, InterruptedException {
-        var frame = new PublishFrame(topic, qos, payloadSize);
+        var frame = new PublishFrame(traffic.topic(), traffic.qos(), traffic.payloadSize());
+        long startMicros = Payloads.nowMicros();
         int packetId = 0;
-        for (long sequence = 0; sequence < count; sequence++) {
-            if (qos > 0) {
-                if (!unacknowledged.tryAcquire()) {
-                    // The subscriber cannot acknowledge what is still in the buffer.
-                    flush(out);
-                    await(unacknowledged, 1);
+        long sequence = 0;
+        while (sequence < traffic.count()) {
+            long due = traffic.count();
+            if (traffic.paced()) {
+                long elapsed = Payloads.nowMicros() - startMicros;
+                due = Math.min(due, elapsed * traffic.rate() / 1_000_000 + 1);
+                if (sequence == due) {
+                    Thread.onSpinWait();
+                    continue;
                 }
-                packetId = packetId % 65_535 + 1;
+                // The first message due in this pass is the one that has waited longest.
+                long lateness = elapsed - sequence * 1_000_000 / traffic.rate();
+                if (lateness > maxLatenessMicros) {
+                    maxLatenessMicros = lateness;
+                }
             }
-            writing.lock();
-            try {
-                frame.write(out, packetId, sequence, Payloads.nowMicros());
-            } finally {
-                writing.unlock();
+            for (; sequence < due; sequence++) {
+                if (traffic.qos() > 0) {
+                    if (!unacknowledged.tryAcquire()) {
+                        // The subscriber cannot acknowledge what is still in the buffer.
+                        flush(out);
+                        await(unacknowledged, 1);
+                    }
+                    packetId = packetId % 65_535 + 1;
+                }
+                long sentMicros = traffic.paced()
+                        ? startMicros + sequence * 1_000_000 / traffic.rate()
+                        : Payloads.nowMicros();
+                writing.lock();
+                try {
+                    frame.write(out, packetId, sequence, sentMicros);
+                } finally {
+                    writing.unlock();
+                }
             }
+            flush(out);
         }
-        flush(out);
     }
 
     private void await(Semaphore unacknowledged, int permits)

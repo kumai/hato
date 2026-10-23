@@ -3,11 +3,13 @@ package org.mqtt4j.hato.comparison;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.jspecify.annotations.Nullable;
 
-/// Counts the messages that reach a subscriber's handler and marks the stretch that is measured.
+/// Counts the messages that reach a subscriber's handler, takes each one's latency, and marks the
+/// stretch that is measured.
 ///
 /// The messages numbered below `warmup` warm up the client and are not measured. The stretch
 /// starts with the first message handled from `warmup` on, and ends with the last message sent,
@@ -19,16 +21,26 @@ import org.jspecify.annotations.Nullable;
 /// The sequence numbers also tell how many messages came off the wire in the stretch, handled or
 /// dropped: every client delivers a subscription's messages in order, so the stretch spans the
 /// numbers from its first handled message to its last.
+///
+/// A message's latency runs from the send time in its payload to the start of its handler.
 final class Reception {
 
     // How often the waiting thread checks for the end.
     private static final Duration POLL = Duration.ofMillis(5);
+
+    // The latency slot of a message that the handler has not received.
+    private static final long NOT_HANDLED = Long.MIN_VALUE;
 
     private static final ThreadMXBean threads = ManagementFactory.getThreadMXBean();
 
     private final long expected;
 
     private final long warmup;
+
+    // The latency of each message from `warmup` on, in microseconds, at its sequence number less
+    // `warmup`. Written by the handler before the volatile fields below, so that a thread that
+    // has read those sees it.
+    private final long[] latencies;
 
     private final AtomicLong handled = new AtomicLong();
 
@@ -56,10 +68,16 @@ final class Reception {
         }
         this.expected = expected;
         this.warmup = warmup;
+        this.latencies = new long[Math.toIntExact(expected - warmup)];
+        Arrays.fill(latencies, NOT_HANDLED);
     }
 
-    /// The handler under measurement: it counts the message and does nothing else with it.
+    /// The handler under measurement: it takes the message's latency, counts the message, and
+    /// does nothing else with it.
     void handle(long sequence, long sentMicros) {
+        if (sequence >= warmup) {
+            latencies[(int) (sequence - warmup)] = Payloads.nowMicros() - sentMicros;
+        }
         long count = handled.incrementAndGet();
         lastNanos = System.nanoTime();
         lastSequence = sequence;
@@ -96,7 +114,7 @@ final class Reception {
         ProcessUsage first = start;
         if (first == null) {
             var nothing = new ProcessUsage(0, 0, 0, 0, 0);
-            return new Result(expected, handled.get(), 0, 0, 0, nothing, 0);
+            return new Result(expected, handled.get(), 0, 0, 0, nothing, 0, Latency.NONE);
         }
         long arrived = lastSequence - firstSequence;
         ProcessUsage last = end;
@@ -108,7 +126,8 @@ final class Reception {
                 arrived,
                 lastNanos - first.nanos(),
                 used,
-                threads.getPeakThreadCount()
+                threads.getPeakThreadCount(),
+                Latency.of(latencies)
         );
     }
 
@@ -121,6 +140,7 @@ final class Reception {
     /// @param elapsedNanos the time from the end of the warm-up to the last message handled
     /// @param used what the process used from the end of the warm-up to the end of the run
     /// @param peakThreads the most platform threads alive at once after the warm-up
+    /// @param latency the latencies of the messages handled after the warm-up
     record Result(
             long expected,
             long handled,
@@ -128,7 +148,8 @@ final class Reception {
             long arrived,
             long elapsedNanos,
             ProcessUsage used,
-            int peakThreads
+            int peakThreads,
+            Latency latency
     ) {
 
         /// The result as `key=value` words separated by spaces, which [Arguments] reads back.
@@ -142,7 +163,39 @@ final class Reception {
                     + " allocatedBytes=" + used.allocatedBytes()
                     + " gcCount=" + used.gcCount()
                     + " gcMillis=" + used.gcMillis()
-                    + " peakThreads=" + peakThreads;
+                    + " peakThreads=" + peakThreads
+                    + " p50Micros=" + latency.p50()
+                    + " p99Micros=" + latency.p99()
+                    + " p999Micros=" + latency.p999()
+                    + " maxMicros=" + latency.max();
+        }
+    }
+
+    /// Percentiles of the latencies of handled messages, in microseconds.
+    record Latency(long p50, long p99, long p999, long max) {
+
+        static final Latency NONE = new Latency(0, 0, 0, 0);
+
+        /// The percentiles of `latencies`, skipping the slots of messages never handled.
+        static Latency of(long[] latencies) {
+            long[] sorted = Arrays.stream(latencies)
+                    .filter(latency -> latency != NOT_HANDLED)
+                    .sorted()
+                    .toArray();
+            if (sorted.length == 0) {
+                return NONE;
+            }
+            return new Latency(
+                    below(sorted, 0.5),
+                    below(sorted, 0.99),
+                    below(sorted, 0.999),
+                    sorted[sorted.length - 1]
+            );
+        }
+
+        /// The value below which the `fraction` of the values in `sorted` lie.
+        private static long below(long[] sorted, double fraction) {
+            return sorted[Math.min(sorted.length - 1, (int) (sorted.length * fraction))];
         }
     }
 }

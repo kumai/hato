@@ -44,6 +44,22 @@ class ReceptionTest {
     }
 
     @Test
+    void latency_runs_from_the_send_time_in_the_payload_and_leaves_out_the_warm_up()
+            throws Exception {
+        // Arrange
+        var sut = new Reception(10, 3);
+        long now = Payloads.nowMicros();
+        // Act: the warm-up messages were sent a minute ago, the others two milliseconds ago.
+        for (long sequence = 0; sequence < 10; sequence++) {
+            sut.handle(sequence, now - (sequence < 3 ? 60_000_000 : 2_000));
+        }
+        Reception.Result result = sut.await(IDLE, LIMIT);
+        // Assert
+        assertThat(result.latency().p50()).isGreaterThanOrEqualTo(2_000);
+        assertThat(result.latency().max()).isLessThan(60_000_000);
+    }
+
+    @Test
     void a_run_whose_connection_ends_during_the_warm_up_measures_nothing() throws Exception {
         // Arrange
         var sut = new Reception(10, 3);

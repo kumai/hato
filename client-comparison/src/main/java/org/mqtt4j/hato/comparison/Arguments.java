@@ -29,6 +29,13 @@ record Arguments(Map<String, String> values) {
         return parse(Arrays.asList(line.trim().split("\\s+")));
     }
 
+    /// These settings with `key` set to `value`.
+    Arguments with(String key, String value) {
+        var copy = new HashMap<>(values);
+        copy.put(key, value);
+        return new Arguments(copy);
+    }
+
     String text(String key) {
         String value = values.get(key);
         if (value == null) {
