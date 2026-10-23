@@ -677,18 +677,25 @@ public final class ClientActor implements MqttClient {
         Throwable failure = null;
         try {
             Optional<Mailbox.Event> next;
-            long busySince = System.nanoTime();
+            // The time spent on events since the actor last let others run. Waiting for an event
+            // frees the carrier, so only the handling counts.
+            long worked = 0;
             while ((next = mailbox.take(stopping::get)).isPresent()) {
+                long started = System.nanoTime();
                 Mailbox.Event event = next.orElseThrow();
                 handle(event);
                 if (event.kind() == Mailbox.Kind.AT_MOST_ONCE) {
                     continueRun();
                 }
                 deliverArrivals();
-                if (CarrierShare.due(busySince)) {
+                worked += System.nanoTime() - started;
+                if (CarrierShare.spent(worked)) {
                     // The actor blocks next when its mailbox is empty, which frees the carrier
                     // without parking.
-                    busySince = mailbox.size() == 0 ? System.nanoTime() : CarrierShare.share();
+                    if (mailbox.size() != 0) {
+                        CarrierShare.share();
+                    }
+                    worked = 0;
                 }
             }
         } catch (Throwable cause) {
