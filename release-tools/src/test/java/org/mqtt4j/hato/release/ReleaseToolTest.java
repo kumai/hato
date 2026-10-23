@@ -63,8 +63,57 @@ class ReleaseToolTest {
         assertThat(ReleaseTool.publishingType(Map.of())).isEqualTo(PublishingType.USER_MANAGED);
     }
 
+    @Test
+    void the_next_command_moves_only_the_version_line_after_a_release_of_that_version()
+            throws Exception {
+        // Arrange
+        Path properties = Files.writeString(
+                directory.resolve("gradle.properties"),
+                """
+                # Publication coordinates.
+                group=org.mqtt4j
+                version=0.8.0-SNAPSHOT
+                """
+        );
+        Path output = directory.resolve("github-output");
+        Map<String, String> environment = Map.of(
+                "RELEASE_VERSION", "0.8.0",
+                "GITHUB_OUTPUT", output.toString()
+        );
+
+        // Act
+        ReleaseTool.run(List.of("next", properties.toString()), environment);
+
+        // Assert
+        assertThat(Files.readString(properties)).isEqualTo("""
+                # Publication coordinates.
+                group=org.mqtt4j
+                version=0.9.0-SNAPSHOT
+                """);
+        assertThat(Files.readString(output)).isEqualTo("next=0.9.0-SNAPSHOT\n");
+    }
+
+    @Test
+    void the_next_command_keeps_the_version_after_a_release_of_an_earlier_one() throws Exception {
+        // Arrange
+        Path properties = properties("0.8.0-SNAPSHOT");
+        Path output = directory.resolve("github-output");
+        Map<String, String> environment = Map.of(
+                "RELEASE_VERSION", "0.7.1",
+                "GITHUB_OUTPUT", output.toString()
+        );
+
+        // Act
+        ReleaseTool.run(List.of("next", properties.toString()), environment);
+
+        // Assert
+        assertThat(Files.readString(properties))
+                .isEqualTo("group=org.mqtt4j\nversion=0.8.0-SNAPSHOT\n");
+        assertThat(output).doesNotExist();
+    }
+
     @ParameterizedTest(name = "\"{0}\"")
-    @ValueSource(strings = {"", "publish", "bundle 0.3.0", "upload a.zip b.zip"})
+    @ValueSource(strings = {"", "publish", "bundle 0.3.0", "upload a.zip b.zip", "next"})
     void unknown_commands_and_wrong_arguments_show_the_usage(String arguments) {
         List<String> args = arguments.isEmpty() ? List.of() : List.of(arguments.split(" "));
 

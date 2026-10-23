@@ -19,3 +19,15 @@ tasks.register<JavaExec>("checkReleaseTag") {
     args("version", layout.settingsDirectory.file("gradle.properties").asFile.path)
     notCompatibleWithConfigurationCache("Reads the GitHub Actions environment of each run")
 }
+
+// The last job of the release workflow. The tool reads the released version from the
+// environment, moves gradle.properties on if that release calls for it, and writes the new
+// version to GITHUB_OUTPUT.
+tasks.register<JavaExec>("moveToNextVersion") {
+    group = "publishing"
+    description = "Moves gradle.properties to the next minor SNAPSHOT after a release of its version."
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass = application.mainClass
+    args("next", layout.settingsDirectory.file("gradle.properties").asFile.path)
+    notCompatibleWithConfigurationCache("Reads the GitHub Actions environment of each run")
+}

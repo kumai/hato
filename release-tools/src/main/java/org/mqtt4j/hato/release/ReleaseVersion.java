@@ -2,6 +2,7 @@ package org.mqtt4j.hato.release;
 
 import java.util.Arrays;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -78,6 +79,25 @@ final class ReleaseVersion {
             );
         }
         return version;
+    }
+
+    /// Returns the version that `gradle.properties` moves to once `released` is published from a
+    /// commit with `committedVersion`, or empty when it stays.
+    ///
+    /// Only a final release of the committed version moves it, to the next minor version's
+    /// SNAPSHOT: `0.8.0` moves `0.8.0-SNAPSHOT` to `0.9.0-SNAPSHOT`, which still allows patch
+    /// releases such as `0.8.1`. A pre-release, or a release of an earlier version such as
+    /// `0.7.1`, leaves the committed version alone. A major version is set by hand.
+    static Optional<String> next(String released, String committedVersion) {
+        check(released);
+        if (released.contains("-")) {
+            return Optional.empty();
+        }
+        int[] numbers = numbers(released);
+        if (!Arrays.equals(numbers, numbers(committedVersion))) {
+            return Optional.empty();
+        }
+        return Optional.of("%d.%d.0-SNAPSHOT".formatted(numbers[0], numbers[1] + 1));
     }
 
     /// Returns the three numbers at the start of `version`, such as 0, 8, and 0 for

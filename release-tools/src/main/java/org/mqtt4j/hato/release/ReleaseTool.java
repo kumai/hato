@@ -9,7 +9,10 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.mqtt4j.hato.release.CentralUpload.PublishingType;
 
@@ -27,6 +30,9 @@ import static java.nio.file.StandardOpenOption.CREATE;
 ///   publishes the bundle once it passes validation, and the command waits until publishing
 ///   starts. Any other run, such as a manual trial, leaves publishing to the maintainer and
 ///   waits until the Portal validates the bundle.
+/// - `next <gradle.properties>` moves the version in `gradle.properties` on once the version in
+///   `RELEASE_VERSION` is published, as [ReleaseVersion#next] decides, and writes the new
+///   version to `GITHUB_OUTPUT` as `next`. It writes nothing when the version stays.
 ///
 /// A failure that the maintainer can act on ends with exit status 1 and a message that says
 /// what to do.
@@ -39,7 +45,8 @@ public final class ReleaseTool {
     private static final String USAGE = """
             Usage: release-tools version <gradle.properties>
                    release-tools bundle <version> <bundle.zip>
-                   release-tools upload <bundle.zip>""";
+                   release-tools upload <bundle.zip>
+                   release-tools next <gradle.properties>""";
 
     private ReleaseTool() {
     }
@@ -65,6 +72,8 @@ public final class ReleaseTool {
             ReleaseBundle.verify(Path.of(args.get(2)), args.get(1));
         } else if (command.equals("upload") && args.size() == 2) {
             upload(Path.of(args.get(1)), environment);
+        } else if (command.equals("next") && args.size() == 2) {
+            next(Path.of(args.get(1)), environment);
         } else {
             throw new ReleaseException(USAGE);
         }
@@ -72,26 +81,64 @@ public final class ReleaseTool {
 
     private static void version(Path properties, Map<String, String> environment)
             throws IOException {
-        var committed = new Properties();
-        try (BufferedReader reader = Files.newBufferedReader(properties)) {
-            committed.load(reader);
-        }
-        String committedVersion = committed.getProperty("version");
-        if (committedVersion == null) {
-            throw new ReleaseException("No version in " + properties);
-        }
         var ref = new ReleaseVersion.Ref(
                 required(environment, "GITHUB_EVENT_NAME"),
                 required(environment, "GITHUB_REF_TYPE"),
                 required(environment, "GITHUB_REF_NAME")
         );
-        String version = ReleaseVersion.of(ref, committedVersion.strip());
+        String version = ReleaseVersion.of(ref, committedVersion(properties));
         String output = environment.get("GITHUB_OUTPUT");
         if (output == null) {
             System.out.println(version);
         } else {
             Files.writeString(Path.of(output), "version=" + version + "\n", UTF_8, CREATE, APPEND);
         }
+    }
+
+    private static void next(Path properties, Map<String, String> environment)
+            throws IOException {
+        String committed = committedVersion(properties);
+        Optional<String> next = ReleaseVersion.next(
+                required(environment, "RELEASE_VERSION"),
+                committed
+        );
+        if (next.isEmpty()) {
+            System.out.println("gradle.properties keeps " + committed);
+            return;
+        }
+        // Replace only the version line, so that the comments and other properties stay as
+        // they are.
+        Pattern versionLine = Pattern.compile(
+                "^version=" + Pattern.quote(committed) + "$",
+                Pattern.MULTILINE
+        );
+        String text = Files.readString(properties);
+        if (versionLine.matcher(text).results().count() != 1) {
+            throw new ReleaseException(
+                    "Expected one line version=" + committed + " in " + properties
+            );
+        }
+        String nextVersion = next.get();
+        String moved = versionLine.matcher(text)
+                .replaceFirst(Matcher.quoteReplacement("version=" + nextVersion));
+        Files.writeString(properties, moved);
+        System.out.println("gradle.properties moves to " + nextVersion);
+        String output = environment.get("GITHUB_OUTPUT");
+        if (output != null) {
+            Files.writeString(Path.of(output), "next=" + nextVersion + "\n", UTF_8, CREATE, APPEND);
+        }
+    }
+
+    private static String committedVersion(Path properties) throws IOException {
+        var committed = new Properties();
+        try (BufferedReader reader = Files.newBufferedReader(properties)) {
+            committed.load(reader);
+        }
+        String version = committed.getProperty("version");
+        if (version == null) {
+            throw new ReleaseException("No version in " + properties);
+        }
+        return version.strip();
     }
 
     private static void upload(Path bundle, Map<String, String> environment)

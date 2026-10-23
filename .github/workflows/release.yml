@@ -82,3 +82,39 @@ jobs:
         run: |
           release-tools/build/install/release-tools/bin/release-tools upload \
             "distribution-tests/build/distributions/hato-${RELEASE_VERSION}.zip"
+
+  # After a release of the version on the default branch, move the branch to the next minor
+  # SNAPSHOT. Only first-party actions and the checksum-verified Gradle wrapper run here, and
+  # only the last step holds the token that can push.
+  next-version:
+    name: Move the default branch to the next version
+    needs: [version, upload]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - id: next
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: ./gradlew :release-tools:moveToNextVersion
+      - name: Push the version
+        if: steps.next.outputs.next != ''
+        env:
+          NEXT_VERSION: ${{ steps.next.outputs.next }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "build: move the version to ${NEXT_VERSION}" -- gradle.properties
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:${BRANCH}"
