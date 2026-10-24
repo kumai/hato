@@ -102,7 +102,7 @@ final class Routing {
             holds.remove(hold);
             for (Connection connection : connections) {
                 if (connection.clientId.equals(clientId)) {
-                    connection.release(type);
+                    connection.client.release(type);
                 }
             }
         }
@@ -112,7 +112,7 @@ final class Routing {
         synchronized (this) {
             var all = new ArrayList<BrokerServer.Held>();
             for (Connection connection : connections) {
-                for (Packet response : connection.held) {
+                for (Packet response : connection.client.held) {
                     all.add(new BrokerServer.Held(connection.clientId, response));
                 }
             }
