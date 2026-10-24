@@ -12,6 +12,7 @@ import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
+import org.mqtt4j.hato.client.internal.common.protocol.IncomingAliases;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
@@ -162,7 +163,7 @@ final class ClientIo {
         }
         var connection = new Connection(generation, transport, new SendQueue<>(budget));
         // The broker's Topic Aliases last for this connection, so its own callback resolves them.
-        var aliases = new IncomingAliases();
+        var aliases = new IncomingAliases(ConnectionEstablishment.TOPIC_ALIAS_MAXIMUM);
         var frames = new IncomingFrames(
                 maxPacketSize,
                 codec,

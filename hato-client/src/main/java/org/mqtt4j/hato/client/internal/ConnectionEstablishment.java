@@ -86,6 +86,11 @@ final class ConnectionEstablishment {
     // The Receive Maximum when the broker announces none, as no MQTT 3.1.1 broker can.
     private static final int DEFAULT_RECEIVE_MAXIMUM = 65_535;
 
+    // The Topic Alias Maximum that the client announces in CONNECT. A topic takes up to 65,535
+    // bytes, so the mapping holds at most about 1 MiB. The value is provisional: it covers
+    // Mosquitto's default of 10 aliases, and measurements may change it.
+    static final int TOPIC_ALIAS_MAXIMUM = 16;
+
     private final String clientId;
 
     private final MqttVersion version;
@@ -185,7 +190,7 @@ final class ConnectionEstablishment {
         properties.add(new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, maxPacketSize));
         properties.add(new Property.TwoByteValue(
                 PropertyId.TOPIC_ALIAS_MAXIMUM,
-                IncomingAliases.TOPIC_ALIAS_MAXIMUM
+                TOPIC_ALIAS_MAXIMUM
         ));
         return new Properties(properties);
     }

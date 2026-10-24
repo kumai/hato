@@ -1,18 +1,15 @@
-package org.mqtt4j.hato.client.internal;
+package org.mqtt4j.hato.common.protocol;
 
 import java.util.ArrayList;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
-import org.mqtt4j.hato.Qos;
-import org.mqtt4j.hato.ReasonCode;
-import org.mqtt4j.hato.Topic;
-import org.mqtt4j.hato.client.internal.common.protocol.Packet;
-import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
-import org.mqtt4j.hato.client.internal.common.protocol.Properties;
-import org.mqtt4j.hato.client.internal.common.protocol.Property;
-import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
+import org.mqtt4j.hato.common.value.Qos;
+import org.mqtt4j.hato.common.value.ReasonCode;
+import org.mqtt4j.hato.common.value.Topic;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -21,7 +18,14 @@ class IncomingAliasesTest {
 
     private static final Property USER_PROPERTY = new Property.UserProperty("site", "plant-3");
 
-    private final IncomingAliases sut = new IncomingAliases();
+    private final IncomingAliases sut = new IncomingAliases(16);
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 65_536})
+    void a_maximum_outside_the_two_byte_aliases_is_refused(int maximum) {
+        assertThatThrownBy(() -> new IncomingAliases(maximum))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 
     @Test
     void an_alias_that_a_publication_sets_resolves_a_later_publication_without_a_topic() {
