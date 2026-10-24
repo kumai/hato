@@ -188,9 +188,9 @@ class BrokerClientLimitsTest {
         try (var sut = MqttBroker.start();
                 var subscriber = RawSession.open(sut.port(), MqttVersion.V5);
                 RawSession publisher = connected(sut.port(), "publisher")) {
-            // Arrange
-            publisher.publish(retained("kept/large", "x".repeat(100)));
-            publisher.publish(retained("kept/small", "small"));
+            // Arrange: at QoS 1, the broker has stored each one once its PUBACK arrives.
+            publisher.publish(retained("kept/large", "x".repeat(100), AT_LEAST_ONCE, 1));
+            publisher.publish(retained("kept/small", "small", AT_LEAST_ONCE, 2));
             accepted(subscriber, connect("subscriber", true, maximumPacketSize(64)), false);
 
             // Act
@@ -198,7 +198,7 @@ class BrokerClientLimitsTest {
 
             // Assert
             assertThat(subscriber.expect(Packet.Publish.class))
-                    .isEqualTo(retained("kept/small", "small"));
+                    .isEqualTo(retained("kept/small", "small", AT_MOST_ONCE, 0));
             subscriber.ping();
         }
     }
@@ -307,14 +307,14 @@ class BrokerClientLimitsTest {
         );
     }
 
-    private static Packet.Publish retained(String topic, String payload) {
+    private static Packet.Publish retained(String topic, String payload, Qos qos, int packetId) {
         return new Packet.Publish(
                 new Topic(topic),
                 payload.getBytes(UTF_8),
-                AT_MOST_ONCE,
+                qos,
                 true,
                 false,
-                0,
+                packetId,
                 EMPTY
         );
     }
