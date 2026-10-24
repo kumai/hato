@@ -20,6 +20,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.Property;
+import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
@@ -33,6 +35,7 @@ import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_MOST_ONCE;
+import static org.mqtt4j.hato.broker.internal.common.value.Qos.EXACTLY_ONCE;
 
 class BrokerDeadlineTest {
 
@@ -110,6 +113,35 @@ class BrokerDeadlineTest {
                     .isEqualTo(new Packet.Disconnect(ReasonCode.KEEP_ALIVE_TIMEOUT, EMPTY));
             client.expectClosed();
             assertThat(timer.clock.pendingTaskCount()).isZero();
+        }
+    }
+
+    @Test
+    void a_server_keep_alive_replaces_the_keep_alive_that_the_client_asked_for()
+            throws Exception {
+        // Arrange: a Server Keep Alive of one second, for a client that asks for a minute.
+        var timer = new ManualTimer();
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, null, null, 16, 1);
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(CONNECT_TIMEOUT)
+                        .scheduler(timer)
+                        .capabilities(capabilities)
+                        .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                var client = RawSession.open(sut.port(), MqttVersion.V5)
+        ) {
+            client.send(connectV5("told", true, 60, 0));
+            Packet.ConnAck connAck = client.expect(Packet.ConnAck.class);
+
+            // Act
+            timer.clock.advance(KEEP_ALIVE_TIMEOUT);
+
+            // Assert: the broker keeps to the value that it announced [MQTT-3.2.2-21].
+            assertThat(connAck.properties().find(PropertyId.SERVER_KEEP_ALIVE))
+                    .contains(new Property.TwoByteValue(PropertyId.SERVER_KEEP_ALIVE, 1));
+            assertThat(client.expect(Packet.Disconnect.class))
+                    .isEqualTo(new Packet.Disconnect(ReasonCode.KEEP_ALIVE_TIMEOUT, EMPTY));
+            client.expectClosed();
         }
     }
 

@@ -2,6 +2,7 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
@@ -25,15 +26,11 @@ import static java.util.Objects.requireNonNull;
 
 // The client on one connection, as the broker sees it: it accepts the CONNECT that opens the
 // connection, then handles each packet that the client sends. Its state belongs to routing: the
-// session that the CONNECT attached, the Will, and the responses that a test holds back.
+// session that the CONNECT attached, what CONNACK announced, the Will, the Topic Aliases, and
+// the responses that a test holds back.
 final class Client {
 
     private static final Log log = Log.of(Client.class);
-
-    // The Topic Alias Maximum that the broker announces to MQTT 5.0 clients. It is the client's
-    // own value, and provisional like it; the aliases of one connection hold at most this many
-    // topics of up to 65,535 bytes each.
-    private static final int TOPIC_ALIAS_MAXIMUM = 16;
 
     private final Connection connection;
 
@@ -47,13 +44,25 @@ final class Client {
     // normal DISCONNECT discards it.
     private Packet.@Nullable Will will;
 
-    // The Topic Aliases that the client has set on this connection, from its acceptance; none in
-    // MQTT 3.1.1, which has no aliases.
+    // What CONNACK announced to the client, which the broker holds it to for the connection's
+    // life; nothing for MQTT 3.1.1 or before acceptance.
+    private Capabilities limits = Capabilities.UNANNOUNCED;
+
+    // The Topic Aliases that the client has set on this connection, from its acceptance; none
+    // without an announced Topic Alias Maximum, as in MQTT 3.1.1.
     private @Nullable IncomingAliases aliases;
 
     // The responses that a test holds back from this connection, in the order held. They end
     // with the connection.
     final ArrayDeque<Packet> held = new ArrayDeque<>();
+
+    // The publications that the client sent on this connection and that have no response yet,
+    // for an announced Receive Maximum: QoS 2 publications until PUBREL, and the PUBACKs and
+    // PUBCOMPs that a test holds back. A response in the send queue counts as sent, so the count
+    // never exceeds the client's own, and a client that keeps to the maximum is never closed.
+    private final BitSet unreleased = new BitSet();
+
+    private int heldAcknowledgements;
 
     Client(Connection connection, Routing routing) {
         this.connection = connection;
@@ -114,8 +123,34 @@ final class Client {
                 if (connection.ended) {
                     return false;
                 }
+                // The connection keeps what its CONNACK announces. MQTT 3.1.1 announces nothing.
+                Capabilities offered = switch (request.version()) {
+                    case V3_1_1 -> Capabilities.UNANNOUNCED;
+                    case V5 -> routing.capabilities;
+                };
+                // A Will that the announced capabilities cannot carry is refused [MQTT-3.2.2-12]
+                // [MQTT-3.2.2-13].
+                if (requestedWill != null
+                        && requestedWill.qos().level() > offered.maximumQos().level()) {
+                    connection.refuse(
+                            ReasonCode.QOS_NOT_SUPPORTED,
+                            "a Will above the maximum QoS for client '" + request.clientId() + "'"
+                    );
+                    return false;
+                }
+                if (requestedWill != null && requestedWill.retain() && !offered.retainAvailable()) {
+                    connection.refuse(
+                            ReasonCode.RETAIN_NOT_SUPPORTED,
+                            "a retained Will for client '" + request.clientId() + "'"
+                    );
+                    return false;
+                }
                 // Inline expiry or a scheduling failure must happen before taking over a peer.
-                connection.keepAlive(request.keepAliveSeconds());
+                // A Server Keep Alive replaces the client's own [MQTT-3.2.2-21] [MQTT-3.2.2-22].
+                Integer serverKeepAlive = offered.serverKeepAlive();
+                connection.keepAlive(
+                        (serverKeepAlive == null) ? request.keepAliveSeconds() : serverKeepAlive
+                );
                 if (connection.ended) {
                     return false;
                 }
@@ -157,13 +192,18 @@ final class Client {
                 connection.clientId = id;
                 session = accepted;
                 will = requestedWill;
-                if (request.version() == MqttVersion.V5) {
-                    aliases = new IncomingAliases(TOPIC_ALIAS_MAXIMUM);
+                limits = offered;
+                if (offered.topicAliasMaximum() > 0) {
+                    aliases = new IncomingAliases(offered.topicAliasMaximum());
+                }
+                Integer maximumPacketSize = offered.maximumPacketSize();
+                if (maximumPacketSize != null) {
+                    connection.limitPacketSize(maximumPacketSize);
                 }
                 accepted.connection = connection;
                 Properties properties = switch (request.version()) {
                     case V3_1_1 -> Properties.EMPTY;
-                    case V5 -> acceptanceV5(id, request.clientId().isEmpty());
+                    case V5 -> acceptanceV5(id, request.clientId().isEmpty(), offered);
                 };
                 connection.enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, properties));
             }
@@ -188,13 +228,44 @@ final class Client {
 
     // The properties of an MQTT 5.0 CONNACK that accepts the connection. The broker sets no
     // Subscription Identifiers on its deliveries and has no shared subscriptions, so it tells
-    // clients to send neither. It says how many Topic Aliases a client may set, and only MQTT
-    // 5.0 can tell a client the identifier assigned to it.
-    private static Properties acceptanceV5(String id, boolean assigned) {
+    // clients to send neither. It announces the capabilities that differ from what a client
+    // assumes without them, and only MQTT 5.0 can tell a client the identifier assigned to it.
+    private static Properties acceptanceV5(String id, boolean assigned, Capabilities offered) {
         var entries = new ArrayList<Property>();
         entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
         entries.add(new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0));
-        entries.add(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, TOPIC_ALIAS_MAXIMUM));
+        int topicAliasMaximum = offered.topicAliasMaximum();
+        if (topicAliasMaximum > 0) {
+            entries.add(new Property.TwoByteValue(
+                    PropertyId.TOPIC_ALIAS_MAXIMUM,
+                    topicAliasMaximum
+            ));
+        }
+        Qos maximumQos = offered.maximumQos();
+        if (maximumQos != Qos.EXACTLY_ONCE) {
+            entries.add(new Property.ByteValue(PropertyId.MAXIMUM_QOS, maximumQos.level()));
+        }
+        if (!offered.retainAvailable()) {
+            entries.add(new Property.ByteValue(PropertyId.RETAIN_AVAILABLE, 0));
+        }
+        if (!offered.wildcardSubscriptionAvailable()) {
+            entries.add(new Property.ByteValue(PropertyId.WILDCARD_SUBSCRIPTION_AVAILABLE, 0));
+        }
+        Integer receiveMaximum = offered.receiveMaximum();
+        if (receiveMaximum != null) {
+            entries.add(new Property.TwoByteValue(PropertyId.RECEIVE_MAXIMUM, receiveMaximum));
+        }
+        Integer maximumPacketSize = offered.maximumPacketSize();
+        if (maximumPacketSize != null) {
+            entries.add(new Property.FourByteValue(
+                    PropertyId.MAXIMUM_PACKET_SIZE,
+                    maximumPacketSize
+            ));
+        }
+        Integer serverKeepAlive = offered.serverKeepAlive();
+        if (serverKeepAlive != null) {
+            entries.add(new Property.TwoByteValue(PropertyId.SERVER_KEEP_ALIVE, serverKeepAlive));
+        }
         if (assigned) {
             entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
         }
@@ -264,6 +335,16 @@ final class Client {
                     );
                     return;
                 }
+                // So is a wildcard when CONNACK announced that none are available (MQTT 5.0
+                // section 3.2.2.3.11).
+                if (!limits.wildcardSubscriptionAvailable() && request.subscriptions().stream()
+                        .anyMatch(requested -> hasWildcard(requested.filter()))) {
+                    connection.disconnect(
+                            ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED,
+                            "wildcard subscription although none are supported"
+                    );
+                    return;
+                }
                 var grants = new ArrayList<ReasonCode>();
                 // The subscriptions that receive retained messages after SUBACK.
                 var retaining = new ArrayList<Packet.Subscription>();
@@ -277,12 +358,17 @@ final class Client {
                     }
                     // A test rule can refuse the filter, which then subscribes to nothing
                     // and leaves an earlier subscription to it as it was, or grant it less
-                    // than the requested QoS.
-                    Qos maximum = routing.allowedQos(requested);
-                    if (maximum == null) {
+                    // than the requested QoS. The announced Maximum QoS lowers the grant too,
+                    // as a broker without QoS 1 or 2 still accepts every SUBSCRIBE
+                    // [MQTT-3.2.2-10].
+                    Qos allowed = routing.allowedQos(requested);
+                    if (allowed == null) {
                         grants.add(ReasonCode.UNSPECIFIED_ERROR);
                         continue;
                     }
+                    Qos maximum = Qos.of(
+                            Math.min(allowed.level(), limits.maximumQos().level())
+                    );
                     boolean lowered = maximum.level() < requested.qos().level();
                     Packet.Subscription subscription = lowered
                             ? new Packet.Subscription(
@@ -341,6 +427,7 @@ final class Client {
             case Packet.PubRec ack -> owner.release(ack.packetId(), ack.reasonCode());
             case Packet.PubRel ack -> {
                 owner.received.clear(ack.packetId());
+                unreleased.clear(ack.packetId());
                 send(new Packet.PubComp(ack.packetId(), ReasonCode.SUCCESS, Properties.EMPTY));
             }
             case Packet.PubComp ack -> owner.acknowledge(ack.packetId(), true);
@@ -410,7 +497,36 @@ final class Client {
                     "Subscription Identifier from a client"
             );
         }
+        // A PUBLISH beyond what CONNACK announced is a Protocol Error (MQTT 5.0 sections
+        // 3.2.2.3.4 and 3.2.2.3.5, and 3.3.4 for the Receive Maximum). The first two end the
+        // connection here, as the SUBSCRIBE checks do, because a PacketDecodeException carries
+        // only the reasons for a packet that cannot be accepted as read.
+        if (publish.qos().level() > limits.maximumQos().level()) {
+            connection.disconnect(
+                    ReasonCode.QOS_NOT_SUPPORTED,
+                    "PUBLISH above the announced Maximum QoS"
+            );
+            return;
+        }
+        if (publish.retain() && !limits.retainAvailable()) {
+            connection.disconnect(
+                    ReasonCode.RETAIN_NOT_SUPPORTED,
+                    "retained PUBLISH although retained messages are not supported"
+            );
+            return;
+        }
+        Integer receiveMaximum = limits.receiveMaximum();
+        boolean unanswered = publish.qos() == Qos.AT_LEAST_ONCE
+                || (publish.qos() == Qos.EXACTLY_ONCE && !unreleased.get(publish.packetId()));
+        if (receiveMaximum != null && unanswered
+                && unreleased.cardinality() + heldAcknowledgements >= receiveMaximum) {
+            throw new PacketDecodeException(
+                    ReasonCode.RECEIVE_MAXIMUM_EXCEEDED,
+                    "more unanswered QoS 1 and 2 publications than the Receive Maximum"
+            );
+        }
         if (publish.qos() == Qos.EXACTLY_ONCE) {
+            unreleased.set(publish.packetId());
             if (owner.received.get(publish.packetId())) {
                 send(new Packet.PubRec(
                         publish.packetId(),
@@ -425,6 +541,7 @@ final class Client {
             // PUBREL, as a client that lost its state does. Its message was already
             // forwarded on PUBLISH, so nothing is lost.
             owner.received.clear(publish.packetId());
+            unreleased.clear(publish.packetId());
         }
         routing.route(publish, owner);
         // Acknowledge only after every delivery was enqueued or its target closed.
@@ -452,6 +569,9 @@ final class Client {
                 connection.close("held responses over their limit");
             } else {
                 held.addLast(packet);
+                if (answersPublication(packet)) {
+                    heldAcknowledgements++;
+                }
             }
             return;
         }
@@ -467,9 +587,22 @@ final class Client {
             if (type.isInstance(response)) {
                 responses.remove();
                 released.add(response);
+                if (answersPublication(response)) {
+                    heldAcknowledgements--;
+                }
             }
         }
         connection.release(released);
+    }
+
+    // Whether `response` ends the client's QoS 1 or 2 publication, as far as the client's
+    // Receive Maximum counts it.
+    private static boolean answersPublication(Packet response) {
+        return response instanceof Packet.PubAck || response instanceof Packet.PubComp;
+    }
+
+    private static boolean hasWildcard(TopicFilter filter) {
+        return filter.pattern().contains("+") || filter.pattern().contains("#");
     }
 
     // Detaches the session from the connection, which has ended, and publishes the Will. Called

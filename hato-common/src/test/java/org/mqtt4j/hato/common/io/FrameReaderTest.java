@@ -211,8 +211,28 @@ class FrameReaderTest {
     @ParameterizedTest
     @ValueSource(ints = {Integer.MIN_VALUE, -1, 0})
     void the_size_limit_must_be_positive(int maxSize) {
+        var sut = new FrameReader(InputStream.nullInputStream(), 1024);
+
         assertThatThrownBy(() -> new FrameReader(InputStream.nullInputStream(), maxSize))
                 .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> sut.limit(maxSize))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void a_new_size_limit_applies_to_the_packets_read_after_it() throws IOException {
+        // Arrange: two packets of four bytes, the first read under the original limit.
+        var input = new ByteArrayInputStream(HexFormat.of().parseHex("3002abcd3002abcd"));
+        var sut = new FrameReader(input, 1024);
+        assertThat(sut.read()).hasValueSatisfying(packet -> assertThat(packet).hasSize(4));
+
+        // Act
+        sut.limit(3);
+
+        // Assert
+        assertThatExceptionOfType(PacketDecodeException.class)
+                .isThrownBy(sut::read)
+                .withMessage("MQTT packet size 4 exceeds maximum 3");
     }
 
     @Test

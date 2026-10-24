@@ -32,17 +32,29 @@ public final class FrameReader {
 
     private final InputStream input;
 
-    private final int maxPacketSize;
+    private int maxPacketSize;
 
     /// Creates a reader with an inclusive packet size limit in bytes, including the fixed header.
     ///
     /// @throws IllegalArgumentException if `maxPacketSize` is not positive
     public FrameReader(InputStream input, int maxPacketSize) {
         this.input = requireNonNull(input, "input must not be null");
+        this.maxPacketSize = checkedLimit(maxPacketSize);
+    }
+
+    /// Replaces the size limit for the packets that later calls to [#read] return, as when a
+    /// server announces a Maximum Packet Size in CONNACK. The owner calls it between reads.
+    ///
+    /// @throws IllegalArgumentException if `maxPacketSize` is not positive
+    public void limit(int maxPacketSize) {
+        this.maxPacketSize = checkedLimit(maxPacketSize);
+    }
+
+    private static int checkedLimit(int maxPacketSize) {
         if (maxPacketSize <= 0) {
             throw new IllegalArgumentException("Maximum packet size must be positive");
         }
-        this.maxPacketSize = maxPacketSize;
+        return maxPacketSize;
     }
 
     /// Blocks until one complete packet is available; returns empty only for EOF before it starts.

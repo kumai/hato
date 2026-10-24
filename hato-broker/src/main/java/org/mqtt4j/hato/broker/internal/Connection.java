@@ -48,8 +48,9 @@ final class Connection {
 
     private static final long RESERVED_BYTES = 1024 * 1024;
 
-    // The framing format bounds packet size; a configurable broker cap comes later.
-    private static final int MAX_PACKET_SIZE = 268_435_460;
+    // The framing format bounds packet size, until a connection's announced Maximum Packet Size
+    // lowers the bound.
+    static final int MAX_PACKET_SIZE = 268_435_460;
 
     private final Routing routing;
 
@@ -125,6 +126,12 @@ final class Connection {
 
     SocketAddress remoteAddress() {
         return socket.getRemoteSocketAddress();
+    }
+
+    // Refuses the packets after this point that are larger than `maximumPacketSize`, which
+    // CONNACK announced. Called by the reader, which alone uses it.
+    void limitPacketSize(int maximumPacketSize) {
+        reader.limit(maximumPacketSize);
     }
 
     synchronized void start() {

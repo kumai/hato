@@ -100,6 +100,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxHeld = MAX_HELD;
 
+        private Capabilities capabilities = Capabilities.DEFAULT;
+
         private Timer scheduler = TimerService.instance;
 
         private Consumer<Packet> beforeProcess = _ -> { };
@@ -159,6 +161,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder capabilities(Capabilities value) {
+            capabilities = requireNonNull(value, "capabilities must not be null");
+            return this;
+        }
+
         Builder scheduler(Timer value) {
             scheduler = requireNonNull(value, "scheduler must not be null");
             return this;
@@ -205,6 +212,7 @@ public final class BrokerServer implements AutoCloseable {
                     maxRetained,
                     maxRetainedBytes,
                     maxHeld,
+                    capabilities,
                     scheduler,
                     beforeProcess,
                     beforeDeliveryWrite

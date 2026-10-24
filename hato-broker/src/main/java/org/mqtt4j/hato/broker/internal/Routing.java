@@ -59,11 +59,15 @@ final class Routing {
     // The kinds of response that the connections of these clients hold back.
     private final Set<Hold> holds = new HashSet<>();
 
+    // What the broker announces to the MQTT 5.0 connections that it accepts from now on.
+    Capabilities capabilities;
+
     boolean closed;
 
     Routing(BrokerSettings settings, int port) {
         this.settings = settings;
         this.port = port;
+        capabilities = settings.capabilities();
     }
 
     void refuseSubscriptions(String filter) {
