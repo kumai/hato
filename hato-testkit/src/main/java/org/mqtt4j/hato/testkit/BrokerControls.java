@@ -142,6 +142,7 @@ public final class BrokerControls {
                 capabilities.maximumQos().level(),
                 capabilities.retainAvailable(),
                 capabilities.wildcardSubscriptionAvailable(),
+                capabilities.subscriptionIdentifiersAvailable(),
                 capabilities.receiveMaximum(),
                 capabilities.maximumPacketSize(),
                 capabilities.topicAliasMaximum()

@@ -15,9 +15,9 @@ import static java.util.Objects.requireNonNull;
 /// The broker refuses an MQTT 5.0 connection whose Will the capabilities forbid, and ends a
 /// connection that sends what they forbid, with the reason code that MQTT 5.0 defines for it.
 /// CONNACK leaves out each capability whose value is what MQTT 5.0 assumes without it: QoS 2,
-/// retained messages and wildcard subscriptions available, a Receive Maximum of 65,535, the
-/// largest packet that MQTT allows, and no Topic Aliases. Whatever the value, the broker
-/// announces that it does not support shared subscriptions.
+/// retained messages, wildcard subscriptions, and Subscription Identifiers available, a Receive
+/// Maximum of 65,535, the largest packet that MQTT allows, and no Topic Aliases. Whatever the
+/// value, the broker announces that it does not support shared subscriptions.
 ///
 /// Experimental, like [BrokerControls].
 public final class BrokerCapabilities {
@@ -28,6 +28,7 @@ public final class BrokerCapabilities {
 
     private static final BrokerCapabilities DEFAULTS = new BrokerCapabilities(
             Qos.EXACTLY_ONCE,
+            true,
             true,
             true,
             65_535,
@@ -41,6 +42,8 @@ public final class BrokerCapabilities {
 
     private final boolean wildcardSubscriptionAvailable;
 
+    private final boolean subscriptionIdentifiersAvailable;
+
     private final int receiveMaximum;
 
     private final int maximumPacketSize;
@@ -51,6 +54,7 @@ public final class BrokerCapabilities {
             Qos maximumQos,
             boolean retainAvailable,
             boolean wildcardSubscriptionAvailable,
+            boolean subscriptionIdentifiersAvailable,
             int receiveMaximum,
             int maximumPacketSize,
             int topicAliasMaximum
@@ -58,6 +62,7 @@ public final class BrokerCapabilities {
         this.maximumQos = maximumQos;
         this.retainAvailable = retainAvailable;
         this.wildcardSubscriptionAvailable = wildcardSubscriptionAvailable;
+        this.subscriptionIdentifiersAvailable = subscriptionIdentifiersAvailable;
         this.receiveMaximum = receiveMaximum;
         this.maximumPacketSize = maximumPacketSize;
         this.topicAliasMaximum = topicAliasMaximum;
@@ -78,6 +83,7 @@ public final class BrokerCapabilities {
                 requireNonNull(maximumQos, "maximumQos must not be null"),
                 retainAvailable,
                 wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -91,6 +97,7 @@ public final class BrokerCapabilities {
                 maximumQos,
                 retainAvailable,
                 wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -106,6 +113,23 @@ public final class BrokerCapabilities {
                 maximumQos,
                 retainAvailable,
                 wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
+                receiveMaximum,
+                maximumPacketSize,
+                topicAliasMaximum
+        );
+    }
+
+    /// Returns a copy with a different answer to whether a client may give its subscriptions
+    /// Subscription Identifiers, which the broker returns with their deliveries.
+    public BrokerCapabilities withSubscriptionIdentifiersAvailable(
+            boolean subscriptionIdentifiersAvailable
+    ) {
+        return new BrokerCapabilities(
+                maximumQos,
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -125,6 +149,7 @@ public final class BrokerCapabilities {
                 maximumQos,
                 retainAvailable,
                 wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -145,6 +170,7 @@ public final class BrokerCapabilities {
                 maximumQos,
                 retainAvailable,
                 wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -163,6 +189,7 @@ public final class BrokerCapabilities {
                 maximumQos,
                 retainAvailable,
                 wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -182,6 +209,11 @@ public final class BrokerCapabilities {
     /// Whether a client may subscribe to filters that contain wildcards.
     public boolean wildcardSubscriptionAvailable() {
         return wildcardSubscriptionAvailable;
+    }
+
+    /// Whether a client may give its subscriptions Subscription Identifiers.
+    public boolean subscriptionIdentifiersAvailable() {
+        return subscriptionIdentifiersAvailable;
     }
 
     /// The number of QoS 1 and QoS 2 publications that a client may have unanswered at once.
@@ -206,6 +238,7 @@ public final class BrokerCapabilities {
                 && maximumQos == that.maximumQos
                 && retainAvailable == that.retainAvailable
                 && wildcardSubscriptionAvailable == that.wildcardSubscriptionAvailable
+                && subscriptionIdentifiersAvailable == that.subscriptionIdentifiersAvailable
                 && receiveMaximum == that.receiveMaximum
                 && maximumPacketSize == that.maximumPacketSize
                 && topicAliasMaximum == that.topicAliasMaximum;
@@ -217,6 +250,7 @@ public final class BrokerCapabilities {
                 maximumQos,
                 retainAvailable,
                 wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -228,6 +262,7 @@ public final class BrokerCapabilities {
         return "BrokerCapabilities[maximumQos=" + maximumQos
                 + ", retainAvailable=" + retainAvailable
                 + ", wildcardSubscriptionAvailable=" + wildcardSubscriptionAvailable
+                + ", subscriptionIdentifiersAvailable=" + subscriptionIdentifiersAvailable
                 + ", receiveMaximum=" + receiveMaximum
                 + ", maximumPacketSize=" + maximumPacketSize
                 + ", topicAliasMaximum=" + topicAliasMaximum + "]";

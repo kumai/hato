@@ -36,6 +36,7 @@ class AnnouncedCapabilitiesTest {
                     .withMaximumQos(Qos.AT_MOST_ONCE)
                     .withRetainAvailable(false)
                     .withWildcardSubscriptionAvailable(false)
+                    .withSubscriptionIdentifiersAvailable(false)
                     .withReceiveMaximum(7)
                     .withMaximumPacketSize(1_024)
                     .withTopicAliasMaximum(3);
@@ -46,6 +47,7 @@ class AnnouncedCapabilitiesTest {
 
             // Assert
             assertThat(ack.properties().entries()).containsExactlyInAnyOrder(
+                    new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0),
                     new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0),
                     new Property.ByteValue(PropertyId.MAXIMUM_QOS, 0),
                     new Property.ByteValue(PropertyId.RETAIN_AVAILABLE, 0),
@@ -65,6 +67,7 @@ class AnnouncedCapabilitiesTest {
             Packet.ConnAck original = connAck(broker);
             BrokerCapabilities narrowed = BrokerCapabilities.defaults()
                     .withMaximumQos(Qos.AT_LEAST_ONCE)
+                    .withSubscriptionIdentifiersAvailable(false)
                     .withReceiveMaximum(1)
                     .withTopicAliasMaximum(0);
             sut.announce(narrowed);

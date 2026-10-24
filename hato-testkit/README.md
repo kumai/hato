@@ -106,9 +106,9 @@ try (MqttBroker broker = MqttBroker.start()) {
   `disconnect(clientId)` closes one from the broker's side, which publishes the
   client's Will.
 - `announce(capabilities)` changes the limits that the broker announces to MQTT 5.0
-  clients as they connect: the highest QoS, whether retained messages and wildcard
-  subscriptions are available, the Receive Maximum, the Maximum Packet Size, and the
-  Topic Alias Maximum. Build them with
+  clients as they connect: the highest QoS, whether retained messages, wildcard
+  subscriptions, and Subscription Identifiers are available, the Receive Maximum, the
+  Maximum Packet Size, and the Topic Alias Maximum. Build them with
   [BrokerCapabilities](src/main/java/org/mqtt4j/hato/testkit/BrokerCapabilities.java),
   for example `BrokerCapabilities.defaults().withMaximumQos(Qos.AT_LEAST_ONCE)`, and
   announce `BrokerCapabilities.defaults()` again to go back. Only clients that connect
