@@ -55,6 +55,7 @@ import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.Transport;
+import org.mqtt4j.hato.client.internal.common.concurrent.TimerService;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
@@ -128,6 +129,8 @@ public final class ClientActor implements MqttClient {
     private final Function<Packet.Publish, MqttMessage> messageOf;
 
     private final ClientTermination termination;
+
+    private final Completions completions;
 
     private final ListenerLane listenerLane;
 
@@ -397,6 +400,14 @@ public final class ClientActor implements MqttClient {
                 termination::check
         );
         termination.watch(listenerLane, metricsLane, this.credentials);
+        completions = new Completions(
+                endpoint,
+                clientId,
+                threadName("complete-"),
+                TimerService.instance,
+                Completions.TAKEOVER,
+                Completions.IDLE
+        );
         Thread.ofVirtual().name(threadName("actor")).start(this::run);
     }
 
@@ -999,7 +1010,8 @@ public final class ClientActor implements MqttClient {
         return false;
     }
 
-    /// Called by an API caller or the actor; futures complete on independent threads.
+    /// Called by an API caller or the actor; futures complete on the client's completion threads,
+    /// where a blocked continuation holds up no other completion for long; see [Completions].
     private void completeOperation(
             long token,
             @Nullable Object result,
@@ -1025,11 +1037,12 @@ public final class ClientActor implements MqttClient {
             }
             return;
         }
-        Thread.ofVirtual().name(threadName("complete-" + token)).start(() -> {
+        completions.submit(() -> {
             termination.completionStarted();
             try {
                 // The slot returns before the future completes, so that its continuations can
-                // start an operation in its place. Termination waits for them through the count.
+                // start an operation in its place. Termination waits for them through the count,
+                // and for a queued completion through its slot.
                 operation.slot.release();
                 reportPublication(operation.timing, failure);
                 operation.finish(result, failure);
