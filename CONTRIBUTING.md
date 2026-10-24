@@ -120,6 +120,11 @@ metadata. The separate
 `:build-logic:check` task is needed because `build-logic` is an included build;
 its checks do not run as part of `./gradlew build`.
 
+`./gradlew :distribution-tests:reportApiChanges` reports how the API of the client
+and the test kit differs from the last release on Maven Central, leaving out the
+broker and the experimental test kit types. It is a report, not one of the checks
+above; an HTML copy goes to `distribution-tests/build/reports/`.
+
 Maintainers can find bundle inspection, trial uploads, and publication steps in
 the [release guide](docs/releasing.md).
 

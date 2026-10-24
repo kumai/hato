@@ -13,6 +13,9 @@ nullaway = "0.14.2"
 errorprone-plugin = "5.1.1"
 checkstyle = "14.3.0"
 micrometer = "1.17.2"
+japicmp = "0.26.5"
+# The last release on Maven Central, which the API report compares the build with.
+hato-release = "0.7.0"
 
 [libraries]
 # Nullness annotations. Build-time only: never a runtime or POM dependency of the published jars.
@@ -30,6 +33,9 @@ micrometer-core = { module = "io.micrometer:micrometer-core", version.ref = "mic
 # Real brokers in Docker for the integrationTest suites. Only the core library is used: each test
 # class decides whether a missing Docker skips it or, in CI, fails the build.
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
+# API differences from the last release, reported on request. Build time only.
+japicmp = { module = "com.github.siom79.japicmp:japicmp", version.ref = "japicmp" }
+hato-release-testkit = { module = "org.mqtt4j:hato-testkit", version.ref = "hato-release" }
 
 [plugins]
 graalvm-native = { id = "org.graalvm.buildtools.native", version.ref = "graalvm-native" }

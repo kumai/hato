@@ -24,6 +24,10 @@ version by hand for a major version, such as `1.0.0-SNAPSHOT` before `1.0.0`, or
 the workflow cannot push because the branch moved on or branch protection refuses
 it.
 
+After a release, move `hato-release` in `gradle/libs.versions.toml` to the released
+version by hand, so that `./gradlew :distribution-tests:reportApiChanges` compares
+the build with the newest release.
+
 ## Prepare the release environment
 
 Before the first upload, verify the `org.mqtt4j` namespace in the Portal, create a
