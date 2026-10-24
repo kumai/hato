@@ -20,11 +20,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
 /// The client against brokers configured to announce smaller MQTT 5.0 limits than their
-/// defaults, shared by Mosquitto, EMQX, and HiveMQ CE: Maximum QoS 1, no retained messages, a
-/// Maximum Packet Size of 512 bytes, a Receive Maximum of 2, and no Topic Aliases from the
-/// client. The client refuses what the limits forbid and keeps to what they allow, so the
-/// connection goes on. A broker that would end the connection over a violation, as most of
-/// them do, shows that the client sent none.
+/// defaults, shared by Mosquitto, EMQX, HiveMQ CE, and the embedded broker: Maximum QoS 1, no
+/// retained messages, a Maximum Packet Size of 512 bytes, a Receive Maximum of 2, and no Topic
+/// Aliases from the client. The client refuses what the limits forbid and keeps to what they
+/// allow, so the connection goes on. A broker that would end the connection over a violation,
+/// as most of them do, shows that the client sent none.
 @Timeout(30)
 abstract class Mqtt5RestrictedTest {
 

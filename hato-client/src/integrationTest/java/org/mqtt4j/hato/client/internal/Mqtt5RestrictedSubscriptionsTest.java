@@ -6,8 +6,9 @@ import org.mqtt4j.hato.*;
 
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The limits of [Mqtt5RestrictedTest], and no wildcard or shared subscriptions, shared by EMQX
-/// and HiveMQ CE. Mosquitto cannot withdraw either kind of subscription.
+/// The limits of [Mqtt5RestrictedTest], and no wildcard or shared subscriptions, shared by EMQX,
+/// HiveMQ CE, and the embedded broker, which has no shared subscriptions at all. Mosquitto cannot
+/// withdraw either kind of subscription.
 abstract class Mqtt5RestrictedSubscriptionsTest extends Mqtt5RestrictedTest {
 
     @Test
