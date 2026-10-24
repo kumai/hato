@@ -33,4 +33,18 @@ public final class FrameWriter {
         output.write(packet);
         output.flush();
     }
+
+    /// Writes one complete packet given in two parts, such as a PUBLISH header from
+    /// [org.mqtt4j.hato.common.protocol.PacketCodec#encodePublishHeader] and its payload, with
+    /// one [OutputStream#write(byte[])] call for each, then flushes. This spares joining a large
+    /// payload to its header in a new array; the parts may leave in separate TCP segments.
+    ///
+    /// @throws IOException if writing or flushing fails
+    public void write(byte[] head, byte[] rest) throws IOException {
+        requireNonNull(head, "head must not be null");
+        requireNonNull(rest, "rest must not be null");
+        output.write(head);
+        output.write(rest);
+        output.flush();
+    }
 }

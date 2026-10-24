@@ -82,6 +82,12 @@ final class ClientIo {
     // packet itself. A larger send goes alone.
     static final int BATCH_BYTE_LIMIT = 64 * 1024;
 
+    // A PUBLISH payload this large leaves after its header, in a second write, instead of being
+    // joined to it in a new array. Measured over loopback TCP, a 64 KiB payload published 5%
+    // slower that way, because the extra write cost as much as the copy it saved, and payloads
+    // from 128 KiB to 1 MiB published 13 to 22% faster. Such a send goes alone anyway.
+    static final int APART_PAYLOAD_BYTES = 128 * 1024;
+
     // Receive capacity counts each property of a received packet with this many bytes beyond
     // the packet's size. Decoded, a User Property takes up to 118 bytes of memory beyond its
     // encoding, as measured with compressed references, the default for heaps under 32 GiB.
@@ -464,7 +470,7 @@ final class ClientIo {
         Connection connection = write.connection();
         List<SendQueue.Send<Outbound>> sends = write.sends();
         try {
-            byte[] bytes = encode(sends);
+            Encoded encoded = encode(connection, sends);
             synchronized (sending) {
                 if (connection.closed) {
                     return;
@@ -481,11 +487,7 @@ final class ClientIo {
                 }
             }
             try {
-                long ticket = sends.getLast().ticket();
-                // Writing here saves handing the write to a thread of the transport's own.
-                result = connection.transport instanceof BlockingWriteTransport direct
-                        ? direct.write(ticket, bytes)
-                        : connection.transport.send(ticket, bytes);
+                result = encoded.writeTo(connection.transport, sends.getLast().ticket());
             } catch (RuntimeException failure) {
                 ended(connection, failure);
                 return;
@@ -509,6 +511,23 @@ final class ClientIo {
                 releaseCompleted(connection);
             }
         }
+    }
+
+    /// What the one write of `sends` carries. A PUBLISH that goes alone with a payload of at least
+    /// [#APART_PAYLOAD_BYTES] leaves as its header and then its payload on a transport that lets
+    /// the sender write; anything else leaves as one array.
+    private Encoded encode(Connection connection, List<SendQueue.Send<Outbound>> sends) {
+        if (sends.size() == 1 && connection.transport instanceof BlockingWriteTransport) {
+            SendQueue.Send<Outbound> send = sends.getFirst();
+            MqttMessage message = send.value().message();
+            if (message != null && message.payloadSize() >= APART_PAYLOAD_BYTES) {
+                byte[] header = send.value().currentHeader();
+                log.trace("Write attempt for ticket {}: {} bytes of header and {} of payload",
+                        send.ticket(), header.length, message.payloadSize());
+                return new Encoded.Apart(header, payloadOf.apply(message));
+            }
+        }
+        return new Encoded.Whole(encode(sends));
     }
 
     /// The bytes of `sends`, one after another, as the one write that carries them.
@@ -803,16 +822,50 @@ final class ClientIo {
             if (message == null) {
                 return header;
             }
-            byte[] bytes = codec.encodePublish(header, payloadOf.apply(message));
-            if (receipt != null && receipt.accepted()) {
-                // The sole sender has returned from every earlier attempt before encoding this
-                // one, even if its queue admission preceded the old transport's send return.
-                bytes[0] |= 0x08;
+            return codec.encodePublish(currentHeader(), payloadOf.apply(message));
+        }
+
+        /// The PUBLISH header as this attempt sends it, with DUP set once the transport has
+        /// accepted an earlier attempt. The sole sender has returned from every earlier attempt
+        /// before encoding this one, even if its queue admission preceded the old transport's
+        /// send return.
+        byte[] currentHeader() {
+            if (receipt == null || !receipt.accepted()) {
+                return header;
             }
-            return bytes;
+            byte[] marked = header.clone();
+            marked[0] |= 0x08;
+            return marked;
         }
     }
 
     private record Write(Connection connection, List<SendQueue.Send<Outbound>> sends) {
+    }
+
+    /// What one write carries: one array, or a PUBLISH header and its payload, which the
+    /// transport writes one after the other.
+    private sealed interface Encoded {
+
+        Transport.SendResult writeTo(Transport transport, long ticket);
+
+        record Whole(byte[] bytes) implements Encoded {
+
+            // Writing here saves handing the write to a thread of the transport's own.
+            @Override
+            public Transport.SendResult writeTo(Transport transport, long ticket) {
+                return transport instanceof BlockingWriteTransport direct
+                        ? direct.write(ticket, bytes)
+                        : transport.send(ticket, bytes);
+            }
+        }
+
+        record Apart(byte[] header, byte[] payload) implements Encoded {
+
+            // Only a transport that lets the sender write takes the parts apart; see encode.
+            @Override
+            public Transport.SendResult writeTo(Transport transport, long ticket) {
+                return ((BlockingWriteTransport) transport).write(ticket, header, payload);
+            }
+        }
     }
 }
