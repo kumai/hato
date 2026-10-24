@@ -50,9 +50,10 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// subscription, or never. A Will with a positive Will Delay Interval is refused with Server
 /// unavailable; the properties of other Wills, except the delay, reach MQTT 5.0 subscribers as
 /// publication properties. CONNACK announces only that Subscription Identifiers and shared
-/// subscriptions are not supported, and the broker ignores the client's Receive Maximum and
-/// Maximum Packet Size. An Authentication Method is refused with Bad authentication method.
-/// AUTH, a PUBLISH with a Topic Alias or a Subscription Identifier, or a SUBSCRIBE with a
+/// subscriptions are not supported, and a Topic Alias Maximum of 16: the aliases that a client
+/// sets last for its connection. The broker ignores the client's Receive Maximum and Maximum
+/// Packet Size. An Authentication Method is refused with Bad authentication method. AUTH, a
+/// PUBLISH with a Subscription Identifier or an invalid Topic Alias, or a SUBSCRIBE with a
 /// Subscription Identifier or a `$share/` filter closes the connection. A PUBREC with a failure
 /// reason code ends the QoS 2 delivery without PUBREL.
 /// Before it closes an MQTT 5.0 connection for a malformed or forbidden packet, an expired

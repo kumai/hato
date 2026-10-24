@@ -9,6 +9,7 @@ import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.broker.internal.common.log.Log;
+import org.mqtt4j.hato.broker.internal.common.protocol.IncomingAliases;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
@@ -29,6 +30,11 @@ final class Client {
 
     private static final Log log = Log.of(Client.class);
 
+    // The Topic Alias Maximum that the broker announces to MQTT 5.0 clients. It is the client's
+    // own value, and provisional like it; the aliases of one connection hold at most this many
+    // topics of up to 65,535 bytes each.
+    private static final int TOPIC_ALIAS_MAXIMUM = 16;
+
     private final Connection connection;
 
     private final Routing routing;
@@ -40,6 +46,10 @@ final class Client {
     // The Will of the accepted connection, until the connection's end publishes it or a
     // normal DISCONNECT discards it.
     private Packet.@Nullable Will will;
+
+    // The Topic Aliases that the client has set on this connection, from its acceptance; none in
+    // MQTT 3.1.1, which has no aliases.
+    private @Nullable IncomingAliases aliases;
 
     // The responses that a test holds back from this connection, in the order held. They end
     // with the connection.
@@ -147,6 +157,9 @@ final class Client {
                 connection.clientId = id;
                 session = accepted;
                 will = requestedWill;
+                if (request.version() == MqttVersion.V5) {
+                    aliases = new IncomingAliases(TOPIC_ALIAS_MAXIMUM);
+                }
                 accepted.connection = connection;
                 Properties properties = switch (request.version()) {
                     case V3_1_1 -> Properties.EMPTY;
@@ -175,11 +188,13 @@ final class Client {
 
     // The properties of an MQTT 5.0 CONNACK that accepts the connection. The broker sets no
     // Subscription Identifiers on its deliveries and has no shared subscriptions, so it tells
-    // clients to send neither; and only MQTT 5.0 can tell a client the identifier assigned to it.
+    // clients to send neither. It says how many Topic Aliases a client may set, and only MQTT
+    // 5.0 can tell a client the identifier assigned to it.
     private static Properties acceptanceV5(String id, boolean assigned) {
         var entries = new ArrayList<Property>();
         entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
         entries.add(new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0));
+        entries.add(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, TOPIC_ALIAS_MAXIMUM));
         if (assigned) {
             entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
         }
@@ -320,53 +335,8 @@ final class Client {
                 };
                 send(new Packet.UnsubAck(request.packetId(), reasonCodes, Properties.EMPTY));
             }
-            case Packet.Publish publish -> {
-                // The broker announces no Topic Alias Maximum, so no alias is valid, and only
-                // a server sets Subscription Identifiers. MQTT 3.1.1 has no properties.
-                if (publish.properties().find(PropertyId.TOPIC_ALIAS).isPresent()) {
-                    throw new PacketDecodeException(
-                            ReasonCode.TOPIC_ALIAS_INVALID,
-                            "Topic Alias without an announced maximum"
-                    );
-                }
-                if (publish.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
-                    throw new PacketDecodeException(
-                            ReasonCode.PROTOCOL_ERROR,
-                            "Subscription Identifier from a client"
-                    );
-                }
-                if (publish.qos() == Qos.EXACTLY_ONCE) {
-                    if (owner.received.get(publish.packetId())) {
-                        send(new Packet.PubRec(
-                                publish.packetId(),
-                                ReasonCode.SUCCESS,
-                                Properties.EMPTY
-                        ));
-                        return;
-                    }
-                    owner.received.set(publish.packetId());
-                } else if (publish.qos() == Qos.AT_LEAST_ONCE) {
-                    // Reusing the identifier abandons a QoS 2 exchange still waiting for
-                    // PUBREL, as a client that lost its state does. Its message was already
-                    // forwarded on PUBLISH, so nothing is lost.
-                    owner.received.clear(publish.packetId());
-                }
-                routing.route(publish, owner);
-                // Acknowledge only after every delivery was enqueued or its target closed.
-                if (publish.qos() == Qos.AT_LEAST_ONCE) {
-                    send(new Packet.PubAck(
-                            publish.packetId(),
-                            ReasonCode.SUCCESS,
-                            Properties.EMPTY
-                    ));
-                } else if (publish.qos() == Qos.EXACTLY_ONCE) {
-                    send(new Packet.PubRec(
-                            publish.packetId(),
-                            ReasonCode.SUCCESS,
-                            Properties.EMPTY
-                    ));
-                }
-            }
+            case Packet.Publish publish -> receive(owner, resolved(publish));
+            case Packet.AliasPublish publish -> receive(owner, resolved(publish));
             case Packet.PubAck ack -> owner.acknowledge(ack.packetId(), false);
             case Packet.PubRec ack -> owner.release(ack.packetId(), ack.reasonCode());
             case Packet.PubRel ack -> {
@@ -389,10 +359,6 @@ final class Client {
                                 : "client sent DISCONNECT with " + disconnect.reasonCode()
                 );
             }
-            case Packet.AliasPublish _ -> throw new PacketDecodeException(
-                    ReasonCode.TOPIC_ALIAS_INVALID,
-                    "Topic Alias without an announced maximum"
-            );
             // Name only the type; the INFO end log must not carry fields such as AUTH data.
             case Packet.Connect _,
                  Packet.ConnAck _,
@@ -403,6 +369,77 @@ final class Client {
                          ReasonCode.PROTOCOL_ERROR,
                          "Unexpected " + packet.getClass().getSimpleName() + " packet"
                  );
+        }
+    }
+
+    // `publish` without its Topic Alias, after the alias, if any, takes its topic. The aliases
+    // last for this connection [MQTT-3.3.2-7]; without them, as in MQTT 3.1.1, none is valid.
+    private Packet.Publish resolved(Packet.Publish publish) {
+        IncomingAliases table = aliases;
+        if (table != null) {
+            return table.set(publish);
+        }
+        if (publish.properties().find(PropertyId.TOPIC_ALIAS).isPresent()) {
+            throw noAliases();
+        }
+        return publish;
+    }
+
+    // The PUBLISH that a Topic Alias without a topic stands for.
+    private Packet.Publish resolved(Packet.AliasPublish publish) {
+        IncomingAliases table = aliases;
+        if (table == null) {
+            throw noAliases();
+        }
+        return table.resolve(publish);
+    }
+
+    private static PacketDecodeException noAliases() {
+        return new PacketDecodeException(
+                ReasonCode.TOPIC_ALIAS_INVALID,
+                "Topic Alias without an announced maximum"
+        );
+    }
+
+    // Forwards a publication from the client and acknowledges it. Only a server sets
+    // Subscription Identifiers. MQTT 3.1.1 has no properties.
+    private void receive(Session owner, Packet.Publish publish) {
+        if (publish.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
+            throw new PacketDecodeException(
+                    ReasonCode.PROTOCOL_ERROR,
+                    "Subscription Identifier from a client"
+            );
+        }
+        if (publish.qos() == Qos.EXACTLY_ONCE) {
+            if (owner.received.get(publish.packetId())) {
+                send(new Packet.PubRec(
+                        publish.packetId(),
+                        ReasonCode.SUCCESS,
+                        Properties.EMPTY
+                ));
+                return;
+            }
+            owner.received.set(publish.packetId());
+        } else if (publish.qos() == Qos.AT_LEAST_ONCE) {
+            // Reusing the identifier abandons a QoS 2 exchange still waiting for
+            // PUBREL, as a client that lost its state does. Its message was already
+            // forwarded on PUBLISH, so nothing is lost.
+            owner.received.clear(publish.packetId());
+        }
+        routing.route(publish, owner);
+        // Acknowledge only after every delivery was enqueued or its target closed.
+        if (publish.qos() == Qos.AT_LEAST_ONCE) {
+            send(new Packet.PubAck(
+                    publish.packetId(),
+                    ReasonCode.SUCCESS,
+                    Properties.EMPTY
+            ));
+        } else if (publish.qos() == Qos.EXACTLY_ONCE) {
+            send(new Packet.PubRec(
+                    publish.packetId(),
+                    ReasonCode.SUCCESS,
+                    Properties.EMPTY
+            ));
         }
     }
 

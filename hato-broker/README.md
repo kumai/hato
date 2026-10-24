@@ -65,7 +65,7 @@ Use the broker in local or trusted environments. It does not check credentials.
 It supports MQTT 3.1.1, MQTT 5.0 as far as client tests need it, QoS 0/1/2,
 retained messages, and Wills. It refuses an MQTT 5.0 Will with a delay, and
 retained messages do not expire. MQTT 5.0 subscriptions honor No Local, Retain As
-Published, and Retain Handling.
+Published, and Retain Handling, and MQTT 5.0 clients may set up to 16 Topic Aliases.
 The broker supports neither shared subscriptions nor Subscription Identifiers, and
 tells MQTT 5.0 clients so when they connect; it refuses `$share/` filters in
 MQTT 3.1.1 too. Persistent sessions do not expire, and the broker does not

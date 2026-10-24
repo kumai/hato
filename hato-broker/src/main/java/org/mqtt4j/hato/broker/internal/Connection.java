@@ -239,13 +239,13 @@ final class Connection {
     private static boolean answered(Packet packet) {
         return switch (packet) {
             case Packet.Publish publish -> publish.qos() != Qos.AT_MOST_ONCE;
+            case Packet.AliasPublish publish -> publish.qos() != Qos.AT_MOST_ONCE;
             case Packet.Subscribe _,
                  Packet.Unsubscribe _,
                  Packet.PubRel _,
                  Packet.PingReq _ -> true;
             case Packet.Connect _,
                  Packet.ConnAck _,
-                 Packet.AliasPublish _,
                  Packet.PubAck _,
                  Packet.PubRec _,
                  Packet.PubComp _,

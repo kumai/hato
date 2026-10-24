@@ -6,6 +6,7 @@ import java.net.BindException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -17,8 +18,12 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
+import org.mqtt4j.hato.broker.internal.common.protocol.Property;
+import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
+import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -206,6 +211,47 @@ class BrokerConnectionTest {
             client.sendRaw(burst.toByteArray());
 
             // Assert: every publication gets its PUBACK, in order, on the same connection.
+            for (int id = 1; id <= 2000; id++) {
+                assertThat(client.expect(Packet.PubAck.class).packetId()).isEqualTo(id);
+            }
+            client.ping();
+        }
+    }
+
+    @Test
+    void publications_by_topic_alias_sent_faster_than_their_responses_are_read_wait_too()
+            throws Exception {
+        // Arrange: the first publication sets the alias, and the others carry it alone.
+        var alias = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 1)));
+        var v5 = PacketCodec.of(MqttVersion.V5);
+        var burst = new ByteArrayOutputStream();
+        burst.writeBytes(v5.encode(new Packet.Publish(
+                new Topic("burst"),
+                new byte[] {'x'},
+                AT_LEAST_ONCE,
+                false,
+                false,
+                1,
+                alias
+        )));
+        for (int id = 2; id <= 2000; id++) {
+            burst.writeBytes(v5.encode(new Packet.AliasPublish(
+                    new byte[] {'x'},
+                    AT_LEAST_ONCE,
+                    false,
+                    false,
+                    id,
+                    alias
+            )));
+        }
+        try (
+                var sut = MqttBroker.start();
+                var client = RawSession.connectedV5(sut.port(), "burst")
+        ) {
+            // Act
+            client.sendRaw(burst.toByteArray());
+
+            // Assert
             for (int id = 1; id <= 2000; id++) {
                 assertThat(client.expect(Packet.PubAck.class).packetId()).isEqualTo(id);
             }

@@ -66,10 +66,12 @@ class BrokerMqtt5Test {
             client.send(connectV5("accepted", true, 0, 0));
 
             // Assert: only the MQTT 5.0 form, which has a reason code, decodes here. It announces
-            // only that Subscription Identifiers and shared subscriptions are not supported.
+            // only that Subscription Identifiers and shared subscriptions are not supported, and
+            // the Topic Alias Maximum.
             var announcements = new Properties(List.of(
                     new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0),
-                    new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0)
+                    new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0),
+                    new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16)
             ));
             assertThat(client.expect(Packet.ConnAck.class))
                     .isEqualTo(new Packet.ConnAck(false, SUCCESS, announcements));
@@ -155,6 +157,59 @@ class BrokerMqtt5Test {
                         ReasonCode.BAD_AUTHENTICATION_METHOD
                 )
         );
+    }
+
+    @Test
+    void a_topic_alias_stands_for_its_topic_until_the_connection_ends() throws Exception {
+        var alias = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 16)));
+        try (var sut = MqttBroker.start(); var subscriber = connectedV5(sut.port(), "subscriber")) {
+            // Arrange
+            subscriber.subscribe("aliased/#", AT_MOST_ONCE);
+            try (var publisher = connectedV5(sut.port(), "publisher")) {
+                // Act: the largest alias that CONNACK allows sets the topic, then stands for it.
+                publisher.send(new Packet.Publish(
+                        new Topic("aliased/topic"),
+                        "first".getBytes(UTF_8),
+                        AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        alias
+                ));
+                publisher.send(new Packet.AliasPublish(
+                        "second".getBytes(UTF_8),
+                        AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        alias
+                ));
+                publisher.ping();
+
+                // Assert: subscribers get the topic, and no alias.
+                assertThat(subscriber.expect(Packet.Publish.class))
+                        .isEqualTo(publication("aliased/topic", "first", AT_MOST_ONCE, 0));
+                assertThat(subscriber.expect(Packet.Publish.class))
+                        .isEqualTo(publication("aliased/topic", "second", AT_MOST_ONCE, 0));
+            }
+            try (var publisher = connectedV5(sut.port(), "publisher")) {
+                // Act: the next connection of the client starts without aliases [MQTT-3.3.2-7].
+                publisher.send(new Packet.AliasPublish(
+                        "third".getBytes(UTF_8),
+                        AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        alias
+                ));
+
+                // Assert
+                assertThat(publisher.expect(Packet.Disconnect.class))
+                        .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
+                publisher.expectClosed();
+            }
+            subscriber.ping();
+        }
     }
 
     @Test
@@ -423,21 +478,24 @@ class BrokerMqtt5Test {
 
     static Stream<Violation> violations() {
         byte[] payload = "payload".getBytes(UTF_8);
-        var alias = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 1)));
+        var unset = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 1)));
+        var tooLarge = new Properties(List.of(
+                new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 17)
+        ));
         var identifier = new Properties(List.of(
                 new Property.VariableByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER, 1)
         ));
         var topic = new Topic("violation/topic");
         return Stream.of(
                 new Violation(
-                        "a Topic Alias",
-                        new Packet.Publish(topic, payload, AT_MOST_ONCE, false, false, 0, alias),
+                        "a Topic Alias above the announced maximum",
+                        new Packet.Publish(topic, payload, AT_MOST_ONCE, false, false, 0, tooLarge),
                         ReasonCode.TOPIC_ALIAS_INVALID
                 ),
                 new Violation(
-                        "a topic given only by its alias",
-                        new Packet.AliasPublish(payload, AT_MOST_ONCE, false, false, 0, alias),
-                        ReasonCode.TOPIC_ALIAS_INVALID
+                        "a topic given only by an alias that no PUBLISH set",
+                        new Packet.AliasPublish(payload, AT_MOST_ONCE, false, false, 0, unset),
+                        ReasonCode.PROTOCOL_ERROR
                 ),
                 new Violation(
                         "a Subscription Identifier",
