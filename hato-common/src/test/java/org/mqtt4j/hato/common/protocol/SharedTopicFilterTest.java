@@ -43,7 +43,10 @@ class SharedTopicFilterTest {
             "a/b", "#", "$share", "$sharex/g/a", "$SHARE/g/a", "$SYS/#", "share/g/a", "/$share/g/a"
     })
     void filters_without_the_share_prefix_are_ordinary_filters(String pattern) {
-        assertThat(SharedTopicFilter.parse(new TopicFilter(pattern))).isEmpty();
+        var filter = new TopicFilter(pattern);
+
+        assertThat(SharedTopicFilter.parse(filter)).isEmpty();
+        assertThat(SharedTopicFilter.isShared(filter)).isFalse();
     }
 
     @ParameterizedTest
@@ -53,11 +56,13 @@ class SharedTopicFilterTest {
     })
     void a_share_prefix_without_a_valid_shared_subscription_is_rejected(String pattern) {
         // MQTT 5.0 [MQTT-4.8.2-1, MQTT-4.8.2-2]: a non-empty share name, then '/' and a filter.
-        // Each pattern is still a valid ordinary filter, as MQTT 3.1.1 reads it.
+        // Each pattern is still a valid ordinary filter, as MQTT 3.1.1 reads it, and still asks
+        // for a shared subscription.
         var filter = new TopicFilter(pattern);
 
         assertThatThrownBy(() -> SharedTopicFilter.parse(filter))
                 .isInstanceOf(IllegalArgumentException.class);
+        assertThat(SharedTopicFilter.isShared(filter)).isTrue();
     }
 
     @ParameterizedTest(name = "{0} against {1}: {2}")

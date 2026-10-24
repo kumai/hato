@@ -65,15 +65,14 @@ class BrokerMqtt5Test {
             // Act
             client.send(connectV5("accepted", true, 0, 0));
 
-            // Assert: only the MQTT 5.0 form, which has a reason code, decodes here. Its only
-            // announcement is that Subscription Identifiers are not supported.
-            var notSupported = new Property.ByteValue(
-                    PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE,
-                    0
-            );
-            assertThat(client.expect(Packet.ConnAck.class)).isEqualTo(
-                    new Packet.ConnAck(false, SUCCESS, new Properties(List.of(notSupported)))
-            );
+            // Assert: only the MQTT 5.0 form, which has a reason code, decodes here. It announces
+            // only that Subscription Identifiers and shared subscriptions are not supported.
+            var announcements = new Properties(List.of(
+                    new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0),
+                    new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0)
+            ));
+            assertThat(client.expect(Packet.ConnAck.class))
+                    .isEqualTo(new Packet.ConnAck(false, SUCCESS, announcements));
             client.ping();
             client.disconnect();
         }
@@ -156,6 +155,36 @@ class BrokerMqtt5Test {
                         ReasonCode.BAD_AUTHENTICATION_METHOD
                 )
         );
+    }
+
+    @Test
+    void a_subscribe_with_a_shared_subscription_ends_the_connection_and_subscribes_to_nothing()
+            throws Exception {
+        try (var sut = MqttBroker.start(); var publisher = connectedV5(sut.port(), "publisher")) {
+            // Arrange: a session that outlives the connection.
+            try (var first = connectedV5(sut.port(), "sharing", false, 60, false)) {
+                // Act
+                first.send(new Packet.Subscribe(
+                        1,
+                        List.of(
+                                subscription("ordinary/#", AT_MOST_ONCE),
+                                subscription("$share/group/ordinary/#", AT_MOST_ONCE)
+                        ),
+                        EMPTY
+                ));
+
+                // Assert: the ordinary filter of the same SUBSCRIBE does not subscribe either.
+                assertThat(first.expect(Packet.Disconnect.class)).isEqualTo(new Packet.Disconnect(
+                        ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED,
+                        EMPTY
+                ));
+                first.expectClosed();
+            }
+            try (var resumed = connectedV5(sut.port(), "sharing", false, 60, true)) {
+                publisher.publish("ordinary/topic", "unsubscribed", AT_LEAST_ONCE, 1);
+                resumed.ping();
+            }
+        }
     }
 
     @Test
@@ -431,6 +460,15 @@ class BrokerMqtt5Test {
                                 identifier
                         ),
                         ReasonCode.SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED
+                ),
+                new Violation(
+                        "a SUBSCRIBE with a shared subscription",
+                        new Packet.Subscribe(
+                                1,
+                                List.of(subscription("$share/group/violation/#", AT_MOST_ONCE)),
+                                EMPTY
+                        ),
+                        ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED
                 ),
                 new Violation("AUTH", new Packet.Auth(SUCCESS, EMPTY), ReasonCode.PROTOCOL_ERROR),
                 new Violation(

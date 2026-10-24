@@ -64,11 +64,11 @@ port. The default listens only on loopback. Starting the broker throws
 Use the broker in local or trusted environments. It does not check credentials.
 It supports MQTT 3.1.1, MQTT 5.0 as far as client tests need it, QoS 0/1/2,
 retained messages, and Wills. It refuses an MQTT 5.0 Will with a delay, and
-retained messages do not expire. `$share/` filters are matched literally, without
-shared routing. MQTT 5.0 subscriptions honor No Local, Retain As Published, and
-Retain Handling.
-The broker does not support Subscription Identifiers, and tells MQTT 5.0 clients
-so when they connect. Persistent sessions do not expire, and the broker does not
+retained messages do not expire. MQTT 5.0 subscriptions honor No Local, Retain As
+Published, and Retain Handling.
+The broker supports neither shared subscriptions nor Subscription Identifiers, and
+tells MQTT 5.0 clients so when they connect; it refuses `$share/` filters in
+MQTT 3.1.1 too. Persistent sessions do not expire, and the broker does not
 keep to the Receive Maximum and Maximum Packet Size that MQTT 5.0 clients announce.
 
 With Clean Session false, or a positive session expiry in MQTT 5.0, subscriptions

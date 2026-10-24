@@ -36,4 +36,9 @@ class EmbeddedBrokerMessagingTest extends MessagingTest {
     URI endpoint() {
         return URI.create("mqtt://localhost:" + requireNonNull(broker).port());
     }
+
+    @Override
+    boolean sharedSubscriptionAvailable() {
+        return false;
+    }
 }

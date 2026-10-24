@@ -122,10 +122,11 @@ final class RawSession implements AutoCloseable {
     }
 
     /// The CONNACK that accepts an MQTT 5.0 client that chose its identifier. It announces that
-    /// the broker does not support Subscription Identifiers.
+    /// the broker supports neither Subscription Identifiers nor shared subscriptions.
     static Packet.ConnAck acceptedV5(boolean sessionPresent) {
         return new Packet.ConnAck(sessionPresent, SUCCESS, new Properties(List.of(
-                new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0)
+                new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0),
+                new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0)
         )));
     }
 

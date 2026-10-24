@@ -29,6 +29,7 @@ import static org.mqtt4j.hato.broker.internal.common.value.Qos.EXACTLY_ONCE;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.GRANTED_QOS_1;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.GRANTED_QOS_2;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.SUCCESS;
+import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.UNSPECIFIED_ERROR;
 
 class BrokerRoutingTest {
 
@@ -150,17 +151,32 @@ class BrokerRoutingTest {
     }
 
     @Test
-    void share_prefixes_are_literal_topic_levels_in_the_minimal_broker() throws Exception {
+    void a_shared_subscription_is_refused_while_the_other_filters_subscribe() throws Exception {
         try (var sut = MqttBroker.start();
                 var subscriber = connected(sut.port(), "subscriber");
                 var publisher = connected(sut.port(), "publisher")) {
-            subscriber.subscribe("$share/team/sensors/#", AT_MOST_ONCE);
-            publisher.publish("sensors/temperature", "unmatched", AT_LEAST_ONCE, 1);
-            subscriber.ping();
-            publisher.publish("$share/team/sensors/temperature", "matched", AT_LEAST_ONCE, 2);
-            assertThat(subscriber.expect(Packet.Publish.class)).isEqualTo(publication(
-                    "$share/team/sensors/temperature", "matched", AT_MOST_ONCE, 0
+            // Act: a malformed shared filter is refused like a well-formed one.
+            subscriber.send(new Packet.Subscribe(
+                    1,
+                    List.of(
+                            subscription("$share/team/sensors/#", AT_MOST_ONCE),
+                            subscription("$share/team", AT_MOST_ONCE),
+                            subscription("sensors/#", AT_MOST_ONCE)
+                    ),
+                    EMPTY
             ));
+
+            // Assert: MQTT 3.1.1 can refuse any filter, with 0x80.
+            assertThat(subscriber.expect(Packet.SubAck.class)).isEqualTo(new Packet.SubAck(
+                    1,
+                    List.of(UNSPECIFIED_ERROR, UNSPECIFIED_ERROR, SUCCESS),
+                    EMPTY
+            ));
+            publisher.publish("sensors/temperature", "matched", AT_LEAST_ONCE, 1);
+            assertThat(subscriber.expect(Packet.Publish.class))
+                    .isEqualTo(publication("sensors/temperature", "matched", AT_MOST_ONCE, 0));
+            publisher.publish("$share/team/sensors/temperature", "unmatched", AT_LEAST_ONCE, 2);
+            subscriber.ping();
         }
     }
 

@@ -19,9 +19,9 @@ import static java.util.Objects.requireNonNull;
 ///
 /// - The client interprets `$share/` in MQTT 3.1.1 and 5.0 alike. When subscribing, it rejects
 ///   a filter that [#parse] rejects, and it routes deliveries by [#filter()].
-/// - The broker treats `$share/` filters as ordinary topic filters in MQTT 3.1.1 until it
-///   supports shared subscriptions. [TopicFilter] and the MQTT 3.1.1 codec therefore keep the
-///   filter exactly as written.
+/// - The broker has no shared subscriptions and refuses every filter that [#isShared]
+///   recognizes, in MQTT 3.1.1 too. [TopicFilter] and the MQTT 3.1.1 codec keep the filter
+///   exactly as written, so there it may be any filter that starts with `$share/`.
 /// - The MQTT 5.0 codec uses this type to reject No Local on a shared subscription
 ///   (`MQTT-3.8.3-4`).
 ///
@@ -61,11 +61,10 @@ public record SharedTopicFilter(String shareName, TopicFilter filter) {
     /// @throws IllegalArgumentException if `topicFilter` starts with `$share/` but does not
     ///         continue with a valid share name, `/`, and a non-empty topic filter
     public static Optional<SharedTopicFilter> parse(TopicFilter topicFilter) {
-        requireNonNull(topicFilter, "topicFilter must not be null");
-        String pattern = topicFilter.pattern();
-        if (!pattern.startsWith(PREFIX)) {
+        if (!isShared(topicFilter)) {
             return Optional.empty();
         }
+        String pattern = topicFilter.pattern();
 
         // The share name runs to the next '/', and the rest is the topic filter [MQTT-4.8.2-2].
         int separator = pattern.indexOf('/', PREFIX.length());
@@ -80,5 +79,13 @@ public record SharedTopicFilter(String shareName, TopicFilter filter) {
                 pattern.substring(PREFIX.length(), separator),
                 new TopicFilter(pattern.substring(separator + 1))
         ));
+    }
+
+    /// Whether `topicFilter` asks for a shared subscription: whether it starts with `$share/`,
+    /// whatever follows. A filter that [#parse] rejects is then a malformed shared subscription,
+    /// not an ordinary filter.
+    public static boolean isShared(TopicFilter topicFilter) {
+        requireNonNull(topicFilter, "topicFilter must not be null");
+        return topicFilter.pattern().startsWith(PREFIX);
     }
 }

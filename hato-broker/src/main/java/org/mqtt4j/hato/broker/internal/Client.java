@@ -14,6 +14,7 @@ import org.mqtt4j.hato.broker.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
 import org.mqtt4j.hato.broker.internal.common.protocol.Property;
 import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
+import org.mqtt4j.hato.broker.internal.common.protocol.SharedTopicFilter;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
@@ -173,11 +174,12 @@ final class Client {
     }
 
     // The properties of an MQTT 5.0 CONNACK that accepts the connection. The broker sets no
-    // Subscription Identifiers on its deliveries, so it tells clients to send none; and only
-    // MQTT 5.0 can tell a client the identifier assigned to it.
+    // Subscription Identifiers on its deliveries and has no shared subscriptions, so it tells
+    // clients to send neither; and only MQTT 5.0 can tell a client the identifier assigned to it.
     private static Properties acceptanceV5(String id, boolean assigned) {
         var entries = new ArrayList<Property>();
         entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
+        entries.add(new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0));
         if (assigned) {
             entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
         }
@@ -236,10 +238,28 @@ final class Client {
                     );
                     return;
                 }
+                // The broker has no shared subscriptions, which CONNACK announced in MQTT 5.0,
+                // so a shared filter there is a Protocol Error that subscribes to nothing
+                // (MQTT 5.0 section 3.2.2.3.13) and ends the connection [MQTT-4.13.1-1].
+                if (owner.version == MqttVersion.V5 && request.subscriptions().stream()
+                        .anyMatch(requested -> SharedTopicFilter.isShared(requested.filter()))) {
+                    connection.disconnect(
+                            ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED,
+                            "shared subscription although none are supported"
+                    );
+                    return;
+                }
                 var grants = new ArrayList<ReasonCode>();
                 // The subscriptions that receive retained messages after SUBACK.
                 var retaining = new ArrayList<Packet.Subscription>();
                 for (Packet.Subscription requested : request.subscriptions()) {
+                    // An MQTT 3.1.1 client cannot learn that shared subscriptions are missing,
+                    // so the broker refuses the filter rather than match it as written: a
+                    // client that means a shared subscription would wait for nothing.
+                    if (SharedTopicFilter.isShared(requested.filter())) {
+                        grants.add(ReasonCode.UNSPECIFIED_ERROR);
+                        continue;
+                    }
                     // A test rule can refuse the filter, which then subscribes to nothing
                     // and leaves an earlier subscription to it as it was, or grant it less
                     // than the requested QoS.

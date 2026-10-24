@@ -559,11 +559,17 @@ abstract class MessagingTest {
             assertThat(requireNonNull(received.poll(5, SECONDS)).message())
                     .isEqualTo(message(base + "/job", (byte) 1));
 
-            // Act & Assert: acknowledged removal permits the previously conflicting filter.
+            // Act & Assert: acknowledged removal permits the previously conflicting filter. A
+            // broker without shared subscriptions then refuses it, which no longer conflicts.
             ordinary.unsubscribe().get(5, SECONDS);
             Subscription replacement = sut.subscribe(shared, _ -> { });
-            replacement.established().get(5, SECONDS);
-            replacement.unsubscribe().get(5, SECONDS);
+            if (sharedSubscriptionAvailable()) {
+                replacement.established().get(5, SECONDS);
+                replacement.unsubscribe().get(5, SECONDS);
+            } else {
+                assertThatThrownBy(() -> replacement.established().get(5, SECONDS))
+                        .hasCauseInstanceOf(MqttSubscriptionRefusedException.class);
+            }
             sut.disconnect().get(5, SECONDS);
         }
     }
@@ -1147,6 +1153,12 @@ abstract class MessagingTest {
     }
 
     abstract URI endpoint();
+
+    /// Whether the broker has shared subscriptions, as Mosquitto does and the embedded broker does
+    /// not.
+    boolean sharedSubscriptionAvailable() {
+        return true;
+    }
 
     /// Publishes `count` QoS 1 messages that the client's own subscription on `topic` receives,
     /// and returns once the client holds every one of their deliveries.
