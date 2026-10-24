@@ -52,12 +52,14 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// publication properties. By default, CONNACK announces only that Subscription Identifiers and
 /// shared subscriptions are not supported, and a Topic Alias Maximum of 16: the aliases that a
 /// client sets last for its connection. A test can make the broker announce smaller limits with
-/// the test kit's `BrokerControls`, and the broker then holds clients to them. The broker
-/// ignores the client's Receive Maximum and Maximum Packet Size. An Authentication Method is
-/// refused with Bad authentication method. AUTH, a PUBLISH with a Subscription Identifier or an
-/// invalid Topic Alias, or a SUBSCRIBE with a Subscription Identifier or a `$share/` filter
-/// closes the connection. A PUBREC with a failure reason code ends the QoS 2 delivery without
-/// PUBREL.
+/// the test kit's `BrokerControls`, and the broker then holds clients to them. In turn, the
+/// broker keeps to the client's Receive Maximum on each connection, resending on a resumed
+/// session no more than the new connection allows, and discards a publication larger than the
+/// client's Maximum Packet Size as if the client had received and acknowledged it. An
+/// Authentication Method is refused with Bad authentication method. AUTH, a PUBLISH with a
+/// Subscription Identifier or an invalid Topic Alias, or a SUBSCRIBE with a Subscription
+/// Identifier or a `$share/` filter closes the connection. A PUBREC with a failure reason code
+/// ends the QoS 2 delivery without PUBREL.
 /// Before it closes an MQTT 5.0 connection for a malformed or forbidden packet, an expired
 /// keep-alive, or another connection with the same client identifier, the broker sends
 /// DISCONNECT with the reason code; a peer that stops reading may not receive it.

@@ -64,6 +64,14 @@ final class Client {
 
     private int heldAcknowledgements;
 
+    // What the client announced in its CONNECT, which the session keeps to on this connection.
+    // The send quota is its Receive Maximum: how many QoS 1 and QoS 2 publications the broker
+    // may send it unanswered at once (MQTT 5.0 section 4.9). The send limit is its Maximum
+    // Packet Size. MQTT 3.1.1 announces neither, which leaves the broker's own window and limits.
+    int sendQuota = 65_535;
+
+    int sendLimit = Connection.MAX_PACKET_SIZE;
+
     Client(Connection connection, Routing routing) {
         this.connection = connection;
         this.routing = routing;
@@ -193,6 +201,8 @@ final class Client {
                 session = accepted;
                 will = requestedWill;
                 limits = offered;
+                sendQuota = sendQuotaOf(request);
+                sendLimit = sendLimitOf(request);
                 if (offered.topicAliasMaximum() > 0) {
                     aliases = new IncomingAliases(offered.topicAliasMaximum());
                 }
@@ -270,6 +280,25 @@ final class Client {
             entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
         }
         return new Properties(entries);
+    }
+
+    // The QoS 1 and QoS 2 publications that the client takes unanswered at once: the Receive
+    // Maximum of its CONNECT, 65,535 without one [MQTT-3.3.4-9].
+    private static int sendQuotaOf(Packet.Connect request) {
+        return switch (request.properties().find(PropertyId.RECEIVE_MAXIMUM).orElse(null)) {
+            case Property.TwoByteValue(var _, var value) -> value;
+            case null, default -> 65_535;
+        };
+    }
+
+    // The largest packet that the client takes: the Maximum Packet Size of its CONNECT, and
+    // without one, or above it, the largest that MQTT allows [MQTT-3.1.2-24].
+    private static int sendLimitOf(Packet.Connect request) {
+        return switch (request.properties().find(PropertyId.MAXIMUM_PACKET_SIZE).orElse(null)) {
+            case Property.FourByteValue(var _, var value) ->
+                    (int) Math.min(value, Connection.MAX_PACKET_SIZE);
+            case null, default -> Connection.MAX_PACKET_SIZE;
+        };
     }
 
     // The session of this connection while it is attached and the connection has not ended.

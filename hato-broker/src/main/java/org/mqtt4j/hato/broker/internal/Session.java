@@ -3,12 +3,14 @@ package org.mqtt4j.hato.broker.internal;
 import java.util.ArrayDeque;
 import java.util.BitSet;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.broker.internal.common.io.SendQueue;
+import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketIds;
@@ -19,6 +21,8 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 // Every session field, including the active connection, belongs to routing.
 final class Session {
+
+    private static final Log log = Log.of(Session.class);
 
     private final Routing routing;
 
@@ -46,6 +50,15 @@ final class Session {
     // one per inflight identifier. It lives for one connection: resume() rebuilds it from
     // inflight, and detaching the connection drops it.
     private final LinkedHashMap<Integer, Outgoing> deferred = new LinkedHashMap<>();
+
+    // The identifiers of the QoS 1 and QoS 2 PUBLISH packets that went to the current
+    // connection and await their PUBACK, PUBCOMP, or failing PUBREC: the client's send quota in
+    // use [MQTT-3.3.4-9]. An exchange that continues from an earlier connection with a PUBREL
+    // takes none of it (MQTT 5.0 section 4.9). Like deferred, it lives for one connection; the
+    // count saves counting the bits for each delivery.
+    private final BitSet outstanding = new BitSet();
+
+    private int outstandingCount;
 
     // Only identifiers are retained for inbound QoS 2. The set grows by doubling on first use,
     // so the 16-bit identifier space bounds it to 16 KiB.
@@ -136,6 +149,12 @@ final class Session {
             return;
         }
         var delivery = new Delivery(publication, qos, retain, version);
+        // A connected client that takes no packet this large loses only this delivery, before
+        // the broker's own limits below could discard the whole session.
+        Connection current = connection;
+        if (current != null && tooLargeFor(current, delivery)) {
+            return;
+        }
         // A frame that can never fit must not block the head indefinitely.
         if (delivery.byteCount > settings.sendBytes()
                 || (qos != Qos.AT_MOST_ONCE && delivery.byteCount > settings.maxInflightBytes())) {
@@ -152,7 +171,21 @@ final class Session {
 
     void resume() {
         deferred.clear();
-        deferred.putAll(inflight);
+        outstanding.clear();
+        outstandingCount = 0;
+        Connection peer = connection;
+        if (peer == null) {
+            return;
+        }
+        // A publication that an earlier connection sent first can be larger than the new one
+        // takes; it ends as if answered, and the rest go out again.
+        for (Map.Entry<Integer, Outgoing> entry : new LinkedHashMap<>(inflight).entrySet()) {
+            if (entry.getValue() instanceof Delivery replay && tooLargeFor(peer, replay)) {
+                end(entry.getKey(), replay);
+            } else {
+                deferred.put(entry.getKey(), entry.getValue());
+            }
+        }
         drain();
     }
 
@@ -161,20 +194,43 @@ final class Session {
         if (peer == null || peer.isEnded()) {
             return;
         }
-        // Replays and PUBRELs precede new deliveries in the regular queue. When it is full,
+        // Replays and PUBRELs precede new deliveries in the regular queue. A PUBREL goes out
+        // whatever the client's send quota [MQTT-3.3.4-10], while a replayed PUBLISH waits for
+        // room in it, and new deliveries wait behind the replays. When the queue is full,
         // draining pauses here and the writer resumes it after freeing space.
-        while (!deferred.isEmpty()) {
-            Outgoing outgoing = deferred.firstEntry().getValue();
+        boolean replaysWait = false;
+        Iterator<Outgoing> waiting = deferred.values().iterator();
+        while (waiting.hasNext()) {
+            Outgoing outgoing = waiting.next();
+            Delivery replay = outgoing instanceof Delivery value ? value : null;
+            if (replay != null && outstandingCount >= peer.client.sendQuota) {
+                replaysWait = true;
+                continue;
+            }
             if (peer.enqueue(outgoing) != SendQueue.OfferResult.ACCEPTED) {
                 return;
             }
-            deferred.pollFirstEntry();
+            waiting.remove();
+            if (replay != null) {
+                countOutstanding(replay.packetId);
+            }
+        }
+        if (replaysWait) {
+            return;
         }
         Delivery delivery;
         while ((delivery = pending.peekFirst()) != null) {
+            // A delivery queued for an earlier connection can be larger than this one takes.
+            // It goes as if sent and answered, without an identifier or a place in the window.
+            if (tooLargeFor(peer, delivery)) {
+                pending.removeFirst();
+                pendingBytes -= delivery.byteCount;
+                continue;
+            }
             boolean acknowledged = delivery.qos != Qos.AT_MOST_ONCE;
             if (acknowledged && (inflight.size() == settings.maxInflight()
-                    || delivery.byteCount > settings.maxInflightBytes() - inflightBytes)) {
+                    || delivery.byteCount > settings.maxInflightBytes() - inflightBytes
+                    || outstandingCount >= peer.client.sendQuota)) {
                 return;
             }
             if (acknowledged) {
@@ -194,8 +250,32 @@ final class Session {
             if (acknowledged) {
                 inflight.put(delivery.packetId, delivery);
                 inflightBytes += delivery.byteCount;
+                countOutstanding(delivery.packetId);
             }
         }
+    }
+
+    private void countOutstanding(int id) {
+        outstanding.set(id);
+        outstandingCount++;
+    }
+
+    // Whether `delivery` is larger than the client on `peer` takes. The broker discards such a
+    // delivery and behaves as if it had sent it [MQTT-3.1.2-25]; this logs that.
+    private boolean tooLargeFor(Connection peer, Delivery delivery) {
+        int limit = peer.client.sendLimit;
+        if (delivery.byteCount <= limit) {
+            return false;
+        }
+        log.debug(
+                "Broker on port {} discarded a {}-byte delivery for client {}, which takes at most"
+                        + " {} bytes",
+                routing.port,
+                delivery.byteCount,
+                clientId,
+                limit
+        );
+        return true;
     }
 
     void acknowledge(int id, boolean complete) {
@@ -248,13 +328,18 @@ final class Session {
         drain();
     }
 
-    // Forgets an outgoing exchange and returns its identifier and window share.
+    // Forgets an outgoing exchange and returns its identifier, its window share, and its place
+    // in the client's send quota.
     private void end(int id, Outgoing outgoing) {
         inflight.remove(id);
         deferred.remove(id);
         packetIds.release(id);
         if (outgoing instanceof Delivery delivery) {
             inflightBytes -= delivery.byteCount;
+        }
+        if (outstanding.get(id)) {
+            outstanding.clear(id);
+            outstandingCount--;
         }
     }
 
@@ -264,6 +349,8 @@ final class Session {
         }
         connection = null;
         deferred.clear();
+        outstanding.clear();
+        outstandingCount = 0;
         if (!kept) {
             routing.sessions.remove(clientId, this);
             clear();
@@ -284,6 +371,8 @@ final class Session {
         received.clear();
         inflight.clear();
         deferred.clear();
+        outstanding.clear();
+        outstandingCount = 0;
         pending.clear();
         inflightBytes = 0;
         pendingBytes = 0;
