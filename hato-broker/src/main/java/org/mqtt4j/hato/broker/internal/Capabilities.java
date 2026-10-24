@@ -8,12 +8,13 @@ import static java.util.Objects.requireNonNull;
 
 // What the broker announces to an MQTT 5.0 client in CONNACK and then holds the client to: the
 // capabilities that a test can narrow. A null value is not announced, which MQTT 5.0 reads as no
-// limit, and so is a maximum QoS of 2, retained messages, and wildcards. A connection keeps what
-// it was accepted with.
+// limit, and so is a maximum QoS of 2, retained messages, wildcards, and Subscription
+// Identifiers. A connection keeps what it was accepted with.
 record Capabilities(
         Qos maximumQos,
         boolean retainAvailable,
         boolean wildcardSubscriptionAvailable,
+        boolean subscriptionIdentifiersAvailable,
         @Nullable Integer receiveMaximum,
         @Nullable Integer maximumPacketSize,
         int topicAliasMaximum,
@@ -26,6 +27,7 @@ record Capabilities(
             Qos.EXACTLY_ONCE,
             true,
             true,
+            true,
             null,
             null,
             16,
@@ -36,6 +38,7 @@ record Capabilities(
     // no Topic Aliases.
     static final Capabilities UNANNOUNCED = new Capabilities(
             Qos.EXACTLY_ONCE,
+            true,
             true,
             true,
             null,

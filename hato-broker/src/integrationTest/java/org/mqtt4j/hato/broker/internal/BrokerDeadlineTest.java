@@ -121,7 +121,7 @@ class BrokerDeadlineTest {
             throws Exception {
         // Arrange: a Server Keep Alive of one second, for a client that asks for a minute.
         var timer = new ManualTimer();
-        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, null, null, 16, 1);
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, true, null, null, 16, 1);
         try (
                 BrokerServer sut = BrokerServer.builder()
                         .connectTimeout(CONNECT_TIMEOUT)

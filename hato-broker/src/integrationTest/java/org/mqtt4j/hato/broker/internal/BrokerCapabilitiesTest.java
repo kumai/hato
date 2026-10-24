@@ -36,6 +36,7 @@ import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.PACKET_TOO
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.QOS_NOT_SUPPORTED;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.RECEIVE_MAXIMUM_EXCEEDED;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.RETAIN_NOT_SUPPORTED;
+import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.SUCCESS;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.TOPIC_ALIAS_INVALID;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED;
@@ -48,7 +49,7 @@ class BrokerCapabilitiesTest {
     void a_lower_maximum_qos_is_announced_and_lowers_the_qos_granted_to_subscriptions()
             throws Exception {
         // Arrange: Maximum QoS 1.
-        var capabilities = new Capabilities(AT_LEAST_ONCE, true, true, null, null, 16, null);
+        var capabilities = new Capabilities(AT_LEAST_ONCE, true, true, true, null, null, 16, null);
         try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
             // Act
             Packet.ConnAck connAck = accepted(client, "limited");
@@ -70,7 +71,7 @@ class BrokerCapabilitiesTest {
     void a_publication_above_the_maximum_qos_ends_the_connection_and_forwards_nothing()
             throws Exception {
         // Arrange: Maximum QoS 1.
-        var capabilities = new Capabilities(AT_LEAST_ONCE, true, true, null, null, 16, null);
+        var capabilities = new Capabilities(AT_LEAST_ONCE, true, true, true, null, null, 16, null);
         try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
             accepted(client, "limited");
             client.subscribe("limited/#", AT_LEAST_ONCE);
@@ -89,7 +90,7 @@ class BrokerCapabilitiesTest {
     void a_will_above_the_maximum_qos_or_retained_without_retained_messages_is_refused()
             throws Exception {
         // Arrange: Maximum QoS 1 and no retained messages.
-        var capabilities = new Capabilities(AT_LEAST_ONCE, false, true, null, null, 16, null);
+        var capabilities = new Capabilities(AT_LEAST_ONCE, false, true, true, null, null, 16, null);
         try (
                 BrokerServer sut = broker(capabilities);
                 var aboveMaximum = open(sut);
@@ -112,7 +113,7 @@ class BrokerCapabilitiesTest {
     @Test
     void without_retained_messages_a_retained_publication_ends_the_connection() throws Exception {
         // Arrange: no retained messages.
-        var capabilities = new Capabilities(EXACTLY_ONCE, false, true, null, null, 16, null);
+        var capabilities = new Capabilities(EXACTLY_ONCE, false, true, true, null, null, 16, null);
         try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
             Packet.ConnAck connAck = accepted(client, "retaining");
 
@@ -139,7 +140,7 @@ class BrokerCapabilitiesTest {
     @Test
     void without_wildcards_a_subscribe_with_one_ends_the_connection() throws Exception {
         // Arrange: no wildcard subscriptions.
-        var capabilities = new Capabilities(EXACTLY_ONCE, true, false, null, null, 16, null);
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, false, true, null, null, 16, null);
         try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
             Packet.ConnAck connAck = accepted(client, "wildcards");
             client.subscribe("plain/topic", AT_MOST_ONCE);
@@ -165,10 +166,37 @@ class BrokerCapabilitiesTest {
     }
 
     @Test
+    void without_subscription_identifiers_a_subscribe_with_one_ends_the_connection()
+            throws Exception {
+        // Arrange: no Subscription Identifiers.
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, false, null, null, 16, null);
+        try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
+            Packet.ConnAck connAck = accepted(client, "identified");
+            var identifier = new Property.VariableByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER, 1);
+            var request = new Packet.Subscribe(
+                    1,
+                    List.of(subscription("identified/#", AT_MOST_ONCE)),
+                    new Properties(List.of(identifier))
+            );
+
+            // Act
+            client.send(request);
+
+            // Assert: MQTT 5.0 section 3.2.2.3.12.
+            var none = new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0);
+            assertThat(connAck.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE))
+                    .contains(none);
+            var refusal = new Packet.Disconnect(SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED, EMPTY);
+            assertThat(client.expect(Packet.Disconnect.class)).isEqualTo(refusal);
+            client.expectClosed();
+        }
+    }
+
+    @Test
     void more_publications_without_a_response_than_the_receive_maximum_end_the_connection()
             throws Exception {
         // Arrange: Receive Maximum 2.
-        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, 2, null, 16, null);
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, true, 2, null, 16, null);
         try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
             Packet.ConnAck connAck = accepted(client, "eager");
             // Two QoS 2 publications wait for PUBREL, and releasing one leaves room for one more.
@@ -197,7 +225,7 @@ class BrokerCapabilitiesTest {
     void a_puback_that_a_test_holds_back_leaves_its_publication_without_a_response()
             throws Exception {
         // Arrange: Receive Maximum 1, and the client's PUBACKs held back.
-        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, 1, null, 16, null);
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, true, 1, null, 16, null);
         try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
             accepted(client, "held");
             sut.holdResponses(Packet.PubAck.class, "held");
@@ -217,7 +245,7 @@ class BrokerCapabilitiesTest {
     @Test
     void a_packet_larger_than_the_maximum_packet_size_ends_the_connection() throws Exception {
         // Arrange: Maximum Packet Size 64, and publications of exactly 64 bytes and one more.
-        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, null, 64, 16, null);
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, true, null, 64, 16, null);
         int header = PacketCodec.of(MqttVersion.V5)
                 .encode(publication("sized", "", AT_MOST_ONCE, 0))
                 .length;
@@ -241,7 +269,7 @@ class BrokerCapabilitiesTest {
     @Test
     void a_lower_topic_alias_maximum_is_announced_and_bounds_the_aliases() throws Exception {
         // Arrange: Topic Alias Maximum 2.
-        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, null, null, 2, null);
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, true, null, null, 2, null);
         try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
             Packet.ConnAck connAck = accepted(client, "aliasing");
             client.send(aliased(2));
@@ -262,7 +290,7 @@ class BrokerCapabilitiesTest {
     @Test
     void a_topic_alias_maximum_of_zero_is_not_announced_and_allows_no_alias() throws Exception {
         // Arrange: no Topic Aliases.
-        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, null, null, 0, null);
+        var capabilities = new Capabilities(EXACTLY_ONCE, true, true, true, null, null, 0, null);
         try (BrokerServer sut = broker(capabilities); var client = open(sut)) {
             Packet.ConnAck connAck = accepted(client, "unaliased");
 
@@ -280,7 +308,7 @@ class BrokerCapabilitiesTest {
     @Test
     void narrowed_capabilities_leave_mqtt_3_1_1_connections_as_they_were() throws Exception {
         // Arrange: every capability narrowed, which MQTT 3.1.1 cannot announce.
-        var capabilities = new Capabilities(AT_MOST_ONCE, false, false, 1, 64, 0, 1);
+        var capabilities = new Capabilities(AT_MOST_ONCE, false, false, false, 1, 64, 0, 1);
         try (BrokerServer sut = broker(capabilities); var client = RawSession.open(sut.port())) {
             client.send(connect("unaffected", true, 0));
             assertThat(client.expect(Packet.ConnAck.class))
@@ -332,6 +360,7 @@ class BrokerCapabilitiesTest {
     ) {
         assertThatThrownBy(() -> new Capabilities(
                 EXACTLY_ONCE,
+                true,
                 true,
                 true,
                 receiveMaximum,

@@ -1,10 +1,12 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.jspecify.annotations.Nullable;
@@ -40,7 +42,7 @@ final class Session {
     boolean kept;
 
     // Each filter's subscription with the options that the client requested.
-    final Map<TopicFilter, Packet.Subscription> subscriptions = new HashMap<>();
+    final Map<TopicFilter, Subscribed> subscriptions = new HashMap<>();
 
     private final PacketIds packetIds = new PacketIds();
 
@@ -81,15 +83,21 @@ final class Session {
     }
 
     // Delivers `publication` from `publisher` for the subscriptions that match it.
-    // Overlapping subscriptions share one copy at their highest QoS [MQTT-3.3.4-2]. A retained
-    // publication takes a second copy when only some of them keep its retain flag, so that
-    // each subscription gets the flag it asked for [MQTT-3.3.1-12] [MQTT-3.3.1-13].
+    // Overlapping subscriptions share one copy at their highest QoS [MQTT-3.3.4-2], which
+    // carries the Subscription Identifiers of them all [MQTT-3.3.4-4]. A retained publication
+    // takes a second copy when only some of them keep its retain flag, so that each
+    // subscription gets the flag it asked for [MQTT-3.3.1-12] [MQTT-3.3.1-13]; each copy then
+    // carries the identifiers of the subscriptions that receive it [MQTT-3.3.4-5].
     void deliverMatching(Packet.Publish publication, Session publisher) {
         // The highest QoS granted by the matching subscriptions with Retain As Published, and
-        // by the other matching subscriptions; -1 while none matches.
+        // by the other matching subscriptions; -1 while none matches. Their identifiers repeat
+        // one that several of them have, as MQTT 5.0 section 3.3.4 describes.
         int asPublished = -1;
         int cleared = -1;
-        for (Packet.Subscription subscription : subscriptions.values()) {
+        List<Integer> asPublishedIdentifiers = List.of();
+        List<Integer> clearedIdentifiers = List.of();
+        for (Subscribed subscribed : subscriptions.values()) {
+            Packet.Subscription subscription = subscribed.subscription();
             // No Local withholds a client's own publications [MQTT-3.8.3-3].
             boolean withheld = subscription.noLocal() && publisher == this;
             if (withheld || !subscription.filter().matches(publication.topic())) {
@@ -98,18 +106,43 @@ final class Session {
             int level = subscription.qos().level();
             if (subscription.retainAsPublished()) {
                 asPublished = Math.max(asPublished, level);
+                asPublishedIdentifiers = withIdentifier(asPublishedIdentifiers, subscribed);
             } else {
                 cleared = Math.max(cleared, level);
+                clearedIdentifiers = withIdentifier(clearedIdentifiers, subscribed);
             }
         }
         int published = publication.qos().level();
         if (publication.retain() && asPublished >= 0 && cleared >= 0) {
-            deliver(publication, Qos.of(Math.min(asPublished, published)), true);
-            deliver(publication, Qos.of(Math.min(cleared, published)), false);
+            deliver(
+                    publication,
+                    Qos.of(Math.min(asPublished, published)),
+                    true,
+                    asPublishedIdentifiers
+            );
+            deliver(
+                    publication,
+                    Qos.of(Math.min(cleared, published)),
+                    false,
+                    clearedIdentifiers
+            );
         } else if (asPublished >= 0 || cleared >= 0) {
             Qos qos = Qos.of(Math.min(Math.max(asPublished, cleared), published));
-            deliver(publication, qos, publication.retain() && asPublished >= 0);
+            var identifiers = new ArrayList<>(asPublishedIdentifiers);
+            identifiers.addAll(clearedIdentifiers);
+            deliver(publication, qos, publication.retain() && asPublished >= 0, identifiers);
         }
+    }
+
+    // `identifiers` with the identifier of `subscribed`, if it has one. The list is created for
+    // the first identifier, so that a session without them allocates none.
+    private static List<Integer> withIdentifier(List<Integer> identifiers, Subscribed subscribed) {
+        if (subscribed.identifier() == 0) {
+            return identifiers;
+        }
+        List<Integer> added = identifiers.isEmpty() ? new ArrayList<>() : identifiers;
+        added.add(subscribed.identifier());
+        return added;
     }
 
     // Sends the retained messages that match `subscription`, which the client has just made
@@ -122,7 +155,12 @@ final class Session {
     // subscription that matches more of them than those hold discards the session like any
     // other overflow. A deliberate simplification: sending them as the window frees up would
     // lift that ceiling, if productization needs it.
-    void deliverRetained(Packet.Subscription subscription) {
+    void deliverRetained(Subscribed subscribed) {
+        Packet.Subscription subscription = subscribed.subscription();
+        // They result from this subscription alone, and carry its identifier [MQTT-3.3.4-3].
+        List<Integer> identifiers = subscribed.identifier() == 0
+                ? List.of()
+                : List.of(subscribed.identifier());
         // A copy, because a delivery that overflows closes the connection, and the Will that
         // its end publishes can change the retained messages.
         for (Routing.Retained entry : routing.retainedMessages()) {
@@ -135,11 +173,16 @@ final class Session {
                 return;
             }
             int level = Math.min(subscription.qos().level(), publication.qos().level());
-            deliver(publication, Qos.of(level), true);
+            deliver(publication, Qos.of(level), true, identifiers);
         }
     }
 
-    private void deliver(Packet.Publish publication, Qos qos, boolean retain) {
+    private void deliver(
+            Packet.Publish publication,
+            Qos qos,
+            boolean retain,
+            List<Integer> identifiers
+    ) {
         Connection peer = connection;
         if (peer != null && peer.isEnded()) {
             detach(peer);
@@ -148,7 +191,7 @@ final class Session {
         if (!online && (!kept || qos == Qos.AT_MOST_ONCE)) {
             return;
         }
-        var delivery = new Delivery(publication, qos, retain, version);
+        var delivery = new Delivery(publication, qos, retain, identifiers, version);
         // A connected client that takes no packet this large loses only this delivery, before
         // the broker's own limits below could discard the whole session.
         Connection current = connection;
@@ -386,5 +429,11 @@ final class Session {
         if (peer != null) {
             peer.close(reason);
         }
+    }
+
+    // A subscription with the Subscription Identifier that its SUBSCRIBE gave it, or 0, which no
+    // identifier takes, for none. Making the subscription again replaces both (MQTT 5.0 section
+    // 3.8.4).
+    record Subscribed(Packet.Subscription subscription, int identifier) {
     }
 }

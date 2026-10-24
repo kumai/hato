@@ -46,7 +46,6 @@ class AnnouncedCapabilitiesTest {
 
             // Assert
             assertThat(ack.properties().entries()).containsExactlyInAnyOrder(
-                    new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0),
                     new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0),
                     new Property.ByteValue(PropertyId.MAXIMUM_QOS, 0),
                     new Property.ByteValue(PropertyId.RETAIN_AVAILABLE, 0),

@@ -17,7 +17,7 @@ import static java.util.Objects.requireNonNull;
 /// CONNACK leaves out each capability whose value is what MQTT 5.0 assumes without it: QoS 2,
 /// retained messages and wildcard subscriptions available, a Receive Maximum of 65,535, the
 /// largest packet that MQTT allows, and no Topic Aliases. Whatever the value, the broker
-/// announces that it supports neither shared subscriptions nor Subscription Identifiers.
+/// announces that it does not support shared subscriptions.
 ///
 /// Experimental, like [BrokerControls].
 public final class BrokerCapabilities {

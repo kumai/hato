@@ -362,7 +362,8 @@ public final class BrokerServer implements AutoCloseable {
     /// from now on, and hold those connections to them; connections accepted before keep theirs.
     /// The maximum QoS is a level. A Receive Maximum of 65,535 and a Maximum Packet Size of
     /// 268,435,460 bytes are what a client assumes when CONNACK leaves them out, so the broker
-    /// leaves them out. The Server Keep Alive stays as the broker was built with.
+    /// leaves them out. Subscription Identifiers and the Server Keep Alive stay as the broker was
+    /// built with.
     ///
     /// @throws IllegalArgumentException if the level is not 0, 1, or 2, or a value is outside
     ///         what MQTT 5.0 can announce
@@ -378,6 +379,7 @@ public final class BrokerServer implements AutoCloseable {
                 Qos.of(maximumQosLevel),
                 retainAvailable,
                 wildcardSubscriptionAvailable,
+                routing.settings.capabilities().subscriptionIdentifiersAvailable(),
                 (receiveMaximum == 65_535) ? null : receiveMaximum,
                 (maximumPacketSize == Connection.MAX_PACKET_SIZE) ? null : maximumPacketSize,
                 topicAliasMaximum,

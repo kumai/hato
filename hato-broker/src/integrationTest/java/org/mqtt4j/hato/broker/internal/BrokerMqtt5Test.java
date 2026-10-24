@@ -66,10 +66,8 @@ class BrokerMqtt5Test {
             client.send(connectV5("accepted", true, 0, 0));
 
             // Assert: only the MQTT 5.0 form, which has a reason code, decodes here. It announces
-            // only that Subscription Identifiers and shared subscriptions are not supported, and
-            // the Topic Alias Maximum.
+            // only that shared subscriptions are not supported, and the Topic Alias Maximum.
             var announcements = new Properties(List.of(
-                    new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0),
                     new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0),
                     new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16)
             ));
@@ -509,15 +507,6 @@ class BrokerMqtt5Test {
                                 identifier
                         ),
                         ReasonCode.PROTOCOL_ERROR
-                ),
-                new Violation(
-                        "a SUBSCRIBE with a Subscription Identifier",
-                        new Packet.Subscribe(
-                                1,
-                                List.of(subscription("violation/#", AT_MOST_ONCE)),
-                                identifier
-                        ),
-                        ReasonCode.SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED
                 ),
                 new Violation(
                         "a SUBSCRIBE with a shared subscription",

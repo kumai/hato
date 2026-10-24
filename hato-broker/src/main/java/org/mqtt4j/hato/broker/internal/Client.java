@@ -236,13 +236,15 @@ final class Client {
         return true;
     }
 
-    // The properties of an MQTT 5.0 CONNACK that accepts the connection. The broker sets no
-    // Subscription Identifiers on its deliveries and has no shared subscriptions, so it tells
-    // clients to send neither. It announces the capabilities that differ from what a client
-    // assumes without them, and only MQTT 5.0 can tell a client the identifier assigned to it.
+    // The properties of an MQTT 5.0 CONNACK that accepts the connection. The broker has no shared
+    // subscriptions, so it tells clients to send none. It announces the capabilities that differ
+    // from what a client assumes without them, and only MQTT 5.0 can tell a client the identifier
+    // assigned to it.
     private static Properties acceptanceV5(String id, boolean assigned, Capabilities offered) {
         var entries = new ArrayList<Property>();
-        entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
+        if (!offered.subscriptionIdentifiersAvailable()) {
+            entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
+        }
         entries.add(new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0));
         int topicAliasMaximum = offered.topicAliasMaximum();
         if (topicAliasMaximum > 0) {
@@ -280,6 +282,19 @@ final class Client {
             entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
         }
         return new Properties(entries);
+    }
+
+    // The Subscription Identifier that a SUBSCRIBE gives every subscription that it makes or
+    // replaces, and without one 0, which no identifier takes (MQTT 5.0 section 3.8.2.1.2). MQTT
+    // 3.1.1 has no properties.
+    private static int identifierOf(Packet.Subscribe request) {
+        Property identifier = request.properties()
+                .find(PropertyId.SUBSCRIPTION_IDENTIFIER)
+                .orElse(null);
+        return switch (identifier) {
+            case Property.VariableByteValue(var _, var value) -> value;
+            case null, default -> 0;
+        };
     }
 
     // The QoS 1 and QoS 2 publications that the client takes unanswered at once: the Receive
@@ -343,10 +358,10 @@ final class Client {
     void process(Session owner, Packet packet) {
         switch (packet) {
             case Packet.Subscribe request -> {
-                // CONNACK announced that Subscription Identifiers are not supported, so one
-                // is a Protocol Error that subscribes to nothing (MQTT 5.0 section
-                // 3.2.2.3.12). MQTT 3.1.1 has no properties.
-                if (request.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
+                int identifier = identifierOf(request);
+                // Where CONNACK announced that Subscription Identifiers are not supported, one
+                // is a Protocol Error that subscribes to nothing (MQTT 5.0 section 3.2.2.3.12).
+                if (identifier != 0 && !limits.subscriptionIdentifiersAvailable()) {
                     connection.disconnect(
                             ReasonCode.SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED,
                             "Subscription Identifier although none are supported"
@@ -376,7 +391,7 @@ final class Client {
                 }
                 var grants = new ArrayList<ReasonCode>();
                 // The subscriptions that receive retained messages after SUBACK.
-                var retaining = new ArrayList<Packet.Subscription>();
+                var retaining = new ArrayList<Session.Subscribed>();
                 for (Packet.Subscription requested : request.subscriptions()) {
                     // An MQTT 3.1.1 client cannot learn that shared subscriptions are missing,
                     // so the broker refuses the filter rather than match it as written: a
@@ -408,9 +423,10 @@ final class Client {
                                     requested.retainHandling()
                             )
                             : requested;
-                    Packet.Subscription replaced = owner.subscriptions.put(
+                    var subscribed = new Session.Subscribed(subscription, identifier);
+                    Session.Subscribed replaced = owner.subscriptions.put(
                             subscription.filter(),
-                            subscription
+                            subscribed
                     );
                     ReasonCode granted = switch (subscription.qos()) {
                         case AT_MOST_ONCE -> ReasonCode.SUCCESS;
@@ -427,12 +443,12 @@ final class Client {
                         default -> false;
                     };
                     if (sendsRetained) {
-                        retaining.add(subscription);
+                        retaining.add(subscribed);
                     }
                 }
                 send(new Packet.SubAck(request.packetId(), grants, Properties.EMPTY));
-                for (Packet.Subscription subscription : retaining) {
-                    owner.deliverRetained(subscription);
+                for (Session.Subscribed subscribed : retaining) {
+                    owner.deliverRetained(subscribed);
                 }
             }
             case Packet.Unsubscribe request -> {
