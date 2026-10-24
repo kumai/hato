@@ -11,9 +11,9 @@ import org.mqtt4j.hato.broker.internal.control.ControlPort;
 import static java.util.Objects.requireNonNull;
 
 /// Experimental test controls for an embedded broker: rules that refuse subscriptions or grant
-/// them a lower QoS, responses held back until the test releases them, and the clients connected
-/// now. Like the broker API, the controls are outside the compatibility promise until
-/// productization.
+/// them a lower QoS, responses held back until the test releases them, the capabilities that the
+/// broker announces to MQTT 5.0 clients, and the clients connected now. Like the broker API, the
+/// controls are outside the compatibility promise until productization.
 ///
 /// The test starts and closes the broker through the broker's own API, and the controls act on
 /// it; the controls that [#of(MqttBroker)] returns for one broker share its state. Each method
@@ -36,6 +36,13 @@ import static java.util.Objects.requireNonNull;
 /// responses, one for each packet identifier, and the broker closes a connection that would
 /// hold more. [#heldResponses()] shows when the broker holds a response, so a test can wait
 /// for one, for example with Awaitility.
+///
+/// An announcement applies to the MQTT 5.0 connections that the broker accepts after
+/// [#announce(BrokerCapabilities)] returns, and lasts until the next one or until the broker
+/// closes. A connection keeps the capabilities that it was accepted with until it ends, and what
+/// the broker holds already stays as it was: sessions, the QoS granted to their subscriptions,
+/// retained messages, and the deliveries that wait. MQTT 3.1.1 connections learn of no
+/// capabilities and are held to none.
 public final class BrokerControls {
 
     private final ControlPort port;
@@ -122,6 +129,23 @@ public final class BrokerControls {
     /// @throws NullPointerException if `clientId` is null
     public void disconnect(String clientId) {
         port.disconnect(requireNonNull(clientId, "clientId must not be null"));
+    }
+
+    /// Makes the broker announce `capabilities` to the MQTT 5.0 clients that connect from now
+    /// on, and hold their connections to them. Announce [BrokerCapabilities#defaults()] to go
+    /// back to what the broker announces by itself.
+    ///
+    /// @throws NullPointerException if `capabilities` is null
+    public void announce(BrokerCapabilities capabilities) {
+        requireNonNull(capabilities, "capabilities must not be null");
+        port.announce(
+                capabilities.maximumQos().level(),
+                capabilities.retainAvailable(),
+                capabilities.wildcardSubscriptionAvailable(),
+                capabilities.receiveMaximum(),
+                capabilities.maximumPacketSize(),
+                capabilities.topicAliasMaximum()
+        );
     }
 
     private static ControlPort.Response responseOf(ResponseKind kind) {

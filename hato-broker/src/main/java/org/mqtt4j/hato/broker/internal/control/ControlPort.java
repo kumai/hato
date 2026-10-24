@@ -81,6 +81,25 @@ public final class ControlPort {
         server.disconnect(clientId);
     }
 
+    /// See [BrokerServer#announce(int, boolean, boolean, int, int, int)].
+    public void announce(
+            int maximumQosLevel,
+            boolean retainAvailable,
+            boolean wildcardSubscriptionAvailable,
+            int receiveMaximum,
+            int maximumPacketSize,
+            int topicAliasMaximum
+    ) {
+        server.announce(
+                maximumQosLevel,
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                receiveMaximum,
+                maximumPacketSize,
+                topicAliasMaximum
+        );
+    }
+
     private static Class<? extends Packet> typeOf(Response kind) {
         return switch (kind) {
             case SUBACK -> Packet.SubAck.class;

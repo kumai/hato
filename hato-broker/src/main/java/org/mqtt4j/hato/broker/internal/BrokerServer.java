@@ -17,6 +17,7 @@ import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.concurrent.TimerService;
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.value.Qos;
 
 import static java.util.Objects.requireNonNull;
 
@@ -355,6 +356,34 @@ public final class BrokerServer implements AutoCloseable {
     /// nothing when the client has no open connection.
     public void disconnect(String clientId) {
         routing.disconnect(clientId);
+    }
+
+    /// Makes the broker announce these capabilities to the MQTT 5.0 connections that it accepts
+    /// from now on, and hold those connections to them; connections accepted before keep theirs.
+    /// The maximum QoS is a level. A Receive Maximum of 65,535 and a Maximum Packet Size of
+    /// 268,435,460 bytes are what a client assumes when CONNACK leaves them out, so the broker
+    /// leaves them out. The Server Keep Alive stays as the broker was built with.
+    ///
+    /// @throws IllegalArgumentException if the level is not 0, 1, or 2, or a value is outside
+    ///         what MQTT 5.0 can announce
+    public void announce(
+            int maximumQosLevel,
+            boolean retainAvailable,
+            boolean wildcardSubscriptionAvailable,
+            int receiveMaximum,
+            int maximumPacketSize,
+            int topicAliasMaximum
+    ) {
+        var capabilities = new Capabilities(
+                Qos.of(maximumQosLevel),
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                (receiveMaximum == 65_535) ? null : receiveMaximum,
+                (maximumPacketSize == Connection.MAX_PACKET_SIZE) ? null : maximumPacketSize,
+                topicAliasMaximum,
+                routing.settings.capabilities().serverKeepAlive()
+        );
+        routing.announce(capabilities);
     }
 
     /// A response that a connection of `clientId` holds back.

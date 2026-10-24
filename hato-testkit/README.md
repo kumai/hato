@@ -1,8 +1,8 @@
 # Hato test kit
 
 Test the code that publishes and subscribes without a broker, and how your
-application handles interrupted connections, timeouts, and a broker that refuses or
-holds back its answers. The test kit includes the
+application handles interrupted connections, timeouts, and a broker that refuses,
+holds back its answers, or announces narrower limits. The test kit includes the
 [client](../hato-client/README.md) and [embedded broker](../hato-broker/README.md) as
 dependencies.
 
@@ -82,7 +82,8 @@ If you only need a broker, you can depend on `hato-broker` directly.
 ## Controlling the broker
 
 [BrokerControls](src/main/java/org/mqtt4j/hato/testkit/BrokerControls.java) lets a
-test make the embedded broker refuse, hold back, or disconnect:
+test make the embedded broker refuse, hold back, disconnect, or announce narrower
+limits:
 
 ```java
 try (MqttBroker broker = MqttBroker.start()) {
@@ -104,6 +105,19 @@ try (MqttBroker broker = MqttBroker.start()) {
 - `connectedClients()` lists the clients with an open connection, and
   `disconnect(clientId)` closes one from the broker's side, which publishes the
   client's Will.
+- `announce(capabilities)` changes the limits that the broker announces to MQTT 5.0
+  clients as they connect: the highest QoS, whether retained messages and wildcard
+  subscriptions are available, the Receive Maximum, the Maximum Packet Size, and the
+  Topic Alias Maximum. Build them with
+  [BrokerCapabilities](src/main/java/org/mqtt4j/hato/testkit/BrokerCapabilities.java),
+  for example `BrokerCapabilities.defaults().withMaximumQos(Qos.AT_LEAST_ONCE)`, and
+  announce `BrokerCapabilities.defaults()` again to go back. Only clients that connect
+  afterward get the new limits:
+  open connections keep theirs, and the broker's sessions and retained messages stay
+  as they are, so announce before the code under test connects. A Hato client refuses
+  what the limits forbid with `MqttPublicationRefusedException` or
+  `MqttSubscriptionRefusedException` and stays connected. MQTT 3.1.1 connections learn
+  of no limits.
 
 ## Simulating failures and timeouts
 
@@ -124,5 +138,5 @@ try (MqttBroker broker = MqttBroker.start()) {
   response before checking the result.
 
 `FaultyTransport` is experimental: its API may change as it gains kinds of
-faults. `BrokerControls`, `ResponseKind`, and `HeldResponse` are experimental,
-like the broker that they control.
+faults. `BrokerControls`, `BrokerCapabilities`, `ResponseKind`, and `HeldResponse`
+are experimental, like the broker that they control.

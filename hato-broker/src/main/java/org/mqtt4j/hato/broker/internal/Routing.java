@@ -147,6 +147,14 @@ final class Routing {
         }
     }
 
+    // A connection copies the capabilities as routing accepts it, so each one works by those
+    // before or those after this replacement, never by a mix.
+    void announce(Capabilities value) {
+        synchronized (this) {
+            capabilities = value;
+        }
+    }
+
     // The highest QoS that the test rules let `requested` have: the requested QoS without a
     // rule for its filter, the rule's maximum with one, and null when the rule refuses it.
     // Called under routing.

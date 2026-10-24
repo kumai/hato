@@ -246,18 +246,105 @@ class BrokerControlsTest {
         }
     }
 
+    @Test
+    void an_announcement_applies_to_the_mqtt_5_clients_that_connect_afterward() throws Exception {
+        try (var broker = MqttBroker.start();
+                MqttClient before = connected(broker, MqttVersion.V5);
+                MqttClient after = client(broker, MqttVersion.V5, clientId())) {
+            // Arrange
+            var sut = BrokerControls.of(broker);
+            BrokerCapabilities narrowed = BrokerCapabilities.defaults()
+                    .withMaximumQos(Qos.AT_LEAST_ONCE)
+                    .withRetainAvailable(false)
+                    .withWildcardSubscriptionAvailable(false)
+                    .withMaximumPacketSize(512);
+
+            // Act
+            sut.announce(narrowed);
+            ConnAck ack = after.connect().get(5, SECONDS);
+
+            // Assert: the client that connected before keeps what it learned then, so the
+            // broker still takes a retained QoS 2 publication from it.
+            ConnAck expected = ConnAck.of(false, 1)
+                    .withMaximumQos(Qos.AT_LEAST_ONCE)
+                    .withRetainAvailable(false)
+                    .withWildcardSubscriptionAvailable(false)
+                    .withSharedSubscriptionAvailable(false)
+                    .withMaximumPacketSize(512);
+            assertThat(ack).isEqualTo(expected);
+            MqttMessage retained = MqttMessage.of(
+                    new Topic("announced/before"),
+                    new byte[] {1},
+                    Qos.EXACTLY_ONCE,
+                    true
+            );
+            assertThat(before.publish(retained)).succeedsWithin(Duration.ofSeconds(5));
+        }
+    }
+
+    @Test
+    void an_mqtt_3_1_1_client_is_held_to_no_announcement() throws Exception {
+        try (var broker = MqttBroker.start();
+                MqttClient client = client(broker, MqttVersion.V3_1_1, clientId())) {
+            // Arrange
+            var sut = BrokerControls.of(broker);
+            BrokerCapabilities narrowed = BrokerCapabilities.defaults()
+                    .withMaximumQos(Qos.AT_MOST_ONCE)
+                    .withRetainAvailable(false);
+            sut.announce(narrowed);
+            MqttMessage retained = MqttMessage.of(
+                    new Topic("announced/v311"),
+                    new byte[] {1},
+                    Qos.EXACTLY_ONCE,
+                    true
+            );
+
+            // Act
+            ConnAck ack = client.connect().get(5, SECONDS);
+            CompletableFuture<PublishResult> publication = client.publish(retained);
+
+            // Assert
+            assertThat(ack).isEqualTo(ConnAck.of(false, 1));
+            assertThat(publication).succeedsWithin(Duration.ofSeconds(5));
+        }
+    }
+
+    @Test
+    void held_back_responses_count_against_the_receive_maximum() throws Exception {
+        String clientId = clientId();
+        try (var broker = MqttBroker.start();
+                MqttClient client = client(broker, MqttVersion.V5, clientId)) {
+            // Arrange
+            var sut = BrokerControls.of(broker);
+            sut.announce(BrokerCapabilities.defaults().withReceiveMaximum(1));
+            sut.holdResponses(ResponseKind.PUBACK, clientId);
+            client.connect().get(5, SECONDS);
+
+            // Act
+            var publications = new ArrayList<CompletableFuture<PublishResult>>();
+            for (int index = 0; index < 3; index++) {
+                publications.add(client.publish(message("counted/" + index, Qos.AT_LEAST_ONCE)));
+            }
+
+            // Assert: the client sends a publication only once the broker has answered the one
+            // before, so the broker holds one response at a time until the test releases them.
+            await().during(Duration.ofMillis(300))
+                    .atMost(Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(sut.heldResponses()).hasSize(1));
+            sut.releaseResponses(ResponseKind.PUBACK, clientId);
+            for (CompletableFuture<PublishResult> publication : publications) {
+                assertThat(publication).succeedsWithin(Duration.ofSeconds(5));
+            }
+        }
+    }
+
     private static MqttClient connected(MqttBroker broker, MqttVersion version) throws Exception {
         return connected(broker, version, clientId());
     }
 
     private static MqttClient connected(MqttBroker broker, MqttVersion version, String clientId)
             throws Exception {
-        MqttClient client = MqttClient.builder()
-                .server(endpoint(broker))
-                .version(version)
-                .clientId(clientId)
-                .reconnectPolicy(ReconnectPolicy.disabled())
-                .build();
+        MqttClient client = client(broker, version, clientId);
         try {
             client.connect().get(5, SECONDS);
             return client;
@@ -265,6 +352,15 @@ class BrokerControlsTest {
             client.close();
             throw failure;
         }
+    }
+
+    private static MqttClient client(MqttBroker broker, MqttVersion version, String clientId) {
+        return MqttClient.builder()
+                .server(endpoint(broker))
+                .version(version)
+                .clientId(clientId)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .build();
     }
 
     private static URI endpoint(MqttBroker broker) {

@@ -68,7 +68,8 @@ retained messages do not expire. MQTT 5.0 subscriptions honor No Local, Retain A
 Published, and Retain Handling, and MQTT 5.0 clients may set up to 16 Topic Aliases.
 The broker supports neither shared subscriptions nor Subscription Identifiers, and
 tells MQTT 5.0 clients so when they connect; it refuses `$share/` filters in
-MQTT 3.1.1 too. Persistent sessions do not expire, and the broker does not
+MQTT 3.1.1 too. Tests can make it announce smaller limits to MQTT 5.0 clients with
+the test kit. Persistent sessions do not expire, and the broker does not
 keep to the Receive Maximum and Maximum Packet Size that MQTT 5.0 clients announce.
 
 With Clean Session false, or a positive session expiry in MQTT 5.0, subscriptions
@@ -82,5 +83,5 @@ has been saved to disk. The broker API is experimental and outside the
 compatibility promise.
 
 See the [MqttBroker Javadoc](src/main/java/org/mqtt4j/hato/broker/MqttBroker.java)
-for the API contract, or the [test kit](../hato-testkit/README.md) to simulate
-connection failures and control time in client tests.
+for the API contract, or the [test kit](../hato-testkit/README.md) to control the
+broker from tests, simulate connection failures, and control time in client tests.

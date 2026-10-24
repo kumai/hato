@@ -119,7 +119,13 @@ tasks.register<JavaExec>("reportApiChanges") {
     val built = files(testkitJars)
     val htmlReport = layout.buildDirectory.file("reports/api-changes.html")
     // Outside the compatibility promise, as the README says.
-    val experimental = listOf("FaultyTransport", "BrokerControls", "ResponseKind", "HeldResponse")
+    val experimental = listOf(
+        "FaultyTransport",
+        "BrokerCapabilities",
+        "BrokerControls",
+        "ResponseKind",
+        "HeldResponse",
+    )
     inputs.files(released, built)
     classpath = files(japicmp)
     mainClass = "japicmp.JApiCmp"
