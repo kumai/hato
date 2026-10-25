@@ -17,7 +17,6 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
 import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
-import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
@@ -59,6 +58,13 @@ final class Routing {
     // Rules for later subscriptions to exactly these filters.
     private final Map<TopicFilter, SubscriptionRule> subscriptionRules = new HashMap<>();
 
+    // Rules that refuse later publications to the topics that their filters match, in the order
+    // set. A topic that several of them match takes the one set last.
+    private final LinkedHashMap<TopicFilter, Reason> publicationRules = new LinkedHashMap<>();
+
+    // Rules that refuse later CONNECT requests with exactly these client identifiers.
+    private final Map<String, Reason> connectionRules = new HashMap<>();
+
     // The kinds of response that the connections of these clients hold back.
     private final Set<Hold> holds = new HashSet<>();
 
@@ -73,8 +79,8 @@ final class Routing {
         capabilities = settings.capabilities();
     }
 
-    void refuseSubscriptions(String filter) {
-        var rule = new SubscriptionRule(null);
+    void refuseSubscriptions(String filter, Reason reason) {
+        var rule = new SubscriptionRule.Refusal(reason);
         var key = new TopicFilter(filter);
         synchronized (this) {
             subscriptionRules.put(key, rule);
@@ -82,7 +88,7 @@ final class Routing {
     }
 
     void grantAtMost(String filter, int maximumLevel) {
-        var rule = new SubscriptionRule(Qos.of(maximumLevel));
+        var rule = new SubscriptionRule.Limit(Qos.of(maximumLevel));
         var key = new TopicFilter(filter);
         synchronized (this) {
             subscriptionRules.put(key, rule);
@@ -93,6 +99,34 @@ final class Routing {
         var key = new TopicFilter(filter);
         synchronized (this) {
             subscriptionRules.remove(key);
+        }
+    }
+
+    void refusePublications(String filter, Reason reason) {
+        var key = new TopicFilter(filter);
+        synchronized (this) {
+            // Setting a rule again makes it the last one set.
+            publicationRules.remove(key);
+            publicationRules.put(key, reason);
+        }
+    }
+
+    void clearPublicationRule(String filter) {
+        var key = new TopicFilter(filter);
+        synchronized (this) {
+            publicationRules.remove(key);
+        }
+    }
+
+    void refuseConnections(String clientId, Reason reason) {
+        synchronized (this) {
+            connectionRules.put(clientId, reason);
+        }
+    }
+
+    void clearConnectionRule(String clientId) {
+        synchronized (this) {
+            connectionRules.remove(clientId);
         }
     }
 
@@ -140,12 +174,16 @@ final class Routing {
         }
     }
 
-    void disconnect(String clientId) {
+    void disconnect(String clientId, Reason reason) {
         synchronized (this) {
             Session session = sessions.get(clientId);
             Connection peer = (session == null) ? null : session.connection;
             if (peer != null) {
-                peer.disconnect(ReasonCode.ADMINISTRATIVE_ACTION, "disconnected by a test");
+                Packet.Disconnect disconnect = reason.fitted(
+                        properties -> new Packet.Disconnect(reason.code(), properties),
+                        peer.client.sendLimit
+                );
+                peer.disconnect(disconnect, "disconnected by a test");
             }
         }
     }
@@ -158,12 +196,28 @@ final class Routing {
         }
     }
 
-    // The highest QoS that the test rules let `requested` have: the requested QoS without a
-    // rule for its filter, the rule's maximum with one, and null when the rule refuses it.
+    // The test rule for subscriptions to exactly `filter`, or null without one. Called under
+    // routing.
+    @Nullable SubscriptionRule subscriptionRule(TopicFilter filter) {
+        return subscriptionRules.get(filter);
+    }
+
+    // The reason for refusing a publication to `topic`: that of the rule set last among those
+    // whose filters match it, or null when none does. Called under routing.
+    @Nullable Reason publicationRefusal(Topic topic) {
+        Reason refusal = null;
+        for (Map.Entry<TopicFilter, Reason> rule : publicationRules.entrySet()) {
+            if (rule.getKey().matches(topic)) {
+                refusal = rule.getValue();
+            }
+        }
+        return refusal;
+    }
+
+    // The reason for refusing a CONNECT with exactly `clientId`, or null without a rule.
     // Called under routing.
-    @Nullable Qos allowedQos(Packet.Subscription requested) {
-        SubscriptionRule rule = subscriptionRules.get(requested.filter());
-        return (rule == null) ? requested.qos() : rule.maximum();
+    @Nullable Reason connectionRefusal(String clientId) {
+        return connectionRules.get(clientId);
     }
 
     // Whether a test holds back the responses of `type` to `clientId`. Called under routing.
@@ -318,9 +372,15 @@ final class Routing {
         }
     }
 
-    // A test rule for subscriptions to one filter: they are refused without a maximum, and
-    // granted at most the maximum otherwise.
-    private record SubscriptionRule(@Nullable Qos maximum) {
+    // A test rule for subscriptions to one filter, which refuses them or grants them at most a
+    // QoS.
+    sealed interface SubscriptionRule {
+
+        record Refusal(Reason reason) implements SubscriptionRule {
+        }
+
+        record Limit(Qos maximum) implements SubscriptionRule {
+        }
     }
 
     // One kind of response that the connections of one client hold back.

@@ -585,7 +585,7 @@ final class Mqtt5PacketCodec implements PacketCodec {
         return ReasonCode.of(value);
     }
 
-    private static boolean allowsReason(PacketType type, int value) {
+    static boolean allowsReason(PacketType type, int value) {
         // MQTT 5.0 packet-specific reason tables; legality is independent of enum membership.
         return switch (type) {
             case CONNACK -> switch (value) {

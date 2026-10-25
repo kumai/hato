@@ -17,7 +17,9 @@ import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.concurrent.TimerService;
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.PacketType;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
+import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 
 import static java.util.Objects.requireNonNull;
 
@@ -311,7 +313,70 @@ public final class BrokerServer implements AutoCloseable {
     ///
     /// @throws IllegalArgumentException if `filter` is not a valid topic filter
     public void refuseSubscriptions(String filter) {
-        routing.refuseSubscriptions(filter);
+        routing.refuseSubscriptions(filter, new Reason(ReasonCode.UNSPECIFIED_ERROR, null, null));
+    }
+
+    /// Refuses later subscriptions to exactly `filter` as [#refuseSubscriptions(String)] does,
+    /// with `reasonCode`, and `reasonString` if not null, for MQTT 5.0 clients. A SUBACK carries
+    /// the Reason String of the first filter refused with one.
+    ///
+    /// @throws IllegalArgumentException if `filter` is not a valid topic filter, `reasonCode`
+    ///         is not a SUBACK failure, or `reasonString` is not an MQTT UTF-8 string
+    public void refuseSubscriptions(String filter, int reasonCode, @Nullable String reasonString) {
+        Reason reason = Reason.checked(PacketType.SUBACK, reasonCode, reasonString, null);
+        routing.refuseSubscriptions(filter, reason);
+    }
+
+    /// Refuses later publications to the topics that `filter` matches; a topic that several
+    /// rules match takes the one set last. A refused publication reaches no subscriber and is
+    /// not retained. MQTT 5.0 PUBACK and PUBREC answer it with `reasonCode`, and `reasonString`
+    /// if not null; MQTT 3.1.1 acknowledges it as usual, and QoS 0 has no answer.
+    ///
+    /// @throws IllegalArgumentException if `filter` is not a valid topic filter, `reasonCode`
+    ///         is not a PUBACK and PUBREC failure, or `reasonString` is not an MQTT UTF-8 string
+    public void refusePublications(
+            String filter,
+            int reasonCode,
+            @Nullable String reasonString
+    ) {
+        Reason reason = Reason.checked(PacketType.PUBACK, reasonCode, reasonString, null);
+        routing.refusePublications(filter, reason);
+    }
+
+    /// Lets later publications to the topics that `filter` matches go through again, unless
+    /// another rule refuses them.
+    ///
+    /// @throws IllegalArgumentException if `filter` is not a valid topic filter
+    public void clearPublicationRule(String filter) {
+        routing.clearPublicationRule(filter);
+    }
+
+    /// Refuses later CONNECT requests with exactly `clientId`, before they touch a session or a
+    /// Will. MQTT 5.0 CONNACK answers them with `reasonCode`, `reasonString`, and
+    /// `serverReference`, the last two if not null. MQTT 3.1.1 answers with the return code of
+    /// `reasonCode`, if it has one, and otherwise closes the connection without CONNACK.
+    ///
+    /// @throws IllegalArgumentException if `reasonCode` is not a CONNACK failure, a Server
+    ///         Reference goes with another reason than Use another server or Server moved, or a
+    ///         string is not an MQTT UTF-8 string
+    public void refuseConnections(
+            String clientId,
+            int reasonCode,
+            @Nullable String reasonString,
+            @Nullable String serverReference
+    ) {
+        Reason reason = Reason.checked(
+                PacketType.CONNACK,
+                reasonCode,
+                reasonString,
+                serverReference
+        );
+        routing.refuseConnections(clientId, reason);
+    }
+
+    /// Lets later CONNECT requests with exactly `clientId` through again.
+    public void clearConnectionRule(String clientId) {
+        routing.clearConnectionRule(clientId);
     }
 
     /// Grants later subscriptions to exactly `filter` at most the QoS of `maximumLevel`.
@@ -355,7 +420,30 @@ public final class BrokerServer implements AutoCloseable {
     /// client learns from DISCONNECT. The client did not disconnect, so its Will goes out as for
     /// a lost connection. Does nothing when the client has no open connection.
     public void disconnect(String clientId) {
-        routing.disconnect(clientId);
+        routing.disconnect(clientId, new Reason(ReasonCode.ADMINISTRATIVE_ACTION, null, null));
+    }
+
+    /// Ends the open connection of `clientId` as [#disconnect(String)] does, but tells an MQTT
+    /// 5.0 client `reasonCode`, `reasonString`, and `serverReference`, the last two if not
+    /// null. Even Normal disconnection leaves the Will to go out, because the client did not
+    /// disconnect.
+    ///
+    /// @throws IllegalArgumentException if a server cannot send `reasonCode` in DISCONNECT, a
+    ///         Server Reference goes with another reason than Use another server or Server
+    ///         moved, or a string is not an MQTT UTF-8 string
+    public void disconnect(
+            String clientId,
+            int reasonCode,
+            @Nullable String reasonString,
+            @Nullable String serverReference
+    ) {
+        Reason reason = Reason.checked(
+                PacketType.DISCONNECT,
+                reasonCode,
+                reasonString,
+                serverReference
+        );
+        routing.disconnect(clientId, reason);
     }
 
     /// Makes the broker announce these capabilities to the MQTT 5.0 connections that it accepts

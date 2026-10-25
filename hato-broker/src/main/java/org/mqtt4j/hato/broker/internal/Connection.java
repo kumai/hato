@@ -206,10 +206,33 @@ final class Connection {
     }
 
     void refuse(ReasonCode reason, String request) {
+        refuse(new Packet.ConnAck(false, reason, Properties.EMPTY), request);
+    }
+
+    // Answers the CONNECT with `refusal` and closes the connection. MQTT 3.1.1 has return codes
+    // for five reasons only, and a broker with none of them to give closes the connection
+    // without CONNACK (MQTT 3.1.1 [MQTT-3.2.2-6]).
+    void refuse(Packet.ConnAck refusal, String request) {
+        ReasonCode reason = refusal.reasonCode();
         log.info("Broker refused {} from {} on port {}: {}",
                 request, socket.getRemoteSocketAddress(), routing.port, reason);
         synchronized (this) {
-            closeAfter(new Packet.ConnAck(false, reason, Properties.EMPTY), "refusal sent");
+            boolean answered = switch (version) {
+                case V3_1_1 -> switch (reason) {
+                    case UNSUPPORTED_PROTOCOL_VERSION,
+                         CLIENT_IDENTIFIER_NOT_VALID,
+                         SERVER_UNAVAILABLE,
+                         BAD_USER_NAME_OR_PASSWORD,
+                         NOT_AUTHORIZED -> true;
+                    default -> false;
+                };
+                case V5 -> true;
+            };
+            if (answered) {
+                closeAfter(refusal, "refusal sent");
+            } else {
+                terminate("refusal without an MQTT 3.1.1 return code");
+            }
         }
     }
 
@@ -475,9 +498,13 @@ final class Connection {
     // Ends the connection, first telling an MQTT 5.0 client why with DISCONNECT. MQTT 3.1.1
     // has no DISCONNECT from a server.
     synchronized void disconnect(ReasonCode reasonCode, String reason) {
+        disconnect(new Packet.Disconnect(reasonCode, Properties.EMPTY), reason);
+    }
+
+    synchronized void disconnect(Packet.Disconnect disconnect, String reason) {
         switch (version) {
             case V3_1_1 -> terminate(reason);
-            case V5 -> closeAfter(new Packet.Disconnect(reasonCode, Properties.EMPTY), reason);
+            case V5 -> closeAfter(disconnect, reason);
         }
     }
 

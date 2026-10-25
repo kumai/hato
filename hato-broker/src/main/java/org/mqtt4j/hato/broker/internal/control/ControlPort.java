@@ -3,6 +3,8 @@ package org.mqtt4j.hato.broker.internal.control;
 import java.util.List;
 import java.util.Set;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.internal.BrokerServer;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
@@ -44,6 +46,36 @@ public final class ControlPort {
         server.refuseSubscriptions(filter);
     }
 
+    /// See [BrokerServer#refuseSubscriptions(String, int, String)].
+    public void refuseSubscriptions(String filter, int reasonCode, @Nullable String reasonString) {
+        server.refuseSubscriptions(filter, reasonCode, reasonString);
+    }
+
+    /// See [BrokerServer#refusePublications(String, int, String)].
+    public void refusePublications(String filter, int reasonCode, @Nullable String reasonString) {
+        server.refusePublications(filter, reasonCode, reasonString);
+    }
+
+    /// See [BrokerServer#clearPublicationRule(String)].
+    public void clearPublicationRule(String filter) {
+        server.clearPublicationRule(filter);
+    }
+
+    /// See [BrokerServer#refuseConnections(String, int, String, String)].
+    public void refuseConnections(
+            String clientId,
+            int reasonCode,
+            @Nullable String reasonString,
+            @Nullable String serverReference
+    ) {
+        server.refuseConnections(clientId, reasonCode, reasonString, serverReference);
+    }
+
+    /// See [BrokerServer#clearConnectionRule(String)].
+    public void clearConnectionRule(String clientId) {
+        server.clearConnectionRule(clientId);
+    }
+
     /// See [BrokerServer#grantAtMost(String, int)].
     public void grantAtMost(String filter, int maximumLevel) {
         server.grantAtMost(filter, maximumLevel);
@@ -79,6 +111,16 @@ public final class ControlPort {
     /// See [BrokerServer#disconnect(String)].
     public void disconnect(String clientId) {
         server.disconnect(clientId);
+    }
+
+    /// See [BrokerServer#disconnect(String, int, String, String)].
+    public void disconnect(
+            String clientId,
+            int reasonCode,
+            @Nullable String reasonString,
+            @Nullable String serverReference
+    ) {
+        server.disconnect(clientId, reasonCode, reasonString, serverReference);
     }
 
     /// See [BrokerServer#announce(int, boolean, boolean, boolean, int, int, int)].

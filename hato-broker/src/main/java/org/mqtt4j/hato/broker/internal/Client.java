@@ -7,6 +7,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.UUID;
+import java.util.function.Function;
 
 import org.jspecify.annotations.Nullable;
 
@@ -58,12 +59,17 @@ final class Client {
     final ArrayDeque<Packet> held = new ArrayDeque<>();
 
     // The publications that the client sent on this connection and that have no response yet,
-    // for an announced Receive Maximum: QoS 2 publications until PUBREL, and the PUBACKs and
-    // PUBCOMPs that a test holds back. A response in the send queue counts as sent, so the count
-    // never exceeds the client's own, and a client that keeps to the maximum is never closed.
+    // for an announced Receive Maximum: QoS 2 publications until PUBREL, and the PUBACKs,
+    // PUBCOMPs, and failing PUBRECs that a test holds back. A response in the send queue counts
+    // as sent, so the count never exceeds the client's own, and a client that keeps to the
+    // maximum is never closed.
     private final BitSet unreleased = new BitSet();
 
     private int heldAcknowledgements;
+
+    // Whether the client takes a Reason String on acknowledgements: an MQTT 5.0 client can ask
+    // for none with Request Problem Information 0 [MQTT-3.1.2-29].
+    private boolean problemInformation = true;
 
     // What the client announced in its CONNECT, which the session keeps to on this connection.
     // The send quota is its Receive Maximum: how many QoS 1 and QoS 2 publications the broker
@@ -122,6 +128,20 @@ final class Client {
             Packet.Will waited = null;
             synchronized (connection) {
                 if (connection.ended) {
+                    return false;
+                }
+                // A test rule can refuse the client before anything else, which leaves the
+                // session and the Will of its identifier as they were.
+                Reason refusal = routing.connectionRefusal(request.clientId());
+                if (refusal != null) {
+                    Packet.ConnAck answer = switch (request.version()) {
+                        case V3_1_1 -> new Packet.ConnAck(false, refusal.code(), Properties.EMPTY);
+                        case V5 -> refusal.fitted(
+                                properties -> new Packet.ConnAck(false, refusal.code(), properties),
+                                sendLimitOf(request)
+                        );
+                    };
+                    connection.refuse(answer, "client '" + request.clientId() + "' by a test rule");
                     return false;
                 }
                 // The connection keeps what its CONNACK announces. MQTT 3.1.1 announces nothing.
@@ -206,6 +226,7 @@ final class Client {
                 limits = offered;
                 sendQuota = sendQuotaOf(request);
                 sendLimit = sendLimitOf(request);
+                problemInformation = problemInformationOf(request);
                 if (offered.topicAliasMaximum() > 0) {
                     aliases = new IncomingAliases(offered.topicAliasMaximum());
                 }
@@ -331,6 +352,17 @@ final class Client {
         };
     }
 
+    // Whether the CONNECT leaves the client's Request Problem Information at 1, as it is without
+    // one; MQTT 3.1.1 has none.
+    private static boolean problemInformationOf(Packet.Connect request) {
+        return switch (request.properties()
+                .find(PropertyId.REQUEST_PROBLEM_INFORMATION)
+                .orElse(null)) {
+            case Property.ByteValue(var _, var value) -> value != 0;
+            case null, default -> true;
+        };
+    }
+
     // The session of this connection while it is attached and the connection has not ended.
     // Called under routing.
     @Nullable Session currentSession() {
@@ -397,6 +429,9 @@ final class Client {
                     return;
                 }
                 var grants = new ArrayList<ReasonCode>();
+                // The first refusal with a Reason String, which SUBACK carries; it has room for
+                // one.
+                Reason described = null;
                 // The subscriptions that receive retained messages after SUBACK.
                 var retaining = new ArrayList<Session.Subscribed>();
                 for (Packet.Subscription requested : request.subscriptions()) {
@@ -409,14 +444,24 @@ final class Client {
                     }
                     // A test rule can refuse the filter, which then subscribes to nothing
                     // and leaves an earlier subscription to it as it was, or grant it less
-                    // than the requested QoS. The announced Maximum QoS lowers the grant too,
-                    // as a broker without QoS 1 or 2 still accepts every SUBSCRIBE
-                    // [MQTT-3.2.2-10].
-                    Qos allowed = routing.allowedQos(requested);
-                    if (allowed == null) {
-                        grants.add(ReasonCode.UNSPECIFIED_ERROR);
+                    // than the requested QoS. A refusal gives MQTT 5.0 the rule's reason, and
+                    // MQTT 3.1.1 the only failure that it has [MQTT-3.9.3-2]. The announced
+                    // Maximum QoS lowers the grant too, as a broker without QoS 1 or 2 still
+                    // accepts every SUBSCRIBE [MQTT-3.2.2-10].
+                    Routing.SubscriptionRule rule = routing.subscriptionRule(requested.filter());
+                    if (rule instanceof Routing.SubscriptionRule.Refusal(Reason refusal)) {
+                        grants.add(switch (owner.version) {
+                            case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
+                            case V5 -> refusal.code();
+                        });
+                        if (described == null && refusal.reasonString() != null) {
+                            described = refusal;
+                        }
                         continue;
                     }
+                    Qos allowed = (rule instanceof Routing.SubscriptionRule.Limit(Qos limit))
+                            ? limit
+                            : requested.qos();
                     Qos maximum = Qos.of(
                             Math.min(allowed.level(), limits.maximumQos().level())
                     );
@@ -453,7 +498,11 @@ final class Client {
                         retaining.add(subscribed);
                     }
                 }
-                send(new Packet.SubAck(request.packetId(), grants, Properties.EMPTY));
+                send(acknowledgement(
+                        owner,
+                        described,
+                        properties -> new Packet.SubAck(request.packetId(), grants, properties)
+                ));
                 for (Session.Subscribed subscribed : retaining) {
                     owner.deliverRetained(subscribed);
                 }
@@ -589,23 +638,33 @@ final class Client {
                     "more unanswered QoS 1 and 2 publications than the Receive Maximum"
             );
         }
-        if (publish.qos() == Qos.EXACTLY_ONCE) {
+        if (publish.qos() == Qos.EXACTLY_ONCE && owner.received.get(publish.packetId())) {
             unreleased.set(publish.packetId());
-            if (owner.received.get(publish.packetId())) {
-                send(new Packet.PubRec(
-                        publish.packetId(),
-                        ReasonCode.SUCCESS,
-                        Properties.EMPTY
-                ));
-                return;
-            }
-            owner.received.set(publish.packetId());
-        } else if (publish.qos() == Qos.AT_LEAST_ONCE) {
+            send(new Packet.PubRec(
+                    publish.packetId(),
+                    ReasonCode.SUCCESS,
+                    Properties.EMPTY
+            ));
+            return;
+        }
+        if (publish.qos() == Qos.AT_LEAST_ONCE) {
             // Reusing the identifier abandons a QoS 2 exchange still waiting for
             // PUBREL, as a client that lost its state does. Its message was already
             // forwarded on PUBLISH, so nothing is lost.
             owner.received.clear(publish.packetId());
             unreleased.clear(publish.packetId());
+        }
+        // A test rule can refuse the publication, which then reaches no subscriber and is not
+        // retained. The broker keeps no receipt of a refused QoS 2 publication, whose exchange
+        // ends with the refusal [MQTT-4.3.3-9].
+        Reason refusal = routing.publicationRefusal(publish.topic());
+        if (refusal != null) {
+            refuse(owner, publish, refusal);
+            return;
+        }
+        if (publish.qos() == Qos.EXACTLY_ONCE) {
+            unreleased.set(publish.packetId());
+            owner.received.set(publish.packetId());
         }
         routing.route(publish, owner);
         // Acknowledge only after every delivery was enqueued or its target closed.
@@ -622,6 +681,44 @@ final class Client {
                     Properties.EMPTY
             ));
         }
+    }
+
+    // Answers a publication that a test rule refuses: MQTT 5.0 with the rule's reason in PUBACK
+    // or PUBREC, MQTT 3.1.1 with an ordinary acknowledgement, the only one that it has, and QoS
+    // 0 not at all.
+    private void refuse(Session owner, Packet.Publish publish, Reason refusal) {
+        ReasonCode code = switch (owner.version) {
+            case V3_1_1 -> ReasonCode.SUCCESS;
+            case V5 -> refusal.code();
+        };
+        int packetId = publish.packetId();
+        switch (publish.qos()) {
+            case AT_MOST_ONCE -> { }
+            case AT_LEAST_ONCE -> send(acknowledgement(
+                    owner,
+                    refusal,
+                    properties -> new Packet.PubAck(packetId, code, properties)
+            ));
+            case EXACTLY_ONCE -> send(acknowledgement(
+                    owner,
+                    refusal,
+                    properties -> new Packet.PubRec(packetId, code, properties)
+            ));
+        }
+    }
+
+    // The acknowledgement that `build` makes with the Reason String of `reason`, if any. Only
+    // an MQTT 5.0 client that did not ask for no problem information gets one
+    // [MQTT-3.1.2-29], and only as far as its Maximum Packet Size allows.
+    private <P extends Packet> P acknowledgement(
+            Session owner,
+            @Nullable Reason reason,
+            Function<Properties, P> build
+    ) {
+        if (reason == null || owner.version == MqttVersion.V3_1_1 || !problemInformation) {
+            return build.apply(Properties.EMPTY);
+        }
+        return reason.fitted(build, sendLimit);
     }
 
     // Called under routing, which guards the test controls.
@@ -660,9 +757,13 @@ final class Client {
     }
 
     // Whether `response` ends the client's QoS 1 or 2 publication, as far as the client's
-    // Receive Maximum counts it.
+    // Receive Maximum counts it: a PUBREC does only with a failure (MQTT 5.0 section 4.9).
     private static boolean answersPublication(Packet response) {
-        return response instanceof Packet.PubAck || response instanceof Packet.PubComp;
+        return switch (response) {
+            case Packet.PubAck _, Packet.PubComp _ -> true;
+            case Packet.PubRec rec -> rec.reasonCode().value() >= 0x80;
+            default -> false;
+        };
     }
 
     private static boolean hasWildcard(TopicFilter filter) {

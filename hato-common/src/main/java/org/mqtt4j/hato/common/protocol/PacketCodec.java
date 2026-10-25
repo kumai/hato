@@ -6,6 +6,7 @@ import java.util.Set;
 
 import org.mqtt4j.hato.common.value.MqttVersion;
 import org.mqtt4j.hato.common.value.Qos;
+import org.mqtt4j.hato.common.value.ReasonCode;
 import org.mqtt4j.hato.common.value.Topic;
 
 import static java.util.Objects.requireNonNull;
@@ -28,6 +29,14 @@ public interface PacketCodec {
     /// than its few bytes on the wire, so this bounds the memory of one packet whatever its
     /// size; packets that applications exchange carry far fewer.
     int MAX_PROPERTIES = 65_536;
+
+    /// Whether MQTT 5.0 allows `reason` in a packet of `type`, by the reason code table of that
+    /// packet. Encoding a packet with a reason code outside its table fails.
+    static boolean allowsReason(PacketType type, ReasonCode reason) {
+        requireNonNull(type, "type must not be null");
+        requireNonNull(reason, "reason must not be null");
+        return Mqtt5PacketCodec.allowsReason(type, reason.value());
+    }
 
     /// Returns the codec for `version`.
     static PacketCodec of(MqttVersion version) {
