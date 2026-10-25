@@ -64,16 +64,18 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// properties, and its Message Expiry Interval counts from its publication. By default, CONNACK
 /// announces only that shared subscriptions are not supported, and a Topic Alias Maximum of 16: the
 /// aliases that a client sets last for its connection. A test can make the broker announce smaller
-/// limits with the test kit's `BrokerControls`, and the broker then holds clients to them. In turn,
-/// the broker keeps to the client's Receive Maximum on each connection, resending on a resumed
-/// session no more than the new connection allows, and discards a publication larger than the
-/// client's Maximum Packet Size as if the client had received and acknowledged it. An
-/// Authentication Method is refused with Bad authentication method. AUTH, a PUBLISH with a
-/// Subscription Identifier or an invalid Topic Alias, or a SUBSCRIBE with a `$share/` filter closes
-/// the connection. A PUBREC with a failure reason code ends the QoS 2 delivery without PUBREL.
-/// Before it closes an MQTT 5.0 connection for a malformed or forbidden packet, an expired
-/// keep-alive, or another connection with the same client identifier, the broker sends
-/// DISCONNECT with the reason code; a peer that stops reading may not receive it.
+/// limits with the test kit's `BrokerControls`, and the broker then holds clients to them; the test
+/// kit can also make it refuse publications, subscriptions, and connections, or end a connection,
+/// with a reason code of the test's choice. In turn, the broker keeps to the client's Receive
+/// Maximum on each connection, resending on a resumed session no more than the new connection
+/// allows, and discards a publication larger than the client's Maximum Packet Size as if the client
+/// had received and acknowledged it. An Authentication Method is refused with Bad authentication
+/// method. AUTH, a PUBLISH with a Subscription Identifier or an invalid Topic Alias, or a SUBSCRIBE
+/// with a `$share/` filter closes the connection. A PUBREC with a failure reason code ends the
+/// QoS 2 delivery without PUBREL. Before it closes an MQTT 5.0 connection for a malformed or
+/// forbidden packet, an expired keep-alive, or another connection with the same client
+/// identifier, the broker sends DISCONNECT with the reason code; a peer that stops reading may
+/// not receive it.
 ///
 /// A client that sends requests faster than it reads the responses is held back: the broker
 /// stops reading from it until there is room for the next response, rather than closing its

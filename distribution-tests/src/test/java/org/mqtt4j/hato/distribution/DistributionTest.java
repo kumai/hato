@@ -480,6 +480,7 @@ class DistributionTest {
         assertThat(publicTypes(testkitJar())).containsExactlyInAnyOrder(
                 "org.mqtt4j.hato.testkit.BrokerCapabilities",
                 "org.mqtt4j.hato.testkit.BrokerControls",
+                "org.mqtt4j.hato.testkit.BrokerReason",
                 "org.mqtt4j.hato.testkit.FakeMqttPublisher",
                 "org.mqtt4j.hato.testkit.FakeMqttPublisher$HeldPublication",
                 "org.mqtt4j.hato.testkit.FakeMqttSubscriber",

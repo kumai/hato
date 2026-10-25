@@ -123,6 +123,7 @@ tasks.register<JavaExec>("reportApiChanges") {
         "FaultyTransport",
         "BrokerCapabilities",
         "BrokerControls",
+        "BrokerReason",
         "ResponseKind",
         "HeldResponse",
     )

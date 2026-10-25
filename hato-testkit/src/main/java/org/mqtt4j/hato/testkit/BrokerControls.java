@@ -10,10 +10,11 @@ import org.mqtt4j.hato.broker.internal.control.ControlPort;
 
 import static java.util.Objects.requireNonNull;
 
-/// Experimental test controls for an embedded broker: rules that refuse subscriptions or grant
-/// them a lower QoS, responses held back until the test releases them, the capabilities that the
-/// broker announces to MQTT 5.0 clients, and the clients connected now. Like the broker API, the
-/// controls are outside the compatibility promise until productization.
+/// Experimental test controls for an embedded broker: rules that refuse publications,
+/// subscriptions, or connections, or grant subscriptions a lower QoS, responses held back until
+/// the test releases them, the capabilities that the broker announces to MQTT 5.0 clients, and
+/// the clients connected now, which the test can disconnect. Like the broker API, the controls
+/// are outside the compatibility promise until productization.
 ///
 /// The test starts and closes the broker through the broker's own API, and the controls act on
 /// it; the controls that [#of(MqttBroker)] returns for one broker share its state. Each method
@@ -22,11 +23,30 @@ import static java.util.Objects.requireNonNull;
 /// nothing.
 ///
 /// A subscription rule applies to SUBSCRIBE requests for exactly its filter, as written, without
-/// matching other filters. The broker answers a refused filter with failure, which MQTT 5.0
-/// reports as Unspecified error, and makes no subscription; a subscription that the client made
-/// to the filter before stays as it was. A filter granted at most a QoS is granted the lower of
-/// that QoS and the requested one, and its deliveries, retained messages included, follow the
-/// granted QoS. A rule lasts until it is cleared or replaced, or until the broker closes.
+/// matching other filters. The broker answers a refused filter with the rule's reason code, or
+/// Unspecified error when the rule gives none, which MQTT 3.1.1 reports as failure 0x80, and
+/// makes no subscription; a subscription that the client made to the filter before stays as it
+/// was. A filter granted at most a QoS is granted the lower of that QoS and the requested one,
+/// and its deliveries, retained messages included, follow the granted QoS. A rule lasts until
+/// it is cleared or replaced, or until the broker closes.
+///
+/// A publication rule applies to the PUBLISH packets whose topic its filter matches; a topic that
+/// several rules match takes the rule set last. The broker delivers a refused publication to no
+/// subscriber and does not retain it, in both MQTT versions and at every QoS. An MQTT 5.0 client
+/// learns of the refusal from the PUBACK or PUBREC that carries the rule's reason, and a refused
+/// QoS 2 publication ends there; an MQTT 3.1.1 client receives an ordinary acknowledgement, and
+/// a QoS 0 publication no answer. The rules do not apply to Wills.
+///
+/// A connection rule applies to CONNECT requests with exactly its client identifier, as written,
+/// and refuses them before they affect a session or a Will; connections accepted before stay. An
+/// MQTT 5.0 client receives the rule's reason in CONNACK. An MQTT 3.1.1 client receives the
+/// return code that MQTT 3.1.1 has for the reason code, if it has one, and otherwise sees its
+/// connection closed without CONNACK.
+///
+/// A reason's strings reach MQTT 5.0 clients only. The broker leaves the Reason String out of
+/// PUBACK, PUBREC, and SUBACK for a client that asked for no problem information, and leaves out
+/// the Reason String, and then the Server Reference, as far as a packet would otherwise exceed
+/// the client's Maximum Packet Size.
 ///
 /// Holding back a kind of response to a client holds every later response of that kind to the
 /// connections of the client, without taking room in the broker's send queue. Releasing sends
@@ -66,6 +86,24 @@ public final class BrokerControls {
         port.refuseSubscriptions(requireNonNull(filter, "filter must not be null").pattern());
     }
 
+    /// Refuses later subscriptions to exactly `filter` with `reason`, whose reason code must be
+    /// a failure that MQTT 5.0 allows in SUBACK (MQTT 5.0 section 3.9.3). A SUBACK carries the
+    /// Reason String of the first filter refused with one.
+    ///
+    /// @throws NullPointerException if `filter` or `reason` is null
+    /// @throws IllegalArgumentException if the reason code is not such a failure, `reason` has
+    ///         a Server Reference, or its Reason String is not an MQTT UTF-8 string
+    public void refuseSubscriptions(TopicFilter filter, BrokerReason reason) {
+        requireNonNull(filter, "filter must not be null");
+        requireNonNull(reason, "reason must not be null");
+        requireNoServerReference(reason);
+        port.refuseSubscriptions(
+                filter.pattern(),
+                reason.reasonCode().value(),
+                reason.reasonString().orElse(null)
+        );
+    }
+
     /// Grants later subscriptions to exactly `filter` at most `maximum`.
     ///
     /// @throws NullPointerException if `filter` or `maximum` is null
@@ -81,6 +119,57 @@ public final class BrokerControls {
     /// @throws NullPointerException if `filter` is null
     public void clearSubscriptionRule(TopicFilter filter) {
         port.clearSubscriptionRule(requireNonNull(filter, "filter must not be null").pattern());
+    }
+
+    /// Refuses later publications to the topics that `filter` matches with `reason`, whose
+    /// reason code must be a failure that MQTT 5.0 allows in PUBACK and PUBREC (MQTT 5.0
+    /// sections 3.4.2.1 and 3.5.2.1).
+    ///
+    /// @throws NullPointerException if `filter` or `reason` is null
+    /// @throws IllegalArgumentException if the reason code is not such a failure, `reason` has
+    ///         a Server Reference, or its Reason String is not an MQTT UTF-8 string
+    public void refusePublications(TopicFilter filter, BrokerReason reason) {
+        requireNonNull(filter, "filter must not be null");
+        requireNonNull(reason, "reason must not be null");
+        requireNoServerReference(reason);
+        port.refusePublications(
+                filter.pattern(),
+                reason.reasonCode().value(),
+                reason.reasonString().orElse(null)
+        );
+    }
+
+    /// Removes the publication rule for `filter`, if there is one, so that later publications to
+    /// its topics go through unless another rule refuses them.
+    ///
+    /// @throws NullPointerException if `filter` is null
+    public void clearPublicationRule(TopicFilter filter) {
+        port.clearPublicationRule(requireNonNull(filter, "filter must not be null").pattern());
+    }
+
+    /// Refuses later connections of the client with `clientId` with `reason`, whose reason code
+    /// must be a failure that MQTT 5.0 allows in CONNACK (MQTT 5.0 section 3.2.2.2).
+    ///
+    /// @throws NullPointerException if `clientId` or `reason` is null
+    /// @throws IllegalArgumentException if the reason code is not such a failure, a Server
+    ///         Reference goes with another reason code, or a string is not an MQTT UTF-8 string
+    public void refuseConnections(String clientId, BrokerReason reason) {
+        requireNonNull(clientId, "clientId must not be null");
+        requireNonNull(reason, "reason must not be null");
+        port.refuseConnections(
+                clientId,
+                reason.reasonCode().value(),
+                reason.reasonString().orElse(null),
+                reason.serverReference().orElse(null)
+        );
+    }
+
+    /// Removes the connection rule for `clientId`, if there is one, so that later connections of
+    /// the client are accepted again.
+    ///
+    /// @throws NullPointerException if `clientId` is null
+    public void clearConnectionRule(String clientId) {
+        port.clearConnectionRule(requireNonNull(clientId, "clientId must not be null"));
     }
 
     /// Holds back the responses of `kind` to the client with `clientId`, from now until
@@ -132,6 +221,26 @@ public final class BrokerControls {
         port.disconnect(requireNonNull(clientId, "clientId must not be null"));
     }
 
+    /// Closes the open connection of the client with `clientId` as [#disconnect(String)] does,
+    /// but an MQTT 5.0 client first receives DISCONNECT with `reason`, whose reason code must be
+    /// one that MQTT 5.0 lets a server send in DISCONNECT (MQTT 5.0 section 3.14.2.1). Even
+    /// with Normal disconnection, the Will is published, because the client did not
+    /// disconnect.
+    ///
+    /// @throws NullPointerException if `clientId` or `reason` is null
+    /// @throws IllegalArgumentException if a server cannot send the reason code, a Server
+    ///         Reference goes with another reason code, or a string is not an MQTT UTF-8 string
+    public void disconnect(String clientId, BrokerReason reason) {
+        requireNonNull(clientId, "clientId must not be null");
+        requireNonNull(reason, "reason must not be null");
+        port.disconnect(
+                clientId,
+                reason.reasonCode().value(),
+                reason.reasonString().orElse(null),
+                reason.serverReference().orElse(null)
+        );
+    }
+
     /// Makes the broker announce `capabilities` to the MQTT 5.0 clients that connect from now
     /// on, and hold their connections to them. Announce [BrokerCapabilities#defaults()] to go
     /// back to what the broker announces by itself.
@@ -148,6 +257,16 @@ public final class BrokerControls {
                 capabilities.maximumPacketSize(),
                 capabilities.topicAliasMaximum()
         );
+    }
+
+    // MQTT 5.0 carries a Server Reference in CONNACK and DISCONNECT only, so the broker's rules
+    // for acknowledgements take none, and a reason with one is refused rather than sent without.
+    private static void requireNoServerReference(BrokerReason reason) {
+        if (reason.serverReference().isPresent()) {
+            throw new IllegalArgumentException(
+                    "A Server Reference goes only with a refused or ended connection"
+            );
+        }
     }
 
     private static ControlPort.Response responseOf(ResponseKind kind) {

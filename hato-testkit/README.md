@@ -98,6 +98,16 @@ try (MqttBroker broker = MqttBroker.start()) {
 - `refuseSubscriptions(filter)` refuses subscriptions to that exact filter, and
   `grantAtMost(filter, qos)` grants them a lower QoS. `clearSubscriptionRule(filter)`
   lets them through again, so a test can refuse a subscription for a while.
+- `refusePublications(filter, reason)` refuses publications to the topics that the
+  filter matches: they reach no subscriber, and an MQTT 5.0 client's QoS 1 or 2
+  publication fails with the reason. `refuseConnections(clientId, reason)` refuses
+  the client's connections, for example with bad credentials or a redirection, and
+  `refuseSubscriptions(filter, reason)` gives a subscription refusal a reason.
+  `clearPublicationRule(filter)` and `clearConnectionRule(clientId)` let them through
+  again. Build a reason with
+  [BrokerReason](src/main/java/org/mqtt4j/hato/testkit/BrokerReason.java), for
+  example `BrokerReason.of(ReasonCode.NOT_AUTHORIZED).withReasonString("no access")`;
+  each operation refuses a reason code that its MQTT packet cannot carry.
 - `holdResponses(kind, clientId)` holds back SUBACK, UNSUBACK, PUBACK, PUBREC, or
   PUBCOMP for one client until `releaseResponses(kind, clientId)` sends them in
   order, for example to see the application time out. `heldResponses()` lists what
@@ -105,6 +115,8 @@ try (MqttBroker broker = MqttBroker.start()) {
 - `connectedClients()` lists the clients with an open connection, and
   `disconnect(clientId)` closes one from the broker's side, which publishes the
   client's Will as for a lost connection, after its delay if it has one.
+  `disconnect(clientId, reason)` tells an MQTT 5.0 client a reason of the test's
+  choice instead of Administrative action.
 - `announce(capabilities)` changes the limits that the broker announces to MQTT 5.0
   clients as they connect: the highest QoS, whether retained messages, wildcard
   subscriptions, and Subscription Identifiers are available, the Receive Maximum, the
@@ -138,5 +150,5 @@ try (MqttBroker broker = MqttBroker.start()) {
   response before checking the result.
 
 `FaultyTransport` is experimental: its API may change as it gains kinds of
-faults. `BrokerControls`, `BrokerCapabilities`, `ResponseKind`, and `HeldResponse`
-are experimental, like the broker that they control.
+faults. `BrokerControls`, `BrokerCapabilities`, `BrokerReason`, `ResponseKind`, and
+`HeldResponse` are experimental, like the broker that they control.
