@@ -113,33 +113,10 @@ class BrokerMqtt5Test {
     }
 
     static Stream<Refusal> refusals() {
-        var delayedWill = new Packet.Will(
-                new Topic("will"),
-                new byte[] {1},
-                AT_MOST_ONCE,
-                false,
-                new Properties(List.of(
-                        new Property.FourByteValue(PropertyId.WILL_DELAY_INTERVAL, 1)
-                ))
-        );
         var authentication = new Properties(List.of(
                 new Property.StringValue(PropertyId.AUTHENTICATION_METHOD, "SCRAM-SHA-256")
         ));
         return Stream.of(
-                new Refusal(
-                        "a delayed Will",
-                        new Packet.Connect(
-                                "with-delayed-will",
-                                MqttVersion.V5,
-                                true,
-                                0,
-                                delayedWill,
-                                null,
-                                null,
-                                EMPTY
-                        ),
-                        ReasonCode.SERVER_UNAVAILABLE
-                ),
                 new Refusal(
                         "an authentication method",
                         new Packet.Connect(

@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -11,6 +12,7 @@ import java.util.Map;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.io.SendQueue;
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
@@ -20,6 +22,8 @@ import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
+
+import static java.util.Objects.requireNonNull;
 
 // Every session field, including the active connection, belongs to routing.
 final class Session {
@@ -45,8 +49,18 @@ final class Session {
     // the client's DISCONNECT can change it (MQTT 5.0 section 3.14.2.2.2).
     long expiry;
 
-    // The broker's time at which the session lost its connection, from which its expiry counts.
+    // The broker's time at which the session lost its connection, from which its expiry and the
+    // delay of its Will count.
     private long detachedAt;
+
+    // The Will of the connection that ended last, which waits `willDelay` seconds before it goes
+    // out, or less if the session ends first [MQTT-3.1.2-8]; none waits while a connection is
+    // attached. The timer comes when the delay or the expiry has passed, whichever is earlier.
+    private Packet.@Nullable Will will;
+
+    private long willDelay;
+
+    private Timer.@Nullable Cancellable willTimer;
 
     // Each filter's subscription with the options that the client requested.
     final Map<TopicFilter, Subscribed> subscriptions = new HashMap<>();
@@ -101,6 +115,87 @@ final class Session {
         return connection == null
                 && expiry != NEVER
                 && now - detachedAt >= expiry * 1_000_000_000L;
+    }
+
+    // Keeps the Will of the connection that just ended until `delay` seconds have passed since
+    // the session lost it, or until the session ends if that comes first [MQTT-3.1.2-8]. Called
+    // under routing, after the detachment from which both count.
+    //
+    // The broker decides from the time whether the Will goes out, as with the expiry: when a
+    // connection continues the session, when the session ends, and when the timer comes. The
+    // timer only makes sure that someone looks once the time has come, so a timer that comes
+    // late, or after its cancellation, changes nothing.
+    void awaitWill(Packet.Will lastWill, long delay) {
+        will = lastWill;
+        willDelay = delay;
+        try {
+            // A Session Expiry Interval of NEVER is at least any delay.
+            willTimer = settings.scheduler().schedule(
+                    Duration.ofSeconds(Math.min(delay, expiry)),
+                    this::checkWill
+            );
+        } catch (RuntimeException failure) {
+            // Publishing the Will early beats never publishing it.
+            log.warn("Broker on port {} could not delay the Will of client {}",
+                    routing.port, clientId, failure);
+            will = null;
+            routing.publishWill(lastWill, this);
+        }
+    }
+
+    // Whether a Will waits with the session and its delay has passed by `now`, so that a
+    // connection that continues the session comes too late to cancel it [MQTT-3.1.3-9].
+    boolean willDue(long now) {
+        return will != null && now - detachedAt >= willDelay * 1_000_000_000L;
+    }
+
+    // Takes the Will that waits with the session, to publish it, and cancels its timer; null
+    // when none waits.
+    Packet.@Nullable Will takeWill() {
+        Packet.Will waiting = will;
+        cancelWill();
+        return waiting;
+    }
+
+    // Drops the Will that waits with the session, if any, as a connection that continues the
+    // session within the delay does [MQTT-3.1.3-9].
+    void cancelWill() {
+        will = null;
+        Timer.Cancellable timer = willTimer;
+        willTimer = null;
+        if (timer == null) {
+            return;
+        }
+        try {
+            timer.cancel();
+        } catch (Throwable failure) {
+            // A failing injected timer must not keep the session from ending.
+            log.warn("Cancelling the Will timer of client {} on port {} failed",
+                    clientId, routing.port, failure);
+        }
+    }
+
+    // The timer of the waiting Will, which comes once its delay or the session's expiry has
+    // passed. Unlike the connection timers, which leave the routing work to the reader and the
+    // writer, the Will has no thread of its own, so the shared timer takes routing to publish
+    // it. A deliberate simplification: the timer thread waits for routing, which is held for
+    // routing work but never for reads or writes, and the other timers of the distribution wait
+    // with it; handing the publication to a thread of its own would remove that wait, if
+    // productization needs it.
+    private void checkWill() {
+        try {
+            synchronized (routing) {
+                long now = settings.scheduler().nanoTime();
+                if (expired(now)) {
+                    discard();
+                } else if (willDue(now)) {
+                    routing.publishWill(requireNonNull(takeWill()), this);
+                }
+            }
+        } catch (Throwable failure) {
+            log.warn("Broker on port {} failed to publish the Will of client {}",
+                    routing.port, clientId, failure);
+        }
     }
 
     // Delivers `publication` from `publisher` for the subscriptions that match it.
@@ -445,6 +540,8 @@ final class Session {
         });
     }
 
+    // Drops the session state, the Will that waits with it included, which a closing broker
+    // does not publish.
     void clear() {
         subscriptions.clear();
         received.clear();
@@ -456,12 +553,27 @@ final class Session {
         inflightBytes = 0;
         pendingBytes = 0;
         connection = null;
+        cancelWill();
+    }
+
+    // Ends the session, which no connection continues, as its expiry passes or its deliveries
+    // overflow. Its state goes, and a Will that waits with it goes out now, because the session
+    // ends before the delay [MQTT-3.1.2-8]. Discarding it again does nothing. Called under
+    // routing.
+    void discard() {
+        if (!routing.sessions.remove(clientId, this)) {
+            return;
+        }
+        Packet.Will waiting = takeWill();
+        clear();
+        if (waiting != null) {
+            routing.publishWill(waiting, this);
+        }
     }
 
     private void discard(String reason) {
         Connection peer = connection;
-        routing.sessions.remove(clientId, this);
-        clear();
+        discard();
         if (peer != null) {
             peer.close(reason);
         }

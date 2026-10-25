@@ -520,8 +520,11 @@ class BrokerDeadlineTest {
         final ManualTimerScheduler clock = new ManualTimerScheduler();
         final List<Runnable> actions = new CopyOnWriteArrayList<>();
         private final AtomicBoolean failNextClockRead = new AtomicBoolean();
-        private final AtomicBoolean failNextSchedule = new AtomicBoolean();
+        final AtomicBoolean failNextSchedule = new AtomicBoolean();
         private volatile boolean cancellationFails;
+
+        // How much later than asked each task runs, as on a busy timer thread.
+        volatile Duration lateness = Duration.ZERO;
 
         @Override
         public long nanoTime() {
@@ -537,7 +540,7 @@ class BrokerDeadlineTest {
                 throw new IllegalStateException("Injected scheduling failure");
             }
             actions.add(task);
-            TimerScheduler.Cancellable pending = clock.schedule(delay, task);
+            TimerScheduler.Cancellable pending = clock.schedule(delay.plus(lateness), task);
             return () -> {
                 pending.cancel();
                 if (cancellationFails) {

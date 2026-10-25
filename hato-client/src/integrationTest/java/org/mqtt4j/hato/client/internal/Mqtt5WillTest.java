@@ -22,10 +22,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The Will of MQTT 5.0 sessions, shared by Mosquitto, EMQX, and HiveMQ CE: its properties, its
-/// delay, and how a reconnection or a new session for the same identifier affects it. The
-/// embedded broker refuses a delayed Will, which most of these use, so it runs none of them;
-/// hato-broker's integration tests check its Will.
+/// The Will of MQTT 5.0 sessions, shared by Mosquitto, EMQX, HiveMQ CE, and the embedded broker:
+/// its properties, its delay, and how a reconnection or a new session for the same identifier
+/// affects it.
 @Timeout(60)
 @SuppressWarnings("try") // Explicit close is the abnormal MQTT termination under test.
 abstract class Mqtt5WillTest {
@@ -188,12 +187,13 @@ abstract class Mqtt5WillTest {
     }
 
     /// Whether the broker publishes a delayed Will as the connection of a session without expiry
-    /// ends, rather than when the delay has passed, as recorded for the pinned image.
+    /// ends, rather than when the delay has passed, as recorded for the pinned image or as MQTT
+    /// 5.0 reads for the embedded broker.
     abstract boolean endsTheDelayWithTheSession();
 
     /// Whether the broker publishes the Will of a session at once when a new client with the same
     /// identifier starts a new session within the Will's delay, rather than discarding it, as
-    /// recorded for the pinned image.
+    /// recorded for the pinned image or as MQTT 5.0 reads for the embedded broker.
     abstract boolean publishesTheWillOfAReplacedSession();
 
     abstract URI endpoint();

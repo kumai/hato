@@ -63,18 +63,19 @@ port. The default listens only on loopback. Starting the broker throws
 
 Use the broker in local or trusted environments. It does not check credentials. It
 supports MQTT 3.1.1, MQTT 5.0 as far as client tests need it, QoS 0/1/2, retained
-messages, and Wills. It refuses an MQTT 5.0 Will with a delay. A message's Message
-Expiry Interval counts down while it waits in the broker, which drops it, retained
-messages included, once its lifetime has passed. MQTT 5.0 subscriptions honor No
-Local, Retain As Published, Retain Handling, and Subscription Identifiers, and MQTT
-5.0 clients may set up to 16 Topic Aliases. The broker does not support shared
-subscriptions, and tells MQTT 5.0 clients so when they connect; it refuses `$share/`
-filters in MQTT 3.1.1 too. Tests can make it announce smaller limits to MQTT 5.0
-clients with the test kit. In turn, it keeps to the Receive Maximum and Maximum
-Packet Size that MQTT 5.0 clients announce, and drops a message too large for a
-client instead of sending it. An MQTT 5.0 persistent session ends once its Session
-Expiry Interval has passed after its connection; MQTT 3.1.1 persistent sessions do
-not expire.
+messages, and Wills. An MQTT 5.0 Will waits for its delay unless the session ends
+first, and the broker drops it if the client resumes the session within the delay. A
+message's Message Expiry Interval counts down while it waits in the broker, which
+drops it, retained messages included, once its lifetime has passed. MQTT 5.0
+subscriptions honor No Local, Retain As Published, Retain Handling, and Subscription
+Identifiers, and MQTT 5.0 clients may set up to 16 Topic Aliases. The broker does
+not support shared subscriptions, and tells MQTT 5.0 clients so when they connect;
+it refuses `$share/` filters in MQTT 3.1.1 too. Tests can make it announce smaller
+limits to MQTT 5.0 clients with the test kit. In turn, it keeps to the Receive
+Maximum and Maximum Packet Size that MQTT 5.0 clients announce, and drops a message
+too large for a client instead of sending it. An MQTT 5.0 persistent session ends
+once its Session Expiry Interval has passed after its connection; MQTT 3.1.1
+persistent sessions do not expire.
 
 With Clean Session false, or a positive session expiry in MQTT 5.0, subscriptions
 and QoS 1/2 deliveries survive a disconnect, and reconnecting with the same client

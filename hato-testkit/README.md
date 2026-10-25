@@ -104,7 +104,7 @@ try (MqttBroker broker = MqttBroker.start()) {
   the broker holds, so wait for an entry before you act.
 - `connectedClients()` lists the clients with an open connection, and
   `disconnect(clientId)` closes one from the broker's side, which publishes the
-  client's Will.
+  client's Will as for a lost connection, after its delay if it has one.
 - `announce(capabilities)` changes the limits that the broker announces to MQTT 5.0
   clients as they connect: the highest QoS, whether retained messages, wildcard
   subscriptions, and Subscription Identifiers are available, the Receive Maximum, the

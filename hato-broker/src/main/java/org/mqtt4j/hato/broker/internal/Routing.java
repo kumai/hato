@@ -13,6 +13,8 @@ import org.jspecify.annotations.Nullable;
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
+import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
@@ -26,7 +28,8 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 // This global lock and linear session/subscription scan bound routing throughput. Replace
 // them with an index and finer ownership if broker measurements justify productization.
 // Lock order is routing -> Connection. Readers/writers release their monitor before routing;
-// timers stop I/O without routing, and reader/writer cleanup detaches the connection later.
+// connection timers stop I/O without routing, and reader/writer cleanup detaches the connection
+// later. The timer of a waiting Will takes routing while it holds no Connection monitor.
 final class Routing {
 
     private static final Log log = Log.of(Routing.class);
@@ -169,19 +172,47 @@ final class Routing {
     }
 
     // Discards the sessions whose expiry has passed since their connection ended
-    // [MQTT-4.1.0-2]. The broker looks for them when it looks a session up for a CONNECT and
-    // when it routes, in place of a timer per session, so an expired session keeps its queued
-    // deliveries, within the session limits, until then. A timer that discards it would release
-    // them at once, if productization needs that. Called under routing.
+    // [MQTT-4.1.0-2], and publishes the Wills that wait with them. The broker looks for them
+    // when it looks a session up for a CONNECT and when it routes, in place of a timer per
+    // session; only a session with a waiting Will has a timer, which comes at its expiry if the
+    // Will's delay is longer. So an expired session keeps its queued deliveries, within the
+    // session limits, until then. A timer for every session would release them at once, if
+    // productization needs that. Called under routing.
     void discardExpiredSessions() {
         long now = settings.scheduler().nanoTime();
-        sessions.values().removeIf(session -> {
-            if (!session.expired(now)) {
-                return false;
-            }
-            session.clear();
-            return true;
-        });
+        // A Will routes, and routing looks for expired sessions again, so they are listed before
+        // any of them is discarded; discarding one twice does nothing.
+        List<Session> expired = sessions.values().stream()
+                .filter(session -> session.expired(now))
+                .toList();
+        for (Session session : expired) {
+            session.discard();
+        }
+    }
+
+    // Publishes `will` as its client would have published the message, from the session of
+    // `publisher`. A closing broker publishes none, because every session goes with it. Called
+    // under routing.
+    void publishWill(Packet.Will will, Session publisher) {
+        if (closed) {
+            return;
+        }
+        // The Will properties travel as the publication's, without the delay, which only
+        // the Will has; User Properties keep their order [MQTT-3.1.3-10]. The packet
+        // identifier is a placeholder, because every delivery takes its own.
+        var properties = new Properties(will.properties().entries().stream()
+                .filter(property -> property.id() != PropertyId.WILL_DELAY_INTERVAL)
+                .toList());
+        var publication = new Packet.Publish(
+                will.topic(),
+                will.payload(),
+                will.qos(),
+                will.retain(),
+                false,
+                (will.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
+                properties
+        );
+        route(publication, publisher);
     }
 
     // Delivers `publication` from `publisher`'s client to every matching subscription, after

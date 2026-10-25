@@ -100,22 +100,7 @@ final class Client {
             );
             return false;
         }
-        // The broker publishes a Will as its connection ends, so it cannot keep one for a
-        // delay that a new connection of the session would cancel [MQTT-3.1.3-9]. Only
-        // whether the delay is positive matters.
         Packet.Will requestedWill = request.will();
-        boolean delayed = requestedWill != null && requestedWill.properties()
-                .find(PropertyId.WILL_DELAY_INTERVAL)
-                .filter(delay -> delay instanceof Property.FourByteValue value
-                        && value.value() > 0)
-                .isPresent();
-        if (delayed) {
-            connection.refuse(
-                    ReasonCode.SERVER_UNAVAILABLE,
-                    "a delayed Will for client '" + request.clientId() + "'"
-            );
-            return false;
-        }
         // MQTT 3.1.1 leaves the retention of a Clean Session 0 session to the broker, which
         // keeps it without end.
         long expiry = switch (request.version()) {
@@ -125,8 +110,16 @@ final class Client {
         boolean keep = expiry > 0;
         String id;
         synchronized (routing) {
+            // An expired session is gone, for resuming and for the limit alike, and the Will
+            // that waits with it goes out. That routes to other connections, so it happens
+            // before the new peer's monitor is taken.
+            routing.discardExpiredSessions();
             Connection previous;
             Session accepted;
+            // The Will that waits with the session goes out after CONNACK when this CONNECT
+            // ends the session, or when it continues the session after the Will's delay has
+            // passed; a connection within the delay cancels it [MQTT-3.1.3-9].
+            Packet.Will waited = null;
             synchronized (connection) {
                 if (connection.ended) {
                     return false;
@@ -168,8 +161,6 @@ final class Client {
                         id = "hato" + UUID.randomUUID().toString().replace("-", "");
                     } while (routing.sessions.containsKey(id));
                 }
-                // An expired session is gone, for resuming and for the limit alike.
-                routing.discardExpiredSessions();
                 Session existing = routing.sessions.get(id);
                 boolean present = !request.cleanStart()
                         && existing != null
@@ -190,10 +181,20 @@ final class Client {
                     accepted = requireNonNull(existing);
                     if (previous != null) {
                         accepted.detach(previous);
+                        previous.client.cancelDelayedWill();
+                    }
+                    // The timer may not have come yet for a Will whose delay has passed.
+                    if (accepted.willDue(settings.scheduler().nanoTime())) {
+                        waited = accepted.takeWill();
+                    } else {
+                        accepted.cancelWill();
                     }
                     accepted.expiry = expiry;
                 } else {
+                    // A new session ends the old one, and with it the delay of its Will (MQTT
+                    // 5.0 sections 3.1.3.2.2 and 3.1.4).
                     if (existing != null) {
+                        waited = existing.takeWill();
                         existing.clear();
                     }
                     accepted = new Session(routing, id, request.version(), expiry);
@@ -227,10 +228,14 @@ final class Client {
                 );
             }
             // CONNACK, retransmissions, and queued deliveries stay ahead of later publications,
-            // including the Will of the connection that this one took over.
+            // including the Will of the connection that this one took over and the Will that
+            // waited with the session.
             accepted.resume();
             if (previous != null) {
                 previous.client.publishWill();
+            }
+            if (waited != null) {
+                routing.publishWill(waited, accepted);
             }
         }
         log.info("Broker accepted client {} from {} on port {}",
@@ -336,32 +341,24 @@ final class Client {
     }
 
     // Publishes the Will of this connection, which ended without a DISCONNECT that discards
-    // it, as its client would have published the message. Called under routing; taking the
-    // Will means that no later end publishes it again. A closing broker publishes none,
-    // because every session goes with it.
+    // it. Called under routing; taking the Will means that no later end publishes it again.
     void publishWill() {
         Packet.Will last = will;
         Session owner = session;
         will = null;
-        if (last == null || owner == null || routing.closed) {
-            return;
+        if (last != null && owner != null) {
+            routing.publishWill(last, owner);
         }
-        // The Will properties travel as the publication's, without the delay, which only
-        // the Will has; User Properties keep their order [MQTT-3.1.3-10]. The packet
-        // identifier is a placeholder, because every delivery takes its own.
-        var properties = new Properties(last.properties().entries().stream()
-                .filter(property -> property.id() != PropertyId.WILL_DELAY_INTERVAL)
-                .toList());
-        var publication = new Packet.Publish(
-                last.topic(),
-                last.payload(),
-                last.qos(),
-                last.retain(),
-                false,
-                (last.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
-                properties
-        );
-        routing.route(publication, owner);
+    }
+
+    // Drops the Will of this connection if it has a delay, because the connection that takes
+    // over continues the session before the delay could pass [MQTT-3.1.3-9]. A Will without a
+    // delay still goes out as this connection ends. Called under routing.
+    void cancelDelayedWill() {
+        Packet.Will last = will;
+        if (last != null && delayOf(last) > 0) {
+            will = null;
+        }
     }
 
     // Handles one packet that the client sent on its accepted connection. Called under routing.
@@ -672,16 +669,36 @@ final class Client {
         return filter.pattern().contains("+") || filter.pattern().contains("#");
     }
 
-    // Detaches the session from the connection, which has ended, and publishes the Will. Called
-    // under routing.
+    // Detaches the session from the connection, which has ended, and publishes the Will. A Will
+    // with a delay waits with the session instead when the session outlives the connection,
+    // and never goes out when another connection has already continued the session
+    // [MQTT-3.1.3-9]. Called under routing.
     void connectionEnded() {
         Session owner = session;
-        if (owner != null) {
-            owner.detach(connection);
+        if (owner == null) {
+            return;
+        }
+        owner.detach(connection);
+        Packet.Will last = will;
+        long delay = (last == null) ? 0 : delayOf(last);
+        if (last != null && delay > 0 && routing.sessions.get(owner.clientId) == owner) {
+            will = null;
+            if (owner.connection == null) {
+                owner.awaitWill(last, delay);
+            }
+            return;
         }
         // The Will follows the end of the network connection ([MQTT-3.1.2-8] in MQTT
         // 3.1.1), so a persistent session that subscribes to it receives it as an
         // absent client.
         publishWill();
+    }
+
+    // The Will Delay Interval of `will` in seconds, 0 without one (MQTT 5.0 section 3.1.3.2.2).
+    private static long delayOf(Packet.Will will) {
+        return switch (will.properties().find(PropertyId.WILL_DELAY_INTERVAL).orElse(null)) {
+            case Property.FourByteValue(var _, var value) -> value;
+            case null, default -> 0;
+        };
     }
 }

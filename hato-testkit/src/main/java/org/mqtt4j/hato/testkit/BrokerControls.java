@@ -123,8 +123,9 @@ public final class BrokerControls {
 
     /// Closes the open connection of the client with `clientId`, as a broker does for an
     /// administrative reason: an MQTT 5.0 client first receives DISCONNECT with Administrative
-    /// action. The client did not disconnect, so its Will is published. Does nothing if the
-    /// client has no open connection.
+    /// action. The client did not disconnect, so its Will is published as for a lost connection,
+    /// after its Will Delay Interval if it has one. Does nothing if the client has no open
+    /// connection.
     ///
     /// @throws NullPointerException if `clientId` is null
     public void disconnect(String clientId) {
