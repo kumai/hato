@@ -11,7 +11,7 @@ import static java.util.Objects.requireNonNull;
 /// [MqttSubscriber#subscribe(Subscribe, DeliveryOptions, java.util.function.Consumer)].
 /// Instances are immutable and can be shared between subscriptions; they do not define equality.
 ///
-/// [#serial()] runs one delivery at a time, in receive order, on an internal virtual thread, as
+/// [#serial()] runs one delivery at a time, in receive order, on an internal thread, as
 /// [MqttSubscriber#subscribe(Subscribe, java.util.function.Consumer)] does.
 /// [#withExecutor(Executor)] keeps that order but runs each handler on the application's
 /// executor. [#lanes(Function)] runs each delivery on the executor that the application chooses
@@ -20,6 +20,7 @@ import static java.util.Objects.requireNonNull;
 /// default their topics, and runs different keys at the same time on a fixed number of stripes;
 /// each stripe is a lane in what follows. [#parallel(int)] runs up to a given number of
 /// deliveries at the same time in no particular order, as one lane that runs that many at once.
+/// A handler on an internal thread may block: meanwhile only its own lane waits.
 ///
 /// An executor that runs handlers receives at most one task per subscription and lane at a time,
 /// or, for [#parallel(int)], as many as its parallelism. A task runs one delivery's handler and,
@@ -60,7 +61,7 @@ public final class DeliveryOptions {
         this.execution = execution;
     }
 
-    /// One delivery at a time, in receive order, on an internal virtual thread: the behavior of
+    /// One delivery at a time, in receive order, on an internal thread: the behavior of
     /// [MqttSubscriber#subscribe(Subscribe, java.util.function.Consumer)].
     public static DeliveryOptions serial() {
         return SERIAL;
@@ -84,8 +85,8 @@ public final class DeliveryOptions {
     /// Runs deliveries with equal topics one at a time in receive order, and deliveries with
     /// different topics possibly at the same time, at most `stripes` at once. Each topic's
     /// deliveries go to one of `stripes` fixed stripes that its hash chooses, so different topics
-    /// can share a stripe and then wait for each other. A stripe runs on an internal virtual
-    /// thread while it has deliveries, or on the executor that [#withExecutor(Executor)] sets.
+    /// can share a stripe and then wait for each other. A stripe runs on an internal thread while
+    /// it has deliveries, or on the executor that [#withExecutor(Executor)] sets.
     ///
     /// @throws IllegalArgumentException if `stripes` is less than 1 or greater than 256
     public static DeliveryOptions striped(int stripes) {
@@ -105,7 +106,7 @@ public final class DeliveryOptions {
     }
 
     /// Runs up to `parallelism` deliveries at the same time, in no particular order. Handlers run
-    /// on internal virtual threads while deliveries wait, or on the executor that
+    /// on internal threads while deliveries wait, or on the executor that
     /// [#withExecutor(Executor)] sets.
     ///
     /// @throws IllegalArgumentException if `parallelism` is less than 1 or greater than 256
@@ -114,7 +115,7 @@ public final class DeliveryOptions {
     }
 
     /// Keeps the order, stripes, or parallelism of these options, with each handler running on
-    /// `executor` instead of an internal virtual thread. Replaces an executor chosen earlier.
+    /// `executor` instead of an internal thread. Replaces an executor chosen earlier.
     ///
     /// @throws NullPointerException if `executor` is null
     /// @throws IllegalArgumentException if these options are [#lanes(Function)], whose selector

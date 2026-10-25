@@ -15,7 +15,7 @@ import static java.util.Objects.requireNonNull;
 /// and creates no event for these timings.
 ///
 /// Callbacks run serially, on a thread of their own, never on a thread that the client needs for
-/// I/O, publications, or deliveries. Events wait in a queue of 1,024: when a slow callback lets
+/// I/O, publications, or deliveries. Events wait in a bounded queue: when a slow callback lets
 /// it fill, the oldest event not yet delivered is dropped and counted in
 /// [ClientStats#droppedMetricEvents()], so the listener never delays the client. Durations are
 /// measured with the client's [TimerScheduler]; an event whose times the scheduler fails to read

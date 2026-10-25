@@ -211,14 +211,13 @@ public final class Subscribe {
     /// subscriptions.
     ///
     /// What happens beyond these bounds depends on the QoS of the received message, which can
-    /// exceed the requested one when another subscription of the client also matches. A QoS 0
-    /// message that finds this subscription full is dropped for this subscription only, and
-    /// other matching subscriptions still receive it. One that does not fit the client's bounds
-    /// is dropped for every subscription. Waiting deliveries are kept, and the connection goes
-    /// on. Drops are logged as a warning the first time for each subscription and bound, and at
-    /// debug level after that. A QoS 1 or 2 message that exceeds any bound ends the connection
-    /// instead. A small capacity for QoS 0 subscriptions leaves room in the client's bounds for
-    /// QoS 1 and 2 messages.
+    /// exceed the requested one when another subscription of the client also matches. A QoS 1 or
+    /// 2 message that exceeds any bound ends the connection. To stay within them, the client
+    /// drops QoS 0 messages instead, possibly before a bound is reached, and the connection goes
+    /// on; [ClientStats.Receiving#dropped()] counts the drops by reason. Which QoS 0 messages it
+    /// drops, and when, is not part of this contract and may change between versions. A small
+    /// capacity for QoS 0 subscriptions leaves room in the client's bounds for QoS 1 and 2
+    /// messages.
     public int bufferCapacity() {
         return bufferCapacity;
     }

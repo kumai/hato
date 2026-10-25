@@ -6,7 +6,7 @@ bytecode generation.
 
 - Operations return [`CompletableFuture`s](hato-client/README.md#working-without-blocking).
   The handlers that process received messages
-  [run on virtual threads by default, or on your own executors](hato-client/README.md#where-your-code-runs),
+  [run on threads of the client by default, or on your own executors](hato-client/README.md#where-your-code-runs),
   and may block.
 - The client [reconnects by itself](hato-client/README.md#staying-connected) and subscribes
   again after each reconnection.

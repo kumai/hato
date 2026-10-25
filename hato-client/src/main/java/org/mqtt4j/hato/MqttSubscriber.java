@@ -48,8 +48,8 @@ public interface MqttSubscriber {
     /// subscription's order and holds back its acknowledgement meanwhile. To give up a message,
     /// catch the failure and return normally, call [MqttDelivery#ack()] with [AckMode#MANUAL], or
     /// use [FailurePolicy#SKIP]; the message then counts as handled.
-    /// A QoS 1 or 2 message that exhausts receive capacity also ends the connection, while a
-    /// QoS 0 one is dropped; see [Subscribe#bufferCapacity()].
+    /// A QoS 1 or 2 message that exhausts receive capacity also ends the connection, while QoS 0
+    /// messages may be dropped instead; see [Subscribe#bufferCapacity()].
     /// On connection termination, queued deliveries are discarded; a running handler can finish.
     /// A subscription survives termination and resumes on the same handle after
     /// the client's next connection, including an automatic reconnection. New deliveries wait
@@ -127,14 +127,13 @@ public interface MqttSubscriber {
     /// one delivery at a time, in receive order across them; a publication that several of them
     /// match is offered to each in turn. Deliveries waiting for hand-off count against
     /// [Subscribe#bufferCapacity()]. The acceptor returns true to accept a delivery: from then on
-    /// the application owns it, and its capacity returns. Returning false leaves it unaccepted
-    /// and counts as an overflow, as when the buffer is full: a QoS 0 delivery is dropped for
-    /// this subscription, and a QoS 1 or 2 delivery ends the connection. The client does not
-    /// offer a refused delivery again. An exception is a handler failure under the request's
-    /// [FailurePolicy]; a QoS 1 or 2 delivery that was not accepted still holds back its
-    /// acknowledgement, so [FailurePolicy#STOP] stops the client. Once it has accepted a
-    /// delivery, the acceptor must neither return false nor throw, because the client cannot
-    /// take the delivery back.
+    /// the application owns it, and its capacity returns. Returning false refuses it: a refused
+    /// QoS 0 delivery is dropped for this subscription, and a refused QoS 1 or 2 delivery ends
+    /// the connection. The client does not offer a refused delivery again. An exception is a
+    /// handler failure under the request's [FailurePolicy]; a QoS 1 or 2 delivery that was not
+    /// accepted still holds back its acknowledgement, so [FailurePolicy#STOP] stops the client.
+    /// Once it has accepted a delivery, the acceptor must neither return false nor throw,
+    /// because the client cannot take the delivery back.
     ///
     /// The acceptor must not wait, as `BlockingQueue.put` does; use `offer`. While it waits, the
     /// client's other hand-off subscriptions wait too, and their deliveries can overflow. Waiting

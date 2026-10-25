@@ -1046,6 +1046,162 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void removing_a_lane_discards_deliveries_claimed_with_its_running_handler() throws Exception {
+        // Arrange: three deliveries claimed together, the first handler running.
+        CountDownLatch release = release();
+        LinkedBlockingQueue<MqttDelivery> entered = claimThreeTogether(release);
+
+        // Act
+        sut.remove(1);
+
+        // Assert: the claimed deliveries whose handlers have not started are discarded at once,
+        // so only the running handler keeps its reservations.
+        assertThat(sut.retainedDeliveries()).isEqualTo(1);
+        assertThat(sut.retainedBytes()).isEqualTo(10);
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isEqualTo(2);
+
+        // Act & Assert: the worker exits after the running handler returns and starts none of
+        // the discarded deliveries.
+        release.countDown();
+        await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
+        assertThat(entered).isEmpty();
+    }
+
+    @Test
+    void a_connection_end_discards_deliveries_claimed_with_a_running_handler() throws Exception {
+        // Arrange: three deliveries claimed together, the first handler running.
+        CountDownLatch release = release();
+        LinkedBlockingQueue<MqttDelivery> entered = claimThreeTogether(release);
+
+        // Act
+        sut.connectionEnded(false, false);
+
+        // Assert: the claimed deliveries whose handlers have not started are discarded at once.
+        assertThat(sut.retainedDeliveries()).isEqualTo(1);
+        assertThat(sut.retainedBytes()).isEqualTo(10);
+        assertThat(sut.dropped(1, DropReason.CONNECTION_ENDED)).isEqualTo(2);
+
+        // Act: the next connection delivers while the old handler still runs.
+        assertThat(sut.deliver(token(2, 0), List.of(1L), message(4), false, 40)).isTrue();
+        release.countDown();
+
+        // Assert: the lane goes on with the new delivery and never runs the discarded ones.
+        assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(4));
+        await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
+        assertThat(entered).isEmpty();
+    }
+
+    @Test
+    void deliveries_claimed_with_a_running_handler_wait_for_the_close_once_hand_off_closes()
+            throws Exception {
+        // Arrange: three deliveries claimed together, the first handler running.
+        CountDownLatch release = release();
+        LinkedBlockingQueue<MqttDelivery> entered = claimThreeTogether(release);
+
+        // Act
+        sut.closeHandOffs();
+        release.countDown();
+
+        // Assert: the worker exits after the running handler returns, and the claimed
+        // deliveries whose handlers had not started stay held, unstarted, for the close.
+        await().untilAsserted(() -> assertThat(sut.retainedLanes()).isZero());
+        assertThat(sut.retainedDeliveries()).isEqualTo(2);
+        assertThat(sut.retainedBytes()).isEqualTo(50);
+        assertThat(entered).isEmpty();
+
+        // Act
+        sut.close(null);
+
+        // Assert
+        assertThat(sut.retainedDeliveries()).isZero();
+        assertThat(sut.dropped(DropReason.SUBSCRIPTION_STOPPED)).isEqualTo(2);
+        assertThat(entered).isEmpty();
+    }
+
+    @Test
+    void deliveries_claimed_with_a_running_handler_count_as_waiting() throws Exception {
+        // Arrange: three deliveries claimed together, the first handler running.
+        CountDownLatch release = release();
+        LinkedBlockingQueue<MqttDelivery> entered = claimThreeTogether(release);
+
+        // Act
+        DeliveryLanes.LaneValues values = requireNonNull(sut.values().lanes().get(1L));
+
+        // Assert
+        assertThat(values.waiting()).isEqualTo(2);
+        assertThat(values.running()).isOne();
+
+        // Act & Assert: the claimed deliveries run in order once the first handler returns.
+        release.countDown();
+        assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(2));
+        assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(3));
+        await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
+    }
+
+    @Test
+    void a_returned_handler_frees_its_slot_while_a_handler_claimed_with_it_runs()
+            throws Exception {
+        // Arrange: two deliveries handed over together fill the lane; the first handler returns
+        // at once and the second keeps running.
+        var entered = new LinkedBlockingQueue<MqttDelivery>();
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(2), delivery -> {
+            entered.add(delivery);
+            if (delivery.message().equals(message(2))) {
+                waitFor(release);
+            }
+        })).isTrue();
+        sut.deliverAtMostOnce(List.of(
+                arrival(List.of(1L), message(1), 10),
+                arrival(List.of(1L), message(2), 20)
+        ));
+        assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(1));
+        assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(2));
+
+        // Act
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(3), false, 30)).isTrue();
+
+        // Assert: the first delivery returned its slot and bytes before the second handler
+        // started, so the third finds room.
+        assertThat(sut.dropped(1, DropReason.SUBSCRIPTION_FULL)).isZero();
+        assertThat(sut.retainedDeliveries()).isEqualTo(2);
+        assertThat(sut.retainedBytes()).isEqualTo(50);
+        release.countDown();
+        assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(3));
+    }
+
+    @Test
+    void a_qos_1_delivery_among_qos_0_ones_keeps_its_place_and_acknowledgement() throws Exception {
+        // Arrange: a running handler holds the lane while QoS 0, QoS 1, and QoS 0 deliveries
+        // queue behind it.
+        var entered = new LinkedBlockingQueue<MqttMessage>();
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(4), delivery -> {
+            entered.add(delivery.message());
+            if (delivery.message().equals(message(1))) {
+                waitFor(release);
+            }
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(entered.poll(5, SECONDS)).isEqualTo(message(1));
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(3), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(4), false, 10)).isTrue();
+
+        // Act
+        release.countDown();
+
+        // Assert: the handlers run in receive order, and the QoS 1 delivery becomes ready for its
+        // acknowledgement after its handler returns.
+        assertThat(entered.poll(5, SECONDS)).isEqualTo(message(2));
+        assertThat(entered.poll(5, SECONDS)).isEqualTo(qosOneMessage(3));
+        assertThat(entered.poll(5, SECONDS)).isEqualTo(message(4));
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        sut.release(10);
+        await().untilAsserted(() -> assertThat(sut.retainedDeliveries()).isZero());
+    }
+
+    @Test
     void connection_end_retains_running_bytes_until_old_handlers_finish() throws Exception {
         // Arrange: one handler retains the entire byte budget.
         var entered = new CountDownLatch(1);
@@ -2854,6 +3010,25 @@ class DeliveryLanesTest {
 
     private DeliveryLanes.Arrival arrival(List<Long> ids, MqttMessage message, int bytes) {
         return new DeliveryLanes.Arrival(token(1, 0), ids, message, false, bytes);
+    }
+
+    /// Registers lane 1 with a handler that records each delivery and waits for `release`, and
+    /// hands the lane three QoS 0 deliveries of 10, 20, and 30 bytes together, so that its
+    /// dispatcher claims them together. Returns once the first handler runs.
+    private LinkedBlockingQueue<MqttDelivery> claimThreeTogether(CountDownLatch release)
+            throws InterruptedException {
+        var entered = new LinkedBlockingQueue<MqttDelivery>();
+        assertThat(sut.register(1, request(3), delivery -> {
+            entered.add(delivery);
+            waitFor(release);
+        })).isTrue();
+        sut.deliverAtMostOnce(List.of(
+                arrival(List.of(1L), message(1), 10),
+                arrival(List.of(1L), message(2), 20),
+                arrival(List.of(1L), message(3), 30)
+        ));
+        assertThat(requireNonNull(entered.poll(5, SECONDS)).message()).isEqualTo(message(1));
+        return entered;
     }
 
     private static void waitFor(CountDownLatch latch) {

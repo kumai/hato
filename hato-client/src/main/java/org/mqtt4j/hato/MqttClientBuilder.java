@@ -216,7 +216,7 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Supplies credentials once per connection attempt, on a dedicated virtual thread before
+    /// Supplies credentials once per connection attempt, on a thread of its own before
     /// opening the attempt's first transport. Evaluation consumes the same
     /// [#connectionTimeout(Duration)] deadline as that transport's establishment and the
     /// broker's CONNACK response. Every connection of the attempt, including those with which
@@ -337,9 +337,10 @@ public final class MqttClientBuilder {
     /// sending it. An MQTT 3.1.1 broker does not learn the limit, and a larger packet ends the
     /// connection with [MqttProtocolException].
     ///
-    /// Whatever its size, an MQTT 5.0 packet with more than 65536 properties, such as User
-    /// Properties, also ends the connection with [MqttProtocolException] and
-    /// [ReasonCode#PACKET_TOO_LARGE]. Brokers do not learn this limit.
+    /// Whatever its size, an MQTT 5.0 packet with more properties than the client takes, such
+    /// as a very large number of User Properties, also ends the connection with
+    /// [MqttProtocolException] and [ReasonCode#PACKET_TOO_LARGE]. Brokers do not learn this
+    /// limit.
     public MqttClientBuilder maxPacketSize(int value) {
         if (value < MIN_PACKET_SIZE || value > MAX_PACKET_SIZE) {
             throw new IllegalArgumentException(
