@@ -226,7 +226,7 @@ final class Connection {
                 ? SendQueue.OfferResult.ACCEPTED
                 : outgoing.checkCapacity(delivery.byteCount, false);
         if (result == SendQueue.OfferResult.ACCEPTED) {
-            byte[] bytes = PacketCodec.of(version).encode(message.packet());
+            byte[] bytes = PacketCodec.of(version).encode(message.packet(scheduler.nanoTime()));
             result = outgoing.offer(
                     ++ticket,
                     new Outbound(bytes, delivery),

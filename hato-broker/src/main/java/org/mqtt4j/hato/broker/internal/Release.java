@@ -7,7 +7,7 @@ import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 record Release(int packetId) implements Outgoing {
 
     @Override
-    public Packet.PubRel packet() {
+    public Packet.PubRel packet(long now) {
         return new Packet.PubRel(packetId, ReasonCode.SUCCESS, Properties.EMPTY);
     }
 }

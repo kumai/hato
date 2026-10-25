@@ -6,5 +6,7 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // that continues one.
 sealed interface Outgoing permits Delivery, Release {
 
-    Packet packet();
+    // The packet to send at `now` on the broker's clock, which a delivery's remaining Message
+    // Expiry Interval depends on.
+    Packet packet(long now);
 }

@@ -189,17 +189,31 @@ final class Routing {
     // routing.
     void route(Packet.Publish publication, Session publisher) {
         discardExpiredSessions();
+        // A Message Expiry Interval counts from here.
+        long received = settings.scheduler().nanoTime();
         if (publication.retain()) {
-            retain(publication);
+            retain(publication, received);
         }
         // Snapshot permits an overloaded target to remove itself during delivery.
         for (Session target : List.copyOf(sessions.values())) {
-            target.deliverMatching(publication, publisher);
+            target.deliverMatching(publication, publisher, received);
         }
     }
 
-    // A copy of the retained messages, in the order they were stored. Called under routing.
+    // A copy of the retained messages, in the order they were stored, after discarding those
+    // whose Message Expiry Interval has passed (MQTT 5.0 section 3.3.1.3). They are looked for
+    // here rather than with a timer each, so an expired one keeps its share of the retained
+    // limits until a subscription looks; a timer would release it at once, if productization
+    // needs that. Called under routing.
     List<Retained> retainedMessages() {
+        long now = settings.scheduler().nanoTime();
+        retained.values().removeIf(entry -> {
+            if (!entry.expired(now)) {
+                return false;
+            }
+            retainedBytes -= entry.byteCount();
+            return true;
+        });
         return List.copyOf(retained.values());
     }
 
@@ -219,7 +233,7 @@ final class Routing {
     // [MQTT-3.3.1-5]. An empty payload only removes the previous one [MQTT-3.3.1-6]
     // [MQTT-3.3.1-7]. A message beyond the retained limits is not kept either, which leaves its
     // topic without a retained message rather than with an outdated one.
-    private void retain(Packet.Publish publication) {
+    private void retain(Packet.Publish publication, long received) {
         Retained previous = retained.remove(publication.topic());
         if (previous != null) {
             retainedBytes -= previous.byteCount();
@@ -237,7 +251,11 @@ final class Routing {
                 publication.properties(),
                 publication.payload().length
         );
-        var entry = new Retained(publication, header.length + publication.payload().length);
+        var entry = new Retained(
+                publication,
+                header.length + publication.payload().length,
+                received
+        );
         if (retained.size() >= settings.maxRetained()
                 || entry.byteCount() > settings.maxRetainedBytes() - retainedBytes) {
             if (!retainedLimitReached) {
@@ -261,8 +279,12 @@ final class Routing {
         retainedBytes += entry.byteCount();
     }
 
-    // A retained message and its share of the retained size limit.
-    record Retained(Packet.Publish publication, long byteCount) {
+    // A retained message, its share of the retained size limit, and when the broker received it.
+    record Retained(Packet.Publish publication, long byteCount, long received) {
+
+        boolean expired(long now) {
+            return Delivery.expired(Delivery.lifetimeOf(publication), received, now);
+        }
     }
 
     // A test rule for subscriptions to one filter: they are refused without a maximum, and

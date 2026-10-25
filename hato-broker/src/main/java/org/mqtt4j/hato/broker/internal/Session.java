@@ -109,7 +109,7 @@ final class Session {
     // takes a second copy when only some of them keep its retain flag, so that each
     // subscription gets the flag it asked for [MQTT-3.3.1-12] [MQTT-3.3.1-13]; each copy then
     // carries the identifiers of the subscriptions that receive it [MQTT-3.3.4-5].
-    void deliverMatching(Packet.Publish publication, Session publisher) {
+    void deliverMatching(Packet.Publish publication, Session publisher, long received) {
         // The highest QoS granted by the matching subscriptions with Retain As Published, and
         // by the other matching subscriptions; -1 while none matches. Their identifiers repeat
         // one that several of them have, as MQTT 5.0 section 3.3.4 describes.
@@ -137,12 +137,14 @@ final class Session {
         if (publication.retain() && asPublished >= 0 && cleared >= 0) {
             deliver(
                     publication,
+                    received,
                     Qos.of(Math.min(asPublished, published)),
                     true,
                     asPublishedIdentifiers
             );
             deliver(
                     publication,
+                    received,
                     Qos.of(Math.min(cleared, published)),
                     false,
                     clearedIdentifiers
@@ -151,7 +153,8 @@ final class Session {
             Qos qos = Qos.of(Math.min(Math.max(asPublished, cleared), published));
             var identifiers = new ArrayList<>(asPublishedIdentifiers);
             identifiers.addAll(clearedIdentifiers);
-            deliver(publication, qos, publication.retain() && asPublished >= 0, identifiers);
+            boolean retain = publication.retain() && asPublished >= 0;
+            deliver(publication, received, qos, retain, identifiers);
         }
     }
 
@@ -194,12 +197,13 @@ final class Session {
                 return;
             }
             int level = Math.min(subscription.qos().level(), publication.qos().level());
-            deliver(publication, Qos.of(level), true, identifiers);
+            deliver(publication, entry.received(), Qos.of(level), true, identifiers);
         }
     }
 
     private void deliver(
             Packet.Publish publication,
+            long received,
             Qos qos,
             boolean retain,
             List<Integer> identifiers
@@ -212,7 +216,7 @@ final class Session {
         if (!online && (!kept() || qos == Qos.AT_MOST_ONCE)) {
             return;
         }
-        var delivery = new Delivery(publication, qos, retain, identifiers, version);
+        var delivery = new Delivery(publication, received, qos, retain, identifiers, version);
         // A connected client that takes no packet this large loses only this delivery, before
         // the broker's own limits below could discard the whole session.
         Connection current = connection;
@@ -282,8 +286,18 @@ final class Session {
         if (replaysWait) {
             return;
         }
+        // A delivery that waited its whole Message Expiry Interval before it could start goes
+        // without being sent [MQTT-3.3.2-5]. Expired ones are found here rather than with a
+        // timer each, so they keep their place in the queue limits until the queue moves; a timer
+        // would release them at once, if productization needs that.
+        long now = settings.scheduler().nanoTime();
         Delivery delivery;
         while ((delivery = pending.peekFirst()) != null) {
+            if (delivery.expired(now)) {
+                pending.removeFirst();
+                pendingBytes -= delivery.byteCount;
+                continue;
+            }
             // A delivery queued for an earlier connection can be larger than this one takes.
             // It goes as if sent and answered, without an identifier or a place in the window.
             if (tooLargeFor(peer, delivery)) {

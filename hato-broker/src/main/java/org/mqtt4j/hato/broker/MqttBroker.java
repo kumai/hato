@@ -43,28 +43,30 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// 0xFFFFFFFF; the client's DISCONNECT can change the interval, though not from 0. A Clean Session
 /// false session of MQTT 3.1.1 does not expire. A session resumes only with the protocol version
 /// that created it. An empty client identifier is assigned and returned in CONNACK. Publication
-/// properties reach MQTT 5.0 subscribers unchanged and are dropped for MQTT 3.1.1 subscribers;
-/// Message Expiry Interval is not counted down, so retained messages do not expire. A No Local
-/// subscription receives no publications from its own client, though it does receive the retained
-/// messages that its client published. A Retain As Published subscription receives the publisher's
-/// retain flag; when only some overlapping subscriptions use it, a retained publication arrives
-/// once with each flag. Retain Handling sends the retained messages for every SUBSCRIBE, only for a
-/// new subscription, or never. A delivery carries the Subscription Identifiers of the subscriptions
-/// that it is for: of all the overlapping ones in a single copy, and in each of the two copies of a
-/// retained publication the identifiers of the subscriptions that receive that copy. A delivery
-/// keeps the identifiers that it was matched with even if the subscription is made again before it
-/// is sent. A Will with a positive Will Delay Interval is refused with Server unavailable; the
-/// properties of other Wills, except the delay, reach MQTT 5.0 subscribers as publication
-/// properties. By default, CONNACK announces only that shared subscriptions are not supported, and
-/// a Topic Alias Maximum of 16: the aliases that a client sets last for its connection. A test can
-/// make the broker announce smaller limits with the test kit's `BrokerControls`, and the broker
-/// then holds clients to them. In turn, the broker keeps to the client's Receive Maximum on each
-/// connection, resending on a resumed session no more than the new connection allows, and discards
-/// a publication larger than the client's Maximum Packet Size as if the client had received and
-/// acknowledged it. An Authentication Method is refused with Bad authentication method. AUTH, a
-/// PUBLISH with a Subscription Identifier or an invalid Topic Alias, or a SUBSCRIBE with a
-/// `$share/` filter closes the connection. A PUBREC with a failure reason code ends the QoS 2
-/// delivery without PUBREL.
+/// properties reach MQTT 5.0 subscribers unchanged and are dropped for MQTT 3.1.1 subscribers,
+/// except that a Message Expiry Interval arrives less the whole seconds that the message waited in
+/// the broker. A copy whose lifetime passed before the broker could start sending it is dropped,
+/// for MQTT 3.1.1 subscribers too, and so is an expired retained message; a delivery that started
+/// in time is resent with what is left, down to 0. A No Local subscription receives no publications
+/// from its own client, though it does receive the retained messages that its client published. A
+/// Retain As Published subscription receives the publisher's retain flag; when only some
+/// overlapping subscriptions use it, a retained publication arrives once with each flag. Retain
+/// Handling sends the retained messages for every SUBSCRIBE, only for a new subscription, or never.
+/// A delivery carries the Subscription Identifiers of the subscriptions that it is for: of all the
+/// overlapping ones in a single copy, and in each of the two copies of a retained publication the
+/// identifiers of the subscriptions that receive that copy. A delivery keeps the identifiers that
+/// it was matched with even if the subscription is made again before it is sent. A Will with a
+/// positive Will Delay Interval is refused with Server unavailable; the properties of other Wills,
+/// except the delay, reach MQTT 5.0 subscribers as publication properties. By default, CONNACK
+/// announces only that shared subscriptions are not supported, and a Topic Alias Maximum of 16: the
+/// aliases that a client sets last for its connection. A test can make the broker announce smaller
+/// limits with the test kit's `BrokerControls`, and the broker then holds clients to them. In turn,
+/// the broker keeps to the client's Receive Maximum on each connection, resending on a resumed
+/// session no more than the new connection allows, and discards a publication larger than the
+/// client's Maximum Packet Size as if the client had received and acknowledged it. An
+/// Authentication Method is refused with Bad authentication method. AUTH, a PUBLISH with a
+/// Subscription Identifier or an invalid Topic Alias, or a SUBSCRIBE with a `$share/` filter closes
+/// the connection. A PUBREC with a failure reason code ends the QoS 2 delivery without PUBREL.
 /// Before it closes an MQTT 5.0 connection for a malformed or forbidden packet, an expired
 /// keep-alive, or another connection with the same client identifier, the broker sends
 /// DISCONNECT with the reason code; a peer that stops reading may not receive it.
