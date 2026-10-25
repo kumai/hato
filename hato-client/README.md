@@ -825,11 +825,13 @@ never stalls the connection or its keep-alive.
 | `receive()` | Your own threads | Yes |
 | Connection listener, metrics listener | A thread of its own for each listener, one notification at a time | Briefly. A listener that falls behind loses its oldest notifications |
 | Credentials supplier | A virtual thread of the client, before each connection attempt | Within the connection timeout |
-| Continuations of a returned future, such as `thenApply` or `whenComplete` | A virtual thread of the client for each completed operation, whatever executors you chose for handlers, or your own thread when the future has already completed as you attach them | Yes, with the cautions below |
+| Continuations of a returned future, such as `thenApply` or `whenComplete` | A thread of the client, whatever executors you chose for handlers, or your own thread when the future has already completed as you attach them | Yes, with the cautions below |
 
 - A continuation does not run on the thread that started the operation. A `publish()` that a
   handler starts completes on another thread, so its continuation runs alongside the
   subscription's later messages, outside their order.
+- A continuation that blocks does not keep other operations from completing, but their
+  completions can wait a moment behind it, so keep continuations short where you can.
 - To run a continuation on a thread of your choice, such as your event loop, use the
   `...Async` variant with your executor, as in `whenCompleteAsync(action, executor)`.
 - `terminated()` waits until continuations have returned, so one that never returns keeps the
