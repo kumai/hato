@@ -71,7 +71,8 @@ tells MQTT 5.0 clients so when they connect; it refuses `$share/` filters in
 MQTT 3.1.1 too. Tests can make it announce smaller limits to MQTT 5.0 clients with
 the test kit. In turn, it keeps to the Receive Maximum and Maximum Packet Size that
 MQTT 5.0 clients announce, and drops a message too large for a client instead of
-sending it. Persistent sessions do not expire.
+sending it. An MQTT 5.0 persistent session ends once its Session Expiry Interval has
+passed after its connection; MQTT 3.1.1 persistent sessions do not expire.
 
 With Clean Session false, or a positive session expiry in MQTT 5.0, subscriptions
 and QoS 1/2 deliveries survive a disconnect, and reconnecting with the same client

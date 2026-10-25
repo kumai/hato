@@ -36,10 +36,17 @@ final class Session {
     // are sized and encoded for one version.
     final MqttVersion version;
 
-    // Whether the session outlives its connection: Clean Session 0 in MQTT 3.1.1, or a
-    // positive Session Expiry Interval in MQTT 5.0. A connection that resumes the session
-    // sets it again from its own CONNECT.
-    boolean kept;
+    // A Session Expiry Interval of 0xFFFFFFFF, which keeps a session without end.
+    static final long NEVER = 0xFFFF_FFFFL;
+
+    // How long the session outlives a connection, in seconds: 0 ends it with its connection,
+    // and NEVER keeps it, as MQTT 3.1.1 Clean Session 0 does, which leaves retention to the
+    // broker. A connection that resumes the session sets it again from its own CONNECT, and
+    // the client's DISCONNECT can change it (MQTT 5.0 section 3.14.2.2.2).
+    long expiry;
+
+    // The broker's time at which the session lost its connection, from which its expiry counts.
+    private long detachedAt;
 
     // Each filter's subscription with the options that the client requested.
     final Map<TopicFilter, Subscribed> subscriptions = new HashMap<>();
@@ -74,12 +81,26 @@ final class Session {
 
     private long pendingBytes;
 
-    Session(Routing routing, String clientId, MqttVersion version, boolean kept) {
+    Session(Routing routing, String clientId, MqttVersion version, long expiry) {
         this.routing = routing;
         settings = routing.settings;
         this.clientId = clientId;
         this.version = version;
-        this.kept = kept;
+        this.expiry = expiry;
+    }
+
+    // Whether the session outlives its connection: Clean Session 0 in MQTT 3.1.1, or a
+    // positive Session Expiry Interval in MQTT 5.0.
+    boolean kept() {
+        return expiry > 0;
+    }
+
+    // Whether the session has lost its connection for longer than its expiry, so that the
+    // broker must discard it [MQTT-4.1.0-2].
+    boolean expired(long now) {
+        return connection == null
+                && expiry != NEVER
+                && now - detachedAt >= expiry * 1_000_000_000L;
     }
 
     // Delivers `publication` from `publisher` for the subscriptions that match it.
@@ -188,7 +209,7 @@ final class Session {
             detach(peer);
         }
         boolean online = connection != null;
-        if (!online && (!kept || qos == Qos.AT_MOST_ONCE)) {
+        if (!online && (!kept() || qos == Qos.AT_MOST_ONCE)) {
             return;
         }
         var delivery = new Delivery(publication, qos, retain, identifiers, version);
@@ -394,11 +415,12 @@ final class Session {
         deferred.clear();
         outstanding.clear();
         outstandingCount = 0;
-        if (!kept) {
+        if (!kept()) {
             routing.sessions.remove(clientId, this);
             clear();
             return;
         }
+        detachedAt = settings.scheduler().nanoTime();
         // QoS 0 belongs to the connection; only acknowledged deliveries survive it.
         pending.removeIf(delivery -> {
             if (delivery.qos == Qos.AT_MOST_ONCE) {

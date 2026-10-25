@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
@@ -115,14 +116,13 @@ final class Client {
             );
             return false;
         }
-        boolean keep = switch (request.version()) {
-            case V3_1_1 -> !request.cleanStart();
-            // Only whether the interval is positive matters; sessions do not expire.
-            case V5 -> request.properties().find(PropertyId.SESSION_EXPIRY_INTERVAL)
-                    .filter(interval -> interval instanceof Property.FourByteValue value
-                            && value.value() > 0)
-                    .isPresent();
+        // MQTT 3.1.1 leaves the retention of a Clean Session 0 session to the broker, which
+        // keeps it without end.
+        long expiry = switch (request.version()) {
+            case V3_1_1 -> request.cleanStart() ? 0 : Session.NEVER;
+            case V5 -> expiryOf(request.properties()).orElse(0);
         };
+        boolean keep = expiry > 0;
         String id;
         synchronized (routing) {
             Connection previous;
@@ -168,14 +168,16 @@ final class Client {
                         id = "hato" + UUID.randomUUID().toString().replace("-", "");
                     } while (routing.sessions.containsKey(id));
                 }
+                // An expired session is gone, for resuming and for the limit alike.
+                routing.discardExpiredSessions();
                 Session existing = routing.sessions.get(id);
                 boolean present = !request.cleanStart()
                         && existing != null
-                        && existing.kept
+                        && existing.kept()
                         && existing.version == request.version();
                 // Resuming or replacing a kept session reuses its place in the limit.
-                if (keep && (existing == null || !existing.kept)
-                        && routing.sessions.values().stream().filter(value -> value.kept).count()
+                if (keep && (existing == null || !existing.kept())
+                        && routing.sessions.values().stream().filter(Session::kept).count()
                         >= settings.maxSessions()) {
                     connection.refuse(
                             ReasonCode.SERVER_UNAVAILABLE,
@@ -189,12 +191,12 @@ final class Client {
                     if (previous != null) {
                         accepted.detach(previous);
                     }
-                    accepted.kept = keep;
+                    accepted.expiry = expiry;
                 } else {
                     if (existing != null) {
                         existing.clear();
                     }
-                    accepted = new Session(routing, id, request.version(), keep);
+                    accepted = new Session(routing, id, request.version(), expiry);
                     routing.sessions.put(id, accepted);
                 }
                 connection.clientId = id;
@@ -294,6 +296,14 @@ final class Client {
         return switch (identifier) {
             case Property.VariableByteValue(var _, var value) -> value;
             case null, default -> 0;
+        };
+    }
+
+    // The Session Expiry Interval in `properties` of a CONNECT or DISCONNECT, in seconds.
+    private static OptionalLong expiryOf(Properties properties) {
+        return switch (properties.find(PropertyId.SESSION_EXPIRY_INTERVAL).orElse(null)) {
+            case Property.FourByteValue(var _, var value) -> OptionalLong.of(value);
+            case null, default -> OptionalLong.empty();
         };
     }
 
@@ -478,6 +488,18 @@ final class Client {
             case Packet.PubComp ack -> owner.acknowledge(ack.packetId(), true);
             case Packet.PingReq _ -> send(new Packet.PingResp());
             case Packet.Disconnect disconnect -> {
+                // The client may change the Session Expiry Interval as it leaves, but not from
+                // 0, which makes the DISCONNECT invalid (MQTT 5.0 section 3.14.2.2.2).
+                OptionalLong expiry = expiryOf(disconnect.properties());
+                if (expiry.isPresent()) {
+                    if (owner.expiry == 0 && expiry.getAsLong() != 0) {
+                        throw new PacketDecodeException(
+                                ReasonCode.PROTOCOL_ERROR,
+                                "Session Expiry Interval on DISCONNECT after none on CONNECT"
+                        );
+                    }
+                    owner.expiry = expiry.getAsLong();
+                }
                 // Only a normal disconnection discards the Will [MQTT-3.14.4-3]; MQTT 5.0
                 // publishes it for any other reason code, Disconnect with Will Message
                 // among them (MQTT 5.0 section 3.1.2.5).

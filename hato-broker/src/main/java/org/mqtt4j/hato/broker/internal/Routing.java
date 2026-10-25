@@ -168,10 +168,27 @@ final class Routing {
         return holds.contains(new Hold(type, clientId));
     }
 
+    // Discards the sessions whose expiry has passed since their connection ended
+    // [MQTT-4.1.0-2]. The broker looks for them when it looks a session up for a CONNECT and
+    // when it routes, in place of a timer per session, so an expired session keeps its queued
+    // deliveries, within the session limits, until then. A timer that discards it would release
+    // them at once, if productization needs that. Called under routing.
+    void discardExpiredSessions() {
+        long now = settings.scheduler().nanoTime();
+        sessions.values().removeIf(session -> {
+            if (!session.expired(now)) {
+                return false;
+            }
+            session.clear();
+            return true;
+        });
+    }
+
     // Delivers `publication` from `publisher`'s client to every matching subscription, after
     // making it the retained message of its topic if its RETAIN flag asks for that. Called under
     // routing.
     void route(Packet.Publish publication, Session publisher) {
+        discardExpiredSessions();
         if (publication.retain()) {
             retain(publication);
         }
