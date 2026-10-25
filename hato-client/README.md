@@ -503,8 +503,9 @@ Subscription subscription = client.handOff(
 ```
 
 - Return `true` to take a message; from then on it is yours to process or drop.
-- Return `false` when your mailbox is full. The client treats that as a full subscription
-  buffer; see [When a buffer is full](#when-a-buffer-is-full).
+- Return `false` when your mailbox is full. The client then drops a QoS 0 message for this
+  subscription and ends the connection for a QoS 1 or 2 message, as
+  [When a buffer is full](#when-a-buffer-is-full) describes.
 - One thread of the client offers the messages of all its hand-off subscriptions in the order
   they arrive, so your mailbox sees one order across them, and `delivery.filter()` tells which
   subscription each message came through. Never wait in the acceptor: use `offer`, not `put`,
@@ -571,18 +572,20 @@ do not change this order.
 
 | Received QoS | What the client does |
 | --- | --- |
-| 0 | Drops the message for the full subscription, while other matching subscriptions still receive it, and goes on. When the client-wide limit is full, it drops the message for every subscription. |
+| 0 | Drops messages to stay within the buffers, possibly before one is full, and goes on. Which messages it drops, and when, may change between versions. |
 | 1 or 2 | Ends the connection rather than hold more, which affects every subscription on it. |
 
 What counts is the QoS of the received message, which can be higher than a subscription
 requested when another subscription of the client also matches. A hand-off acceptor that
-returns `false` counts as a full buffer, and the client does not offer that message again.
-`FailurePolicy.SKIP` does not change any of this.
+returns `false` refuses the message: the client drops a QoS 0 message for that subscription,
+ends the connection for a QoS 1 or 2 message, and does not offer it again.
+`FailurePolicy.SKIP` does not change any of this. If you cannot lose a message, receive it
+with QoS 1 or 2.
 
 When the connection ends, queued deliveries are discarded; a handler that is already
 processing a message can finish. The broker sends unacknowledged messages again only when the
-client resumes a [persistent session](#keeping-a-session-between-connections). The client logs
-drops, and [stats](#checking-what-the-client-holds) count them by reason.
+client resumes a [persistent session](#keeping-a-session-between-connections).
+[Stats](#checking-what-the-client-holds) count drops by reason.
 
 ### Keeping up
 

@@ -176,10 +176,12 @@ public final class ClientStats {
         /// Its subscription stopped while it waited.
         SUBSCRIPTION_STOPPED,
 
-        /// A QoS 0 delivery found its subscription's buffer full.
+        /// The client dropped a QoS 0 delivery to keep its subscription within its buffer
+        /// capacity.
         SUBSCRIPTION_FULL,
 
-        /// A QoS 0 delivery did not fit the client's limits on deliveries and their bytes.
+        /// The client dropped a QoS 0 delivery to keep within its limits on deliveries and their
+        /// bytes.
         CLIENT_FULL,
 
         /// Its hand-off acceptor refused it.
@@ -244,9 +246,8 @@ public final class ClientStats {
         }
 
         /// A lifetime count of received QoS 0 publications that the client dropped before
-        /// routing them, because they arrived faster than it routes publications and found its
-        /// queue of incoming packets full. They reach no subscription, and [#publishes(Qos)]
-        /// counts them.
+        /// routing them, because they arrived faster than it could route them. They reach no
+        /// subscription, and [#publishes(Qos)] counts them.
         public long unrouted() {
             return values.unrouted();
         }
