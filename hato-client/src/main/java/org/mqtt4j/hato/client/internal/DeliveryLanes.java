@@ -16,6 +16,7 @@ import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
@@ -67,6 +68,14 @@ final class DeliveryLanes {
     /// ends. The bound does not grow with the subscriptions, so fan-out over many of them cannot
     /// multiply it; it is what the core's 4,096 receipts reach with 256 subscriptions each.
     static final int CONDITION_LIMIT = 1_048_576;
+
+    // The most QoS 0 deliveries that a serial dispatcher claims under one hold of the lock: as
+    // many as the actor admits under one hold.
+    private static final int CLAIM_LIMIT = 64;
+
+    // A lane's count of started claims once a stop, a connection end, or the client's close has
+    // put the claims that its dispatcher had not started back in the lane's queue.
+    private static final int REQUEUED = -1;
 
     // One lock keeps fan-out reservations atomic; each lane's condition wakes only that lane's
     // dispatcher or receivers.
@@ -327,12 +336,14 @@ final class DeliveryLanes {
 
     /// Closes hand-off for every lane before the client's close() returns. No dispatcher or
     /// receiver claims a delivery afterwards. Queued deliveries wait for [#close] to discard
-    /// them, and handlers that already claimed one may finish.
+    /// them, joined by those that a dispatcher claimed together and has not started, and handlers
+    /// that already started may finish.
     void closeHandOffs() {
         lock.lock();
         try {
             handOffsClosed = true;
             for (Lane lane : lanes.values()) {
+                requeueUnstarted(lane);
                 lane.ready.signalAll();
             }
         } finally {
@@ -413,6 +424,7 @@ final class DeliveryLanes {
             }
             // A finishing pull lane can stop here, which removes it from the map.
             for (Lane lane : List.copyOf(lanes.values())) {
+                requeueUnstarted(lane);
                 discard(lane, lane.queue);
                 for (Sublane sublane : lane.sublanes.values()) {
                     discard(lane, sublane.queue);
@@ -885,7 +897,7 @@ final class DeliveryLanes {
             }
             var values = new HashMap<Long, LaneValues>();
             for (Lane lane : lanes.values()) {
-                long waiting = lane.queue.size() + lane.queuedInSublanes;
+                long waiting = lane.queue.size() + lane.queuedInSublanes + unstarted(lane);
                 values.put(lane.id, new LaneValues(
                         waiting,
                         lane.retained - waiting - processed.getOrDefault(lane.id, 0L),
@@ -1024,20 +1036,108 @@ final class DeliveryLanes {
         return !lane.stopped && !handOffsClosed;
     }
 
-    /// Serial delivery: claims the head and executes its handler here, in place.
+    /// Serial delivery: claims the head and executes its handler here, in place. A run of QoS 0
+    /// deliveries at the head is claimed under the same hold, up to [#CLAIM_LIMIT] of them, so
+    /// that the dispatcher waits for the lock at most once for the run, rather than twice for
+    /// each delivery while the actor holds the lock to admit the next run.
     private boolean executeNext(Lane lane) {
         Claim claim;
         lock.lock();
         try {
+            // The previous claims have all run, failed, or gone back to the queue.
+            endHandled(lane);
+            lane.claimed.clear();
             if (!awaitNext(lane)) {
                 return false;
             }
             claim = claim(lane, lane.queue);
+            if (atMostOnce(claim.view())) {
+                lane.claimed.add(claim.view());
+                while (lane.claimed.size() < CLAIM_LIMIT && atMostOnce(lane.queue.peekFirst())) {
+                    // A QoS 0 claim meets no acknowledgement condition, so none is ready.
+                    lane.claimed.add(claim(lane, lane.queue).view());
+                }
+                lane.started.set(0);
+            }
         } finally {
             lock.unlock();
         }
-        execute(lane, claim);
+        if (lane.claimed.isEmpty()) {
+            execute(lane, claim);
+        } else {
+            executeClaimed(lane);
+        }
         return true;
+    }
+
+    /// Executes the handlers of the QoS 0 deliveries claimed together, in order. Each handler
+    /// starts only after the lane's count of started claims has counted it, so a stop, a
+    /// connection end, or the client's close that puts the rest back in the queue keeps them from
+    /// starting. A returned delivery ends its local processing at once if the lock is free;
+    /// otherwise a later return or the next claim ends it, so the dispatcher does not wait for
+    /// the lock here.
+    private void executeClaimed(Lane lane) {
+        for (int i = 0; i < lane.claimed.size() && lane.started.compareAndSet(i, i + 1); i++) {
+            DeliveryView view = lane.claimed.get(i);
+            try {
+                started(lane, view);
+                requireNonNull(lane.handler).accept(view);
+            } catch (Throwable failure) {
+                boolean _ = Thread.interrupted();
+                fail(lane, view, failure, false);
+                continue;
+            }
+            // Clear handler-owned interrupt state before the next delivery or queue wait.
+            boolean _ = Thread.interrupted();
+            lane.handled.add(view);
+            if (lock.tryLock()) {
+                try {
+                    endHandled(lane);
+                } finally {
+                    lock.unlock();
+                }
+            }
+        }
+    }
+
+    /// Caller holds lock. Ends the local processing of the claimed QoS 0 deliveries whose
+    /// handlers have returned; they meet no acknowledgement condition.
+    private void endHandled(Lane lane) {
+        for (DeliveryView view : lane.handled) {
+            view.localDone = true;
+            releaseView(view);
+        }
+        handledDeliveries += lane.handled.size();
+        lane.handled.clear();
+    }
+
+    /// Caller holds lock. Puts the QoS 0 deliveries that the lane's dispatcher claimed together
+    /// and has not started back at the head of the lane's queue, in their order, and keeps the
+    /// dispatcher from starting them. A stop, a connection end, and the client's close call this
+    /// first, so that they find those deliveries queued, as they would have without the claim.
+    private void requeueUnstarted(Lane lane) {
+        int started = lane.started.getAndSet(REQUEUED);
+        if (started == REQUEUED) {
+            return;
+        }
+        for (int i = lane.claimed.size() - 1; i >= started; i--) {
+            DeliveryView view = lane.claimed.get(i);
+            view.recipient.handed = false;
+            view.recipient.queued = true;
+            lane.queue.addFirst(view);
+        }
+    }
+
+    /// Caller holds lock. How many of the QoS 0 deliveries that the lane's dispatcher claimed
+    /// together still wait for their handlers to start.
+    private static int unstarted(Lane lane) {
+        int started = lane.started.get();
+        return started == REQUEUED ? 0 : Math.max(lane.claimed.size() - started, 0);
+    }
+
+    /// A QoS 0 delivery, which holds back no acknowledgement.
+    private static boolean atMostOnce(@Nullable DeliveryView view) {
+        return view != null && view.delivery.token.acknowledgement() == 0;
     }
 
     /// An application executor: moves the head to the executor's sublane, then submits a drain
@@ -1186,7 +1286,8 @@ final class DeliveryLanes {
     /// Caller holds lock; the lane is not stopped, no failure holds it, and the queue is not
     /// empty. Taking the head fixes its hand-off. Claiming and stopping share the lock, so a stop
     /// either discards the delivery first or leaves its handler to run, possibly after the stop
-    /// returns.
+    /// returns. Of the QoS 0 deliveries that a serial dispatcher claims together, a stop leaves
+    /// only those whose handlers have started; see [#requeueUnstarted(Lane)].
     private Claim claim(Lane lane, ArrayDeque<DeliveryView> queue) {
         DeliveryView view = queue.removeFirst();
         view.recipient.queued = false;
@@ -1793,6 +1894,7 @@ final class DeliveryLanes {
             handOffLanes--;
         }
         lane.stopped = true;
+        requeueUnstarted(lane);
         boolean ready = abandon(lane, lane.queue);
         for (Sublane sublane : lane.sublanes.values()) {
             ready |= abandon(lane, sublane.queue);
@@ -2067,6 +2169,16 @@ final class DeliveryLanes {
         // A hand-off lane shares the hand-off worker's condition.
         final Condition ready;
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
+        // The QoS 0 deliveries that a serial dispatcher claimed together, in receive order, and
+        // how many of their handlers it has started, or REQUEUED once a stop, a connection end,
+        // or the client's close has put the rest back in the queue. The dispatcher changes the
+        // list only under the lock, and it counts a handler before starting it, so a delivery is
+        // either started or put back, never both.
+        final ArrayList<DeliveryView> claimed = new ArrayList<>();
+        final AtomicInteger started = new AtomicInteger();
+        // Claimed deliveries whose handlers returned while the lock was busy, which the
+        // dispatcher ends under a later hold; only the dispatcher uses them.
+        final ArrayList<DeliveryView> handled = new ArrayList<>();
         // A sublane exists while deliveries wait there or a drain task is on its way. Executors
         // are told apart by identity, so no application's equals() runs under the lock. Stripes,
         // and the one sublane of a parallel lane, are told apart by the equality of their
