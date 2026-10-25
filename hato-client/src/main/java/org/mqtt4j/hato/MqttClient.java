@@ -127,7 +127,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     ///
     /// Each call returns an independent future. Completing, cancelling, or timing out that future
     /// changes neither the connection nor another observation. Pending observations share the
-    /// limit of 1,024 per client described by [Subscription#established()]: a full limit returns
+    /// per-client limit described by [Subscription#established()]: a full limit returns
     /// a future already failed with [MqttCapacityException], and each call made while
     /// disconnected holds a slot until the client resolves it. To check the state periodically,
     /// keep one pending future and call again only after it completes. A future that then

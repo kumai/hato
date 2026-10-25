@@ -35,7 +35,8 @@ public interface Subscription extends AutoCloseable {
     /// closes the client fails it with [MqttConnectionLostException] carrying that failure. The
     /// first permanent ending decides every later result.
     ///
-    /// Pending observations share a limit of 1,024 per client, independent of operation capacity.
+    /// Pending observations share a limit per client, independent of operation capacity, which
+    /// can be lower than the number of subscriptions that the client holds.
     /// This includes [#unsubscribe()] and [MqttClient#whenConnected()] observations. A full limit
     /// returns a future already failed with [MqttCapacityException], which is done, without
     /// changing the subscription. A slot remains held through completion and any synchronous

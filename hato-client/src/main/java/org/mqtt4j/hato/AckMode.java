@@ -11,9 +11,10 @@ package org.mqtt4j.hato;
 /// Push subscriptions keep a delivery's capacity until its handler finishes and its PUBACK or
 /// PUBREC enters the send queue. Pull subscriptions release it at handoff (ON_RECEIVE) or at
 /// [MqttDelivery#ack()] (MANUAL), and hand-off subscriptions when their acceptor accepts the
-/// delivery, in either mode. At most 4,096 receptions may await protocol completion in one
-/// session, including QoS 2 exchanges and connections that continue the session. A QoS 1 or 2
-/// message that exhausts either bound ends the connection; see [Subscribe#bufferCapacity()].
+/// delivery, in either mode. The client also limits the receptions that may await protocol
+/// completion in one session, including QoS 2 exchanges and connections that continue the
+/// session; [ClientStats.Receiving#receptions()] shows the limit. A QoS 1 or 2 message that
+/// exhausts either bound ends the connection; see [Subscribe#bufferCapacity()].
 /// Connection loss alone does not release a push delivery's capacity in a continued session.
 /// Acknowledgement never releases a running handler's capacity.
 public enum AckMode {

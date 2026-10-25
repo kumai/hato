@@ -836,8 +836,8 @@ never stalls the connection or its keep-alive.
   `...Async` variant with your executor, as in `whenCompleteAsync(action, executor)`.
 - `terminated()` waits until continuations have returned, so one that never returns keeps the
   client from terminating. Continuations of `established()`, `whenConnected()`, and
-  `unsubscribe()` also count toward the client's 1,024 pending observations until they return,
-  so keep them short.
+  `unsubscribe()` also count toward the client's limit on pending observations until they
+  return, so keep them short.
 
 ## Watching the client
 
