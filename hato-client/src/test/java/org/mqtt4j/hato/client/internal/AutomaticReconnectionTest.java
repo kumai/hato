@@ -1218,7 +1218,8 @@ class AutomaticReconnectionTest {
                 initialRetry ? RetryRules.DEFAULT.withInitialRetry() : RetryRules.DEFAULT,
                 responseTimeout,
                 DeliveryOptionsAccess::execution,
-                UserPropertyAccess::received,
+                MqttMessageAccess::received,
+                MqttMessageAccess::payloadArray,
                 ClientStatsAccess::of,
                 ClientLimits.DEFAULT
         );

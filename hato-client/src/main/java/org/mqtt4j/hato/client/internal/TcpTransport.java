@@ -406,6 +406,23 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     @Override
     public SendResult write(long ticket, byte[] bytes) {
         requireNonNull(bytes, "bytes");
+        return writeHere(ticket, writer -> writer.write(bytes));
+    }
+
+    @Override
+    public SendResult write(long ticket, byte[] header, byte[] payload) {
+        requireNonNull(header, "header");
+        requireNonNull(payload, "payload");
+        return writeHere(ticket, writer -> writer.write(header, payload));
+    }
+
+    @FunctionalInterface
+    private interface FrameWrite {
+
+        void writeTo(FrameWriter writer) throws IOException;
+    }
+
+    private SendResult writeHere(long ticket, FrameWrite write) {
         FrameWriter writer;
         synchronized (callbacks) {
             writer = admit();
@@ -417,7 +434,7 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             ioWorkers++;
         }
         try {
-            writer.write(bytes);
+            write.writeTo(writer);
             synchronized (callbacks) {
                 writing = false;
                 Listener receiver = listener;

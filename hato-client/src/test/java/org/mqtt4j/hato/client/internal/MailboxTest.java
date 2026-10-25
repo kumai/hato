@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Stream;
@@ -239,14 +240,37 @@ class MailboxTest {
         // Act & Assert: a run stops before another kind of event, which take() returns next,
         // and at the end of the queue.
         assertThat(sut.take(() -> false)).containsSame(first);
-        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(second);
-        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        var run = new ArrayList<Mailbox.Event>();
+        sut.takeAtMostOnce(() -> false, 10, run);
+        assertThat(run).containsExactly(second);
         assertThat(sut.take(() -> false)).containsSame(incoming);
         assertThat(sut.offer(later)).isEqualTo(ACCEPTED);
-        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(later);
-        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        run.clear();
+        sut.takeAtMostOnce(() -> false, 10, run);
+        assertThat(run).containsExactly(later);
         // A publication taken in a run returns its allowance, as one that take() returns does.
         assertThat(sut.bytes()).isZero();
+    }
+
+    @Test
+    void a_run_takes_no_more_qos_0_publications_than_its_limit() throws Exception {
+        // Arrange
+        var sut = new Mailbox(1, 10, 256, 3, 30, 1);
+        var first = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var second = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        var third = new Mailbox.Event(1, () -> { }, Mailbox.Kind.AT_MOST_ONCE, 10);
+        sut.activate(1);
+        for (Mailbox.Event event : List.of(first, second, third)) {
+            assertThat(sut.offer(event)).isEqualTo(ACCEPTED);
+        }
+        var run = new ArrayList<Mailbox.Event>();
+
+        // Act
+        sut.takeAtMostOnce(() -> false, 2, run);
+
+        // Assert: the publication past the limit stays queued for the next run.
+        assertThat(run).containsExactly(first, second);
+        assertThat(sut.take(() -> false)).containsSame(third);
     }
 
     @Test
@@ -263,20 +287,26 @@ class MailboxTest {
         assertThat(sut.offer(publication)).isEqualTo(ACCEPTED);
 
         // Act & Assert: a keep-alive event, a termination, and a stop request each come first.
+        var run = new ArrayList<Mailbox.Event>();
         assertThat(sut.offer(timer)).isEqualTo(ACCEPTED);
-        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        sut.takeAtMostOnce(() -> false, 10, run);
+        assertThat(run).isEmpty();
         assertThat(sut.take(() -> false)).containsSame(timer);
         sut.terminate(end);
-        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        sut.takeAtMostOnce(() -> false, 10, run);
+        assertThat(run).isEmpty();
         assertThat(sut.take(() -> false)).containsSame(end);
         assertThat(sut.stopSession(1, () -> { })).isTrue();
-        assertThat(sut.takeAtMostOnce(() -> false)).isNull();
+        sut.takeAtMostOnce(() -> false, 10, run);
+        assertThat(run).isEmpty();
         assertThat(sut.take(() -> false)).hasValueSatisfying(stop ->
                 assertThat(stop.kind()).isEqualTo(Mailbox.Kind.CONTROL));
 
         // Act & Assert: stopping ends a run too, and leaves the publication queued.
-        assertThat(sut.takeAtMostOnce(() -> true)).isNull();
-        assertThat(sut.takeAtMostOnce(() -> false)).isSameAs(publication);
+        sut.takeAtMostOnce(() -> true, 10, run);
+        assertThat(run).isEmpty();
+        sut.takeAtMostOnce(() -> false, 10, run);
+        assertThat(run).containsExactly(publication);
     }
 
     @Test

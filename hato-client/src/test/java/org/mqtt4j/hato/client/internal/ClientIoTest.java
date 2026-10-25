@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -32,6 +33,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttMessageAccess;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
@@ -80,7 +82,8 @@ class ClientIoTest {
                 return transport;
             },
             events,
-            codec
+            codec,
+            MqttMessageAccess::payloadArray
     );
 
     // The I/Os that the tests of batched writes make.
@@ -223,7 +226,8 @@ class ClientIoTest {
                     return transport;
                 },
                 events,
-                codec
+                codec,
+                MqttMessageAccess::payloadArray
         );
         batching.add(io);
         return io;
@@ -564,7 +568,8 @@ class ClientIoTest {
                 0,
                 _ -> transport,
                 events,
-                codec
+                codec,
+                MqttMessageAccess::payloadArray
         );
         batching.add(io);
         io.open(1, Duration.ofSeconds(30));
@@ -580,6 +585,54 @@ class ClientIoTest {
                 assertThat(writer.getName()).endsWith("-sender"));
         assertThat(transport.maximumDepth).isEqualTo(1);
         assertThat(events.failures).isEmpty();
+    }
+
+    @Test
+    void a_large_publication_leaves_as_its_header_then_its_own_payload_and_retries_with_dup()
+            throws Exception {
+        // Arrange: each connection gets a transport that lets the client write.
+        var transports = new CopyOnWriteArrayList<BlockingTransport>();
+        var io = new ClientIo(
+                URI.create("mqtt://localhost"),
+                "io-test",
+                16 * 1024 * 1024,
+                128,
+                0,
+                _ -> {
+                    var transport = new BlockingTransport();
+                    transports.add(transport);
+                    return transport;
+                },
+                events,
+                codec,
+                MqttMessageAccess::payloadArray
+        );
+        batching.add(io);
+        var payload = new byte[ClientIo.APART_PAYLOAD_BYTES];
+        payload[payload.length - 1] = 9;
+        var message = MqttMessage.of(new Topic("large"), payload, Qos.AT_LEAST_ONCE, false);
+        var receipt = new SendReceipt();
+        io.open(1, Duration.ofSeconds(30));
+        assertThat(io.publish(1, 1, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+        await().until(receipt::accepted);
+
+        // Act: the same publication again on the next connection.
+        io.close();
+        io.open(2, Duration.ofSeconds(30));
+        assertThat(io.publish(2, 2, message, 7, receipt, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+
+        // Assert: both writes carry the message's own payload array behind the header.
+        await().until(() -> transports.size() == 2 && transports.get(1).parts.size() == 1);
+        List<byte[]> first = transports.get(0).parts.getFirst();
+        List<byte[]> retry = transports.get(1).parts.getFirst();
+        byte[] own = MqttMessageAccess.payloadArray(message);
+        assertThat(first.get(1)).isSameAs(own);
+        assertThat(retry.get(1)).isSameAs(own);
+        assertThat(publication(first).dup()).isFalse();
+        Packet.Publish packet = publication(retry);
+        assertThat(packet.dup()).isTrue();
+        assertThat(packet.packetId()).isEqualTo(7);
+        assertThat(packet.payload()).isEqualTo(payload);
     }
 
     @Test
@@ -1251,6 +1304,13 @@ class ClientIoTest {
         return transports.getLast();
     }
 
+    /// The PUBLISH that a write made of `parts` carries.
+    private Packet.Publish publication(List<byte[]> parts) {
+        var bytes = new ByteArrayOutputStream();
+        parts.forEach(bytes::writeBytes);
+        return (Packet.Publish) codec.decode(bytes.toByteArray());
+    }
+
     private static MqttMessage message(int payloadSize) {
         return MqttMessage.of(new Topic("a"), new byte[payloadSize], Qos.AT_MOST_ONCE, false);
     }
@@ -1424,6 +1484,8 @@ class ClientIoTest {
     private static final class BlockingTransport implements Transport, BlockingWriteTransport {
 
         final List<Thread> writers = new CopyOnWriteArrayList<>();
+        // The header and the payload of each write that the sender made in two parts.
+        final List<List<byte[]>> parts = new CopyOnWriteArrayList<>();
         @Nullable Listener listener;
         volatile boolean closed;
         int depth;
@@ -1438,6 +1500,12 @@ class ClientIoTest {
         @Override
         public SendResult send(long ticket, byte[] bytes) {
             throw new AssertionError("The client writes through write()");
+        }
+
+        @Override
+        public synchronized SendResult write(long ticket, byte[] header, byte[] payload) {
+            parts.add(List.of(header, payload));
+            return BlockingWriteTransport.super.write(ticket, header, payload);
         }
 
         @Override
@@ -1521,8 +1589,8 @@ class ClientIoTest {
         }
 
         @Override
-        public Packet decode(byte[] packet) {
-            return delegate.decode(packet);
+        public Packet decode(byte[] bytes, int offset, int length) {
+            return delegate.decode(bytes, offset, length);
         }
     }
 

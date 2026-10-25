@@ -217,9 +217,9 @@ final class Mqtt5PacketCodec implements PacketCodec {
     }
 
     @Override
-    public Packet decode(byte[] packet) {
-        requireNonNull(packet, "packet must not be null");
-        var input = ByteBuffer.wrap(packet);
+    public Packet decode(byte[] bytes, int offset, int length) {
+        requireNonNull(bytes, "bytes must not be null");
+        var input = ByteBuffer.wrap(bytes, offset, length);
         try {
             int header = input.get() & 0xFF;
             int typeValue = header >>> 4;

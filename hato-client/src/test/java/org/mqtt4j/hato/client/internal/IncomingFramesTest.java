@@ -59,7 +59,7 @@ class IncomingFramesTest {
 
     @ParameterizedTest
     @ValueSource(ints = {1, 127, 16384, 100000})
-    void growing_frames_preserve_payloads_sizes_and_the_next_packet(int chunkSize) {
+    void packets_split_across_chunks_keep_payloads_sizes_and_the_next_packet(int chunkSize) {
         var codec = PacketCodec.of(MqttVersion.V3_1_1);
         var payload = new byte[65537];
         for (int i = 0; i < payload.length; i++) {

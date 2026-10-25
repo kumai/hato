@@ -104,19 +104,17 @@ class PropertiesTest {
     }
 
     @Test
-    void binary_properties_own_their_bytes_and_compare_by_content() {
+    void binary_properties_take_over_their_bytes_and_compare_by_content() {
         // Arrange
         var original = new byte[]{1, 2};
-        var sut = new Property.BinaryValue(PropertyId.CORRELATION_DATA, original);
-        var equal = new Property.BinaryValue(PropertyId.CORRELATION_DATA, original);
+        var equal = new Property.BinaryValue(PropertyId.CORRELATION_DATA, new byte[]{1, 2});
 
         // Act
-        original[0] = 9;
-        sut.value()[1] = 9;
+        var property = new Property.BinaryValue(PropertyId.CORRELATION_DATA, original);
 
         // Assert
-        assertThat(sut.value()).containsExactly((byte) 1, (byte) 2);
-        assertThat(sut).isEqualTo(equal).hasSameHashCodeAs(equal);
+        assertThat(property.value()).isSameAs(original);
+        assertThat(property).isEqualTo(equal).hasSameHashCodeAs(equal);
     }
 
     @Test
