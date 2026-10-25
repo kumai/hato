@@ -150,6 +150,10 @@ public final class ClientActor implements MqttClient {
     // that the ending finds them queued as though each had been handed over at once.
     private final ArrayList<DeliveryLanes.Arrival> arrivals = new ArrayList<>();
 
+    // The QoS 0 publications that continueRun() took from the mailbox after the first of its run;
+    // only the actor touches them, and it empties the list at the end of each run.
+    private final ArrayList<Mailbox.Event> following = new ArrayList<>(RUN_LIMIT - 1);
+
     // Published under lifecycleLock before admitting commands for an established connection.
     private long connectedGeneration;
 
@@ -785,12 +789,19 @@ public final class ClientActor implements MqttClient {
     /// run, so that each lane's dispatcher wakes once for the run rather than once for each
     /// publication.
     private void continueRun() {
-        for (int taken = 1; taken < RUN_LIMIT; taken++) {
-            Mailbox.Event following = mailbox.takeAtMostOnce(stopping::get);
-            if (following == null) {
-                return;
+        mailbox.takeAtMostOnce(stopping::get, RUN_LIMIT - 1, following);
+        try {
+            for (Mailbox.Event event : following) {
+                // Taking a publication one at a time saw stopping before each; one that the run
+                // took but has not handled when the actor stops is dropped, as the mailbox's
+                // queue is.
+                if (stopping.get()) {
+                    return;
+                }
+                handle(event);
             }
-            handle(following);
+        } finally {
+            following.clear();
         }
     }
 
