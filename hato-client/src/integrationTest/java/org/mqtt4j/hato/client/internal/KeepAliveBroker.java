@@ -39,12 +39,12 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
-/// A raw broker for the keep-alive backlog tests. It accepts one client and establishes its
+/// A raw broker for the keep-alive backlog measurements. It accepts one client and establishes its
 /// subscriptions, then streams QoS 0 publications at it until the client's first PINGREQ
 /// arrives. A platform thread, which keeps the broker's clock independent of virtual threads,
 /// answers each PINGREQ and records how long the client goes without sending a packet. Writes
-/// stop without an exception once the client has closed the connection, so that a test reports
-/// the client's reason through [#ended()].
+/// stop without an exception once the client has closed the connection, whose reason
+/// [#ended()] then reports.
 final class KeepAliveBroker implements AutoCloseable {
 
     static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);

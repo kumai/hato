@@ -25,9 +25,9 @@ import static org.mqtt4j.hato.client.internal.Measurements.sorted;
 /// the first PINGREQ goes out while a fan-out to 256 subscriptions keeps the client busy, against
 /// the half interval that a broker allows, and how long the client takes to read through a
 /// backlog to the PINGRESP behind it, against its own deadline of one interval. The scheduling of
-/// the client's threads sets both, so they vary with the machine and its load;
-/// [KeepAliveBacklogTest] checks with room to spare only that a paused reader reads on towards
-/// the PINGRESP. Runs only with `-Phato.measure=true`; the integrationTestSingleCarrier task
+/// the client's threads sets both, so they vary with the machine and its load, which is why no
+/// build runs them; `MailboxTest` checks without real time that keep-alive events overtake a
+/// backlog. Runs only with `-Phato.measure=true`; the integrationTestSingleCarrier task
 /// measures the worst case of one carrier thread.
 @EnabledIfSystemProperty(named = "hato.measure", matches = "true")
 @Timeout(600)
