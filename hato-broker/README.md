@@ -9,7 +9,7 @@ Gradle:
 
 ```kotlin
 dependencies {
-    implementation("org.mqtt4j:hato-broker:0.7.0")
+    implementation("org.mqtt4j:hato-broker:0.8.0")
 }
 ```
 
@@ -19,7 +19,7 @@ Maven:
 <dependency>
     <groupId>org.mqtt4j</groupId>
     <artifactId>hato-broker</artifactId>
-    <version>0.7.0</version>
+    <version>0.8.0</version>
 </dependency>
 ```
 
