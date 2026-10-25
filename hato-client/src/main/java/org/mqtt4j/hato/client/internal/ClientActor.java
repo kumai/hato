@@ -650,12 +650,16 @@ public final class ClientActor implements MqttClient {
                     bytes
             ));
             if (admitted == Mailbox.OfferResult.FULL) {
+                // Refused at admission like the cases above, so the call has failed when it
+                // returns. The operation never started: no completion thread finishes it, and no
+                // metrics listener hears of it.
+                operations.remove(token);
+                operation.slot.release();
                 refused(CapacityLimit.OPERATION_QUEUE);
-                completeOperation(token, null,
-                        new MqttCapacityException(
-                                "Command mailbox capacity",
-                                CapacityLimit.OPERATION_QUEUE
-                        ));
+                return CompletableFuture.failedFuture(new MqttCapacityException(
+                        "Command mailbox capacity",
+                        CapacityLimit.OPERATION_QUEUE
+                ));
             }
             return operation.future;
         }
@@ -1010,8 +1014,8 @@ public final class ClientActor implements MqttClient {
         return false;
     }
 
-    /// Called by an API caller or the actor; futures complete on the client's completion threads,
-    /// where a blocked continuation holds up no other completion for long; see [Completions].
+    /// Called by the actor; futures complete on the client's completion threads, where a blocked
+    /// continuation holds up no other completion for long; see [Completions].
     private void completeOperation(
             long token,
             @Nullable Object result,

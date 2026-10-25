@@ -5190,17 +5190,19 @@ class ClientActorTest {
             MqttMessage message = message(new byte[0])
                     .withUserProperties(userPropertiesOf(1024 * 1024));
             var publications = new ArrayList<CompletableFuture<PublishResult>>();
+            var refused = new ArrayList<CompletableFuture<PublishResult>>();
 
-            // Act
+            // Act: note each publication that has already ended when publish() returns.
             for (int i = 0; i < 40; i++) {
-                publications.add(sut.publish(message));
+                CompletableFuture<PublishResult> publication = sut.publish(message);
+                publications.add(publication);
+                if (publication.isDone()) {
+                    refused.add(publication);
+                }
             }
 
             // Assert: while the actor is held, only the command budget can end a publication,
-            // and it fails the excess at once.
-            List<CompletableFuture<PublishResult>> refused = publications.stream()
-                    .filter(CompletableFuture::isDone)
-                    .toList();
+            // and it fails the excess before publish() returns.
             assertThat(refused).hasSizeGreaterThanOrEqualTo(7).allSatisfy(publication ->
                     assertThat(publication.handle((_, cause) -> cause).join())
                             .isInstanceOf(MqttCapacityException.class)
