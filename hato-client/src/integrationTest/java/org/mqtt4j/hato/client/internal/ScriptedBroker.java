@@ -3,6 +3,8 @@ package org.mqtt4j.hato.client.internal;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -225,6 +227,16 @@ final class ScriptedBroker implements AutoCloseable {
     /// for the start of the next packet.
     boolean hasPending() throws IOException {
         return input.available() > 0;
+    }
+
+    /// The buffered input from the client, for a peer that reads packets without decoding them.
+    InputStream input() {
+        return input;
+    }
+
+    /// The unbuffered output to the client, for a peer that writes prepared bytes itself.
+    OutputStream output() throws IOException {
+        return socket.getOutputStream();
     }
 
     void send(Packet packet) throws IOException {

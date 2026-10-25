@@ -330,15 +330,20 @@ final class Mailbox {
         return Optional.empty();
     }
 
-    /// Takes the next event without waiting when it is a received QoS 0 publication, so that the
-    /// actor can go on with a run of them; otherwise returns null and leaves the next event
-    /// queued. An event that goes ahead of the FIFO therefore ends the run, as stopping does.
-    synchronized @Nullable Event takeAtMostOnce(BooleanSupplier stopping) {
-        Event next = next();
-        if (next == null || next.kind() != Kind.AT_MOST_ONCE || stopping.getAsBoolean()) {
-            return null;
+    /// Takes, without waiting, the received QoS 0 publications that come next, up to `limit`, and
+    /// adds them to `into` in order, so that the actor can go on with a run of them. It stops at
+    /// the first event of another kind, which stays queued; an event that goes ahead of the FIFO
+    /// therefore ends the run, as stopping does. The run leaves under one hold of the monitor,
+    /// which the reader takes for each packet it posts: taking the publications one at a time
+    /// made the two contend for it on every one when they ran at once.
+    synchronized void takeAtMostOnce(BooleanSupplier stopping, int limit, List<Event> into) {
+        for (int taken = 0; taken < limit; taken++) {
+            Event next = next();
+            if (next == null || next.kind() != Kind.AT_MOST_ONCE || stopping.getAsBoolean()) {
+                return;
+            }
+            into.add(remove(next));
         }
-        return remove(next);
     }
 
     // The event to take next: a stop request, then a termination, then keep-alive events, then

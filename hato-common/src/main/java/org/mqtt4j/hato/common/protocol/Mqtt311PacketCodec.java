@@ -196,9 +196,9 @@ final class Mqtt311PacketCodec implements PacketCodec {
     /// @throws PacketDecodeException if the packet is malformed or violates a checked rule
     /// @throws UnsupportedProtocolVersionException if CONNECT requests a level other than 4
     @Override
-    public Packet decode(byte[] packet) {
-        requireNonNull(packet, "packet must not be null");
-        var input = ByteBuffer.wrap(packet);
+    public Packet decode(byte[] bytes, int offset, int length) {
+        requireNonNull(bytes, "bytes must not be null");
+        var input = ByteBuffer.wrap(bytes, offset, length);
         try {
             int header = input.get() & 0xFF;
             int typeValue = header >>> 4;

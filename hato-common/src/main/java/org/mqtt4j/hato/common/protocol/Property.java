@@ -54,7 +54,8 @@ public sealed interface Property {
         }
     }
 
-    /// Binary data of at most 65535 bytes, copied on construction and access.
+    /// Binary data of at most 65535 bytes, with transferred ownership of its array, like the
+    /// payload of [Packet.Publish]: neither the property nor its holders modify it.
     record BinaryValue(PropertyId id, byte[] value) implements Property {
 
         public BinaryValue {
@@ -62,12 +63,6 @@ public sealed interface Property {
             if (value.length > 65535) {
                 throw new IllegalArgumentException("Binary property exceeds 65535 bytes");
             }
-            value = value.clone();
-        }
-
-        @Override
-        public byte[] value() {
-            return value.clone();
         }
 
         @Override

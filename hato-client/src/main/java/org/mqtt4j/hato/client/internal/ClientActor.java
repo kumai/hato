@@ -55,12 +55,11 @@ import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.Transport;
-import org.mqtt4j.hato.UserProperty;
+import org.mqtt4j.hato.client.internal.common.concurrent.TimerService;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
-import org.mqtt4j.hato.client.internal.common.protocol.Property;
 
 import static java.util.Objects.requireNonNull;
 
@@ -124,11 +123,14 @@ public final class ClientActor implements MqttClient {
     // package-private accessor.
     private final Function<DeliveryOptions, HandlerExecution> executionOf;
 
-    // Received User Properties skip the check of their strings, which the codec validated; only
-    // the builder can pass the package-private factory that does so.
-    private final Function<Property.UserProperty, UserProperty> userPropertyOf;
+    // A received message takes over the arrays that decoding made for it and skips the check of
+    // the strings that the codec validated; only the builder can pass the package-private
+    // factory that does so.
+    private final Function<Packet.Publish, MqttMessage> messageOf;
 
     private final ClientTermination termination;
+
+    private final Completions completions;
 
     private final ListenerLane listenerLane;
 
@@ -150,6 +152,10 @@ public final class ClientActor implements MqttClient {
     // ending a connection or a subscription through the core's port hands them over first, so
     // that the ending finds them queued as though each had been handed over at once.
     private final ArrayList<DeliveryLanes.Arrival> arrivals = new ArrayList<>();
+
+    // The QoS 0 publications that continueRun() took from the mailbox after the first of its run;
+    // only the actor touches them, and it empties the list at the end of each run.
+    private final ArrayList<Mailbox.Event> following = new ArrayList<>(RUN_LIMIT - 1);
 
     // Published under lifecycleLock before admitting commands for an established connection.
     private long connectedGeneration;
@@ -255,7 +261,8 @@ public final class ClientActor implements MqttClient {
             RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf,
-            Function<Property.UserProperty, UserProperty> userPropertyOf,
+            Function<Packet.Publish, MqttMessage> messageOf,
+            Function<MqttMessage, byte[]> payloadOf,
             Function<ClientSnapshot, ClientStats> statsOf,
             ClientLimits limits
     ) {
@@ -278,7 +285,8 @@ public final class ClientActor implements MqttClient {
                 rules,
                 responseTimeout,
                 executionOf,
-                userPropertyOf,
+                messageOf,
+                payloadOf,
                 statsOf,
                 limits
         );
@@ -303,7 +311,8 @@ public final class ClientActor implements MqttClient {
             RetryRules rules,
             Duration responseTimeout,
             Function<DeliveryOptions, HandlerExecution> executionOf,
-            Function<Property.UserProperty, UserProperty> userPropertyOf,
+            Function<Packet.Publish, MqttMessage> messageOf,
+            Function<MqttMessage, byte[]> payloadOf,
             Function<ClientSnapshot, ClientStats> statsOf,
             ClientLimits limits
     ) {
@@ -312,7 +321,7 @@ public final class ClientActor implements MqttClient {
         this.version = version;
         this.scheduler = scheduler;
         this.executionOf = executionOf;
-        this.userPropertyOf = userPropertyOf;
+        this.messageOf = messageOf;
         this.statsOf = statsOf;
         this.limits = limits;
         cleanStart = sessionExpiry.isZero();
@@ -366,7 +375,8 @@ public final class ClientActor implements MqttClient {
                 ClientIo.BATCH_BYTE_LIMIT,
                 transportFactory,
                 new IoEvents(),
-                codec
+                codec,
+                payloadOf
         );
         core = new SessionCore(
                 new CorePort(),
@@ -390,6 +400,14 @@ public final class ClientActor implements MqttClient {
                 termination::check
         );
         termination.watch(listenerLane, metricsLane, this.credentials);
+        completions = new Completions(
+                endpoint,
+                clientId,
+                threadName("complete-"),
+                TimerService.instance,
+                Completions.TAKEOVER,
+                Completions.IDLE
+        );
         Thread.ofVirtual().name(threadName("actor")).start(this::run);
     }
 
@@ -782,12 +800,19 @@ public final class ClientActor implements MqttClient {
     /// run, so that each lane's dispatcher wakes once for the run rather than once for each
     /// publication.
     private void continueRun() {
-        for (int taken = 1; taken < RUN_LIMIT; taken++) {
-            Mailbox.Event following = mailbox.takeAtMostOnce(stopping::get);
-            if (following == null) {
-                return;
+        mailbox.takeAtMostOnce(stopping::get, RUN_LIMIT - 1, following);
+        try {
+            for (Mailbox.Event event : following) {
+                // Taking a publication one at a time saw stopping before each; one that the run
+                // took but has not handled when the actor stops is dropped, as the mailbox's
+                // queue is.
+                if (stopping.get()) {
+                    return;
+                }
+                handle(event);
             }
-            handle(following);
+        } finally {
+            following.clear();
         }
     }
 
@@ -985,7 +1010,8 @@ public final class ClientActor implements MqttClient {
         return false;
     }
 
-    /// Called by an API caller or the actor; futures complete on independent threads.
+    /// Called by an API caller or the actor; futures complete on the client's completion threads,
+    /// where a blocked continuation holds up no other completion for long; see [Completions].
     private void completeOperation(
             long token,
             @Nullable Object result,
@@ -1011,11 +1037,12 @@ public final class ClientActor implements MqttClient {
             }
             return;
         }
-        Thread.ofVirtual().name(threadName("complete-" + token)).start(() -> {
+        completions.submit(() -> {
             termination.completionStarted();
             try {
                 // The slot returns before the future completes, so that its continuations can
-                // start an operation in its place. Termination waits for them through the count.
+                // start an operation in its place. Termination waits for them through the count,
+                // and for a queued completion through its slot.
                 operation.slot.release();
                 reportPublication(operation.timing, failure);
                 operation.finish(result, failure);
@@ -1607,7 +1634,7 @@ public final class ClientActor implements MqttClient {
                 Packet.Publish publish,
                 int bytes
         ) {
-            MqttMessage message = MessageProperties.received(publish, userPropertyOf);
+            MqttMessage message = messageOf.apply(publish);
             if (publish.qos() == Qos.AT_MOST_ONCE) {
                 // Its lanes take it at the end of the actor's run; see continueRun().
                 arrivals.add(new DeliveryLanes.Arrival(token, ids, message, publish.dup(), bytes));

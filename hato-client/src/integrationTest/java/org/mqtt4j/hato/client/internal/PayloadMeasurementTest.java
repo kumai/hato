@@ -1,0 +1,423 @@
+package org.mqtt4j.hato.client.internal;
+
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.net.ServerSocket;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+
+import org.jspecify.annotations.Nullable;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+
+import org.mqtt4j.hato.MqttCapacityException;
+import org.mqtt4j.hato.MqttClient;
+import org.mqtt4j.hato.MqttDelivery;
+import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.PublishResult;
+import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.Subscribe;
+import org.mqtt4j.hato.Subscription;
+import org.mqtt4j.hato.Topic;
+import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.mqtt4j.hato.client.internal.Measurements.percentile;
+import static org.mqtt4j.hato.client.internal.Measurements.print;
+import static org.mqtt4j.hato.client.internal.Measurements.runtime;
+import static org.mqtt4j.hato.client.internal.Measurements.sorted;
+import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
+
+/// Measures how the cost of publishing and of receiving grows with the payload, and prints the
+/// results instead of asserting limits: per message, the elapsed time, the processor time of the
+/// whole process, and the heap that every thread allocated. A raw peer reads and writes the bytes
+/// without decoding them and allocates nothing for each message, so beyond the socket the
+/// processor time and the allocation are nearly all the client's. Waits block instead of
+/// spinning, so that they do not count as processor time. Runs only with `-Phato.measure=true`;
+/// the integrationTestSingleCarrier task measures the worst case of one carrier thread.
+@EnabledIfSystemProperty(named = "hato.measure", matches = "true")
+@Timeout(600)
+class PayloadMeasurementTest {
+
+    private static final int RUNS = 5;
+
+    private static final List<Integer> SIZES = List.of(16, 1024, 64 * 1024, 1024 * 1024);
+
+    // A run moves about this many payload bytes, within the message counts below, so that it
+    // lasts long enough to measure whatever the payload size.
+    private static final long RUN_BYTES = 512L * 1024 * 1024;
+
+    private static final int MOST_MESSAGES = 100_000;
+
+    private static final int LEAST_MESSAGES = 512;
+
+    // The messages unfinished at once: at most the client's default limit of inflight
+    // publications, or the receive window that the delivery measurement uses, and at most this
+    // many payload bytes, well within the client's send and receive budgets.
+    private static final int PUBLISH_WINDOW = 64;
+
+    private static final int RECEIVE_WINDOW = 500;
+
+    private static final int WINDOW_BYTES = 8 * 1024 * 1024;
+
+    // The peer writes publications to the client in batches of at most this many, or of this many
+    // bytes, whichever comes first, as a broker writes what it has ready.
+    private static final int RECEIVE_BATCH = 50;
+
+    private static final int BATCH_BYTES = 64 * 1024;
+
+    @Test
+    void publishing_costs_grow_with_the_payload() throws Exception {
+        print(
+                "%s: per publication through the client, each a new message, median of %d runs;"
+                        + " at most %d or %d MiB outstanding",
+                runtime(),
+                RUNS,
+                PUBLISH_WINDOW,
+                WINDOW_BYTES / (1024 * 1024)
+        );
+        printHeading();
+        for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
+            for (int size : SIZES) {
+                printRow(qos, size, median(() -> publishing(size, qos)));
+            }
+        }
+    }
+
+    @Test
+    void receiving_costs_grow_with_the_payload() throws Exception {
+        print(
+                "%s: per publication received through the client, no-op handler, median of %d"
+                        + " runs; at most %d or %d MiB unfinished",
+                runtime(),
+                RUNS,
+                RECEIVE_WINDOW,
+                WINDOW_BYTES / (1024 * 1024)
+        );
+        printHeading();
+        for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
+            for (int size : SIZES) {
+                printRow(qos, size, median(() -> receiving(size, qos)));
+            }
+        }
+    }
+
+    /// What a run cost per message.
+    private record Cost(long nanos, long processorNanos, long allocatedBytes) {}
+
+    @FunctionalInterface
+    private interface CostRun {
+
+        Cost run() throws Exception;
+    }
+
+    @FunctionalInterface
+    private interface Body {
+
+        void run() throws Exception;
+    }
+
+    /// Publishes the run's messages of `size` bytes at `qos`, each a new message as an
+    /// application would make it, keeping a window outstanding, and returns the cost per
+    /// publication until the last has completed: QoS 0 once written and QoS 1 at PUBACK.
+    private static Cost publishing(int size, Qos qos) throws Exception {
+        int messages = messages(size);
+        var topic = new Topic("publish");
+        var payload = new byte[size];
+        var outstanding = new Semaphore(Math.clamp(WINDOW_BYTES / size, 1, PUBLISH_WINDOW));
+        var completed = new CountDownLatch(messages);
+        var failure = new AtomicReference<@Nullable Throwable>();
+        try (ServerSocket server = ScriptedBroker.listen();
+                MqttClient sut = ScriptedBroker.client(server);
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
+            Thread draining = Thread.ofPlatform().start(() -> drain(peer, messages));
+            Cost cost = measure(messages, () -> {
+                for (int index = 0; index < messages; index++) {
+                    if (!outstanding.tryAcquire(1, TimeUnit.MINUTES)) {
+                        throw new AssertionError("No publication completed for a minute");
+                    }
+                    MqttMessage message = MqttMessage.of(topic, payload, qos, false);
+                    CompletableFuture<PublishResult> publication = sut.publish(message);
+                    // A publication's operation slot returns once the continuations of its
+                    // future have returned, just after the one below has made room here, so a
+                    // refusal for operation capacity is tried again.
+                    while (refusedForCapacity(publication)) {
+                        Thread.onSpinWait();
+                        publication = sut.publish(message);
+                    }
+                    publication.whenComplete((_, cause) -> {
+                        if (cause != null) {
+                            failure.compareAndSet(null, cause);
+                        }
+                        outstanding.release();
+                        completed.countDown();
+                    });
+                }
+                if (!completed.await(1, TimeUnit.MINUTES)) {
+                    throw new AssertionError("Not every publication completed");
+                }
+            });
+            draining.join();
+            Throwable failed = failure.get();
+            if (failed != null) {
+                throw new AssertionError("A publication failed", failed);
+            }
+            return cost;
+        }
+    }
+
+    /// Sends the run's messages of `size` bytes at `qos` from the peer to a subscription whose
+    /// handler does nothing, keeping a window unfinished, and returns the cost per message until
+    /// the last has finished: QoS 0 once the handler has it and QoS 1 at PUBACK. The publications
+    /// are encoded before the clock starts and written again and again, so the time is mostly
+    /// the client's.
+    private static Cost receiving(int size, Qos qos) throws Exception {
+        int batch = Math.clamp(BATCH_BYTES / size, 1, RECEIVE_BATCH);
+        int window = Math.max(batch, Math.min(RECEIVE_WINDOW, WINDOW_BYTES / size));
+        int writes = Math.ceilDiv(messages(size), batch);
+        int messages = writes * batch;
+        // Under QoS 1 a write reuses the packet identifiers of the write that used the same
+        // batch before it. More batches than the window holds leave that one finished.
+        byte[][] batches = batches(size, qos, batch, window / batch + 2);
+        var room = new Semaphore(window);
+        var finished = new CountDownLatch(messages);
+        Runnable finish = () -> {
+            room.release();
+            finished.countDown();
+        };
+        Consumer<MqttDelivery> handler = qos == Qos.AT_MOST_ONCE ? _ -> finish.run() : _ -> { };
+        try (ServerSocket server = ScriptedBroker.listen();
+                MqttClient sut = ScriptedBroker.client(server);
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter("receive"), qos),
+                    handler
+            );
+            var request = (Packet.Subscribe) peer.receive();
+            peer.send(new Packet.SubAck(
+                    request.packetId(),
+                    List.of(ReasonCode.of(qos.level())),
+                    EMPTY
+            ));
+            subscription.established().get(5, SECONDS);
+            Thread counting = Thread.ofPlatform().start(() -> acknowledgements(
+                    peer,
+                    qos == Qos.AT_MOST_ONCE ? 0 : messages,
+                    finish
+            ));
+            OutputStream output = peer.output();
+            Cost cost = measure(messages, () -> {
+                for (int write = 0; write < writes; write++) {
+                    if (!room.tryAcquire(batch, 1, TimeUnit.MINUTES)) {
+                        throw new AssertionError("No message finished for a minute");
+                    }
+                    output.write(batches[write % batches.length]);
+                }
+                if (!finished.await(1, TimeUnit.MINUTES)) {
+                    throw new AssertionError("Not every message finished");
+                }
+            });
+            counting.join();
+            return cost;
+        }
+    }
+
+    /// The prepared writes: `count` batches of `batch` publications of `size` bytes at `qos`.
+    /// Under QoS 1 every publication in them has its own packet identifier.
+    private static byte[][] batches(int size, Qos qos, int batch, int count) {
+        var codec = PacketCodec.of(MqttVersion.V3_1_1);
+        var payload = new byte[size];
+        var batches = new byte[count][];
+        for (int index = 0; index < count; index++) {
+            var bytes = new ByteArrayOutputStream();
+            for (int position = 0; position < batch; position++) {
+                int packetId = qos == Qos.AT_MOST_ONCE ? 0 : index * batch + position + 1;
+                bytes.writeBytes(codec.encode(new Packet.Publish(
+                        new Topic("receive"),
+                        payload,
+                        qos,
+                        false,
+                        false,
+                        packetId,
+                        EMPTY
+                )));
+            }
+            batches[index] = bytes.toByteArray();
+        }
+        return batches;
+    }
+
+    /// Reads the client's `messages` publications without decoding them, so that the peer
+    /// allocates nothing for each, and answers QoS 1 with PUBACK. The answers to publications
+    /// that arrived together go out in one write.
+    private static void drain(ScriptedBroker peer, int messages) {
+        try {
+            InputStream input = peer.input();
+            OutputStream output = peer.output();
+            var scratch = new byte[64 * 1024];
+            var answers = new byte[4 * 1024];
+            int answered = 0;
+            for (int received = 0; received < messages; received++) {
+                int header = read(input);
+                int length = remainingLength(input);
+                int qos = (header >>> 1) & 3;
+                if (header >>> 4 != 3 || qos > 1) {
+                    throw new AssertionError("Unexpected packet: " + Integer.toHexString(header));
+                }
+                // An MQTT 3.1.1 PUBLISH names its topic, and gives a packet identifier at QoS 1,
+                // before the payload.
+                int topicLength = (read(input) << 8) | read(input);
+                skip(input, scratch, topicLength);
+                length -= 2 + topicLength;
+                if (qos == 1) {
+                    answers[answered++] = 0x40;
+                    answers[answered++] = 2;
+                    answers[answered++] = (byte) read(input);
+                    answers[answered++] = (byte) read(input);
+                    length -= 2;
+                }
+                skip(input, scratch, length);
+                if (answered > 0 && (answered == answers.length || input.available() == 0)) {
+                    output.write(answers, 0, answered);
+                    answered = 0;
+                }
+            }
+        } catch (IOException cause) {
+            throw new UncheckedIOException(cause);
+        }
+    }
+
+    /// Reads the client's packets without decoding them and finishes a message for each of the
+    /// `messages` PUBACKs.
+    private static void acknowledgements(ScriptedBroker peer, int messages, Runnable finish) {
+        try {
+            InputStream input = peer.input();
+            var scratch = new byte[16];
+            for (int acknowledged = 0; acknowledged < messages; acknowledged++) {
+                int header = read(input);
+                if (header != 0x40) {
+                    throw new AssertionError("Unexpected packet: " + Integer.toHexString(header));
+                }
+                skip(input, scratch, remainingLength(input));
+                finish.run();
+            }
+        } catch (IOException cause) {
+            throw new UncheckedIOException(cause);
+        }
+    }
+
+    private static int read(InputStream input) throws IOException {
+        int value = input.read();
+        if (value == -1) {
+            throw new EOFException("The client closed the connection");
+        }
+        return value;
+    }
+
+    private static int remainingLength(InputStream input) throws IOException {
+        int length = 0;
+        int shift = 0;
+        int digit;
+        do {
+            digit = read(input);
+            length |= (digit & 0x7F) << shift;
+            shift += 7;
+        } while ((digit & 0x80) != 0);
+        return length;
+    }
+
+    /// Reads and drops `count` bytes into the reused `scratch` array.
+    private static void skip(InputStream input, byte[] scratch, int count) throws IOException {
+        for (int left = count; left > 0; ) {
+            int read = input.readNBytes(scratch, 0, Math.min(scratch.length, left));
+            if (read == 0) {
+                throw new EOFException("The client closed the connection");
+            }
+            left -= read;
+        }
+    }
+
+    /// Runs `body` once and returns its cost per message.
+    private static Cost measure(int messages, Body body) throws Exception {
+        long allocated = Measurements.allocatedBytes();
+        long processor = Measurements.processorNanos();
+        long start = System.nanoTime();
+        body.run();
+        long elapsed = System.nanoTime() - start;
+        return new Cost(
+                elapsed / messages,
+                (Measurements.processorNanos() - processor) / messages,
+                (Measurements.allocatedBytes() - allocated) / messages
+        );
+    }
+
+    /// The median of each part of the cost over [#RUNS] runs of `run`, after one more run that
+    /// warms up the code paths.
+    private static Cost median(CostRun run) throws Exception {
+        Cost _ = run.run();
+        var nanos = new long[RUNS];
+        var processorNanos = new long[RUNS];
+        var allocatedBytes = new long[RUNS];
+        for (int index = 0; index < RUNS; index++) {
+            Cost cost = run.run();
+            nanos[index] = cost.nanos();
+            processorNanos[index] = cost.processorNanos();
+            allocatedBytes[index] = cost.allocatedBytes();
+        }
+        return new Cost(
+                percentile(sorted(nanos), 50),
+                percentile(sorted(processorNanos), 50),
+                percentile(sorted(allocatedBytes), 50)
+        );
+    }
+
+    private static int messages(int size) {
+        return Math.clamp(RUN_BYTES / size, LEAST_MESSAGES, MOST_MESSAGES);
+    }
+
+    private static boolean refusedForCapacity(CompletableFuture<PublishResult> publication) {
+        return publication.state() == Future.State.FAILED
+                && publication.exceptionNow() instanceof MqttCapacityException;
+    }
+
+    private static void printHeading() {
+        print(
+                "%-13s | %9s | %8s | %10s | %10s | %12s | %8s",
+                "qos",
+                "payload",
+                "messages",
+                "ns",
+                "cpu ns",
+                "allocated B",
+                "x payload"
+        );
+    }
+
+    private static void printRow(Qos qos, int size, Cost cost) {
+        print(
+                "%-13s | %9d | %8d | %10d | %10d | %12d | %8.2f",
+                qos,
+                size,
+                messages(size),
+                cost.nanos(),
+                cost.processorNanos(),
+                cost.allocatedBytes(),
+                (double) cost.allocatedBytes() / size
+        );
+    }
+}

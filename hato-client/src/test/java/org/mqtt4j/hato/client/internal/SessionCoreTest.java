@@ -36,6 +36,7 @@ import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttCredentials;
 import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttMessageAccess;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttPublicationRefusedException;
@@ -50,7 +51,6 @@ import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.UserProperty;
-import org.mqtt4j.hato.UserPropertyAccess;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
@@ -5259,7 +5259,7 @@ class SessionCoreTest {
                 deliveries.add(new Received(
                         token,
                         List.copyOf(ids),
-                        MessageProperties.received(publish, UserPropertyAccess::received),
+                        MqttMessageAccess.received(publish),
                         publish.dup(),
                         bytes
                 ));

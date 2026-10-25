@@ -559,7 +559,8 @@ public final class MqttClientBuilder {
                 reconnectPolicy.rules(),
                 responseTimeout,
                 DeliveryOptions::execution,
-                UserProperty::received,
+                MqttMessage::received,
+                MqttMessage::payloadArray,
                 ClientStats::of,
                 new ClientLimits(maxInflightPublishes, maxSubscriptions)
         );
@@ -588,7 +589,7 @@ public final class MqttClientBuilder {
         };
         return new Packet.Will(
                 message.topic(),
-                message.payload(),
+                message.payloadArray(),
                 message.qos(),
                 message.retain(),
                 properties
