@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
 
 import org.jspecify.annotations.Nullable;
@@ -124,6 +125,14 @@ final class ClientIo {
     // holding this monitor: its callbacks may acquire it inline.
     private final Object sending = new Object();
 
+    // The one thread that writes to transports. It parks while it has nothing to write, rather
+    // than waiting on sending: the JDK resumes a virtual thread that a monitor wakes through a
+    // platform thread of its own, which leaves it behind the work that the carrier queues for
+    // itself. On a single carrier kept busy by the reader and the actor, a due PINGREQ then
+    // went unwritten until its PINGRESP deadline expired. A virtual thread that unparks the
+    // sender queues it on its own carrier.
+    private final Thread sender;
+
     private @Nullable Connection current;
 
     private boolean shutdown;
@@ -135,6 +144,10 @@ final class ClientIo {
     private int openTransports;
 
     private boolean senderEnded;
+
+    // Set by the sender when it finds nothing to write, before it parks; cleared by the thread
+    // that unparks it.
+    private boolean senderIdle;
 
     private boolean closeReported;
 
@@ -164,7 +177,8 @@ final class ClientIo {
                 RESERVED_SEND_LIMIT,
                 RESERVED_SEND_BYTE_LIMIT
         );
-        Thread.ofVirtual().name("hato-" + clientId + "-sender").start(this::run);
+        sender = Thread.ofVirtual().name("hato-" + clientId + "-sender").unstarted(this::run);
+        sender.start();
     }
 
     void open(long generation, Duration timeout) {
@@ -447,8 +461,11 @@ final class ClientIo {
     }
 
     private Optional<Write> next() throws InterruptedException {
-        synchronized (sending) {
-            while (!shutdown) {
+        while (true) {
+            synchronized (sending) {
+                if (shutdown) {
+                    return Optional.empty();
+                }
                 Connection connection = current;
                 if (connection != null) {
                     List<SendQueue.Send<Outbound>> batch =
@@ -461,9 +478,15 @@ final class ClientIo {
                         return Optional.of(new Write(connection, batch));
                     }
                 }
-                sending.wait();
+                senderIdle = true;
             }
-            return Optional.empty();
+            // Parks outside the monitor, so that the threads that give the sender work can take
+            // it. An unpark in between leaves a permit, and a spurious return only makes the
+            // sender look again.
+            LockSupport.park(this);
+            if (Thread.interrupted()) {
+                throw new InterruptedException();
+            }
         }
     }
 
@@ -616,10 +639,18 @@ final class ClientIo {
         }
     }
 
-    /// Caller holds sending, so a ready queue cannot race with the sender entering wait.
+    /// Caller holds sending, so a ready queue cannot race with the sender going idle.
     private void wakeSender(Connection connection) {
         if (current == connection && connection.queue.hasReady()) {
-            sending.notifyAll();
+            unparkSender();
+        }
+    }
+
+    /// Caller holds sending. Unparks the sender if it has gone idle.
+    private void unparkSender() {
+        if (senderIdle) {
+            senderIdle = false;
+            LockSupport.unpark(sender);
         }
     }
 
@@ -680,7 +711,7 @@ final class ClientIo {
             if (connection != null) {
                 connection.queue.close();
             }
-            sending.notifyAll();
+            unparkSender();
         }
         if (connection != null) {
             try {
@@ -700,7 +731,7 @@ final class ClientIo {
                 connection.closed = true;
                 connection.queue.close();
             }
-            sending.notifyAll();
+            unparkSender();
         }
         if (connection != null) {
             try {
