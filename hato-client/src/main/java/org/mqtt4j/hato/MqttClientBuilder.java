@@ -216,7 +216,7 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Supplies credentials once per connection attempt, on a dedicated virtual thread before
+    /// Supplies credentials once per connection attempt, on a thread of its own before
     /// opening the attempt's first transport. Evaluation consumes the same
     /// [#connectionTimeout(Duration)] deadline as that transport's establishment and the
     /// broker's CONNACK response. Every connection of the attempt, including those with which

@@ -142,7 +142,7 @@ A few behaviors shape everything below, and most surprises come from one of them
   `connect()`, and the client subscribes again after each reconnection. Subscribe once and
   keep the handle.
 - **Your handler may block.** The client calls a subscription's message handler for one
-  message at a time, apart from the network, by default on a virtual thread of the client or
+  message at a time, apart from the network, by default on a thread of the client or
   on an executor that you choose, and other subscriptions' handlers run meanwhile. The handler
   can write to a database, or publish and wait for the result.
   [Where your code runs](#where-your-code-runs) covers every callback.
@@ -460,7 +460,7 @@ Subscription subscription = client.subscribe(
 ```
 
 - Messages with equal keys run one at a time in arrival order. The handler processes at most
-  16 messages of this subscription at once, by default each on a virtual thread of the client.
+  16 messages of this subscription at once, by default each on a thread of the client.
 - `DeliveryOptions.striped(16)` uses each message's topic as its key.
 - The key's hash picks one of the 16 stripes, so two devices can share a stripe and then wait
   for each other.
@@ -820,11 +820,11 @@ never stalls the connection or its keep-alive.
 
 | Your code | Runs on | Can it block? |
 | --- | --- | --- |
-| Message handler | By default, a virtual thread of the client for each subscription, or up to `n` with striped or parallel delivery. With `withExecutor(pool)` or `lanes(selector)`, a thread of your executor instead | Yes. Its own subscription waits meanwhile, and acknowledgements keep [arrival order](#acknowledgements-keep-arrival-order). On your executor, it also holds that executor's thread |
+| Message handler | By default, a thread of the client for each subscription, or up to `n` with striped or parallel delivery. With `withExecutor(pool)` or `lanes(selector)`, a thread of your executor instead | Yes. Its own subscription waits meanwhile, and acknowledgements keep [arrival order](#acknowledgements-keep-arrival-order). On your executor, it also holds that executor's thread |
 | Hand-off acceptor | One thread of the client, shared by all hand-off subscriptions | No. The other hand-off subscriptions wait while it runs |
 | `receive()` | Your own threads | Yes |
 | Connection listener, metrics listener | A thread of its own for each listener, one notification at a time | Briefly. A listener that falls behind loses its oldest notifications |
-| Credentials supplier | A virtual thread of the client, before each connection attempt | Within the connection timeout |
+| Credentials supplier | A thread of the client, before each connection attempt | Within the connection timeout |
 | Continuations of a returned future, such as `thenApply` or `whenComplete` | A thread of the client, whatever executors you chose for handlers, or your own thread when the future has already completed as you attach them | Yes, with the cautions below |
 
 - A continuation does not run on the thread that started the operation. A `publish()` that a
@@ -977,7 +977,7 @@ changed copies.
 | `maxSubscriptions(n)` | 4,096 | Hold more subscriptions, or catch an application that subscribes without end. Subscriptions that wait for the broker count too. |
 | `maxPacketSize(n)` | 16 MiB | Accept larger incoming packets, or only smaller ones. MQTT 5.0 tells the broker the limit; on MQTT 3.1.1, a larger packet ends the connection. |
 | `DeliveryOptions.striped(n, key)`, `parallel(n)` | One message at a time | Let the handler process up to 256 messages of a subscription at once; see [Choosing how messages run](#choosing-how-messages-run). |
-| `DeliveryOptions.withExecutor(pool)`, `lanes(selector)` | Virtual threads of the client | Run message handlers on executors that your application owns; the client never shuts them down. |
+| `DeliveryOptions.withExecutor(pool)`, `lanes(selector)` | Threads of the client | Run message handlers on executors that your application owns; the client never shuts them down. |
 
 The client keeps some limits internal, such as the deliveries and bytes that it holds across
 subscriptions. [Stats](#checking-what-the-client-holds) report their use and limit, and when one
