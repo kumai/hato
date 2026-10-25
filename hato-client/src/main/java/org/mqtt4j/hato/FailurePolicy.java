@@ -6,8 +6,8 @@ package org.mqtt4j.hato;
 ///
 /// Either policy applies only to exceptions that escape the handler. To retry a transient
 /// failure, catch it and repeat the work inside the handler, which keeps the subscription's
-/// order and holds back the acknowledgement meanwhile. A skipped failure is logged as a warning
-/// the first time for each subscription, and at debug level after that.
+/// order and holds back the acknowledgement meanwhile. A skipped failure is logged, and
+/// [ClientStats.Receiving#dropped()] counts it as [ClientStats.DropReason#FAILED].
 public enum FailurePolicy {
 
     /// Stops the client when the failed delivery still holds back its acknowledgement: a QoS 1
