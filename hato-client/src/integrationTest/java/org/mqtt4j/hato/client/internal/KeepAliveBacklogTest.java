@@ -1,246 +1,84 @@
 package org.mqtt4j.hato.client.internal;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.URI;
 import java.time.Duration;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import org.mqtt4j.hato.*;
-import org.mqtt4j.hato.client.internal.common.io.FrameReader;
-import org.mqtt4j.hato.client.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
-import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.mqtt4j.hato.client.internal.KeepAliveBroker.codec;
+import static org.mqtt4j.hato.client.internal.KeepAliveBroker.filter;
+import static org.mqtt4j.hato.client.internal.KeepAliveBroker.publication;
+import static org.mqtt4j.hato.client.internal.KeepAliveBroker.repeat;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
-/// A raw broker measures the client's silence while a receive backlog drains. A real broker
-/// closes a connection that sends nothing for one and a half keep-alive intervals.
+/// A raw broker streams QoS 0 publications that the client routes more slowly than it reads them,
+/// until the client's first PINGREQ arrives, and checks that a reader paused by the backlog reads
+/// on towards the PINGRESP. Streaming until then makes keep-alive come due during a backlog
+/// however fast the machine runs, and reading on shows as publications dropped before routing,
+/// whatever the client's speed. The time bounds leave room for the client's scheduling delays,
+/// which `KeepAliveBacklogMeasurementTest` measures; `ClientActorTest` checks without real time
+/// that keep-alive events overtake a backlog.
 class KeepAliveBacklogTest {
 
-    private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
+    private static final Duration KEEP_ALIVE = Duration.ofSeconds(2);
 
-    private static final int SUBSCRIPTIONS = 256;
+    // A broker closes a connection that sends nothing for one and a half intervals; this bound
+    // adds room for the client's scheduling delays.
+    private static final Duration SILENCE_LIMIT = KEEP_ALIVE.multipliedBy(5).dividedBy(2);
 
-    private static final int PUBLICATIONS = 16_384;
+    // How long the broker streams without a PINGREQ before it gives up, which fails the test.
+    private static final Duration STREAM_LIMIT = Duration.ofSeconds(30);
 
-    // Far more than the 32,768 received packets at which the client pauses reading.
-    private static final int LONG_BURST = 300_000;
-
-    @Test
-    @Timeout(60)
-    void a_backlog_for_256_overlapping_subscriptions_does_not_hold_back_keep_alive()
-            throws Exception {
-        // Arrange: every publication matches all 256 filters, so the backlog outlasts the
-        // broker's allowance of 1.5 seconds for a one-second keep-alive. Where the handlers fall
-        // behind the fan-out, the client drops QoS 0 deliveries once its buffers are full, and
-        // the backlog still drains.
-        var ended = new LinkedBlockingQueue<Disconnection>();
-        var handled = new AtomicLong();
-        try (
-                ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
-                MqttClient sut = MqttClient.builder()
-                        .server(URI.create("mqtt://127.0.0.1:" + server.getLocalPort()))
-                        .version(MqttVersion.V3_1_1)
-                        .reconnectPolicy(ReconnectPolicy.disabled())
-                        .keepAlive(Duration.ofSeconds(1))
-                        .connectionListener(ended::add)
-                        .build()
-        ) {
-            CompletableFuture<ConnAck> connecting = sut.connect();
-            try (Socket socket = server.accept()) {
-                var reader = new FrameReader(socket.getInputStream(), 1024 * 1024);
-                var writer = new FrameWriter(socket.getOutputStream());
-                assertThat(receive(reader)).isInstanceOf(Packet.Connect.class);
-                writer.write(codec.encode(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY)));
-                connecting.get(5, SECONDS);
-                for (int i = 0; i < SUBSCRIPTIONS; i++) {
-                    Subscription subscription = sut.subscribe(
-                            Subscribe.of(new TopicFilter(filter(i)), Qos.AT_MOST_ONCE),
-                            _ -> handled.incrementAndGet()
-                    );
-                    var subscribe = (Packet.Subscribe) receive(reader);
-                    writer.write(codec.encode(new Packet.SubAck(
-                            subscribe.packetId(), List.of(ReasonCode.SUCCESS), EMPTY
-                    )));
-                    subscription.established().get(5, SECONDS);
-                }
-                var silence = new Silence();
-                // A platform thread keeps the broker's clock independent of virtual threads.
-                Thread.ofPlatform().daemon().start(() -> answerPings(reader, writer, silence));
-                var burst = new ByteArrayOutputStream();
-                byte[] publication = codec.encode(new Packet.Publish(new Topic("a/b/c/d/e/f/g/h"),
-                        new byte[1], Qos.AT_MOST_ONCE, false, false, 0, EMPTY));
-                for (int i = 0; i < PUBLICATIONS; i++) {
-                    burst.writeBytes(publication);
-                }
-
-                // Act
-                synchronized (writer) {
-                    socket.getOutputStream().write(burst.toByteArray());
-                }
-                long deliveries = (long) PUBLICATIONS * SUBSCRIPTIONS;
-                await().atMost(Duration.ofSeconds(30)).until(() ->
-                        handled.get() + overflows(sut) == deliveries || !ended.isEmpty());
-                // One more interval shows that keep-alive continues after the backlog.
-                Thread.sleep(1_200);
-
-                // Assert
-                assertThat(ended).isEmpty();
-                assertThat(handled.get() + overflows(sut)).isEqualTo(deliveries);
-                assertThat(silence.longest()).isLessThanOrEqualTo(Duration.ofMillis(1_500));
-            }
-        }
-    }
+    // More publications than the 65,536 that the client's queue of received packets holds, so a
+    // client that reads on towards the PINGRESP after them overflows the queue and drops some.
+    private static final int FILLER = 100_000;
 
     @Test
-    @Timeout(60)
+    @Timeout(120)
     void a_backlog_that_pauses_reading_does_not_hold_back_keep_alive() throws Exception {
-        // Arrange: every publication matches 32 filters, so the client routes far more slowly
-        // than it reads and pauses reading, which leaves the broker's PINGRESP behind the rest of
-        // the burst. A QoS 1 publication after the burst marks its end.
-        var ended = new LinkedBlockingQueue<Disconnection>();
+        // Arrange: every publication matches 32 filters, so the client routes more slowly than it
+        // reads, fills its queue of received packets, and pauses reading. The broker sends the
+        // first PINGRESP only after FILLER more publications, and then a QoS 1 publication that
+        // marks the end.
         var marked = new CountDownLatch(1);
-        try (
-                ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
-                MqttClient sut = MqttClient.builder()
-                        .server(URI.create("mqtt://127.0.0.1:" + server.getLocalPort()))
-                        .version(MqttVersion.V3_1_1)
-                        .reconnectPolicy(ReconnectPolicy.disabled())
-                        .keepAlive(Duration.ofSeconds(1))
-                        .connectionListener(ended::add)
-                        .build()
-        ) {
-            CompletableFuture<ConnAck> connecting = sut.connect();
-            try (Socket socket = server.accept()) {
-                var reader = new FrameReader(socket.getInputStream(), 1024 * 1024);
-                var writer = new FrameWriter(socket.getOutputStream());
-                assertThat(receive(reader)).isInstanceOf(Packet.Connect.class);
-                writer.write(codec.encode(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY)));
-                connecting.get(5, SECONDS);
-                for (int i = 0; i < 32; i++) {
-                    subscribe(sut, reader, writer, filter(i), Qos.AT_MOST_ONCE, _ -> { });
-                }
-                subscribe(sut, reader, writer, "marker", Qos.AT_LEAST_ONCE,
-                        _ -> marked.countDown());
-                var silence = new Silence();
-                Thread.ofPlatform().daemon().start(() -> answerPings(reader, writer, silence));
-                var burst = new ByteArrayOutputStream();
-                byte[] publication = codec.encode(new Packet.Publish(new Topic("a/b/c/d/e/f/g/h"),
-                        new byte[1], Qos.AT_MOST_ONCE, false, false, 0, EMPTY));
-                for (int i = 0; i < LONG_BURST; i++) {
-                    burst.writeBytes(publication);
-                }
-                burst.writeBytes(codec.encode(new Packet.Publish(new Topic("marker"),
-                        new byte[1], Qos.AT_LEAST_ONCE, false, false, 1, EMPTY)));
-
-                // Act
-                synchronized (writer) {
-                    socket.getOutputStream().write(burst.toByteArray());
-                }
-                await().atMost(Duration.ofSeconds(30))
-                        .until(() -> marked.getCount() == 0 || !ended.isEmpty());
-                // One more interval shows that keep-alive continues after the backlog.
-                Thread.sleep(1_200);
-
-                // Assert
-                assertThat(ended).isEmpty();
-                assertThat(marked.getCount()).isZero();
-                assertThat(silence.longest()).isLessThanOrEqualTo(Duration.ofMillis(1_500));
+        try (var broker = new KeepAliveBroker(KEEP_ALIVE)) {
+            MqttClient sut = broker.client();
+            broker.connect();
+            for (int i = 0; i < 32; i++) {
+                broker.subscribe(filter(i), Qos.AT_MOST_ONCE, _ -> { });
             }
-        }
-    }
+            broker.subscribe("marker", Qos.AT_LEAST_ONCE, _ -> marked.countDown());
+            byte[] message = publication("a/b/c/d/e/f/g/h");
+            broker.answerPings(repeat(message, FILLER));
 
-    private static void subscribe(
-            MqttClient sut,
-            FrameReader reader,
-            FrameWriter writer,
-            String filter,
-            Qos qos,
-            Consumer<MqttDelivery> handler
-    ) throws Exception {
-        Subscription subscription = sut.subscribe(
-                Subscribe.of(new TopicFilter(filter), qos),
-                handler
-        );
-        var subscribe = (Packet.Subscribe) receive(reader);
-        writer.write(codec.encode(new Packet.SubAck(
-                subscribe.packetId(), List.of(ReasonCode.of(qos.level())), EMPTY
-        )));
-        subscription.established().get(5, SECONDS);
-    }
+            // Act
+            long _ = broker.streamUntilPinged(message, STREAM_LIMIT);
+            broker.send(codec.encode(new Packet.Publish(
+                    new Topic("marker"),
+                    new byte[1],
+                    Qos.AT_LEAST_ONCE,
+                    false,
+                    false,
+                    1,
+                    EMPTY
+            )));
+            await().atMost(Duration.ofSeconds(60))
+                    .until(() -> marked.getCount() == 0 || !broker.ended().isEmpty());
 
-    /// The QoS 0 deliveries that the client dropped because its buffers or a subscription's buffer
-    /// were full. A delivery dropped for any other reason does not count, so it fails the test.
-    private static long overflows(MqttClient client) throws Exception {
-        Map<ClientStats.DropReason, Long> dropped =
-                client.stats().get(5, SECONDS).receiving().dropped();
-        return dropped.getOrDefault(ClientStats.DropReason.CLIENT_FULL, 0L)
-                + dropped.getOrDefault(ClientStats.DropReason.SUBSCRIPTION_FULL, 0L);
-    }
-
-    /// Each of the 256 filters keeps or replaces each of eight levels with +.
-    private static String filter(int index) {
-        var filter = new StringBuilder();
-        for (int level = 0; level < 8; level++) {
-            if (level > 0) {
-                filter.append('/');
-            }
-            filter.append((index & 1 << level) != 0 ? "+" : String.valueOf((char) ('a' + level)));
-        }
-        return filter.toString();
-    }
-
-    private static void answerPings(FrameReader reader, FrameWriter writer, Silence silence) {
-        try {
-            while (true) {
-                Packet packet = codec.decode(reader.read().orElseThrow());
-                silence.received();
-                if (packet instanceof Packet.PingReq) {
-                    synchronized (writer) {
-                        writer.write(codec.encode(new Packet.PingResp()));
-                    }
-                }
-            }
-        } catch (IOException | RuntimeException _) {
-            // The test closes the socket when it is done.
-        }
-    }
-
-    private static Packet receive(FrameReader reader) throws IOException {
-        return codec.decode(reader.read().orElseThrow());
-    }
-
-    /// The longest time without a client packet, measured from the end of setup.
-    private static final class Silence {
-
-        private long last = System.nanoTime();
-
-        private long longest;
-
-        synchronized void received() {
-            long now = System.nanoTime();
-            longest = Math.max(longest, now - last);
-            last = now;
-        }
-
-        synchronized Duration longest() {
-            return Duration.ofNanos(Math.max(longest, System.nanoTime() - last));
+            // Assert: the client read on past its full queue towards the PINGRESP, which a
+            // paused reader never does, so it dropped publications before routing them, and it
+            // reached the PINGRESP before its deadline.
+            assertThat(broker.ended()).isEmpty();
+            assertThat(marked.getCount()).isZero();
+            assertThat(sut.stats().get(5, SECONDS).receiving().unrouted()).isPositive();
+            assertThat(broker.longestSilence()).isLessThanOrEqualTo(SILENCE_LIMIT);
         }
     }
 }
