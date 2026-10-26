@@ -135,6 +135,23 @@ public interface PacketCodec {
     /// @throws IndexOutOfBoundsException if the range does not lie within `bytes`
     Packet decode(byte[] bytes, int offset, int length, TopicCache topics);
 
+    /// The size of the fixed and variable headers of the PUBLISH whose first `available` bytes
+    /// lie in `bytes` from `offset`, which come before its payload, or -1 when those bytes do not
+    /// locate the payload. A reader can then give the payload an array of its own, which
+    /// [#decodePublish] takes over, before the rest of the packet arrives. Only the lengths that
+    /// lead to the payload are read; decoding checks the packet.
+    int publishHeadersSize(byte[] bytes, int offset, int available);
+
+    /// Decodes a PUBLISH whose payload arrived apart: the `length` bytes of `bytes` from `offset`
+    /// are its headers, as [#publishHeadersSize] found them, whose Remaining Length counts the
+    /// payload too, and `payload` holds the rest of the packet, which the decoded packet takes
+    /// over. Checks the packet and takes topics from `topics` as
+    /// [#decode(byte[], int, int, TopicCache)] does.
+    ///
+    /// @throws PacketDecodeException if the packet is malformed or violates a checked rule
+    /// @throws IllegalArgumentException if the headers are not those of a PUBLISH
+    Packet decodePublish(byte[] bytes, int offset, int length, byte[] payload, TopicCache topics);
+
     /// Decodes the first CONNECT before the connection's MQTT version has been selected.
     ///
     /// The protocol name and level are inspected before version-specific fields. Levels 4 and 5

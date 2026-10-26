@@ -220,16 +220,42 @@ final class Mqtt5PacketCodec implements PacketCodec {
 
     @Override
     public Packet decode(byte[] bytes, int offset, int length) {
-        return decoded(bytes, offset, length, null);
+        return decoded(bytes, offset, length, null, null);
     }
 
     @Override
     public Packet decode(byte[] bytes, int offset, int length, TopicCache topics) {
         requireNonNull(topics, "topics must not be null");
-        return decoded(bytes, offset, length, topics);
+        return decoded(bytes, offset, length, topics, null);
     }
 
-    private Packet decoded(byte[] bytes, int offset, int length, @Nullable TopicCache topics) {
+    @Override
+    public int publishHeadersSize(byte[] bytes, int offset, int available) {
+        return PublishHeaders.size(bytes, offset, available, true);
+    }
+
+    @Override
+    public Packet decodePublish(
+            byte[] bytes,
+            int offset,
+            int length,
+            byte[] payload,
+            TopicCache topics
+    ) {
+        requireNonNull(payload, "payload must not be null");
+        requireNonNull(topics, "topics must not be null");
+        return decoded(bytes, offset, length, topics, payload);
+    }
+
+    // Decodes the packet in the `length` bytes of `bytes` from `offset`, or, given `apart`, the
+    // PUBLISH whose headers lie there and whose payload is `apart`.
+    private Packet decoded(
+            byte[] bytes,
+            int offset,
+            int length,
+            @Nullable TopicCache topics,
+            byte @Nullable [] apart
+    ) {
         requireNonNull(bytes, "bytes must not be null");
         var input = ByteBuffer.wrap(bytes, offset, length);
         try {
@@ -243,14 +269,17 @@ final class Mqtt5PacketCodec implements PacketCodec {
             if (type != PacketType.PUBLISH && flags != type.fixedFlags().orElseThrow()) {
                 throw new PacketDecodeException(MALFORMED_PACKET, "Invalid fixed-header flags");
             }
+            if (apart != null && type != PacketType.PUBLISH) {
+                throw new IllegalArgumentException("Only a PUBLISH carries a payload apart");
+            }
             int remainingLength = RemainingLength.readMinimal(input);
-            if (remainingLength != input.remaining()) {
+            if (remainingLength != input.remaining() + (apart == null ? 0 : apart.length)) {
                 throw new PacketDecodeException(MALFORMED_PACKET, "Remaining Length mismatch");
             }
             Packet decoded = switch (type) {
                 case CONNECT -> readConnect(input);
                 case CONNACK -> readConnAck(input);
-                case PUBLISH -> readPublish(input, flags, topics);
+                case PUBLISH -> readPublish(input, flags, topics, apart);
                 case PUBACK -> new Packet.PubAck(
                         readPacketId(input),
                         readOptionalReason(input, type),
@@ -392,7 +421,12 @@ final class Mqtt5PacketCodec implements PacketCodec {
         );
     }
 
-    private static Packet readPublish(ByteBuffer input, int flags, @Nullable TopicCache topics) {
+    private static Packet readPublish(
+            ByteBuffer input,
+            int flags,
+            @Nullable TopicCache topics,
+            byte @Nullable [] apart
+    ) {
         int qosBits = (flags >>> 1) & 3;
         if (qosBits == 3) {
             throw new PacketDecodeException(MALFORMED_PACKET, "Invalid PUBLISH QoS bits");
@@ -410,8 +444,7 @@ final class Mqtt5PacketCodec implements PacketCodec {
         String topicName = cached == null ? MqttString.read(input) : cached.name();
         int packetId = qos == Qos.AT_MOST_ONCE ? 0 : readPacketId(input);
         Properties properties = Mqtt5Properties.read(input, PacketType.PUBLISH);
-        var payload = new byte[input.remaining()];
-        input.get(payload);
+        byte[] payload = apart != null ? apart : remaining(input);
         if (topicName.isEmpty()) {
             if (properties.find(PropertyId.TOPIC_ALIAS).isEmpty()) {
                 throw new PacketDecodeException(PROTOCOL_ERROR, "Empty topic requires Topic Alias");
@@ -670,6 +703,13 @@ final class Mqtt5PacketCodec implements PacketCodec {
         if (properties.find(PropertyId.TOPIC_ALIAS).isEmpty()) {
             throw new IllegalArgumentException("Empty topic requires Topic Alias");
         }
+    }
+
+    // The rest of the packet: a PUBLISH's payload that arrived with its headers.
+    private static byte[] remaining(ByteBuffer input) {
+        var bytes = new byte[input.remaining()];
+        input.get(bytes);
+        return bytes;
     }
 
     private static int readPacketId(ByteBuffer input) {

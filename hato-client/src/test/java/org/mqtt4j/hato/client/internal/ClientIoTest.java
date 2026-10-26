@@ -1598,6 +1598,22 @@ class ClientIoTest {
         public Packet decode(byte[] bytes, int offset, int length, TopicCache topics) {
             return delegate.decode(bytes, offset, length, topics);
         }
+
+        @Override
+        public int publishHeadersSize(byte[] bytes, int offset, int available) {
+            return delegate.publishHeadersSize(bytes, offset, available);
+        }
+
+        @Override
+        public Packet decodePublish(
+                byte[] bytes,
+                int offset,
+                int length,
+                byte[] payload,
+                TopicCache topics
+        ) {
+            return delegate.decodePublish(bytes, offset, length, payload, topics);
+        }
     }
 
     private static final class RecordingEvents implements ClientIo.Events {

@@ -199,16 +199,42 @@ final class Mqtt311PacketCodec implements PacketCodec {
     /// @throws UnsupportedProtocolVersionException if CONNECT requests a level other than 4
     @Override
     public Packet decode(byte[] bytes, int offset, int length) {
-        return decoded(bytes, offset, length, null);
+        return decoded(bytes, offset, length, null, null);
     }
 
     @Override
     public Packet decode(byte[] bytes, int offset, int length, TopicCache topics) {
         requireNonNull(topics, "topics must not be null");
-        return decoded(bytes, offset, length, topics);
+        return decoded(bytes, offset, length, topics, null);
     }
 
-    private Packet decoded(byte[] bytes, int offset, int length, @Nullable TopicCache topics) {
+    @Override
+    public int publishHeadersSize(byte[] bytes, int offset, int available) {
+        return PublishHeaders.size(bytes, offset, available, false);
+    }
+
+    @Override
+    public Packet decodePublish(
+            byte[] bytes,
+            int offset,
+            int length,
+            byte[] payload,
+            TopicCache topics
+    ) {
+        requireNonNull(payload, "payload must not be null");
+        requireNonNull(topics, "topics must not be null");
+        return decoded(bytes, offset, length, topics, payload);
+    }
+
+    // Decodes the packet in the `length` bytes of `bytes` from `offset`, or, given `apart`, the
+    // PUBLISH whose headers lie there and whose payload is `apart`.
+    private Packet decoded(
+            byte[] bytes,
+            int offset,
+            int length,
+            @Nullable TopicCache topics,
+            byte @Nullable [] apart
+    ) {
         requireNonNull(bytes, "bytes must not be null");
         var input = ByteBuffer.wrap(bytes, offset, length);
         try {
@@ -223,15 +249,18 @@ final class Mqtt311PacketCodec implements PacketCodec {
             if (type != PacketType.PUBLISH && flags != type.fixedFlags().orElseThrow()) {
                 throw new PacketDecodeException(MALFORMED_PACKET, "Invalid fixed-header flags");
             }
+            if (apart != null && type != PacketType.PUBLISH) {
+                throw new IllegalArgumentException("Only a PUBLISH carries a payload apart");
+            }
             int remainingLength = RemainingLength.read(input);
-            if (remainingLength != input.remaining()) {
+            if (remainingLength != input.remaining() + (apart == null ? 0 : apart.length)) {
                 throw new PacketDecodeException(MALFORMED_PACKET, "Remaining Length mismatch");
             }
 
             Packet decoded = switch (type) {
                 case CONNECT -> readConnect(input);
                 case CONNACK -> readConnAck(input);
-                case PUBLISH -> readPublish(input, flags, topics);
+                case PUBLISH -> readPublish(input, flags, topics, apart);
                 case PUBACK -> new Packet.PubAck(readPacketId(input), SUCCESS, EMPTY);
                 case PUBREC -> new Packet.PubRec(readPacketId(input), SUCCESS, EMPTY);
                 case PUBREL -> new Packet.PubRel(readPacketId(input), SUCCESS, EMPTY);
@@ -356,7 +385,8 @@ final class Mqtt311PacketCodec implements PacketCodec {
     private static Packet.Publish readPublish(
             ByteBuffer input,
             int flags,
-            @Nullable TopicCache topics
+            @Nullable TopicCache topics,
+            byte @Nullable [] apart
     ) {
         int qosBits = (flags >>> 1) & 3;
         // [MQTT-3.3.1-4]; MQTT 5.0 section 3.3.1.2 classifies QoS 3 as malformed.
@@ -366,8 +396,7 @@ final class Mqtt311PacketCodec implements PacketCodec {
         Qos qos = Qos.of(qosBits);
         Topic topic = topics == null ? readTopic(input) : readTopic(input, topics);
         int packetId = (qos == Qos.AT_MOST_ONCE) ? 0 : readPacketId(input);
-        var payload = new byte[input.remaining()];
-        input.get(payload);
+        byte[] payload = apart != null ? apart : remaining(input);
         // [MQTT-3.3.1-2] constrains the sender; ignore DUP for QoS 0 on receipt.
         boolean dup = (qos != Qos.AT_MOST_ONCE) && ((flags & 8) != 0);
         return new Packet.Publish(topic, payload, qos, (flags & 1) != 0, dup, packetId, EMPTY);
@@ -489,6 +518,13 @@ final class Mqtt311PacketCodec implements PacketCodec {
         } catch (IllegalArgumentException e) {
             throw new PacketDecodeException(PROTOCOL_ERROR, "Invalid topic filter", e);
         }
+    }
+
+    // The rest of the packet: a PUBLISH's payload that arrived with its headers.
+    private static byte[] remaining(ByteBuffer input) {
+        var bytes = new byte[input.remaining()];
+        input.get(bytes);
+        return bytes;
     }
 
     private static int readPacketId(ByteBuffer input) {

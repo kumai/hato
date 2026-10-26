@@ -9091,6 +9091,22 @@ class ClientActorTest {
         }
 
         @Override
+        public int publishHeadersSize(byte[] bytes, int offset, int available) {
+            return codec.publishHeadersSize(bytes, offset, available);
+        }
+
+        @Override
+        public Packet decodePublish(
+                byte[] bytes,
+                int offset,
+                int length,
+                byte[] payload,
+                TopicCache topics
+        ) {
+            return codec.decodePublish(bytes, offset, length, payload, topics);
+        }
+
+        @Override
         public byte[] encodePublishHeader(
                 Topic topic,
                 Qos qos,
