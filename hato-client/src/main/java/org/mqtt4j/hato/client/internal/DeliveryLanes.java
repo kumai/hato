@@ -77,6 +77,13 @@ final class DeliveryLanes {
     // put the claims that its dispatcher had not started back in the lane's queue.
     private static final int REQUEUED = -1;
 
+    // How many claimed QoS 0 deliveries a serial dispatcher lets return before it takes the lock
+    // to end their local processing, unless its claims run out first. Taking the lock after every
+    // handler cost a dispatcher at full speed about as much as the rest of its work, and a
+    // waiting actor had to be woken each time. Meanwhile an admission that finds the lane full
+    // takes back the capacity of the returned ones itself; see reclaimReturned.
+    private static final int RETURN_INTERVAL = 8;
+
     // One lock keeps fan-out reservations atomic; each lane's condition wakes only that lane's
     // dispatcher or receivers.
     private final ReentrantLock lock = new ReentrantLock();
@@ -601,6 +608,9 @@ final class DeliveryLanes {
                 }
             }
             for (Lane lane : recipients) {
+                if (lane.retained >= lane.capacity) {
+                    reclaimReturned(lane);
+                }
                 // A pending failure owns termination; don't replace it with a capacity failure.
                 if (lane.retained >= lane.capacity && !lane.failed) {
                     return false;
@@ -697,6 +707,9 @@ final class DeliveryLanes {
             // A lane awaiting removal admits nothing new.
             if (lane == null || lane.paused) {
                 continue;
+            }
+            if (lane.retained >= lane.capacity) {
+                reclaimReturned(lane);
             }
             if (lane.retained < lane.capacity) {
                 recipients.add(lane);
@@ -1060,9 +1073,13 @@ final class DeliveryLanes {
         Claim claim;
         lock.lock();
         try {
-            // The previous claims have all run, failed, or gone back to the queue.
+            // The previous claims have all run, failed, or gone back to the queue. Their count
+            // goes with them, so that an admission meanwhile, as when a QoS 1 delivery runs alone
+            // next, finds no claims to take capacity back from.
             endHandled(lane);
             lane.claimed.clear();
+            lane.started.set(0);
+            lane.reclaimed = 0;
             if (!awaitNext(lane)) {
                 return false;
             }
@@ -1089,9 +1106,10 @@ final class DeliveryLanes {
     /// Executes the handlers of the QoS 0 deliveries claimed together, in order. Each handler
     /// starts only after the lane's count of started claims has counted it, so a stop, a
     /// connection end, or the client's close that puts the rest back in the queue keeps them from
-    /// starting. A returned delivery ends its local processing at once if the lock is free;
-    /// otherwise a later return or the next claim ends it, so the dispatcher does not wait for
-    /// the lock here.
+    /// starting. Returned deliveries end their local processing every [#RETURN_INTERVAL] returns
+    /// if the lock is free, and otherwise at a later return or the next claim, so the dispatcher
+    /// does not wait for the lock here; an admission that finds the lane full takes their
+    /// capacity back meanwhile.
     private void executeClaimed(Lane lane) {
         for (int i = 0; i < lane.claimed.size() && lane.started.compareAndSet(i, i + 1); i++) {
             DeliveryView view = lane.claimed.get(i);
@@ -1106,13 +1124,29 @@ final class DeliveryLanes {
             // Clear handler-owned interrupt state before the next delivery or queue wait.
             boolean _ = Thread.interrupted();
             lane.handled.add(view);
-            if (lock.tryLock()) {
+            if (lane.handled.size() >= RETURN_INTERVAL && lock.tryLock()) {
                 try {
                     endHandled(lane);
                 } finally {
                     lock.unlock();
                 }
             }
+        }
+    }
+
+    /// Caller holds lock. Returns the capacity of the claimed QoS 0 deliveries of `lane` whose
+    /// handlers have returned, ahead of the dispatcher, which ends them only every few returns
+    /// (see [#RETURN_INTERVAL]), so that an admission that finds the lane full counts them as
+    /// returned. Claims run one after another, so every claim before the one that started last
+    /// has returned or failed, and a failed one has returned its capacity already. Taking a
+    /// delivery's capacity back twice is harmless: the dispatcher's later end of the same one
+    /// finds it gone and only counts the handler's return.
+    private void reclaimReturned(Lane lane) {
+        int started = lane.started.get();
+        for (; lane.reclaimed < started - 1; lane.reclaimed++) {
+            DeliveryView view = lane.claimed.get(lane.reclaimed);
+            view.localDone = true;
+            releaseView(view);
         }
     }
 
@@ -2187,13 +2221,16 @@ final class DeliveryLanes {
         final ArrayDeque<DeliveryView> queue = new ArrayDeque<>();
         // The QoS 0 deliveries that a serial dispatcher claimed together, in receive order, and
         // how many of their handlers it has started, or REQUEUED once a stop, a connection end,
-        // or the client's close has put the rest back in the queue. The dispatcher changes the
-        // list only under the lock, and it counts a handler before starting it, so a delivery is
-        // either started or put back, never both.
+        // or the client's close has put the rest back in the queue; zero once they are done. The
+        // dispatcher changes the list only under the lock, and it counts a handler before
+        // starting it, so a delivery is either started or put back, never both.
         final ArrayList<DeliveryView> claimed = new ArrayList<>();
         final AtomicInteger started = new AtomicInteger();
-        // Claimed deliveries whose handlers returned while the lock was busy, which the
-        // dispatcher ends under a later hold; only the dispatcher uses them.
+        // How many claims from the first an admission has taken capacity back from, under the
+        // lock; see reclaimReturned.
+        int reclaimed;
+        // Claimed deliveries whose handlers returned and whose local processing the dispatcher
+        // has yet to end under a hold of the lock; only the dispatcher uses them.
         final ArrayList<DeliveryView> handled = new ArrayList<>();
         // A sublane exists while deliveries wait there or a drain task is on its way. Executors
         // are told apart by identity, so no application's equals() runs under the lock. Stripes,

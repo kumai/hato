@@ -1171,6 +1171,43 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void a_lane_filled_behind_a_qos_1_handler_drops_further_qos_0_deliveries() throws Exception {
+        // Arrange: two QoS 0 deliveries claimed together have returned, and a QoS 1 delivery,
+        // which runs alone, holds the lane with its handler while QoS 0 ones fill the lane.
+        var entered = new LinkedBlockingQueue<MqttDelivery>();
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(4), delivery -> {
+            entered.add(delivery);
+            if (delivery.message().qos() == Qos.AT_LEAST_ONCE) {
+                waitFor(release);
+            }
+        })).isTrue();
+        sut.deliverAtMostOnce(List.of(
+                arrival(List.of(1L), message(1), 10),
+                arrival(List.of(1L), message(2), 10)
+        ));
+        await().until(() -> sut.handledDeliveries() == 2);
+        assertThat(sut.deliver(token(1, 7), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        await().until(() -> entered.stream()
+                .anyMatch(delivery -> delivery.message().qos() == Qos.AT_LEAST_ONCE));
+        sut.deliverAtMostOnce(List.of(
+                arrival(List.of(1L), message(3), 10),
+                arrival(List.of(1L), message(4), 10),
+                arrival(List.of(1L), message(5), 10)
+        ));
+
+        // Act
+        sut.deliverAtMostOnce(List.of(arrival(List.of(1L), message(6), 10)));
+
+        // Assert: the queued ones still run once the QoS 1 handler returns.
+        assertThat(sut.dropped(1, DropReason.SUBSCRIPTION_FULL)).isOne();
+        assertThat(sut.retainedDeliveries()).isEqualTo(4);
+        release.countDown();
+        await().until(() -> entered.stream()
+                .anyMatch(delivery -> delivery.message().equals(message(5))));
+    }
+
+    @Test
     void a_qos_1_delivery_among_qos_0_ones_keeps_its_place_and_acknowledgement() throws Exception {
         // Arrange: a running handler holds the lane while QoS 0, QoS 1, and QoS 0 deliveries
         // queue behind it.
