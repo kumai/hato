@@ -69,19 +69,24 @@ final class DeliveryLanes {
     /// multiply it; it is what the core's 4,096 receipts reach with 256 subscriptions each.
     static final int CONDITION_LIMIT = 1_048_576;
 
-    // The most QoS 0 deliveries that a serial dispatcher claims under one hold of the lock: as
-    // many as the actor admits under one hold.
-    private static final int CLAIM_LIMIT = 64;
+    // The most QoS 0 deliveries that a serial dispatcher claims under one hold of the lock, as
+    // many as the actor admits in four of its runs. Each time the dispatcher takes the lock, it
+    // may wait for an admission that holds the lock for a whole run: claiming 64 at a time, a
+    // dispatcher at full speed waited for the lock a third of its time when measured, and fell
+    // behind the actor.
+    private static final int CLAIM_LIMIT = 256;
 
     // A lane's count of started claims once a stop, a connection end, or the client's close has
     // put the claims that its dispatcher had not started back in the lane's queue.
     private static final int REQUEUED = -1;
 
-    // How many claimed QoS 0 deliveries a serial dispatcher lets return before it takes the lock
-    // to end their local processing, unless its claims run out first. Taking the lock after every
-    // handler cost a dispatcher at full speed about as much as the rest of its work, and a
-    // waiting actor had to be woken each time. Meanwhile an admission that finds the lane full
-    // takes back the capacity of the returned ones itself; see reclaimReturned.
+    // How many claimed QoS 0 deliveries a serial dispatcher lets return before it tries the lock
+    // to end their local processing, unless its claims run out first; when the lock is taken, it
+    // tries again only after as many more. Taking the lock after every handler cost a dispatcher
+    // at full speed about as much as the rest of its work, and a waiting actor had to be woken
+    // each time; trying again after every handler while the actor admitted a run failed most of
+    // the time. Meanwhile an admission that finds the lane full takes back the capacity of the
+    // returned ones itself; see reclaimReturned.
     private static final int RETURN_INTERVAL = 8;
 
     // One lock keeps fan-out reservations atomic; each lane's condition wakes only that lane's
@@ -1107,9 +1112,9 @@ final class DeliveryLanes {
     /// starts only after the lane's count of started claims has counted it, so a stop, a
     /// connection end, or the client's close that puts the rest back in the queue keeps them from
     /// starting. Returned deliveries end their local processing every [#RETURN_INTERVAL] returns
-    /// if the lock is free, and otherwise at a later return or the next claim, so the dispatcher
-    /// does not wait for the lock here; an admission that finds the lane full takes their
-    /// capacity back meanwhile.
+    /// if the lock is free, and otherwise after as many more or at the next claim, so the
+    /// dispatcher does not wait for the lock here; an admission that finds the lane full takes
+    /// their capacity back meanwhile.
     private void executeClaimed(Lane lane) {
         for (int i = 0; i < lane.claimed.size() && lane.started.compareAndSet(i, i + 1); i++) {
             DeliveryView view = lane.claimed.get(i);
@@ -1124,7 +1129,7 @@ final class DeliveryLanes {
             // Clear handler-owned interrupt state before the next delivery or queue wait.
             boolean _ = Thread.interrupted();
             lane.handled.add(view);
-            if (lane.handled.size() >= RETURN_INTERVAL && lock.tryLock()) {
+            if (lane.handled.size() % RETURN_INTERVAL == 0 && lock.tryLock()) {
                 try {
                     endHandled(lane);
                 } finally {
