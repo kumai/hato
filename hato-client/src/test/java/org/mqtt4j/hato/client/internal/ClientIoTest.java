@@ -591,6 +591,51 @@ class ClientIoTest {
     }
 
     @Test
+    void the_sender_takes_over_the_events_of_a_write_that_it_makes_itself_and_runs_them_after()
+            throws Exception {
+        // Arrange: the transport takes writes only through write(), and reports each at once.
+        var transport = new BlockingTransport();
+        var io = new ClientIo(
+                URI.create("mqtt://localhost"),
+                "io-test",
+                16 * 1024 * 1024,
+                128,
+                0,
+                _ -> transport,
+                events,
+                codec,
+                MqttMessageAccess::payloadArray
+        );
+        batching.add(io);
+        io.open(1, Duration.ofSeconds(30));
+
+        // Act
+        assertThat(io.send(1, 1, new Packet.PubAck(5, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+
+        // Assert: the sender takes the events over before it posts what the write completed,
+        // and runs them once the write is over.
+        await().untilAsserted(() -> assertThat(events.senderCalls).contains("runHeld"));
+        assertThat(events.senderCalls).containsExactly("hold", "written 1", "sent 1", "runHeld");
+    }
+
+    @Test
+    void a_send_that_a_transport_completes_on_the_sender_leaves_its_events_to_the_actor_thread()
+            throws Exception {
+        // Arrange: a transport that may write on a thread of its own completes at once instead.
+        SingleWriteTransport transport = open(1);
+        transport.completeInline = true;
+
+        // Act
+        assertThat(sut.send(1, 1, new Packet.PubAck(5, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+
+        // Assert: the sender posts what the send completed without taking the events over.
+        await().untilAsserted(() -> assertThat(events.senderCalls).contains("runHeld"));
+        assertThat(events.senderCalls).containsExactly("written 1", "sent 1", "runHeld");
+    }
+
+    @Test
     void a_large_publication_leaves_as_its_header_then_its_own_payload_and_retries_with_dup()
             throws Exception {
         // Arrange: each connection gets a transport that lets the client write.
@@ -1750,6 +1795,8 @@ class ClientIoTest {
         // Whether the reader said it would run each received packet's events itself.
         final List<Boolean> here = new CopyOnWriteArrayList<>();
         final AtomicInteger runs = new AtomicInteger();
+        // The sender's calls that take the events over, post them, and run them, in order.
+        final List<String> senderCalls = new CopyOnWriteArrayList<>();
         final List<Long> written = new CopyOnWriteArrayList<>();
         final List<Long> capacityGenerations = new CopyOnWriteArrayList<>();
         final AtomicInteger closures = new AtomicInteger();
@@ -1774,6 +1821,7 @@ class ClientIoTest {
         @Override
         public void written(long generation, long ticket) {
             written.add(ticket);
+            recordSenderCall("written " + ticket);
         }
 
         @Override
@@ -1787,12 +1835,25 @@ class ClientIoTest {
                 beforeSent.run();
                 generations.add(generation);
                 tickets.add(ticket);
+                recordSenderCall("sent " + ticket);
             };
+        }
+
+        @Override
+        public void hold() {
+            recordSenderCall("hold");
         }
 
         @Override
         public void runHeld() {
             runs.incrementAndGet();
+            recordSenderCall("runHeld");
+        }
+
+        private void recordSenderCall(String call) {
+            if (Thread.currentThread().getName().endsWith("-sender")) {
+                senderCalls.add(call);
+            }
         }
 
         @Override

@@ -364,6 +364,14 @@ final class Mailbox {
         return Optional.empty();
     }
 
+    /// Takes over running the events for the calling thread when no thread runs them, as a post
+    /// with `here` does; see [#offer(Event, boolean)].
+    synchronized void hold() {
+        if (holder == null) {
+            holder = Thread.currentThread();
+        }
+    }
+
     /// Whether the calling thread runs the events now.
     boolean holds() {
         return holder == Thread.currentThread();

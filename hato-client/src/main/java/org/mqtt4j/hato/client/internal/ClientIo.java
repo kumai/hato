@@ -56,6 +56,11 @@ final class ClientIo {
         /// monitor. This must only enqueue an event, without calling external code or waiting.
         void sendCapacityAvailable(long generation);
 
+        /// Takes over running the client's events for the calling thread, the sender, when no
+        /// thread runs them, so that the events that it posts next wait for it rather than wake
+        /// the actor thread. The sender calls [#runHeld()] after the write.
+        void hold();
+
         /// Runs the client's events that the calling thread took over, if it did; it holds no
         /// lock of I/O or of the transport.
         void runHeld();
@@ -284,6 +289,12 @@ final class ClientIo {
 
             @Override
             public void onSent(long ticket) {
+                // The sender reports a write that it made itself here, before the write returns,
+                // and then runs what the write completes rather than wake the actor thread.
+                if (connection.transport instanceof BlockingWriteTransport
+                        && Thread.currentThread() == sender) {
+                    events.hold();
+                }
                 boolean notify;
                 List<SendQueue.Send<Outbound>> written;
                 synchronized (sending) {
@@ -498,7 +509,12 @@ final class ClientIo {
         if (write.isEmpty()) {
             return false;
         }
-        prepareAndSend(write.orElseThrow());
+        try {
+            prepareAndSend(write.orElseThrow());
+        } finally {
+            // What the write completed, if the sender took the events over; see onSent.
+            events.runHeld();
+        }
         return true;
     }
 
