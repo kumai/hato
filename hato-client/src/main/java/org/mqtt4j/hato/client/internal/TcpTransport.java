@@ -97,16 +97,35 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     // replace the resolver if applications need a stronger per-host cancellation contract.
     private static final Semaphore resolving = new Semaphore(RESOLUTION_LIMIT, true);
 
+    // A virtual thread that waits for its socket is woken by the JDK's poller, a hand-off that
+    // each read pays when it arrives after a pause. On Linux, where the poller runs on virtual
+    // threads too, a connection receiving 20,000 messages a second spent 40 to 60 percent less
+    // CPU per message when a platform thread read it, blocking in the read itself. A platform
+    // thread per connection does not scale, though: with a thousand of them, a message to every
+    // connection took 14 to 50 times as long to reach them all. So, once connected, as many
+    // connections as the JVM has processors read on platform threads of their own, and the
+    // others go on reading on the virtual thread that connected them. The connections that come
+    // up first take them, busy or not; a shared event loop would serve every connection without
+    // either cost. The build's single-carrier suite sets hato.client.platformReaders to 0, so
+    // that it tests virtual readers on one carrier; the property is not a supported setting.
+    private static final Semaphore platformReading = new Semaphore(Integer.getInteger(
+            "hato.client.platformReaders",
+            Runtime.getRuntime().availableProcessors()
+    ));
+
     private final String threadName;
     private final String scheme;
     private final Semaphore resolutionSlots;
     private final Resolver resolver;
     private final Connector connector;
     private final TimerScheduler timer;
+    private final Semaphore platformReadingSlots;
     private final Object callbacks = new Object();
 
     private @Nullable Listener listener;
     private @Nullable Connection connection;
+    // The thread that connects and then reads, or the platform thread that it hands the reading
+    // to once connected.
     private @Nullable Thread reader;
     private @Nullable Throwable terminalCause;
     private @Nullable Write pending;
@@ -177,12 +196,33 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             Connector connector,
             TimerScheduler timer
     ) {
+        this(
+                clientId,
+                scheme,
+                resolutionSlots,
+                resolver,
+                connector,
+                timer,
+                platformReading
+        );
+    }
+
+    TcpTransport(
+            String clientId,
+            String scheme,
+            Semaphore resolutionSlots,
+            Resolver resolver,
+            Connector connector,
+            TimerScheduler timer,
+            Semaphore platformReadingSlots
+    ) {
         threadName = "hato-" + requireNonNull(clientId, "clientId");
         this.scheme = scheme;
         this.resolutionSlots = resolutionSlots;
         this.resolver = resolver;
         this.connector = connector;
         this.timer = timer;
+        this.platformReadingSlots = platformReadingSlots;
     }
 
     @Override
@@ -268,6 +308,11 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                         if (closed) {
                             return;
                         }
+                        if (readOnPlatformThread(socket, receiver)) {
+                            // That thread ends this worker when it stops reading.
+                            attached = false;
+                            return;
+                        }
                     }
                     read(socket, receiver);
                 } catch (Throwable failure) {
@@ -280,6 +325,38 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             });
             reader.start();
         }
+    }
+
+    /// Caller holds callbacks, once connected. Hands the reading to a platform thread of its own
+    /// while the JVM has one to spare, and returns whether it did; otherwise the caller reads.
+    private boolean readOnPlatformThread(Connection socket, Listener receiver) {
+        if (!platformReadingSlots.tryAcquire()) {
+            return false;
+        }
+        Thread platform = Thread.ofPlatform()
+                .daemon()
+                .name(threadName + "-reader")
+                .unstarted(() -> {
+                    try {
+                        read(socket, receiver);
+                    } catch (Throwable failure) {
+                        terminate(failure);
+                    } finally {
+                        // Before onClosed, so that a connection that replaces this one can take
+                        // the slot.
+                        platformReadingSlots.release();
+                        workerEnded();
+                    }
+                });
+        try {
+            platform.start();
+        } catch (OutOfMemoryError _) {
+            // The system refused another thread; the caller reads instead.
+            platformReadingSlots.release();
+            return false;
+        }
+        reader = platform;
+        return true;
     }
 
     private InetAddress resolve(String host, long deadline)
@@ -336,6 +413,8 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         // A listener that borrows takes the bytes where they lie, which spares a copy of every
         // read.
         BorrowingListener borrower = receiver instanceof BorrowingListener lender ? lender : null;
+        // A platform reader holds no carrier that others wait for.
+        boolean sharesCarrier = Thread.currentThread().isVirtual();
         // The time spent on what arrived since the reader last let others run. A read that waits
         // for the peer frees the carrier, so only the work on the bytes counts.
         long worked = 0;
@@ -374,10 +453,10 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                 }
                 worked = 0;
             }
-            // A peer that never pauses keeps every read from blocking, and the reader from
+            // A peer that never pauses keeps every read from blocking, and a virtual reader from
             // freeing its carrier for the writer, the closing worker, and the client, so the
             // reader parks once its work fills a slice.
-            if (CarrierShare.spent(worked)) {
+            if (sharesCarrier && CarrierShare.spent(worked)) {
                 CarrierShare.share();
                 worked = 0;
             }

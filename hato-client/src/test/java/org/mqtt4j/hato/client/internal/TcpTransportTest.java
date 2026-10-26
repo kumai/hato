@@ -16,6 +16,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.Pipe;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -398,6 +399,66 @@ class TcpTransportTest {
             assertThat(received.poll(5, SECONDS)).isEqualTo((byte) 1);
             assertThat(resumed.poll(5, SECONDS)).isTrue();
             assertThat(received.poll(5, SECONDS)).isEqualTo((byte) 2);
+        }
+    }
+
+    @Test
+    void connections_read_on_platform_threads_of_their_own_while_one_is_to_spare()
+            throws Exception {
+        // Arrange: one platform thread to spare for reading, and connections that a close ends
+        // at once.
+        var slots = new Semaphore(1);
+        var first = new ReadConnection();
+        var second = new ReadConnection();
+        var third = new ReadConnection();
+        for (ReadConnection connection : List.of(first, second, third)) {
+            connection.lastRead.complete(null);
+        }
+        var firstListener = new ConnectedListener();
+        try (
+                TcpTransport firstSut = readingTransport("first", first, slots);
+                TcpTransport secondSut = readingTransport("second", second, slots);
+                TcpTransport thirdSut = readingTransport("third", third, slots)
+        ) {
+            // Act: the second connects while the first reads, and the third once the first has
+            // closed.
+            firstSut.start(SERVER, TIMEOUT, firstListener);
+            Thread firstReader = requireNonNull(first.readers.poll(5, SECONDS));
+            secondSut.start(SERVER, TIMEOUT, new ConnectedListener());
+            Thread secondReader = requireNonNull(second.readers.poll(5, SECONDS));
+            firstSut.close();
+            firstListener.closed.get(5, SECONDS);
+            thirdSut.start(SERVER, TIMEOUT, new ConnectedListener());
+            Thread thirdReader = requireNonNull(third.readers.poll(5, SECONDS));
+
+            // Assert: the first takes the platform thread and gives it back before it reports
+            // its close; the second reads on the virtual thread that connected it.
+            assertThat(firstReader.isVirtual()).isFalse();
+            assertThat(firstReader.getName()).isEqualTo("hato-first-reader");
+            assertThat(secondReader.isVirtual()).isTrue();
+            assertThat(secondReader.getName()).isEqualTo("hato-second-reader");
+            assertThat(thirdReader.isVirtual()).isFalse();
+        }
+    }
+
+    @Test
+    void a_connection_read_on_a_platform_thread_reports_its_close_once_that_thread_stops()
+            throws Exception {
+        // Arrange: a connection whose last read, which the close ends, returns only when told.
+        var socket = new ReadConnection();
+        var listener = new ConnectedListener();
+        try (TcpTransport sut = readingTransport("closing", socket, new Semaphore(1))) {
+            sut.start(SERVER, TIMEOUT, listener);
+            Thread reader = requireNonNull(socket.readers.poll(5, SECONDS));
+
+            // Act
+            sut.close();
+
+            // Assert: the close waits for the platform reader, and follows once it stops.
+            assertThat(reader.isVirtual()).isFalse();
+            assertThat(listener.closed).isNotDone();
+            socket.lastRead.complete(null);
+            listener.closed.get(5, SECONDS);
         }
     }
 
@@ -1071,6 +1132,54 @@ class TcpTransportTest {
                 (_, _, _) -> socket,
                 timer
         );
+    }
+
+    private TcpTransport readingTransport(
+            String clientId,
+            TcpTransport.Connection socket,
+            Semaphore platformReadingSlots
+    ) {
+        return new TcpTransport(
+                clientId,
+                "mqtt",
+                resolutionSlots,
+                this::resolve,
+                (_, _, _) -> socket,
+                clock,
+                platformReadingSlots
+        );
+    }
+
+    /// Records each thread that reads it. A read waits until the connection closes, and then
+    /// until `lastRead` completes, before it reports the end of the stream.
+    private static final class ReadConnection implements TcpTransport.Connection {
+
+        final LinkedBlockingQueue<Thread> readers = new LinkedBlockingQueue<>();
+        final CompletableFuture<Void> closed = new CompletableFuture<>();
+        final CompletableFuture<Void> lastRead = new CompletableFuture<>();
+
+        @Override
+        public InputStream input() {
+            return new InputStream() {
+                @Override
+                public int read() {
+                    readers.add(Thread.currentThread());
+                    closed.join();
+                    lastRead.join();
+                    return -1;
+                }
+            };
+        }
+
+        @Override
+        public OutputStream output() {
+            return OutputStream.nullOutputStream();
+        }
+
+        @Override
+        public void close() {
+            closed.complete(null);
+        }
     }
 
     private static final class GracefulConnection implements TcpTransport.Connection {
