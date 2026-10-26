@@ -7,7 +7,6 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
@@ -89,7 +88,7 @@ class TcpConnectionTest {
                 // Assert: local cancellation is an I/O failure, not remote EOF.
                 assertThatExceptionOfType(ExecutionException.class)
                         .isThrownBy(() -> read.get(5, SECONDS))
-                        .withCauseInstanceOf(SocketException.class);
+                        .withCauseInstanceOf(IOException.class);
                 assertThat(peer.getInputStream().read()).isEqualTo(-1);
             } finally {
                 sut.close();
@@ -110,8 +109,8 @@ class TcpConnectionTest {
                 sut.close();
                 sut.close();
 
-                assertThatThrownBy(() -> sut.input().read()).isInstanceOf(SocketException.class);
-                assertThatThrownBy(() -> sut.output().write(1)).isInstanceOf(SocketException.class);
+                assertThatThrownBy(() -> sut.input().read()).isInstanceOf(IOException.class);
+                assertThatThrownBy(() -> sut.output().write(1)).isInstanceOf(IOException.class);
                 assertThat(peer.getInputStream().read()).isEqualTo(-1);
             } finally {
                 sut.close();

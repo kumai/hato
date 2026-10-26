@@ -3,6 +3,8 @@ package org.mqtt4j.hato.common.io;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.Pipe;
 import java.util.ArrayList;
 import java.util.HexFormat;
 
@@ -50,6 +52,72 @@ class FrameWriterTest {
         // Assert
         assertThat(bytes.toByteArray()).isEqualTo(HexFormat.of().parseHex("c0004002000a"));
         assertThat(calls).containsExactly("write 2", "flush", "write 4", "flush");
+    }
+
+    @Test
+    void parts_go_through_the_channel_in_order_without_being_joined() throws IOException {
+        // Arrange: a writer whose output stream must stay unused.
+        Pipe pipe = Pipe.open();
+        var output = new OutputStream() {
+            @Override
+            public void write(int value) {
+                throw new AssertionError("Parts go through the channel");
+            }
+        };
+        var sut = new FrameWriter(output, pipe.sink());
+        ByteBuffer[] parts = {
+                ByteBuffer.wrap(HexFormat.of().parseHex("3005")),
+                ByteBuffer.wrap(HexFormat.of().parseHex("000161")),
+                ByteBuffer.wrap(HexFormat.of().parseHex("ff")),
+                ByteBuffer.wrap(HexFormat.of().parseHex("c000"))
+        };
+
+        // Act
+        sut.writeParts(parts);
+
+        // Assert
+        var received = ByteBuffer.allocate(8);
+        while (received.hasRemaining()) {
+            pipe.source().read(received);
+        }
+        assertThat(received.array()).isEqualTo(HexFormat.of().parseHex("3005000161ffc000"));
+        assertThat(parts).allSatisfy(part -> assertThat(part.hasRemaining()).isFalse());
+    }
+
+    @Test
+    void without_a_channel_parts_are_written_one_after_another_then_flushed()
+            throws IOException {
+        // Arrange
+        var bytes = new ByteArrayOutputStream();
+        var calls = new ArrayList<String>();
+        var output = new OutputStream() {
+            @Override
+            public void write(int value) {
+                throw new AssertionError("Use one bulk write for each part");
+            }
+
+            @Override
+            public void write(byte[] part, int offset, int length) {
+                calls.add("write " + length);
+                bytes.write(part, offset, length);
+            }
+
+            @Override
+            public void flush() {
+                calls.add("flush");
+            }
+        };
+        var sut = new FrameWriter(output);
+
+        // Act
+        sut.writeParts(new ByteBuffer[] {
+                ByteBuffer.wrap(HexFormat.of().parseHex("3005")),
+                ByteBuffer.wrap(HexFormat.of().parseHex("000161ff"))
+        });
+
+        // Assert
+        assertThat(bytes.toByteArray()).isEqualTo(HexFormat.of().parseHex("3005000161ff"));
+        assertThat(calls).containsExactly("write 2", "write 4", "flush");
     }
 
     @Test

@@ -6,11 +6,15 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.channels.SocketChannel;
 import java.time.Duration;
+
+import org.jspecify.annotations.Nullable;
 
 import static java.util.Objects.requireNonNull;
 
-/// Owns one connected TCP socket and its blocking input and output streams.
+/// Owns one connected TCP socket and its blocking input and output streams. The sockets that it
+/// creates itself have a channel, which also writes several buffers at once.
 ///
 /// One reader and one writer may use the connection concurrently. The owner serializes reads
 /// with other reads and writes with other writes; it may close the connection from any thread.
@@ -63,7 +67,7 @@ public final class TcpConnection implements Closeable {
         }
         int timeoutMillis = timeoutMillis(connectTimeout);
         var address = new InetSocketAddress(host, port);
-        return connect(new Socket(), address, Duration.ofMillis(timeoutMillis));
+        return connect(SocketChannel.open().socket(), address, Duration.ofMillis(timeoutMillis));
     }
 
     /// Establishes a TCP connection without resolving a host name.
@@ -79,7 +83,7 @@ public final class TcpConnection implements Closeable {
             InetSocketAddress address,
             Duration connectTimeout
     ) throws IOException {
-        return connect(new Socket(), address, connectTimeout);
+        return connect(SocketChannel.open().socket(), address, connectTimeout);
     }
 
     /// Connects a caller-created plain socket, taking ownership of it on success or failure.
@@ -139,6 +143,13 @@ public final class TcpConnection implements Closeable {
         return output;
     }
 
+    /// Returns the channel of the socket, which writes several buffers with one gathering write,
+    /// for the writer that also uses [#output()]; null for a socket that the caller created
+    /// without a channel.
+    public @Nullable SocketChannel channel() {
+        return socket.getChannel();
+    }
+
     /// Ends the output direction after the bytes already written, so the peer reads the end of
     /// the stream, while the input stays readable until the peer ends its direction too.
     /// Repeated calls before [#close] are harmless.
@@ -156,9 +167,10 @@ public final class TcpConnection implements Closeable {
 
     /// Closes both directions and releases the socket. Repeated calls are harmless.
     ///
-    /// May be called from any thread. A thread blocked in socket I/O is released with a
-    /// [java.net.SocketException], including when that thread is virtual. The connection
-    /// cannot be reopened and this operation does not send an MQTT DISCONNECT packet.
+    /// May be called from any thread. A thread blocked in socket I/O is released with an
+    /// [IOException], including when that thread is virtual: a [java.net.SocketException], or an
+    /// [java.nio.channels.AsynchronousCloseException] for a socket that has a channel. The
+    /// connection cannot be reopened and this operation does not send an MQTT DISCONNECT packet.
     ///
     /// @throws IOException if closing the socket fails
     @Override

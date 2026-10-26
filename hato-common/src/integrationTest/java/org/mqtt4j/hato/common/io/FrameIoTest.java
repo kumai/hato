@@ -4,7 +4,6 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
-import java.net.SocketException;
 import java.time.Duration;
 import java.util.HexFormat;
 import java.util.List;
@@ -143,9 +142,9 @@ class FrameIoTest {
 
                 assertThatExceptionOfType(ExecutionException.class)
                         .isThrownBy(() -> received.get(5, SECONDS))
-                        .withCauseInstanceOf(SocketException.class);
+                        .withCauseInstanceOf(IOException.class);
                 assertThatThrownBy(() -> writer.write(HexFormat.of().parseHex("c000")))
-                        .isInstanceOf(SocketException.class);
+                        .isInstanceOf(IOException.class);
             } finally {
                 connection.close();
             }

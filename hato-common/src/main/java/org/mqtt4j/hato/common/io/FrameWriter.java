@@ -2,6 +2,10 @@ package org.mqtt4j.hato.common.io;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.GatheringByteChannel;
+
+import org.jspecify.annotations.Nullable;
 
 import static java.util.Objects.requireNonNull;
 
@@ -14,9 +18,19 @@ public final class FrameWriter {
 
     private final OutputStream output;
 
+    // The channel that `output` writes to, for gathering writes, or null.
+    private final @Nullable GatheringByteChannel channel;
+
     /// Creates a writer using the borrowed output stream.
     public FrameWriter(OutputStream output) {
+        this(output, null);
+    }
+
+    /// Creates a writer using the borrowed output stream and, for [#writeParts(ByteBuffer[])], the
+    /// borrowed channel that the stream writes to, if any.
+    public FrameWriter(OutputStream output, @Nullable GatheringByteChannel channel) {
         this.output = requireNonNull(output, "output must not be null");
+        this.channel = channel;
     }
 
     /// Writes one complete packet with one [OutputStream#write(byte[])] call, then flushes.
@@ -46,5 +60,32 @@ public final class FrameWriter {
         output.write(head);
         output.write(rest);
         output.flush();
+    }
+
+    /// Writes the bytes that remain in `parts`, which hold complete packets one after another, and
+    /// flushes: with gathering writes of the channel, which spare joining the parts in a new
+    /// array, or without a channel with one [OutputStream#write(byte[], int, int)] call for each
+    /// part. Do not modify the parts during this call; their positions advance.
+    ///
+    /// @throws IOException if writing or flushing fails
+    public void writeParts(ByteBuffer[] parts) throws IOException {
+        requireNonNull(parts, "parts must not be null");
+        if (channel == null) {
+            for (ByteBuffer part : parts) {
+                output.write(part.array(), part.arrayOffset() + part.position(), part.remaining());
+                part.position(part.limit());
+            }
+            output.flush();
+            return;
+        }
+        long remaining = 0;
+        for (ByteBuffer part : parts) {
+            remaining += part.remaining();
+        }
+        // A blocking channel writes everything it is given, unless the operating system takes
+        // fewer buffers at once than the parts, so the loop goes on until nothing remains.
+        while (remaining > 0) {
+            remaining -= channel.write(parts);
+        }
     }
 }
