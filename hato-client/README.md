@@ -144,7 +144,9 @@ A few behaviors shape everything below, and most surprises come from one of them
 - **Your handler may block.** The client calls a subscription's message handler for one
   message at a time, apart from the network, by default on a thread of the client or
   on an executor that you choose, and other subscriptions' handlers run meanwhile. The handler
-  can write to a database, or publish and wait for the result.
+  can write to a database, or publish and wait for the result. Only a subscription that you
+  mark as [inline](#running-handlers-as-part-of-receiving) promises the opposite: its handler
+  returns at once, and the connection waits for it.
   [Where your code runs](#where-your-code-runs) covers every callback.
 - **Acknowledgements keep arrival order.** The client acknowledges QoS 1 and 2 messages in the
   order they arrived, across all subscriptions of a connection, so one slow handler or one
@@ -382,6 +384,7 @@ your code runs, how many messages run at once, and which order is kept:
 | The threads that own each device's state | [`DeliveryOptions.lanes(selector)`](#running-each-device-on-its-own-thread) | per lane | one per lane |
 | Each device in order, devices in parallel | [`DeliveryOptions.striped(n, key)`](#running-devices-in-parallel) | per key | up to `n` |
 | Independent messages, as fast as possible | [`DeliveryOptions.parallel(n)`](#running-independent-messages-in-parallel) | none | up to `n` |
+| The least overhead, for a handler that returns at once | [`DeliveryOptions.inline()`](#running-handlers-as-part-of-receiving) | arrival | one |
 | A queue that your application owns | [`client.handOff(request, mailbox::offer)`](#handing-messages-to-your-own-mailbox) | arrival, into your queue | your choice |
 | Your own threads taking messages | [`client.subscribe(request)` and `receive()`](#receiving-on-your-own-threads) | arrival, as taken | one per thread |
 
@@ -390,7 +393,8 @@ your code runs, how many messages run at once, and which order is kept:
   acknowledgements wait behind them. Striping by device lets devices go on independently
   while each keeps its order, and with enough stripes the processing can keep up.
 - Choose by the order that you need, not by overhead: running messages on stripes or in
-  parallel costs little next to a handler that does real work.
+  parallel costs little next to a handler that does real work. Inline delivery saves the
+  hand-off to another thread, which matters only for a handler that takes microseconds.
 - Use lanes when the work must run on threads that your application already owns. Hand off
   when your application already has a queue, such as a mailbox that also takes work of its
   own. Receive on your own threads when your loop should decide when to take each next
@@ -482,6 +486,35 @@ Subscription subscription = client.subscribe(
 - Up to 16 messages run at once, in no particular order: a later message can finish before an
   earlier one, even one from the same device.
 - `.withExecutor(pool)` works here too.
+
+### Running handlers as part of receiving
+
+A handler that only updates memory and returns at once can run as part of receiving its
+message, which spares the client handing each message to another thread:
+
+```java
+Map<Topic, MqttMessage> latest = new ConcurrentHashMap<>();
+
+Subscription subscription = client.subscribe(
+        Subscribe.of(new TopicFilter("sensors/+/temperature"), Qos.AT_LEAST_ONCE),
+        // The handler only stores the reading, so it may run as part of receiving.
+        DeliveryOptions.inline(),
+        delivery -> latest.put(delivery.message().topic(), delivery.message())
+);
+```
+
+- Messages run one at a time, in arrival order, as with a handler alone.
+- While the handler runs, the connection may read nothing else: no messages for your other
+  subscriptions, and no answers to your publications or to the keep-alive. A handler that
+  blocks holds up the whole connection, and one that runs for about the keep-alive interval
+  can lose it.
+- Never wait for this client inside the handler. `join()` and `get()` of the futures that it
+  returns, and `receive()` of its pull subscriptions, throw `IllegalStateException` there, even
+  when the result is already in. Read a completed result with `getNow()`, or chain the next step
+  instead; a publication that you start without waiting goes out as usual. Other waits are not
+  detected.
+- The buffer, the acknowledgement mode, and the failure policy work as with a handler alone.
+  `.withExecutor(pool)` does not apply.
 
 ### Handing messages to your own mailbox
 
@@ -815,12 +848,14 @@ Subscription subscription = client.subscribe(
 
 ## Where your code runs
 
-None of your code runs on the threads that read and write the network, so a slow callback
-never stalls the connection or its keep-alive.
+Unless you choose [inline delivery](#running-handlers-as-part-of-receiving), none of your code
+runs on the threads that read and write the network, so a slow callback never stalls the
+connection or its keep-alive.
 
 | Your code | Runs on | Can it block? |
 | --- | --- | --- |
 | Message handler | By default, a thread of the client for each subscription, or up to `n` with striped or parallel delivery. With `withExecutor(pool)` or `lanes(selector)`, a thread of your executor instead | Yes. Its own subscription waits meanwhile, and acknowledgements keep [arrival order](#acknowledgements-keep-arrival-order). On your executor, it also holds that executor's thread |
+| Inline message handler | Possibly as part of receiving, before the connection reads on | No. The whole connection waits meanwhile, and waiting for this client throws |
 | Hand-off acceptor | One thread of the client, shared by all hand-off subscriptions | No. The other hand-off subscriptions wait while it runs |
 | `receive()` | Your own threads | Yes |
 | Connection listener, metrics listener | A thread of its own for each listener, one notification at a time | Briefly. A listener that falls behind loses its oldest notifications |
@@ -978,6 +1013,7 @@ changed copies.
 | `maxPacketSize(n)` | 16 MiB | Accept larger incoming packets, or only smaller ones. MQTT 5.0 tells the broker the limit; on MQTT 3.1.1, a larger packet ends the connection. |
 | `DeliveryOptions.striped(n, key)`, `parallel(n)` | One message at a time | Let the handler process up to 256 messages of a subscription at once; see [Choosing how messages run](#choosing-how-messages-run). |
 | `DeliveryOptions.withExecutor(pool)`, `lanes(selector)` | Threads of the client | Run message handlers on executors that your application owns; the client never shuts them down. |
+| `DeliveryOptions.inline()` | Handlers apart from the network | Spare the hand-off for a handler that returns at once; see [Running handlers as part of receiving](#running-handlers-as-part-of-receiving). |
 
 The client keeps some limits internal, such as the deliveries and bytes that it holds across
 subscriptions. [Stats](#checking-what-the-client-holds) report their use and limit, and when one

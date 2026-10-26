@@ -11,7 +11,7 @@ bytecode generation.
 - The client [reconnects by itself](hato-client/README.md#staying-connected) and subscribes
   again after each reconnection.
 - A message handler processes one message at a time by default.
-  [Parallel processing, your own executors, hand-off to your own queue, and pull delivery](hato-client/README.md#choosing-how-messages-run)
+  [Parallel processing, your own executors, handlers that run as part of receiving, hand-off to your own queue, and pull delivery](hato-client/README.md#choosing-how-messages-run)
   are there when you need them.
 
 An embedded in-memory broker and a test kit are separate modules, for local development,

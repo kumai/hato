@@ -29,6 +29,17 @@ class DeliveryOptionsTest {
     }
 
     @Test
+    void inline_options_run_handlers_as_part_of_receiving_and_refuse_an_executor() {
+        // Act
+        DeliveryOptions sut = DeliveryOptions.inline();
+
+        // Assert
+        assertThat(sut.execution()).isEqualTo(new HandlerExecution.Inline());
+        assertThatThrownBy(() -> sut.withExecutor(Runnable::run))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void options_with_the_same_executor_are_not_equal() {
         Executor executor = Runnable::run;
 

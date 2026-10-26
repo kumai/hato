@@ -1126,6 +1126,81 @@ abstract class MessagingTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(Qos.class)
+    void an_inline_subscription_receives_every_message_in_order(Qos qos) throws Exception {
+        // Arrange: more messages than a broker lets wait for their acknowledgements, so that
+        // reception stalls unless the inline handler's acknowledgements go out.
+        String topic = uniqueTopic();
+        var received = new LinkedBlockingQueue<Byte>();
+        try (MqttClient sut = client(); MqttClient publisher = client()) {
+            sut.connect().get(5, SECONDS);
+            publisher.connect().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic), qos),
+                    DeliveryOptions.inline(),
+                    delivery -> received.add(delivery.message().payload()[0])
+            ).established().get(5, SECONDS);
+
+            // Act
+            for (int i = 0; i < 100; i++) {
+                var message = MqttMessage.of(new Topic(topic), new byte[] {(byte) i}, qos, false);
+                publisher.publish(message).get(5, SECONDS);
+            }
+
+            // Assert
+            for (int i = 0; i < 100; i++) {
+                assertThat(received.poll(5, SECONDS)).isEqualTo((byte) i);
+            }
+        }
+    }
+
+    @Test
+    void an_inline_handler_that_waits_for_its_own_client_is_refused_and_its_reply_goes_out()
+            throws Exception {
+        // Arrange: the inline handler publishes a reply and then waits for it.
+        String topic = uniqueTopic();
+        var refused = new LinkedBlockingQueue<Throwable>();
+        var replies = new LinkedBlockingQueue<MqttDelivery>();
+        try (MqttClient sut = client()) {
+            sut.connect().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic + "/replies"), Qos.AT_LEAST_ONCE),
+                    replies::add
+            ).established().get(5, SECONDS);
+            sut.subscribe(
+                    Subscribe.of(new TopicFilter(topic + "/requests"), Qos.AT_LEAST_ONCE),
+                    DeliveryOptions.inline(),
+                    delivery -> {
+                        CompletableFuture<PublishResult> reply = sut.publish(MqttMessage.of(
+                                new Topic(topic + "/replies"),
+                                delivery.message().payload(),
+                                Qos.AT_LEAST_ONCE,
+                                false
+                        ));
+                        try {
+                            reply.join();
+                        } catch (IllegalStateException failure) {
+                            refused.add(failure);
+                        }
+                    }
+            ).established().get(5, SECONDS);
+
+            // Act
+            sut.publish(MqttMessage.of(
+                    new Topic(topic + "/requests"),
+                    new byte[] {1},
+                    Qos.AT_LEAST_ONCE,
+                    false
+            )).get(5, SECONDS);
+
+            // Assert: the wait fails at once, and the reply goes out once the handler returns.
+            assertThat(refused.poll(5, SECONDS)).isInstanceOf(IllegalStateException.class);
+            assertThat(requireNonNull(replies.poll(5, SECONDS)).message().payload())
+                    .containsExactly(1);
+        }
+    }
+
     /// The protocol version of this run's clients.
     MqttVersion version() {
         return version;

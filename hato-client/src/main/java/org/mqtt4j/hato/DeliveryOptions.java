@@ -20,7 +20,9 @@ import static java.util.Objects.requireNonNull;
 /// default their topics, and runs different keys at the same time on a fixed number of stripes;
 /// each stripe is a lane in what follows. [#parallel(int)] runs up to a given number of
 /// deliveries at the same time in no particular order, as one lane that runs that many at once.
-/// A handler on an internal thread may block: meanwhile only its own lane waits.
+/// [#inline()] runs one delivery at a time, in receive order, for a handler that returns at
+/// once: the client may run it as part of receiving, and the connection waits for it meanwhile.
+/// Any other handler on an internal thread may block: meanwhile only its own lane waits.
 ///
 /// An executor that runs handlers receives at most one task per subscription and lane at a time,
 /// or, for [#parallel(int)], as many as its parallelism. A task runs one delivery's handler and,
@@ -54,6 +56,9 @@ public final class DeliveryOptions {
 
     private static final DeliveryOptions SERIAL =
             new DeliveryOptions(new HandlerExecution.Internal());
+
+    private static final DeliveryOptions INLINE =
+            new DeliveryOptions(new HandlerExecution.Inline());
 
     private final HandlerExecution execution;
 
@@ -114,12 +119,35 @@ public final class DeliveryOptions {
         return new DeliveryOptions(new HandlerExecution.Parallel(parallelism, null));
     }
 
+    /// One delivery at a time, in receive order, as [#serial()], for a handler that returns at
+    /// once and never waits for this client. In return, the client may run the handler as part
+    /// of receiving its message, rather than hand the delivery to another thread. While such a
+    /// handler runs, the connection may read nothing else: neither messages for other
+    /// subscriptions nor the broker's answers to publications, subscriptions, and keep-alive
+    /// requests.
+    ///
+    /// Inside the handler, `join()` and `get()` of a future that this client returned, or of a
+    /// future made from one, and the `receive` methods of this client's pull subscriptions throw
+    /// [IllegalStateException], even when they would not wait. Read a completed result with
+    /// `getNow`, or chain the next step instead. Other waits are not detected: a handler that
+    /// blocks, or that waits for anything that needs this connection, holds up every subscription
+    /// of the connection, and one that runs for about the keep-alive interval can lose the
+    /// connection.
+    ///
+    /// A delivery that the client cannot run as part of receiving runs on an internal thread, in
+    /// the same order and under the same rules. The subscription's buffer, acknowledgement mode,
+    /// and failure policy work as for [#serial()]. [#withExecutor(Executor)] rejects these
+    /// options.
+    public static DeliveryOptions inline() {
+        return INLINE;
+    }
+
     /// Keeps the order, stripes, or parallelism of these options, with each handler running on
     /// `executor` instead of an internal thread. Replaces an executor chosen earlier.
     ///
     /// @throws NullPointerException if `executor` is null
     /// @throws IllegalArgumentException if these options are [#lanes(Function)], whose selector
-    ///         chooses the executors
+    ///         chooses the executors, or [#inline()], whose handler runs as part of receiving
     public DeliveryOptions withExecutor(Executor executor) {
         requireNonNull(executor, "executor");
         return switch (execution) {

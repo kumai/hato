@@ -6450,6 +6450,59 @@ class ClientActorTest {
     }
 
     @Test
+    void an_inline_handler_that_waits_for_its_own_client_is_refused_at_once() throws Exception {
+        // Arrange: the inline handler publishes and waits for the result.
+        var refused = new LinkedBlockingQueue<Throwable>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            subscribeWith(sut, transport, qosOneRequest(), DeliveryOptions.inline(), _ -> {
+                try {
+                    sut.publish(message(new byte[] {1})).join();
+                } catch (IllegalStateException failure) {
+                    refused.add(failure);
+                }
+            });
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Assert: the wait fails at once rather than hold up the connection.
+            assertThat(refused.poll(5, SECONDS))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("inline handler");
+        }
+    }
+
+    @Test
+    void an_inline_handler_that_receives_from_a_pull_subscription_of_its_client_is_refused()
+            throws Exception {
+        // Arrange: the inline handler takes from a pull subscription of the same client.
+        var refused = new LinkedBlockingQueue<Throwable>();
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            PullSubscription pull = sut.subscribe(
+                    Subscribe.of(new TopicFilter("other"), Qos.AT_LEAST_ONCE)
+            );
+            establish(transport, pull);
+            subscribeWith(sut, transport, qosOneRequest(), DeliveryOptions.inline(), _ -> {
+                try {
+                    pull.receive(Duration.ofSeconds(1));
+                } catch (IllegalStateException failure) {
+                    refused.add(failure);
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+
+            // Act
+            transport.receive(qosOnePublication("messages", 1, false));
+
+            // Assert
+            assertThat(refused.poll(5, SECONDS)).isInstanceOf(IllegalStateException.class);
+        }
+    }
+
+    @Test
     void a_handler_failure_on_an_executor_holds_the_rest_of_the_subscription() throws Exception {
         // Arrange: two QoS 1 deliveries wait, and the first handler fails.
         var executor = new ManualExecutor();
