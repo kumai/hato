@@ -12,6 +12,9 @@ import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
+import java.nio.channels.GatheringByteChannel;
+import java.nio.channels.Pipe;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -784,6 +787,41 @@ class TcpTransportTest {
     }
 
     @Test
+    void parts_written_by_the_caller_leave_through_the_channel_and_are_reported_at_once()
+            throws Exception {
+        // Arrange: a connection whose channel is a pipe.
+        Pipe pipe = Pipe.open();
+        var socket = new GracefulConnection();
+        socket.channel = pipe.sink();
+        var receiver = new WritingListener();
+        try (TcpTransport sut = transport(socket, clock)) {
+            sut.start(SERVER, TIMEOUT, receiver);
+            receiver.connected.get(5, SECONDS);
+
+            // Act
+            Transport.SendResult result = sut.writeParts(7, new ByteBuffer[] {
+                    ByteBuffer.wrap(new byte[] {1, 2}),
+                    ByteBuffer.wrap(new byte[] {3, 4, 5})
+            });
+
+            // Assert: the parts arrive in order, reported on this thread before write returns.
+            assertThat(sut.gathers()).isTrue();
+            assertThat(result).isEqualTo(Transport.SendResult.ACCEPTED);
+            var received = ByteBuffer.allocate(5);
+            while (received.hasRemaining()) {
+                pipe.source().read(received);
+            }
+            assertThat(received.array()).containsExactly(1, 2, 3, 4, 5);
+            assertThat(receiver.sent).containsExactly(7L);
+            assertThat(receiver.senders).containsExactly(Thread.currentThread());
+        } finally {
+            socket.abort();
+            pipe.sink().close();
+            pipe.source().close();
+        }
+    }
+
+    @Test
     void closing_during_a_write_made_by_the_caller_leaves_it_to_on_closed() throws Exception {
         // Arrange: the socket takes no bytes until it is aborted.
         var socket = new GracefulConnection();
@@ -945,6 +983,7 @@ class TcpTransportTest {
         @Nullable IOException handshakeFailure;
         @Nullable IOException shutdownFailure;
         OutputStream output = OutputStream.nullOutputStream();
+        @Nullable GatheringByteChannel channel;
 
         @Override
         public void handshake() throws IOException {
@@ -991,6 +1030,11 @@ class TcpTransportTest {
         @Override
         public void abort() {
             aborted.complete(null);
+        }
+
+        @Override
+        public @Nullable GatheringByteChannel channel() {
+            return channel;
         }
     }
 

@@ -10,6 +10,8 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.channels.GatheringByteChannel;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.Semaphore;
@@ -83,6 +85,12 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         default void abort() throws IOException {
             close();
         }
+
+        // The channel that output() writes to, which writes several buffers with one gathering
+        // write, or null.
+        default @Nullable GatheringByteChannel channel() {
+            return null;
+        }
     }
 
     // DNS resolution is not reliably cancellable. Bound active lookups across the JVM;
@@ -106,6 +114,9 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     private @Nullable FrameWriter frames;
     // A write that the client makes through write() is under way.
     private boolean writing;
+    // Whether the connection writes several parts with one gathering write; set before
+    // onConnected, so before any write.
+    private volatile boolean gathering;
     private boolean writerStarted;
     private int ioWorkers;
     private boolean closed;
@@ -250,7 +261,8 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                         }
                         // Ready before onConnected, which may send at once. The writer thread
                         // starts with the first send; a client that writes itself needs none.
-                        frames = new FrameWriter(socket.output());
+                        frames = new FrameWriter(socket.output(), socket.channel());
+                        gathering = socket.channel() != null;
                         receiver.onConnected();
                         if (closed) {
                             return;
@@ -422,6 +434,17 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         return writeHere(ticket, writer -> writer.write(header, payload));
     }
 
+    @Override
+    public boolean gathers() {
+        return gathering;
+    }
+
+    @Override
+    public SendResult writeParts(long ticket, ByteBuffer[] parts) {
+        requireNonNull(parts, "parts");
+        return writeHere(ticket, writer -> writer.writeParts(parts));
+    }
+
     @FunctionalInterface
     private interface FrameWrite {
 
@@ -578,6 +601,11 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             @Override
             public void close() throws IOException {
                 socket.close();
+            }
+
+            @Override
+            public @Nullable GatheringByteChannel channel() {
+                return socket.channel();
             }
         };
     }

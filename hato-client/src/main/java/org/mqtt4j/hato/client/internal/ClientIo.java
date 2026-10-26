@@ -2,6 +2,7 @@ package org.mqtt4j.hato.client.internal;
 
 import java.lang.System.Logger.Level;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -91,6 +92,11 @@ final class ClientIo {
     // slower that way, because the extra write cost as much as the copy it saved, and payloads
     // from 128 KiB to 1 MiB published 13 to 22% faster. Such a send goes alone anyway.
     static final int APART_PAYLOAD_BYTES = 128 * 1024;
+
+    // On a transport that gathers, a payload this small is joined to the headers around it
+    // rather than written where its message keeps it: copying it costs less than another buffer
+    // in the gathering write.
+    static final int JOIN_PAYLOAD_BYTES = 4 * 1024;
 
     // Receive capacity counts each property of a received packet with this many bytes beyond
     // the packet's size. Decoded, a User Property takes up to 118 bytes of memory beyond its
@@ -554,10 +560,19 @@ final class ClientIo {
         }
     }
 
-    /// What the one write of `sends` carries. A PUBLISH that goes alone with a payload of at least
+    /// What the one write of `sends` carries. A transport that gathers takes the parts that
+    /// [#parts] makes. Otherwise, a PUBLISH that goes alone with a payload of at least
     /// [#APART_PAYLOAD_BYTES] leaves as its header and then its payload on a transport that lets
     /// the sender write; anything else leaves as one array.
     private Encoded encode(Connection connection, List<SendQueue.Send<Outbound>> sends) {
+        if (connection.transport instanceof BlockingWriteTransport direct && direct.gathers()) {
+            ByteBuffer[] parts = parts(sends);
+            // Packets that join into one part, as small ones do, go as one array by the plain
+            // write that they took before; only writes with a large payload gather.
+            return parts.length == 1
+                    ? new Encoded.Whole(parts[0].array())
+                    : new Encoded.Gathered(parts);
+        }
         if (sends.size() == 1 && connection.transport instanceof BlockingWriteTransport) {
             SendQueue.Send<Outbound> send = sends.getFirst();
             MqttMessage message = send.value().message();
@@ -569,6 +584,62 @@ final class ClientIo {
             }
         }
         return new Encoded.Whole(encode(sends));
+    }
+
+    /// The parts of the one gathering write that carries `sends`: the headers and the payloads
+    /// under [#JOIN_PAYLOAD_BYTES], joined in runs, and each larger payload where its message
+    /// keeps it, so that no such payload is copied on its way out.
+    private ByteBuffer[] parts(List<SendQueue.Send<Outbound>> sends) {
+        var parts = new ArrayList<ByteBuffer>();
+        var run = new ArrayList<byte[]>();
+        for (SendQueue.Send<Outbound> send : sends) {
+            Outbound outbound = send.value();
+            MqttMessage message = outbound.message();
+            if (message == null) {
+                if (outbound.redacted()) {
+                    log.trace("Write attempt for ticket {}: {} bytes (redacted)",
+                            send.ticket(), outbound.header().length);
+                } else {
+                    log.trace("Write attempt for ticket {}: {}", send.ticket(), outbound.header());
+                }
+                run.add(outbound.header());
+                continue;
+            }
+            byte[] header = outbound.currentHeader();
+            byte[] payload = payloadOf.apply(message);
+            log.trace("Write attempt for ticket {}: {} bytes of header and {} of payload",
+                    send.ticket(), header.length, payload.length);
+            run.add(header);
+            if (payload.length < JOIN_PAYLOAD_BYTES) {
+                run.add(payload);
+            } else {
+                parts.add(ByteBuffer.wrap(joined(run)));
+                run.clear();
+                parts.add(ByteBuffer.wrap(payload));
+            }
+        }
+        if (!run.isEmpty()) {
+            parts.add(ByteBuffer.wrap(joined(run)));
+        }
+        return parts.toArray(ByteBuffer[]::new);
+    }
+
+    /// `arrays` one after another in one array, or the only one itself.
+    private static byte[] joined(List<byte[]> arrays) {
+        if (arrays.size() == 1) {
+            return arrays.getFirst();
+        }
+        int length = 0;
+        for (byte[] array : arrays) {
+            length += array.length;
+        }
+        var joined = new byte[length];
+        int at = 0;
+        for (byte[] array : arrays) {
+            System.arraycopy(array, 0, joined, at, array.length);
+            at += array.length;
+        }
+        return joined;
     }
 
     /// The bytes of `sends`, one after another, as the one write that carries them.
@@ -891,8 +962,8 @@ final class ClientIo {
     private record Write(Connection connection, List<SendQueue.Send<Outbound>> sends) {
     }
 
-    /// What one write carries: one array, or a PUBLISH header and its payload, which the
-    /// transport writes one after the other.
+    /// What one write carries: one array, a PUBLISH header and its payload, which the transport
+    /// writes one after the other, or parts that it writes where they lie.
     private sealed interface Encoded {
 
         Transport.SendResult writeTo(Transport transport, long ticket);
@@ -914,6 +985,15 @@ final class ClientIo {
             @Override
             public Transport.SendResult writeTo(Transport transport, long ticket) {
                 return ((BlockingWriteTransport) transport).write(ticket, header, payload);
+            }
+        }
+
+        record Gathered(ByteBuffer[] parts) implements Encoded {
+
+            // Only a transport that gathers takes parts; see encode.
+            @Override
+            public Transport.SendResult writeTo(Transport transport, long ticket) {
+                return ((BlockingWriteTransport) transport).writeParts(ticket, parts);
             }
         }
     }

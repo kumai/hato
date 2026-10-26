@@ -3,6 +3,7 @@ package org.mqtt4j.hato.client.internal;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -634,6 +635,56 @@ class ClientIoTest {
         assertThat(packet.dup()).isTrue();
         assertThat(packet.packetId()).isEqualTo(7);
         assertThat(packet.payload()).isEqualTo(payload);
+    }
+
+    @Test
+    void a_transport_that_gathers_gets_large_payloads_from_their_messages_own_arrays()
+            throws Exception {
+        // Arrange: a transport that gathers, and publications with small and large payloads.
+        var transport = new GatheringTransport();
+        var io = new ClientIo(
+                URI.create("mqtt://localhost"),
+                "io-test",
+                16 * 1024 * 1024,
+                128,
+                0,
+                _ -> transport,
+                events,
+                codec,
+                MqttMessageAccess::payloadArray
+        );
+        batching.add(io);
+        io.open(1, Duration.ofSeconds(30));
+        var small = MqttMessage.of(new Topic("small"), new byte[] {1, 2}, Qos.AT_MOST_ONCE, false);
+        var large = MqttMessage.of(
+                new Topic("large"),
+                new byte[ClientIo.JOIN_PAYLOAD_BYTES],
+                Qos.AT_MOST_ONCE,
+                false
+        );
+
+        // Act
+        assertThat(io.publish(1, 1, small, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+        assertThat(io.publish(1, 2, large, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+        assertThat(io.publish(1, 3, small, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+
+        // Assert: the packets leave in order, and the large payload from the message's array.
+        await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L, 3L));
+        var expected = new ByteArrayOutputStream();
+        for (MqttMessage message : List.of(small, large, small)) {
+            expected.writeBytes(codec.encode(new Packet.Publish(
+                    message.topic(),
+                    MqttMessageAccess.payloadArray(message),
+                    message.qos(),
+                    false,
+                    false,
+                    0,
+                    EMPTY
+            )));
+        }
+        byte[] own = MqttMessageAccess.payloadArray(large);
+        assertThat(transport.bytes.toByteArray()).isEqualTo(expected.toByteArray());
+        assertThat(transport.arrays).anySatisfy(array -> assertThat(array).isSameAs(own));
     }
 
     @Test
@@ -1528,6 +1579,52 @@ class ClientIoTest {
         @Override
         public void close() {
             closed = true;
+        }
+    }
+
+    private static final class GatheringTransport implements Transport, BlockingWriteTransport {
+
+        // The bytes written, in order, and the arrays that every write took, whole or in parts.
+        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        final List<byte[]> arrays = new CopyOnWriteArrayList<>();
+        @Nullable Listener listener;
+
+        @Override
+        public void start(URI endpoint, Duration timeout, Listener receiver) {
+            listener = receiver;
+            receiver.onConnected();
+        }
+
+        @Override
+        public SendResult send(long ticket, byte[] bytes) {
+            throw new AssertionError("The client writes through write()");
+        }
+
+        @Override
+        public synchronized SendResult write(long ticket, byte[] bytes) {
+            arrays.add(bytes);
+            this.bytes.writeBytes(bytes);
+            requireNonNull(listener).onSent(ticket);
+            return SendResult.ACCEPTED;
+        }
+
+        @Override
+        public boolean gathers() {
+            return true;
+        }
+
+        @Override
+        public synchronized SendResult writeParts(long ticket, ByteBuffer[] parts) {
+            for (ByteBuffer part : parts) {
+                arrays.add(part.array());
+                bytes.write(part.array(), part.arrayOffset() + part.position(), part.remaining());
+            }
+            requireNonNull(listener).onSent(ticket);
+            return SendResult.ACCEPTED;
+        }
+
+        @Override
+        public void close() {
         }
     }
 
