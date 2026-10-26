@@ -1,9 +1,11 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.List;
 
 import com.sun.management.ThreadMXBean;
 import org.junit.jupiter.api.Test;
@@ -87,6 +89,42 @@ class IncomingFramesTest {
     }
 
     @ParameterizedTest
+    @ValueSource(ints = {1, 7, 127, 8192, 100000})
+    void lent_chunks_decode_as_handed_over_ones_although_the_buffer_is_reused(int chunkSize) {
+        // Arrange: small publications around one of 64 KiB, which gets storage of its size at
+        // once, and one of 200 KiB, which keeps the parts that arrive, with PINGRESPs between.
+        var codec = PacketCodec.of(MqttVersion.V3_1_1);
+        List<Packet> sent = List.of(
+                publish("a", 16, Qos.AT_MOST_ONCE, 0),
+                publish("large", 65536, Qos.AT_LEAST_ONCE, 7),
+                new Packet.PingResp(),
+                publish("larger", 200 * 1024, Qos.AT_MOST_ONCE, 0),
+                publish("a", 16, Qos.AT_LEAST_ONCE, 8),
+                new Packet.PingResp()
+        );
+        var stream = new ByteArrayOutputStream();
+        for (Packet packet : sent) {
+            stream.writeBytes(codec.encode(packet));
+        }
+        byte[] bytes = stream.toByteArray();
+        var received = new ArrayList<Packet>();
+        var sut = new IncomingFrames(bytes.length, codec, (packet, _) -> received.add(packet));
+        var buffer = new byte[chunkSize + 5];
+
+        // Act: each chunk lies in the same buffer, after five other bytes, and the buffer is
+        // overwritten once the call returns.
+        for (int offset = 0; offset < bytes.length; offset += chunkSize) {
+            int length = Math.min(chunkSize, bytes.length - offset);
+            System.arraycopy(bytes, offset, buffer, 5, length);
+            sut.acceptLent(buffer, 5, length);
+            Arrays.fill(buffer, (byte) 0x55);
+        }
+
+        // Assert
+        assertThat(received).containsExactlyElementsOf(sent);
+    }
+
+    @ParameterizedTest
     @ValueSource(ints = {0, 1, 16383})
     void an_incomplete_frame_allocates_for_received_bytes_and_can_be_cleared(int received) {
         // Arrange
@@ -132,6 +170,22 @@ class IncomingFramesTest {
 
         assertThat(packets).containsExactly(new Packet.PingResp());
         assertThat(sizes).containsExactly(bytes.length);
+    }
+
+    private static Packet.Publish publish(String topic, int size, Qos qos, int packetId) {
+        var payload = new byte[size];
+        for (int i = 0; i < size; i++) {
+            payload[i] = (byte) (i % 251);
+        }
+        return new Packet.Publish(
+                new Topic(topic),
+                payload,
+                qos,
+                false,
+                false,
+                packetId,
+                Properties.EMPTY
+        );
     }
 
     // Heap bytes this thread has allocated so far, or -1 where the JVM cannot measure them.

@@ -2,8 +2,11 @@ package org.mqtt4j.hato.client.internal;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.function.BiConsumer;
+
+import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
@@ -14,11 +17,24 @@ import org.mqtt4j.hato.client.internal.common.protocol.TopicCache;
 
 /// Adapts arbitrary transport chunks to the existing codec without buffering the whole stream.
 /// A packet that lies whole within one chunk is decoded where it lies. A packet that spans
-/// chunks keeps the parts of them that it has received, which the transport handed over and
-/// never reuses, and is copied into one array once its last byte arrives, so its storage follows
-/// the bytes received rather than the declared length. A serialized transport callback owns this
-/// parser and at most one unfinished packet.
+/// chunks is copied, once, into storage of its own as its bytes arrive:
+///
+/// - A PUBLISH of at most [#UPFRONT_LIMIT] bytes whose headers come with its fixed header goes
+///   into an array of its headers and one of its payload, which the decoded packet takes over.
+/// - Any other packet of at most [#UPFRONT_LIMIT] bytes goes into one array of its size.
+/// - A larger packet keeps the parts received so far and is joined once its last byte arrives,
+///   so that its storage follows the bytes received rather than the length that the peer
+///   declares, which could claim memory without sending it.
+///
+/// A chunk is either handed over, and then kept as it is when a large packet needs parts of it,
+/// or lent, and then copied from before the call returns. A serialized transport callback owns
+/// this parser and at most one unfinished packet.
 final class IncomingFrames {
+
+    /// The largest packet that gets storage of its full size as soon as its fixed header arrives.
+    /// A peer that declares a packet and sends no more of it makes a connection hold at most
+    /// this much.
+    static final int UPFRONT_LIMIT = 128 * 1024;
 
     private final int maxPacketSize;
 
@@ -42,7 +58,16 @@ final class IncomingFrames {
     // The bytes of that packet received so far, counting its fixed header.
     private int position;
 
-    // The parts of the chunks that hold the body received so far, in order of arrival.
+    // The headers of a PUBLISH that is read apart from its payload, which `frame` then holds, or
+    // null.
+    private byte @Nullable [] publishHeaders;
+
+    // The storage of the packet being read, at its size, or of its payload when its headers are
+    // kept apart. Null for a packet beyond UPFRONT_LIMIT, which keeps parts instead.
+    private byte @Nullable [] frame;
+
+    // The parts of the chunks that hold the body received so far of a packet beyond
+    // UPFRONT_LIMIT, in order of arrival.
     private final List<Part> parts = new ArrayList<>();
 
     IncomingFrames(int maxPacketSize, PacketCodec codec, BiConsumer<Packet, Integer> receiver) {
@@ -51,12 +76,24 @@ final class IncomingFrames {
         this.receiver = receiver;
     }
 
+    /// Takes a chunk that the transport hands over and never reuses.
     void accept(byte[] bytes) {
+        accept(bytes, 0, bytes.length, false);
+    }
+
+    /// Takes the `length` bytes of `buffer` from `offset`, which the transport only lends: it
+    /// reuses the buffer once this returns, so nothing here keeps a reference to it.
+    void acceptLent(byte[] buffer, int offset, int length) {
+        accept(buffer, offset, offset + length, true);
+    }
+
+    // Reads the bytes of `bytes` from `from` to `to`, which `lent` says the transport reuses.
+    private void accept(byte[] bytes, int from, int to, boolean lent) {
         // Where the fixed header of the packet being read starts in this chunk, or -1 when it
         // started in an earlier one.
         int start = -1;
-        int offset = 0;
-        while (offset < bytes.length) {
+        int offset = from;
+        while (offset < to) {
             if (packetSize == 0) {
                 if (headerSize == 0) {
                     start = offset;
@@ -76,7 +113,7 @@ final class IncomingFrames {
                             "Incoming packet exceeds " + maxPacketSize + " bytes"
                     );
                 }
-                if (start >= 0 && length <= bytes.length - offset) {
+                if (start >= 0 && length <= to - offset) {
                     // The whole packet lies in this chunk, so it is decoded there.
                     offset += length;
                     headerSize = 0;
@@ -85,19 +122,69 @@ final class IncomingFrames {
                 }
                 packetSize = size;
                 position = headerSize;
+                offset = begin(bytes, start, offset, to);
             }
-            int count = Math.min(bytes.length - offset, packetSize - position);
+            int count = Math.min(to - offset, packetSize - position);
             if (count > 0) {
-                parts.add(new Part(bytes, offset, count));
+                keep(bytes, offset, count, lent);
                 offset += count;
                 position += count;
             }
             if (position == packetSize) {
-                byte[] packet = assembled();
-                clear();
-                receiver.accept(codec.decode(packet, 0, packet.length, topics), packet.length);
+                finish();
             }
         }
+    }
+
+    /// Gives the packet whose fixed header has just completed storage of its own, as the class
+    /// describes, and returns where its bytes continue in the chunk: `offset`, where the fixed
+    /// header ends, unless the PUBLISH headers that follow it have been kept already. `start` is
+    /// where the fixed header starts in the chunk, or -1 when it started in an earlier one, and
+    /// the chunk ends at `to`.
+    private int begin(byte[] bytes, int start, int offset, int to) {
+        if (packetSize > UPFRONT_LIMIT) {
+            return offset;
+        }
+        if (start >= 0 && (header[0] & 0xF0) == 0x30) {
+            int headersSize = codec.publishHeadersSize(bytes, start, to - start);
+            if (headersSize >= headerSize && headersSize <= packetSize) {
+                publishHeaders = Arrays.copyOfRange(bytes, start, start + headersSize);
+                frame = new byte[packetSize - headersSize];
+                position = headersSize;
+                return start + headersSize;
+            }
+        }
+        var whole = new byte[packetSize];
+        System.arraycopy(header, 0, whole, 0, headerSize);
+        frame = whole;
+        return offset;
+    }
+
+    // Keeps the `count` bytes of the packet being read that lie in the chunk from `offset`.
+    private void keep(byte[] bytes, int offset, int count, boolean lent) {
+        byte[] storage = frame;
+        if (storage != null) {
+            byte[] headers = publishHeaders;
+            int at = headers == null ? position : position - headers.length;
+            System.arraycopy(bytes, offset, storage, at, count);
+        } else if (lent) {
+            parts.add(new Part(Arrays.copyOfRange(bytes, offset, offset + count), 0, count));
+        } else {
+            parts.add(new Part(bytes, offset, count));
+        }
+    }
+
+    // Decodes the packet whose last byte has arrived, from the storage that kept it.
+    private void finish() {
+        int size = packetSize;
+        byte[] headers = publishHeaders;
+        byte[] storage = frame;
+        byte[] kept = storage != null ? storage : assembled();
+        clear();
+        Packet packet = headers != null
+                ? codec.decodePublish(headers, 0, headers.length, kept, topics)
+                : codec.decode(kept, 0, kept.length, topics);
+        receiver.accept(packet, size);
     }
 
     void clear() {
@@ -105,6 +192,8 @@ final class IncomingFrames {
         headerSize = 0;
         packetSize = 0;
         position = 0;
+        publishHeaders = null;
+        frame = null;
     }
 
     /// The packet being read, copied once from its fixed header and the parts of its body.

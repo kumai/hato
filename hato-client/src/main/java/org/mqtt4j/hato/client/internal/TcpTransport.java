@@ -330,7 +330,13 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                 // After a close, keep reading and drop what arrives until the peer ends its
                 // stream, so that closeGracefully can release a socket that receives nothing.
                 if (!closed) {
-                    receiver.onBytes(Arrays.copyOf(buffer, count));
+                    // A listener that borrows takes the bytes where they lie, which spares a copy
+                    // of every read.
+                    if (receiver instanceof BorrowingListener borrower) {
+                        borrower.onBorrowedBytes(buffer, 0, count);
+                    } else {
+                        receiver.onBytes(Arrays.copyOf(buffer, count));
+                    }
                 }
                 worked += System.nanoTime() - started;
                 // A pause, which onBytes may have asked for, leaves the peer to TCP flow control

@@ -1,8 +1,10 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.lang.System.Logger.Level;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.locks.LockSupport;
@@ -220,7 +222,7 @@ final class ClientIo {
             current = connection;
             openTransports++;
         }
-        var receiver = new Transport.Listener() {
+        var receiver = new BorrowingListener() {
             @Override
             public void onConnected() {
                 if (!isClosed(connection)) {
@@ -234,6 +236,21 @@ final class ClientIo {
                     if (!isClosed(connection)) {
                         log.trace("Received bytes: {}", bytes);
                         frames.accept(bytes);
+                    }
+                } catch (Throwable failure) {
+                    events.failed(generation, failure);
+                }
+            }
+
+            @Override
+            public void onBorrowedBytes(byte[] buffer, int offset, int length) {
+                try {
+                    if (!isClosed(connection)) {
+                        if (log.isLoggable(Level.TRACE)) {
+                            log.trace("Received bytes: {}",
+                                    Arrays.copyOfRange(buffer, offset, offset + length));
+                        }
+                        frames.acceptLent(buffer, offset, length);
                     }
                 } catch (Throwable failure) {
                     events.failed(generation, failure);
