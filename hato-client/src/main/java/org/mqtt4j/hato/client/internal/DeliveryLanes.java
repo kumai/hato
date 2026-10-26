@@ -120,6 +120,15 @@ final class DeliveryLanes {
     // Lanes that ended under the lock. Their terminations run after it is released.
     private final List<Lane> terminatedLanes = new ArrayList<>();
 
+    // The lanes that take the publication being admitted, with, for QoS 1 and 2, their
+    // recipients and those of a retransmission whose lanes are gone. The admission fills and
+    // empties them under the lock, so the same lists serve every publication.
+    private final ArrayList<Lane> admitting = new ArrayList<>();
+
+    private final ArrayList<Recipient> admittingRecipients = new ArrayList<>();
+
+    private final ArrayList<Recipient> abandoning = new ArrayList<>();
+
     // Set before the client's close() returns: no lane claims a delivery afterwards.
     private boolean handOffsClosed;
 
@@ -559,14 +568,15 @@ final class DeliveryLanes {
         }
         boolean ready;
         lock.lock();
+        ArrayList<Lane> recipients = admitting;
+        ArrayList<Recipient> states = admittingRecipients;
+        ArrayList<Recipient> abandoned = abandoning;
         try {
-            var recipients = new ArrayList<Lane>();
-            var states = new ArrayList<Recipient>();
-            var abandoned = new ArrayList<Recipient>();
             RetainedDelivery delivery = acknowledging.get(token.acknowledgement());
             boolean first = delivery == null;
             if (first) {
-                for (long id : ids) {
+                // The boxed ids look the lanes up without boxing them again.
+                for (Long id : ids) {
                     Lane lane = lanes.get(id);
                     // A lane awaiting removal admits nothing new, so it does not hold back the
                     // acknowledgement of QoS 1 and 2.
@@ -644,6 +654,9 @@ final class DeliveryLanes {
                 readyTokens.add(token.acknowledgement());
             }
         } finally {
+            recipients.clear();
+            states.clear();
+            abandoned.clear();
             lock.unlock();
         }
         if (ready) {
@@ -676,8 +689,10 @@ final class DeliveryLanes {
     /// Caller holds lock. Admits `arrival` as [#deliverAtMostOnce(List)] describes, and adds the
     /// lanes that it overflows to `overflows`.
     private void admitAtMostOnce(Arrival arrival, List<Overflow> overflows) {
-        var recipients = new ArrayList<Lane>();
-        for (long id : arrival.ids()) {
+        ArrayList<Lane> recipients = admitting;
+        recipients.clear();
+        // The boxed ids look the lanes up without boxing them again.
+        for (Long id : arrival.ids()) {
             Lane lane = lanes.get(id);
             // A lane awaiting removal admits nothing new.
             if (lane == null || lane.paused) {
@@ -712,6 +727,7 @@ final class DeliveryLanes {
                 }
             }
         }
+        recipients.clear();
     }
 
     /// Caller holds lock. Whether the client's limits leave room for `deliveries` more deliveries
@@ -2386,7 +2402,9 @@ final class DeliveryLanes {
         final int bytes;
         // One condition for each recipient, counted against the client's condition limit.
         // Completed pull views leave only these IDs and conditions, without payload or lane.
-        final Map<Long, Recipient> recipients = new LinkedHashMap<>();
+        // A QoS 0 delivery meets no condition and records no recipient, so it shares the empty
+        // map.
+        final Map<Long, Recipient> recipients;
         // Views that hold capacity; the payload stays counted until the last of them leaves.
         final List<DeliveryView> views = new ArrayList<>(1);
         // Accepted MANUAL hand-off views. They returned their capacity at acceptance, but their
@@ -2399,6 +2417,7 @@ final class DeliveryLanes {
         RetainedDelivery(DeliveryToken token, int bytes) {
             this.token = token;
             this.bytes = bytes;
+            recipients = token.acknowledgement() == 0 ? Map.of() : new LinkedHashMap<>();
         }
     }
 
