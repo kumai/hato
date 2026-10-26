@@ -731,7 +731,7 @@ final class DeliveryLanes {
                 for (Lane lane : recipients) {
                     var view = new DeliveryView(
                             delivery,
-                            new Recipient(lane.id),
+                            Recipient.UNTRACKED,
                             lane,
                             arrival.message(),
                             arrival.dup(),
@@ -765,7 +765,7 @@ final class DeliveryLanes {
         if (delivery.token.acknowledgement() != 0) {
             delivery.views.add(view);
         }
-        view.recipient.queued = true;
+        view.markQueued();
         lane.retained++;
         lane.queue.addLast(view);
         indexHandOff(lane);
@@ -1180,10 +1180,8 @@ final class DeliveryLanes {
             return;
         }
         for (int i = lane.claimed.size() - 1; i >= started; i--) {
-            DeliveryView view = lane.claimed.get(i);
-            view.recipient.handed = false;
-            view.recipient.queued = true;
-            lane.queue.addFirst(view);
+            // Only QoS 0 copies are claimed together, and they track no recipient.
+            lane.queue.addFirst(lane.claimed.get(i));
         }
     }
 
@@ -1327,8 +1325,7 @@ final class DeliveryLanes {
                 return;
             }
             lane.queue.removeFirst();
-            head.recipient.queued = false;
-            head.recipient.handed = true;
+            head.markTaken();
         } finally {
             lock.unlock();
         }
@@ -1349,8 +1346,7 @@ final class DeliveryLanes {
     /// only those whose handlers have started; see [#requeueUnstarted(Lane)].
     private Claim claim(Lane lane, ArrayDeque<DeliveryView> queue) {
         DeliveryView view = queue.removeFirst();
-        view.recipient.queued = false;
-        view.recipient.handed = true;
+        view.markTaken();
         return new Claim(view, lane.ackMode == AckMode.ON_RECEIVE && markReady(view));
     }
 
@@ -1442,8 +1438,7 @@ final class DeliveryLanes {
             }
             view = sublane.queue.removeFirst();
             lane.queuedInSublanes--;
-            view.recipient.queued = false;
-            view.recipient.handed = true;
+            view.markTaken();
         } finally {
             lock.unlock();
         }
@@ -1580,8 +1575,7 @@ final class DeliveryLanes {
                 // Taking the head fixes its hand-off; a stop from here on leaves the lane's end
                 // to the worker.
                 view = lane.queue.removeFirst();
-                view.recipient.queued = false;
-                view.recipient.handed = true;
+                view.markTaken();
                 view.offered = true;
                 lane.accepting = true;
                 // The lane's next delivery waits for its turn behind the older heads.
@@ -1904,7 +1898,7 @@ final class DeliveryLanes {
     private void invalidate(DeliveryView view) {
         if (view.valid) {
             view.valid = false;
-            if (!view.delivery.retired) {
+            if (!view.delivery.retired && view.delivery.token.acknowledgement() != 0) {
                 view.recipient.handed = false;
                 if (view.recipient.ready) {
                     view.recipient.ready = false;
@@ -1984,7 +1978,7 @@ final class DeliveryLanes {
         boolean ready = false;
         while (!queue.isEmpty()) {
             DeliveryView view = queue.removeFirst();
-            view.recipient.queued = false;
+            view.markUnqueued();
             drop(lane, DropReason.SUBSCRIPTION_STOPPED);
             view.localDone = true;
             ready |= markReady(view);
@@ -1998,7 +1992,7 @@ final class DeliveryLanes {
     private void discard(Lane lane, ArrayDeque<DeliveryView> queue) {
         while (!queue.isEmpty()) {
             DeliveryView view = queue.removeFirst();
-            view.recipient.queued = false;
+            view.markUnqueued();
             drop(lane, DropReason.CONNECTION_ENDED);
             view.localDone = true;
             view.released = true;
@@ -2164,8 +2158,7 @@ final class DeliveryLanes {
                     // Claim, close, and acknowledgement share the lock. No other receiver can
                     // claim this view, and an interrupt cannot discard it after handoff commits.
                     DeliveryView view = lane.queue.removeFirst();
-                    view.recipient.queued = false;
-                    view.recipient.handed = true;
+                    view.markTaken();
                     view.localDone = true;
                     ready = lane.ackMode == AckMode.ON_RECEIVE && markReady(view);
                     releaseView(view);
@@ -2490,6 +2483,11 @@ final class DeliveryLanes {
 
     private static final class Recipient {
 
+        // The recipient of every QoS 0 copy. Such a copy meets no acknowledgement condition and
+        // no retransmission looks for it, so nothing reads its marks; the copy's mark methods
+        // leave this one as it is.
+        static final Recipient UNTRACKED = new Recipient(0);
+
         final long id;
         boolean handed;
         boolean ready;
@@ -2541,6 +2539,27 @@ final class DeliveryLanes {
             this.arrival = arrival;
             filter = lane.filter;
             released = delivery.token.acknowledgement() == 0;
+        }
+
+        // Whether the copy waits in a queue, and whether a consumer has taken it: a receipt's
+        // retransmission and acknowledgement read these marks of its recipient.
+        void markQueued() {
+            if (recipient != Recipient.UNTRACKED) {
+                recipient.queued = true;
+            }
+        }
+
+        void markTaken() {
+            if (recipient != Recipient.UNTRACKED) {
+                recipient.queued = false;
+                recipient.handed = true;
+            }
+        }
+
+        void markUnqueued() {
+            if (recipient != Recipient.UNTRACKED) {
+                recipient.queued = false;
+            }
         }
 
         @Override
