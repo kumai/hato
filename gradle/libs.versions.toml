@@ -15,7 +15,7 @@ checkstyle = "14.3.0"
 micrometer = "1.17.2"
 japicmp = "0.26.5"
 # The last release on Maven Central, which the API report compares the build with.
-hato-release = "0.7.0"
+hato-release = "0.8.0"
 
 [libraries]
 # Nullness annotations. Build-time only: never a runtime or POM dependency of the published jars.
