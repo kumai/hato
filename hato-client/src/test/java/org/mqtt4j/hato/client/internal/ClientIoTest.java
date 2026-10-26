@@ -44,6 +44,7 @@ import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.TopicCache;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -1591,6 +1592,11 @@ class ClientIoTest {
         @Override
         public Packet decode(byte[] bytes, int offset, int length) {
             return delegate.decode(bytes, offset, length);
+        }
+
+        @Override
+        public Packet decode(byte[] bytes, int offset, int length, TopicCache topics) {
+            return delegate.decode(bytes, offset, length, topics);
         }
     }
 

@@ -124,6 +124,17 @@ public interface PacketCodec {
     /// @throws IndexOutOfBoundsException if the range does not lie within `bytes`
     Packet decode(byte[] bytes, int offset, int length);
 
+    /// Decodes like [#decode(byte[], int, int)], except that the topic of a PUBLISH whose name
+    /// `topics` holds is the topic decoded from the same bytes before, and a name that it does
+    /// not hold is remembered there once it has been checked. One connection's decoding keeps one
+    /// cache, as its names repeat.
+    ///
+    /// @throws PacketDecodeException if the packet is malformed, violates a checked rule, or
+    ///         carries more than [#MAX_PROPERTIES] properties
+    /// @throws UnsupportedProtocolVersionException if CONNECT requests an unsupported level
+    /// @throws IndexOutOfBoundsException if the range does not lie within `bytes`
+    Packet decode(byte[] bytes, int offset, int length, TopicCache topics);
+
     /// Decodes the first CONNECT before the connection's MQTT version has been selected.
     ///
     /// The protocol name and level are inspected before version-specific fields. Levels 4 and 5

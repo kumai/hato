@@ -87,6 +87,7 @@ import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.client.internal.common.protocol.Property;
 import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
+import org.mqtt4j.hato.client.internal.common.protocol.TopicCache;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.Objects.requireNonNull;
@@ -9082,6 +9083,11 @@ class ClientActorTest {
         @Override
         public Packet decode(byte[] bytes, int offset, int length) {
             return codec.decode(bytes, offset, length);
+        }
+
+        @Override
+        public Packet decode(byte[] bytes, int offset, int length, TopicCache topics) {
+            return codec.decode(bytes, offset, length, topics);
         }
 
         @Override

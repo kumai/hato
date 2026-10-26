@@ -6,6 +6,8 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.common.value.MqttVersion;
 import org.mqtt4j.hato.common.value.Qos;
 import org.mqtt4j.hato.common.value.ReasonCode;
@@ -218,6 +220,16 @@ final class Mqtt5PacketCodec implements PacketCodec {
 
     @Override
     public Packet decode(byte[] bytes, int offset, int length) {
+        return decoded(bytes, offset, length, null);
+    }
+
+    @Override
+    public Packet decode(byte[] bytes, int offset, int length, TopicCache topics) {
+        requireNonNull(topics, "topics must not be null");
+        return decoded(bytes, offset, length, topics);
+    }
+
+    private Packet decoded(byte[] bytes, int offset, int length, @Nullable TopicCache topics) {
         requireNonNull(bytes, "bytes must not be null");
         var input = ByteBuffer.wrap(bytes, offset, length);
         try {
@@ -238,7 +250,7 @@ final class Mqtt5PacketCodec implements PacketCodec {
             Packet decoded = switch (type) {
                 case CONNECT -> readConnect(input);
                 case CONNACK -> readConnAck(input);
-                case PUBLISH -> readPublish(input, flags);
+                case PUBLISH -> readPublish(input, flags, topics);
                 case PUBACK -> new Packet.PubAck(
                         readPacketId(input),
                         readOptionalReason(input, type),
@@ -380,7 +392,7 @@ final class Mqtt5PacketCodec implements PacketCodec {
         );
     }
 
-    private static Packet readPublish(ByteBuffer input, int flags) {
+    private static Packet readPublish(ByteBuffer input, int flags, @Nullable TopicCache topics) {
         int qosBits = (flags >>> 1) & 3;
         if (qosBits == 3) {
             throw new PacketDecodeException(MALFORMED_PACKET, "Invalid PUBLISH QoS bits");
@@ -390,7 +402,12 @@ final class Mqtt5PacketCodec implements PacketCodec {
         if (qos == Qos.AT_MOST_ONCE && dup) {
             throw new PacketDecodeException(PROTOCOL_ERROR, "QoS 0 PUBLISH sets DUP");
         }
-        String topicName = MqttString.read(input);
+        // A name that the connection's cache holds was decoded and checked before. Any other is
+        // checked as a topic only after the properties, as without a cache, so that a packet
+        // with more than one fault is refused for the same one.
+        int nameStart = input.position();
+        Topic cached = topics == null ? null : topics.find(input);
+        String topicName = cached == null ? MqttString.read(input) : cached.name();
         int packetId = qos == Qos.AT_MOST_ONCE ? 0 : readPacketId(input);
         Properties properties = Mqtt5Properties.read(input, PacketType.PUBLISH);
         var payload = new byte[input.remaining()];
@@ -408,8 +425,15 @@ final class Mqtt5PacketCodec implements PacketCodec {
                     properties
             );
         }
+        Topic topic = cached;
+        if (topic == null) {
+            topic = topic(topicName);
+            if (topics != null) {
+                topics.remember(input, nameStart, topic);
+            }
+        }
         return new Packet.Publish(
-                topic(topicName),
+                topic,
                 payload,
                 qos,
                 (flags & 1) != 0,

@@ -6,6 +6,8 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.common.value.MqttVersion;
 import org.mqtt4j.hato.common.value.Qos;
 import org.mqtt4j.hato.common.value.ReasonCode;
@@ -197,6 +199,16 @@ final class Mqtt311PacketCodec implements PacketCodec {
     /// @throws UnsupportedProtocolVersionException if CONNECT requests a level other than 4
     @Override
     public Packet decode(byte[] bytes, int offset, int length) {
+        return decoded(bytes, offset, length, null);
+    }
+
+    @Override
+    public Packet decode(byte[] bytes, int offset, int length, TopicCache topics) {
+        requireNonNull(topics, "topics must not be null");
+        return decoded(bytes, offset, length, topics);
+    }
+
+    private Packet decoded(byte[] bytes, int offset, int length, @Nullable TopicCache topics) {
         requireNonNull(bytes, "bytes must not be null");
         var input = ByteBuffer.wrap(bytes, offset, length);
         try {
@@ -219,7 +231,7 @@ final class Mqtt311PacketCodec implements PacketCodec {
             Packet decoded = switch (type) {
                 case CONNECT -> readConnect(input);
                 case CONNACK -> readConnAck(input);
-                case PUBLISH -> readPublish(input, flags);
+                case PUBLISH -> readPublish(input, flags, topics);
                 case PUBACK -> new Packet.PubAck(readPacketId(input), SUCCESS, EMPTY);
                 case PUBREC -> new Packet.PubRec(readPacketId(input), SUCCESS, EMPTY);
                 case PUBREL -> new Packet.PubRel(readPacketId(input), SUCCESS, EMPTY);
@@ -341,14 +353,18 @@ final class Mqtt311PacketCodec implements PacketCodec {
         return new Packet.ConnAck(reason == SUCCESS && (flags & 1) != 0, reason, EMPTY);
     }
 
-    private static Packet.Publish readPublish(ByteBuffer input, int flags) {
+    private static Packet.Publish readPublish(
+            ByteBuffer input,
+            int flags,
+            @Nullable TopicCache topics
+    ) {
         int qosBits = (flags >>> 1) & 3;
         // [MQTT-3.3.1-4]; MQTT 5.0 section 3.3.1.2 classifies QoS 3 as malformed.
         if (qosBits == 3) {
             throw new PacketDecodeException(MALFORMED_PACKET, "Invalid PUBLISH QoS bits");
         }
         Qos qos = Qos.of(qosBits);
-        Topic topic = readTopic(input);
+        Topic topic = topics == null ? readTopic(input) : readTopic(input, topics);
         int packetId = (qos == Qos.AT_MOST_ONCE) ? 0 : readPacketId(input);
         var payload = new byte[input.remaining()];
         input.get(payload);
@@ -451,6 +467,18 @@ final class Mqtt311PacketCodec implements PacketCodec {
         } catch (IllegalArgumentException e) {
             throw new PacketDecodeException(PROTOCOL_ERROR, "Invalid topic name", e);
         }
+    }
+
+    // Reads a topic as readTopic(ByteBuffer) does, taking it from `topics` when it holds the name.
+    private static Topic readTopic(ByteBuffer input, TopicCache topics) {
+        Topic cached = topics.find(input);
+        if (cached != null) {
+            return cached;
+        }
+        int fieldStart = input.position();
+        Topic topic = readTopic(input);
+        topics.remember(input, fieldStart, topic);
+        return topic;
     }
 
     private static TopicFilter readTopicFilter(ByteBuffer input) {
