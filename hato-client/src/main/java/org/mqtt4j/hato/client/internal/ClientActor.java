@@ -226,6 +226,10 @@ public final class ClientActor implements MqttClient {
 
     private final Semaphore waiterSlots = new Semaphore(WAITER_LIMIT);
 
+    // Marks the threads that run this client's inline handlers, inside which the futures that the
+    // client returns and the receive of its pull subscriptions refuse to wait.
+    private final InlineHandlers inlineHandlers = new InlineHandlers();
+
     // Handles include registrations still queued for the actor. The core decides admission; the
     // mailbox refuses only registrations beyond its queue bound.
     private final Map<Long, ClientSubscription> subscriptions = new ConcurrentHashMap<>();
@@ -336,6 +340,7 @@ public final class ClientActor implements MqttClient {
         commandLimit = commandLimit(limits);
         termination = new ClientTermination(
                 threadName("terminated"),
+                inlineHandlers,
                 waiterSlots,
                 WAITER_LIMIT,
                 List.of(operationSlots, connectSlot, disconnectSlot),
@@ -370,7 +375,8 @@ public final class ClientActor implements MqttClient {
                 this::handOffRefused,
                 this::deliveryReady,
                 this::laneTerminated,
-                metrics == null ? null : this::deliveryStarted
+                metrics == null ? null : this::deliveryStarted,
+                inlineHandlers
         );
         webSockets = transportFactory instanceof WebSocketTransports owner ? owner : null;
         io = new ClientIo(
@@ -438,11 +444,11 @@ public final class ClientActor implements MqttClient {
     public CompletableFuture<ConnAck> whenConnected() {
         synchronized (lifecycleLock) {
             if (stopping.get()) {
-                return CompletableFuture.failedFuture(closedFailure());
+                return ClientFuture.failed(inlineHandlers, closedFailure());
             }
             ConnAck current = connectedAck;
             if (current != null && !disconnecting) {
-                return CompletableFuture.completedFuture(current);
+                return ClientFuture.completed(inlineHandlers, current);
             }
             return observeFuture(connectionWaiters);
         }
@@ -457,7 +463,7 @@ public final class ClientActor implements MqttClient {
     public CompletableFuture<PublishResult> publish(MqttMessage message) {
         requireNonNull(message, "message");
         if (version == MqttVersion.V3_1_1 && MessageProperties.present(message)) {
-            return CompletableFuture.failedFuture(new IllegalArgumentException(
+            return ClientFuture.failed(inlineHandlers, new IllegalArgumentException(
                     "MQTT 3.1.1 cannot carry message properties"
             ));
         }
@@ -629,12 +635,13 @@ public final class ClientActor implements MqttClient {
                 }
             }
             if (refusal != null) {
-                return CompletableFuture.failedFuture(refusal);
+                return ClientFuture.failed(inlineHandlers, refusal);
             }
 
             long token = sequence.incrementAndGet();
             long generation = connectedGeneration;
             var operation = new Operation<T>(
+                    inlineHandlers,
                     requireNonNull(slot),
                     (kind == Command.CONNECT) ? new ConnectionAttempt(token) : null,
                     timing
@@ -668,7 +675,7 @@ public final class ClientActor implements MqttClient {
                 operations.remove(token);
                 operation.slot.release();
                 refused(CapacityLimit.OPERATION_QUEUE);
-                return CompletableFuture.failedFuture(new MqttCapacityException(
+                return ClientFuture.failed(inlineHandlers, new MqttCapacityException(
                         "Command mailbox capacity",
                         CapacityLimit.OPERATION_QUEUE
                 ));
@@ -1260,10 +1267,10 @@ public final class ClientActor implements MqttClient {
     public CompletableFuture<ClientStats> stats() {
         synchronized (lifecycleLock) {
             if (lastStats != null) {
-                return CompletableFuture.completedFuture(lastStats);
+                return ClientFuture.completed(inlineHandlers, lastStats);
             }
             if (lastStatsFailure != null) {
-                return CompletableFuture.failedFuture(lastStatsFailure);
+                return ClientFuture.failed(inlineHandlers, lastStatsFailure);
             }
             CompletableFuture<ClientStats> observed = observeFuture(statsWaiters);
             if (!observed.isDone()) {
@@ -2144,15 +2151,18 @@ public final class ClientActor implements MqttClient {
         public CompletableFuture<Qos> established() {
             synchronized (lifecycleLock) {
                 if (establishmentFailure != null) {
-                    return CompletableFuture.failedFuture(establishmentFailure);
+                    return ClientFuture.failed(inlineHandlers, establishmentFailure);
                 }
                 if (stopping.get()) {
                     endEstablishment(closedFailure());
-                    return CompletableFuture.failedFuture(requireNonNull(establishmentFailure));
+                    return ClientFuture.failed(
+                            inlineHandlers,
+                            requireNonNull(establishmentFailure)
+                    );
                 }
                 if (!disconnecting && connectedGeneration != 0
                         && establishedGeneration == connectedGeneration) {
-                    return CompletableFuture.completedFuture(requireNonNull(granted));
+                    return ClientFuture.completed(inlineHandlers, requireNonNull(granted));
                 }
                 return observeFuture(establishmentWaiters);
             }
@@ -2202,7 +2212,7 @@ public final class ClientActor implements MqttClient {
         public CompletableFuture<Void> terminated() {
             synchronized (lifecycleLock) {
                 if (terminated) {
-                    return CompletableFuture.completedFuture(null);
+                    return ClientFuture.completed(inlineHandlers, null);
                 }
                 return observeFuture(terminationWaiters);
             }
@@ -2224,11 +2234,11 @@ public final class ClientActor implements MqttClient {
                 if (stopping.get()) {
                     // Discards deliveries still queued here; a running handler finishes.
                     endLocally(permanentFailure(), false);
-                    return CompletableFuture.completedFuture(null);
+                    return ClientFuture.completed(inlineHandlers, null);
                 }
                 if (retired) {
                     // Deliveries an earlier confirmed removal accepted may still be finishing.
-                    return CompletableFuture.completedFuture(null);
+                    return ClientFuture.completed(inlineHandlers, null);
                 }
 
                 lanes.pause(id);
@@ -2263,11 +2273,13 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public ReceiveResult receive() throws InterruptedException {
+            inlineHandlers.refuseWait();
             return pullReceiver().receive();
         }
 
         @Override
         public ReceiveResult receive(Duration timeout) throws InterruptedException {
+            inlineHandlers.refuseWait();
             return pullReceiver().receive(timeout);
         }
     }
@@ -2300,12 +2312,12 @@ public final class ClientActor implements MqttClient {
     private <T> CompletableFuture<T> observeFuture(List<CompletableFuture<T>> observers) {
         if (!waiterSlots.tryAcquire()) {
             refused(CapacityLimit.OBSERVATIONS);
-            return CompletableFuture.failedFuture(new MqttCapacityException(
+            return ClientFuture.failed(inlineHandlers, new MqttCapacityException(
                     "Waiter capacity",
                     CapacityLimit.OBSERVATIONS
             ));
         }
-        var future = new CompletableFuture<T>();
+        var future = new ClientFuture<T>(inlineHandlers);
         observers.add(future);
         return future;
     }
@@ -2352,7 +2364,7 @@ public final class ClientActor implements MqttClient {
 
     private static final class Operation<T> {
 
-        final CompletableFuture<T> future = new CompletableFuture<>();
+        final CompletableFuture<T> future;
 
         // Returned just before the future completes.
         final Semaphore slot;
@@ -2365,10 +2377,12 @@ public final class ClientActor implements MqttClient {
         final @Nullable PublishTiming timing;
 
         Operation(
+                InlineHandlers inlineHandlers,
                 Semaphore slot,
                 @Nullable ConnectionAttempt attempt,
                 @Nullable PublishTiming timing
         ) {
+            future = new ClientFuture<>(inlineHandlers);
             this.slot = slot;
             this.attempt = attempt;
             this.timing = timing;

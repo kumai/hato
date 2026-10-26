@@ -129,6 +129,9 @@ final class DeliveryLanes {
     // deliveries.
     private final @Nullable Started onStarted;
 
+    // Marks the threads that run inline handlers, for the client's own waits to refuse.
+    private final InlineHandlers inlineHandlers;
+
     // Lanes that ended under the lock. Their terminations run after it is released.
     private final List<Lane> terminatedLanes = new ArrayList<>();
 
@@ -210,7 +213,8 @@ final class DeliveryLanes {
             Consumer<DeliveryToken> onOverload,
             Ready onReady,
             LongConsumer onTerminated,
-            @Nullable Started onStarted
+            @Nullable Started onStarted,
+            InlineHandlers inlineHandlers
     ) {
         this.clientId = clientId;
         this.byteLimit = byteLimit;
@@ -221,6 +225,7 @@ final class DeliveryLanes {
         this.onReady = onReady;
         this.onTerminated = onTerminated;
         this.onStarted = onStarted;
+        this.inlineHandlers = inlineHandlers;
     }
 
     /// A serial push lane whose dispatcher executes each handler in place.
@@ -1264,7 +1269,7 @@ final class DeliveryLanes {
             DeliveryView view = lane.claimed.get(i);
             try {
                 started(lane, view);
-                requireNonNull(lane.handler).accept(view);
+                runHandler(lane, view);
             } catch (Throwable failure) {
                 boolean _ = Thread.interrupted();
                 fail(lane, view, failure, false);
@@ -1888,6 +1893,23 @@ final class DeliveryLanes {
         }
     }
 
+    /// Calls the lane's handler for `view`. An inline lane's handler runs with its thread marked,
+    /// wherever it runs, so that the client's own waits refuse to run inside it whether the
+    /// reader or the dispatcher runs it; see [InlineHandlers].
+    private void runHandler(Lane lane, DeliveryView view) {
+        Consumer<MqttDelivery> handler = requireNonNull(lane.handler);
+        if (!(lane.execution instanceof HandlerExecution.Inline)) {
+            handler.accept(view);
+            return;
+        }
+        InlineHandlers previous = inlineHandlers.enter();
+        try {
+            handler.accept(view);
+        } finally {
+            InlineHandlers.exit(previous);
+        }
+    }
+
     /// Runs a claimed delivery's handler without the lock, then settles the delivery. A normal
     /// return ends its local processing; a failure invalidates its acknowledgement condition and
     /// is reported. Either way the handler's interrupt state is cleared. `here` when the calling
@@ -1899,7 +1921,7 @@ final class DeliveryLanes {
                 onReady.ready(here, here && claim.last());
             }
             started(lane, view);
-            requireNonNull(lane.handler).accept(view);
+            runHandler(lane, view);
             // Clear handler-owned interrupt state before the next delivery or queue wait.
             boolean _ = Thread.interrupted();
             boolean ready;

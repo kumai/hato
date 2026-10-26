@@ -44,6 +44,9 @@ final class ClientTermination {
 
     private final String threadName;
 
+    // Its futures refuse to be waited for inside the client's inline handlers.
+    private final InlineHandlers inlineHandlers;
+
     private final Semaphore waiterSlots;
 
     private final int waiterLimit;
@@ -84,6 +87,7 @@ final class ClientTermination {
 
     ClientTermination(
             String threadName,
+            InlineHandlers inlineHandlers,
             Semaphore waiterSlots,
             int waiterLimit,
             List<Semaphore> operationSlots,
@@ -91,6 +95,7 @@ final class ClientTermination {
             Runnable observationRefused
     ) {
         this.threadName = threadName;
+        this.inlineHandlers = inlineHandlers;
         this.waiterSlots = waiterSlots;
         this.waiterLimit = waiterLimit;
         this.operationSlots = List.copyOf(operationSlots);
@@ -113,16 +118,16 @@ final class ClientTermination {
     /// An observation within the client-wide waiter limit; a completed one after termination.
     synchronized CompletableFuture<Void> observe() {
         if (terminated) {
-            return CompletableFuture.completedFuture(null);
+            return ClientFuture.completed(inlineHandlers, null);
         }
         if (!waiterSlots.tryAcquire()) {
             observationRefused.run();
-            return CompletableFuture.failedFuture(new MqttCapacityException(
+            return ClientFuture.failed(inlineHandlers, new MqttCapacityException(
                     "Waiter capacity",
                     CapacityLimit.OBSERVATIONS
             ));
         }
-        var future = new CompletableFuture<Void>();
+        var future = new ClientFuture<Void>(inlineHandlers);
         waiters.add(future);
         return future;
     }

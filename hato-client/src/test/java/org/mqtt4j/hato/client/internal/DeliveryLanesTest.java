@@ -66,6 +66,9 @@ class DeliveryLanesTest {
 
     private final LinkedBlockingQueue<Long> terminated = new LinkedBlockingQueue<>();
 
+    // The client of every lanes that a test makes, which marks the threads of inline handlers.
+    private final InlineHandlers inlineHandlers = new InlineHandlers();
+
     private final List<DeliveryLanes> managers = new ArrayList<>();
 
     private final List<CountDownLatch> releases = new ArrayList<>();
@@ -3152,6 +3155,31 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void an_inline_handler_runs_marked_wherever_it_runs_and_a_serial_one_does_not()
+            throws Exception {
+        // Arrange: each handler records whether the client's waits refuse to run inside it.
+        var refused = new LinkedBlockingQueue<String>();
+        assertThat(sut.register(1, request(2), new HandlerExecution.Inline(), _ ->
+                refused.add("inline " + waitsRefused()))).isTrue();
+        assertThat(sut.register(2, request(1), new HandlerExecution.Internal(), _ ->
+                refused.add("serial " + waitsRefused()))).isTrue();
+        await().until(() -> sut.dispatcherSleeps(1) && sut.dispatcherSleeps(2));
+
+        // Act: the inline handler runs once on the reader and once on its dispatcher.
+        sut.runReading(() -> sut.deliver(token(1, 0), List.of(1L), message(1), false, 10));
+        assertThat(refused.poll(5, SECONDS)).isEqualTo("inline true");
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(2L), message(3), false, 10)).isTrue();
+
+        // Assert
+        assertThat(List.of(
+                requireNonNull(refused.poll(5, SECONDS)),
+                requireNonNull(refused.poll(5, SECONDS))
+        )).containsExactlyInAnyOrder("inline true", "serial false");
+        assertThat(waitsRefused()).isFalse();
+    }
+
+    @Test
     void a_read_leaves_a_delivery_of_a_serial_lane_to_its_dispatcher() throws Exception {
         // Arrange: an inline lane and a serial one, whose dispatcher sleeps.
         var threads = new LinkedBlockingQueue<Thread>();
@@ -3335,7 +3363,8 @@ class DeliveryLanesTest {
                 overloads::add,
                 (_, _) -> onReady.run(),
                 terminated::add,
-                null
+                null,
+                inlineHandlers
         );
         managers.add(manager);
         return manager;
@@ -3357,11 +3386,22 @@ class DeliveryLanesTest {
                     ready.addAll(requireNonNull(owner.get()).takeReady());
                 },
                 terminated::add,
-                null
+                null,
+                inlineHandlers
         );
         owner.set(manager);
         managers.add(manager);
         return manager;
+    }
+
+    /// Whether the client's waits refuse to run on the calling thread.
+    private boolean waitsRefused() {
+        try {
+            inlineHandlers.refuseWait();
+            return false;
+        } catch (IllegalStateException _) {
+            return true;
+        }
     }
 
     private CountDownLatch release() {

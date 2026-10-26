@@ -400,7 +400,8 @@ class DeliveryMeasurementTest {
                 _ -> { },
                 (_, _) -> { },
                 _ -> { },
-                null
+                null,
+                new InlineHandlers()
         );
         Subscribe request = Subscribe.of(new TopicFilter("#"), Qos.AT_MOST_ONCE)
                 .withBufferCapacity(WINDOW * subscriptions);
