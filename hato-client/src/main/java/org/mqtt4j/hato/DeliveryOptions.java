@@ -134,6 +134,9 @@ public final class DeliveryOptions {
             case HandlerExecution.Lanes _ -> throw new IllegalArgumentException(
                     "Lanes take their executors from the selector"
             );
+            case HandlerExecution.Inline _ -> throw new IllegalArgumentException(
+                    "Inline handlers run as part of receiving, not on an executor"
+            );
         };
     }
 

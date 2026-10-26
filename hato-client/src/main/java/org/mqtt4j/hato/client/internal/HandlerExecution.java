@@ -20,6 +20,11 @@ public sealed interface HandlerExecution {
     /// The subscription's dispatcher runs each handler in place, on its internal virtual thread.
     record Internal() implements HandlerExecution {}
 
+    /// As [Internal], except that the thread that reads the connection may run a handler itself,
+    /// right after the read that brought its delivery, while the dispatcher sleeps. The handler
+    /// then holds up the connection's reading until it returns.
+    record Inline() implements HandlerExecution {}
+
     /// Each handler runs on the application's executor, one at a time in receive order.
     record OnExecutor(Executor executor) implements HandlerExecution {
 

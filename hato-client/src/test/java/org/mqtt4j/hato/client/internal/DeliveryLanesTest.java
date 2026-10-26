@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -42,6 +43,7 @@ import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 
 import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -3096,6 +3098,161 @@ class DeliveryLanesTest {
         // its own work off.
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(told).containsExactly(new Told(false, false));
+    }
+
+    @Test
+    void an_inline_lane_runs_a_delivery_of_a_read_on_the_reading_thread_after_its_events()
+            throws Exception {
+        // Arrange: the inline lane's dispatcher sleeps.
+        var told = new LinkedBlockingQueue<Told>();
+        DeliveryLanes sut = lanesTellingWhere(told);
+        var steps = new CopyOnWriteArrayList<String>();
+        var handlerThread = new AtomicReference<Thread>();
+        assertThat(sut.register(
+                1,
+                request(AckMode.AFTER_HANDLER, 1),
+                new HandlerExecution.Inline(),
+                _ -> {
+                    handlerThread.set(Thread.currentThread());
+                    steps.add("handler");
+                }
+        )).isTrue();
+        await().until(() -> sut.dispatcherSleeps(1));
+
+        // Act
+        sut.runReading(() -> {
+            assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10))
+                    .isTrue();
+            steps.add("events");
+        });
+
+        // Assert: the reading thread ran the handler once the read's events were over, and
+        // told the acknowledgement as a thread between deliveries of its own.
+        assertThat(handlerThread.get()).isSameAs(Thread.currentThread());
+        assertThat(steps).containsExactly("events", "handler");
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(told).containsExactly(new Told(true, true));
+    }
+
+    @Test
+    void an_inline_lane_leaves_a_delivery_outside_a_read_to_its_dispatcher() throws Exception {
+        // Arrange
+        var threads = new LinkedBlockingQueue<Thread>();
+        assertThat(sut.register(1, request(1), new HandlerExecution.Inline(), _ ->
+                threads.add(Thread.currentThread()))).isTrue();
+        await().until(() -> sut.dispatcherSleeps(1));
+
+        // Act
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+
+        // Assert
+        Thread handlerThread = requireNonNull(threads.poll(5, SECONDS));
+        assertThat(handlerThread).isNotSameAs(Thread.currentThread());
+        assertThat(handlerThread.getName()).endsWith("-delivery-1");
+    }
+
+    @Test
+    void a_read_leaves_a_delivery_of_a_serial_lane_to_its_dispatcher() throws Exception {
+        // Arrange: an inline lane and a serial one, whose dispatcher sleeps.
+        var threads = new LinkedBlockingQueue<Thread>();
+        assertThat(sut.register(1, request(1), new HandlerExecution.Inline(), _ -> { }))
+                .isTrue();
+        assertThat(sut.register(2, request(1), new HandlerExecution.Internal(), _ ->
+                threads.add(Thread.currentThread()))).isTrue();
+        await().until(() -> sut.dispatcherSleeps(2));
+
+        // Act
+        sut.runReading(() -> sut.deliver(token(1, 0), List.of(2L), message(1), false, 10));
+
+        // Assert: only inline lanes run as part of a read.
+        Thread handlerThread = requireNonNull(threads.poll(5, SECONDS));
+        assertThat(handlerThread.getName()).endsWith("-delivery-2");
+    }
+
+    @Test
+    void a_read_leaves_a_delivery_to_an_inline_dispatcher_that_runs_a_handler()
+            throws Exception {
+        // Arrange: the dispatcher runs the first delivery, whose handler waits.
+        var threads = new LinkedBlockingQueue<Thread>();
+        var started = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var first = new AtomicBoolean(true);
+        assertThat(sut.register(1, request(2), new HandlerExecution.Inline(), _ -> {
+            threads.add(Thread.currentThread());
+            if (first.getAndSet(false)) {
+                started.countDown();
+                waitFor(release);
+            }
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)).isTrue();
+        assertThat(started.await(5, SECONDS)).isTrue();
+
+        // Act
+        sut.runReading(() -> sut.deliver(token(1, 0), List.of(1L), message(2), false, 10));
+        release.countDown();
+
+        // Assert: the read left the lane to its running dispatcher, which ran both deliveries.
+        Thread firstThread = requireNonNull(threads.poll(5, SECONDS));
+        assertThat(threads.poll(5, SECONDS)).isSameAs(firstThread);
+        assertThat(firstThread).isNotSameAs(Thread.currentThread());
+    }
+
+    @Test
+    void a_borrowed_lane_runs_the_deliveries_that_arrive_meanwhile_on_the_reader()
+            throws Exception {
+        // Arrange: a reader runs an inline delivery, whose handler waits.
+        var threads = new LinkedBlockingQueue<Thread>();
+        var started = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var first = new AtomicBoolean(true);
+        assertThat(sut.register(1, request(2), new HandlerExecution.Inline(), _ -> {
+            threads.add(Thread.currentThread());
+            if (first.getAndSet(false)) {
+                started.countDown();
+                waitFor(release);
+            }
+        })).isTrue();
+        await().until(() -> sut.dispatcherSleeps(1));
+        Thread reader = Thread.ofPlatform().start(() -> sut.runReading(() ->
+                sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)));
+        assertThat(started.await(5, SECONDS)).isTrue();
+
+        // Act: a second delivery arrives outside the read while the reader has the lane.
+        assertThat(sut.deliver(token(1, 0), List.of(1L), message(2), false, 10)).isTrue();
+        release.countDown();
+
+        // Assert: the reader runs it too, after the first, before it gives the lane back.
+        assertThat(threads.poll(5, SECONDS)).isSameAs(reader);
+        assertThat(threads.poll(5, SECONDS)).isSameAs(reader);
+        reader.join(5_000);
+        assertThat(reader.isAlive()).isFalse();
+        await().until(() -> sut.dispatcherSleeps(1));
+    }
+
+    @Test
+    void a_borrowed_lane_that_stops_ends_only_after_the_handler_on_the_reader_returns()
+            throws Exception {
+        // Arrange: a reader runs an inline delivery, whose handler waits.
+        var started = new CountDownLatch(1);
+        CountDownLatch release = release();
+        assertThat(sut.register(1, request(1), new HandlerExecution.Inline(), _ -> {
+            started.countDown();
+            waitFor(release);
+        })).isTrue();
+        await().until(() -> sut.dispatcherSleeps(1));
+        Thread reader = Thread.ofPlatform().start(() -> sut.runReading(() ->
+                sut.deliver(token(1, 0), List.of(1L), message(1), false, 10)));
+        assertThat(started.await(5, SECONDS)).isTrue();
+
+        // Act
+        sut.remove(1);
+
+        // Assert: the lane ends once the handler on the reader has returned, and not before.
+        assertThat(terminated.poll(200, MILLISECONDS)).isNull();
+        release.countDown();
+        assertThat(terminated.poll(5, SECONDS)).isEqualTo(1L);
+        reader.join(5_000);
+        assertThat(reader.isAlive()).isFalse();
     }
 
     /// What the lanes told when acknowledgements were ready; see [DeliveryLanes.Ready].

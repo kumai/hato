@@ -1876,6 +1876,9 @@ public final class ClientActor implements MqttClient {
     /// I/O callbacks post events; fatal failures stop the actor independently of its mailbox.
     private final class IoEvents implements ClientIo.Events {
 
+        // Made once, for the reads that run the events they took over.
+        private final Runnable runHeld = ClientActor.this::runHeld;
+
         @Override
         public void connected(long generation) {
             post(generation, () -> core.opened(generation), Mailbox.Kind.CONTROL, 0);
@@ -1965,6 +1968,14 @@ public final class ClientActor implements MqttClient {
         @Override
         public void runHeld() {
             ClientActor.this.runHeld();
+        }
+
+        @Override
+        public void runAfterRead() {
+            // Only the thread that took the events over has deliveries of its own to run.
+            if (mailbox.holds()) {
+                lanes.runReading(runHeld);
+            }
         }
 
         @Override

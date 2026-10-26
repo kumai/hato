@@ -65,6 +65,11 @@ final class ClientIo {
         /// lock of I/O or of the transport.
         void runHeld();
 
+        /// [#runHeld()] for the thread that reads the connection, once a read is over. The
+        /// deliveries that the events admit for subscriptions whose handlers may run as part of
+        /// receiving can then run on this thread too, after the events.
+        void runAfterRead();
+
         void ended(long generation, Throwable cause);
 
         void failed(long generation, Throwable cause);
@@ -297,7 +302,7 @@ final class ClientIo {
 
             @Override
             public void afterBorrowedBytes() {
-                events.runHeld();
+                events.runAfterRead();
             }
 
             @Override

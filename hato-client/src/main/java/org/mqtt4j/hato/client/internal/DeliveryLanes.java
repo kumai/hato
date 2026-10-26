@@ -156,6 +156,18 @@ final class DeliveryLanes {
     // The hand-off lanes in the routing map.
     private int handOffLanes;
 
+    // The inline lanes in the routing map, so that the reads of a client without them take no
+    // lock for them; see runReading. Written under the lock and read without it, where a stale
+    // count only takes the lock for nothing or leaves one read's deliveries to the dispatchers.
+    private volatile int inlineLanes;
+
+    // The thread that runs the client's events of a read, while it does, and the inline lanes
+    // that it took over meanwhile from their sleeping dispatchers, to run once those events are
+    // over; see runReading.
+    private @Nullable Thread readingThread;
+
+    private @Nullable ArrayList<Lane> borrowedByReader;
+
     // The heads of hand-off lanes, oldest first, so the worker finds the oldest one without
     // visiting every lane. Each lane that can hand off has an entry for its head: queuing into
     // an empty lane, the worker taking a head, and a cleared failure enter one. An entry goes
@@ -293,6 +305,8 @@ final class DeliveryLanes {
             retainedLanes++;
             if (lane.acceptor != null) {
                 handOffLanes++;
+            } else if (lane.execution instanceof HandlerExecution.Inline) {
+                inlineLanes++;
             }
             try {
                 if (lane.handler != null) {
@@ -310,6 +324,8 @@ final class DeliveryLanes {
                 retainedLanes--;
                 if (lane.acceptor != null) {
                     handOffLanes--;
+                } else if (lane.execution instanceof HandlerExecution.Inline) {
+                    inlineLanes--;
                 }
                 throw failure;
             }
@@ -769,7 +785,121 @@ final class DeliveryLanes {
         lane.retained++;
         lane.queue.addLast(view);
         indexHandOff(lane);
+        // A borrowed lane's deliveries wait for the thread that runs it, which takes them in
+        // order before it gives the lane back; waking the dispatcher would only make it wait
+        // again.
+        if (lane.borrower != null || borrow(lane)) {
+            return;
+        }
         lane.ready.signal();
+    }
+
+    /// Caller holds lock. Takes `lane` over from its dispatcher for the thread that runs the
+    /// events of a read, when the lane is inline and its dispatcher sleeps; see [#runReading].
+    private boolean borrow(Lane lane) {
+        Thread current = Thread.currentThread();
+        if (current != readingThread || !lane.dispatcherWaiting
+                || !(lane.execution instanceof HandlerExecution.Inline)) {
+            return false;
+        }
+        lane.borrower = current;
+        if (borrowedByReader == null) {
+            borrowedByReader = new ArrayList<>();
+        }
+        borrowedByReader.add(lane);
+        return true;
+    }
+
+    /// Runs `events`, the client's events of a read, on the thread that read the connection.
+    /// The deliveries that they admit for inline lanes whose dispatchers sleep wait for this
+    /// thread, which then runs their handlers in the dispatchers' place, without a lock, so that
+    /// a delivery reaches its handler without waking another thread. Called by that thread with
+    /// no lock held; returns once each lane that it took over is back with its dispatcher.
+    void runReading(Runnable events) {
+        if (inlineLanes == 0) {
+            events.run();
+            return;
+        }
+        lock.lock();
+        try {
+            readingThread = Thread.currentThread();
+        } finally {
+            lock.unlock();
+        }
+        try {
+            events.run();
+        } finally {
+            ArrayList<Lane> borrowed;
+            lock.lock();
+            try {
+                borrowed = borrowedByReader;
+                readingThread = null;
+                borrowedByReader = null;
+            } finally {
+                lock.unlock();
+            }
+            if (borrowed != null) {
+                for (Lane lane : borrowed) {
+                    runBorrowed(lane);
+                }
+            }
+        }
+    }
+
+    /// Runs a borrowed lane's deliveries as its dispatcher would, until none waits, and then
+    /// gives the lane back. The dispatcher waits meanwhile, even to stop, so the lane's
+    /// termination waits for the handlers that run here.
+    private void runBorrowed(Lane lane) {
+        while (true) {
+            Claim claim;
+            lock.lock();
+            try {
+                // As executeNext does before it waits, so that the dispatcher finds the claims
+                // as it left them.
+                endHandled(lane);
+                lane.claimed.clear();
+                lane.started.set(0);
+                lane.reclaimed = 0;
+                if (lane.stopped || handOffsClosed || lane.failed || lane.queue.isEmpty()) {
+                    lane.borrower = null;
+                    // The dispatcher waited while the lane was borrowed; it goes on if there is
+                    // something for it to do.
+                    if (lane.stopped || handOffsClosed || lane.finishing
+                            || (!lane.failed && !lane.queue.isEmpty())) {
+                        lane.ready.signal();
+                    }
+                    return;
+                }
+                claim = claim(lane, lane.queue);
+                if (atMostOnce(claim.view())) {
+                    lane.claimed.add(claim.view());
+                    while (lane.claimed.size() < CLAIM_LIMIT
+                            && atMostOnce(lane.queue.peekFirst())) {
+                        // A QoS 0 claim meets no acknowledgement condition, so none is ready.
+                        lane.claimed.add(claim(lane, lane.queue).view());
+                    }
+                    lane.started.set(0);
+                }
+            } finally {
+                lock.unlock();
+            }
+            if (lane.claimed.isEmpty()) {
+                execute(lane, claim, true);
+            } else {
+                executeClaimed(lane);
+            }
+        }
+    }
+
+    /// Whether the dispatcher of lane `id` waits for a delivery; for tests.
+    boolean dispatcherSleeps(long id) {
+        lock.lock();
+        try {
+            Lane lane = lanes.get(id);
+            return lane != null && lane.dispatcherWaiting;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /// Caller holds lock. Counts a QoS 0 delivery that overflow kept from `lane`. The lane's first
@@ -1047,7 +1177,8 @@ final class DeliveryLanes {
     /// or the client's close has ended hand-off.
     private boolean dispatchNext(Lane lane) {
         return switch (lane.execution) {
-            case HandlerExecution.Internal _ ->
+            case HandlerExecution.Internal _,
+                 HandlerExecution.Inline _ ->
                     executeNext(lane);
             case HandlerExecution.OnExecutor(Executor executor) ->
                     placeNext(lane, executor);
@@ -1064,12 +1195,21 @@ final class DeliveryLanes {
     /// instead once the lane has stopped, its queue has emptied after a confirmed removal, or the
     /// client's close has ended hand-off.
     private boolean awaitNext(Lane lane) {
-        while (!lane.stopped && !handOffsClosed && (lane.failed || lane.queue.isEmpty())) {
-            if (lane.finishing && lane.queue.isEmpty()) {
+        // A borrowed lane keeps its dispatcher waiting, even to stop, until the thread that
+        // runs it gives it back.
+        while (lane.borrower != null
+                || (!lane.stopped && !handOffsClosed && (lane.failed || lane.queue.isEmpty()))) {
+            if (lane.borrower == null && lane.finishing && lane.queue.isEmpty()) {
                 return false;
             }
-            // stop(), finish(), and closeHandOffs() signal this condition.
-            lane.ready.awaitUninterruptibly();
+            // stop(), finish(), closeHandOffs(), and the return of a borrowed lane signal this
+            // condition.
+            lane.dispatcherWaiting = true;
+            try {
+                lane.ready.awaitUninterruptibly();
+            } finally {
+                lane.dispatcherWaiting = false;
+            }
         }
         return !lane.stopped && !handOffsClosed;
     }
@@ -1955,8 +2095,12 @@ final class DeliveryLanes {
         if (lane.stopped) {
             return false;
         }
-        if (lanes.remove(lane.id, lane) && lane.acceptor != null) {
-            handOffLanes--;
+        if (lanes.remove(lane.id, lane)) {
+            if (lane.acceptor != null) {
+                handOffLanes--;
+            } else if (lane.execution instanceof HandlerExecution.Inline) {
+                inlineLanes--;
+            }
         }
         lane.stopped = true;
         requeueUnstarted(lane);
@@ -2264,6 +2408,11 @@ final class DeliveryLanes {
         boolean finishing;
         boolean stopped;
         boolean failed;
+        // The dispatcher waits for this lane's condition; and the thread that reads the
+        // connection, while it runs this inline lane's deliveries in the dispatcher's place,
+        // which keeps the dispatcher waiting until the thread gives the lane back.
+        boolean dispatcherWaiting;
+        @Nullable Thread borrower;
         // The hand-off worker is in this lane's acceptor; a stop then leaves the lane's end to
         // the worker.
         boolean accepting;
@@ -2299,6 +2448,7 @@ final class DeliveryLanes {
                 case HandlerExecution.Striped _,
                      HandlerExecution.Parallel _ -> new HashMap<>();
                 case HandlerExecution.Internal _,
+                     HandlerExecution.Inline _,
                      HandlerExecution.OnExecutor _,
                      HandlerExecution.Lanes _ -> new IdentityHashMap<>();
             };
@@ -2432,11 +2582,12 @@ final class DeliveryLanes {
     @FunctionalInterface
     interface Ready {
 
-        /// `here` when the calling thread is one of the lanes' own, a dispatcher or the hand-off
-        /// worker, between the deliveries that it runs or offers, where the client may do its own
-        /// work in place before the next. `last` when, besides, no delivery waits for that thread
-        /// to run next, so that what the acknowledgements queue need not wait to leave together
-        /// with those of the deliveries that follow.
+        /// `here` when the calling thread runs or offers the lanes' deliveries, between them: a
+        /// dispatcher, the hand-off worker, or the thread that reads the connection while it runs
+        /// an inline lane in its dispatcher's place. The client may then do its own work in place
+        /// before the next delivery. `last` when, besides, no delivery waits for that thread to
+        /// run next, so that what the acknowledgements queue need not wait to leave together with
+        /// those of the deliveries that follow.
         void ready(boolean here, boolean last);
     }
 

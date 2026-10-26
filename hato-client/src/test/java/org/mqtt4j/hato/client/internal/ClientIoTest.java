@@ -1474,7 +1474,7 @@ class ClientIoTest {
         // may wait behind it. After either, the reader runs what it took over.
         assertThat(events.received).hasSize(2);
         assertThat(events.here).containsExactly(!full, !full);
-        assertThat(events.runs).hasValue(1);
+        assertThat(events.afterReads).hasValue(1);
     }
 
     @Test
@@ -1882,6 +1882,8 @@ class ClientIoTest {
         // Whether the reader said it would run each received packet's events itself.
         final List<Boolean> here = new CopyOnWriteArrayList<>();
         final AtomicInteger runs = new AtomicInteger();
+        // How often the reader ran what it took over once a read was over.
+        final AtomicInteger afterReads = new AtomicInteger();
         // The sender's calls that take the events over, post them, and run them, in order.
         final List<String> senderCalls = new CopyOnWriteArrayList<>();
         final List<Long> written = new CopyOnWriteArrayList<>();
@@ -1935,6 +1937,11 @@ class ClientIoTest {
         public void runHeld() {
             runs.incrementAndGet();
             recordSenderCall("runHeld");
+        }
+
+        @Override
+        public void runAfterRead() {
+            afterReads.incrementAndGet();
         }
 
         private void recordSenderCall(String call) {
