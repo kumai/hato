@@ -389,7 +389,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.ready(false);
+            onReady.ready(false, false);
         }
         runTerminations();
     }
@@ -675,7 +675,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.ready(false);
+            onReady.ready(false, false);
         }
         return true;
     }
@@ -1347,7 +1347,12 @@ final class DeliveryLanes {
     private Claim claim(Lane lane, ArrayDeque<DeliveryView> queue) {
         DeliveryView view = queue.removeFirst();
         view.markTaken();
-        return new Claim(view, lane.ackMode == AckMode.ON_RECEIVE && markReady(view));
+        return new Claim(
+                view,
+                lane.ackMode == AckMode.ON_RECEIVE && markReady(view),
+                queue.isEmpty(),
+                queue
+        );
     }
 
     /// Caller holds lock. The sublane of an application's executor, told apart by identity.
@@ -1689,7 +1694,7 @@ final class DeliveryLanes {
         }
         if (ready) {
             // The hand-off worker tells between the deliveries that it offers.
-            onReady.ready(true);
+            onReady.ready(true, false);
         }
         runTerminations();
     }
@@ -1751,24 +1756,27 @@ final class DeliveryLanes {
         DeliveryView view = claim.view();
         try {
             if (claim.ready()) {
-                onReady.ready(here);
+                onReady.ready(here, here && claim.last());
             }
             started(lane, view);
             requireNonNull(lane.handler).accept(view);
             // Clear handler-owned interrupt state before the next delivery or queue wait.
             boolean _ = Thread.interrupted();
             boolean ready;
+            boolean last;
             lock.lock();
             try {
                 view.localDone = true;
                 ready = lane.ackMode == AckMode.AFTER_HANDLER && markReady(view);
+                // Deliveries that arrived while the handler ran come next from the same queue.
+                last = claim.source().isEmpty();
                 releaseView(view);
                 handledDeliveries++;
             } finally {
                 lock.unlock();
             }
             if (ready) {
-                onReady.ready(here);
+                onReady.ready(here, here && last);
             }
         } catch (Throwable failure) {
             boolean _ = Thread.interrupted();
@@ -1805,7 +1813,7 @@ final class DeliveryLanes {
         }
         if (!stops) {
             if (ready) {
-                onReady.ready(false);
+                onReady.ready(false, false);
             }
             if (firstSkip) {
                 log.warn("Skipped a failed delivery for {} (subscription {}); later ones are "
@@ -1875,7 +1883,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.ready(false);
+            onReady.ready(false, false);
         }
     }
 
@@ -2094,7 +2102,7 @@ final class DeliveryLanes {
                 lock.unlock();
             }
             if (ready) {
-                onReady.ready(false);
+                onReady.ready(false, false);
             }
             runTerminations();
         }
@@ -2175,7 +2183,7 @@ final class DeliveryLanes {
                 lock.unlock();
             }
             if (ready) {
-                onReady.ready(false);
+                onReady.ready(false, false);
             }
             runTerminations();
             return result;
@@ -2426,8 +2434,10 @@ final class DeliveryLanes {
 
         /// `here` when the calling thread is one of the lanes' own, a dispatcher or the hand-off
         /// worker, between the deliveries that it runs or offers, where the client may do its own
-        /// work in place before the next.
-        void ready(boolean here);
+        /// work in place before the next. `last` when, besides, no delivery waits for that thread
+        /// to run next, so that what the acknowledgements queue need not wait to leave together
+        /// with those of the deliveries that follow.
+        void ready(boolean here, boolean last);
     }
 
     /// A received QoS 0 publication that the client routes to the lanes `ids`; see
@@ -2448,7 +2458,14 @@ final class DeliveryLanes {
 
     /// A delivery taken from its lane's queue. `ready` says whether taking it met the last
     /// acknowledgement condition of its receipt, which `execute` announces without the lock.
-    private record Claim(DeliveryView view, boolean ready) {}
+    /// A delivery taken from `source`, a lane's queue or a sublane's, and whether its claim made
+    /// an acknowledgement ready; `last` when nothing else waited in `source` at the claim.
+    private record Claim(
+            DeliveryView view,
+            boolean ready,
+            boolean last,
+            ArrayDeque<DeliveryView> source
+    ) {}
 
 
     private static final class RetainedDelivery {

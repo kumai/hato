@@ -398,7 +398,7 @@ class DeliveryMeasurementTest {
                 DeliveryLanes.CONDITION_LIMIT,
                 (_, _) -> true,
                 _ -> { },
-                _ -> { },
+                (_, _) -> { },
                 _ -> { },
                 null
         );

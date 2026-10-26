@@ -636,6 +636,91 @@ class ClientIoTest {
     }
 
     @Test
+    void a_thread_that_defers_its_writes_makes_them_itself_while_the_sender_sleeps()
+            throws Exception {
+        // Arrange: the transport takes writes only through write(), and the sender sleeps.
+        var transport = new BlockingTransport();
+        ClientIo io = blockingIo(transport);
+        await().until(io::senderSleeps);
+
+        // Act
+        io.deferWrites();
+        assertThat(io.send(1, 1, new Packet.PubAck(5, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+        io.writeDeferred();
+
+        // Assert: the calling thread made the write and completed it, and the sender slept on.
+        assertThat(transport.writers).containsExactly(Thread.currentThread());
+        assertThat(events.tickets).containsExactly(1L);
+        assertThat(io.senderSleeps()).isTrue();
+    }
+
+    @Test
+    void a_thread_that_defers_its_writes_leaves_them_to_a_sender_that_is_writing()
+            throws Exception {
+        // Arrange: the sender's first write waits in the transport.
+        var transport = new BlockingTransport();
+        var entered = new CountDownLatch(1);
+        var proceed = new CountDownLatch(1);
+        transport.beforeWrite = () -> {
+            if (entered.getCount() > 0) {
+                entered.countDown();
+                waitFor(proceed);
+            }
+        };
+        ClientIo io = blockingIo(transport);
+        assertThat(io.send(1, 1, new Packet.PingReq(), null)).isEqualTo(ACCEPTED);
+        assertThat(entered.await(5, SECONDS)).isTrue();
+
+        // Act
+        io.deferWrites();
+        assertThat(io.send(1, 2, new Packet.PubAck(5, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+        io.writeDeferred();
+        proceed.countDown();
+
+        // Assert: the sender writes the deferred send after its own write.
+        await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L));
+        assertThat(transport.writers).hasSize(2).allSatisfy(writer ->
+                assertThat(writer.getName()).endsWith("-sender"));
+    }
+
+    @Test
+    void a_thread_that_defers_its_writes_wakes_the_sender_for_a_transport_that_writes_itself()
+            throws Exception {
+        // Arrange: the transport writes on a thread of its own, and the sender sleeps.
+        SingleWriteTransport transport = open(1);
+        await().until(sut::senderSleeps);
+
+        // Act
+        sut.deferWrites();
+        assertThat(sut.send(1, 1, new Packet.PubAck(5, ReasonCode.SUCCESS, EMPTY), null))
+                .isEqualTo(ACCEPTED);
+        sut.writeDeferred();
+
+        // Assert: the calling thread cannot write to this transport, so the sender does.
+        await().untilAsserted(() -> assertThat(transport.attempts).containsExactly(1L));
+    }
+
+    /// A client I/O whose one connection takes writes only through write(), opened.
+    private ClientIo blockingIo(BlockingTransport transport) {
+        var io = new ClientIo(
+                URI.create("mqtt://localhost"),
+                "io-test",
+                16 * 1024 * 1024,
+                128,
+                0,
+                _ -> transport,
+                events,
+                codec,
+                MqttMessageAccess::payloadArray
+        );
+        batching.add(io);
+        io.open(1, Duration.ofSeconds(30));
+        return io;
+    }
+
+    @Test
     void a_large_publication_leaves_as_its_header_then_its_own_payload_and_retries_with_dup()
             throws Exception {
         // Arrange: each connection gets a transport that lets the client write.
@@ -1609,6 +1694,7 @@ class ClientIoTest {
         // The header and the payload of each write that the sender made in two parts.
         final List<List<byte[]>> parts = new CopyOnWriteArrayList<>();
         @Nullable Listener listener;
+        volatile Runnable beforeWrite = () -> { };
         volatile boolean closed;
         int depth;
         int maximumDepth;
@@ -1632,6 +1718,7 @@ class ClientIoTest {
 
         @Override
         public synchronized SendResult write(long ticket, byte[] bytes) {
+            beforeWrite.run();
             if (closed) {
                 return SendResult.CLOSED;
             }

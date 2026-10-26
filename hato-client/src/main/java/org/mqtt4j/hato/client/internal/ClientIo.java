@@ -172,6 +172,14 @@ final class ClientIo {
 
     private boolean closeReported;
 
+    // A thread that runs the client's events and writes the sends that they queue itself once
+    // it has let go of them, so that queuing them leaves an idle sender asleep; see
+    // deferWrites. And the thread that writes a batch in the sender's place meanwhile, owning it
+    // as the sender would. Guarded by sending; each thread only compares itself with them.
+    private @Nullable Thread deferringThread;
+
+    private @Nullable Thread standInWriter;
+
     ClientIo(
             URI endpoint,
             String clientId,
@@ -294,10 +302,12 @@ final class ClientIo {
 
             @Override
             public void onSent(long ticket) {
-                // The sender reports a write that it made itself here, before the write returns,
-                // and then runs what the write completes rather than wake the actor thread.
+                // The sender, or a thread that writes in its place, reports a write that it made
+                // itself here, before the write returns, and then runs what the write completes
+                // rather than wake the actor thread.
                 if (connection.transport instanceof BlockingWriteTransport
-                        && Thread.currentThread() == sender) {
+                        && (Thread.currentThread() == sender
+                                || Thread.currentThread() == standInWriter)) {
                     events.hold();
                 }
                 boolean notify;
@@ -773,8 +783,62 @@ final class ClientIo {
 
     /// Caller holds sending, so a ready queue cannot race with the sender going idle.
     private void wakeSender(Connection connection) {
-        if (current == connection && connection.queue.hasReady()) {
+        if (current == connection && connection.queue.hasReady()
+                && Thread.currentThread() != deferringThread) {
             unparkSender();
+        }
+    }
+
+    /// The calling thread, which is about to run the client's events, writes the sends that they
+    /// queue itself once it has let go of them, so that queuing them does not wake the sender;
+    /// the thread then calls [#writeDeferred()].
+    void deferWrites() {
+        synchronized (sending) {
+            deferringThread = Thread.currentThread();
+        }
+    }
+
+    /// Ends [#deferWrites()]: writes the sends that wait on the calling thread, as the sender
+    /// would, when the sender sleeps and the transport lets the client write, and otherwise leaves
+    /// them to the sender. A sender that is busy takes them after its current write, and a write
+    /// still outstanding wakes the sender for them once it completes. Called with no lock held,
+    /// after the thread has let go of the client's events.
+    void writeDeferred() {
+        Write write = null;
+        synchronized (sending) {
+            deferringThread = null;
+            Connection connection = current;
+            if (connection != null && connection.queue.hasReady()) {
+                if (senderIdle && !shutdown
+                        && connection.transport instanceof BlockingWriteTransport) {
+                    List<SendQueue.Send<Outbound>> batch =
+                            connection.queue.pollBatch(batchByteLimit);
+                    connection.activeTicket = batch.getLast().ticket();
+                    connection.activeSends = batch;
+                    connection.senderOwnsActive = true;
+                    standInWriter = Thread.currentThread();
+                    write = new Write(connection, batch);
+                } else {
+                    unparkSender();
+                }
+            }
+        }
+        if (write != null) {
+            try {
+                prepareAndSend(write);
+            } finally {
+                synchronized (sending) {
+                    standInWriter = null;
+                }
+                events.runHeld();
+            }
+        }
+    }
+
+    /// Whether the sender has found nothing to write and sleeps; for tests.
+    boolean senderSleeps() {
+        synchronized (sending) {
+            return senderIdle;
         }
     }
 

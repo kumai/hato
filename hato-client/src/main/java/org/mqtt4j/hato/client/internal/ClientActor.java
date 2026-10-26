@@ -912,7 +912,7 @@ public final class ClientActor implements MqttClient {
         }
     }
 
-    private void deliveryReady(boolean here) {
+    private void deliveryReady(boolean here, boolean last) {
         post(
                 0,
                 () -> core.deliveriesReady(lanes.takeReady()),
@@ -920,9 +920,21 @@ public final class ClientActor implements MqttClient {
                 0,
                 here
         );
-        if (here) {
-            // A thread of the lanes' own runs what it took over before its next delivery.
-            runHeld();
+        if (here && mailbox.holds()) {
+            // A thread of the lanes' own runs what it took over before its next delivery. After
+            // the last delivery that waits for it, it also writes what those events queued, such
+            // as a PUBACK, when the sender sleeps, which spares waking the sender for it. While
+            // more deliveries wait, the sender writes their acknowledgements together instead.
+            if (last) {
+                io.deferWrites();
+            }
+            try {
+                runHeld();
+            } finally {
+                if (last) {
+                    io.writeDeferred();
+                }
+            }
         }
     }
 

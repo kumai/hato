@@ -2966,8 +2966,8 @@ class DeliveryLanesTest {
             HandlerExecution execution
     ) throws Exception {
         // Arrange: one subscription acknowledges after its handler, the other on receipt.
-        var here = new LinkedBlockingQueue<Boolean>();
-        DeliveryLanes sut = lanesTellingWhere(here);
+        var told = new LinkedBlockingQueue<Told>();
+        DeliveryLanes sut = lanesTellingWhere(told);
         assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 1), execution, _ -> { }))
                 .isTrue();
         assertThat(sut.register(2, request(AckMode.ON_RECEIVE, 1), execution, _ -> { }))
@@ -2978,33 +2978,111 @@ class DeliveryLanesTest {
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
         assertThat(sut.deliver(token(1, 11), List.of(2L), qosOneMessage(), false, 10)).isTrue();
 
-        // Assert
+        // Assert: each delivery was alone, so nothing waited for the dispatcher after it.
         assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
-        assertThat(here).containsExactly(true, true);
+        assertThat(told).containsExactly(new Told(true, true), new Told(true, true));
+    }
+
+    static Stream<Named<HandlerExecution>> orderedInternalExecutions() {
+        return Stream.of(
+                Named.of("serial", new HandlerExecution.Internal()),
+                Named.of("striped", new HandlerExecution.Striped(2, MqttMessage::topic, null))
+        );
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("orderedInternalExecutions")
+    void a_dispatcher_tells_that_more_deliveries_wait_until_it_reaches_the_last_one(
+            HandlerExecution execution
+    ) throws Exception {
+        // Arrange: the first handler holds its thread while a second delivery, with the same
+        // topic and so on the same stripe, waits behind it.
+        var told = new LinkedBlockingQueue<Told>();
+        DeliveryLanes sut = lanesTellingWhere(told);
+        var started = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var first = new AtomicBoolean(true);
+        assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 2), execution, _ -> {
+            if (first.getAndSet(false)) {
+                started.countDown();
+                waitFor(release);
+            }
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(started.await(5, SECONDS)).isTrue();
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        if (execution instanceof HandlerExecution.Striped) {
+            // The lane's dispatcher moves the second delivery to the stripe behind the first.
+            await().until(() -> sut.placedDeliveries() == 2);
+        }
+
+        // Act
+        release.countDown();
+
+        // Assert: the second delivery waited for the same thread when the first one's
+        // acknowledgement became ready, and nothing waited after the second.
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
+        assertThat(told).containsExactly(new Told(true, false), new Told(true, true));
+    }
+
+    @Test
+    void a_claim_acknowledged_on_receipt_tells_whether_more_deliveries_wait() throws Exception {
+        // Arrange: the first handler holds the dispatcher while two more deliveries queue.
+        var told = new LinkedBlockingQueue<Told>();
+        DeliveryLanes sut = lanesTellingWhere(told);
+        var started = new CountDownLatch(1);
+        CountDownLatch release = release();
+        var first = new AtomicBoolean(true);
+        assertThat(sut.register(1, request(AckMode.ON_RECEIVE, 3), _ -> {
+            if (first.getAndSet(false)) {
+                started.countDown();
+                waitFor(release);
+            }
+        })).isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(started.await(5, SECONDS)).isTrue();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(sut.deliver(token(1, 11), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.deliver(token(1, 12), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+
+        // Act
+        release.countDown();
+
+        // Assert: each acknowledgement is ready when its delivery is claimed, and only the
+        // claims that leave the queue empty are the last.
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(12L);
+        assertThat(told).containsExactly(
+                new Told(true, true),
+                new Told(true, false),
+                new Told(true, true)
+        );
     }
 
     @Test
     void the_hand_off_worker_says_that_it_runs_between_deliveries_when_it_tells()
             throws Exception {
         // Arrange
-        var here = new LinkedBlockingQueue<Boolean>();
-        DeliveryLanes sut = lanesTellingWhere(here);
+        var told = new LinkedBlockingQueue<Told>();
+        DeliveryLanes sut = lanesTellingWhere(told);
         assertThat(sut.registerHandOff(1, request(AckMode.ON_RECEIVE, 1), _ -> true)).isTrue();
 
         // Act
         assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
 
-        // Assert
+        // Assert: the worker runs the client's events between offers, but never writes for
+        // them, since its next offer may follow at once.
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
-        assertThat(here).containsExactly(true);
+        assertThat(told).containsExactly(new Told(true, false));
     }
 
     @Test
     void a_task_on_an_application_executor_tells_as_any_other_thread_does() throws Exception {
         // Arrange
         var executor = new ManualExecutor();
-        var here = new LinkedBlockingQueue<Boolean>();
-        DeliveryLanes sut = lanesTellingWhere(here);
+        var told = new LinkedBlockingQueue<Told>();
+        DeliveryLanes sut = lanesTellingWhere(told);
         var execution = new HandlerExecution.OnExecutor(executor);
         assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 1), execution, _ -> { }))
                 .isTrue();
@@ -3017,7 +3095,11 @@ class DeliveryLanesTest {
         // Assert: the executor's thread belongs to the application, which the client keeps
         // its own work off.
         assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
-        assertThat(here).containsExactly(false);
+        assertThat(told).containsExactly(new Told(false, false));
+    }
+
+    /// What the lanes told when acknowledgements were ready; see [DeliveryLanes.Ready].
+    private record Told(boolean here, boolean last) {
     }
 
     private record Failure(DeliveryToken token, Throwable cause) {
@@ -3094,7 +3176,7 @@ class DeliveryLanesTest {
                 conditionLimit,
                 onFailure,
                 overloads::add,
-                _ -> onReady.run(),
+                (_, _) -> onReady.run(),
                 terminated::add,
                 null
         );
@@ -3103,8 +3185,8 @@ class DeliveryLanesTest {
     }
 
     /// Lanes that record, each time acknowledgements are ready, whether one of their own
-    /// dispatchers said so between its deliveries.
-    private DeliveryLanes lanesTellingWhere(LinkedBlockingQueue<Boolean> here) {
+    /// dispatchers said so between its deliveries, and whether no delivery waited for it next.
+    private DeliveryLanes lanesTellingWhere(LinkedBlockingQueue<Told> told) {
         var owner = new AtomicReference<DeliveryLanes>();
         var manager = new DeliveryLanes(
                 "lane-test",
@@ -3113,8 +3195,8 @@ class DeliveryLanesTest {
                 DeliveryLanes.CONDITION_LIMIT,
                 (token, cause) -> failures.add(new Failure(token, cause)),
                 overloads::add,
-                ownThread -> {
-                    here.add(ownThread);
+                (here, last) -> {
+                    told.add(new Told(here, last));
                     ready.addAll(requireNonNull(owner.get()).takeReady());
                 },
                 terminated::add,
