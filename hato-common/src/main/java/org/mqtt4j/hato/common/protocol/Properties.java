@@ -22,6 +22,14 @@ public record Properties(List<Property> entries) {
 
     /// The first property with `id`, or empty when the packet has none.
     public Optional<Property> find(PropertyId id) {
-        return entries.stream().filter(property -> property.id() == id).findFirst();
+        // A loop rather than a stream: the client looks up properties for every PUBLISH it
+        // receives, and an MQTT 3.1.1 PUBLISH has none.
+        for (int i = 0; i < entries.size(); i++) {
+            Property property = entries.get(i);
+            if (property.id() == id) {
+                return Optional.of(property);
+            }
+        }
+        return Optional.empty();
     }
 }

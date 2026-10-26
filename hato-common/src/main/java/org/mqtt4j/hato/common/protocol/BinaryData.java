@@ -22,6 +22,16 @@ public final class BinaryData {
     ///
     /// @throws PacketDecodeException if the length prefix or the declared data is truncated
     public static byte[] read(ByteBuffer input) {
+        var value = new byte[readLength(input)];
+        input.get(value);
+        return value;
+    }
+
+    /// Reads the length prefix of one field and checks that the field's bytes follow it, leaving
+    /// the buffer at the first of them.
+    ///
+    /// @throws PacketDecodeException if the length prefix or the declared data is truncated
+    static int readLength(ByteBuffer input) {
         requireNonNull(input, "input must not be null");
         if (input.remaining() < 2) {
             throw new PacketDecodeException(MALFORMED_PACKET, "Truncated binary data length");
@@ -30,9 +40,7 @@ public final class BinaryData {
         if (input.remaining() < length) {
             throw new PacketDecodeException(MALFORMED_PACKET, "Truncated binary data");
         }
-        var value = new byte[length];
-        input.get(value);
-        return value;
+        return length;
     }
 
     /// Appends the length prefix and a copy of `value`, validating before writing any bytes.

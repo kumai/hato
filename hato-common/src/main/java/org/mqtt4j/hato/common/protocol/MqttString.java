@@ -2,8 +2,7 @@ package org.mqtt4j.hato.common.protocol;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
+import java.nio.charset.MalformedInputException;
 import java.nio.charset.StandardCharsets;
 
 import static java.util.Objects.requireNonNull;
@@ -29,23 +28,97 @@ public final class MqttString {
     /// @throws PacketDecodeException if the field is truncated, malformed UTF-8,
     ///         or contains U+0000
     public static String read(ByteBuffer input) {
-        byte[] bytes = BinaryData.read(input);
-        try {
-            // [MQTT-1.5.3-1]: never silently replace malformed UTF-8, including surrogates.
-            String value = StandardCharsets.UTF_8.newDecoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)
-                    .decode(ByteBuffer.wrap(bytes))
-                    .toString();
-            // [MQTT-1.5.3-2]
-            if (value.indexOf('\0') >= 0) {
-                throw new PacketDecodeException(MALFORMED_PACKET, "MQTT string contains NUL");
-            }
-            // [MQTT-1.5.3-3] (Errata 01): U+FEFF remains part of the string.
-            return value;
-        } catch (CharacterCodingException e) {
-            throw new PacketDecodeException(MALFORMED_PACKET, "Malformed MQTT UTF-8 string", e);
+        int length = BinaryData.readLength(input);
+        int position = input.position();
+        String value;
+        if (input.hasArray()) {
+            // Checked and decoded where the field lies, without copying it out first.
+            value = decode(input.array(), input.arrayOffset() + position, length);
+        } else {
+            var bytes = new byte[length];
+            input.get(position, bytes);
+            value = decode(bytes, 0, length);
         }
+        input.position(position + length);
+        return value;
+    }
+
+    /// Decodes the `length` bytes of `bytes` from `offset` as the content of an MQTT UTF-8
+    /// string, which [#read(ByteBuffer)] reads after its length prefix.
+    ///
+    /// @throws PacketDecodeException if the bytes are malformed UTF-8 or contain U+0000
+    static String decode(byte[] bytes, int offset, int length) {
+        // [MQTT-1.5.3-1]: never silently replace malformed UTF-8. One scan checks the bytes
+        // against the well-formed sequences of the Unicode standard (table 3-7), as a strict
+        // decoder does: it rejects overlong forms, encoded surrogates, values beyond U+10FFFF,
+        // and truncated sequences. Decoding checked bytes then cannot replace anything.
+        int end = offset + length;
+        boolean nul = false;
+        int index = offset;
+        while (index < end) {
+            int lead = bytes[index] & 0xFF;
+            if (lead < 0x80) {
+                if (lead == 0) {
+                    nul = true;
+                }
+                index++;
+                continue;
+            }
+            // How many continuation bytes the lead byte announces, and the range that the first
+            // of them must lie in; the rest lie in 80..BF.
+            int continuations;
+            int low = 0x80;
+            int high = 0xBF;
+            if (lead >= 0xC2 && lead <= 0xDF) {
+                continuations = 1;
+            } else if (lead == 0xE0) {
+                continuations = 2;
+                low = 0xA0;
+            } else if (lead == 0xED) {
+                continuations = 2;
+                high = 0x9F;
+            } else if (lead >= 0xE1 && lead <= 0xEF) {
+                continuations = 2;
+            } else if (lead == 0xF0) {
+                continuations = 3;
+                low = 0x90;
+            } else if (lead == 0xF4) {
+                continuations = 3;
+                high = 0x8F;
+            } else if (lead >= 0xF1 && lead <= 0xF3) {
+                continuations = 3;
+            } else {
+                throw malformed();
+            }
+            if (end - index <= continuations) {
+                throw malformed();
+            }
+            int first = bytes[index + 1] & 0xFF;
+            if (first < low || first > high) {
+                throw malformed();
+            }
+            for (int at = index + 2; at <= index + continuations; at++) {
+                int continuation = bytes[at] & 0xFF;
+                if (continuation < 0x80 || continuation > 0xBF) {
+                    throw malformed();
+                }
+            }
+            index += continuations + 1;
+        }
+        // [MQTT-1.5.3-2]
+        if (nul) {
+            throw new PacketDecodeException(MALFORMED_PACKET, "MQTT string contains NUL");
+        }
+        // [MQTT-1.5.3-3] (Errata 01): U+FEFF remains part of the string.
+        return new String(bytes, offset, length, StandardCharsets.UTF_8);
+    }
+
+    private static PacketDecodeException malformed() {
+        return new PacketDecodeException(
+                MALFORMED_PACKET,
+                "Malformed MQTT UTF-8 string",
+                new MalformedInputException(1)
+        );
     }
 
     /// Appends the byte-length prefix and UTF-8 content, validating before writing any bytes.

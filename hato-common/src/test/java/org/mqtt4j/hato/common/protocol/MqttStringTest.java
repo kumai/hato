@@ -3,9 +3,14 @@ package org.mqtt4j.hato.common.protocol;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.Objects;
 
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -71,6 +76,76 @@ class MqttStringTest {
                 .withCauseInstanceOf(CharacterCodingException.class)
                 .satisfies(error -> assertThat(error.reasonCode())
                         .isSameAs(ReasonCode.MALFORMED_PACKET));
+    }
+
+    @Test
+    void decoding_agrees_with_a_strict_utf8_decoder_on_short_sequences() {
+        // Arrange: every sequence of one or two bytes, and after each byte that can lead a three-
+        // or four-byte sequence, every second byte with later bytes at the edges of the ranges
+        // that decide well-formedness.
+        int[] edges = {0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xFF};
+        var mismatches = new ArrayList<String>();
+        // Act
+        for (int first = 0; first < 256; first++) {
+            check(bytes(first), mismatches);
+            for (int second = 0; second < 256; second++) {
+                check(bytes(first, second), mismatches);
+                if (first < 0xE0) {
+                    continue;
+                }
+                for (int third : edges) {
+                    check(bytes(first, second, third), mismatches);
+                    if (first < 0xF0) {
+                        continue;
+                    }
+                    for (int fourth : edges) {
+                        check(bytes(first, second, third, fourth), mismatches);
+                    }
+                }
+            }
+        }
+        // Assert
+        assertThat(mismatches).isEmpty();
+    }
+
+    // Adds `content` to `mismatches` unless MqttString reads it as a field exactly as a strict
+    // decoder reads it, under MQTT's rule against U+0000.
+    private static void check(byte[] content, List<String> mismatches) {
+        ByteBuffer field = ByteBuffer.allocate(content.length + 2)
+                .putShort((short) content.length)
+                .put(content)
+                .flip();
+        @Nullable String actual;
+        try {
+            actual = MqttString.read(field);
+        } catch (PacketDecodeException _) {
+            actual = null;
+        }
+        if (!Objects.equals(actual, strictlyDecoded(content))) {
+            mismatches.add(HexFormat.of().formatHex(content));
+        }
+    }
+
+    private static byte[] bytes(int... values) {
+        var bytes = new byte[values.length];
+        for (int i = 0; i < values.length; i++) {
+            bytes[i] = (byte) values[i];
+        }
+        return bytes;
+    }
+
+    // What a strict UTF-8 decoder makes of `content`, or null when MQTT rejects it.
+    private static @Nullable String strictlyDecoded(byte[] content) {
+        try {
+            String value = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(content))
+                    .toString();
+            return value.indexOf('\0') >= 0 ? null : value;
+        } catch (CharacterCodingException _) {
+            return null;
+        }
     }
 
     @ParameterizedTest

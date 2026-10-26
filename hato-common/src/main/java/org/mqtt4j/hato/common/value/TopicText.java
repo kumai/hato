@@ -1,9 +1,5 @@
 package org.mqtt4j.hato.common.value;
 
-import java.nio.CharBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 /// Validates the text constraints shared by topic names and topic filters.
@@ -27,18 +23,32 @@ final class TopicText {
             throw new IllegalArgumentException(label + " must not contain NUL character");
         }
 
-        // [MQTT-1.5.3-1]: report malformed UTF-16 instead of replacing unpaired surrogates.
-        try {
-            int encodedLength = StandardCharsets.UTF_8.newEncoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .encode(CharBuffer.wrap(value))
-                    .remaining();
-            // [MQTT-4.7.3-3]: the limit applies to the complete UTF-8 encoding.
-            if (encodedLength > 65535) {
-                throw new IllegalArgumentException(label + " exceeds 65535 bytes in UTF-8");
+        // One scan counts the UTF-8 length without encoding the text, which every received
+        // topic name would otherwise pay for: a char below U+0080 takes one byte, below U+0800
+        // two, and any other three, except that a surrogate pair takes four for its two chars.
+        // [MQTT-1.5.3-1]: an unpaired surrogate has no UTF-8 encoding, so it is reported rather
+        // than replaced.
+        long encodedLength = 0;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 0x80) {
+                encodedLength += 1;
+            } else if (c < 0x800) {
+                encodedLength += 2;
+            } else if (!Character.isSurrogate(c)) {
+                encodedLength += 3;
+            } else if (Character.isHighSurrogate(c)
+                    && i + 1 < value.length()
+                    && Character.isLowSurrogate(value.charAt(i + 1))) {
+                encodedLength += 4;
+                i++;
+            } else {
+                throw new IllegalArgumentException(label + " contains an unpaired surrogate");
             }
-        } catch (CharacterCodingException e) {
-            throw new IllegalArgumentException(label + " contains an unpaired surrogate", e);
+        }
+        // [MQTT-4.7.3-3]: the limit applies to the complete UTF-8 encoding.
+        if (encodedLength > 65535) {
+            throw new IllegalArgumentException(label + " exceeds 65535 bytes in UTF-8");
         }
     }
 }
