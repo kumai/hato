@@ -1477,6 +1477,30 @@ class SessionCoreTest {
     }
 
     @Test
+    void each_publication_goes_to_the_registrations_that_match_it_when_it_arrives() {
+        // Arrange: a publication to a/b reaches the one registration that matches it.
+        connected();
+        sut.subscribe(2, subscription("a/#"));
+        receive(1, publication(), 0);
+
+        // Act: the same topic again after an overlapping registration, after the first
+        // registration's removal starts, and after the last registration's removal starts.
+        sut.subscribe(3, subscription("a/+"));
+        receive(1, publication(), 0);
+        sut.unsubscribe(4, 2);
+        receive(1, publication(), 0);
+        sut.unsubscribe(5, 3);
+        receive(1, publication(), 0);
+
+        // Assert
+        assertThat(port.deliveries).extracting(Received::ids).containsExactly(
+                List.of(2L),
+                List.of(2L, 3L),
+                List.of(3L)
+        );
+    }
+
+    @Test
     void shared_deliveries_match_the_inner_filter_before_and_after_suback() {
         // Arrange: unrelated ordinary and shared subscriptions remain independent.
         connected();

@@ -10,6 +10,7 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.client.internal.common.protocol.RemainingLength;
+import org.mqtt4j.hato.client.internal.common.protocol.TopicCache;
 
 /// Adapts arbitrary transport chunks to the existing codec without buffering the whole stream.
 /// A packet that lies whole within one chunk is decoded where it lies. A packet that spans
@@ -24,6 +25,10 @@ final class IncomingFrames {
     private final PacketCodec codec;
 
     private final BiConsumer<Packet, Integer> receiver;
+
+    // The connection's topic names, which most streams repeat, so that each is decoded and
+    // checked once rather than for every PUBLISH.
+    private final TopicCache topics = new TopicCache();
 
     // The fixed header of the packet being read, which may arrive over several chunks: its first
     // byte and at most four bytes of Remaining Length.
@@ -75,7 +80,7 @@ final class IncomingFrames {
                     // The whole packet lies in this chunk, so it is decoded there.
                     offset += length;
                     headerSize = 0;
-                    receiver.accept(codec.decode(bytes, start, size), size);
+                    receiver.accept(codec.decode(bytes, start, size, topics), size);
                     continue;
                 }
                 packetSize = size;
@@ -90,7 +95,7 @@ final class IncomingFrames {
             if (position == packetSize) {
                 byte[] packet = assembled();
                 clear();
-                receiver.accept(codec.decode(packet), packet.length);
+                receiver.accept(codec.decode(packet, 0, packet.length, topics), packet.length);
             }
         }
     }

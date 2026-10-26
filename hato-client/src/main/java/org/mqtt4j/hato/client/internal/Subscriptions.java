@@ -64,6 +64,9 @@ final class Subscriptions {
     private static final Comparator<LocalSubscription> REGISTRATION_ORDER =
             Comparator.comparingLong(local -> local.id);
 
+    // The most topics whose registrations the client keeps for publications to come.
+    private static final int ROUTE_LIMIT = 64;
+
     // The largest Subscription Identifier, a variable byte integer of at most four bytes.
     static final int MAX_SUBSCRIPTION_IDENTIFIER = 268_435_455;
 
@@ -97,6 +100,13 @@ final class Subscriptions {
 
     // The registrations by the filter that they match topics with.
     private final FilterTree<LocalSubscription> byTopic = new FilterTree<>();
+
+    // The registrations that publications without Subscription Identifiers went to, by topic
+    // name, as matching() returned them. Registering, unregistering, and starting or ending a
+    // removal empty it. A deliberate simplification: once it holds ROUTE_LIMIT topics it is
+    // emptied and refilled, so a stream of ever new topics, such as one per device, pays a map
+    // insertion per publication and never hits; a bounded LRU would keep the hot ones.
+    private final Map<String, List<Long>> routes = new HashMap<>();
 
     // Where the search for the next registration's Subscription Identifier starts.
     private int nextIdentifier = 1;
@@ -197,6 +207,7 @@ final class Subscriptions {
         }
         // A registration still queued for SUBSCRIBE stays in the queue, which passes over it.
         local.removal = new UnsubscribeOperation(operation, local);
+        routes.clear();
         if (core.state() != State.CONNECTED) {
             if (cleanStart) {
                 removeSubscription(local, null);
@@ -227,7 +238,27 @@ final class Subscriptions {
         List<Integer> identifiers = core.subscriptionIdentifiers()
                 ? identifiers(publish.properties())
                 : List.of();
-        Topic topic = publish.topic();
+        if (!identifiers.isEmpty()) {
+            return matching(publish.topic(), identifiers);
+        }
+        // Without identifiers, the answer depends on the topic and the registrations alone, and
+        // most streams repeat a few topics, so the answer for a topic is kept until the
+        // registrations change.
+        String name = publish.topic().name();
+        List<Long> route = routes.get(name);
+        if (route == null) {
+            if (routes.size() == ROUTE_LIMIT) {
+                routes.clear();
+            }
+            route = List.copyOf(matching(publish.topic(), identifiers));
+            routes.put(name, route);
+        }
+        return route;
+    }
+
+    /// The registrations to which a publication to `topic` that carries `identifiers` goes, as
+    /// [#matching(Packet.Publish)] describes.
+    private List<Long> matching(Topic topic, List<Integer> identifiers) {
         var matches = new ArrayList<LocalSubscription>();
         if (identifiers.isEmpty()) {
             byTopic.match(topic, matches::add);
@@ -527,6 +558,7 @@ final class Subscriptions {
             if (local.removal == null) {
                 // No caller observes this removal; it only keeps the filter until confirmed.
                 local.removal = new UnsubscribeOperation(0, local);
+                routes.clear();
             }
         }
         core.fail(protocolError(message));
@@ -630,6 +662,7 @@ final class Subscriptions {
             sharedRegistrations.add(local);
         }
         byTopic.add(local.matchingFilter, local);
+        routes.clear();
     }
 
     /// Removes `local` from the registry and its indexes, if it is still there. The queues of
@@ -642,6 +675,7 @@ final class Subscriptions {
         byIdentifier.remove(local.identifier);
         sharedRegistrations.remove(local);
         byTopic.remove(local.matchingFilter, local);
+        routes.clear();
     }
 
     private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
@@ -657,6 +691,7 @@ final class Subscriptions {
             port.complete(removal.operation, null, null);
         }
         local.removal = null;
+        routes.clear();
     }
 
     /// Whether both filters can match at least one valid, nonempty MQTT topic.
