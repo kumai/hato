@@ -25,6 +25,12 @@ import org.jspecify.annotations.Nullable;
 /// flow control rather than the allowances holds back a broker that sends faster than the actor
 /// routes. While a PINGRESP is due the reader goes on instead: it overtakes the queue only once
 /// it has been read, and what does not fit meanwhile meets the allowances.
+///
+/// One thread at a time runs the events, in the order described above; this class calls it the
+/// actor. It is the client's actor thread, or another thread of the client that posts an event
+/// while none runs them: that thread then runs them itself, in place, rather than waking the actor
+/// thread, which costs more than a small event. It lets go of them once none is left, or hands
+/// them over to the actor thread.
 final class Mailbox {
 
     enum OfferResult {
@@ -147,6 +153,14 @@ final class Mailbox {
 
     private long stopSession;
 
+    // The thread that runs the events now, or null while none does. Written under the monitor; a
+    // thread reads it without, to learn whether it runs them itself, which only it changes.
+    private volatile @Nullable Thread holder;
+
+    // Set once the actor ends: the actor thread then waits for the thread that runs the events to
+    // let go.
+    private boolean ending;
+
     Mailbox(
             int commandLimit,
             long commandByteLimit,
@@ -188,6 +202,14 @@ final class Mailbox {
     }
 
     synchronized OfferResult offer(Event event) {
+        return offer(event, false);
+    }
+
+    /// Admits `event` as [#offer(Event)] does. When `here` and no thread runs the events, the
+    /// calling thread takes them over instead of waking the actor: it must then run them with
+    /// [#poll()] as soon as it holds no lock that their actions take, and before it waits for
+    /// anything.
+    synchronized OfferResult offer(Event event, boolean here) {
         // Client-owned commands and wakes use generation zero and survive connection changes.
         if (event.generation() != 0 && event.generation() != activeGeneration) {
             return OfferResult.STALE;
@@ -238,7 +260,11 @@ final class Mailbox {
                 // The keep-alive queue's size is its count.
             }
         }
-        notifyAll();
+        if (here && holder == null) {
+            holder = Thread.currentThread();
+        } else {
+            wakeActor();
+        }
         return OfferResult.ACCEPTED;
     }
 
@@ -293,7 +319,7 @@ final class Mailbox {
         if (termination == null) {
             termination = event;
         }
-        notifyAll();
+        wakeActor();
         return true;
     }
 
@@ -307,7 +333,7 @@ final class Mailbox {
             stop = new Event(0, action, Kind.CONTROL, 0);
             stopSession = session;
         }
-        notifyAll();
+        wakeActor();
         return true;
     }
 
@@ -318,16 +344,85 @@ final class Mailbox {
         }
     }
 
-    /// Waits for the next event; returns empty when the actor is stopping.
+    /// For the actor thread: waits until an event is queued and no other thread runs the events,
+    /// then runs them and returns the next; returns empty when the actor is stopping. While
+    /// nothing is queued, the actor thread lets go of the events, so that a thread that posts one
+    /// can run it.
     synchronized Optional<Event> take(BooleanSupplier stopping) throws InterruptedException {
+        Thread current = Thread.currentThread();
         while (!stopping.getAsBoolean()) {
-            Event next = next();
-            if (next != null) {
-                return Optional.of(remove(next));
+            if (holder == null || holder == current) {
+                Event next = next();
+                if (next != null) {
+                    holder = current;
+                    return Optional.of(remove(next));
+                }
+                holder = null;
             }
             wait();
         }
         return Optional.empty();
+    }
+
+    /// Whether the calling thread runs the events now.
+    boolean holds() {
+        return holder == Thread.currentThread();
+    }
+
+    /// For a thread that runs the events: takes the next one, or lets go of them and returns null
+    /// when none is queued.
+    synchronized @Nullable Event poll() {
+        if (holder != Thread.currentThread()) {
+            throw new IllegalStateException("The calling thread does not run the events");
+        }
+        Event next = next();
+        if (next != null) {
+            return remove(next);
+        }
+        holder = null;
+        if (ending) {
+            notifyAll();
+        }
+        return null;
+    }
+
+    /// For a thread that runs the events: lets go of them, and wakes the actor thread to run those
+    /// that are still queued. Does nothing for a thread that does not run them.
+    void handOver() {
+        if (holds()) {
+            synchronized (this) {
+                holder = null;
+                notifyAll();
+            }
+        }
+    }
+
+    /// For the actor thread once the actor ends: waits until no other thread runs the events, then
+    /// runs them for good, so that none runs beside the actor's cleanup.
+    synchronized void holdForGood() {
+        Thread current = Thread.currentThread();
+        ending = true;
+        boolean interrupted = false;
+        while (holder != null && holder != current) {
+            try {
+                wait();
+            } catch (InterruptedException _) {
+                // The thread that runs the events lets go after its current one; keep waiting.
+                interrupted = true;
+            }
+        }
+        holder = current;
+        if (interrupted) {
+            current.interrupt();
+        }
+    }
+
+    // A thread that runs the events takes those posted meanwhile before it lets go, so only an
+    // event queued while none runs them wakes the actor thread.
+    private void wakeActor() {
+        if (holder == null) {
+            notifyAll();
+        }
     }
 
     /// Takes, without waiting, the received QoS 0 publications that come next, up to `limit`, and

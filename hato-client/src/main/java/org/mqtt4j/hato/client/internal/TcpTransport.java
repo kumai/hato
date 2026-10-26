@@ -122,8 +122,9 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     private boolean closed;
     private boolean started;
     private boolean connected;
-    // The reader waits before its next read while set, and a close ends the wait.
-    private boolean readingPaused;
+    // The reader waits before its next read while set, and a close ends the wait. Written under
+    // callbacks; the reader reads it without first.
+    private volatile boolean readingPaused;
 
     public TcpTransport(String clientId, TimerScheduler timer) {
         this(
@@ -332,33 +333,46 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             throws IOException, InterruptedException {
         var buffer = new byte[READ_BUFFER_SIZE];
         InputStream input = socket.input();
+        // A listener that borrows takes the bytes where they lie, which spares a copy of every
+        // read.
+        BorrowingListener borrower = receiver instanceof BorrowingListener lender ? lender : null;
         // The time spent on what arrived since the reader last let others run. A read that waits
         // for the peer frees the carrier, so only the work on the bytes counts.
         long worked = 0;
         int count;
         while ((count = input.read(buffer)) != -1) {
-            synchronized (callbacks) {
-                long started = System.nanoTime();
-                // After a close, keep reading and drop what arrives until the peer ends its
-                // stream, so that closeGracefully can release a socket that receives nothing.
-                if (!closed) {
-                    // A listener that borrows takes the bytes where they lie, which spares a copy
-                    // of every read.
-                    if (receiver instanceof BorrowingListener borrower) {
-                        borrower.onBorrowedBytes(buffer, 0, count);
-                    } else {
-                        receiver.onBytes(Arrays.copyOf(buffer, count));
+            long started = System.nanoTime();
+            BorrowingListener lent = null;
+            try {
+                synchronized (callbacks) {
+                    // After a close, keep reading and drop what arrives until the peer ends its
+                    // stream, so that closeGracefully can release a socket that receives nothing.
+                    if (!closed) {
+                        if (borrower != null) {
+                            lent = borrower;
+                            borrower.onBorrowedBytes(buffer, 0, count);
+                        } else {
+                            receiver.onBytes(Arrays.copyOf(buffer, count));
+                        }
                     }
                 }
-                worked += System.nanoTime() - started;
-                // A pause, which onBytes may have asked for, leaves the peer to TCP flow control
-                // until the client resumes. Waiting frees the carrier.
-                if (readingPaused && !closed) {
+            } finally {
+                if (lent != null) {
+                    // Without the lock, where what the listener does may call this transport.
+                    lent.afterBorrowedBytes();
+                }
+            }
+            worked += System.nanoTime() - started;
+            // A pause, which the listener may have asked for, leaves the peer to TCP flow control
+            // until the client resumes. It waits after afterBorrowedBytes, whose work may resume
+            // the reader. Waiting frees the carrier.
+            if (readingPaused) {
+                synchronized (callbacks) {
                     while (readingPaused && !closed) {
                         callbacks.wait();
                     }
-                    worked = 0;
                 }
+                worked = 0;
             }
             // A peer that never pauses keeps every read from blocking, and the reader from
             // freeing its carrier for the writer, the closing worker, and the client, so the

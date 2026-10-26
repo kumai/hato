@@ -7,6 +7,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -1322,6 +1323,30 @@ class ClientIoTest {
         assertThat(events.received).containsExactly(new Packet.PingResp(), new Packet.PingResp());
     }
 
+    @ParameterizedTest(name = "the read fills its buffer: {0}")
+    @ValueSource(booleans = {false, true})
+    void the_reader_runs_the_events_of_a_lent_read_itself_unless_it_fills_its_buffer(
+            boolean full
+    ) {
+        // Arrange: one read lends two packets.
+        byte[] response = codec.encode(new Packet.PingResp());
+        var bytes = new byte[response.length * 2];
+        System.arraycopy(response, 0, bytes, 0, response.length);
+        System.arraycopy(response, 0, bytes, response.length, response.length);
+        byte[] buffer = full ? bytes : Arrays.copyOf(bytes, bytes.length + 1);
+        var reader = (BorrowingListener) requireNonNull(open(1).listener);
+
+        // Act
+        reader.onBorrowedBytes(buffer, 0, bytes.length);
+        reader.afterBorrowedBytes();
+
+        // Assert: a read that fills its buffer leaves its events to the actor thread, since more
+        // may wait behind it. After either, the reader runs what it took over.
+        assertThat(events.received).hasSize(2);
+        assertThat(events.here).containsExactly(!full, !full);
+        assertThat(events.runs).hasValue(1);
+    }
+
     @Test
     void shutdown_reports_the_end_of_io_once_every_started_transport_has_closed()
             throws Exception {
@@ -1722,6 +1747,9 @@ class ClientIoTest {
         final List<Throwable> fatals = new CopyOnWriteArrayList<>();
         final List<Packet> received = new CopyOnWriteArrayList<>();
         final List<Packet> pingResponses = new CopyOnWriteArrayList<>();
+        // Whether the reader said it would run each received packet's events itself.
+        final List<Boolean> here = new CopyOnWriteArrayList<>();
+        final AtomicInteger runs = new AtomicInteger();
         final List<Long> written = new CopyOnWriteArrayList<>();
         final List<Long> capacityGenerations = new CopyOnWriteArrayList<>();
         final AtomicInteger closures = new AtomicInteger();
@@ -1732,13 +1760,15 @@ class ClientIoTest {
         }
 
         @Override
-        public void received(long generation, Packet packet, int size) {
+        public void received(long generation, Packet packet, int size, boolean here) {
             received.add(packet);
+            this.here.add(here);
         }
 
         @Override
-        public void pingResponse(long generation, Packet packet, int size) {
+        public void pingResponse(long generation, Packet packet, int size, boolean here) {
             pingResponses.add(packet);
+            this.here.add(here);
         }
 
         @Override
@@ -1758,6 +1788,11 @@ class ClientIoTest {
                 generations.add(generation);
                 tickets.add(ticket);
             };
+        }
+
+        @Override
+        public void runHeld() {
+            runs.incrementAndGet();
         }
 
         @Override

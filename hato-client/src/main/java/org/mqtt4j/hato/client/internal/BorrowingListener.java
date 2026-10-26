@@ -10,4 +10,9 @@ import org.mqtt4j.hato.Transport;
 interface BorrowingListener extends Transport.Listener {
 
     void onBorrowedBytes(byte[] buffer, int offset, int length);
+
+    /// Called on the reading thread after each [#onBorrowedBytes] and before the next read, once
+    /// the transport holds none of its locks, so that the listener can do work there that may
+    /// call the transport.
+    void afterBorrowedBytes();
 }

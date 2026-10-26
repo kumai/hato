@@ -66,6 +66,10 @@ import static java.util.Objects.requireNonNull;
 /// Serializes protocol decisions, isolating application continuations and listeners from I/O.
 /// API methods run on their callers; the core runs on the actor. A separate sender prepares
 /// publication payloads and starts writes without blocking protocol decisions.
+///
+/// The actor is whichever thread runs the mailbox's events, one at a time: the actor thread, or
+/// the thread that reads the connection when it brings events while no other thread runs them;
+/// see [Mailbox]. What only the actor touches is therefore touched by one thread at a time.
 public final class ClientActor implements MqttClient {
 
     private static final Log log = Log.of(ClientActor.class);
@@ -704,12 +708,7 @@ public final class ClientActor implements MqttClient {
             long worked = 0;
             while ((next = mailbox.take(stopping::get)).isPresent()) {
                 long started = System.nanoTime();
-                Mailbox.Event event = next.orElseThrow();
-                handle(event);
-                if (event.kind() == Mailbox.Kind.AT_MOST_ONCE) {
-                    continueRun();
-                }
-                deliverArrivals();
+                handleRun(next.orElseThrow());
                 worked += System.nanoTime() - started;
                 if (CarrierShare.spent(worked)) {
                     // The actor blocks next when its mailbox is empty, which frees the carrier
@@ -732,6 +731,9 @@ public final class ClientActor implements MqttClient {
                 stopping.set(true);
                 mailbox.connectionRequested(false);
             }
+            // Another thread that runs events stops after its current one, now that the actor is
+            // stopping; the cleanup waits for it.
+            mailbox.holdForGood();
             if (credentials != null) {
                 // Drops a waiting result before the remaining cleanup.
                 credentials.close();
@@ -781,6 +783,59 @@ public final class ClientActor implements MqttClient {
                     }
                 }
             }
+        }
+    }
+
+    /// Handles `event`, with the QoS 0 publications that follow it when it is one, and hands the
+    /// publications of the run to their lanes.
+    private void handleRun(Mailbox.Event event) {
+        handle(event);
+        if (event.kind() == Mailbox.Kind.AT_MOST_ONCE) {
+            continueRun();
+        }
+        deliverArrivals();
+    }
+
+    /// Runs the events that the calling thread took over by posting one while no thread ran them,
+    /// until none is left. A thread of the client does so in place, where it holds no lock and
+    /// waits for nothing, which costs less than waking the actor thread. It hands the events over
+    /// to the actor thread once it has worked for a slice, so that its own work does not wait
+    /// long, and when the actor stops; a failure stops the client, as one on the actor thread
+    /// does.
+    private void runHeld() {
+        if (!mailbox.holds()) {
+            return;
+        }
+        try {
+            long started = System.nanoTime();
+            while (!stopping.get()) {
+                Mailbox.Event event = mailbox.poll();
+                if (event == null) {
+                    return;
+                }
+                handleRun(event);
+                if (CarrierShare.spent(System.nanoTime() - started)) {
+                    break;
+                }
+            }
+        } catch (Throwable failure) {
+            stopFor(failure);
+        } finally {
+            // Nothing once the thread has let go of the events with none left.
+            mailbox.handOver();
+        }
+    }
+
+    /// Stops the client for a failure that it cannot recover from, as one of the actor's own
+    /// would: of the sender, or of a thread that ran the events in place. The actor reports it.
+    private void stopFor(Throwable failure) {
+        synchronized (lifecycleLock) {
+            if (fatalFailure == null) {
+                fatalFailure = failure;
+            }
+            stopping.set(true);
+            mailbox.connectionRequested(false);
+            mailbox.wake();
         }
     }
 
@@ -917,11 +972,25 @@ public final class ClientActor implements MqttClient {
     }
 
     private void post(long generation, Runnable action, Mailbox.Kind kind, int bytes) {
+        post(generation, action, kind, bytes, false);
+    }
+
+    /// Posts an event. When `here`, a calling thread of the client that will call [#runHeld()]
+    /// next takes the events over if no thread runs them; see [Mailbox#offer(Mailbox.Event,
+    /// boolean)].
+    private void post(
+            long generation,
+            Runnable action,
+            Mailbox.Kind kind,
+            int bytes,
+            boolean here
+    ) {
         if (stopping.get()) {
             return;
         }
         Mailbox.OfferResult admitted = mailbox.offer(
-                new Mailbox.Event(generation, action, kind, bytes)
+                new Mailbox.Event(generation, action, kind, bytes),
+                here
         );
         if (admitted == Mailbox.OfferResult.FULL) {
             if (kind == Mailbox.Kind.AT_MOST_ONCE) {
@@ -1767,17 +1836,18 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
-        public void pingResponse(long generation, Packet packet, int size) {
+        public void pingResponse(long generation, Packet packet, int size, boolean here) {
             post(
                     generation,
                     () -> core.received(generation, packet, nanoTime(generation), size),
                     Mailbox.Kind.KEEP_ALIVE,
-                    0
+                    0,
+                    here
             );
         }
 
         @Override
-        public void received(long generation, Packet packet, int size) {
+        public void received(long generation, Packet packet, int size, boolean here) {
             // A PUBLISH's deliveries are timed from here, before it waits for the actor.
             long receivedAt = packet instanceof Packet.Publish
                     ? receptionTime()
@@ -1794,9 +1864,11 @@ public final class ClientActor implements MqttClient {
                     packet instanceof Packet.Publish publish && publish.qos() == Qos.AT_MOST_ONCE
                             ? Mailbox.Kind.AT_MOST_ONCE
                             : Mailbox.Kind.INCOMING,
-                    size
+                    size,
+                    here
             );
-            if (mailbox.pauseDue(generation)) {
+            // A reader that runs the events itself reads no more before it has run them.
+            if (!mailbox.holds() && mailbox.pauseDue(generation)) {
                 io.pauseReading(generation);
             }
         }
@@ -1838,6 +1910,11 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
+        public void runHeld() {
+            ClientActor.this.runHeld();
+        }
+
+        @Override
         public void ended(long generation, Throwable cause) {
             // FIFO termination keeps preceding input and write completions, such as a final
             // CONNACK refusal that arrived just before EOF.
@@ -1858,14 +1935,7 @@ public final class ClientActor implements MqttClient {
 
         @Override
         public void fatal(Throwable failure) {
-            synchronized (lifecycleLock) {
-                if (fatalFailure == null) {
-                    fatalFailure = failure;
-                }
-                stopping.set(true);
-                mailbox.connectionRequested(false);
-                mailbox.wake();
-            }
+            stopFor(failure);
         }
 
         @Override

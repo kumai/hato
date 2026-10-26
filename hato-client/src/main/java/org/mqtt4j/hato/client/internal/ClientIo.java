@@ -34,11 +34,15 @@ final class ClientIo {
 
         void connected(long generation);
 
-        void received(long generation, Packet packet, int size);
+        /// When `here`, the calling thread, which reads the connection, calls [#runHeld()] once
+        /// the read is over, so the client may leave its events to that thread rather than wake
+        /// the actor thread.
+        void received(long generation, Packet packet, int size, boolean here);
 
         /// A PINGRESP that answers a PINGREQ admitted on this connection, which may be handled
-        /// ahead of earlier input. Any other PINGRESP arrives through [#received].
-        void pingResponse(long generation, Packet packet, int size);
+        /// ahead of earlier input. Any other PINGRESP arrives through [#received]. `here` as for
+        /// [#received].
+        void pingResponse(long generation, Packet packet, int size, boolean here);
 
         /// Posts a completed PUBACK, PUBREC, or PUBCOMP write as soon as the transport reports
         /// it, even if send is still returning. Only enqueues an event, without external code.
@@ -51,6 +55,10 @@ final class ClientIo {
         /// Posts a capacity wakeup for the current connection, possibly while holding the send
         /// monitor. This must only enqueue an event, without calling external code or waiting.
         void sendCapacityAvailable(long generation);
+
+        /// Runs the client's events that the calling thread took over, if it did; it holds no
+        /// lock of I/O or of the transport.
+        void runHeld();
 
         void ended(long generation, Throwable cause);
 
@@ -204,11 +212,12 @@ final class ClientIo {
                 codec,
                 (packet, size) -> {
                     log.debug("Received {} ({} bytes)", packet.getClass().getSimpleName(), size);
+                    boolean here = connection.readsHere;
                     if (packet instanceof Packet.PingResp && answersPing(connection)) {
-                        events.pingResponse(generation, packet, size);
+                        events.pingResponse(generation, packet, size, here);
                     } else if (packet instanceof Packet.Publish publish) {
                         Packet.Publish held = aliases.set(publish);
-                        events.received(generation, held, size + propertyCost(held));
+                        events.received(generation, held, size + propertyCost(held), here);
                     } else if (packet instanceof Packet.AliasPublish publish) {
                         Packet.Publish resolved = aliases.resolve(publish);
                         // Receive capacity counts the topic as if the broker had sent it, so an
@@ -217,10 +226,11 @@ final class ClientIo {
                         events.received(
                                 generation,
                                 resolved,
-                                size + topicBytes + propertyCost(resolved)
+                                size + topicBytes + propertyCost(resolved),
+                                here
                         );
                     } else {
-                        events.received(generation, packet, size + propertyCost(packet));
+                        events.received(generation, packet, size + propertyCost(packet), here);
                     }
                 }
         );
@@ -256,11 +266,20 @@ final class ClientIo {
                             log.trace("Received bytes: {}",
                                     Arrays.copyOfRange(buffer, offset, offset + length));
                         }
+                        // A read that fills the buffer suggests that more waits behind it, so
+                        // the actor thread routes what arrived while the reader reads on;
+                        // otherwise the reader runs the events itself, which spares waking it.
+                        connection.readsHere = offset + length < buffer.length;
                         frames.acceptLent(buffer, offset, length);
                     }
                 } catch (Throwable failure) {
                     events.failed(generation, failure);
                 }
+            }
+
+            @Override
+            public void afterBorrowedBytes() {
+                events.runHeld();
             }
 
             @Override
@@ -915,6 +934,8 @@ final class ClientIo {
         @Nullable Throwable pendingEnd;
         // Admitted PINGREQs that no PINGRESP has answered yet.
         int pings;
+        // Whether the reader runs the events of the read under way itself; only it uses this.
+        boolean readsHere;
         // The transport has reported its close or failed to start.
         boolean released;
 

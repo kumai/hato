@@ -304,6 +304,104 @@ class TcpTransportTest {
     }
 
     @Test
+    void a_borrowing_listener_works_after_each_read_without_the_lock_before_a_pause_holds()
+            throws Exception {
+        // Arrange: a peer stream that hands over one byte per read, and a listener that pauses
+        // as it takes the bytes and resumes from another thread once the read is over, as a
+        // client that has caught up again there does.
+        var peer = new LinkedBlockingQueue<Integer>();
+        var received = new LinkedBlockingQueue<Byte>();
+        var resumed = new LinkedBlockingQueue<Boolean>();
+        var input = new InputStream() {
+            @Override
+            public int read() throws IOException {
+                try {
+                    return peer.take();
+                } catch (InterruptedException _) {
+                    throw new InterruptedIOException();
+                }
+            }
+
+            @Override
+            public int read(byte[] bytes, int offset, int length) throws IOException {
+                int value = read();
+                if (value < 0) {
+                    return -1;
+                }
+                bytes[offset] = (byte) value;
+                return 1;
+            }
+        };
+        var socket = new TcpTransport.Connection() {
+            @Override
+            public InputStream input() {
+                return input;
+            }
+
+            @Override
+            public OutputStream output() {
+                return OutputStream.nullOutputStream();
+            }
+
+            @Override
+            public void close() {
+                peer.add(-1);
+            }
+        };
+        var connected = new CompletableFuture<Void>();
+        try (TcpTransport sut = transport(socket, clock)) {
+            sut.start(SERVER, TIMEOUT, new BorrowingListener() {
+                @Override
+                public void onConnected() {
+                    connected.complete(null);
+                }
+
+                @Override
+                public void onBytes(byte[] bytes) {
+                    throw new AssertionError("The transport lends what it reads");
+                }
+
+                @Override
+                public void onBorrowedBytes(byte[] buffer, int offset, int length) {
+                    received.add(buffer[offset]);
+                    sut.pauseReading();
+                }
+
+                @Override
+                public void afterBorrowedBytes() {
+                    // Resuming takes the transport's lock, which this thread must not hold.
+                    Thread resumer = Thread.ofVirtual().start(sut::resumeReading);
+                    try {
+                        resumed.add(resumer.join(Duration.ofSeconds(5)));
+                    } catch (InterruptedException failure) {
+                        throw new AssertionError(failure);
+                    }
+                }
+
+                @Override
+                public void onSent(long ticket) {
+                    throw new AssertionError("Unexpected send completion");
+                }
+
+                @Override
+                public void onClosed(Throwable cause) {
+                    // The test ends by closing the transport.
+                }
+            });
+            connected.get(5, SECONDS);
+
+            // Act
+            peer.add(1);
+            peer.add(2);
+
+            // Assert: the second read follows, since the resume came before the pause held.
+            assertThat(received.poll(5, SECONDS)).isEqualTo((byte) 1);
+            assertThat(resumed.poll(5, SECONDS)).isTrue();
+            assertThat(received.poll(5, SECONDS)).isEqualTo((byte) 2);
+        }
+    }
+
+    @Test
     void handshake_progress_does_not_extend_the_total_connection_deadline() throws Exception {
         // Arrange: repeatedly model progress without ever completing the handshake.
         var handshaking = new CompletableFuture<Void>();

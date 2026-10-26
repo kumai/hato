@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
@@ -112,6 +113,9 @@ class ClientActorTest {
     private final LinkedBlockingQueue<ScriptTransport> transports = new LinkedBlockingQueue<>();
 
     private volatile Runnable beforeActorTime = () -> { };
+
+    // Runs before every clock read of the client, on the thread that reads it.
+    private volatile Runnable beforeTime = () -> { };
 
     @Test
     void joining_connection_requests_start_no_new_attempt_or_notification() throws Exception {
@@ -2448,6 +2452,70 @@ class ClientActorTest {
             jul.removeHandler(handler);
             jul.setLevel(previousLevel);
             jul.setUseParentHandlers(previousParents);
+        }
+    }
+
+    @Test
+    void a_read_that_leaves_room_in_its_buffer_runs_its_events_on_the_reader() throws Exception {
+        // Arrange
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Set<Thread> clockReaders = ConcurrentHashMap.newKeySet();
+            beforeTime = () -> clockReaders.add(Thread.currentThread());
+
+            // Act: the session ignores each PINGRESP after reading the clock for it. A reader
+            // that finds another thread running the events leaves its own to that thread, so
+            // readers come until one runs them.
+            boolean ranOnReader = false;
+            for (int attempt = 0; attempt < 50 && !ranOnReader; attempt++) {
+                Thread reader = Thread.ofVirtual()
+                        .start(() -> transport.lend(new Packet.PingResp()));
+                assertThat(reader.join(Duration.ofSeconds(5))).isTrue();
+                ranOnReader = clockReaders.contains(reader);
+            }
+
+            // Assert: a reader read the clock for its packet before its read was over.
+            assertThat(ranOnReader).isTrue();
+        }
+    }
+
+    @Test
+    void a_failure_while_a_reader_runs_the_events_ends_the_client_as_one_of_the_actor_does()
+            throws Exception {
+        // Arrange: the clock fails for a reader that runs the events.
+        var failure = new AssertionError("Reader failed");
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            Set<Thread> readers = ConcurrentHashMap.newKeySet();
+            beforeTime = () -> {
+                if (readers.contains(Thread.currentThread())) {
+                    throw failure;
+                }
+            };
+            var escaped = new CopyOnWriteArrayList<Throwable>();
+
+            // Act: readers come until one runs the events; see the test above.
+            Disconnection end = null;
+            for (int attempt = 0; attempt < 50 && end == null; attempt++) {
+                Thread reader = Thread.ofVirtual().unstarted(() -> {
+                    try {
+                        transport.lend(new Packet.PingResp());
+                    } catch (Throwable thrown) {
+                        escaped.add(thrown);
+                    }
+                });
+                readers.add(reader);
+                reader.start();
+                assertThat(reader.join(Duration.ofSeconds(5))).isTrue();
+                end = ends.poll(100, MILLISECONDS);
+            }
+
+            // Assert: the failure stays with the client, which ends as when its actor fails.
+            assertThat(end).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(escaped).isEmpty();
+            assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+            assertThat(sut.terminated()).succeedsWithin(Duration.ofSeconds(5));
         }
     }
 
@@ -8938,6 +9006,7 @@ class ClientActorTest {
                 if (actor == Thread.currentThread()) {
                     beforeActorTime.run();
                 }
+                beforeTime.run();
                 return scheduler.nanoTime();
             }
 

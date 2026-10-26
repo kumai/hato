@@ -63,6 +63,18 @@ final class ScriptTransport implements Transport {
         receiver().onBytes(codec.encode(packet));
     }
 
+    /// Lends `packet` to the client as one read that leaves room in its buffer, and then tells
+    /// it, without this transport's monitor, that the read is over, as the TCP transport does.
+    void lend(Packet packet) {
+        BorrowingListener borrower;
+        synchronized (this) {
+            borrower = (BorrowingListener) receiver();
+            byte[] bytes = codec.encode(packet);
+            borrower.onBorrowedBytes(Arrays.copyOf(bytes, bytes.length + 1), 0, bytes.length);
+        }
+        borrower.afterBorrowedBytes();
+    }
+
     synchronized void accept() {
         receiver().onBytes(codec.encode(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY)));
     }

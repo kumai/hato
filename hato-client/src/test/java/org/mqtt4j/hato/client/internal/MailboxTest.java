@@ -3,6 +3,10 @@ package org.mqtt4j.hato.client.internal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
@@ -14,7 +18,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.client.internal.Mailbox.OfferResult.ACCEPTED;
 import static org.mqtt4j.hato.client.internal.Mailbox.OfferResult.FULL;
 import static org.mqtt4j.hato.client.internal.Mailbox.OfferResult.STALE;
@@ -860,5 +866,111 @@ class MailboxTest {
         assertThat(sut.take(() -> false)).containsSame(control);
         assertThat(sut.offer(incoming)).isEqualTo(ACCEPTED);
         assertThat(sut.take(() -> true)).isEmpty();
+    }
+
+    @Test
+    void a_thread_that_posts_while_none_runs_the_events_runs_them_without_the_actor_thread()
+            throws Exception {
+        // Arrange
+        var sut = new Mailbox(4, 40, 256, 0, 0, 0);
+        var taken = new LinkedBlockingQueue<Mailbox.Event>();
+        var stopping = new AtomicBoolean();
+        var first = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var second = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var third = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+
+        // Act: this thread posts in place, then posts as any other thread does, and the actor
+        // thread starts meanwhile.
+        assertThat(sut.offer(first, true)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(second)).isEqualTo(ACCEPTED);
+        Thread actor = startActor(sut, stopping, taken);
+
+        // Assert: the actor thread waits without taking either, this thread runs both, and once
+        // this thread has let go, a post wakes the actor thread.
+        await().until(() -> actor.getState() == Thread.State.WAITING);
+        assertThat(taken).isEmpty();
+        assertThat(sut.holds()).isTrue();
+        assertThat(sut.poll()).isSameAs(first);
+        assertThat(sut.poll()).isSameAs(second);
+        assertThat(sut.poll()).isNull();
+        assertThat(sut.holds()).isFalse();
+        assertThat(sut.offer(third)).isEqualTo(ACCEPTED);
+        assertThat(taken.poll(5, SECONDS)).isSameAs(third);
+        assertThat(taken).isEmpty();
+        stopActor(sut, stopping, actor);
+    }
+
+    @Test
+    void a_thread_that_runs_the_events_hands_those_left_to_the_actor_thread() throws Exception {
+        // Arrange: this thread runs the events while the actor thread waits.
+        var sut = new Mailbox(4, 40, 256, 0, 0, 0);
+        var taken = new LinkedBlockingQueue<Mailbox.Event>();
+        var stopping = new AtomicBoolean();
+        Thread actor = startActor(sut, stopping, taken);
+        await().until(() -> actor.getState() == Thread.State.WAITING);
+        var first = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var second = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        assertThat(sut.offer(first, true)).isEqualTo(ACCEPTED);
+        assertThat(sut.offer(second)).isEqualTo(ACCEPTED);
+        assertThat(sut.poll()).isSameAs(first);
+
+        // Act
+        sut.handOver();
+
+        // Assert
+        assertThat(sut.holds()).isFalse();
+        assertThat(taken.poll(5, SECONDS)).isSameAs(second);
+        stopActor(sut, stopping, actor);
+    }
+
+    @Test
+    void the_actor_thread_ends_once_the_thread_that_runs_the_events_lets_go() throws Exception {
+        // Arrange: this thread runs the events when the actor ends.
+        var sut = new Mailbox(4, 40, 256, 0, 0, 0);
+        var first = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var second = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        assertThat(sut.offer(first, true)).isEqualTo(ACCEPTED);
+        var ended = new CompletableFuture<Boolean>();
+        Thread actor = Thread.ofVirtual().start(() -> {
+            sut.holdForGood();
+            ended.complete(sut.holds());
+        });
+        await().until(() -> actor.getState() == Thread.State.WAITING);
+
+        // Act
+        assertThat(sut.poll()).isSameAs(first);
+        assertThat(ended).isNotDone();
+        assertThat(sut.poll()).isNull();
+
+        // Assert: the actor thread now runs the events for good, so a later post leaves them
+        // with it.
+        assertThat(ended.get(5, SECONDS)).isTrue();
+        assertThat(sut.offer(second, true)).isEqualTo(ACCEPTED);
+        assertThat(sut.holds()).isFalse();
+    }
+
+    /// An actor thread that takes events until it stops, as the client's does.
+    private static Thread startActor(
+            Mailbox mailbox,
+            AtomicBoolean stopping,
+            LinkedBlockingQueue<Mailbox.Event> taken
+    ) {
+        return Thread.ofVirtual().start(() -> {
+            try {
+                Optional<Mailbox.Event> next;
+                while ((next = mailbox.take(stopping::get)).isPresent()) {
+                    taken.add(next.orElseThrow());
+                }
+            } catch (InterruptedException failure) {
+                throw new AssertionError(failure);
+            }
+        });
+    }
+
+    private static void stopActor(Mailbox mailbox, AtomicBoolean stopping, Thread actor)
+            throws InterruptedException {
+        stopping.set(true);
+        mailbox.wake();
+        actor.join();
     }
 }
