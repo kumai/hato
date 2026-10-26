@@ -12,7 +12,7 @@ Gradle:
 
 ```kotlin
 dependencies {
-    testImplementation("org.mqtt4j:hato-testkit:0.8.0")
+    testImplementation("org.mqtt4j:hato-testkit:0.8.1")
 }
 ```
 
@@ -22,7 +22,7 @@ Maven:
 <dependency>
     <groupId>org.mqtt4j</groupId>
     <artifactId>hato-testkit</artifactId>
-    <version>0.8.0</version>
+    <version>0.8.1</version>
     <scope>test</scope>
 </dependency>
 ```
