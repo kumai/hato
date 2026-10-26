@@ -622,7 +622,7 @@ final class DeliveryLanes {
                 }
             }
             RetainedDelivery retained = requireNonNull(delivery);
-            long addedBytes = recipients.isEmpty() || !retained.views.isEmpty()
+            long addedBytes = recipients.isEmpty() || retained.holders != 0
                     ? 0 : retained.bytes;
             // A first copy adds a condition for each recipient; a retransmission reuses them.
             if (!fits(recipients.size(), addedBytes)
@@ -760,7 +760,11 @@ final class DeliveryLanes {
     private void enqueue(Lane lane, DeliveryView view) {
         admittedDeliveries++;
         view.sequence = ++enqueued;
-        view.delivery.views.add(view);
+        RetainedDelivery delivery = view.delivery;
+        delivery.holders++;
+        if (delivery.token.acknowledgement() != 0) {
+            delivery.views.add(view);
+        }
         view.recipient.queued = true;
         lane.retained++;
         lane.queue.addLast(view);
@@ -1909,7 +1913,9 @@ final class DeliveryLanes {
             }
             view.acknowledgement = null;
         }
-        view.delivery.accepted.remove(view);
+        if (view.delivery.token.acknowledgement() != 0) {
+            view.delivery.accepted.remove(view);
+        }
         releaseView(view);
     }
 
@@ -2057,9 +2063,11 @@ final class DeliveryLanes {
         view.lane = null;
         lane.retained--;
         retainedDeliveries--;
-        // A fast pull recipient must not remain referenced by a slower overlapping one.
-        delivery.views.remove(view);
-        if (delivery.views.isEmpty()) {
+        if (delivery.token.acknowledgement() != 0) {
+            // A fast pull recipient must not remain referenced by a slower overlapping one.
+            delivery.views.remove(view);
+        }
+        if (--delivery.holders == 0) {
             retainedBytes -= delivery.bytes;
             delivery.message = null;
         }
@@ -2457,13 +2465,15 @@ final class DeliveryLanes {
         // One condition for each recipient, counted against the client's condition limit.
         // Completed pull views leave only these IDs and conditions, without payload or lane.
         // A QoS 0 delivery meets no condition and records no recipient, so it shares the empty
-        // map.
+        // map, and it shares the empty lists below as well.
         final Map<Long, Recipient> recipients;
-        // Views that hold capacity; the payload stays counted until the last of them leaves.
-        final List<DeliveryView> views = new ArrayList<>(1);
+        // A receipt's views that hold capacity, which its acknowledgement handling visits.
+        final List<DeliveryView> views;
         // Accepted MANUAL hand-off views. They returned their capacity at acceptance, but their
         // acknowledgement condition stays open until ack(), a stop, or retirement.
-        final List<DeliveryView> accepted = new ArrayList<>(0);
+        final List<DeliveryView> accepted;
+        // How many views hold capacity; the payload stays counted until the last of them leaves.
+        int holders;
         @Nullable MqttMessage message;
         int pending;
         boolean retired;
@@ -2471,7 +2481,10 @@ final class DeliveryLanes {
         RetainedDelivery(DeliveryToken token, int bytes) {
             this.token = token;
             this.bytes = bytes;
-            recipients = token.acknowledgement() == 0 ? Map.of() : new LinkedHashMap<>();
+            boolean receipt = token.acknowledgement() != 0;
+            recipients = receipt ? new LinkedHashMap<>() : Map.of();
+            views = receipt ? new ArrayList<>(1) : List.of();
+            accepted = receipt ? new ArrayList<>(0) : List.of();
         }
     }
 
