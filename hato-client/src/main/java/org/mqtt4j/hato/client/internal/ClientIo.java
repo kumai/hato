@@ -216,7 +216,12 @@ final class ClientIo {
                 maxPacketSize,
                 codec,
                 (packet, size) -> {
-                    log.debug("Received {} ({} bytes)", packet.getClass().getSimpleName(), size);
+                    // Naming the packet's class costs a lookup on every packet, even with debug
+                    // logging off, so the name waits for the level.
+                    if (log.isLoggable(Level.DEBUG)) {
+                        log.debug("Received {} ({} bytes)",
+                                packet.getClass().getSimpleName(), size);
+                    }
                     boolean here = connection.readsHere;
                     if (packet instanceof Packet.PingResp && answersPing(connection)) {
                         events.pingResponse(generation, packet, size, here);
@@ -382,7 +387,7 @@ final class ClientIo {
                 new Outbound(header, message, false, false, receipt),
                 false,
                 false,
-                "Publish",
+                Packet.Publish.class,
                 false
         );
     }
@@ -445,7 +450,7 @@ final class ClientIo {
                 ),
                 reserved,
                 acknowledgement,
-                packet.getClass().getSimpleName(),
+                packet.getClass(),
                 packet instanceof Packet.PingReq
         );
     }
@@ -456,7 +461,7 @@ final class ClientIo {
             Outbound outbound,
             boolean reserved,
             boolean acknowledgement,
-            String packetName,
+            Class<? extends Packet> packetType,
             boolean ping
     ) {
         synchronized (sending) {
@@ -478,7 +483,11 @@ final class ClientIo {
                     // Counted before the sender can write it, so its answer is recognized.
                     connection.pings++;
                 }
-                log.debug("Queued {} ticket {} ({} bytes)", packetName, ticket, size);
+                // The type's name waits for the level, as for a received packet.
+                if (log.isLoggable(Level.DEBUG)) {
+                    log.debug("Queued {} ticket {} ({} bytes)",
+                            packetType.getSimpleName(), ticket, size);
+                }
                 wakeSender(connection);
             }
             return admitted;
