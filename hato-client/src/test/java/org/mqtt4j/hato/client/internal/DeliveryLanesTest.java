@@ -19,11 +19,14 @@ import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import java.util.stream.LongStream;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.AckMode;
@@ -2949,6 +2952,74 @@ class DeliveryLanesTest {
         assertThat(next.join(Duration.ofSeconds(5))).isTrue();
     }
 
+    static Stream<Named<HandlerExecution>> internalExecutions() {
+        return Stream.of(
+                Named.of("serial", new HandlerExecution.Internal()),
+                Named.of("striped", new HandlerExecution.Striped(2, MqttMessage::topic, null)),
+                Named.of("parallel", new HandlerExecution.Parallel(2, null))
+        );
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("internalExecutions")
+    void a_dispatcher_of_the_lanes_own_says_that_it_runs_between_deliveries_when_it_tells(
+            HandlerExecution execution
+    ) throws Exception {
+        // Arrange: one subscription acknowledges after its handler, the other on receipt.
+        var here = new LinkedBlockingQueue<Boolean>();
+        DeliveryLanes sut = lanesTellingWhere(here);
+        assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 1), execution, _ -> { }))
+                .isTrue();
+        assertThat(sut.register(2, request(AckMode.ON_RECEIVE, 1), execution, _ -> { }))
+                .isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(sut.deliver(token(1, 11), List.of(2L), qosOneMessage(), false, 10)).isTrue();
+
+        // Assert
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(11L);
+        assertThat(here).containsExactly(true, true);
+    }
+
+    @Test
+    void the_hand_off_worker_says_that_it_runs_between_deliveries_when_it_tells()
+            throws Exception {
+        // Arrange
+        var here = new LinkedBlockingQueue<Boolean>();
+        DeliveryLanes sut = lanesTellingWhere(here);
+        assertThat(sut.registerHandOff(1, request(AckMode.ON_RECEIVE, 1), _ -> true)).isTrue();
+
+        // Act
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+
+        // Assert
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(here).containsExactly(true);
+    }
+
+    @Test
+    void a_task_on_an_application_executor_tells_as_any_other_thread_does() throws Exception {
+        // Arrange
+        var executor = new ManualExecutor();
+        var here = new LinkedBlockingQueue<Boolean>();
+        DeliveryLanes sut = lanesTellingWhere(here);
+        var execution = new HandlerExecution.OnExecutor(executor);
+        assertThat(sut.register(1, request(AckMode.AFTER_HANDLER, 1), execution, _ -> { }))
+                .isTrue();
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        await().until(() -> sut.placedDeliveries() == 1);
+
+        // Act
+        executor.runNext();
+
+        // Assert: the executor's thread belongs to the application, which the client keeps
+        // its own work off.
+        assertThat(ready.poll(5, SECONDS)).isEqualTo(10L);
+        assertThat(here).containsExactly(false);
+    }
+
     private record Failure(DeliveryToken token, Throwable cause) {
     }
 
@@ -3023,10 +3094,33 @@ class DeliveryLanesTest {
                 conditionLimit,
                 onFailure,
                 overloads::add,
-                onReady,
+                _ -> onReady.run(),
                 terminated::add,
                 null
         );
+        managers.add(manager);
+        return manager;
+    }
+
+    /// Lanes that record, each time acknowledgements are ready, whether one of their own
+    /// dispatchers said so between its deliveries.
+    private DeliveryLanes lanesTellingWhere(LinkedBlockingQueue<Boolean> here) {
+        var owner = new AtomicReference<DeliveryLanes>();
+        var manager = new DeliveryLanes(
+                "lane-test",
+                BYTE_LIMIT,
+                256,
+                DeliveryLanes.CONDITION_LIMIT,
+                (token, cause) -> failures.add(new Failure(token, cause)),
+                overloads::add,
+                ownThread -> {
+                    here.add(ownThread);
+                    ready.addAll(requireNonNull(owner.get()).takeReady());
+                },
+                terminated::add,
+                null
+        );
+        owner.set(manager);
         managers.add(manager);
         return manager;
     }

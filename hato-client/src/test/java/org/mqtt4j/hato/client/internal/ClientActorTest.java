@@ -8999,11 +8999,13 @@ class ClientActorTest {
 
             @Override
             public long nanoTime() {
-                // The first clock read starts connect on the actor; sender reads are independent.
+                // The client's first clock read is on its actor thread. A thread of the delivery
+                // lanes reads the clock only while it runs the client's events in place; the
+                // reads for writes are independent.
                 if (actor == null) {
                     actor = Thread.currentThread();
                 }
-                if (actor == Thread.currentThread()) {
+                if (actor == Thread.currentThread() || ofTheLanes(Thread.currentThread())) {
                     beforeActorTime.run();
                 }
                 beforeTime.run();
@@ -9124,6 +9126,13 @@ class ClientActorTest {
         discarding.receive(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
         assertThat(discarding.sent.poll(5, SECONDS)).isEqualTo(disconnect);
         return nextTransport();
+    }
+
+    /// Whether `thread` is one of the delivery lanes' own, a dispatcher or the hand-off worker,
+    /// which may run the client's events in place between deliveries.
+    private static boolean ofTheLanes(Thread thread) {
+        String name = thread.getName();
+        return name.contains("-delivery-") || name.endsWith("-hand-off");
     }
 
     private static void waitFor(CountDownLatch latch) {

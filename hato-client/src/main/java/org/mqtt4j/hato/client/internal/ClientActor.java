@@ -68,9 +68,9 @@ import static java.util.Objects.requireNonNull;
 /// publication payloads and starts writes without blocking protocol decisions.
 ///
 /// The actor is whichever thread runs the mailbox's events, one at a time: the actor thread, or
-/// the thread that reads the connection or the sender when it brings events while no other
-/// thread runs them; see [Mailbox]. What only the actor touches is therefore touched by one
-/// thread at a time.
+/// the thread that reads the connection, the sender, or a thread of the delivery lanes' own when
+/// it brings events while no other thread runs them; see [Mailbox]. What only the actor touches
+/// is therefore touched by one thread at a time.
 public final class ClientActor implements MqttClient {
 
     private static final Log log = Log.of(ClientActor.class);
@@ -884,13 +884,18 @@ public final class ClientActor implements MqttClient {
         }
     }
 
-    private void deliveryReady() {
+    private void deliveryReady(boolean here) {
         post(
                 0,
                 () -> core.deliveriesReady(lanes.takeReady()),
                 Mailbox.Kind.DELIVERY_READY,
-                0
+                0,
+                here
         );
+        if (here) {
+            // A thread of the lanes' own runs what it took over before its next delivery.
+            runHeld();
+        }
     }
 
     /// A lane runs and hands off nothing more. Called without the lanes' lock, from the lane's

@@ -114,7 +114,7 @@ final class DeliveryLanes {
     // refused it. Called without the lock.
     private final Consumer<DeliveryToken> onOverload;
 
-    private final Runnable onReady;
+    private final Ready onReady;
 
     // Called once per lane, without the lock, when the lane can run and hand off nothing more: a
     // push lane's dispatcher has ended it, or a pull lane has stopped.
@@ -191,7 +191,7 @@ final class DeliveryLanes {
             int conditionLimit,
             BiPredicate<DeliveryToken, Throwable> onFailure,
             Consumer<DeliveryToken> onOverload,
-            Runnable onReady,
+            Ready onReady,
             LongConsumer onTerminated,
             @Nullable Started onStarted
     ) {
@@ -384,7 +384,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.run();
+            onReady.ready(false);
         }
         runTerminations();
     }
@@ -670,7 +670,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.run();
+            onReady.ready(false);
         }
         return true;
     }
@@ -1096,7 +1096,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (lane.claimed.isEmpty()) {
-            execute(lane, claim);
+            execute(lane, claim, true);
         } else {
             executeClaimed(lane);
         }
@@ -1502,7 +1502,7 @@ final class DeliveryLanes {
         } finally {
             lock.unlock();
         }
-        execute(lane, claim);
+        execute(lane, claim, sublane.drainsUntilEmpty);
         return true;
     }
 
@@ -1685,7 +1685,8 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.run();
+            // The hand-off worker tells between the deliveries that it offers.
+            onReady.ready(true);
         }
         runTerminations();
     }
@@ -1741,12 +1742,13 @@ final class DeliveryLanes {
 
     /// Runs a claimed delivery's handler without the lock, then settles the delivery. A normal
     /// return ends its local processing; a failure invalidates its acknowledgement condition and
-    /// is reported. Either way the handler's interrupt state is cleared.
-    private void execute(Lane lane, Claim claim) {
+    /// is reported. Either way the handler's interrupt state is cleared. `here` when the calling
+    /// thread is one of the lanes' own; see [Ready].
+    private void execute(Lane lane, Claim claim, boolean here) {
         DeliveryView view = claim.view();
         try {
             if (claim.ready()) {
-                onReady.run();
+                onReady.ready(here);
             }
             started(lane, view);
             requireNonNull(lane.handler).accept(view);
@@ -1763,7 +1765,7 @@ final class DeliveryLanes {
                 lock.unlock();
             }
             if (ready) {
-                onReady.run();
+                onReady.ready(here);
             }
         } catch (Throwable failure) {
             boolean _ = Thread.interrupted();
@@ -1800,7 +1802,7 @@ final class DeliveryLanes {
         }
         if (!stops) {
             if (ready) {
-                onReady.run();
+                onReady.ready(false);
             }
             if (firstSkip) {
                 log.warn("Skipped a failed delivery for {} (subscription {}); later ones are "
@@ -1870,7 +1872,7 @@ final class DeliveryLanes {
             lock.unlock();
         }
         if (ready) {
-            onReady.run();
+            onReady.ready(false);
         }
     }
 
@@ -2085,7 +2087,7 @@ final class DeliveryLanes {
                 lock.unlock();
             }
             if (ready) {
-                onReady.run();
+                onReady.ready(false);
             }
             runTerminations();
         }
@@ -2167,7 +2169,7 @@ final class DeliveryLanes {
                 lock.unlock();
             }
             if (ready) {
-                onReady.run();
+                onReady.ready(false);
             }
             runTerminations();
             return result;
@@ -2410,6 +2412,16 @@ final class DeliveryLanes {
     interface Started {
 
         void started(long id, long receivedAt);
+    }
+
+    /// Told, without the lock, that acknowledgements are ready to take with [#takeReady()].
+    @FunctionalInterface
+    interface Ready {
+
+        /// `here` when the calling thread is one of the lanes' own, a dispatcher or the hand-off
+        /// worker, between the deliveries that it runs or offers, where the client may do its own
+        /// work in place before the next.
+        void ready(boolean here);
     }
 
     /// A received QoS 0 publication that the client routes to the lanes `ids`; see
