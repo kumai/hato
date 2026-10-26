@@ -2520,6 +2520,29 @@ class ClientActorTest {
     }
 
     @Test
+    void a_publication_made_while_the_client_has_nothing_else_to_do_runs_on_the_calling_thread()
+            throws Exception {
+        // Arrange
+        var encoder = new ScriptCodec();
+        Set<Thread> encoders = ConcurrentHashMap.newKeySet();
+        encoder.beforeHeader = () -> encoders.add(Thread.currentThread());
+        try (MqttClient sut = client("publish-test", ends::add, 16 * 1024 * 1024, encoder)) {
+            connect(sut);
+
+            // Act: a publication that finds another thread running the events leaves itself to
+            // that thread, so this thread publishes until one runs alone.
+            boolean ranHere = false;
+            for (int attempt = 0; attempt < 50 && !ranHere; attempt++) {
+                sut.publish(message(new byte[] {1})).get(5, SECONDS);
+                ranHere = encoders.contains(Thread.currentThread());
+            }
+
+            // Assert
+            assertThat(ranHere).isTrue();
+        }
+    }
+
+    @Test
     void actor_failure_is_visible_to_subscription_calls_before_cleanup() throws Exception {
         // Arrange: the diagnostic pauses shutdown after the actor has recorded its failure.
         var failure = new AssertionError("Actor failed");
@@ -9152,6 +9175,10 @@ class ClientActorTest {
 
         volatile Consumer<Packet> beforeEncode = _ -> { };
 
+        // Runs as the client encodes the header of a PUBLISH, which the core does for each
+        // publication on the thread that runs it.
+        volatile Runnable beforeHeader = () -> { };
+
         @Override
         public byte[] encode(Packet packet) {
             beforeEncode.accept(packet);
@@ -9194,6 +9221,7 @@ class ClientActorTest {
                 Properties properties,
                 int payloadSize
         ) {
+            beforeHeader.run();
             return codec.encodePublishHeader(
                     topic,
                     qos,

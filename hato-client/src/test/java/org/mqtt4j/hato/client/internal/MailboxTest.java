@@ -949,6 +949,80 @@ class MailboxTest {
         assertThat(sut.holds()).isFalse();
     }
 
+    @Test
+    void a_post_alone_takes_the_events_over_only_while_none_waits() throws Exception {
+        // Arrange
+        var sut = new Mailbox(4, 40, 256, 0, 0, 0);
+        var own = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var waiting = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var later = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+
+        // Act & Assert: the first post finds nothing waiting, and runs alone.
+        assertThat(sut.offerAlone(own)).isEqualTo(ACCEPTED);
+        assertThat(sut.holds()).isTrue();
+        assertThat(sut.takeAlone(own)).isTrue();
+        sut.letGo();
+        assertThat(sut.holds()).isFalse();
+
+        // Act & Assert: a post behind an event that waits leaves both to the actor thread.
+        assertThat(sut.offer(waiting)).isEqualTo(ACCEPTED);
+        assertThat(sut.offerAlone(later)).isEqualTo(ACCEPTED);
+        assertThat(sut.holds()).isFalse();
+        assertThat(sut.take(() -> false)).containsSame(waiting);
+        assertThat(sut.take(() -> false)).containsSame(later);
+    }
+
+    @Test
+    void a_thread_that_runs_its_post_alone_leaves_what_comes_meanwhile_to_the_actor_thread()
+            throws Exception {
+        // Arrange: this thread posts alone while the actor thread waits.
+        var sut = new Mailbox(4, 40, 256, 0, 0, 0);
+        var taken = new LinkedBlockingQueue<Mailbox.Event>();
+        var stopping = new AtomicBoolean();
+        Thread actor = startActor(sut, stopping, taken);
+        await().until(() -> actor.getState() == Thread.State.WAITING);
+        var own = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var meanwhile = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        assertThat(sut.offerAlone(own)).isEqualTo(ACCEPTED);
+
+        // Act: another post comes while this thread takes its own and lets go.
+        assertThat(sut.offer(meanwhile)).isEqualTo(ACCEPTED);
+        assertThat(sut.takeAlone(own)).isTrue();
+        sut.letGo();
+
+        // Assert
+        assertThat(taken.poll(5, SECONDS)).isSameAs(meanwhile);
+        assertThat(taken).isEmpty();
+        stopActor(sut, stopping, actor);
+    }
+
+    @Test
+    void an_event_that_goes_ahead_of_a_post_alone_leaves_both_to_the_actor_thread()
+            throws Exception {
+        // Arrange: this thread posts alone while the actor thread waits.
+        var sut = new Mailbox(4, 40, 256, 0, 0, 0);
+        var taken = new LinkedBlockingQueue<Mailbox.Event>();
+        var stopping = new AtomicBoolean();
+        Thread actor = startActor(sut, stopping, taken);
+        await().until(() -> actor.getState() == Thread.State.WAITING);
+        sut.activate(1);
+        var own = new Mailbox.Event(0, () -> { }, Mailbox.Kind.COMMAND, 10);
+        var timer = new Mailbox.Event(1, () -> { }, Mailbox.Kind.KEEP_ALIVE, 0);
+        assertThat(sut.offerAlone(own)).isEqualTo(ACCEPTED);
+
+        // Act: a keep-alive event, which goes ahead of the FIFO, comes before this thread takes
+        // its own.
+        assertThat(sut.offer(timer)).isEqualTo(ACCEPTED);
+        boolean ranAlone = sut.takeAlone(own);
+
+        // Assert
+        assertThat(ranAlone).isFalse();
+        assertThat(sut.holds()).isFalse();
+        assertThat(taken.poll(5, SECONDS)).isSameAs(timer);
+        assertThat(taken.poll(5, SECONDS)).isSameAs(own);
+        stopActor(sut, stopping, actor);
+    }
+
     /// An actor thread that takes events until it stops, as the client's does.
     private static Thread startActor(
             Mailbox mailbox,

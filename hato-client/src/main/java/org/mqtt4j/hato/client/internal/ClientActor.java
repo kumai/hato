@@ -69,8 +69,9 @@ import static java.util.Objects.requireNonNull;
 ///
 /// The actor is whichever thread runs the mailbox's events, one at a time: the actor thread, or
 /// the thread that reads the connection, the sender, or a thread of the delivery lanes' own when
-/// it brings events while no other thread runs them; see [Mailbox]. What only the actor touches
-/// is therefore touched by one thread at a time.
+/// it brings events while no other thread runs them; see [Mailbox]. A thread that publishes
+/// while the client has nothing else to do runs its own publication alone. What only the actor
+/// touches is therefore touched by one thread at a time.
 public final class ClientActor implements MqttClient {
 
     private static final Log log = Log.of(ClientActor.class);
@@ -608,6 +609,8 @@ public final class ClientActor implements MqttClient {
             LongConsumer command
     ) {
         boolean needsConnection = kind == Command.PUBLISH;
+        Mailbox.Event own;
+        CompletableFuture<T> future;
         synchronized (lifecycleLock) {
             Throwable refusal = null;
             Semaphore slot = null;
@@ -637,7 +640,7 @@ public final class ClientActor implements MqttClient {
                     timing
             );
             operations.put(token, operation);
-            Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
+            var event = new Mailbox.Event(
                     0,
                     () -> {
                         if (needsConnection) {
@@ -653,7 +656,11 @@ public final class ClientActor implements MqttClient {
                     },
                     Mailbox.Kind.COMMAND,
                     bytes
-            ));
+            );
+            // A publication may run on the calling thread; see runAlone.
+            Mailbox.OfferResult admitted = kind == Command.PUBLISH
+                    ? mailbox.offerAlone(event)
+                    : mailbox.offer(event);
             if (admitted == Mailbox.OfferResult.FULL) {
                 // Refused at admission like the cases above, so the call has failed when it
                 // returns. The operation never started: no completion thread finishes it, and no
@@ -666,7 +673,28 @@ public final class ClientActor implements MqttClient {
                         CapacityLimit.OPERATION_QUEUE
                 ));
             }
-            return operation.future;
+            own = mailbox.holds() ? event : null;
+            future = operation.future;
+        }
+        if (own != null) {
+            runAlone(own);
+        }
+        return future;
+    }
+
+    /// Runs `own`, the publication that the calling thread posted while the client had nothing
+    /// else to do, in place, which spares waking the actor thread for it. The thread runs no other
+    /// event: one that goes ahead of it, or that another thread posts meanwhile, is left to the
+    /// actor thread, so that an application thread does not take over the client's other work.
+    private void runAlone(Mailbox.Event own) {
+        try {
+            if (mailbox.takeAlone(own)) {
+                handleRun(own);
+            }
+        } catch (Throwable failure) {
+            stopFor(failure);
+        } finally {
+            mailbox.letGo();
         }
     }
 

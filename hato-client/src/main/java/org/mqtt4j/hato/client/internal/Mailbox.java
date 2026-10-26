@@ -364,6 +364,42 @@ final class Mailbox {
         return Optional.empty();
     }
 
+    /// Admits `event` as [#offer(Event)] does. When no thread runs the events and none waits, the
+    /// calling thread takes them over to run `event` alone; see [#takeAlone(Event)].
+    synchronized OfferResult offerAlone(Event event) {
+        return offer(event, holder == null && next() == null);
+    }
+
+    /// For a thread that took the events over with [#offerAlone(Event)]: takes `own` if it still
+    /// comes first. Otherwise an event that goes ahead of the FIFO came meanwhile, and the thread
+    /// hands the events over to the actor thread and returns false.
+    synchronized boolean takeAlone(Event own) {
+        if (holder != Thread.currentThread()) {
+            return false;
+        }
+        Event next = next();
+        if (next == own) {
+            remove(next);
+            return true;
+        }
+        holder = null;
+        notifyAll();
+        return false;
+    }
+
+    /// For a thread that ran its own event alone: lets go of the events, and wakes the actor
+    /// thread for those that other threads posted meanwhile.
+    void letGo() {
+        if (holds()) {
+            synchronized (this) {
+                holder = null;
+                if (next() != null || ending) {
+                    notifyAll();
+                }
+            }
+        }
+    }
+
     /// Takes over running the events for the calling thread when no thread runs them, as a post
     /// with `here` does; see [#offer(Event, boolean)].
     synchronized void hold() {
