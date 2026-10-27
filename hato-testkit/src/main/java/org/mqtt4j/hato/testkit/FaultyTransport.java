@@ -403,10 +403,9 @@ public final class FaultyTransport implements Transport {
                 try {
                     delegate.close();
                 } catch (Throwable failure) {
+                    // The cause belongs to the test, which may share it among connections.
+                    log.warn("Closing the delegate transport failed", failure);
                     synchronized (FaultyTransport.this) {
-                        if (failure != cause) {
-                            cause.addSuppressed(failure);
-                        }
                         delegateEnded = true;
                     }
                     drain();

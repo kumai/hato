@@ -415,6 +415,29 @@ class FaultyTransportTest {
         }
     }
 
+    @Test
+    void a_delegate_that_fails_to_close_leaves_the_cause_of_the_disconnection_unchanged()
+            throws Exception {
+        // Arrange
+        var clock = new ManualTimerScheduler();
+        var delegate = new Delegate();
+        delegate.beforeClose = () -> {
+            throw new IllegalStateException("cannot close");
+        };
+        try (var sut = new FaultyTransport(delegate, clock)) {
+            var receiver = new Receiver();
+            sut.start(URI.create("mqtt://localhost"), Duration.ofSeconds(1), receiver);
+            var failure = new IOException("injected disconnect");
+
+            // Act
+            sut.disconnect(failure);
+
+            // Assert: the test's exception, which it may share, reaches the listener as given.
+            assertThat(receiver.end.get(5, SECONDS)).isSameAs(failure);
+            assertThat(failure.getSuppressed()).isEmpty();
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void a_closed_delegate_send_rejects_later_sends_and_preserves_its_terminal_cause(boolean inline)
@@ -759,6 +782,7 @@ class FaultyTransportTest {
         final List<Send> sent = new ArrayList<>();
         Runnable beforeStart = () -> { };
         Runnable beforeSend = () -> { };
+        Runnable beforeClose = () -> { };
         SendResult sendResult = ACCEPTED;
         boolean completeInline;
         boolean terminateOnClose = true;
@@ -782,6 +806,7 @@ class FaultyTransportTest {
 
         @Override
         public void close() {
+            beforeClose.run();
             closingThread.complete(Thread.currentThread());
             if (terminateOnClose) {
                 listener.join().onClosed(new IOException("Delegate closed"));
