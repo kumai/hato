@@ -172,9 +172,9 @@ client.connect().join();
 
 `server` is required, and the other settings have defaults; see
 [Tuning the client](#tuning-the-client). Omitting `clientId` generates a random one. Give every
-running client its own `clientId`: two clients with the same identifier keep taking over each
-other's connection, and with a persistent session, the one that connects later also discards
-the other's session.
+running client its own `clientId`: a broker closes the older connection of two with the same
+identifier, and with a persistent session, the one that connects later also discards the
+other's session.
 
 ### Connecting over TLS or WebSocket
 
@@ -508,11 +508,11 @@ Subscription subscription = client.subscribe(
   subscriptions, and no answers to your publications or to the keep-alive. A handler that
   blocks holds up the whole connection, and one that runs for about the keep-alive interval
   can lose it.
-- Never wait for this client inside the handler. `join()` and `get()` of the futures that it
-  returns, and `receive()` of its pull subscriptions, throw `IllegalStateException` there, even
-  when the result is already in. Read a completed result with `getNow()`, or chain the next step
-  instead; a publication that you start without waiting goes out as usual. Other waits are not
-  detected.
+- Never wait for this client inside the handler. `join()` and the `get` methods of the futures
+  that it returns, and `receive()` of its pull subscriptions, throw `IllegalStateException`
+  there, even when the result is already in. Read a completed result with `getNow()`, or
+  chain the next step instead; a publication that you start without waiting goes out as usual.
+  Other waits are not detected.
 - The buffer, the acknowledgement mode, and the failure policy work as with a handler alone.
   `.withExecutor(pool)` does not apply.
 
@@ -764,7 +764,8 @@ handed to your own queue needs its own shutdown.
 ## Handling failures
 
 Operations report failures through their futures; with `join()`, the exception arrives as the
-cause of a `CompletionException`. Invalid arguments throw at once.
+cause of a `CompletionException`. Null arguments throw at once, as do invalid subscription
+requests; a publication that the client cannot send fails its future instead.
 
 | Exception | Meaning |
 | --- | --- |

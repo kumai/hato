@@ -181,11 +181,9 @@ public final class MqttClientBuilder {
     /// Uses this nonempty MQTT UTF-8 identifier of at most 65535 bytes, validated immediately.
     /// Persistent sessions require an explicit value. Otherwise, omission generates 23 ASCII
     /// letters/digits. Give each running client its own identifier: a broker closes the older
-    /// connection of two that share one, so two clients that reconnect automatically keep
-    /// taking over each other's connection. Reconnection delays slow this down but do not
-    /// stop it. With a persistent session, a client that connects while another one runs with
-    /// the same identifier also discards that client's session and the messages stored for it;
-    /// see [MqttClient#connect()].
+    /// connection of two that share one. With a persistent session, a client that connects while
+    /// another one runs with the same identifier also discards that client's session and the
+    /// messages stored for it; see [MqttClient#connect()].
     ///
     /// @param value
     ///     the client identifier

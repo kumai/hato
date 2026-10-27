@@ -151,11 +151,11 @@ public final class DeliveryOptions {
     /// subscriptions nor the broker's answers to publications, subscriptions, and keep-alive
     /// requests.
     ///
-    /// Inside the handler, [join()][java.util.concurrent.CompletableFuture#join()] and
-    /// [get()][java.util.concurrent.CompletableFuture#get()] of a future that this client returned,
-    /// or of a future made from one, and the [receive][PullSubscription#receive()] methods of this
-    /// client's pull subscriptions throw [IllegalStateException], even when they would not wait.
-    /// Read a completed result with
+    /// Inside the handler, [join()][java.util.concurrent.CompletableFuture#join()] and the
+    /// [get][java.util.concurrent.CompletableFuture#get()] methods of a future that this client
+    /// returned, or of a future made from one, and the [receive][PullSubscription#receive()]
+    /// methods of this client's pull subscriptions throw [IllegalStateException], even when they
+    /// would not wait. Read a completed result with
     /// [getNow][java.util.concurrent.CompletableFuture#getNow(Object)], or chain the next step
     /// instead. Other waits are not detected: a handler that blocks, or that waits for anything
     /// that needs this connection, holds up every subscription of the connection, and one that runs

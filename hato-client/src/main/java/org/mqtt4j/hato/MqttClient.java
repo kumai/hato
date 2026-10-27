@@ -197,17 +197,16 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     @Override
     void close();
 
-    /// Observes the end of this client's work without requesting it; it completes only after
-    /// [#close()]. The future completes once the client runs no application code and calls
-    /// none later: every subscription has terminated, as [Subscription#terminated()] observes,
-    /// so no handler runs; the [ConnectionListener] has returned from every notification it
-    /// receives, including the last one that closing produces, while notifications dropped
-    /// because it fell behind never arrive; a credentials supplier call, which closing
-    /// interrupts, has returned; every transport has finished closing; and the synchronous
-    /// continuations of the futures that the client completes have returned, except those of
-    /// this method. Afterwards the client calls no handler, executor chosen with [DeliveryOptions],
-    /// listener, supplier, [TimerScheduler], [Transport], or continuation, and a reconnection timer
-    /// that fires late does nothing.
+    /// Observes the end of this client's work without requesting it; it completes only after the
+    /// client is closed. The future completes once the client runs no application code and calls
+    /// none later: every subscription has terminated, as [Subscription#terminated()] observes, so
+    /// no handler runs; the [ConnectionListener] has returned from every notification it receives,
+    /// including the last one that closing produces, while notifications dropped because it fell
+    /// behind never arrive; a credentials supplier call, which closing interrupts, has returned;
+    /// every transport has finished closing; and the synchronous continuations of the futures that
+    /// the client completes have returned, except those of this method. Afterwards the client calls
+    /// no handler, executor chosen with [DeliveryOptions], listener, supplier, [TimerScheduler],
+    /// [Transport], or continuation, and a reconnection timer that fires late does nothing.
     ///
     /// It does not wait for work that application code started, such as tasks submitted to the
     /// application's own executors, nor for the application's own calls into the client, such as
@@ -230,8 +229,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
 
     /// Takes a snapshot of what this client holds and has counted, which only the client can
     /// know; see [ClientStats]. The client collects it at one point, so its values agree with
-    /// each other. Calling it often does not crowd the client. After [#close()], the future
-    /// completes with the snapshot collected when the client stopped, which no longer changes.
+    /// each other. Calling it often does not crowd the client. After the client is closed, the
+    /// future completes with the snapshot collected when the client stopped, which no longer
+    /// changes.
     ///
     /// Each call returns an independent future. Pending calls share the client-wide limit
     /// described by [Subscription#established()], and a full limit returns a future already

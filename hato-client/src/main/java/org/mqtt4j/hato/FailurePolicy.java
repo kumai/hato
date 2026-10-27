@@ -1,13 +1,15 @@
 package org.mqtt4j.hato;
 
-/// What a push subscription does when its handler throws for a delivery. Set it with
+/// What a push subscription does when its handler throws for a delivery, and a hand-off
+/// subscription when its acceptor throws. Set it with
 /// [Subscribe#withFailurePolicy(FailurePolicy)]; pull subscriptions have no handler and accept
 /// only [#STOP].
 ///
-/// Either policy applies only to exceptions that escape the handler. To retry a transient
-/// failure, catch it and repeat the work inside the handler, which keeps the subscription's
-/// order and holds back the acknowledgement meanwhile. A skipped failure is logged, and
-/// [ClientStats.Receiving#dropped()] counts it as [ClientStats.DropReason#FAILED].
+/// Either policy applies only to exceptions that escape the handler or the acceptor. To retry a
+/// transient failure, catch it and repeat the work inside the handler, which keeps the
+/// subscription's order and holds back the acknowledgement meanwhile. A skipped failure is
+/// logged, and [ClientStats.Receiving#dropped()] counts it as
+/// [ClientStats.DropReason#FAILED].
 public enum FailurePolicy {
 
     /// Stops the client when the failed delivery still holds back its acknowledgement: a QoS 1

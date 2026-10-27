@@ -51,9 +51,9 @@ public interface ConnectionListener {
     /// Called for each connection attempt that ends without an established connection,
     /// for example because the broker cannot be reached or refuses the connection.
     /// [Disconnection#reconnectDelay()] is the delay before the next attempt; when it is empty,
-    /// the client has given up and a pending [MqttClient#connect()] fails. A handler failure
-    /// that stops the client while it waits to reconnect is reported here too, for the attempt
-    /// that it cancels; see [MqttSubscriber].
+    /// the client has given up and a pending [MqttClient#connect()] fails. A failure that stops
+    /// the client while it waits to reconnect, such as a handler failure, is reported here too,
+    /// for the attempt that it cancels; see [MqttSubscriber].
     ///
     /// The cause is the handler's failure when a handler stopped the attempt. Otherwise it is
     /// the same [MqttConnectException] with which the attempt fails a pending

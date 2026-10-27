@@ -11,9 +11,9 @@ public interface MqttSubscriber {
     /// observes broker acceptance. Publications received before SUBACK are buffered within the
     /// subscription's capacity.
     ///
-    /// [AckMode#AFTER_HANDLER] throws [IllegalArgumentException]. Other registration
-    /// restrictions and delivery rules, apart from those about the handler, are as for
-    /// [#subscribe(Subscribe, Consumer)].
+    /// [AckMode#AFTER_HANDLER] and [FailurePolicy#SKIP] throw [IllegalArgumentException]. Other
+    /// registration restrictions and delivery rules, apart from those about the handler, are as
+    /// for [#subscribe(Subscribe, Consumer)].
     ///
     /// The default implementation throws [UnsupportedOperationException], so implementations
     /// of the subscribing role that only provide handlers need not implement pull delivery.
@@ -171,11 +171,12 @@ public interface MqttSubscriber {
     ///
     /// [Subscription#close()], [Subscription#unsubscribe()], and closing the client end new
     /// hand-offs; [unsubscribe()][Subscription#unsubscribe()] first hands off the deliveries it
-    /// already accepted. A call that started before the stop can still return after it. Once
-    /// [Subscription#terminated()] completes, the acceptor is not called again, and the application
-    /// can drain or discard its mailbox. A connection's end discards the deliveries still waiting
-    /// for hand-off. Each delivery reports its [MqttDelivery#connectionAttempt()], so deliveries
-    /// kept from an earlier connection can be told apart.
+    /// already accepted. A call for a delivery taken before the stop can still start or return
+    /// after it. Once [Subscription#terminated()] completes, the acceptor is not called again,
+    /// and the application can drain or discard its mailbox. A connection's end discards the
+    /// deliveries still waiting for hand-off. Each delivery reports its
+    /// [MqttDelivery#connectionAttempt()], so deliveries kept from an earlier connection can be
+    /// told apart.
     ///
     /// The default implementation throws [UnsupportedOperationException], so implementations of
     /// the subscribing role need not hand off deliveries.

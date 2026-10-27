@@ -122,10 +122,11 @@ public interface Subscription extends AutoCloseable {
 
     /// Permanently stops local delivery, discards queued messages, including those an earlier
     /// [#unsubscribe()] accepted, releases their acknowledgement conditions, and wakes waiting
-    /// receivers. No delivery is handed off after this returns. Schedules broker removal without
-    /// waiting for the broker or application code. Running handlers may finish;
-    /// [#terminated()] observes their end. Local closure does not acknowledge handed-off MANUAL
-    /// deliveries; their [MqttDelivery#ack()] rules continue to apply.
+    /// receivers. Schedules broker removal without waiting for the broker or application code.
+    /// A handler can still start after this returns for a delivery taken before, and running
+    /// handlers may finish; [#terminated()] observes their end. Local closure does not
+    /// acknowledge handed-off MANUAL deliveries; their [MqttDelivery#ack()] rules continue to
+    /// apply.
     /// Calling close again has no further effect.
     /// A closed subscription is never re-created, including when closed while disconnected.
     ///
