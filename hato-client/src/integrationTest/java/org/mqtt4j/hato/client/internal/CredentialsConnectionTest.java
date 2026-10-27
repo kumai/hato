@@ -1,15 +1,27 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.net.ServerSocket;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.*;
+import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -142,6 +154,64 @@ class CredentialsConnectionTest {
                 peer.roundTripBarrier(sut);
             }
         }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void credentials_reach_no_log_at_any_level(MqttVersion version) throws Exception {
+        // Arrange: every log of the client and the broker records at its finest level.
+        String username = "credential-user-7d3a";
+        byte[] password = "credential-password-1c9e".getBytes(StandardCharsets.UTF_8);
+        var records = new CopyOnWriteArrayList<LogRecord>();
+        var handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        Logger hato = Logger.getLogger("org.mqtt4j.hato");
+        Level previousLevel = hato.getLevel();
+        boolean previousParents = hato.getUseParentHandlers();
+        hato.addHandler(handler);
+        hato.setUseParentHandlers(false);
+        hato.setLevel(Level.ALL);
+        try (MqttBroker broker = MqttBroker.start();
+                MqttClient sut = MqttClient.builder()
+                        .server(URI.create("mqtt://localhost:" + broker.port()))
+                        .version(version)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
+                        .credentials(() -> MqttCredentials.of(username, password))
+                        .build()) {
+            // Act: the credentials travel in the CONNECT of an accepted connection.
+            sut.connect().get(5, SECONDS);
+            sut.disconnect().get(5, SECONDS);
+        } finally {
+            hato.removeHandler(handler);
+            hato.setLevel(previousLevel);
+            hato.setUseParentHandlers(previousParents);
+        }
+
+        // Assert: the logs saw the exchange down to wire dumps, and neither credential in any
+        // form, as a handler that prints messages, parameters, and exceptions would write them.
+        assertThat(records).extracting(LogRecord::getLevel).contains(Level.FINER);
+        var formatter = new SimpleFormatter();
+        HexFormat hex = HexFormat.of();
+        assertThat(records).extracting(formatter::format).allSatisfy(text -> assertThat(text)
+                .doesNotContain(
+                        username,
+                        hex.formatHex(username.getBytes(StandardCharsets.UTF_8)),
+                        new String(password, StandardCharsets.UTF_8),
+                        hex.formatHex(password),
+                        Arrays.toString(password)
+                ));
     }
 
     private static Packet.Will connectWill(MqttMessage will) {
