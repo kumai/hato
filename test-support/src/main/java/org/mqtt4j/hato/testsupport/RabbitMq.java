@@ -32,4 +32,15 @@ public final class RabbitMq {
                 .withExposedPorts(MQTT_PORT, WEBSOCKET_PORT)
                 .waitingFor(Wait.forLogMessage(".*Server startup complete.*", 1));
     }
+
+    /// RabbitMQ that announces smaller limits than the defaults: a Maximum Packet Size of 512
+    /// bytes and no Topic Aliases from clients, besides the Maximum QoS of 1 that it always
+    /// announces. RabbitMQ has no setting that withdraws retained messages or wildcard
+    /// subscriptions, or that lowers its Receive Maximum.
+    public static GenericContainer<?> restrictedContainer() {
+        return container().withCopyFileToContainer(
+                MountableFile.forClasspathResource("rabbitmq-restricted.conf"),
+                "/etc/rabbitmq/conf.d/90-restricted.conf"
+        );
+    }
 }

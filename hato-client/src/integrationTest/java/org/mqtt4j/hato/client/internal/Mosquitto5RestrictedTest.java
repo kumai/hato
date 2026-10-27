@@ -15,7 +15,7 @@ import org.mqtt4j.hato.testsupport.Mosquitto;
         value = "dockerIsAvailableOrRequired",
         disabledReason = "Docker explicitly optional"
 )
-class Mosquitto5RestrictedTest extends Mqtt5RestrictedTest {
+class Mosquitto5RestrictedTest extends Mqtt5RestrictedPublicationsTest {
 
     private static final GenericContainer<?> broker = Mosquitto.restrictedContainer();
 

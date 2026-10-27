@@ -22,9 +22,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The Will of MQTT 5.0 sessions, shared by Mosquitto, EMQX, HiveMQ CE, and the embedded broker:
-/// its properties, its delay, and how a reconnection or a new session for the same identifier
-/// affects it.
+/// The Will of MQTT 5.0 sessions, shared by Mosquitto, EMQX, HiveMQ CE, NanoMQ, RabbitMQ, and
+/// the embedded broker: its properties, its delay, and how a reconnection or a new session for
+/// the same identifier affects it.
 @Timeout(60)
 @SuppressWarnings("try") // Explicit close is the abnormal MQTT termination under test.
 abstract class Mqtt5WillTest {
@@ -80,7 +80,7 @@ abstract class Mqtt5WillTest {
     }
 
     @Test
-    void a_lasting_session_publishes_the_will_once_the_delay_has_passed() throws Exception {
+    void a_lasting_session_delays_the_will_unless_the_broker_drops_the_session() throws Exception {
         String topic = uniqueTopic();
         MqttMessage will = willOn(topic);
         try (
@@ -97,23 +97,29 @@ abstract class Mqtt5WillTest {
             // Act
             sut.close();
 
-            // Assert
-            assertThat(subscription.receive(Duration.ofSeconds(1)))
-                    .isEqualTo(new ReceiveResult.TimedOut());
-            assertThat(receive(subscription, Duration.ofSeconds(10))).isEqualTo(will);
+            // Assert: a broker that drops the session ends the delay with it.
+            if (keepsSessionsThatCleanStartBegan()) {
+                assertThat(subscription.receive(Duration.ofSeconds(1)))
+                        .isEqualTo(new ReceiveResult.TimedOut());
+                assertThat(receive(subscription, Duration.ofSeconds(10))).isEqualTo(will);
+            } else {
+                assertThat(receive(subscription, Duration.ofSeconds(1))).isEqualTo(will);
+            }
         }
     }
 
     @Test
-    void a_reconnection_within_the_delay_publishes_no_will() throws Exception {
+    void a_reconnection_within_the_delay_publishes_no_will_unless_the_broker_drops_the_session()
+            throws Exception {
         String topic = uniqueTopic();
+        MqttMessage will = willOn(topic);
         var transport = new AtomicReference<FaultyTransport>();
         var connections = new LinkedBlockingQueue<ConnAck>();
         var clock = new ManualTimerScheduler();
         try (
                 MqttClient subscriber = subscriber();
                 MqttClient sut = builder(clientId(), Duration.ofMinutes(1))
-                        .will(willOn(topic))
+                        .will(will)
                         .willDelay(DELAY)
                         .reconnectPolicy(ReconnectPolicy.exponentialBackoff(
                                 Duration.ofMillis(100),
@@ -140,16 +146,23 @@ abstract class Mqtt5WillTest {
             PullSubscription subscription = subscribe(subscriber, topic);
             sut.connect().get(5, SECONDS);
             assertThat(connections.poll(5, SECONDS)).isNotNull();
+            // RabbitMQ keeps a session only while it has a subscription.
+            PullSubscription _ = subscribe(sut, uniqueTopic());
 
-            // Act: the network fails, and the client resumes its session within the delay.
+            // Act: the network fails, and the client reconnects within the delay.
             requireNonNull(transport.get()).disconnect(new IOException("network lost"));
             ConnAck resumed = connections.poll(5, SECONDS);
 
-            // Assert: nothing arrives after the delay has passed.
+            // Assert: nothing arrives after the delay has passed, unless the broker dropped the
+            // session and published the Will as the connection ended.
             assertThat(resumed).isNotNull();
-            assertThat(resumed.sessionPresent()).isTrue();
-            assertThat(subscription.receive(DELAY.plusSeconds(1)))
-                    .isEqualTo(new ReceiveResult.TimedOut());
+            assertThat(resumed.sessionPresent()).isEqualTo(keepsSessionsThatCleanStartBegan());
+            if (keepsSessionsThatCleanStartBegan()) {
+                assertThat(subscription.receive(DELAY.plusSeconds(1)))
+                        .isEqualTo(new ReceiveResult.TimedOut());
+            } else {
+                assertThat(receive(subscription, Duration.ofSeconds(5))).isEqualTo(will);
+            }
             sut.disconnect().get(5, SECONDS);
         }
     }
@@ -195,6 +208,13 @@ abstract class Mqtt5WillTest {
     /// identifier starts a new session within the Will's delay, rather than discarding it, as
     /// recorded for the pinned image or as MQTT 5.0 reads for the embedded broker.
     abstract boolean publishesTheWillOfAReplacedSession();
+
+    /// Whether the broker keeps a session that began with Clean Start and a Session Expiry
+    /// Interval after the connection ends, as MQTT 5.0 requires and as recorded for it. The
+    /// client starts its first connection with Clean Start.
+    boolean keepsSessionsThatCleanStartBegan() {
+        return true;
+    }
 
     abstract URI endpoint();
 

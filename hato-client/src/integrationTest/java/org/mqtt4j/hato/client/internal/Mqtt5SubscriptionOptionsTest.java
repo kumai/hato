@@ -16,8 +16,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The MQTT 5.0 subscription options, shared by Mosquitto, EMQX, HiveMQ CE, and the embedded
-/// broker: No Local, Retain As Published, and Retain Handling.
+/// The MQTT 5.0 subscription options, shared by Mosquitto, EMQX, HiveMQ CE, NanoMQ, RabbitMQ, and
+/// the embedded broker: No Local, Retain As Published, and Retain Handling.
 @Timeout(30)
 abstract class Mqtt5SubscriptionOptionsTest {
 

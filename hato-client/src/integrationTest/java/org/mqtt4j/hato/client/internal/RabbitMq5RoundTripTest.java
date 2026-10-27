@@ -22,8 +22,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
-/// The client's MQTT 5.0 connections to RabbitMQ, the limits that RabbitMQ announces, and the
-/// QoS 2 publications and shared subscriptions that RabbitMQ does not take.
+/// The client's MQTT 5.0 connections to RabbitMQ, the limits that RabbitMQ announces, the
+/// sessions that it keeps, and the QoS 2 publications and shared subscriptions that RabbitMQ does
+/// not take.
 @EnabledIf(
         value = "dockerIsAvailableOrRequired",
         disabledReason = "Docker explicitly optional"
@@ -75,6 +76,23 @@ class RabbitMq5RoundTripTest extends Mqtt5RoundTripTest {
                     .withMaximumQos(Qos.AT_LEAST_ONCE)
                     .withSharedSubscriptionAvailable(false)
                     .withMaximumPacketSize(16_777_216));
+            sut.disconnect().get(5, SECONDS);
+        }
+    }
+
+    @Test
+    void a_session_without_subscriptions_is_not_kept() throws Exception {
+        try (MqttClient sut = client("mqtt5-no-subscriptions", Duration.ofMinutes(1))) {
+            // Arrange
+            sut.connect().get(5, SECONDS);
+            sut.disconnect().get(5, SECONDS);
+
+            // Act
+            ConnAck reconnected = sut.connect().get(5, SECONDS);
+
+            // Assert: recorded from the pinned RabbitMQ 4.4.0 image, which keeps no session
+            // without a subscription, although the Session Expiry Interval asks for one.
+            assertThat(reconnected.sessionPresent()).isFalse();
             sut.disconnect().get(5, SECONDS);
         }
     }
