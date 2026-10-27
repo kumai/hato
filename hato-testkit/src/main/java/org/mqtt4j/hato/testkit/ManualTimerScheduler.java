@@ -10,7 +10,8 @@ import static java.util.Objects.requireNonNull;
 
 /// A monotonic clock starting at zero. Advancing executes due tasks on the calling thread,
 /// in deadline and registration order. It does not wait for work those tasks enqueue elsewhere.
-/// Tasks may schedule or cancel other tasks; recursive advance calls are rejected.
+/// Tasks may schedule or cancel other tasks; concurrent or recursive advance calls are
+/// rejected with [IllegalStateException].
 public final class ManualTimerScheduler implements TimerScheduler {
 
     private final PriorityQueue<Task> tasks = new PriorityQueue<>(
@@ -48,6 +49,8 @@ public final class ManualTimerScheduler implements TimerScheduler {
     ///
     /// @param duration
     ///     the time to advance by
+    /// @throws IllegalArgumentException
+    ///     if `duration` is negative
     public void advance(Duration duration) {
         long target;
         synchronized (this) {
