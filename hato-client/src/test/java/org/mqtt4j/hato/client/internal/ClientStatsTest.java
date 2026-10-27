@@ -764,6 +764,9 @@ class ClientStatsTest {
         var failure = new IllegalStateException("Clock unavailable");
         try (MqttClient sut = builder().build()) {
             ScriptTransport transport = connect(sut);
+            // The transport never reports the SUBSCRIBE written: the actor reads the clock when
+            // it learns of a write, and that read could fall among the ones counted below.
+            transport.completeSends = false;
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("readings"), Qos.AT_MOST_ONCE),
                     delivery -> {
