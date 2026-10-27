@@ -48,7 +48,9 @@ final class ResponseDeadlines {
     }
 
     Optional<Duration> written(long ticket, long writtenAt, long now) {
-        Response response = writing.remove(ticket);
+        // Every write of the connection comes here, acknowledgements among them, which await no
+        // response; looking up an empty table would only box the ticket.
+        Response response = writing.isEmpty() ? null : writing.remove(ticket);
         if (response == null || waiting.putIfAbsent(response, writtenAt) != null || armed) {
             return Optional.empty();
         }

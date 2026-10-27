@@ -407,11 +407,15 @@ final class Publications {
     /// Completes the QoS 0 publication that `ticket` wrote, and returns whether the write was a
     /// PUBREC response, whose completion makes room for the next one.
     boolean written(long ticket) {
-        Long publication = window.publications.remove(ticket);
+        // Every write of the connection comes here, acknowledgements and keep-alives among them;
+        // looking up an empty table would only box the ticket.
+        Long publication = window.publications.isEmpty()
+                ? null
+                : window.publications.remove(ticket);
         if (publication != null) {
             port.complete(publication, PublishResult.of(), null);
         }
-        return window.releaseWrites.remove(ticket);
+        return !window.releaseWrites.isEmpty() && window.releaseWrites.remove(ticket);
     }
 
     /// Whether an unknown PUBREC still holds `packetId`. A PUBREL answering it has no session

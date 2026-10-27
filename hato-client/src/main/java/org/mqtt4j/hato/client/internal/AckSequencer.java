@@ -1,12 +1,15 @@
 package org.mqtt4j.hato.client.internal;
 
-import java.util.HashMap;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
-import java.util.Map;
 import java.util.Optional;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.client.internal.ReceiveTable.Entry;
+
+import static java.util.Objects.requireNonNull;
 
 /// Actor-owned acknowledgement order and pending writes for one connection. PUBACK and PUBREC
 /// leave in receive order. PUBCOMP has no order requirement and is always ready, so it also
@@ -32,7 +35,15 @@ final class AckSequencer {
     // which happens only after every earlier pending acknowledgement.
     private final LinkedHashMap<Integer, Acknowledgement> completions = new LinkedHashMap<>();
 
-    private final Map<Long, Acknowledgement> writing = new HashMap<>();
+    // Admitted writes, the ticket of each at the same index as its acknowledgement. Receptions
+    // admits at most 16 at once, so a scan finds a ticket without boxing it or keeping an entry
+    // for each write; the arrays grow if that window does. A finished write leaves its slot to
+    // the last one, since the order of writes means nothing here.
+    private long[] writingTickets = new long[16];
+
+    private @Nullable Acknowledgement[] writingAcknowledgements = new Acknowledgement[16];
+
+    private int writingCount;
 
     void add(Entry entry, Kind kind) {
         var acknowledgement = new Acknowledgement(kind, entry);
@@ -48,9 +59,16 @@ final class AckSequencer {
     }
 
     boolean contains(Entry entry, Kind kind) {
-        // The core bounds outstanding writes to 16; index tokens here if that window grows.
         var acknowledgement = new Acknowledgement(kind, entry);
-        return pending.contains(acknowledgement) || writing.containsValue(acknowledgement);
+        if (pending.contains(acknowledgement)) {
+            return true;
+        }
+        for (int at = 0; at < writingCount; at++) {
+            if (acknowledgement.equals(writingAcknowledgements[at])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// An admitted acknowledgement cannot be withdrawn while its write is pending.
@@ -72,15 +90,34 @@ final class AckSequencer {
     void submitted(long ticket) {
         Acknowledgement acknowledgement = nextReady().orElseThrow();
         pending.remove(acknowledgement);
-        completions.remove(acknowledgement.entry().packetId(), acknowledgement);
-        writing.put(ticket, acknowledgement);
+        // Without a pending PUBCOMP, the lookup would only box the identifier.
+        if (!completions.isEmpty()) {
+            completions.remove(acknowledgement.entry().packetId(), acknowledgement);
+        }
+        if (writingCount == writingTickets.length) {
+            writingTickets = Arrays.copyOf(writingTickets, writingCount * 2);
+            writingAcknowledgements = Arrays.copyOf(writingAcknowledgements, writingCount * 2);
+        }
+        writingTickets[writingCount] = ticket;
+        writingAcknowledgements[writingCount] = acknowledgement;
+        writingCount++;
     }
 
     int writingCount() {
-        return writing.size();
+        return writingCount;
     }
 
     Optional<Acknowledgement> written(long ticket) {
-        return Optional.ofNullable(writing.remove(ticket));
+        for (int at = 0; at < writingCount; at++) {
+            if (writingTickets[at] == ticket) {
+                Acknowledgement acknowledgement = requireNonNull(writingAcknowledgements[at]);
+                writingCount--;
+                writingTickets[at] = writingTickets[writingCount];
+                writingAcknowledgements[at] = writingAcknowledgements[writingCount];
+                writingAcknowledgements[writingCount] = null;
+                return Optional.of(acknowledgement);
+            }
+        }
+        return Optional.empty();
     }
 }

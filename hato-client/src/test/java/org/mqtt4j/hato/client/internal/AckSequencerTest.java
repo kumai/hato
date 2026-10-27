@@ -1,5 +1,9 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.Qos;
@@ -194,5 +198,42 @@ class AckSequencerTest {
         assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBACK, current));
         assertThat(sut.written(10)).contains(new Acknowledgement(Kind.PUBREC, earlier));
         assertThat(sut.contains(earlier, Kind.PUBREC)).isFalse();
+    }
+
+    @Test
+    void writes_beyond_sixteen_finish_in_any_order() {
+        // Arrange
+        var receptions = new ReceiveTable(20);
+        var sut = new AckSequencer();
+        var entries = new ArrayList<Entry>();
+        for (int number = 1; number <= 20; number++) {
+            Entry entry = receptions.add(number, number, Qos.AT_LEAST_ONCE, 0).orElseThrow();
+            sut.add(entry, Kind.PUBACK);
+            receptions.ready(number);
+            entries.add(entry);
+        }
+        for (int number = 1; number <= 20; number++) {
+            sut.submitted(100 + number);
+        }
+        // The last write first, then from both ends towards the middle.
+        List<Long> order = List.of(
+                120L, 101L, 119L, 102L, 110L, 111L, 103L, 118L, 104L, 117L,
+                105L, 116L, 106L, 115L, 107L, 114L, 108L, 113L, 109L, 112L
+        );
+
+        // Act
+        List<Optional<Acknowledgement>> finished = order.stream()
+                .map(sut::written)
+                .toList();
+
+        // Assert
+        assertThat(finished).containsExactlyElementsOf(order.stream()
+                .map(ticket -> Optional.of(new Acknowledgement(
+                        Kind.PUBACK,
+                        entries.get((int) (ticket - 101))
+                )))
+                .toList());
+        assertThat(sut.writingCount()).isZero();
+        assertThat(sut.contains(entries.getFirst(), Kind.PUBACK)).isFalse();
     }
 }
