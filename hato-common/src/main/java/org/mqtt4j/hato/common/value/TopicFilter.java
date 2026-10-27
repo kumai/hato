@@ -103,6 +103,12 @@ public record TopicFilter(String pattern) {
         }
     }
 
+    /// Returns the pattern unchanged.
+    @Override
+    public String toString() {
+        return pattern;
+    }
+
     private static int levelEnd(String text, int start) {
         int end = text.indexOf('/', start);
         return end < 0 ? text.length() : end;

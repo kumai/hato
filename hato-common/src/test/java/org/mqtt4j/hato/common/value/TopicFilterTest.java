@@ -31,6 +31,7 @@ class TopicFilterTest {
         var sut = new TopicFilter(pattern);
 
         assertThat(sut.pattern()).isEqualTo(pattern);
+        assertThat(sut.toString()).isEqualTo(pattern);
     }
 
     @ParameterizedTest
