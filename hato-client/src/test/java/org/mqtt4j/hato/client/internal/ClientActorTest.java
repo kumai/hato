@@ -42,6 +42,7 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedClass;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -105,18 +106,32 @@ import static org.mqtt4j.hato.Transport.SendResult.CLOSED;
 import static org.mqtt4j.hato.client.internal.SessionPersistenceTest.userPropertiesOf;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
+/// Each test runs with both ways in which the transports hand what they read to the client: with
+/// copied bytes the actor thread runs the client's events, and with lent reads the thread that
+/// reads runs them itself. The client's rules hold whichever thread runs them.
+@ParameterizedClass(name = "{0} reads")
+@EnumSource(ScriptTransport.Reads.class)
 class ClientActorTest {
 
     private static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
 
+    private final ScriptTransport.Reads reads;
     private final ManualTimerScheduler scheduler = new ManualTimerScheduler();
     private final LinkedBlockingQueue<Disconnection> ends = new LinkedBlockingQueue<>();
     private final LinkedBlockingQueue<ScriptTransport> transports = new LinkedBlockingQueue<>();
 
+    // Runs before each clock read of the actor thread, and of a thread of the delivery lanes that
+    // runs the client's events in place. With lent reads, the thread that hands input over runs
+    // its events itself and skips this, so a test that waits for this on received input hands it
+    // over with receiveForActor.
     private volatile Runnable beforeActorTime = () -> { };
 
     // Runs before every clock read of the client, on the thread that reads it.
     private volatile Runnable beforeTime = () -> { };
+
+    ClientActorTest(ScriptTransport.Reads reads) {
+        this.reads = reads;
+    }
 
     @Test
     void joining_connection_requests_start_no_new_attempt_or_notification() throws Exception {
@@ -194,7 +209,7 @@ class ClientActorTest {
                 .timerScheduler(clock)
                 .connectionListener(ends::add)
                 .transportFactory(_ -> {
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(reads);
                     transports.add(transport);
                     return transport;
                 })
@@ -450,7 +465,7 @@ class ClientActorTest {
                 .timerScheduler(timer)
                 .credentials(supplier)
                 .transportFactory(_ -> {
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(reads);
                     transports.add(transport);
                     return transport;
                 })
@@ -951,7 +966,7 @@ class ClientActorTest {
             subscriptions.forEach(Subscription::close);
             var processed = new CountDownLatch(1);
             beforeActorTime = processed::countDown;
-            transport.receive(new Packet.PingResp());
+            transport.receiveForActor(new Packet.PingResp());
             assertThat(processed.await(5, SECONDS)).isTrue();
             beforeActorTime = () -> { };
             transport.completeSends = true;
@@ -1432,7 +1447,7 @@ class ClientActorTest {
             String message
     ) throws Exception {
         // Arrange
-        var transport = new ScriptTransport();
+        var transport = new ScriptTransport(reads);
         transport.connectOnStart = false;
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
@@ -1508,7 +1523,7 @@ class ClientActorTest {
                     if (call == SpiCall.CREATE) {
                         reject.run();
                     }
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(reads);
                     if (call == SpiCall.START) {
                         transport.onStart = reject;
                     } else if (call == SpiCall.SEND) {
@@ -1597,7 +1612,7 @@ class ClientActorTest {
                 .timerScheduler(timers)
                 .connectionListener(ends::add)
                 .transportFactory(_ -> {
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(reads);
                     transports.add(transport);
                     return transport;
                 })
@@ -1664,7 +1679,7 @@ class ClientActorTest {
         // Arrange: hold the actor inside the first connection's SPI start call.
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var transport = new ScriptTransport();
+        var transport = new ScriptTransport(reads);
         transport.onStart = () -> {
             entered.countDown();
             waitFor(release);
@@ -1730,7 +1745,7 @@ class ClientActorTest {
                 .timerScheduler(timers)
                 .connectionListener(ends::add)
                 .transportFactory(_ -> {
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(reads);
                     transports.add(transport);
                     return transport;
                 })
@@ -1949,7 +1964,7 @@ class ClientActorTest {
                 .timerScheduler(scheduler)
                 .connectionListener(recording(notifications))
                 .transportFactory(_ -> {
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(reads);
                     if (created.incrementAndGet() == 2) {
                         transport.onStart = () -> {
                             throw startFailure;
@@ -1995,7 +2010,7 @@ class ClientActorTest {
                 .timerScheduler(scheduler)
                 .connectionListener(ends::add)
                 .transportFactory(_ -> {
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(reads);
                     transports.add(transport);
                     return transport;
                 })
@@ -2059,7 +2074,7 @@ class ClientActorTest {
     void closure_queued_before_connect_send_keeps_its_original_cause() throws Exception {
         // Arrange: both callbacks arrive before the actor handles the connected event.
         var failure = new EOFException("Peer closed before CONNECT");
-        var transport = new ScriptTransport();
+        var transport = new ScriptTransport(reads);
         transport.startFailure = failure;
         try (MqttClient sut = MqttClient.builder()
                 .server(URI.create("mqtt://localhost"))
@@ -2339,7 +2354,7 @@ class ClientActorTest {
                 .version(MqttVersion.V3_1_1)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .timerScheduler(inline)
-                .transportFactory(_ -> new ScriptTransport())
+                .transportFactory(_ -> new ScriptTransport(reads))
                 .build()) {
             // Act & Assert
             assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
@@ -2462,7 +2477,7 @@ class ClientActorTest {
             };
 
             // Act
-            transport.receive(new Packet.PingResp());
+            transport.receiveForActor(new Packet.PingResp());
 
             // Assert: cleanup preserves the first cause and stops the idle sender too.
             assertThatThrownBy(() -> pending.get(5, SECONDS))
@@ -2610,7 +2625,7 @@ class ClientActorTest {
             beforeActorTime = () -> {
                 throw failure;
             };
-            transport.receive(new Packet.PingResp());
+            transport.receiveForActor(new Packet.PingResp());
             Thread actor = cleanupStarted.get(5, SECONDS);
 
             // Act & Assert: callers see the permanent cause before shutdown reaches the core.
@@ -3025,7 +3040,7 @@ class ClientActorTest {
                 .timerScheduler(timers)
                 .connectionListener(listener)
                 .transportFactory(_ -> {
-                    var transport = new ScriptTransport();
+                    var transport = new ScriptTransport(reads);
                     transports.add(transport);
                     return transport;
                 })
@@ -4476,7 +4491,7 @@ class ClientActorTest {
                 actorHeld.countDown();
                 waitFor(releaseActor);
             };
-            current.receive(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));
+            current.receiveForActor(new Packet.ConnAck(sessionPresent, ReasonCode.SUCCESS, EMPTY));
             assertThat(actorHeld.await(5, SECONDS)).isTrue();
 
             // Act: I/O failure follows an admitted handler failure before CONNACK resumes.
@@ -4532,7 +4547,7 @@ class ClientActorTest {
                 actorHeld.countDown();
                 waitFor(releaseActor);
             };
-            transport.receive(new Packet.Publish(new Topic("messages"), new byte[] {2},
+            transport.receiveForActor(new Packet.Publish(new Topic("messages"), new byte[] {2},
                     Qos.AT_LEAST_ONCE, false, false, 8, EMPTY));
             assertThat(actorHeld.await(5, SECONDS)).isTrue();
 
@@ -5759,7 +5774,7 @@ class ClientActorTest {
                 waitFor(release);
                 throw new AssertionError("Actor failed");
             };
-            transport.receive(new Packet.PingResp());
+            transport.receiveForActor(new Packet.PingResp());
             assertThat(entered.await(5, SECONDS)).isTrue();
             sut.close();
 
@@ -9136,7 +9151,7 @@ class ClientActorTest {
                 listener,
                 null,
                 _ -> {
-                    var transport = new ScriptTransport(version);
+                    var transport = new ScriptTransport(version, reads);
                     transports.add(transport);
                     return transport;
                 },
@@ -9166,7 +9181,7 @@ class ClientActorTest {
             waitFor(release);
         };
         // The actor reads the clock for each received packet; the session ignores this PINGRESP.
-        transport.receive(new Packet.PingResp());
+        transport.receiveForActor(new Packet.PingResp());
         assertThat(entered.await(5, SECONDS)).isTrue();
     }
 

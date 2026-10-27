@@ -25,10 +25,22 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// A scripted transport for client tests: it records the packets of each send, completes sends
 /// unless told not to, and lets a test feed packets and connection events to the client. A send
 /// carries several packets when the client writes them together. Like a real transport, a
-/// started one reports its close once; received bytes and that report are serialized.
+/// started one reports its close once; received bytes and that report are serialized. It hands
+/// what it reads to the client in one of the two ways that the real transports do, which decides
+/// the thread that runs the client's events of a read; see [Reads].
 final class ScriptTransport implements Transport {
 
+    /// How a transport hands what it reads to the client.
+    enum Reads {
+        /// As copied bytes, as the WebSocket transport does: the actor thread runs the events.
+        COPIED,
+        /// As reads of a buffer that it lends, as the TCP transport does: the thread that reads
+        /// runs the events itself, unless a read fills the buffer.
+        LENT
+    }
+
     private final PacketCodec codec;
+    private final Reads reads;
 
     final LinkedBlockingQueue<Packet> sent = new LinkedBlockingQueue<>();
     volatile @Nullable Listener listener;
@@ -45,38 +57,103 @@ final class ScriptTransport implements Transport {
     // When set, close() leaves its report to finishClose(), as a transport still closing would.
     volatile boolean deferCloseReport;
 
-    /// A transport that speaks MQTT 3.1.1.
+    /// A transport that speaks MQTT 3.1.1 and hands over copied bytes.
     ScriptTransport() {
-        this(MqttVersion.V3_1_1);
+        this(Reads.COPIED);
     }
 
-    /// A transport that decodes sends and encodes received packets in `version`.
+    /// A transport that speaks MQTT 3.1.1 and hands over what it reads as `reads` says.
+    ScriptTransport(Reads reads) {
+        this(MqttVersion.V3_1_1, reads);
+    }
+
+    /// A transport that decodes sends and encodes received packets in `version`, and hands over
+    /// copied bytes.
     ScriptTransport(MqttVersion version) {
+        this(version, Reads.COPIED);
+    }
+
+    /// A transport that decodes sends and encodes received packets in `version`, and hands over
+    /// what it reads as `reads` says.
+    ScriptTransport(MqttVersion version, Reads reads) {
         codec = PacketCodec.of(version);
+        this.reads = reads;
     }
 
+    /// The client's listener. With lent reads, the bytes that a test hands to it arrive as lent
+    /// reads too, so that a connection never mixes the two ways, which no real transport does.
     Listener receiver() {
-        return requireNonNull(listener);
+        Listener current = requireNonNull(listener);
+        return switch (reads) {
+            case COPIED -> current;
+            case LENT -> new Listener() {
+                @Override
+                public void onConnected() {
+                    current.onConnected();
+                }
+
+                @Override
+                public void onBytes(byte[] bytes) {
+                    read(bytes, false);
+                }
+
+                @Override
+                public void onSent(long ticket) {
+                    current.onSent(ticket);
+                }
+
+                @Override
+                public void onClosed(Throwable cause) {
+                    current.onClosed(cause);
+                }
+            };
+        };
     }
 
-    synchronized void receive(Packet packet) {
-        receiver().onBytes(codec.encode(packet));
+    /// Hands `packet` to the client as one read.
+    void receive(Packet packet) {
+        read(codec.encode(packet), false);
     }
 
-    /// Lends `packet` to the client as one read that leaves room in its buffer, and then tells
-    /// it, without this transport's monitor, that the read is over, as the TCP transport does.
+    /// Hands `packet` to the client as one read whose events the actor thread runs: copied bytes,
+    /// or a lent read that fills the buffer, which the thread that reads leaves to the actor
+    /// thread. A test that blocks in those events holds the actor thread this way, rather than
+    /// the thread that hands the packet over.
+    void receiveForActor(Packet packet) {
+        read(codec.encode(packet), true);
+    }
+
+    /// Lends `packet` to the client as one read that leaves room in its buffer, whichever way
+    /// this transport reads otherwise.
     void lend(Packet packet) {
+        lend(codec.encode(packet), false);
+    }
+
+    void accept() {
+        receive(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY));
+    }
+
+    private void read(byte[] bytes, boolean fillsBuffer) {
+        switch (reads) {
+            case COPIED -> {
+                synchronized (this) {
+                    requireNonNull(listener).onBytes(bytes);
+                }
+            }
+            case LENT -> lend(bytes, fillsBuffer);
+        }
+    }
+
+    /// Lends `bytes` to the client as one read, and then tells it, without this transport's
+    /// monitor, that the read is over, as the TCP transport does.
+    private void lend(byte[] bytes, boolean fillsBuffer) {
         BorrowingListener borrower;
         synchronized (this) {
-            borrower = (BorrowingListener) receiver();
-            byte[] bytes = codec.encode(packet);
-            borrower.onBorrowedBytes(Arrays.copyOf(bytes, bytes.length + 1), 0, bytes.length);
+            borrower = (BorrowingListener) requireNonNull(listener);
+            byte[] buffer = fillsBuffer ? bytes : Arrays.copyOf(bytes, bytes.length + 1);
+            borrower.onBorrowedBytes(buffer, 0, bytes.length);
         }
         borrower.afterBorrowedBytes();
-    }
-
-    synchronized void accept() {
-        receiver().onBytes(codec.encode(new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY)));
     }
 
     synchronized void finishClose() {
