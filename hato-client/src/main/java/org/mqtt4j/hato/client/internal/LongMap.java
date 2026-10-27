@@ -114,14 +114,20 @@ final class LongMap<V> {
         size = 0;
     }
 
-    /// A copy of the values, in no particular order, which later changes of the map leave as it
-    /// is.
+    /// A copy of the values in ascending order of their keys, which later changes of the map
+    /// leave as it is. The order makes a pass over the values as repeatable as the keys.
     List<V> values() {
-        var copy = new ArrayList<V>(size);
+        var present = new long[size];
+        int count = 0;
         for (int at = 0; at < values.length; at++) {
             if (values[at] != null) {
-                copy.add(valueAt(at));
+                present[count++] = keys[at];
             }
+        }
+        Arrays.sort(present);
+        var copy = new ArrayList<V>(size);
+        for (long key : present) {
+            copy.add(valueAt(slot(key)));
         }
         return copy;
     }

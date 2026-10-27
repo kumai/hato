@@ -3,12 +3,12 @@ package org.mqtt4j.hato.client.internal;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -95,11 +95,17 @@ final class DeliveryLanes {
 
     private final Map<Long, Lane> lanes = new HashMap<>();
 
-    private final Map<Long, RetainedDelivery> acknowledging = new HashMap<>();
+    // By acknowledgement token, which the map does not box.
+    private final LongMap<RetainedDelivery> acknowledging = new LongMap<>();
 
-    // Each core-admitted QoS 1 or QoS 2 receipt enters once. The core's 4096-receipt limit also
-    // bounds this metadata-only queue, including receipts with no local recipient.
-    private final Set<Long> readyTokens = new LinkedHashSet<>();
+    // The tokens of receipts that became ready, in that order. Each core-admitted QoS 1 or QoS 2
+    // receipt enters once, marked queuedReady until it is taken. The core's 4096-receipt limit
+    // also bounds this metadata-only queue, including receipts with no local recipient. A
+    // forgotten receipt leaves its token here, which takeReady() skips, since tokens are never
+    // reused.
+    private long[] readyTokens = new long[16];
+
+    private int readyCount;
 
     private final String clientId;
 
@@ -490,12 +496,14 @@ final class DeliveryLanes {
                 }
             }
             result = receiveStateLocked();
-            for (long token : List.copyOf(acknowledging.keySet())) {
+            for (RetainedDelivery delivery : acknowledging.values()) {
+                long token = delivery.token.acknowledgement();
                 if (!result.containsKey(token)) {
-                    retire(requireNonNull(acknowledging.remove(token)));
+                    acknowledging.remove(token);
+                    retire(delivery);
                 }
             }
-            readyTokens.clear();
+            clearReady();
         } finally {
             lock.unlock();
         }
@@ -525,10 +533,9 @@ final class DeliveryLanes {
 
     private Map<Long, Boolean> receiveStateLocked() {
         var result = new HashMap<Long, Boolean>();
-        for (var entry : acknowledging.entrySet()) {
-            RetainedDelivery delivery = entry.getValue();
+        for (RetainedDelivery delivery : acknowledging.values()) {
             if (delivery.recipients.values().stream().anyMatch(recipient -> recipient.handed)) {
-                result.put(entry.getKey(), delivery.pending == 0);
+                result.put(delivery.token.acknowledgement(), delivery.pending == 0);
             }
         }
         return result;
@@ -552,11 +559,34 @@ final class DeliveryLanes {
 
     /// Caller holds lock. Running handlers retain their payload until they return.
     private void retireAcknowledgements() {
-        for (RetainedDelivery delivery : List.copyOf(acknowledging.values())) {
+        for (RetainedDelivery delivery : acknowledging.values()) {
             retire(delivery);
         }
+        clearReady();
         acknowledging.clear();
-        readyTokens.clear();
+    }
+
+    /// Caller holds lock. Queues the receipt's token for takeReady() unless it waits there.
+    private void queueReady(RetainedDelivery delivery) {
+        if (delivery.queuedReady) {
+            return;
+        }
+        delivery.queuedReady = true;
+        if (readyCount == readyTokens.length) {
+            readyTokens = Arrays.copyOf(readyTokens, readyCount * 2);
+        }
+        readyTokens[readyCount++] = delivery.token.acknowledgement();
+    }
+
+    /// Caller holds lock. Drops the queued tokens, so that their receipts can queue again.
+    private void clearReady() {
+        for (int at = 0; at < readyCount; at++) {
+            RetainedDelivery delivery = acknowledging.get(readyTokens[at]);
+            if (delivery != null) {
+                delivery.queuedReady = false;
+            }
+        }
+        readyCount = 0;
     }
 
     /// Caller holds lock. A retired receipt meets no acknowledgement condition, so a late ack()
@@ -687,7 +717,7 @@ final class DeliveryLanes {
             }
             ready = recipients.isEmpty() && retained.pending == 0;
             if (ready) {
-                readyTokens.add(token.acknowledgement());
+                queueReady(retained);
             }
         } finally {
             recipients.clear();
@@ -933,18 +963,23 @@ final class DeliveryLanes {
 
     /// Takes one finite snapshot. A concurrent completion belongs to this or the next wake;
     /// the mailbox rearms its coalesced wake before the actor calls this method.
-    List<Long> takeReady() {
+    long[] takeReady() {
         lock.lock();
         try {
-            var result = new ArrayList<Long>();
-            for (long token : readyTokens) {
+            var taken = new long[readyCount];
+            int count = 0;
+            for (int at = 0; at < readyCount; at++) {
+                long token = readyTokens[at];
                 RetainedDelivery delivery = acknowledging.get(token);
-                if (delivery != null && delivery.pending == 0) {
-                    result.add(token);
+                if (delivery != null) {
+                    delivery.queuedReady = false;
+                    if (delivery.pending == 0) {
+                        taken[count++] = token;
+                    }
                 }
             }
-            readyTokens.clear();
-            return result;
+            readyCount = 0;
+            return count == taken.length ? taken : Arrays.copyOf(taken, count);
         } finally {
             lock.unlock();
         }
@@ -970,7 +1005,6 @@ final class DeliveryLanes {
     void forget(long token) {
         lock.lock();
         try {
-            readyTokens.remove(token);
             RetainedDelivery delivery = acknowledging.remove(token);
             if (delivery != null) {
                 retire(delivery);
@@ -2057,7 +2091,7 @@ final class DeliveryLanes {
             view.recipient.ready = true;
             view.acknowledgement = null;
             if (--delivery.pending == 0) {
-                readyTokens.add(delivery.token.acknowledgement());
+                queueReady(delivery);
                 return true;
             }
         }
@@ -2660,6 +2694,8 @@ final class DeliveryLanes {
         @Nullable MqttMessage message;
         int pending;
         boolean retired;
+        // Whether its token waits in readyTokens to be taken.
+        boolean queuedReady;
 
         RetainedDelivery(DeliveryToken token, int bytes) {
             this.token = token;

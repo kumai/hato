@@ -794,7 +794,7 @@ final class SessionCore {
     }
 
     void deliveryReady(long token) {
-        deliveriesReady(List.of(token));
+        deliveriesReady(new long[] {token});
     }
 
     /// QoS 0 deliveries and receptions whose PUBACK or PUBCOMP was written have no table entry.
@@ -807,7 +807,7 @@ final class SessionCore {
     }
 
     /// Tokens belong to the client lifetime; only entries still in the receive table can advance.
-    void deliveriesReady(List<Long> tokens) {
+    void deliveriesReady(long[] tokens) {
         if (state == State.CLOSED) {
             return;
         }

@@ -4,6 +4,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.TreeMap;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -85,11 +86,12 @@ class LongMapTest {
     }
 
     @Test
-    void values_are_a_copy_that_later_changes_leave_as_it_is() {
+    void values_are_a_copy_in_key_order_that_later_changes_leave_as_it_is() {
         // Arrange
         var sut = new LongMap<String>();
-        sut.put(1, "one");
         sut.put(2, "two");
+        sut.put(-1, "minus one");
+        sut.put(1, "one");
 
         // Act
         List<String> values = sut.values();
@@ -97,7 +99,7 @@ class LongMapTest {
         sut.clear();
 
         // Assert
-        assertThat(values).containsExactlyInAnyOrder("one", "two");
+        assertThat(values).containsExactly("minus one", "one", "two");
         assertThat(sut.values()).isEmpty();
         assertThat(sut.get(2)).isNull();
     }
@@ -140,6 +142,6 @@ class LongMapTest {
         for (Map.Entry<Long, Integer> entry : model.entrySet()) {
             assertThat(sut.get(entry.getKey())).isEqualTo(entry.getValue());
         }
-        assertThat(sut.values()).containsExactlyInAnyOrderElementsOf(model.values());
+        assertThat(sut.values()).containsExactlyElementsOf(new TreeMap<>(model).values());
     }
 }

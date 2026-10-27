@@ -520,6 +520,32 @@ class DeliveryLanesTest {
     }
 
     @Test
+    void a_retransmission_after_its_readiness_was_taken_reports_it_again() {
+        DeliveryLanes sut = lanes(BYTE_LIMIT, () -> { });
+        assertThat(sut.deliver(token(1, 10), List.of(), qosOneMessage(), false, 10)).isTrue();
+        assertThat(sut.takeReady()).containsExactly(10L);
+
+        assertThat(sut.deliver(token(1, 10), List.of(), qosOneMessage(), true, 10)).isTrue();
+
+        assertThat(sut.takeReady()).containsExactly(10L);
+    }
+
+    @Test
+    void readiness_untaken_at_a_connection_end_is_reported_again_for_the_next_connection()
+            throws Exception {
+        DeliveryLanes sut = lanes(BYTE_LIMIT, () -> { });
+        DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(1));
+        assertThat(sut.deliver(token(1, 10), List.of(1L), qosOneMessage(), false, 10)).isTrue();
+        received(receiver.receive());
+        assertThat(sut.connectionEnded(true, false)).containsExactlyEntriesOf(Map.of(10L, true));
+        assertThat(sut.takeReady()).isEmpty();
+
+        assertThat(sut.deliver(token(2, 10), List.of(1L), qosOneMessage(), true, 10)).isTrue();
+
+        assertThat(sut.takeReady()).containsExactly(10L);
+    }
+
+    @Test
     void pulling_releases_local_capacity_before_the_wire_ack_is_admitted() throws Exception {
         // Arrange
         DeliveryLanes.Receiver receiver = registerPull(sut, 1, request(1));
@@ -1973,7 +1999,7 @@ class DeliveryLanesTest {
 
         // Assert: reservations wait for send admission while a single wake covers the whole batch.
         assertThat(wakes).containsExactly(true);
-        assertThat(sut.takeReady()).isEqualTo(LongStream.rangeClosed(2, 321).boxed().toList());
+        assertThat(sut.takeReady()).containsExactly(LongStream.rangeClosed(2, 321).toArray());
         assertThat(sut.takeReady()).isEmpty();
         assertThat(sut.retainedDeliveries()).isEqualTo(321);
         for (long token = 2; token <= 321; token++) {
@@ -3318,7 +3344,7 @@ class DeliveryLanesTest {
     private DeliveryLanes lanes(long byteLimit) {
         var owner = new AtomicReference<DeliveryLanes>();
         DeliveryLanes manager = lanes(byteLimit, () ->
-                ready.addAll(requireNonNull(owner.get()).takeReady()));
+                LongStream.of(requireNonNull(owner.get()).takeReady()).forEach(ready::add));
         owner.set(manager);
         return manager;
     }
@@ -3329,7 +3355,7 @@ class DeliveryLanesTest {
         DeliveryLanes manager = lanes(
                 BYTE_LIMIT,
                 limit,
-                () -> ready.addAll(requireNonNull(owner.get()).takeReady()),
+                () -> LongStream.of(requireNonNull(owner.get()).takeReady()).forEach(ready::add),
                 (token, cause) -> failures.add(new Failure(token, cause))
         );
         owner.set(manager);
@@ -3383,7 +3409,7 @@ class DeliveryLanesTest {
                 overloads::add,
                 (here, last) -> {
                     told.add(new Told(here, last));
-                    ready.addAll(requireNonNull(owner.get()).takeReady());
+                    LongStream.of(requireNonNull(owner.get()).takeReady()).forEach(ready::add);
                 },
                 terminated::add,
                 null,

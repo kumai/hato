@@ -272,8 +272,10 @@ final class Receptions {
     }
 
     /// Tokens belong to the client lifetime; only entries still in the receive table can advance.
-    void ready(List<Long> tokens) {
-        tokens.forEach(received::ready);
+    void ready(long[] tokens) {
+        for (long token : tokens) {
+            received.ready(token);
+        }
     }
 
     /// Sends ready acknowledgements in receive order while the reserved quota admits them.

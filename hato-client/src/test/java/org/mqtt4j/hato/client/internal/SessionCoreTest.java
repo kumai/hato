@@ -3605,7 +3605,7 @@ class SessionCoreTest {
         sut.subscribe(2, subscription("a/#"));
         receive(1, qosOnePublication(7, "a/b", false), 0);
         long oldToken = port.deliveries.getLast().token();
-        List<Long> snapshot = List.of(oldToken);
+        long[] snapshot = {oldToken};
         var current = new Exchange();
         var expected = new ArrayList<Integer>();
         var chains = new ArrayList<ArrayDeque<Runnable>>();
@@ -3868,7 +3868,7 @@ class SessionCoreTest {
                 receive(1, qosOnePublication(id, "a/b", true), 0);
             }
         }
-        sut.deliveriesReady(port.deliveries.stream().map(Received::token).toList());
+        sut.deliveriesReady(port.deliveries.stream().mapToLong(Received::token).toArray());
         receive(1, qosOnePublication(1, "a/b", true), 0);
 
         // Assert: even an admitted PUBACK has not yet ended the exchange.
@@ -3936,7 +3936,7 @@ class SessionCoreTest {
         assertThat(sut.state()).isEqualTo(CONNECTED);
 
         // Act
-        sut.deliveriesReady(List.of(earlier, later));
+        sut.deliveriesReady(new long[] {earlier, later});
 
         // Assert: one PUBACK covers the reused identifier.
         assertThat(pubAckIds()).containsExactly(8, 7);
@@ -4044,7 +4044,7 @@ class SessionCoreTest {
         port.ackSlots = 2;
 
         // Act
-        sut.deliveriesReady(port.deliveries.stream().map(Received::token).toList());
+        sut.deliveriesReady(port.deliveries.stream().mapToLong(Received::token).toArray());
 
         // Assert
         assertThat(sut.state()).isEqualTo(CONNECTED);
