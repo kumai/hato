@@ -44,7 +44,7 @@ class DistributionTest {
     private static final Path BROKER = Path.of(System.getProperty("broker.jar"));
     private static final String TESTKIT_JARS = System.getProperty("testkit.jars");
     private static final String CLIENT_PROBE = """
-            if (org.mqtt4j.hato.MqttVersion.of(4) != org.mqtt4j.hato.MqttVersion.V3_1_1
+            if (org.mqtt4j.hato.MqttVersion.V3_1_1.protocolLevel() != 4
                     || org.mqtt4j.hato.MqttVersion.V5.protocolLevel() != 5
                     || org.mqtt4j.hato.Qos.of(2) != org.mqtt4j.hato.Qos.EXACTLY_ONCE
                     || org.mqtt4j.hato.ReasonCode.of(0x80)
