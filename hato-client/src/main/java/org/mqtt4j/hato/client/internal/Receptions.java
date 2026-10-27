@@ -1,11 +1,9 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 import org.jspecify.annotations.Nullable;
 
@@ -58,8 +56,9 @@ final class Receptions {
 
     // The packet identifiers of the QoS 1 and QoS 2 publications that the current connection
     // delivered and whose PUBACK or PUBCOMP the send queue has not accepted yet: the broker's
-    // send quota in use (MQTT 5.0 section 4.9). A connection end replaces them.
-    private Set<Integer> quota = new HashSet<>();
+    // send quota in use (MQTT 5.0 section 4.9), each mapped to TRUE. A connection end replaces
+    // them.
+    private LongMap<Boolean> quota = new LongMap<>();
 
     private long nextDelivery;
 
@@ -107,7 +106,9 @@ final class Receptions {
             int packetId = publish.packetId();
             // A broker that sends more than the announced number is in violation, even when the
             // receive table could still hold the publication.
-            if (receiveMaximumAnnounced && quota.add(packetId) && quota.size() > receiveMaximum) {
+            if (receiveMaximumAnnounced
+                    && quota.put(packetId, Boolean.TRUE) == null
+                    && quota.size() > receiveMaximum) {
                 core.fail(new PacketDecodeException(
                         ReasonCode.RECEIVE_MAXIMUM_EXCEEDED,
                         "More unacknowledged QoS 1 and QoS 2 publications than "
@@ -400,7 +401,7 @@ final class Receptions {
 
     void connectionEnded() {
         acknowledgements = new AckSequencer();
-        quota = new HashSet<>();
+        quota = new LongMap<>();
     }
 
     void sessionDiscarded() {

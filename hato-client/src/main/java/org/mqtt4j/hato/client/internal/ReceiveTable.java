@@ -1,8 +1,6 @@
 package org.mqtt4j.hato.client.internal;
 
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
@@ -22,9 +20,10 @@ final class ReceiveTable {
 
     private final int capacity;
 
-    private final Map<Long, Entry> entries = new HashMap<>();
+    // By token and by packet identifier, without boxing either on each reception.
+    private final LongMap<Entry> entries = new LongMap<>();
 
-    private final Map<Integer, Entry> identifiers = new HashMap<>();
+    private final LongMap<Entry> identifiers = new LongMap<>();
 
     ReceiveTable(int capacity) {
         if (capacity < 1) {
@@ -61,7 +60,7 @@ final class ReceiveTable {
     }
 
     List<Entry> entries() {
-        return List.copyOf(entries.values());
+        return entries.values();
     }
 
     /// How many more receptions the table can hold.
