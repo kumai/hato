@@ -8,8 +8,8 @@ package org.mqtt4j.hato;
 /// not met its condition therefore holds back the acknowledgements of every later QoS 1 and
 /// QoS 2 message on the connection, including other subscriptions' messages. PUBCOMP does not
 /// wait for such a delivery.
-/// Push subscriptions keep a delivery's capacity until its handler finishes and its PUBACK or
-/// PUBREC enters the send queue. Pull subscriptions release it at handoff (ON_RECEIVE) or at
+/// Push subscriptions keep a delivery's capacity until its handler finishes and, for QoS 1 and
+/// 2, its acknowledgement has its turn. Pull subscriptions release it at handoff (ON_RECEIVE) or at
 /// [MqttDelivery#ack()] (MANUAL), and hand-off subscriptions when their acceptor accepts the
 /// delivery, in either mode. The client also limits the receptions that may await protocol
 /// completion in one session, including QoS 2 exchanges and connections that continue the

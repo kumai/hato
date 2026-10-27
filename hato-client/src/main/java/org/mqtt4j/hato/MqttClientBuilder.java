@@ -463,18 +463,15 @@ public final class MqttClientBuilder {
     /// Limits the subscriptions that the client holds, from 1 to 268,435,455, the number of MQTT
     /// 5.0 Subscription Identifiers; defaults to 4,096. The limit guards against an application
     /// that subscribes without end: each subscription keeps a delivery lane, and a reconnection
-    /// to a new session sends a SUBSCRIBE for each one, a few at a time, so that restoring many
-    /// subscriptions takes many round trips. A subscription with a handler holds about 3.5 KB of
-    /// heap, its delivery thread included, and a hand-off or pull subscription about 1.6 KB, so
-    /// subscriptions at the default limit hold about 14 MB at most, besides the messages that
-    /// wait for them. Routing a received publication takes time that grows with its topic's
-    /// levels and with the subscriptions that it matches, not with the subscriptions that the
-    /// client holds. A subscription counts from its request
-    /// through [MqttSubscriber], including while it awaits establishment, until the broker has
-    /// removed it, and its delivery lane counts until its handlers have returned. A subscription
-    /// beyond the limit ends its handle, and [Subscription#established()] fails with
-    /// [MqttCapacityException]. The client keeps the deliveries that it holds across all
-    /// subscriptions within an internal limit.
+    /// to a new session sends a SUBSCRIBE for each one, so that restoring many subscriptions
+    /// takes many round trips. Routing a received publication takes time that grows with its
+    /// topic's levels and with the subscriptions that it matches, not with the subscriptions that
+    /// the client holds. A subscription counts from its request through [MqttSubscriber],
+    /// including while it awaits establishment, until the broker has removed it, and its
+    /// delivery lane counts until its handlers have returned. A subscription beyond the limit
+    /// ends its handle, and [Subscription#established()] fails with [MqttCapacityException].
+    /// The client keeps the deliveries that it holds across all subscriptions within an
+    /// internal limit.
     ///
     /// @param value
     ///     the limit on the subscriptions that the client holds
@@ -488,7 +485,7 @@ public final class MqttClientBuilder {
         return this;
     }
 
-    /// Supplies monotonic time and delayed callbacks. Defaults to a shared daemon timer with
+    /// Supplies monotonic time and delayed callbacks. Defaults to a daemon timer with
     /// [System#nanoTime()]. The scheduler is borrowed and is not closed with the client.
     /// The default transports use it for connection deadlines, including the TLS handshake and
     /// the WebSocket opening handshake, and for the grace periods of closing TCP and TLS

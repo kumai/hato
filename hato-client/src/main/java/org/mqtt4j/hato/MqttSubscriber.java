@@ -144,9 +144,9 @@ public interface MqttSubscriber {
     /// the handle immediately; registration and its failures are as for
     /// [#subscribe(Subscribe, Consumer)].
     ///
-    /// One internal thread of the client calls the acceptors of all its hand-off subscriptions,
-    /// one delivery at a time, in receive order across them; a publication that several of them
-    /// match is offered to each in turn. Deliveries waiting for hand-off count against
+    /// The client calls the acceptors of all its hand-off subscriptions one delivery at a time,
+    /// in receive order across them; a publication that several of them match is offered to
+    /// each in turn. Deliveries waiting for hand-off count against
     /// [Subscribe#bufferCapacity()]. The acceptor returns true to accept a delivery: from then on
     /// the application owns it, and its capacity returns. Returning false refuses it: a refused
     /// QoS 0 delivery is dropped for this subscription, and a refused QoS 1 or 2 delivery ends

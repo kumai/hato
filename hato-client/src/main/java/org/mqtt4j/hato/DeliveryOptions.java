@@ -98,8 +98,8 @@ public final class DeliveryOptions {
     /// Runs deliveries with equal topics one at a time in receive order, and deliveries with
     /// different topics possibly at the same time, at most `stripes` at once. Each topic's
     /// deliveries go to one of `stripes` fixed stripes that its hash chooses, so different topics
-    /// can share a stripe and then wait for each other. A stripe runs on an internal thread while
-    /// it has deliveries, or on the executor that [#withExecutor(Executor)] sets.
+    /// can share a stripe and then wait for each other. A stripe runs on an internal thread, or
+    /// on the executor that [#withExecutor(Executor)] sets.
     ///
     /// @param stripes
     ///     the number of stripes
@@ -132,8 +132,7 @@ public final class DeliveryOptions {
     }
 
     /// Runs up to `parallelism` deliveries at the same time, in no particular order. Handlers run
-    /// on internal threads while deliveries wait, or on the executor that
-    /// [#withExecutor(Executor)] sets.
+    /// on internal threads, or on the executor that [#withExecutor(Executor)] sets.
     ///
     /// @param parallelism
     ///     the largest number of deliveries that run at the same time

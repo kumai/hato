@@ -42,9 +42,9 @@ public interface MqttDelivery {
     /// acknowledgement condition is unmet. Their old `ack()` calls and handler returns cannot
     /// acknowledge a replacement after reconnecting.
     /// This does not wait for an acknowledgement write or acknowledge another subscription.
-    /// A push delivery keeps its subscription capacity until its handler returns and its PUBACK
-    /// or PUBREC enters the send queue; a pull delivery releases it at this call, and a hand-off
-    /// delivery released it when accepted. In each case, acknowledgements wait for other
+    /// A push delivery keeps its subscription capacity until its handler returns and, for QoS 1
+    /// and 2, its acknowledgement has its turn; a pull delivery releases it at this call, and a
+    /// hand-off delivery released it when accepted. In each case, acknowledgements wait for other
     /// matching subscriptions and earlier QoS 1 or 2 messages; see [AckMode].
     void ack();
 }

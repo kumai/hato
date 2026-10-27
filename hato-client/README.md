@@ -539,7 +539,7 @@ Subscription subscription = client.handOff(
 - Return `false` when your mailbox is full. The client then drops a QoS 0 message for this
   subscription and ends the connection for a QoS 1 or 2 message, as
   [When a buffer is full](#when-a-buffer-is-full) describes.
-- One thread of the client offers the messages of all its hand-off subscriptions in the order
+- The client offers the messages of all its hand-off subscriptions one at a time, in the order
   they arrive, so your mailbox sees one order across them, and `delivery.filter()` tells which
   subscription each message came through. Never wait in the acceptor: use `offer`, not `put`,
   or the other hand-off subscriptions wait too.
@@ -856,7 +856,7 @@ connection or its keep-alive.
 | --- | --- | --- |
 | Message handler | By default, a thread of the client for each subscription, or up to `n` with striped or parallel delivery. With `withExecutor(pool)` or `lanes(selector)`, a thread of your executor instead | Yes. Its own subscription waits meanwhile, and acknowledgements keep [arrival order](#acknowledgements-keep-arrival-order). On your executor, it also holds that executor's thread |
 | Inline message handler | Possibly as part of receiving, before the connection reads on | No. The whole connection waits meanwhile, and waiting for this client throws |
-| Hand-off acceptor | One thread of the client, shared by all hand-off subscriptions | No. The other hand-off subscriptions wait while it runs |
+| Hand-off acceptor | A thread of the client, one acceptor at a time | No. The other hand-off subscriptions wait while it runs |
 | `receive()` | Your own threads | Yes |
 | Connection listener, metrics listener | A thread of its own for each listener, one notification at a time | Briefly. A listener that falls behind loses its oldest notifications |
 | Credentials supplier | A thread of the client, before each connection attempt | Within the connection timeout |

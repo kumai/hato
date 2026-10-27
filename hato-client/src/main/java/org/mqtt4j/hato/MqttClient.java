@@ -77,8 +77,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// when the first attempt of a request fails, unless the policy retries initial failures;
     /// when the broker refuses the connection with a reason that reconnecting cannot change;
     /// when the client's [TimerScheduler] fails; or when [#disconnect()], [#close()], or a handler
-    /// failure withdraws the request first. Its message or cause tells which, as for
-    /// [ConnectionListener#onConnectFailed(Disconnection)]. With
+    /// failure withdraws the request first. Its reason code or cause tells which, as for
+    /// [ConnectionListener#onConnectFailed(Disconnection)]; a request that [#disconnect()] or
+    /// [#close()] withdraws carries neither. With
     /// [ReconnectPolicy#withInitialRetry()], and for a call that joins an automatic reconnection,
     /// the future can wait without a deadline. Timing out the returned future does not stop the
     /// attempts; [#disconnect()] does.
@@ -229,8 +230,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
 
     /// Takes a snapshot of what this client holds and has counted, which only the client can
     /// know; see [ClientStats]. The client collects it at one point, so its values agree with
-    /// each other. A call made while an earlier call waits for the client shares that call's
-    /// snapshot, so calling often does not crowd the client. After [#close()], the future
+    /// each other. Calling it often does not crowd the client. After [#close()], the future
     /// completes with the snapshot collected when the client stopped, which no longer changes.
     ///
     /// Each call returns an independent future. Pending calls share the client-wide limit
