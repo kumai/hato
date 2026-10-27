@@ -67,6 +67,7 @@ import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttMessageAccess;
 import org.mqtt4j.hato.MqttNotConnectedException;
 import org.mqtt4j.hato.MqttProtocolException;
+import org.mqtt4j.hato.MqttPublicationRefusedException;
 import org.mqtt4j.hato.MqttSubscriptionRefusedException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
@@ -5283,10 +5284,13 @@ class ClientActorTest {
             // Act
             CompletableFuture<PublishResult> publication = sut.publish(message);
 
-            // Assert
+            // Assert: no wait could make room for it, so it is refused as too large.
             assertThat(publication.handle((_, cause) -> cause).get(5, SECONDS))
-                    .isInstanceOf(MqttCapacityException.class)
-                    .hasMessage("Send queue capacity");
+                    .isInstanceOfSatisfying(
+                            MqttPublicationRefusedException.class,
+                            refusal -> assertThat(refusal.reasonCode())
+                                    .isEqualTo(ReasonCode.PACKET_TOO_LARGE)
+                    );
             sut.publish(message(new byte[] {2})).get(5, SECONDS);
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOfSatisfying(
                     Packet.Publish.class,

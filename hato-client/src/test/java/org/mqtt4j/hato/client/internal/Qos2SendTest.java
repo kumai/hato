@@ -448,11 +448,15 @@ class Qos2SendTest {
         sut.failed(generation, new IOException("connection lost"));
         port.outgoingIds.clear();
         connect(true);
-        long large = publish(messageWithWireBytes(32 * 1024 * 1024).withQos(Qos.EXACTLY_ONCE));
+        long firstHalf = publish(halfOfTheByteBudget());
+        long secondHalf = publish(halfOfTheByteBudget());
 
         // Assert: nothing is resumed again, and the whole byte budget is available.
-        assertThat(port.outgoingIds).containsExactly(port.accepted.getLast().packetId());
-        assertThat(port.results).doesNotContainKey(large);
+        assertThat(port.outgoingIds).containsExactly(
+                port.accepted.get(port.accepted.size() - 2).packetId(),
+                port.accepted.getLast().packetId()
+        );
+        assertThat(port.results).doesNotContainKeys(firstHalf, secondHalf);
         assertThat(result(operation)).isSameAs(failure);
         assertThat(sut.state()).isEqualTo(CONNECTED);
     }
@@ -836,17 +840,18 @@ class Qos2SendTest {
 
     @Test
     void pubrec_releases_payload_bytes_once_while_the_exchange_count_waits_for_pubcomp() {
-        // Arrange
+        // Arrange: two publications fill the byte budget.
         connect(false);
-        MqttMessage large = messageWithWireBytes(32 * 1024 * 1024).withQos(Qos.EXACTLY_ONCE);
-        publish(large);
+        publish(halfOfTheByteBudget());
         int first = port.accepted.getLast().packetId();
+        publish(halfOfTheByteBudget());
+        int other = port.accepted.getLast().packetId();
         long full = publish(message());
         assertThat(result(full).failure()).isInstanceOf(MqttCapacityException.class);
 
         // Act
         receive(pubRec(first));
-        long admitted = publish(large);
+        long admitted = publish(halfOfTheByteBudget());
         int second = port.accepted.getLast().packetId();
         receive(pubRec(first));
         receive(pubComp(first));
@@ -856,7 +861,9 @@ class Qos2SendTest {
         assertThat(port.results).doesNotContainKey(admitted);
         assertThat(result(stillFull).failure()).isInstanceOf(MqttCapacityException.class);
 
-        // Act
+        // Act: the other exchange completes, so that only the second one waits for PUBCOMP.
+        receive(pubRec(other));
+        receive(pubComp(other));
         receive(pubRec(second));
         for (int i = 1; i < 64; i++) {
             publish(message());
@@ -1126,6 +1133,12 @@ class Qos2SendTest {
 
     private static MqttMessage message() {
         return messageWithWireBytes(16).withQos(Qos.EXACTLY_ONCE);
+    }
+
+    /// A QoS 2 message that takes half of the 32 MiB byte budget: 16 MiB, the most that the
+    /// client sends in one PUBLISH.
+    private static MqttMessage halfOfTheByteBudget() {
+        return messageWithWireBytes(16 * 1024 * 1024).withQos(Qos.EXACTLY_ONCE);
     }
 
     private static Packet.Publish qosOnePublish(int id) {

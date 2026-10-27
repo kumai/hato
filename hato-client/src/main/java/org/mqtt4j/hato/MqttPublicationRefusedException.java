@@ -14,8 +14,10 @@ import static java.util.Objects.requireNonNull;
 /// at all and fails with the reason code that the broker would use:
 /// [ReasonCode#QOS_NOT_SUPPORTED] above [ConnAck#maximumQos()],
 /// [ReasonCode#RETAIN_NOT_SUPPORTED] without [ConnAck#retainAvailable()], and
-/// [ReasonCode#PACKET_TOO_LARGE] beyond [ConnAck#maximumPacketSize()]. Either way the
-/// connection goes on. Only MQTT 5.0 brokers refuse publications or announce these limits.
+/// [ReasonCode#PACKET_TOO_LARGE] beyond [ConnAck#maximumPacketSize()]. A publication too large
+/// for the client to send fails with [ReasonCode#PACKET_TOO_LARGE] in the same way, with any
+/// broker. Either way the connection goes on. Only MQTT 5.0 brokers refuse publications or
+/// announce these limits.
 @SuppressWarnings("exports") // Nullness annotations are compile-time only.
 public final class MqttPublicationRefusedException extends MqttException {
 

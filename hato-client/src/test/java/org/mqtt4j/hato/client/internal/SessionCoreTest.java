@@ -1811,7 +1811,7 @@ class SessionCoreTest {
         port.sendResult = result;
         var message = MqttMessage.of(
                 new Topic("a/b"),
-                new byte[16 * 1024 * 1024 + 1],
+                new byte[8 * 1024 * 1024],
                 Qos.AT_MOST_ONCE,
                 false
         );
@@ -2767,6 +2767,38 @@ class SessionCoreTest {
         assertThat(port.publications).hasSize(3);
         assertThat(port.publications.getLast().topic()).isEqualTo(new Topic("waiting"));
         assertThat(port.results).containsKey(2L).doesNotContainKeys(3L, 4L);
+    }
+
+    @Test
+    void a_publication_too_large_to_send_is_refused_instead_of_waiting_for_room() {
+        // Arrange: the broker takes one publication at once and announces no packet size, so
+        // only the client's own send limit stands in the way of 16 MiB of payload.
+        SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
+        mqtt5.publish(2, qosOneMessage());
+        MqttMessage tooLarge = MqttMessage.of(
+                new Topic("a/b"),
+                new byte[16 * 1024 * 1024],
+                Qos.AT_LEAST_ONCE,
+                false
+        );
+
+        // Act
+        mqtt5.publish(3, tooLarge);
+        mqtt5.publish(4, qosOneMessage().withTopic(new Topic("later")));
+
+        // Assert: waiting could never send it, so it fails at once and holds nothing back.
+        assertThat(requireNonNull(port.results.get(3L)).failure()).isInstanceOfSatisfying(
+                MqttPublicationRefusedException.class,
+                refusal -> assertThat(refusal.reasonCode()).isEqualTo(ReasonCode.PACKET_TOO_LARGE)
+        );
+        mqtt5.received(
+                1,
+                new Packet.PubAck(port.publicationIds.getFirst(), ReasonCode.SUCCESS, EMPTY),
+                0,
+                0
+        );
+        assertThat(port.publications).hasSize(2);
+        assertThat(port.publications.getLast().topic()).isEqualTo(new Topic("later"));
     }
 
     @Test

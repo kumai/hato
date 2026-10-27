@@ -84,7 +84,9 @@ final class ClientIo {
 
     private static final Log log = Log.of(ClientIo.class);
 
-    private static final int REGULAR_SEND_BYTE_LIMIT = 16 * 1024 * 1024;
+    // The send queue admits no packet beyond this on its own, so a larger PUBLISH is refused
+    // before it is sent.
+    static final int REGULAR_SEND_BYTE_LIMIT = 16 * 1024 * 1024;
 
     // PUBLISH must not consume the capacity needed to finish protocol exchanges. MQTT 3.1.1
     // PUBACK/PUBREC/PUBREL/PUBCOMP each use four bytes; the core defers them when this budget is

@@ -12,9 +12,9 @@ import java.util.concurrent.CompletableFuture;
 /// Operations report failure through their returned futures. Admission can fail immediately
 /// with [MqttCapacityException], or with [IllegalStateException] after the client is closed.
 /// One [#connect()] call and one [#disconnect()] call are admitted even while publications fill
-/// the operation capacity; further concurrent calls share that capacity. A publication that
-/// exceeds the send capacity on its own always fails with
-/// [MqttCapacityException], whatever maximum incoming packet size is configured.
+/// the operation capacity; further concurrent calls share that capacity. A publication too
+/// large for the client to send fails with [MqttPublicationRefusedException] without being sent,
+/// whatever maximum incoming packet size is configured.
 /// Cancelling or completing a returned future does not cancel the underlying operation.
 /// Subscription registration returns its handle immediately, including while disconnected;
 /// [Subscription#established()] observes acceptance. See [MqttSubscriber] for synchronous

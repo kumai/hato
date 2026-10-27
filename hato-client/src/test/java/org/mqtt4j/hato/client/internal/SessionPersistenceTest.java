@@ -366,21 +366,24 @@ class SessionPersistenceTest {
 
     @Test
     void an_mqtt_5_session_counts_publications_at_their_mqtt_5_wire_size() {
-        // Arrange: a persistent MQTT 5.0 session. Its PUBLISH carries a property length that
-        // MQTT 3.1.1 lacks, so a message that just fills the budget in MQTT 3.1.1 exceeds it.
+        // Arrange: a persistent MQTT 5.0 session whose 32 MiB budget two publications fill but
+        // for 12 MiB. Its PUBLISH carries a property length that MQTT 3.1.1 lacks, so a message
+        // that just fills the rest in MQTT 3.1.1 exceeds it.
         SessionCore mqtt5 = core(MqttVersion.V5, false);
         mqtt5.connect(new ConnectionAttempt(1), 0);
         mqtt5.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
-        int budget = 32 * 1024 * 1024;
+        mqtt5.publish(2, messageWithWireBytes(10 * 1024 * 1024, MqttVersion.V5));
+        mqtt5.publish(3, messageWithWireBytes(10 * 1024 * 1024, MqttVersion.V5));
+        int rest = 12 * 1024 * 1024;
 
         // Act
-        mqtt5.publish(2, messageWithWireBytes(budget, MqttVersion.V3_1_1));
-        mqtt5.publish(3, messageWithWireBytes(budget, MqttVersion.V5));
+        mqtt5.publish(4, messageWithWireBytes(rest, MqttVersion.V3_1_1));
+        mqtt5.publish(5, messageWithWireBytes(rest, MqttVersion.V5));
 
         // Assert
-        assertFailure(2, MqttCapacityException.class);
-        assertThat(port.results).doesNotContainKey(3L);
-        assertThat(port.accepted).hasSize(1);
+        assertFailure(4, MqttCapacityException.class);
+        assertThat(port.results).doesNotContainKeys(2L, 3L, 5L);
+        assertThat(port.accepted).hasSize(3);
     }
 
     @Test
@@ -390,16 +393,17 @@ class SessionPersistenceTest {
         mqtt5.connect(new ConnectionAttempt(1), 0);
         mqtt5.received(1, new Packet.ConnAck(false, ReasonCode.SUCCESS, EMPTY), 0, 0);
         MqttMessage message = message("properties")
-                .withUserProperties(userPropertiesOf(20 * 1024 * 1024));
+                .withUserProperties(userPropertiesOf(12 * 1024 * 1024));
 
-        // Act: their User Properties take 40 MiB in all.
+        // Act: their User Properties take 36 MiB in all.
         mqtt5.publish(2, message);
         mqtt5.publish(3, message);
+        mqtt5.publish(4, message);
 
         // Assert
-        assertThat(port.results).doesNotContainKey(2L);
-        assertFailure(3, MqttCapacityException.class);
-        assertThat(port.accepted).hasSize(1);
+        assertThat(port.results).doesNotContainKeys(2L, 3L);
+        assertFailure(4, MqttCapacityException.class);
+        assertThat(port.accepted).hasSize(2);
     }
 
     @Test

@@ -54,6 +54,10 @@ final class Publications {
     // A Topic Alias property: its identifier and its two-byte value.
     private static final int TOPIC_ALIAS_BYTES = 3;
 
+    // The longest PUBLISH apart from its payload and properties: the fixed header, a topic of
+    // 65,535 bytes, a packet identifier, and the length of the properties.
+    private static final int LONGEST_PUBLISH_HEADER = 1 + 4 + 2 + 65_535 + 2 + 4;
+
     // A broker can repeat PUBREC at will, so PUBREC responses bound their completion events in
     // the same way. Replayed PUBRELs are already bounded by the session's exchanges.
     private static final int RELEASE_WRITE_LIMIT = 16;
@@ -584,7 +588,9 @@ final class Publications {
     /// The reason code with which the broker would refuse `message`, by the limits that it
     /// announced for the connection, or empty when it would accept the message. MQTT 5.0 forbids
     /// sending such a publication ([MQTT-3.2.2-11], [MQTT-3.2.2-14], [MQTT-3.2.2-15]), and a
-    /// broker that receives one ends the connection with the same reason code.
+    /// broker that receives one ends the connection with the same reason code. A PUBLISH larger
+    /// than the client can send is refused in the same way, before it could wait for room that
+    /// would never be enough.
     private Optional<ReasonCode> refusal(MqttMessage message) {
         ConnAck limits = core.limits();
         if (message.qos().level() > limits.maximumQos().level()) {
@@ -593,16 +599,26 @@ final class Publications {
         if (message.retain() && !limits.retainAvailable()) {
             return Optional.of(ReasonCode.RETAIN_NOT_SUPPORTED);
         }
-        if (exceeds(message, limits.maximumPacketSize())) {
+        if (exceeds(message, packetLimit())) {
             return Optional.of(ReasonCode.PACKET_TOO_LARGE);
         }
         return Optional.empty();
     }
 
-    /// Whether the PUBLISH that carries `message` is larger than `limit`. Without a limit below
-    /// what MQTT can carry, the send queue bounds the size, as it does for MQTT 3.1.1.
+    /// The largest PUBLISH that this connection sends: the broker's Maximum Packet Size, or the
+    /// most that the send queue admits on its own, whichever is smaller.
+    private int packetLimit() {
+        return Math.min(core.limits().maximumPacketSize(), ClientIo.REGULAR_SEND_BYTE_LIMIT);
+    }
+
+    /// Whether the PUBLISH that carries `message` is larger than `limit`. The size of the payload
+    /// and the properties settles it for most messages without encoding the header.
     private boolean exceeds(MqttMessage message, int limit) {
-        if (limit >= ConnectionEstablishment.LARGEST_PACKET_SIZE) {
+        long body = MessageProperties.bodySize(message);
+        if (body > limit) {
+            return true;
+        }
+        if (body + LONGEST_PUBLISH_HEADER <= limit) {
             return false;
         }
         try {
@@ -615,20 +631,17 @@ final class Publications {
 
     /// The Topic Alias that a PUBLISH of `message` uses on this connection. It uses none when
     /// the broker takes no aliases, or when the alias property could make it larger than the
-    /// broker accepts: whether a publication fits is decided without its alias, because aliases
-    /// differ from one connection to the next.
+    /// connection sends: whether a publication fits is decided without its alias, because
+    /// aliases differ from one connection to the next.
     private TopicAlias alias(MqttMessage message) {
         int maximum = core.topicAliasMaximum();
         if (maximum == 0) {
             return TopicAlias.NONE;
         }
         TopicAlias alias = window.aliases.choose(message.topic(), maximum);
-        int limit = core.limits().maximumPacketSize();
         // Setting an alias adds it to the topic, which makes the longest form; the form that
         // carries the alias alone is never longer.
-        if (alias != TopicAlias.NONE
-                && limit < ConnectionEstablishment.LARGEST_PACKET_SIZE
-                && exceeds(message, limit - TOPIC_ALIAS_BYTES)) {
+        if (alias != TopicAlias.NONE && exceeds(message, packetLimit() - TOPIC_ALIAS_BYTES)) {
             return TopicAlias.NONE;
         }
         return alias;
