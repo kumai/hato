@@ -121,12 +121,6 @@ behaviors that shape everything else. The client guide also shows how to:
 | [Test kit](hato-testkit/README.md) | Test doubles, connection failures, controlled time, and broker behavior in tests |
 | [Examples](examples/README.md) | Complete programs compiled and checked by the build |
 
-## Compatibility
-
-Hato follows semantic versioning; before 1.0, a minor release can change the API.
-The client and the test kit are covered. The embedded broker and the broker controls
-in the test kit are experimental and can change in any release.
-
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing, and contributing.
