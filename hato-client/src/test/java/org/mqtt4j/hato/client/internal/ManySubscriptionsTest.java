@@ -44,19 +44,7 @@ class ManySubscriptionsTest {
         // through a handler and a hand-off acceptor, the others through receive().
         var handled = new LinkedBlockingQueue<Topic>();
         var handedOff = new LinkedBlockingQueue<Topic>();
-        try (MqttClient sut = MqttClient.builder()
-                .server(URI.create("mqtt://localhost"))
-                .version(MqttVersion.V3_1_1)
-                .clientId("many-subscriptions-test")
-                .keepAlive(Duration.ZERO)
-                .maxSubscriptions(SUBSCRIPTIONS)
-                .reconnectPolicy(ReconnectPolicy.disabled())
-                .transportFactory(_ -> {
-                    var transport = new ScriptTransport();
-                    transports.add(transport);
-                    return transport;
-                })
-                .build()) {
+        try (MqttClient sut = client()) {
             ScriptTransport first = connect(sut);
             var pulled = new ArrayList<PullSubscription>();
             for (int device = 0; device < SUBSCRIPTIONS - 2; device++) {
@@ -95,6 +83,44 @@ class ManySubscriptionsTest {
             assertThat(sut.stats().get(5, SECONDS).receiving().unmatched())
                     .isEqualTo(before + 1);
         }
+    }
+
+    @Test
+    @Timeout(60)
+    void every_subscription_can_wait_for_its_establishment_at_once() throws Exception {
+        // Arrange: far more subscriptions than the client observes for itself, all waiting for
+        // their SUBACK.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            var establishments = new ArrayList<CompletableFuture<Qos>>();
+            for (int device = 0; device < SUBSCRIPTIONS; device++) {
+                establishments.add(sut.subscribe(request(device)).established());
+            }
+
+            // Act
+            acknowledgeSubscribes(transport, SUBSCRIPTIONS);
+
+            // Assert: none of them was refused for the client's observation capacity.
+            for (CompletableFuture<Qos> establishment : establishments) {
+                assertThat(establishment).succeedsWithin(Duration.ofSeconds(5));
+            }
+        }
+    }
+
+    private MqttClient client() {
+        return MqttClient.builder()
+                .server(URI.create("mqtt://localhost"))
+                .version(MqttVersion.V3_1_1)
+                .clientId("many-subscriptions-test")
+                .keepAlive(Duration.ZERO)
+                .maxSubscriptions(SUBSCRIPTIONS)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .transportFactory(_ -> {
+                    var transport = new ScriptTransport();
+                    transports.add(transport);
+                    return transport;
+                })
+                .build();
     }
 
     /// Sends one delivery to each of three devices: a pulled one, the handled one, and the

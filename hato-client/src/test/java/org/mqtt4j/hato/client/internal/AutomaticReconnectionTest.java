@@ -653,7 +653,7 @@ class AutomaticReconnectionTest {
         try (MqttClient client = client()) {
             var sut = (ClientActor) client;
             var observations = new ArrayList<CompletableFuture<ConnAck>>();
-            for (int i = 0; i < 1024; i++) {
+            for (int i = 0; i < sut.waiterLimit(); i++) {
                 observations.add(sut.whenConnected());
             }
 
@@ -663,7 +663,7 @@ class AutomaticReconnectionTest {
             // Assert: a full limit refuses only the observation.
             assertThat(refused).isDone();
             assertThat(failureOf(refused)).isInstanceOf(MqttCapacityException.class);
-            assertThat(sut.usage().waiters()).isEqualTo(1024);
+            assertThat(sut.usage().waiters()).isEqualTo(sut.waiterLimit());
             connect(sut);
             for (CompletableFuture<ConnAck> observation : observations) {
                 assertThat(observation.get(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));

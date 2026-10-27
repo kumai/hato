@@ -143,7 +143,7 @@ class SubscriptionObservationTest {
             var sut = (ClientActor) client;
             Subscription subscription = sut.subscribe(REQUEST);
             var observers = new ArrayList<CompletableFuture<Qos>>();
-            for (int i = 0; i < 1024; i++) {
+            for (int i = 0; i < sut.waiterLimit(); i++) {
                 observers.add(subscription.established());
             }
             CompletableFuture<Qos> overwritten = observers.getFirst();

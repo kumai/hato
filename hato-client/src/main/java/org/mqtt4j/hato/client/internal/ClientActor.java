@@ -75,7 +75,12 @@ public final class ClientActor implements MqttClient {
 
     private static final Log log = Log.of(ClientActor.class);
 
-    private static final int WAITER_LIMIT = 1024;
+    // Pending observations beyond those that the subscriptions have room for.
+    private static final int CLIENT_WAITER_LIMIT = 1024;
+
+    // Each subscription has room to observe its establishment, its removal, and its termination
+    // at once, so waiting for every subscription never meets the limit.
+    private static final int WAITERS_PER_SUBSCRIPTION = 3;
 
     // Connection notifications waiting for the listener, excluding the one running. Attempt
     // numbers reveal what a listener that fell this far behind has lost.
@@ -227,7 +232,9 @@ public final class ClientActor implements MqttClient {
 
     private final Semaphore disconnectSlot = new Semaphore(1);
 
-    private final Semaphore waiterSlots = new Semaphore(WAITER_LIMIT);
+    private final int waiterLimit;
+
+    private final Semaphore waiterSlots;
 
     // Marks the threads that run this client's inline handlers, inside which the futures that the
     // client returns and the receive of its pull subscriptions refuse to wait.
@@ -341,11 +348,13 @@ public final class ClientActor implements MqttClient {
         reconnects = backoff.enabled();
         operationSlots = new Semaphore(limits.operations());
         commandLimit = commandLimit(limits);
+        waiterLimit = CLIENT_WAITER_LIMIT + WAITERS_PER_SUBSCRIPTION * limits.subscriptions();
+        waiterSlots = new Semaphore(waiterLimit);
         termination = new ClientTermination(
                 threadName("terminated"),
                 inlineHandlers,
                 waiterSlots,
-                WAITER_LIMIT,
+                waiterLimit,
                 List.of(operationSlots, connectSlot, disconnectSlot),
                 commandLimit,
                 () -> refused(CapacityLimit.OBSERVATIONS)
@@ -1412,6 +1421,11 @@ public final class ClientActor implements MqttClient {
         refusals.incrementAndGet(limit.ordinal());
     }
 
+    /// The most observations that can be pending at once, which [Usage#waiters()] counts against.
+    int waiterLimit() {
+        return waiterLimit;
+    }
+
     /// What the client holds against its internal bounds. Tests compare this with the bounds.
     /// The parts are read one after another, not atomically.
     Usage usage() {
@@ -1428,7 +1442,7 @@ public final class ClientActor implements MqttClient {
                 lanes.retainedLanes(),
                 lanes.retainedDeliveries(),
                 lanes.retainedBytes(),
-                WAITER_LIMIT - waiterSlots.availablePermits()
+                waiterLimit - waiterSlots.availablePermits()
         );
     }
 

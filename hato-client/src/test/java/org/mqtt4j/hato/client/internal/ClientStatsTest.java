@@ -74,7 +74,7 @@ class ClientStatsTest {
             pending.add(holdActorInStats(sut, release));
 
             // Act
-            for (int i = 1; i < 1024; i++) {
+            for (int i = 1; i < ((ClientActor) sut).waiterLimit(); i++) {
                 pending.add(sut.stats());
             }
             CompletableFuture<ClientStats> refused = sut.stats();

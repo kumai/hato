@@ -35,15 +35,13 @@ public interface Subscription extends AutoCloseable {
     /// closes the client fails it with [MqttConnectionLostException] carrying that failure. The
     /// first permanent ending decides every later result.
     ///
-    /// Pending observations share a limit per client, independent of operation capacity, which
-    /// can be lower than the number of subscriptions that the client holds.
-    /// This includes [#unsubscribe()] and [MqttClient#whenConnected()] observations. A full limit
-    /// returns a future already failed with [MqttCapacityException], which is done, without
-    /// changing the subscription. A slot remains held through completion and any synchronous
-    /// continuations run by the client. An already completed result needs no slot. Application
-    /// completion or cancellation does not release a pending slot before the client resolves the
-    /// observation, so each call made while the subscription is not established holds one: a
-    /// periodic check keeps one pending future and calls again only after it completes.
+    /// Pending observations share a limit per client, independent of operation capacity, with
+    /// [#unsubscribe()], [#terminated()], and [MqttClient#whenConnected()] observations. Waiting
+    /// for each subscription's establishment at once stays within it. A full limit returns a
+    /// future already failed with [MqttCapacityException], which is done, without changing the
+    /// subscription. Each call made while the subscription is not established adds a pending
+    /// observation until the client resolves it, even if the application completes or cancels the
+    /// future: a periodic check keeps one pending future and calls again only after it completes.
     ///
     /// @return
     ///     a future that completes with the granted QoS on establishment

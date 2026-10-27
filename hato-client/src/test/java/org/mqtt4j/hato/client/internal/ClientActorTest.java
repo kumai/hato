@@ -4033,7 +4033,7 @@ class ClientActorTest {
             establish(transport, other);
             await().until(() -> ((ClientActor) sut).usage().waiters() == 0);
             var observers = new ArrayList<CompletableFuture<Void>>();
-            for (int i = 0; i < 1024; i++) {
+            for (int i = 0; i < ((ClientActor) sut).waiterLimit(); i++) {
                 observers.add(other.unsubscribe());
             }
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Unsubscribe.class);
@@ -5789,7 +5789,7 @@ class ClientActorTest {
             );
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
             var observers = new ArrayList<CompletableFuture<Qos>>();
-            for (int i = 0; i < 1024; i++) {
+            for (int i = 0; i < ((ClientActor) sut).waiterLimit(); i++) {
                 observers.add(pending.established());
             }
             assertThat(pending.established()).isCompletedExceptionally();
@@ -5799,7 +5799,8 @@ class ClientActorTest {
 
             // Assert: an already established result needs no slot and survives local closure.
             assertThat(observed).isCompletedWithValue(Qos.AT_MOST_ONCE);
-            assertThat(((ClientActor) sut).usage().waiters()).isEqualTo(1024);
+            assertThat(((ClientActor) sut).usage().waiters())
+                    .isEqualTo(((ClientActor) sut).waiterLimit());
             established.close();
             assertThat(established.grantedQos()).contains(Qos.AT_MOST_ONCE);
             assertThat(observers).allMatch(observer -> !observer.isDone());
@@ -6075,7 +6076,7 @@ class ClientActorTest {
             ScriptTransport transport = connect(sut);
             Subscription subscription = sut.subscribe(request(), _ -> { });
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
-            for (int i = 0; i < 1024; i++) {
+            for (int i = 0; i < ((ClientActor) sut).waiterLimit(); i++) {
                 subscription.established();
             }
 
@@ -6282,7 +6283,7 @@ class ClientActorTest {
             ScriptTransport transport = connect(sut);
             Subscription subscription = sut.subscribe(request(), _ -> { });
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
-            for (int i = 0; i < 1024; i++) {
+            for (int i = 0; i < ((ClientActor) sut).waiterLimit(); i++) {
                 subscription.established();
             }
 
@@ -8490,7 +8491,8 @@ class ClientActorTest {
 
             // Act: additional calls take the remaining observation slots until one is refused.
             CompletableFuture<Void> refused = subscription.unsubscribe();
-            for (int i = 0; i < 1024 && !refused.isCompletedExceptionally(); i++) {
+            int limit = ((ClientActor) sut).waiterLimit();
+            for (int i = 0; i < limit && !refused.isCompletedExceptionally(); i++) {
                 refused = subscription.unsubscribe();
             }
             release.countDown();
@@ -8524,7 +8526,7 @@ class ClientActorTest {
             var unsubscribe = (Packet.Unsubscribe) requireNonNull(transport.sent.poll(5, SECONDS));
             var observers = new ArrayList<CompletableFuture<Void>>();
             observers.add(first);
-            for (int i = 1; i < 1024; i++) {
+            for (int i = 1; i < ((ClientActor) sut).waiterLimit(); i++) {
                 observers.add(subscription.unsubscribe());
             }
             assertThat(observers).allSatisfy(observer -> assertThat(observer).isNotDone());
@@ -8543,10 +8545,11 @@ class ClientActorTest {
             transport.receive(new Packet.UnsubAck(unsubscribe.packetId(), List.of(), EMPTY));
 
             // Assert: every callback starts independently and retains its own observation slot.
-            await().untilAtomic(entered, is(1024));
+            await().untilAtomic(entered, is(((ClientActor) sut).waiterLimit()));
             sut.publish(message(new byte[0])).get(5, SECONDS);
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
-            assertThat(((ClientActor) sut).usage().waiters()).isEqualTo(1024);
+            assertThat(((ClientActor) sut).usage().waiters())
+                    .isEqualTo(((ClientActor) sut).waiterLimit());
             assertThat(ends).isEmpty();
         } finally {
             release.countDown();
