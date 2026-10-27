@@ -65,12 +65,13 @@ assertThat(delivery.failure()).isEmpty();
   `heldPublications()`, so a test can see what your code does while it waits.
 - `FakeMqttSubscriber` grants each subscription the QoS it asks for, and
   `refuseSubscriptions(filter)` and `grantAtMost(filter, qos)` work as they do on
-  the broker controls below. `deliver(message)` runs the handler on the test's
-  thread and returns the delivery, which shows whether your code called `ack()`
-  and what the handler threw.
+  the broker controls below. `deliver(message)` runs the handler, or offers the
+  message to the acceptor of a hand-off subscription, on the test's thread and
+  returns the delivery. The delivery shows whether your code called `ack()`,
+  whether the acceptor refused it, and what was thrown.
 - The fakes stand in for the roles, not for a client: they neither connect nor run
-  handlers on other threads, and they do not support pull subscriptions, delivery
-  options, or hand-off subscriptions. To see how your code works with a real client,
+  handlers on other threads, whatever delivery options your code chooses, and they
+  do not support pull subscriptions. To see how your code works with a real client,
   test it with a broker.
 
 ## Testing with a broker

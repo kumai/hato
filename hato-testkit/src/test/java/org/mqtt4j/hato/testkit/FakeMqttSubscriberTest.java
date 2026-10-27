@@ -1,7 +1,9 @@
 package org.mqtt4j.hato.testkit;
 
 import java.util.ArrayList;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -216,16 +218,88 @@ class FakeMqttSubscriberTest {
     }
 
     @Test
-    void pull_placed_and_hand_off_subscriptions_are_not_supported() {
+    void a_subscription_with_delivery_options_runs_its_handler_on_the_delivering_thread() {
+        // Arrange
+        var sut = new FakeMqttSubscriber();
+        var handlerThreads = new ArrayList<Thread>();
+        FakeSubscription subscription = sut.subscribe(
+                AT_LEAST_ONCE,
+                DeliveryOptions.parallel(4),
+                _ -> handlerThreads.add(Thread.currentThread())
+        );
+
+        // Act
+        FakeMqttDelivery delivery = subscription.deliver(READING);
+
+        // Assert
+        assertThat(sut.subscriptions()).containsExactly(subscription);
+        assertThat(handlerThreads).containsExactly(Thread.currentThread());
+        assertThat(delivery.failure()).isEmpty();
+    }
+
+    @Test
+    void a_hand_off_subscription_offers_each_delivery_to_its_acceptor_on_the_delivering_thread() {
+        // Arrange
+        var sut = new FakeMqttSubscriber();
+        var mailbox = new LinkedBlockingQueue<MqttDelivery>();
+        var acceptorThreads = new ArrayList<Thread>();
+        FakeSubscription subscription = sut.handOff(
+                AT_LEAST_ONCE.withAckMode(AckMode.MANUAL),
+                delivery -> {
+                    acceptorThreads.add(Thread.currentThread());
+                    return mailbox.offer(delivery);
+                }
+        );
+
+        // Act: the application acknowledges the delivery once it takes it from its mailbox.
+        FakeMqttDelivery delivery = subscription.deliver(READING);
+        boolean ackedOnAcceptance = delivery.acked();
+        mailbox.remove().ack();
+
+        // Assert
+        assertThat(sut.subscriptions()).containsExactly(subscription);
+        assertThat(subscription.established()).isCompletedWithValue(Qos.AT_LEAST_ONCE);
+        assertThat(acceptorThreads).containsExactly(Thread.currentThread());
+        assertThat(delivery.refused()).isFalse();
+        assertThat(ackedOnAcceptance).isFalse();
+        assertThat(delivery.acked()).isTrue();
+        assertThat(delivery.failure()).isEmpty();
+    }
+
+    @Test
+    void records_a_delivery_that_the_acceptor_refuses() {
+        // Arrange: a mailbox with room for one delivery.
+        var sut = new FakeMqttSubscriber();
+        var mailbox = new ArrayBlockingQueue<MqttDelivery>(1);
+        FakeSubscription subscription = sut.handOff(AT_LEAST_ONCE, mailbox::offer);
+        FakeMqttDelivery accepted = subscription.deliver(READING);
+
+        // Act
+        FakeMqttDelivery refused = subscription.deliver(READING);
+
+        // Assert
+        assertThat(accepted.refused()).isFalse();
+        assertThat(refused.refused()).isTrue();
+        assertThat(mailbox).containsExactly(accepted);
+        assertThat(subscription.ended()).isFalse();
+    }
+
+    @Test
+    void a_hand_off_subscription_cannot_acknowledge_after_a_handler() {
         // Arrange
         var sut = new FakeMqttSubscriber();
 
         // Act & Assert
-        assertThatThrownBy(() -> sut.subscribe(AT_LEAST_ONCE))
-                .isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(() -> sut.subscribe(AT_LEAST_ONCE, DeliveryOptions.serial(), _ -> { }))
-                .isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(() -> sut.handOff(AT_LEAST_ONCE, _ -> true))
+        assertThatThrownBy(() -> sut.handOff(
+                AT_LEAST_ONCE.withAckMode(AckMode.AFTER_HANDLER),
+                _ -> true
+        )).isInstanceOf(IllegalArgumentException.class);
+        assertThat(sut.subscriptions()).isEmpty();
+    }
+
+    @Test
+    void pull_subscriptions_are_not_supported() {
+        assertThatThrownBy(() -> new FakeMqttSubscriber().subscribe(AT_LEAST_ONCE))
                 .isInstanceOf(UnsupportedOperationException.class);
     }
 

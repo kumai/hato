@@ -7,9 +7,12 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttSubscriber;
@@ -23,20 +26,22 @@ import org.mqtt4j.hato.TopicFilter;
 import static java.util.Objects.requireNonNull;
 
 /// A stand-in for the subscribing role of a client, for tests of code that takes an
-/// [MqttSubscriber]. It records each subscription with its handler and grants it at once at the
-/// requested QoS. Rules like those of [BrokerControls] refuse later subscriptions to a filter or
-/// grant them a lower QoS. A test delivers a message to a subscription with
-/// [FakeSubscription#deliver(MqttMessage)], which runs the handler on the test's thread, and then
-/// checks what the handler did with the delivery: whether it called [MqttDelivery#ack()], and
-/// what it threw.
+/// [MqttSubscriber]. It records each subscription with its handler, or with its acceptor for a
+/// hand-off subscription, and grants it at once at the requested QoS. Rules like those of
+/// [BrokerControls] refuse later subscriptions to a filter or grant them a lower QoS. A test
+/// delivers a message to a subscription with [FakeSubscription#deliver(MqttMessage)], which runs
+/// the handler or the acceptor on the test's thread, and then checks what the code under test did
+/// with the delivery: whether it called [MqttDelivery#ack()], whether the acceptor refused it, and
+/// what was thrown.
 ///
 /// The fake records these facts without applying a client's acknowledgement rules: what the
-/// [org.mqtt4j.hato.AckMode] and the [org.mqtt4j.hato.FailurePolicy] of the recorded [Subscribe]
-/// make of them is for the test to check. It supports only subscriptions with a handler; pull
-/// subscriptions, [org.mqtt4j.hato.DeliveryOptions], and hand-off subscriptions throw
-/// [UnsupportedOperationException], as the role's default methods do. It is not a client: apart
-/// from refusing a second subscription to the filter of an active one, it checks nothing that a
-/// client checks. All methods may be called from any thread.
+/// [AckMode] and the [org.mqtt4j.hato.FailurePolicy] of the recorded [Subscribe] make of them is
+/// for the test to check. A subscription with [DeliveryOptions] runs its handler on the test's
+/// thread as well, whatever the options say. Pull subscriptions throw
+/// [UnsupportedOperationException], as the role's default method does. It is not a client: apart
+/// from rejecting null arguments and [AckMode#AFTER_HANDLER] for a hand-off subscription, and
+/// refusing a second subscription to the filter of an active one, it checks nothing that a client
+/// checks. All methods may be called from any thread.
 public final class FakeMqttSubscriber implements MqttSubscriber {
 
     private final List<FakeSubscription> subscriptions = new ArrayList<>();
@@ -62,12 +67,71 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// @throws NullPointerException
     ///     if `request` or `handler` is null
     @Override
-    public synchronized FakeSubscription subscribe(
-            Subscribe request,
-            Consumer<MqttDelivery> handler
-    ) {
+    public FakeSubscription subscribe(Subscribe request, Consumer<MqttDelivery> handler) {
         requireNonNull(request, "request must not be null");
         requireNonNull(handler, "handler must not be null");
+        return register(request, handler::accept);
+    }
+
+    /// Records the subscription as [#subscribe(Subscribe, Consumer)] does. Its handler runs on the
+    /// test's thread, whatever `options` say.
+    ///
+    /// @param request
+    ///     the subscription request
+    /// @param options
+    ///     where and how the handler would run on a client, which the fake ignores
+    /// @param handler
+    ///     the handler that receives the deliveries
+    /// @return
+    ///     the handle of the recorded subscription
+    /// @throws NullPointerException
+    ///     if an argument is null
+    @Override
+    public FakeSubscription subscribe(
+            Subscribe request,
+            DeliveryOptions options,
+            Consumer<MqttDelivery> handler
+    ) {
+        requireNonNull(options, "options must not be null");
+        return subscribe(request, handler);
+    }
+
+    /// Records the hand-off subscription as [#subscribe(Subscribe, Consumer)] records a
+    /// subscription with a handler. [FakeSubscription#deliver(MqttMessage)] offers each delivery to
+    /// `acceptor` on the test's thread, and the delivery shows whether the acceptor refused it.
+    ///
+    /// @param request
+    ///     the subscription request
+    /// @param acceptor
+    ///     the predicate that accepts each delivery by returning true
+    /// @return
+    ///     the handle of the recorded subscription
+    /// @throws NullPointerException
+    ///     if `request` or `acceptor` is null
+    /// @throws IllegalArgumentException
+    ///     if the request acknowledges with [AckMode#AFTER_HANDLER], as
+    ///     [MqttSubscriber#handOff(Subscribe, Predicate)] states
+    @Override
+    public FakeSubscription handOff(Subscribe request, Predicate<MqttDelivery> acceptor) {
+        requireNonNull(request, "request must not be null");
+        requireNonNull(acceptor, "acceptor must not be null");
+        if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
+            throw new IllegalArgumentException(
+                    "A hand-off subscription cannot see when its deliveries are processed"
+            );
+        }
+        return register(request, delivery -> {
+            if (!acceptor.test(delivery)) {
+                delivery.refuse();
+            }
+        });
+    }
+
+    // Records a subscription whose deliveries go to `receiver`, granted or ended at once.
+    private synchronized FakeSubscription register(
+            Subscribe request,
+            Consumer<FakeMqttDelivery> receiver
+    ) {
         TopicFilter filter = request.filter();
         // A client refuses a second subscription to a filter itself, before a broker could.
         boolean duplicate = subscriptions.stream()
@@ -76,20 +140,20 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
         if (duplicate) {
             subscription = FakeSubscription.refused(
                     request,
-                    handler,
+                    receiver,
                     new IllegalStateException("Already subscribed to " + filter.pattern())
             );
         } else {
             subscription = switch (rules.get(filter)) {
-                case null -> FakeSubscription.granted(request, handler, request.qos());
+                case null -> FakeSubscription.granted(request, receiver, request.qos());
                 case Refuse _ -> FakeSubscription.refused(
                         request,
-                        handler,
+                        receiver,
                         new MqttSubscriptionRefusedException(ReasonCode.UNSPECIFIED_ERROR)
                 );
                 case GrantAtMost(var maximum) -> FakeSubscription.granted(
                         request,
-                        handler,
+                        receiver,
                         request.qos().level() <= maximum.level() ? request.qos() : maximum
                 );
             };
@@ -157,29 +221,30 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     }
 
     /// A subscription that the fake recorded. Besides the [Subscription] methods that the code
-    /// under test calls, it lets the test see the request, deliver messages to the handler, and
-    /// see whether the subscription has ended.
+    /// under test calls, it lets the test see the request, deliver messages to the handler or the
+    /// acceptor, and see whether the subscription has ended.
     public static final class FakeSubscription implements Subscription {
 
         private final Subscribe request;
-        private final Consumer<MqttDelivery> handler;
+        // The handler, or the acceptor of a hand-off subscription with its answer recorded.
+        private final Consumer<FakeMqttDelivery> receiver;
         // Null when the fake refused the subscription, which then ended at once.
         private final @Nullable Qos granted;
         private final CompletableFuture<Void> terminated = new CompletableFuture<>();
         // What establishment fails with once the subscription has ended; the first ending
         // decides it. Null while the subscription is active.
         private @Nullable RuntimeException ending;
-        // Deliveries whose handler is running now.
+        // Deliveries whose handler or acceptor is running now.
         private int running;
 
         private FakeSubscription(
                 Subscribe request,
-                Consumer<MqttDelivery> handler,
+                Consumer<FakeMqttDelivery> receiver,
                 @Nullable Qos granted,
                 @Nullable RuntimeException ending
         ) {
             this.request = request;
-            this.handler = handler;
+            this.receiver = receiver;
             this.granted = granted;
             this.ending = ending;
             if (ending != null) {
@@ -189,18 +254,18 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
 
         private static FakeSubscription granted(
                 Subscribe request,
-                Consumer<MqttDelivery> handler,
+                Consumer<FakeMqttDelivery> receiver,
                 Qos granted
         ) {
-            return new FakeSubscription(request, handler, granted, null);
+            return new FakeSubscription(request, receiver, granted, null);
         }
 
         private static FakeSubscription refused(
                 Subscribe request,
-                Consumer<MqttDelivery> handler,
+                Consumer<FakeMqttDelivery> receiver,
                 RuntimeException refusal
         ) {
-            return new FakeSubscription(request, handler, null, refusal);
+            return new FakeSubscription(request, receiver, null, refusal);
         }
 
         /// {@return the request that the code under test subscribed with}
@@ -208,16 +273,17 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             return request;
         }
 
-        /// Delivers `message` to the handler on the calling thread, and returns the delivery once
-        /// the handler returns. The delivery has no DUP flag, connection attempt 1, and the
-        /// filter of this subscription. What the handler throws is recorded in the delivery
-        /// instead of being thrown here. Calls from several threads run the handler at the same
-        /// time, which a client never does.
+        /// Delivers `message` to the handler, or offers it to the acceptor of a hand-off
+        /// subscription, on the calling thread, and returns the delivery once that returns. The
+        /// delivery has no DUP flag, connection attempt 1, and the filter of this subscription.
+        /// What the handler or the acceptor throws is recorded in the delivery instead of being
+        /// thrown here. Calls from several threads run the handler at the same time, which a
+        /// client does only where the subscription's [DeliveryOptions] let deliveries run at once.
         ///
         /// @param message
         ///     the message to deliver
         /// @return
-        ///     the delivery that the handler received
+        ///     the delivery that the handler or the acceptor received
         /// @throws NullPointerException
         ///     if `message` is null
         /// @throws IllegalStateException
@@ -234,9 +300,9 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             }
             var delivery = new FakeMqttDelivery(message, filter());
             try {
-                handler.accept(delivery);
+                receiver.accept(delivery);
             } catch (Throwable failure) {
-                // A client catches whatever escapes the handler, too.
+                // A client catches whatever escapes the handler or the acceptor, too.
                 delivery.failed(failure);
             } finally {
                 boolean done;
@@ -289,8 +355,8 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             return CompletableFuture.completedFuture(null);
         }
 
-        /// {@return a future that completes once this subscription has ended and no handler of
-        /// it is running}
+        /// {@return a future that completes once this subscription has ended and neither its
+        /// handler nor its acceptor is running}
         @Override
         public CompletableFuture<Void> terminated() {
             return terminated.copy();
@@ -319,12 +385,13 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     }
 
     /// A delivery that a test made with [FakeSubscription#deliver(MqttMessage)]. Besides the
-    /// [MqttDelivery] methods that the handler calls, it shows what the handler did with it.
+    /// [MqttDelivery] methods that the code under test calls, it shows what that code did with it.
     public static final class FakeMqttDelivery implements MqttDelivery {
 
         private final MqttMessage message;
         private final TopicFilter filter;
         private volatile boolean acked;
+        private volatile boolean refused;
         private volatile @Nullable Throwable failure;
 
         private FakeMqttDelivery(MqttMessage message, TopicFilter filter) {
@@ -360,14 +427,26 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             acked = true;
         }
 
-        /// {@return whether [#ack()] has been called, by the handler or later by any thread}
+        /// {@return whether [#ack()] has been called, by the handler or the acceptor, or later by
+        /// any thread}
         public boolean acked() {
             return acked;
         }
 
-        /// {@return what the handler threw for this delivery, or empty if it returned normally}
+        /// {@return whether the acceptor of a hand-off subscription returned false for this
+        /// delivery, which is always false for a subscription with a handler}
+        public boolean refused() {
+            return refused;
+        }
+
+        /// {@return what the handler or the acceptor threw for this delivery, or empty if it
+        /// returned normally}
         public Optional<Throwable> failure() {
             return Optional.ofNullable(failure);
+        }
+
+        private void refuse() {
+            refused = true;
         }
 
         private void failed(Throwable thrown) {
