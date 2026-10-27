@@ -31,7 +31,9 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// Configures a client without opening a connection. Not thread safe.
 /// Set [#server(URI)] before calling [#build()]; the other settings have defaults.
-/// Invalid or unsupported configuration is rejected with [IllegalArgumentException].
+/// Each setter rejects a value that is invalid on its own with [IllegalArgumentException] at
+/// once. [#build()] rejects settings that do not work together, and TLS settings that it cannot
+/// use, in the same way.
 public final class MqttClientBuilder {
 
     private static final Duration DEFAULT_KEEP_ALIVE = Duration.ofSeconds(60);
@@ -49,6 +51,9 @@ public final class MqttClientBuilder {
 
     // A Will Delay Interval is a four-byte count of seconds, like the Session Expiry Interval.
     private static final Duration MAX_WILL_DELAY = Duration.ofSeconds(0xFFFF_FFFFL);
+
+    // CONNECT gives the Will payload a two-byte length.
+    private static final int MAX_WILL_PAYLOAD_BYTES = 65_535;
 
     // The CONNECT that carries the Will must fit the send capacity that the client reserves for
     // connection control (1 MiB), or no attempt could send it. Every other CONNECT field holds
@@ -218,21 +223,29 @@ public final class MqttClientBuilder {
     /// local state in this client object, for example from before the application restarted,
     /// is not resumed: the attempt that finds it discards it and starts a new session, so
     /// messages that the broker stored for it are not received; see [MqttClient#connect()].
-    /// [#build()] accepts zero, or durations from 1 through 4294967295 seconds inclusive.
-    /// Fractional seconds are accepted within that range, such as 1.5 seconds. The client does
-    /// not enforce the duration locally. MQTT 5.0 sends it as the Session Expiry Interval,
-    /// rounded up to whole seconds so that the broker keeps the session at least that long;
-    /// 4294967295 seconds means that the session does not expire. MQTT 3.1.1 does not send it:
-    /// zero selects Clean Session 1 and a positive value Clean Session 0, apart from the
-    /// connection that discards a broker session, and the broker determines how long the
-    /// session lasts.
+    /// Accepts zero, or durations from 1 through 4294967295 seconds inclusive, and rejects any
+    /// other duration at once. Fractional seconds are accepted within that range, such as 1.5
+    /// seconds. The client does not enforce the duration locally. MQTT 5.0 sends it as the
+    /// Session Expiry Interval, rounded up to whole seconds so that the broker keeps the session
+    /// at least that long; 4294967295 seconds means that the session does not expire. MQTT 3.1.1
+    /// does not send it: zero selects Clean Session 1 and a positive value Clean Session 0, apart
+    /// from the connection that discards a broker session, and the broker determines how long
+    /// the session lasts.
     ///
     /// @param value
     ///     how long the session outlasts a connection
     /// @return
     ///     this builder
     public MqttClientBuilder sessionExpiry(Duration value) {
-        sessionExpiry = requireNonNull(value, "sessionExpiry");
+        requireNonNull(value, "sessionExpiry");
+        if (!value.isZero()
+                && (value.compareTo(Duration.ofSeconds(1)) < 0
+                || value.compareTo(MAX_SESSION_EXPIRY) > 0)) {
+            throw new IllegalArgumentException(
+                    "Session expiry must be zero or 1..4294967295 seconds"
+            );
+        }
+        sessionExpiry = value;
         return this;
     }
 
@@ -272,10 +285,10 @@ public final class MqttClientBuilder {
     /// Configures the message the broker publishes if the connection ends without receiving
     /// MQTT DISCONNECT, including [MqttClient#close()] alone. No Will is configured by default.
     /// Any QoS and retention flag are accepted. With MQTT 5.0, the message's properties, such as
-    /// [MqttMessage#contentType()], go to the broker as the Will Properties. [#build()] rejects
-    /// payloads over 65535 bytes, properties that take more than 65535 bytes in all, and any
-    /// properties for MQTT 3.1.1, which cannot carry them; the immutable message already
-    /// validates its topic and owns a copy of its payload.
+    /// [MqttMessage#contentType()], go to the broker as the Will Properties. A payload over 65535
+    /// bytes is rejected at once. [#build()] rejects properties that take more than 65535 bytes
+    /// in all, with the Will delay, and any properties for MQTT 3.1.1, which cannot carry them;
+    /// the immutable message already validates its topic and owns a copy of its payload.
     /// Wait for [MqttClient#disconnect()] to complete successfully before [MqttClient#close()]
     /// so closing cannot discard the pending DISCONNECT. Completion confirms the write;
     /// the broker does not acknowledge receipt.
@@ -285,14 +298,18 @@ public final class MqttClientBuilder {
     /// @return
     ///     this builder
     public MqttClientBuilder will(MqttMessage value) {
-        will = requireNonNull(value, "will");
+        requireNonNull(value, "will");
+        if (value.payloadSize() > MAX_WILL_PAYLOAD_BYTES) {
+            throw new IllegalArgumentException("Will payload exceeds 65535 bytes");
+        }
+        will = value;
         return this;
     }
 
-    /// Delays the Will (the MQTT 5.0 Will Delay Interval); default zero. [#build()] accepts zero
-    /// through 4294967295 seconds, and a fraction of a second is rounded up when sent. MQTT 5.0
-    /// has the broker publish the Will once the delay has passed after the connection ended, or
-    /// when the session ends, whichever comes first. With a positive
+    /// Delays the Will (the MQTT 5.0 Will Delay Interval); default zero. Accepts zero through
+    /// 4294967295 seconds, rejects any other duration at once, and rounds a fraction of a second up
+    /// when sending it. MQTT 5.0 has the broker publish the Will once the delay has passed after
+    /// the connection ended, or when the session ends, whichever comes first. With a positive
     /// [#sessionExpiry(Duration)], a reconnection of this client within the delay resumes the
     /// session, and the broker does not publish the Will. Brokers differ when the session ends
     /// sooner. With the default zero session expiry, EMQX and HiveMQ CE, for example, publish
@@ -307,7 +324,11 @@ public final class MqttClientBuilder {
     /// @return
     ///     this builder
     public MqttClientBuilder willDelay(Duration value) {
-        willDelay = requireNonNull(value, "willDelay");
+        requireNonNull(value, "willDelay");
+        if (value.isNegative() || value.compareTo(MAX_WILL_DELAY) > 0) {
+            throw new IllegalArgumentException("Will delay must be 0..4294967295 seconds");
+        }
+        willDelay = value;
         return this;
     }
 
@@ -582,10 +603,10 @@ public final class MqttClientBuilder {
     /// @throws IllegalStateException
     ///     if the server has not been specified
     /// @throws IllegalArgumentException
-    ///     if the session expiry is out of range, TLS settings are invalid or incompatible, a
-    ///     persistent session has no explicit client id, the Will payload exceeds 65535 bytes,
-    ///     the Will's properties exceed 65535 bytes, the Will delay is out of range or positive
-    ///     without a Will, or MQTT 3.1.1 is chosen with Will properties or a positive Will delay
+    ///     if TLS settings are invalid or incompatible, a persistent session has no explicit
+    ///     client id, the Will's properties exceed 65535 bytes with the Will delay, the Will delay
+    ///     is positive without a Will, or MQTT 3.1.1 is chosen with Will properties or a positive
+    ///     Will delay
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null) {
@@ -597,16 +618,6 @@ public final class MqttClientBuilder {
             throw new IllegalArgumentException(
                     "TLS settings require mqtts or wss and the default transport factory"
             );
-        }
-        if (!sessionExpiry.isZero()
-                && (sessionExpiry.compareTo(Duration.ofSeconds(1)) < 0
-                || sessionExpiry.compareTo(MAX_SESSION_EXPIRY) > 0)) {
-            throw new IllegalArgumentException(
-                    "Session expiry must be zero or 1..4294967295 seconds"
-            );
-        }
-        if (willDelay.isNegative() || willDelay.compareTo(MAX_WILL_DELAY) > 0) {
-            throw new IllegalArgumentException("Will delay must be 0..4294967295 seconds");
         }
         if (!willDelay.isZero() && will == null) {
             throw new IllegalArgumentException("A Will delay needs a Will");

@@ -312,16 +312,16 @@ class MqttClientBuilderTest {
     }
 
     @Test
-    void oversized_will_payloads_are_rejected_at_build() {
+    void oversized_will_payloads_are_rejected_at_once() {
         var will = MqttMessage.of(
                 new Topic("status"),
                 new byte[65_536],
                 Qos.AT_MOST_ONCE,
                 false
         );
-        MqttClientBuilder sut = configuredBuilder().will(will);
+        MqttClientBuilder sut = configuredBuilder();
 
-        assertThatThrownBy(sut::build)
+        assertThatThrownBy(() -> sut.will(will))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Will payload");
     }
@@ -384,12 +384,12 @@ class MqttClientBuilderTest {
 
     @ParameterizedTest
     @MethodSource("willDelaysOutOfRange")
-    void will_delays_out_of_range_are_rejected_at_build(Duration delay) {
+    void will_delays_out_of_range_are_rejected_at_once(Duration delay) {
         // Arrange
-        MqttClientBuilder sut = mqtt5Builder().will(willMessage()).willDelay(delay);
+        MqttClientBuilder sut = mqtt5Builder().will(willMessage());
 
         // Act & Assert
-        assertThatThrownBy(sut::build)
+        assertThatThrownBy(() -> sut.willDelay(delay))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Will delay must be");
     }
@@ -489,7 +489,7 @@ class MqttClientBuilderTest {
         assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
     }
 
-    @ParameterizedTest(name = "rejects expiry {0} at build")
+    @ParameterizedTest(name = "rejects expiry {0} at once")
     @ValueSource(strings = {
             "PT-0.000000001S",
             "PT0.000000001S",
@@ -498,12 +498,11 @@ class MqttClientBuilderTest {
             "PT4294967296S",
             "PT9223372036854775807S"
     })
-    void invalid_session_expiry_is_rejected_at_build(String expiry) {
-        MqttClientBuilder sut = configuredBuilder()
-                .clientId("session-client")
-                .sessionExpiry(Duration.parse(expiry));
+    void invalid_session_expiry_is_rejected_at_once(String expiry) {
+        MqttClientBuilder sut = configuredBuilder().clientId("session-client");
 
-        assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> sut.sessionExpiry(Duration.parse(expiry)))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
