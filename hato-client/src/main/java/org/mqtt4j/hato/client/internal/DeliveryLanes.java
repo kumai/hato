@@ -8,7 +8,6 @@ import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -534,7 +533,7 @@ final class DeliveryLanes {
     private Map<Long, Boolean> receiveStateLocked() {
         var result = new HashMap<Long, Boolean>();
         for (RetainedDelivery delivery : acknowledging.values()) {
-            if (delivery.recipients.values().stream().anyMatch(recipient -> recipient.handed)) {
+            if (delivery.handed()) {
                 result.put(delivery.token.acknowledgement(), delivery.pending == 0);
             }
         }
@@ -596,20 +595,30 @@ final class DeliveryLanes {
     /// receipt once, as it leaves acknowledging.
     private void retire(RetainedDelivery delivery) {
         delivery.retired = true;
-        heldConditions -= delivery.recipients.size();
-        for (DeliveryView view : trackedViews(delivery)) {
-            view.acknowledgement = null;
-            view.released = true;
-            releaseView(view);
+        heldConditions -= delivery.recipients.length;
+        // Releasing a view takes it out of views alone, so a pass from the end visits each view
+        // without a copy; accepted views hold no capacity, and only clearAccepted() drops them.
+        for (int at = delivery.views.size() - 1; at >= 0; at--) {
+            retireView(delivery.views.get(at));
         }
-        delivery.accepted.clear();
+        for (DeliveryView view : delivery.accepted()) {
+            retireView(view);
+        }
+        delivery.clearAccepted();
+    }
+
+    /// Caller holds lock.
+    private void retireView(DeliveryView view) {
+        view.acknowledgement = null;
+        view.released = true;
+        releaseView(view);
     }
 
     /// Caller holds lock. A copy of the views whose acknowledgement condition the receipt still
     /// tracks: those that hold capacity, and accepted hand-off views, which returned theirs.
     private static List<DeliveryView> trackedViews(RetainedDelivery delivery) {
         var tracked = new ArrayList<DeliveryView>(delivery.views);
-        tracked.addAll(delivery.accepted);
+        tracked.addAll(delivery.accepted());
         return tracked;
     }
 
@@ -648,9 +657,13 @@ final class DeliveryLanes {
                         states.add(new Recipient(id));
                     }
                 }
-                delivery = new RetainedDelivery(token, bytes);
+                delivery = new RetainedDelivery(
+                        token,
+                        bytes,
+                        states.toArray(RetainedDelivery.NO_RECIPIENTS)
+                );
             } else {
-                for (Recipient recipient : requireNonNull(delivery).recipients.values()) {
+                for (Recipient recipient : requireNonNull(delivery).recipients) {
                     if (!recipient.handed && !recipient.ready && !recipient.queued) {
                         Lane lane = lanes.get(recipient.id);
                         // A removed lane, or one awaiting removal, takes no retransmission.
@@ -698,7 +711,6 @@ final class DeliveryLanes {
                     Lane lane = recipients.get(index);
                     Recipient recipient = states.get(index);
                     if (first) {
-                        retained.recipients.put(recipient.id, recipient);
                         retained.pending++;
                     }
                     var view = new DeliveryView(
@@ -775,7 +787,11 @@ final class DeliveryLanes {
         }
         if (!recipients.isEmpty()) {
             if (fits(recipients.size(), arrival.bytes())) {
-                var delivery = new RetainedDelivery(arrival.token(), arrival.bytes());
+                var delivery = new RetainedDelivery(
+                        arrival.token(),
+                        arrival.bytes(),
+                        RetainedDelivery.NO_RECIPIENTS
+                );
                 delivery.message = arrival.message();
                 retainedBytes += arrival.bytes();
                 retainedDeliveries += recipients.size();
@@ -991,7 +1007,10 @@ final class DeliveryLanes {
         try {
             RetainedDelivery delivery = acknowledging.get(token);
             if (delivery != null) {
-                for (DeliveryView view : List.copyOf(delivery.views)) {
+                // Releasing a view takes it out of views alone, so a pass from the end visits
+                // each view without a copy.
+                for (int at = delivery.views.size() - 1; at >= 0; at--) {
+                    DeliveryView view = delivery.views.get(at);
                     view.released = true;
                     releaseView(view);
                 }
@@ -1096,7 +1115,7 @@ final class DeliveryLanes {
                         }
                     }
                 }
-                for (DeliveryView view : delivery.accepted) {
+                for (DeliveryView view : delivery.accepted()) {
                     if (awaitsAck(view)) {
                         unacknowledged.merge(view.recipient.id, 1L, Long::sum);
                     }
@@ -2073,7 +2092,7 @@ final class DeliveryLanes {
                 return;
             }
             ready = markReady(view);
-            view.delivery.accepted.remove(view);
+            view.delivery.unaccept(view);
             releaseView(view);
         } finally {
             lock.unlock();
@@ -2111,9 +2130,7 @@ final class DeliveryLanes {
             }
             view.acknowledgement = null;
         }
-        if (view.delivery.token.acknowledgement() != 0) {
-            view.delivery.accepted.remove(view);
-        }
+        view.delivery.unaccept(view);
         releaseView(view);
     }
 
@@ -2255,7 +2272,7 @@ final class DeliveryLanes {
     /// find the view in the receipt's accepted list until ack() meets the condition.
     private void keepAccepted(DeliveryView view) {
         returnCapacity(requireNonNull(view.lane), view);
-        view.delivery.accepted.add(view);
+        view.delivery.accept(view);
     }
 
     /// Caller holds lock. The view leaves its lane's slot and the client's delivery slot, and the
@@ -2677,18 +2694,22 @@ final class DeliveryLanes {
 
     private static final class RetainedDelivery {
 
+        static final Recipient[] NO_RECIPIENTS = new Recipient[0];
+
         final DeliveryToken token;
         final int bytes;
-        // One condition for each recipient, counted against the client's condition limit.
+        // One condition for each recipient, counted against the client's condition limit. The
+        // first copy fixes them, in registration order, and retransmissions reuse them.
         // Completed pull views leave only these IDs and conditions, without payload or lane.
-        // A QoS 0 delivery meets no condition and records no recipient, so it shares the empty
-        // map, and it shares the empty lists below as well.
-        final Map<Long, Recipient> recipients;
+        // A QoS 0 delivery meets no condition and records no recipient, and it shares the empty
+        // lists below as well.
+        final Recipient[] recipients;
         // A receipt's views that hold capacity, which its acknowledgement handling visits.
         final List<DeliveryView> views;
         // Accepted MANUAL hand-off views. They returned their capacity at acceptance, but their
-        // acknowledgement condition stays open until ack(), a stop, or retirement.
-        final List<DeliveryView> accepted;
+        // acknowledgement condition stays open until ack(), a stop, or retirement. Empty and
+        // shared until the first acceptance, which only a MANUAL hand-off makes.
+        private List<DeliveryView> accepted = List.of();
         // How many views hold capacity; the payload stays counted until the last of them leaves.
         int holders;
         @Nullable MqttMessage message;
@@ -2697,13 +2718,41 @@ final class DeliveryLanes {
         // Whether its token waits in readyTokens to be taken.
         boolean queuedReady;
 
-        RetainedDelivery(DeliveryToken token, int bytes) {
+        RetainedDelivery(DeliveryToken token, int bytes, Recipient[] recipients) {
             this.token = token;
             this.bytes = bytes;
-            boolean receipt = token.acknowledgement() != 0;
-            recipients = receipt ? new LinkedHashMap<>() : Map.of();
-            views = receipt ? new ArrayList<>(1) : List.of();
-            accepted = receipt ? new ArrayList<>(0) : List.of();
+            this.recipients = recipients;
+            views = token.acknowledgement() != 0 ? new ArrayList<>(1) : List.of();
+        }
+
+        List<DeliveryView> accepted() {
+            return accepted;
+        }
+
+        void accept(DeliveryView view) {
+            if (accepted.isEmpty()) {
+                accepted = new ArrayList<>(1);
+            }
+            accepted.add(view);
+        }
+
+        void unaccept(DeliveryView view) {
+            if (!accepted.isEmpty()) {
+                accepted.remove(view);
+            }
+        }
+
+        void clearAccepted() {
+            accepted = List.of();
+        }
+
+        boolean handed() {
+            for (Recipient recipient : recipients) {
+                if (recipient.handed) {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 
