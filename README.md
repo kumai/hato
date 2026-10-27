@@ -124,8 +124,8 @@ behaviors that shape everything else. The client guide also shows how to:
 ## Compatibility
 
 Hato follows semantic versioning; before 1.0, a minor release can change the API.
-The client and the test kit are covered. The embedded broker, `FaultyTransport`, and
-the broker controls in the test kit are experimental and can change in any release.
+The client and the test kit are covered. The embedded broker and the broker controls
+in the test kit are experimental and can change in any release.
 
 ## Contributing
 

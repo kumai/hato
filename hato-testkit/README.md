@@ -150,6 +150,5 @@ try (MqttBroker broker = MqttBroker.start()) {
   timers. Advancing time runs due timers; wait separately for the client's
   response before checking the result.
 
-`FaultyTransport` is experimental: its API may change as it gains kinds of
-faults. `BrokerControls`, `BrokerCapabilities`, `BrokerReason`, `ResponseKind`, and
+`BrokerControls`, `BrokerCapabilities`, `BrokerReason`, `ResponseKind`, and
 `HeldResponse` are experimental, like the broker that they control.

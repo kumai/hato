@@ -14,13 +14,16 @@ import org.mqtt4j.hato.testkit.internal.common.log.Log;
 
 import static java.util.Objects.requireNonNull;
 
-/// An experimental wrapper that adds ordered receive delays, send delays, and disconnection.
-/// Use a long delay in either direction to simulate stopped traffic. A delay must fit in
-/// nanoseconds, and the scheduler must accept the resulting deadline. At most one send is
-/// outstanding; admission retains its array until [onSent][Transport.Listener#onSent(long)] or
-/// the final [onClosed][Transport.Listener#onClosed(Throwable)].
-/// Incoming data is bounded to 256 chunks and 16 MiB; overload closes the transport with a
-/// capacity failure. The wrapper owns and closes the delegate, but borrows the scheduler.
+/// A wrapper that adds ordered receive delays, send delays, and disconnection to a transport.
+/// Neither direction is delayed until a delay is set. The scheduler measures the delays, so
+/// with [ManualTimerScheduler], delayed data moves on when the test advances it. Use a long
+/// delay in either direction to simulate stopped traffic. A delay must fit in nanoseconds, and
+/// the scheduler must accept the resulting deadline. At most one send is outstanding; admission
+/// retains its array until [onSent][Transport.Listener#onSent(long)] or the final
+/// [onClosed][Transport.Listener#onClosed(Throwable)]. The input that a receive delay holds back
+/// is bounded: beyond the bound, the wrapper ends the connection with [MqttCapacityException], so
+/// a long delay on a connection whose peer keeps sending can end it before the client's own
+/// deadlines. The wrapper owns and closes the delegate, but borrows the scheduler.
 public final class FaultyTransport implements Transport {
 
     private static final int RECEIVE_CHUNK_LIMIT = 256;
@@ -374,7 +377,8 @@ public final class FaultyTransport implements Transport {
     /// Ends the connection with `cause`: later sends are rejected, delayed and later input is
     /// discarded, and the delegate is closed. A write the delegate has already completed is
     /// still reported through [onSent][Transport.Listener#onSent(long)] before the final
-    /// [onClosed][Transport.Listener#onClosed(Throwable)], which carries `cause`.
+    /// [onClosed][Transport.Listener#onClosed(Throwable)], which carries `cause`. No MQTT packet
+    /// is sent, so the peer sees the connection fail, as on a network failure.
     ///
     /// @param cause
     ///     the cause of the disconnection
