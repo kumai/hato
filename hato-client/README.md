@@ -730,6 +730,8 @@ old one, including those published while your application was stopped, are not r
 While the client reconnects, unfinished QoS 1 and 2 publications keep waiting. They complete
 if the broker still has the session, and fail if it has lost the session or the client gives
 up reconnecting; see [MqttPublisher](src/main/java/org/mqtt4j/hato/MqttPublisher.java).
+Some brokers keep no session for a client without subscriptions, so a client that only
+publishes sees these publications fail whenever its connection ends.
 
 ### Leaving a last Will
 
