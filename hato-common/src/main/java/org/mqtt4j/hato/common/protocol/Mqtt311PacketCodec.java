@@ -188,24 +188,16 @@ final class Mqtt311PacketCodec implements PacketCodec {
         // Reuse the packet model's field invariants without storage for the declared payload.
         var packet = new Packet.Publish(topic, new byte[0], qos, retain, dup, packetId, properties);
         requireNoProperties(packet.properties());
-        var variableHeader = new ByteArrayOutputStream();
-        MqttString.write(variableHeader, packet.topic().name());
-        if (packet.qos() != Qos.AT_MOST_ONCE) {
-            writeUnsignedShort(variableHeader, packet.packetId());
-        }
-        if (payloadSize > 268435455 - variableHeader.size()) {
-            throw new IllegalArgumentException("PUBLISH exceeds the Remaining Length limit");
-        }
-        int remainingLength = variableHeader.size() + payloadSize;
-        int headerSize = 1 + RemainingLength.encodedSize(remainingLength) + variableHeader.size();
-        var header = new ByteArrayOutputStream(headerSize);
-        int flags = (packet.dup() ? 8 : 0)
-                | (packet.qos().level() << 1)
-                | (packet.retain() ? 1 : 0);
-        header.write((PacketType.PUBLISH.value() << 4) | flags);
-        RemainingLength.write(header, remainingLength);
-        header.writeBytes(variableHeader.toByteArray());
-        return header.toByteArray();
+        MqttString.validate(packet.topic().name());
+        return PublishHeaders.write(
+                packet.topic().name(),
+                packet.qos(),
+                packet.retain(),
+                packet.dup(),
+                packet.packetId(),
+                false,
+                payloadSize
+        );
     }
 
     /// Decodes exactly one complete packet, rejecting truncation and extra bytes.

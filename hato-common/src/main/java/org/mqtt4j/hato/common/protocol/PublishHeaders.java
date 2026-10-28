@@ -1,11 +1,54 @@
 package org.mqtt4j.hato.common.protocol;
 
-/// Locates the payload of a PUBLISH from its first bytes, so that a reader can give the payload
-/// an array of its own before the rest of the packet arrives. Only the lengths that lead to the
-/// payload are read; decoding checks the packet.
+import java.nio.charset.StandardCharsets;
+
+import org.mqtt4j.hato.common.value.Qos;
+
+/// The fixed and variable headers of a PUBLISH. Reading locates the payload from the packet's
+/// first bytes, so that a reader can give the payload an array of its own before the rest of the
+/// packet arrives; only the lengths that lead to the payload are read, and decoding checks the
+/// packet. Writing builds the headers of a PUBLISH without properties in one array.
 final class PublishHeaders {
 
     private PublishHeaders() {}
+
+    /// The headers of a PUBLISH of `topic`, which must be a valid MQTT string, that carries no
+    /// properties and is followed by `payloadSize` bytes. `properties` says whether the variable
+    /// header ends with a property length, which is then 0, as in MQTT 5.0.
+    ///
+    /// @throws IllegalArgumentException if the packet exceeds the Remaining Length limit
+    static byte[] write(
+            String topic,
+            Qos qos,
+            boolean retain,
+            boolean dup,
+            int packetId,
+            boolean properties,
+            int payloadSize
+    ) {
+        byte[] name = topic.getBytes(StandardCharsets.UTF_8);
+        int variableSize = 2 + name.length
+                + (qos == Qos.AT_MOST_ONCE ? 0 : 2)
+                + (properties ? 1 : 0);
+        if (payloadSize > 268435455 - variableSize) {
+            throw new IllegalArgumentException("PUBLISH exceeds the Remaining Length limit");
+        }
+        int remainingLength = variableSize + payloadSize;
+        var header = new byte[1 + RemainingLength.encodedSize(remainingLength) + variableSize];
+        int flags = (dup ? 8 : 0) | (qos.level() << 1) | (retain ? 1 : 0);
+        header[0] = (byte) ((PacketType.PUBLISH.value() << 4) | flags);
+        int at = RemainingLength.write(header, 1, remainingLength);
+        header[at++] = (byte) (name.length >>> 8);
+        header[at++] = (byte) name.length;
+        System.arraycopy(name, 0, header, at, name.length);
+        at += name.length;
+        if (qos != Qos.AT_MOST_ONCE) {
+            header[at++] = (byte) (packetId >>> 8);
+            header[at] = (byte) packetId;
+        }
+        // An empty property length is the byte 0, which the new array already holds.
+        return header;
+    }
 
     /// The size of the fixed and variable headers of the PUBLISH whose first `available` bytes
     /// lie in `bytes` from `offset`, or -1 when those bytes do not locate its payload: they end

@@ -69,6 +69,25 @@ public final class RemainingLength {
         } while (remaining != 0);
     }
 
+    /// Writes the shortest encoding of `value` into `output` from `offset`, which must have room
+    /// for it, and returns the offset after it.
+    ///
+    /// @throws IllegalArgumentException if `value` is outside 0 to 268435455
+    static int write(byte[] output, int offset, int value) {
+        checkValue(value);
+        int at = offset;
+        int remaining = value;
+        do {
+            int digit = remaining & 0x7F;
+            remaining >>>= 7;
+            if (remaining != 0) {
+                digit |= 0x80;
+            }
+            output[at++] = (byte) digit;
+        } while (remaining != 0);
+        return at;
+    }
+
     /// Returns the number of bytes in the shortest encoding of `value`.
     ///
     /// @throws IllegalArgumentException if `value` is outside 0 to 268435455

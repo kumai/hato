@@ -218,6 +218,11 @@ final class Mqtt5PacketCodec implements PacketCodec {
         if (payloadSize < 0) {
             throw new IllegalArgumentException("PUBLISH payload size must not be negative");
         }
+        if (properties.isEmpty()) {
+            // Without properties, the headers have a fixed shape that needs no buffer.
+            MqttString.validate(topic);
+            return PublishHeaders.write(topic, qos, retain, dup, packetId, true, payloadSize);
+        }
         var variableHeader = new ByteArrayOutputStream();
         MqttString.write(variableHeader, topic);
         if (qos != Qos.AT_MOST_ONCE) {
