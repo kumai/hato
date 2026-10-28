@@ -9,6 +9,8 @@ import java.util.function.BooleanSupplier;
 
 import org.jspecify.annotations.Nullable;
 
+import static java.util.Objects.requireNonNull;
+
 /// FIFO order is shared by every admission class except keep-alive. Keep-alive events go ahead
 /// of the FIFO, so a backlog of received packets cannot hold back the PINGREQ that the keep-alive
 /// interval requires [MQTT-3.1.2-23]. They are the keep-alive and PINGRESP deadline timers and the
@@ -92,7 +94,57 @@ final class Mailbox {
         }
     }
 
-    record Event(long generation, Runnable action, Kind kind, int bytes) {
+    /// What the actor runs, with what admission counts of it: the generation of the connection
+    /// that it belongs to, zero for the client's own, its kind, and its bytes. An event runs an
+    /// action, or, as a subclass, itself, which spares a second object to the events that every
+    /// message posts. An event equals only itself, as the queues need: the mailbox takes out the
+    /// very event that it put in.
+    static class Event {
+
+        private final long generation;
+
+        private final @Nullable Runnable action;
+
+        private final Kind kind;
+
+        private final int bytes;
+
+        Event(long generation, Runnable action, Kind kind, int bytes) {
+            this.generation = generation;
+            this.action = action;
+            this.kind = kind;
+            this.bytes = bytes;
+        }
+
+        /// For a subclass that overrides [#perform()].
+        Event(long generation, Kind kind, int bytes) {
+            this.generation = generation;
+            this.action = null;
+            this.kind = kind;
+            this.bytes = bytes;
+        }
+
+        final long generation() {
+            return generation;
+        }
+
+        /// The action of an event made with one, which [#perform()] runs.
+        final Runnable action() {
+            return requireNonNull(action);
+        }
+
+        final Kind kind() {
+            return kind;
+        }
+
+        final int bytes() {
+            return bytes;
+        }
+
+        /// Runs the event, on the actor.
+        void perform() {
+            requireNonNull(action).run();
+        }
     }
 
     // Two timers and the answers to admitted PINGREQs, a few at a time. A full class ends the

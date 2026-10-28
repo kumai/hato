@@ -151,6 +151,10 @@ public final class ClientActor implements MqttClient {
 
     private final Mailbox mailbox;
 
+    // The wake that tells the core of ready deliveries. The mailbox queues it at most once, so
+    // one event serves every post.
+    private final Mailbox.Event deliveriesReady;
+
     private final DeliveryLanes lanes;
 
     // The QoS 0 publications that the actor has routed in its current run and not yet handed to
@@ -404,6 +408,12 @@ public final class ClientActor implements MqttClient {
                 rules,
                 responseTimeout,
                 limits
+        );
+        deliveriesReady = new Mailbox.Event(
+                0,
+                () -> core.deliveriesReady(lanes.takeReady()),
+                Mailbox.Kind.DELIVERY_READY,
+                0
         );
         this.credentials = credentials == null ? null : new CredentialsEvaluator(
                 threadName("credentials"),
@@ -880,7 +890,7 @@ public final class ClientActor implements MqttClient {
             io.resumeReading(event.generation());
         }
         try {
-            event.action().run();
+            event.perform();
         } catch (SpiException cause) {
             if (cause.schedulerFailure()) {
                 core.schedulerFailed(cause.generation(), requireNonNull(cause.getCause()));
@@ -920,13 +930,7 @@ public final class ClientActor implements MqttClient {
     }
 
     private void deliveryReady(boolean here, boolean last) {
-        post(
-                0,
-                () -> core.deliveriesReady(lanes.takeReady()),
-                Mailbox.Kind.DELIVERY_READY,
-                0,
-                here
-        );
+        post(deliveriesReady, here);
         if (here && mailbox.holds()) {
             // A thread of the lanes' own runs what it took over before its next delivery. After
             // the last delivery that waits for it, it also writes what those events queued, such
@@ -1041,10 +1045,16 @@ public final class ClientActor implements MqttClient {
         if (stopping.get()) {
             return;
         }
-        Mailbox.OfferResult admitted = mailbox.offer(
-                new Mailbox.Event(generation, action, kind, bytes),
-                here
-        );
+        post(new Mailbox.Event(generation, action, kind, bytes), here);
+    }
+
+    /// Posts `event`, with `here` as for [#post(long, Runnable, Mailbox.Kind, int, boolean)].
+    private void post(Mailbox.Event event, boolean here) {
+        if (stopping.get()) {
+            return;
+        }
+        Mailbox.OfferResult admitted = mailbox.offer(event, here);
+        Mailbox.Kind kind = event.kind();
         if (admitted == Mailbox.OfferResult.FULL) {
             if (kind == Mailbox.Kind.AT_MOST_ONCE) {
                 // Like a full subscription buffer, a full mailbox drops QoS 0 and goes on.
@@ -1060,7 +1070,7 @@ public final class ClientActor implements MqttClient {
                         CREDENTIALS_READY, RECONNECT, STATS -> "Control";
             };
             signalOverload(
-                    generation,
+                    event.generation(),
                     OverloadCause.EVENTS,
                     new MqttCapacityException(admission + " mailbox capacity")
             );
@@ -1881,6 +1891,75 @@ public final class ClientActor implements MqttClient {
     }
 
     /// I/O callbacks post events; fatal failures stop the actor independently of its mailbox.
+    /// A packet that the transport received. Every message posts one, so it runs itself rather
+    /// than an action.
+    private final class ReceivedEvent extends Mailbox.Event {
+
+        private final Packet packet;
+
+        private final long receivedAt;
+
+        ReceivedEvent(long generation, Packet packet, int size, long receivedAt) {
+            super(
+                    generation,
+                    packet instanceof Packet.Publish publish && publish.qos() == Qos.AT_MOST_ONCE
+                            ? Mailbox.Kind.AT_MOST_ONCE
+                            : Mailbox.Kind.INCOMING,
+                    size
+            );
+            this.packet = packet;
+            this.receivedAt = receivedAt;
+        }
+
+        @Override
+        void perform() {
+            core.received(generation(), packet, nanoTime(generation()), bytes(), receivedAt);
+        }
+    }
+
+    /// A completed write, which [ClientIo] runs, as the action that
+    /// [ClientIo.Events#prepareSent(long, long)] returned, once it may post. Running posts this
+    /// same object, which the actor then performs: every write makes one, so it is both.
+    private final class SentEvent extends Mailbox.Event implements Runnable {
+
+        private final long ticket;
+
+        private final long sentAt;
+
+        SentEvent(long generation, long ticket, long sentAt) {
+            super(generation, Mailbox.Kind.CONTROL, 0);
+            this.ticket = ticket;
+            this.sentAt = sentAt;
+        }
+
+        @Override
+        public void run() {
+            post(this, false);
+        }
+
+        @Override
+        void perform() {
+            core.sent(generation(), ticket, sentAt, nanoTime(generation()));
+        }
+    }
+
+    /// A completed write of a PUBACK, PUBREC, or PUBCOMP. Every acknowledgement posts one, so it
+    /// runs itself rather than an action.
+    private final class WrittenEvent extends Mailbox.Event {
+
+        private final long ticket;
+
+        WrittenEvent(long generation, long ticket) {
+            super(generation, Mailbox.Kind.CONTROL, 0);
+            this.ticket = ticket;
+        }
+
+        @Override
+        void perform() {
+            core.written(generation(), ticket, nanoTime(generation()));
+        }
+    }
+
     private final class IoEvents implements ClientIo.Events {
 
         // Made once, for the reads that run the events they took over.
@@ -1908,21 +1987,7 @@ public final class ClientActor implements MqttClient {
             long receivedAt = packet instanceof Packet.Publish
                     ? receptionTime()
                     : DeliveryToken.UNTIMED;
-            post(
-                    generation,
-                    () -> core.received(
-                            generation,
-                            packet,
-                            nanoTime(generation),
-                            size,
-                            receivedAt
-                    ),
-                    packet instanceof Packet.Publish publish && publish.qos() == Qos.AT_MOST_ONCE
-                            ? Mailbox.Kind.AT_MOST_ONCE
-                            : Mailbox.Kind.INCOMING,
-                    size,
-                    here
-            );
+            post(new ReceivedEvent(generation, packet, size, receivedAt), here);
             // A reader that runs the events itself reads no more before it has run them.
             if (!mailbox.holds() && mailbox.pauseDue(generation)) {
                 io.pauseReading(generation);
@@ -1937,22 +2002,12 @@ public final class ClientActor implements MqttClient {
             } catch (RuntimeException failure) {
                 return () -> terminate(generation, () -> core.schedulerFailed(generation, failure));
             }
-            return () -> post(
-                    generation,
-                    () -> core.sent(generation, ticket, sentAt, nanoTime(generation)),
-                    Mailbox.Kind.CONTROL,
-                    0
-            );
+            return new SentEvent(generation, ticket, sentAt);
         }
 
         @Override
         public void written(long generation, long ticket) {
-            post(
-                    generation,
-                    () -> core.written(generation, ticket, nanoTime(generation)),
-                    Mailbox.Kind.CONTROL,
-                    0
-            );
+            post(new WrittenEvent(generation, ticket), false);
         }
 
         @Override
