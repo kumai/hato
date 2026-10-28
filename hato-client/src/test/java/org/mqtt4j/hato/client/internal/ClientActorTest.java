@@ -510,6 +510,32 @@ class ClientActorTest {
     }
 
     @Test
+    void a_publication_admitted_on_a_connection_that_ends_before_it_starts_fails_as_lost()
+            throws Exception {
+        // Arrange: the connection ends while the actor is held, so admission still sees it.
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            holdActor(transport, entered, release);
+            transport.finishClose();
+            await().until(() -> ((ClientActor) sut).postedConnectionEnds() == 1);
+            CompletableFuture<PublishResult> published = sut.publish(message(new byte[] {1}));
+            assertThat(published).isNotDone();
+
+            // Act
+            release.countDown();
+
+            // Assert: the publication had a connection when it was admitted, so it fails as
+            // lost rather than as never connected.
+            assertThatThrownBy(() -> published.get(5, SECONDS))
+                    .hasCauseInstanceOf(MqttConnectionLostException.class);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void disconnect_during_connection_defers_subscription_establishment_until_the_next_connection()
             throws Exception {
         // Arrange: the registration waits for the connection already in progress.

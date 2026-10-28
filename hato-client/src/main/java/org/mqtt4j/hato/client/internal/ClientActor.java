@@ -17,7 +17,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.LongConsumer;
 import java.util.function.LongFunction;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -435,19 +434,7 @@ public final class ClientActor implements MqttClient {
 
     @Override
     public CompletableFuture<ConnAck> connect() {
-        return submit(Command.CONNECT, 0, null, token -> {
-            long now;
-            try {
-                now = scheduler.nanoTime();
-            } catch (RuntimeException failure) {
-                core.schedulerFailed(openedGeneration, failure);
-                completeOperation(token, null, new MqttConnectException(
-                        "Cannot read connection start time", failure
-                ));
-                return;
-            }
-            core.connect(requireNonNull(requireNonNull(operations.get(token)).attempt), now);
-        });
+        return submit(Command.CONNECT, 0, null, null);
     }
 
     @Override
@@ -466,7 +453,7 @@ public final class ClientActor implements MqttClient {
 
     @Override
     public CompletableFuture<Void> disconnect() {
-        return submit(Command.DISCONNECT, 0, null, core::disconnect);
+        return submit(Command.DISCONNECT, 0, null, null);
     }
 
     @Override
@@ -482,7 +469,7 @@ public final class ClientActor implements MqttClient {
                 Command.PUBLISH,
                 MessageProperties.bodySize(message),
                 publishTiming(message.qos()),
-                token -> core.publish(token, message)
+                message
         );
     }
 
@@ -622,7 +609,7 @@ public final class ClientActor implements MqttClient {
             Command kind,
             int bytes,
             @Nullable PublishTiming timing,
-            LongConsumer command
+            @Nullable MqttMessage message
     ) {
         boolean needsConnection = kind == Command.PUBLISH;
         Mailbox.Event own;
@@ -649,35 +636,20 @@ public final class ClientActor implements MqttClient {
             }
 
             long token = sequence.incrementAndGet();
-            long generation = connectedGeneration;
             var operation = new Operation<T>(
-                    inlineHandlers,
+                    token,
+                    kind,
                     requireNonNull(slot),
-                    (kind == Command.CONNECT) ? new ConnectionAttempt(token) : null,
-                    timing
-            );
-            operations.put(token, operation);
-            var event = new Mailbox.Event(
-                    0,
-                    () -> {
-                        if (needsConnection) {
-                            synchronized (lifecycleLock) {
-                                if (generation != connectedGeneration) {
-                                    completeOperation(token, null,
-                                            new MqttConnectionLostException());
-                                    return;
-                                }
-                            }
-                        }
-                        command.accept(token);
-                    },
-                    Mailbox.Kind.COMMAND,
+                    connectedGeneration,
+                    message,
+                    timing,
                     bytes
             );
+            operations.put(token, operation);
             // A publication may run on the calling thread; see runAlone.
             Mailbox.OfferResult admitted = kind == Command.PUBLISH
-                    ? mailbox.offerAlone(event)
-                    : mailbox.offer(event);
+                    ? mailbox.offerAlone(operation)
+                    : mailbox.offer(operation);
             if (admitted == Mailbox.OfferResult.FULL) {
                 // Refused at admission like the cases above, so the call has failed when it
                 // returns. The operation never started: no completion thread finishes it, and no
@@ -690,7 +662,7 @@ public final class ClientActor implements MqttClient {
                         CapacityLimit.OPERATION_QUEUE
                 ));
             }
-            own = mailbox.holds() ? event : null;
+            own = mailbox.holds() ? operation : null;
             future = operation.future;
         }
         if (own != null) {
@@ -1173,19 +1145,10 @@ public final class ClientActor implements MqttClient {
             }
             return;
         }
-        completions.submit(() -> {
-            termination.completionStarted();
-            try {
-                // The slot returns before the future completes, so that its continuations can
-                // start an operation in its place. Termination waits for them through the count,
-                // and for a queued completion through its slot.
-                operation.slot.release();
-                reportPublication(operation.timing, failure);
-                operation.finish(result, failure);
-            } finally {
-                termination.completionFinished();
-            }
-        });
+        // The completions' lock hands the outcome to the thread that takes the operation.
+        operation.result = result;
+        operation.failure = failure;
+        completions.submit(operation);
     }
 
     /// The start of a publication's timing at `qos`, or null when publications are not timed or
@@ -2417,7 +2380,10 @@ public final class ClientActor implements MqttClient {
         PUBLISH
     }
 
-    private static final class Operation<T> {
+    /// An operation that the application started. It is also the event that starts the operation
+    /// on the actor, and the completion that finishes its future on a completion thread: every
+    /// publication makes one, so one object serves as all three.
+    private final class Operation<T> extends Mailbox.Event implements Runnable {
 
         final CompletableFuture<T> future;
 
@@ -2431,20 +2397,92 @@ public final class ClientActor implements MqttClient {
         // Present for a publication that a metrics listener times.
         final @Nullable PublishTiming timing;
 
+        private final long token;
+
+        private final Command command;
+
+        // The connection that a publication was admitted on. If another one is current when the
+        // actor starts the publication, the publication has lost its connection.
+        private final long admittedGeneration;
+
+        // Present for a publication until the actor hands it to the core, which keeps it no
+        // longer than the session needs it.
+        private @Nullable MqttMessage message;
+
+        // The outcome, which completeOperation sets before it submits the completion.
+        @Nullable Object result;
+
+        @Nullable Throwable failure;
+
         Operation(
-                InlineHandlers inlineHandlers,
+                long token,
+                Command command,
                 Semaphore slot,
-                @Nullable ConnectionAttempt attempt,
-                @Nullable PublishTiming timing
+                long admittedGeneration,
+                @Nullable MqttMessage message,
+                @Nullable PublishTiming timing,
+                int bytes
         ) {
+            super(0, Mailbox.Kind.COMMAND, bytes);
             future = new ClientFuture<>(inlineHandlers);
             this.slot = slot;
-            this.attempt = attempt;
+            attempt = (command == Command.CONNECT) ? new ConnectionAttempt(token) : null;
             this.timing = timing;
+            this.token = token;
+            this.command = command;
+            this.admittedGeneration = admittedGeneration;
+            this.message = message;
+        }
+
+        @Override
+        void perform() {
+            switch (command) {
+                case CONNECT -> {
+                    long now;
+                    try {
+                        now = scheduler.nanoTime();
+                    } catch (RuntimeException cause) {
+                        core.schedulerFailed(openedGeneration, cause);
+                        completeOperation(token, null, new MqttConnectException(
+                                "Cannot read connection start time", cause
+                        ));
+                        return;
+                    }
+                    core.connect(requireNonNull(attempt), now);
+                }
+                case DISCONNECT -> core.disconnect(token);
+                case PUBLISH -> {
+                    synchronized (lifecycleLock) {
+                        if (admittedGeneration != connectedGeneration) {
+                            completeOperation(token, null, new MqttConnectionLostException());
+                            return;
+                        }
+                    }
+                    MqttMessage published = requireNonNull(message);
+                    message = null;
+                    core.publish(token, published);
+                }
+            }
+        }
+
+        /// Finishes the future with the outcome, on a completion thread.
+        @Override
+        public void run() {
+            termination.completionStarted();
+            try {
+                // The slot returns before the future completes, so that its continuations can
+                // start an operation in its place. Termination waits for them through the count,
+                // and for a queued completion through its slot.
+                slot.release();
+                reportPublication(timing, failure);
+                finish();
+            } finally {
+                termination.completionFinished();
+            }
         }
 
         @SuppressWarnings("unchecked") // Tokens retain their operation's result type in the core.
-        void finish(@Nullable Object result, @Nullable Throwable failure) {
+        private void finish() {
             if (failure == null) {
                 future.complete((T) result);
             } else {
