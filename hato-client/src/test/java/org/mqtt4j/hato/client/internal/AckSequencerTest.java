@@ -35,11 +35,11 @@ class AckSequencerTest {
         receptions.ready(1);
 
         // Assert
-        assertThat(sut.nextReady().orElseThrow().entry().packetId()).isEqualTo(7);
+        assertThat(sut.nextReady().orElseThrow().packetId()).isEqualTo(7);
         sut.submitted(10);
-        assertThat(sut.nextReady().orElseThrow().entry().packetId()).isEqualTo(8);
+        assertThat(sut.nextReady().orElseThrow().packetId()).isEqualTo(8);
         sut.submitted(11);
-        assertThat(sut.nextReady().orElseThrow().entry().packetId()).isEqualTo(9);
+        assertThat(sut.nextReady().orElseThrow().packetId()).isEqualTo(9);
         sut.submitted(12);
         assertThat(sut.nextReady()).isEmpty();
         assertThat(sut.writingCount()).isEqualTo(3);
@@ -64,7 +64,7 @@ class AckSequencerTest {
         assertThat(removed).isTrue();
         assertThat(sut.contains(earlier, Kind.PUBACK)).isFalse();
         assertThat(sut.contains(following, Kind.PUBACK)).isTrue();
-        assertThat(sut.nextReady().map(Acknowledgement::entry)).containsSame(following);
+        assertThat(sut.nextReady()).containsSame(following);
         assertThat(sut.remove(earlier, Kind.PUBACK)).isFalse();
     }
 
@@ -108,14 +108,14 @@ class AckSequencerTest {
 
         // Act & Assert
         assertThat(sut.completing(9)).isTrue();
-        assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBCOMP, completion));
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBCOMP, completion));
         sut.submitted(10);
         assertThat(sut.completing(9)).isFalse();
         assertThat(sut.nextReady()).isEmpty();
         receptions.ready(1);
-        assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBACK, first));
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBACK, first));
         sut.submitted(11);
-        assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBREC, publication));
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBREC, publication));
         sut.submitted(12);
         assertThat(sut.nextReady()).isEmpty();
     }
@@ -139,13 +139,13 @@ class AckSequencerTest {
         assertThat(sut.contains(entry, Kind.PUBREC)).isTrue();
         assertThat(sut.contains(entry, Kind.PUBCOMP)).isTrue();
         assertThat(sut.written(10)).contains(new Acknowledgement(Kind.PUBREC, entry));
-        assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBCOMP, entry));
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBCOMP, entry));
         sut.submitted(11);
         assertThat(sut.written(11)).contains(new Acknowledgement(Kind.PUBCOMP, entry));
     }
 
     @Test
-    void repeated_pubrec_responses_keep_their_receive_position_and_precede_pubcomp() {
+    void repeated_pubrec_responses_keep_their_receive_position() {
         // Arrange
         var receptions = new ReceiveTable(2);
         var sut = new AckSequencer();
@@ -159,19 +159,15 @@ class AckSequencerTest {
 
         // Act
         sut.add(entry, Kind.PUBREC);
-        receptions.complete(entry);
-        sut.add(entry, Kind.PUBCOMP);
         receptions.ready(2);
 
         // Assert
-        assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBREC, entry));
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBREC, entry));
         sut.submitted(11);
-        assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBACK, following));
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBACK, following));
         sut.submitted(12);
-        assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBCOMP, entry));
-        sut.submitted(13);
         assertThat(sut.nextReady()).isEmpty();
-        assertThat(sut.writingCount()).isEqualTo(4);
+        assertThat(sut.writingCount()).isEqualTo(3);
     }
 
     @Test
@@ -195,22 +191,61 @@ class AckSequencerTest {
         // Assert
         assertThat(removed).isTrue();
         assertThat(sut.contains(earlier, Kind.PUBREC)).isTrue();
-        assertThat(sut.nextReady()).contains(new Acknowledgement(Kind.PUBACK, current));
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBACK, current));
         assertThat(sut.written(10)).contains(new Acknowledgement(Kind.PUBREC, earlier));
         assertThat(sut.contains(earlier, Kind.PUBREC)).isFalse();
     }
 
     @Test
-    void writes_beyond_sixteen_finish_in_any_order() {
+    void a_connection_end_lets_each_reception_await_an_acknowledgement_again() {
         // Arrange
+        var receptions = new ReceiveTable(3);
+        var sut = new AckSequencer();
+        Entry written = receptions.add(1, 7, Qos.AT_LEAST_ONCE, 0).orElseThrow();
+        Entry waiting = receptions.add(2, 8, Qos.AT_LEAST_ONCE, 0).orElseThrow();
+        Entry completion = receptions.add(3, 9, Qos.EXACTLY_ONCE, 0).orElseThrow();
+        receptions.complete(completion);
+        sut.add(written, Kind.PUBACK);
+        sut.add(waiting, Kind.PUBACK);
+        sut.add(completion, Kind.PUBCOMP);
+        receptions.ready(1);
+        sut.submitted(10);
+
+        // Act
+        sut.clear();
+
+        // Assert: nothing of the ended connection remains, and the next one queues afresh.
+        assertThat(sut.nextReady()).isEmpty();
+        assertThat(sut.completing(9)).isFalse();
+        assertThat(sut.written(10)).isEmpty();
+        assertThat(sut.writingCount()).isZero();
+        sut.add(waiting, Kind.PUBACK);
+        sut.add(written, Kind.PUBACK);
+        receptions.ready(2);
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBACK, waiting));
+        sut.submitted(11);
+        assertThat(next(sut)).contains(new Acknowledgement(Kind.PUBACK, written));
+    }
+
+    @Test
+    void writes_beyond_sixteen_finish_in_any_order_with_their_kinds() {
+        // Arrange: every third reception is QoS 2, so a finished write can leave its slot to a
+        // write of the other kind.
         var receptions = new ReceiveTable(20);
         var sut = new AckSequencer();
-        var entries = new ArrayList<Entry>();
+        var acknowledgements = new ArrayList<Acknowledgement>();
         for (int number = 1; number <= 20; number++) {
-            Entry entry = receptions.add(number, number, Qos.AT_LEAST_ONCE, 0).orElseThrow();
-            sut.add(entry, Kind.PUBACK);
+            boolean exactlyOnce = number % 3 == 0;
+            Entry entry = receptions.add(
+                    number,
+                    number,
+                    exactlyOnce ? Qos.EXACTLY_ONCE : Qos.AT_LEAST_ONCE,
+                    0
+            ).orElseThrow();
+            Kind kind = exactlyOnce ? Kind.PUBREC : Kind.PUBACK;
+            sut.add(entry, kind);
             receptions.ready(number);
-            entries.add(entry);
+            acknowledgements.add(new Acknowledgement(kind, entry));
         }
         for (int number = 1; number <= 20; number++) {
             sut.submitted(100 + number);
@@ -228,12 +263,14 @@ class AckSequencerTest {
 
         // Assert
         assertThat(finished).containsExactlyElementsOf(order.stream()
-                .map(ticket -> Optional.of(new Acknowledgement(
-                        Kind.PUBACK,
-                        entries.get((int) (ticket - 101))
-                )))
+                .map(ticket -> Optional.of(acknowledgements.get((int) (ticket - 101))))
                 .toList());
         assertThat(sut.writingCount()).isZero();
-        assertThat(sut.contains(entries.getFirst(), Kind.PUBACK)).isFalse();
+        assertThat(sut.contains(acknowledgements.getFirst().entry(), Kind.PUBACK)).isFalse();
+    }
+
+    /// The next ready acknowledgement, with the kind that its reception awaits.
+    private static Optional<Acknowledgement> next(AckSequencer sut) {
+        return sut.nextReady().map(entry -> new Acknowledgement(sut.pendingKind(entry), entry));
     }
 }

@@ -6,6 +6,7 @@ import java.util.Optional;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.client.internal.AckSequencer.Kind;
 
 /// Actor-owned reception state. Tokens remain unique for the client's lifetime, while packet
 /// identifiers can be reused after PUBACK or PUBREL. Capacity also counts completed receptions
@@ -105,6 +106,11 @@ final class ReceiveTable {
         private Stage stage = Stage.RECEIVING;
         private boolean ready;
         private @Nullable SendReceipt receipt;
+        // AckSequencer's: the acknowledgement that this reception awaits on the connection, and
+        // the receptions before and after it in the acknowledgement order.
+        @Nullable Kind pending;
+        @Nullable Entry before;
+        @Nullable Entry after;
 
         Entry(long token, int packetId, Qos qos, long receivedAt) {
             this.token = token;

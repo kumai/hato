@@ -12,7 +12,6 @@ import org.mqtt4j.hato.ClientStats.Usage;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
-import org.mqtt4j.hato.client.internal.AckSequencer.Acknowledgement;
 import org.mqtt4j.hato.client.internal.AckSequencer.Kind;
 import org.mqtt4j.hato.client.internal.ReceiveTable.Stage;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
@@ -48,8 +47,8 @@ final class Receptions {
     // The session's receptions; a new session replaces them.
     private ReceiveTable received = new ReceiveTable(ACKNOWLEDGEMENT_LIMIT);
 
-    // The connection's acknowledgement order; a connection end replaces it.
-    private AckSequencer acknowledgements = new AckSequencer();
+    // The connection's acknowledgement order; a connection end clears it.
+    private final AckSequencer acknowledgements = new AckSequencer();
 
     // The Receive Maximum that the current connection's CONNECT announced.
     private int receiveMaximum;
@@ -280,14 +279,14 @@ final class Receptions {
 
     /// Sends ready acknowledgements in receive order while the reserved quota admits them.
     void sendAcknowledgements() {
-        Optional<Acknowledgement> ready;
+        Optional<ReceiveTable.Entry> ready;
         while (acknowledgements.writingCount() < ACK_WRITE_LIMIT
                 && (ready = acknowledgements.nextReady()).isPresent()) {
-            Acknowledgement acknowledgement = ready.orElseThrow();
-            ReceiveTable.Entry entry = acknowledgement.entry();
+            ReceiveTable.Entry entry = ready.orElseThrow();
+            Kind kind = acknowledgements.pendingKind(entry);
             long ticket = core.nextTicket();
             var receipt = new SendReceipt();
-            Packet packet = switch (acknowledgement.kind()) {
+            Packet packet = switch (kind) {
                 case PUBACK -> new Packet.PubAck(entry.packetId(), ReasonCode.SUCCESS, EMPTY);
                 case PUBREC -> new Packet.PubRec(entry.packetId(), ReasonCode.SUCCESS, EMPTY);
                 case PUBCOMP -> new Packet.PubComp(entry.packetId(), ReasonCode.SUCCESS, EMPTY);
@@ -306,7 +305,7 @@ final class Receptions {
             core.acknowledgementAdmitted();
             acknowledgements.submitted(ticket);
             entry.submitted(receipt, core.now());
-            if (acknowledgement.kind() != Kind.PUBREC) {
+            if (kind != Kind.PUBREC) {
                 // PUBACK and PUBCOMP end the exchange, which returns the broker's send quota.
                 quota.remove(entry.packetId());
             }
@@ -402,7 +401,7 @@ final class Receptions {
     }
 
     void connectionEnded() {
-        acknowledgements = new AckSequencer();
+        acknowledgements.clear();
         quota = new LongMap<>();
     }
 
