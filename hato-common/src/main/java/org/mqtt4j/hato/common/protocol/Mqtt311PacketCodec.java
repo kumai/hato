@@ -49,6 +49,25 @@ final class Mqtt311PacketCodec implements PacketCodec {
     @Override
     public byte[] encode(Packet packet) {
         requireNonNull(packet, "packet must not be null");
+        // Every QoS 1 and QoS 2 message takes an acknowledgement, and any that MQTT 3.1.1 can
+        // carry has four fixed bytes, which skip the buffers that the other packets take.
+        switch (packet) {
+            case Packet.PubAck p when plain(p.reasonCode(), p.properties()) -> {
+                return PacketType.PUBACK.packetIdOnly(p.packetId());
+            }
+            case Packet.PubRec p when plain(p.reasonCode(), p.properties()) -> {
+                return PacketType.PUBREC.packetIdOnly(p.packetId());
+            }
+            case Packet.PubRel p when plain(p.reasonCode(), p.properties()) -> {
+                return PacketType.PUBREL.packetIdOnly(p.packetId());
+            }
+            case Packet.PubComp p when plain(p.reasonCode(), p.properties()) -> {
+                return PacketType.PUBCOMP.packetIdOnly(p.packetId());
+            }
+            default -> {
+                // The general encoding below, which also refuses what this version cannot carry.
+            }
+        }
         var body = new ByteArrayOutputStream();
         PacketType type;
         switch (packet) {
@@ -576,5 +595,10 @@ final class Mqtt311PacketCodec implements PacketCodec {
         if (reason != SUCCESS) {
             throw new IllegalArgumentException("MQTT 3.1.1 cannot encode this reason code");
         }
+    }
+
+    // Whether an acknowledgement takes only its packet identifier.
+    private static boolean plain(ReasonCode reason, Properties properties) {
+        return reason == SUCCESS && properties.isEmpty();
     }
 }

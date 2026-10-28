@@ -93,6 +93,25 @@ public enum PacketType {
         };
     }
 
+    /// The whole packet of this type, PUBACK, PUBREC, PUBREL, or PUBCOMP, that carries its
+    /// packet identifier alone: as MQTT 3.1.1 sends it, and as MQTT 5.0 sends one that succeeds
+    /// without properties.
+    byte[] packetIdOnly(int packetId) {
+        int flags = switch (this) {
+            case PUBACK, PUBREC, PUBCOMP -> 0b0000;
+            case PUBREL -> 0b0010;
+            case CONNECT, CONNACK, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK, PINGREQ,
+                 PINGRESP, DISCONNECT, AUTH ->
+                    throw new IllegalStateException("Not an acknowledgement: " + this);
+        };
+        return new byte[] {
+                (byte) ((value << 4) | flags),
+                2,
+                (byte) (packetId >>> 8),
+                (byte) packetId
+        };
+    }
+
     /// Resolves the packet type after the codec extracts bits 7 to 4 of the first header byte.
     ///
     /// @param value the unshifted type value, not the complete header byte
