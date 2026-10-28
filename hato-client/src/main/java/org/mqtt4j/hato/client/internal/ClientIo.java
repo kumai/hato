@@ -619,11 +619,15 @@ final class ClientIo {
         }
     }
 
-    /// What the one write of `sends` carries. A transport that gathers takes the parts that
-    /// [#parts] makes. Otherwise, a PUBLISH that goes alone with a payload of at least
+    /// What the one write of `sends` carries. Packets without payloads, such as acknowledgements,
+    /// leave as one array on any transport. Otherwise, a transport that gathers takes the parts
+    /// that [#parts] makes, a PUBLISH that goes alone with a payload of at least
     /// [#APART_PAYLOAD_BYTES] leaves as its header and then its payload on a transport that lets
-    /// the sender write; anything else leaves as one array.
+    /// the sender write, and anything else leaves as one array.
     private Encoded encode(Connection connection, List<SendQueue.Send<Outbound>> sends) {
+        if (withoutPayloads(sends)) {
+            return new Encoded.Whole(headers(sends));
+        }
         if (connection.transport instanceof BlockingWriteTransport direct && direct.gathers()) {
             ByteBuffer[] parts = parts(sends);
             // Packets that join into one part, as small ones do, go as one array by the plain
@@ -681,6 +685,35 @@ final class ClientIo {
             parts.add(ByteBuffer.wrap(joined(run)));
         }
         return parts.toArray(ByteBuffer[]::new);
+    }
+
+    private static boolean withoutPayloads(List<SendQueue.Send<Outbound>> sends) {
+        for (SendQueue.Send<Outbound> send : sends) {
+            if (send.value().message() != null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The bytes of `sends`, which carry no payloads, one after another as the one write that
+    /// carries them, or the only send's own bytes.
+    private byte[] headers(List<SendQueue.Send<Outbound>> sends) {
+        if (sends.size() == 1) {
+            return encode(sends.getFirst());
+        }
+        int length = 0;
+        for (SendQueue.Send<Outbound> send : sends) {
+            length += send.value().header().length;
+        }
+        var bytes = new byte[length];
+        int at = 0;
+        for (SendQueue.Send<Outbound> send : sends) {
+            byte[] header = encode(send);
+            System.arraycopy(header, 0, bytes, at, header.length);
+            at += header.length;
+        }
+        return bytes;
     }
 
     /// `arrays` one after another in one array, or the only one itself.
