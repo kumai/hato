@@ -1,0 +1,50 @@
+name: Pages
+
+# Publishes the landing page and the API documentation of a release to GitHub Pages. Release runs
+# it after the upload to Maven Central. Run it by hand from a release tag, such as v0.9.0, to
+# publish that release's site again; a run from a branch stops before the build.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the site
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          validate-wrappers: true
+      - run: ./gradlew :site:assembleSite
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/build/site
+
+  deploy:
+    name: Publish to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

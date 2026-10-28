@@ -85,10 +85,10 @@ trial instead of publishing it.
 
 ## Publish a release
 
-Update the coordinates in the READMEs and finish the release checks. Then publish a
-GitHub Release with a new tag, such as `v0.3.0`, on the commit to release, and the
-release notes in its description. Publishing creates the tag; pushing a tag alone
-starts nothing. For example:
+Update the coordinates in the READMEs and on the landing page, `site/src/index.html`,
+and finish the release checks. Then publish a GitHub Release with a new tag, such as
+`v0.3.0`, on the commit to release, and the release notes in its description.
+Publishing creates the tag; pushing a tag alone starts nothing. For example:
 
 ```shell
 gh release create v0.3.0 --target main --title 0.3.0 --notes-file release-notes.md
@@ -128,4 +128,23 @@ stand-in for the Portal:
 
 ```shell
 ./gradlew :release-tools:check
+```
+
+## Publish the site
+
+After the upload, **Release** runs **Pages**, which builds the landing page in `site/src` and
+the API documentation of the client, the test kit, and the embedded broker from the release
+tag, and publishes them to GitHub Pages. A pre-release leaves the published site alone. To
+publish a release's site again, for example after a failed run, run **Pages** by hand from
+that release's tag; a run from a branch stops before the build.
+
+GitHub Pages takes its source from GitHub Actions, and the `github-pages` environment allows
+deployments from tags matching `v*` as well as from the default branch: Pages deploys from the
+release tag, which the environment refuses by default.
+
+To look at the site before a release, build it and serve it locally:
+
+```shell
+./gradlew :site:assembleSite
+jwebserver -d "$PWD/site/build/site"
 ```

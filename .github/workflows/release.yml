@@ -83,6 +83,18 @@ jobs:
           release-tools/build/install/release-tools/bin/release-tools upload \
             "distribution-tests/build/distributions/hato-${RELEASE_VERSION}.zip"
 
+  # After a release, publish its site: the landing page and the API documentation. A pre-release
+  # and a manual trial leave the published site alone.
+  pages:
+    name: Publish the site
+    needs: upload
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml
+
   # After a release of the version on the default branch, move the branch to the next minor
   # SNAPSHOT. Only first-party actions and the checksum-verified Gradle wrapper run here, and
   # only the last step holds the token that can push.
