@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hato</title>
+<meta name="description" content="Hato is an MQTT 5.0 and 3.1.1 client for Java, with a test kit and an embedded broker for your tests.">
+<link rel="icon" type="image/png" href="assets/seal-hakubun.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap">
+<style>
+/* Layout: a left-aligned document column on washi paper, written in indigo ink. The seal is
+   stamped once, in the hero; dry brush strokes sit behind it, the examples run across a band
+   of indigo, and ink-wash hills close the page. */
+:root {
+  --paper: #F4F1E8;
+  --paper-raised: #EAE6DA;
+  --ink: #141A22;
+  --ink-muted: #535B66;
+  --rule: #D9D4C7;
+  --brush: #AEB8C2;
+  --wash: #A3AEBA;
+  --shu: #C73A2B;
+  --shu-text: #A92E20;
+  --code-bg: #111B25;
+  --code-bar: #16222E;
+  --code-rule: #22303E;
+  --code-fg: #E9E5DA;
+  --code-muted: #8995A3;
+  --code-key: #F07A63;
+  --code-str: #D9C08A;
+  --code-type: #A9C0D3;
+  --seal-blend: multiply;
+  --grain-opacity: 1;
+  --grain: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='1 0 0 0 0  1 0 0 0 0  1 0 0 0 0  0 0 0 0 .07'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+
+
+  --ai: #34445A;
+  --ai-raised: #3D4F67;
+  --ai-ink: #EDE9DF;
+  --ai-ink-muted: #AEB8C5;
+  --ai-rule: #4A5D76;
+  --ai-brush: #43566F;
+  --ai-accent: #F07A63;
+  --ai-code-bg: #1E2B3C;
+  --ai-code-bar: #243346;
+
+  --font-brand: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  --step-0: 0.8125rem;
+  --step-1: 1.0625rem;
+  --step-2: 1.3125rem;
+  --step-3: clamp(1.75rem, 3.2vw, 2.5rem);
+  --step-4: clamp(2.6rem, 6.4vw, 5.25rem);
+  --measure: 34rem;
+  --wide: 72rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #101A25;
+    --paper-raised: #172433;
+    --ink: #EDE9DF;
+    --ink-muted: #9DA9B8;
+    --rule: #243243;
+    --brush: #26384C;
+    --wash: #273B53;
+    --shu: #C73A2B;
+    --shu-text: #F07A63;
+    --code-bg: #0B131C;
+    --code-bar: #0F1922;
+    --code-rule: #243243;
+    --seal-blend: normal;
+    --grain-opacity: 0.55;
+    --ai: #15243A;
+    --ai-raised: #1C2E46;
+    --ai-rule: #2A3D55;
+    --ai-brush: #22364F;
+    --ai-code-bg: #0B131C;
+    --ai-code-bar: #0F1922;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #101A25;
+  --paper-raised: #172433;
+  --ink: #EDE9DF;
+  --ink-muted: #9DA9B8;
+  --rule: #243243;
+  --brush: #26384C;
+  --wash: #273B53;
+  --shu: #C73A2B;
+  --shu-text: #F07A63;
+  --code-bg: #0B131C;
+  --code-bar: #0F1922;
+  --code-rule: #243243;
+  --seal-blend: normal;
+  --grain-opacity: 0.55;
+  --ai: #15243A;
+  --ai-raised: #1C2E46;
+  --ai-rule: #2A3D55;
+  --ai-brush: #22364F;
+  --ai-code-bg: #0B131C;
+  --ai-code-bar: #0F1922;
+  color-scheme: dark;
+}
+
+body {
+  position: relative;
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--step-1);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+/* Paper grain: a tiny noise tile under the content, never over text. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: var(--grain-opacity);
+  background-image: var(--grain);
+}
+.ink-layer { position: absolute; top: 0; left: 0; z-index: 0; pointer-events: none; }
+.wrap { position: relative; z-index: 1; max-width: calc(var(--wide) + 40px); margin-inline: auto; padding-inline: 20px; box-sizing: border-box; }
+a { color: inherit; text-decoration-color: var(--rule); text-underline-offset: 0.2em; text-decoration-thickness: 1px; }
+a:hover { text-decoration-color: var(--shu-text); }
+:focus-visible { outline: 2px solid var(--shu-text); outline-offset: 3px; border-radius: 4px; }
+h1, h2, h3 { font-family: var(--font-brand); font-weight: 700; text-wrap: balance; margin: 0; }
+p { margin: 0; }
+/* Code shows the characters as typed: no ligatures turning -> into an arrow. */
+code, pre { font-family: var(--font-mono); font-variant-ligatures: none; }
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* Header */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 20px; }
+.brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-family: var(--font-brand); font-weight: 700; font-size: 1.5rem; letter-spacing: -0.04em; line-height: 1; }
+.brand img { width: 30px; height: 30px; transform: rotate(-4deg); mix-blend-mode: var(--seal-blend); }
+.nav { display: flex; align-items: center; gap: clamp(12px, 3vw, 28px); font-size: 0.9375rem; }
+.nav a { text-decoration: none; color: var(--ink-muted); padding-block: 10px; }
+.nav a:hover { color: var(--ink); }
+.theme-toggle { display: inline-grid; place-items: center; width: 40px; height: 40px; border: 1px solid var(--rule); border-radius: 50%; background: var(--paper); color: var(--ink-muted); cursor: pointer; }
+.theme-toggle:hover { color: var(--ink); border-color: var(--ink-muted); }
+.theme-toggle svg { width: 18px; height: 18px; }
+.theme-toggle .moon { display: none; }
+.theme-toggle[data-mode="dark"] .sun { display: none; }
+.theme-toggle[data-mode="dark"] .moon { display: block; }
+
+/* Hero: the product name opens the page, set as the logo lockup with the seal pressed beside
+   it, then what the product is and how to add it, all centered like a title page. */
+.hero { padding-block: clamp(28px, 4vw, 56px) clamp(40px, 5vw, 72px); }
+.hero-text { display: flex; flex-direction: column; align-items: center; gap: 28px; text-align: center; }
+.title-block { display: flex; flex-direction: column; align-items: center; gap: clamp(8px, 1.2vw, 16px); }
+.lockup { display: flex; justify-content: center; align-items: baseline; gap: 0.12em; font-size: clamp(4.5rem, 14vw, 10rem); line-height: 0.9; letter-spacing: -0.05em; text-transform: lowercase; }
+.lockup-seal { width: 0.6em; height: auto; transform: rotate(-4deg); mix-blend-mode: var(--seal-blend); animation: stamp 560ms cubic-bezier(.2, .9, .3, 1.15) both; }
+@keyframes stamp {
+  from { transform: scale(1.14) rotate(-9deg); }
+  to { transform: scale(1) rotate(-4deg); }
+}
+.tagline { font-family: var(--font-brand); font-weight: 700; font-size: var(--step-3); line-height: 1.1; letter-spacing: -0.03em; text-wrap: balance; }
+/* The stance, quieter than the tagline: one short line in the body face. */
+.stance { font-size: var(--step-2); line-height: 1.35; color: var(--ink-muted); text-wrap: balance; }
+
+.install { width: 100%; max-width: 36rem; background: var(--paper-raised); border-radius: 10px; overflow: hidden; }
+.install-bar { display: flex; align-items: center; gap: 4px; padding: 6px 6px 0 14px; }
+.install-label { font-size: var(--step-0); color: var(--ink-muted); margin-right: 8px; }
+.tab { font: 500 var(--step-0)/1 var(--font-body); color: var(--ink-muted); background: none; border: 0; border-bottom: 2px solid transparent; padding: 12px 10px 10px; cursor: pointer; }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--shu); }
+.copy { margin-left: auto; font: 500 var(--step-0)/1 var(--font-body); color: var(--ink); background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 9px 14px; cursor: pointer; min-height: 36px; }
+.copy:hover { border-color: var(--ink-muted); }
+.install pre { margin: 0; padding: 16px 18px 18px; overflow-x: auto; text-align: left; font-size: 0.875rem; line-height: 1.6; color: var(--ink); }
+.install .coord { color: var(--shu-text); }
+
+/* Facts under the install box, one short line each and never wrapped. The top row answers
+   whether Hato fits the reader's setup, the bottom row how it is built. The two "None" values
+   come last, so they share a row in both the three-column and the two-column layout. */
+.facts { display: grid; grid-template-columns: repeat(3, auto); justify-content: center; gap: 18px clamp(28px, 4vw, 56px); width: 100%; max-width: 48rem; margin: 4px 0 0; padding-top: 18px; border-top: 1px solid var(--rule); }
+.facts dt { font-family: var(--font-mono); font-size: 0.6875rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
+.facts dd { margin: 4px 0 0; font-weight: 500; white-space: nowrap; }
+
+/* Sections */
+.section { padding-block: clamp(44px, 6vw, 80px); border-top: 1px solid var(--rule); }
+.section h2, .band-ai h2 { font-size: var(--step-3); line-height: 1.08; letter-spacing: -0.03em; }
+
+/* Indigo band: the two sections that show code run across one strip of indigo in both themes.
+   The page tokens are remapped inside it, so the components need no band-specific colors. */
+.band-ai {
+  position: relative;
+  overflow: hidden;
+  --paper: var(--ai);
+  --paper-raised: var(--ai-raised);
+  --ink: var(--ai-ink);
+  --ink-muted: var(--ai-ink-muted);
+  --rule: var(--ai-rule);
+  --shu-text: var(--ai-accent);
+  --code-bg: var(--ai-code-bg);
+  --code-bar: var(--ai-code-bar);
+  --code-rule: var(--ai-rule);
+  background: var(--paper);
+  color: var(--ink);
+}
+/* The same grain as the paper, so the band reads as dyed cloth rather than a flat fill. */
+.band-ai::before { content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none; background-image: var(--grain); }
+.band-section { padding-block: clamp(44px, 6vw, 80px); }
+.band-section + .band-section { border-top: 1px solid var(--rule); }
+.band-ai + .wrap > .section:first-child { border-top: 0; }
+.split { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); gap: clamp(28px, 5vw, 64px); align-items: start; }
+/* The text column always comes first in the markup, so narrow screens and screen readers get
+   the heading before the code; wide screens of a flipped section move it to the right. */
+.split.flip { grid-template-columns: minmax(0, 8fr) minmax(0, 4fr); }
+.split.flip .copy-col { order: 2; }
+.copy-col { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.copy-col p { color: var(--ink-muted); max-width: var(--measure); }
+.copy-col code { font-size: 0.875em; color: var(--ink); }
+
+/* Delivery modes, set like the facts: a name and one short line each. */
+.modes { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.mode-list { margin: 0; border-top: 1px solid var(--rule); }
+.mode-list div { display: grid; grid-template-columns: 10rem minmax(0, 1fr); gap: 4px 24px; align-items: baseline; padding-block: 16px; border-bottom: 1px solid var(--rule); }
+.mode-list dt { display: flex; align-items: baseline; gap: 10px; font-family: var(--font-brand); font-weight: 700; font-size: var(--step-2); letter-spacing: -0.02em; }
+.mode-list dd { margin: 0; color: var(--ink-muted); }
+.mode-default { padding: 2px 6px; border: 1px solid var(--rule); border-radius: 4px; font-family: var(--font-mono); font-size: 0.6875rem; font-weight: 400; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
+.modes-note { color: var(--ink-muted); font-size: var(--step-0); }
+
+.bullets { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.bullets li { display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 14px; align-items: baseline; color: var(--ink); }
+.bullets li::before { content: ""; width: 8px; height: 8px; background: var(--shu); border-radius: 1px; transform: translateY(-1px) rotate(-4deg); }
+
+/* Editor panels */
+.editors { display: grid; gap: 16px; min-width: 0; }
+.editor { min-width: 0; background: var(--code-bg); border: 1px solid var(--code-rule); border-radius: 12px; overflow: hidden; }
+.editor-bar { display: flex; gap: 2px; padding: 0 10px; background: var(--code-bar); border-bottom: 1px solid var(--code-rule); overflow-x: auto; }
+.editor-bar .file { font-family: var(--font-mono); font-size: var(--step-0); color: var(--code-fg); padding: 14px 12px 12px; border-bottom: 2px solid var(--code-key); }
+.editor pre { margin: 0; padding: 20px 18px 24px; overflow-x: auto; font-size: var(--step-0); line-height: 1.7; color: var(--code-fg); tab-size: 4; }
+.editor pre:focus-visible { outline-offset: -3px; }
+
+.token.keyword, .token.annotation { color: var(--code-key); }
+.token.string, .token.number { color: var(--code-str); }
+.token.class-name { color: var(--code-type); }
+.token.namespace, .token.comment { color: var(--code-muted); }
+.token.comment { font-style: italic; }
+.token.punctuation, .token.operator { color: #B4B9BF; }
+
+/* Guides */
+.guides-head { margin-bottom: 28px; }
+.guides { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+.guides li { border-bottom: 1px solid var(--rule); }
+.guides > li > a, .guides .g-row { display: grid; grid-template-columns: minmax(10rem, 3fr) minmax(0, 7fr) auto; gap: 8px 32px; align-items: baseline; padding-block: 22px; text-decoration: none; }
+.guides .g-name { font-family: var(--font-brand); font-weight: 700; font-size: var(--step-2); letter-spacing: -0.02em; }
+.guides .g-desc { color: var(--ink-muted); }
+.guides .g-row a { color: var(--ink); text-decoration-color: var(--ink-muted); }
+.guides .g-arrow { color: var(--ink-muted); transition: transform 160ms ease, color 160ms ease; }
+.guides > li > a:hover .g-name { color: var(--shu-text); }
+.guides > li > a:hover .g-arrow { color: var(--shu-text); transform: translateX(4px); }
+
+/* Footer: the hills are drawn into the band's lower part, below the text. */
+.foot-band { position: relative; overflow: hidden; border-top: 1px solid var(--rule); }
+.foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 20px 32px; padding-block: 40px clamp(150px, 18vw, 210px); color: var(--ink-muted); font-size: 0.9375rem; }
+.foot-story { display: flex; align-items: center; gap: 16px; max-width: 36rem; }
+.foot-story img { width: 52px; height: 52px; flex: none; transform: rotate(-4deg); mix-blend-mode: var(--seal-blend); }
+.foot-links { display: flex; gap: 24px; }
+.foot-links a { text-decoration: none; padding-block: 10px; }
+.foot-links a:hover { color: var(--ink); }
+
+@media (max-width: 900px) {
+  .split, .split.flip { grid-template-columns: minmax(0, 1fr); }
+  .split.flip .copy-col { order: 0; }
+  .guides > li > a, .guides .g-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .guides .g-desc { grid-column: 1; grid-row: 2; }
+  .guides .g-arrow { grid-column: 2; grid-row: 1; }
+}
+@media (max-width: 760px) {
+  .facts { grid-template-columns: repeat(2, auto); }
+  .mode-list div { grid-template-columns: minmax(0, 1fr); }
+  .mode-list dd { font-size: 0.9375rem; }
+  .nav .nav-text { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lockup-seal { animation: none; }
+  .guides .g-arrow { transition: none; }
+}
+</style>
+</head>
+<body>
+
+<canvas class="ink-layer" id="ink-strokes" aria-hidden="true"></canvas>
+
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="#top" aria-label="Hato home">
+      <img src="assets/seal-hakubun.png" alt="" width="30" height="30">
+      <span>hato</span>
+    </a>
+    <nav class="nav" aria-label="Main">
+      <a class="nav-text" href="#guides">Guides</a>
+      <a class="nav-text" href="api/client/">API</a>
+      <a href="https://github.com/kumai/hato">GitHub</a>
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch theme">
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6"></path></svg>
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"></path></svg>
+      </button>
+    </nav>
+  </header>
+</div>
+
+<main id="top">
+  <div class="wrap">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-text">
+        <div class="title-block">
+          <h1 class="lockup" id="hero-title">Hato<img class="lockup-seal" src="assets/seal-hakubun.png" alt="" width="96" height="96"></h1>
+          <p class="tagline">An MQTT client for Java.</p>
+          <p class="stance">Easy on your application, from its handlers to its tests.</p>
+        </div>
+        <div class="install">
+          <div class="install-bar" role="tablist" aria-label="Build tool">
+            <span class="install-label">Add to</span>
+            <button class="tab" role="tab" id="tab-gradle" type="button" aria-selected="true" aria-controls="panel-gradle">Gradle</button>
+            <button class="tab" role="tab" id="tab-maven" type="button" aria-selected="false" aria-controls="panel-maven" tabindex="-1">Maven</button>
+            <button class="copy" id="copy-install" type="button">Copy</button>
+          </div>
+          <pre id="panel-gradle" role="tabpanel" aria-labelledby="tab-gradle" tabindex="0">implementation("<span class="coord">org.mqtt4j:hato-client</span>:0.8.1")</pre>
+          <pre id="panel-maven" role="tabpanel" aria-labelledby="tab-maven" tabindex="0" hidden>&lt;dependency&gt;
+    &lt;groupId&gt;<span class="coord">org.mqtt4j</span>&lt;/groupId&gt;
+    &lt;artifactId&gt;<span class="coord">hato-client</span>&lt;/artifactId&gt;
+    &lt;version&gt;0.8.1&lt;/version&gt;
+&lt;/dependency&gt;</pre>
+        </div>
+
+        <dl class="facts">
+          <div><dt>Protocol</dt><dd>MQTT 5.0, 3.1.1</dd></div>
+          <div><dt>Transports</dt><dd>TCP, TLS, WebSocket</dd></div>
+          <div><dt>Java</dt><dd>25 or later</dd></div>
+          <div><dt>Concurrency</dt><dd>Virtual threads</dd></div>
+          <div><dt>Dependencies</dt><dd>None</dd></div>
+          <div><dt>Reflection</dt><dd>None</dd></div>
+        </dl>
+      </div>
+    </section>
+  </div>
+
+  <div class="band-ai">
+    <canvas class="ink-layer" id="ink-band" aria-hidden="true"></canvas>
+    <div class="wrap">
+      <section class="band-section" aria-labelledby="examples-title">
+      <div class="split">
+        <div class="copy-col">
+          <h2 id="examples-title">Write message handlers like the rest of your code.</h2>
+          <p>Each subscription hands its messages to your handler away from the network threads, so the handler can block, call a database, or publish and wait while the connection and other subscriptions keep going.</p>
+          <ul class="bullets">
+            <li>Reconnects and subscribes again by itself.</li>
+            <li>Join a result, or chain the next step.</li>
+            <li>A client you can call from any thread.</li>
+          </ul>
+        </div>
+
+        <div class="editors">
+          <div class="editor">
+            <div class="editor-bar">
+              <span class="file">Handler</span>
+            </div>
+            <pre tabindex="0"><code class="language-java">client.subscribe(
+        Subscribe.of(new TopicFilter("orders/+"), Qos.AT_LEAST_ONCE),
+        delivery -&gt; {
+            Order order = Order.parse(delivery.message().payload());
+            orders.save(order);
+            client.publish(confirmation(order)).join();
+        }
+);</code></pre>
+          </div>
+        </div>
+      </div>
+      </section>
+
+      <section class="band-section" aria-labelledby="delivery-title">
+      <div class="split flip">
+        <div class="copy-col">
+          <h2 id="delivery-title">One message at a time, until you need more.</h2>
+          <p>The defaults suit most applications, with nothing to tune. When a subscription needs more throughput, choose how its messages reach your code instead of building thread pools.</p>
+          <p>Running your code apart from the network has a price. Hato keeps it small, under a microsecond for each QoS 0 message it receives.</p>
+        </div>
+
+        <div class="modes">
+          <dl class="mode-list">
+            <div><dt>Serial <span class="mode-default">Default</span></dt><dd>One at a time, in arrival order.</dd></div>
+            <div><dt>Striped</dt><dd>In order per key, parallel across keys.</dd></div>
+            <div><dt>Parallel</dt><dd>As many at once as you allow.</dd></div>
+            <div><dt>Hand-off</dt><dd>Straight into your queue, in order.</dd></div>
+          </dl>
+          <p class="modes-note">Handlers can run on your own executor, too.</p>
+        </div>
+      </div>
+      </section>
+
+      <section class="band-section" aria-labelledby="testing-title">
+      <div class="split">
+        <div class="copy-col">
+          <h2 id="testing-title">Rehearse the bad days in your tests.</h2>
+          <p>Test how your application handles interrupted connections and timeouts. The test kit runs on the same API you ship.</p>
+          <ul class="bullets">
+            <li>Unit-test handlers with fakes, without a broker.</li>
+            <li>Start an embedded broker for each test.</li>
+            <li>Cut the connection at any moment.</li>
+            <li>Delay incoming or outgoing traffic.</li>
+            <li>Advance time instead of sleeping.</li>
+          </ul>
+        </div>
+
+        <div class="editor">
+          <div class="editor-bar">
+            <span class="file">DashboardTest.java</span>
+          </div>
+          <pre tabindex="0"><code class="language-java">@Test
+void showsOfflineWhenTheConnectionDrops() throws IOException {
+    var dashboard = new Dashboard();
+    var time = new ManualTimerScheduler();
+    var transport = new AtomicReference&lt;FaultyTransport&gt;();
+    try (
+            MqttBroker broker = MqttBroker.start();
+            MqttClient client = MqttClient.builder()
+                    .server(URI.create("mqtt://localhost:" + broker.port()))
+                    .timerScheduler(time)
+                    .transportFactory(clientId -&gt; {
+                        var faulty = new FaultyTransport(Transport.tcp(clientId), time);
+                        transport.set(faulty);
+                        return faulty;
+                    })
+                    .connectionListener(dashboard::onDisconnected)
+                    .build()
+    ) {
+        client.connect().join();
+
+        transport.get().disconnect(new IOException("cable pulled"));
+
+        await().until(dashboard::isOffline);
+    }
+}</code></pre>
+        </div>
+      </div>
+      </section>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <section class="section" id="guides" aria-labelledby="guides-title">
+      <div class="guides-head">
+        <h2 id="guides-title">Guides and reference</h2>
+      </div>
+      <ul class="guides">
+        <li><a href="https://github.com/kumai/hato/blob/main/hato-client/README.md"><span class="g-name">Client</span><span class="g-desc">Configure connections, manage subscriptions, and handle failures.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
+        <li><a href="https://github.com/kumai/hato/blob/main/hato-broker/README.md"><span class="g-name">Embedded broker</span><span class="g-desc">Run a broker inside your application for tests, device simulators, and demos.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
+        <li><a href="https://github.com/kumai/hato/blob/main/hato-testkit/README.md"><span class="g-name">Test kit</span><span class="g-desc">Simulate connection failures and control time in your tests.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
+        <li><a href="https://github.com/kumai/hato/blob/main/examples/README.md"><span class="g-name">Examples</span><span class="g-desc">Compile and run the examples above, or try a complete round trip with the embedded broker.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
+        <li><div class="g-row"><span class="g-name">API reference</span><span class="g-desc">Javadoc for the <a href="api/client/">client</a>, the <a href="api/testkit/">test kit</a>, and the <a href="api/broker/">embedded broker</a>.</span></div></li>
+      </ul>
+    </section>
+  </div>
+</main>
+
+<footer class="foot-band">
+  <canvas class="ink-layer" id="ink-hills" aria-hidden="true"></canvas>
+  <div class="wrap foot">
+    <div class="foot-story">
+      <img src="assets/seal-shubun.png" alt="" width="52" height="52">
+      <p>Hato is Japanese for pigeon (<span lang="ja">鳩</span>), the bird that carried messages long before MQTT.</p>
+    </div>
+    <div class="foot-links">
+      <a href="https://github.com/kumai/hato">GitHub</a>
+      <a href="https://github.com/kumai/hato/blob/main/LICENSE">MIT License</a>
+    </div>
+  </div>
+</footer>
+
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script>
+(() => {
+  const root = document.documentElement;
+
+  /* Ink: dry brush strokes behind the hero and ink-wash hills under the footer. Both are drawn
+     from a fixed seed, so a theme switch or resize repaints the same marks in the new colors. */
+  const token = name => getComputedStyle(root).getPropertyValue(name).trim();
+  const rgb = hex => {
+    const n = parseInt(hex.replace('#', ''), 16);
+    return [n >> 16 & 255, n >> 8 & 255, n & 255];
+  };
+  const seeded = seed => () => {
+    seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  const surface = (canvas, w, h) => {
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(w * ratio);
+    canvas.height = Math.round(h * ratio);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    return ctx;
+  };
+
+  // One stroke along a quadratic curve, laid down bristle by bristle. Each bristle carries less
+  // ink toward the end, so the tail breaks into the streaks of a dry brush.
+  const brush = (ctx, rnd, p0, c, p1, width, color) => {
+    const bristles = Math.max(24, Math.round(width * 1.3));
+    ctx.strokeStyle = color;
+    ctx.lineCap = 'round';
+    for (let b = 0; b < bristles; b++) {
+      const across = b / (bristles - 1) - 0.5;
+      const end = 0.55 + 0.45 * rnd() * (1 - Math.abs(across));
+      ctx.lineWidth = 0.6 + rnd() * 1.7;
+      ctx.globalAlpha = 0.35 + rnd() * 0.55;
+      ctx.beginPath();
+      let inked = true;
+      let first = true;
+      for (let t = rnd() * 0.04; t <= end; t += 0.004) {
+        const u = 1 - t;
+        const x = u * u * p0[0] + 2 * u * t * c[0] + t * t * p1[0];
+        const y = u * u * p0[1] + 2 * u * t * c[1] + t * t * p1[1];
+        const dx = 2 * u * (c[0] - p0[0]) + 2 * t * (p1[0] - c[0]);
+        const dy = 2 * u * (c[1] - p0[1]) + 2 * t * (p1[1] - c[1]);
+        const len = Math.hypot(dx, dy) || 1;
+        const taper = 0.72 + 0.28 * Math.sin(Math.PI * Math.min(1, t / end));
+        const off = across * width * taper + (rnd() - 0.5) * 0.6;
+        const px = x - dy / len * off;
+        const py = y + dx / len * off;
+        const dryness = Math.max(0, t / end - 0.45);
+        if (inked && rnd() < dryness * 0.09) inked = false;
+        else if (!inked && rnd() < 0.05 * (1 - dryness)) { inked = true; first = true; }
+        if (!inked) continue;
+        if (first) { ctx.moveTo(px, py); first = false; } else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  };
+
+  // Hills as overlapping washes: far ridges pale and soft, near ridges darker, each fading
+  // downward into mist. Taller on the left, settling toward the right.
+  const hills = (ctx, rnd, w, h, color) => {
+    const [r, g, b] = rgb(color);
+    const layers = [
+      { base: h - 120, amp: 90, alpha: 0.45, blur: 5 },
+      { base: h - 64, amp: 70, alpha: 0.7, blur: 2.5 },
+      { base: h - 14, amp: 52, alpha: 1, blur: 1 },
+    ];
+    for (const layer of layers) {
+      const waves = [1, 2, 3, 5].map(k => ({
+        freq: (0.8 + rnd() * 0.6) * k * 2 * Math.PI / Math.max(w, 600) * 1.6,
+        phase: rnd() * Math.PI * 2,
+        weight: 1 / k,
+      }));
+      const ridge = x => {
+        const s = waves.reduce((sum, wave) => sum + wave.weight * Math.sin(wave.freq * x + wave.phase), 0) / 1.9;
+        const peak = Math.pow(Math.max(0, s * 0.5 + 0.5), 1.5);
+        const envelope = 0.35 + 0.65 * (1 - Math.min(1, Math.max(0, (x / w - 0.15) / 0.65)));
+        return layer.base - layer.amp * envelope * peak;
+      };
+      const wash = ctx.createLinearGradient(0, layer.base - layer.amp, 0, layer.base + 50);
+      wash.addColorStop(0, `rgba(${r},${g},${b},1)`);
+      wash.addColorStop(1, `rgba(${r},${g},${b},0)`);
+      ctx.beginPath();
+      ctx.moveTo(0, h);
+      for (let x = 0; x <= w + 4; x += 4) ctx.lineTo(x, ridge(x));
+      ctx.lineTo(w, h);
+      ctx.closePath();
+      ctx.fillStyle = wash;
+      ctx.globalAlpha = layer.alpha;
+      ctx.filter = `blur(${layer.blur}px)`;
+      ctx.fill();
+    }
+    ctx.filter = 'none';
+    ctx.globalAlpha = 1;
+  };
+
+  const strokesCanvas = document.getElementById('ink-strokes');
+  const hillsCanvas = document.getElementById('ink-hills');
+  const hero = document.querySelector('.hero');
+  const footBand = hillsCanvas.parentElement;
+  const bandCanvas = document.getElementById('ink-band');
+  const band = bandCanvas.parentElement;
+
+  const paint = () => {
+    const w = root.clientWidth;
+    const h = Math.ceil(hero.getBoundingClientRect().bottom + window.scrollY);
+    const top = surface(strokesCanvas, w, h);
+    const rnd = seeded(7);
+    const scale = Math.max(0.45, Math.min(1, w / 1200));
+    const brushColor = token('--brush');
+    brush(top, rnd, [-70, h * 0.36], [w * 0.09, h * 0.14], [w * 0.27, -50], 92 * scale, brushColor);
+    brush(top, rnd, [w + 70, h * 0.28], [w * 0.84, h * 0.66], [w * 0.56, h * 0.97], 150 * scale, brushColor);
+    brush(top, rnd, [w + 50, h * 0.58], [w * 0.9, h * 0.8], [w * 0.7, h * 0.95], 48 * scale, brushColor);
+
+    const fw = footBand.clientWidth;
+    const fh = footBand.clientHeight;
+    hills(surface(hillsCanvas, fw, fh), seeded(11), fw, fh, token('--wash'));
+
+    // In the band, keep the strokes where the content leaves room: along the top right above
+    // the first code panel, and below the shorter text column of each section.
+    const bw = band.clientWidth;
+    const bh = band.clientHeight;
+    const sections = band.querySelectorAll('.band-section');
+    const firstEnd = sections[0].offsetHeight;
+    const secondEnd = firstEnd + sections[1].offsetHeight;
+    const strip = surface(bandCanvas, bw, bh);
+    const bandRnd = seeded(23);
+    const bandColor = token('--ai-brush');
+    brush(strip, bandRnd, [bw * 0.6, -50], [bw * 0.82, 60], [bw + 50, 210], 96 * scale, bandColor);
+    brush(strip, bandRnd, [-40, firstEnd - 300], [bw * 0.1, firstEnd - 110], [bw * 0.3, firstEnd - 30], 110 * scale, bandColor);
+    brush(strip, bandRnd, [bw + 60, secondEnd - 380], [bw * 0.88, secondEnd - 130], [bw * 0.62, secondEnd + 20], 120 * scale, bandColor);
+    brush(strip, bandRnd, [-40, bh - 300], [bw * 0.1, bh - 110], [bw * 0.3, bh - 30], 100 * scale, bandColor);
+  };
+
+  let queued = false;
+  const repaint = () => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => { queued = false; paint(); });
+  };
+  new ResizeObserver(repaint).observe(document.body);
+  if (document.fonts) document.fonts.ready.then(repaint);
+
+  /* Theme */
+  const toggle = document.getElementById('theme-toggle');
+  const prefersDark = matchMedia('(prefers-color-scheme: dark)');
+  const effective = () => root.dataset.theme || (prefersDark.matches ? 'dark' : 'light');
+  const refresh = () => {
+    const mode = effective();
+    toggle.dataset.mode = mode;
+    toggle.setAttribute('aria-label', mode === 'dark' ? 'Switch to light theme' : 'Switch to dark theme');
+    repaint();
+  };
+  try {
+    const saved = localStorage.getItem('hato-theme');
+    if (saved === 'light' || saved === 'dark') root.dataset.theme = saved;
+  } catch {}
+  refresh();
+  prefersDark.addEventListener('change', refresh);
+  new MutationObserver(refresh).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  toggle.addEventListener('click', () => {
+    const next = effective() === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = next;
+    try { localStorage.setItem('hato-theme', next); } catch {}
+  });
+
+  /* Tabs */
+  document.querySelectorAll('[role="tablist"]').forEach(list => {
+    const tabs = [...list.querySelectorAll('[role="tab"]')];
+    const select = tab => tabs.forEach(t => {
+      const on = t === tab;
+      t.setAttribute('aria-selected', String(on));
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    });
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => select(tab));
+      tab.addEventListener('keydown', event => {
+        if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
+        const next = tabs[(i + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+        select(next);
+        next.focus();
+        event.preventDefault();
+      });
+    });
+  });
+
+  /* Copy */
+  const copy = document.getElementById('copy-install');
+  const flash = text => {
+    copy.textContent = text;
+    setTimeout(() => { copy.textContent = 'Copy'; }, 1600);
+  };
+  copy.addEventListener('click', () => {
+    const panel = document.querySelector('.install pre:not([hidden])');
+    const selectPanel = () => {
+      const range = document.createRange();
+      range.selectNodeContents(panel);
+      const selection = getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      flash('Selected');
+    };
+    if (!navigator.clipboard) { selectPanel(); return; }
+    navigator.clipboard.writeText(panel.textContent).then(() => flash('Copied'), selectPanel);
+  });
+})();
+</script>
+</body>
+</html>

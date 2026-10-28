@@ -22,7 +22,8 @@ for (taskName in listOf("jar", "sourcesJar")) {
     }
 }
 
-tasks.named<Javadoc>("javadoc") {
+// The API documentation of the javadoc jar and of the GitHub Pages site.
+fun Javadoc.documentPublicApi() {
     exclude("**/internal/**")
     // Javadoc writes its labels in the default locale of the JVM that runs it, so a machine with
     // another language would build different pages from a release tag. -locale cannot fix this:
@@ -37,6 +38,30 @@ tasks.named<Javadoc>("javadoc") {
         "-source-path",
         sourceSets.main.get().java.sourceDirectories.asPath
     )
+}
+
+tasks.named<Javadoc>("javadoc") {
+    documentPublicApi()
+}
+
+// GitHub Pages puts the API documentation of the modules side by side under api/, so the site's
+// copy may link from one module's pages to another's, while the pages in the javadoc jar stand
+// alone. The site project takes this copy through pagesJavadocElements.
+val pagesJavadoc = tasks.register<Javadoc>("pagesJavadoc") {
+    description = "Generates the API documentation for the GitHub Pages site."
+    group = JavaBasePlugin.DOCUMENTATION_GROUP
+    val javadoc = tasks.named<Javadoc>("javadoc").get()
+    source = javadoc.source
+    classpath = javadoc.classpath
+    title = javadoc.title
+    destinationDir = layout.buildDirectory.dir("docs/pagesJavadoc").get().asFile
+    documentPublicApi()
+}
+
+configurations.consumable("pagesJavadocElements") {
+    outgoing.artifact(pagesJavadoc.map { requireNotNull(it.destinationDir) }) {
+        builtBy(pagesJavadoc)
+    }
 }
 
 tasks.named<Jar>("jar") {
