@@ -84,6 +84,23 @@ class ResponseDeadlinesTest {
     }
 
     @Test
+    void one_answer_ends_the_wait_that_duplicate_writes_share() {
+        // Arrange
+        var sut = new ResponseDeadlines(TIMEOUT);
+        sut.add(1, Kind.PUBCOMP, 7);
+        sut.add(2, Kind.PUBCOMP, 7);
+        sut.written(1, 10);
+        sut.written(2, 20);
+
+        // Act
+        sut.answered(Kind.PUBCOMP, 7);
+
+        // Assert
+        assertThat(sut.oldestWait(30)).isEmpty();
+        assertThat(sut.expired(200)).isEmpty();
+    }
+
+    @Test
     void an_answer_before_write_completion_prevents_a_stale_deadline_after_id_reuse() {
         // Arrange
         var sut = new ResponseDeadlines(TIMEOUT);
