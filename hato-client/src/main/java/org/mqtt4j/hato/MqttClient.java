@@ -5,7 +5,7 @@ import java.util.concurrent.CompletableFuture;
 /// Owns an MQTT connection. [#connect()] requests a connection, which the client keeps
 /// re-establishing after a connection ends, as its [ReconnectPolicy] allows, until
 /// [#disconnect()] or [#close()] withdraws the request or a failure that the policy does not
-/// retry ends it; see [MqttClientBuilder#reconnectPolicy].
+/// retry ends it; see [MqttClientBuilder#reconnectPolicy(ReconnectPolicy)].
 /// A disconnected client can connect again until it is closed.
 /// Its methods and those of its subscriptions are safe to call concurrently from any thread.
 ///
@@ -53,6 +53,9 @@ import java.util.concurrent.CompletableFuture;
 public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable {
 
     /// Starts configuration without opening a connection.
+    ///
+    /// @return
+    ///     a new builder
     static MqttClientBuilder builder() {
         return new MqttClientBuilder();
     }
@@ -115,6 +118,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// limits how often one client identifier may connect, as AWS IoT Core allows one CONNECT
     /// per second, may refuse or close the later connections and fail the attempt; MQTT 5.0
     /// needs only one connection.
+    ///
+    /// @return
+    ///     a future that completes with the successful CONNACK that establishes the connection
     CompletableFuture<ConnAck> connect();
 
     /// Observes the current or next established connection without requesting one. Returns an
@@ -133,6 +139,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// keep one pending future and call again only after it completes. A future that then
     /// completed normally means that the client is connected; a failed one means that the client
     /// is closed or the limit is full.
+    ///
+    /// @return
+    ///     a future that completes with the CONNACK of the current or next established connection
     CompletableFuture<ConnAck> whenConnected();
 
     /// Withdraws the connection request: the client stops reconnecting, and an established
@@ -169,6 +178,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// Subscription registrations and pending establishment observations survive disconnection.
     /// Pending removals complete when a nonpersistent connection ends; a persistent session's
     /// removals wait for confirmation on a later connection.
+    ///
+    /// @return
+    ///     a future that completes when the client has disconnected
     CompletableFuture<Void> disconnect();
 
     /// Requests immediate, permanent shutdown without sending DISCONNECT or waiting for I/O
@@ -180,7 +192,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// Discards local session state; a persistent session may remain on the broker until a
     /// later client object with the same identifier replaces it on connecting.
     /// A Will registered with the broker may be published. For a graceful disconnect,
-    /// wait for [#disconnect] to complete successfully before calling this method.
+    /// wait for [#disconnect()] to complete successfully before calling this method.
     @Override
     void close();
 
@@ -210,6 +222,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// resources of a custom transport, from a continuation of this future or after it completes.
     /// Waiting for it inside a handler, listener, supplier, or continuation that the client runs,
     /// or on a thread that such code needs in order to return, never completes.
+    ///
+    /// @return
+    ///     a future that completes at the end of this client's work
     CompletableFuture<Void> terminated();
 
     /// Takes a snapshot of what this client holds and has counted, which only the client can
@@ -225,6 +240,9 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// connection as that interface describes. A client that keeps no statistics, such as an
     /// application's test double, returns a future failed with [UnsupportedOperationException], as
     /// this default method does.
+    ///
+    /// @return
+    ///     a future that completes with the snapshot
     default CompletableFuture<ClientStats> stats() {
         return CompletableFuture.failedFuture(
                 new UnsupportedOperationException("This client keeps no statistics")

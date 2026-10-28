@@ -68,16 +68,19 @@ public final class BrokerCapabilities {
         this.topicAliasMaximum = topicAliasMaximum;
     }
 
-    /// What the broker announces until a test announces something else: the values that MQTT
-    /// 5.0 assumes, except that each client may set up to 16 Topic Aliases.
+    /// {@return what the broker announces until a test announces something else: the values that
+    /// MQTT 5.0 assumes, except that each client may set up to 16 Topic Aliases}
     public static BrokerCapabilities defaults() {
         return DEFAULTS;
     }
 
-    /// Returns a copy with a different highest QoS at which a client may publish, Wills
-    /// included. The broker grants subscriptions at most this QoS as well.
+    /// {@return a copy with a different highest QoS at which a client may publish, Wills
+    /// included} The broker grants subscriptions at most this QoS as well.
     ///
-    /// @throws NullPointerException if `maximumQos` is null
+    /// @param maximumQos
+    ///     the highest QoS at which a client may publish
+    /// @throws NullPointerException
+    ///     if `maximumQos` is null
     public BrokerCapabilities withMaximumQos(Qos maximumQos) {
         return new BrokerCapabilities(
                 requireNonNull(maximumQos, "maximumQos must not be null"),
@@ -90,8 +93,11 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// Returns a copy with a different answer to whether a client may publish retained
-    /// messages, Wills included.
+    /// {@return a copy with a different answer to whether a client may publish retained
+    /// messages, Wills included}
+    ///
+    /// @param retainAvailable
+    ///     whether a client may publish retained messages
     public BrokerCapabilities withRetainAvailable(boolean retainAvailable) {
         return new BrokerCapabilities(
                 maximumQos,
@@ -104,8 +110,11 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// Returns a copy with a different answer to whether a client may subscribe to filters
-    /// that contain wildcards.
+    /// {@return a copy with a different answer to whether a client may subscribe to filters
+    /// that contain wildcards}
+    ///
+    /// @param wildcardSubscriptionAvailable
+    ///     whether a client may subscribe to filters that contain wildcards
     public BrokerCapabilities withWildcardSubscriptionAvailable(
             boolean wildcardSubscriptionAvailable
     ) {
@@ -120,8 +129,11 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// Returns a copy with a different answer to whether a client may give its subscriptions
-    /// Subscription Identifiers, which the broker returns with their deliveries.
+    /// {@return a copy with a different answer to whether a client may give its subscriptions
+    /// Subscription Identifiers, which the broker returns with their deliveries}
+    ///
+    /// @param subscriptionIdentifiersAvailable
+    ///     whether a client may give its subscriptions Subscription Identifiers
     public BrokerCapabilities withSubscriptionIdentifiersAvailable(
             boolean subscriptionIdentifiersAvailable
     ) {
@@ -136,11 +148,14 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// Returns a copy with a different number of QoS 1 and QoS 2 publications that a client may
-    /// have unanswered at once. A publication counts until the broker sends its PUBACK or
+    /// {@return a copy with a different number of QoS 1 and QoS 2 publications that a client may
+    /// have unanswered at once} A publication counts until the broker sends its PUBACK or
     /// PUBCOMP, so one whose response [BrokerControls] holds back goes on counting.
     ///
-    /// @throws IllegalArgumentException if `receiveMaximum` is not between 1 and 65535
+    /// @param receiveMaximum
+    ///     the number of publications that a client may have unanswered at once
+    /// @throws IllegalArgumentException
+    ///     if `receiveMaximum` is not between 1 and 65535
     public BrokerCapabilities withReceiveMaximum(int receiveMaximum) {
         if (receiveMaximum < 1 || receiveMaximum > 65_535) {
             throw new IllegalArgumentException("Receive Maximum must be 1..65535");
@@ -156,10 +171,13 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// Returns a copy with a different largest packet, in bytes including the fixed header,
-    /// that a client may send.
+    /// {@return a copy with a different largest packet, in bytes including the fixed header,
+    /// that a client may send}
     ///
-    /// @throws IllegalArgumentException if `maximumPacketSize` is not between 1 and 268435460
+    /// @param maximumPacketSize
+    ///     the largest packet that a client may send, in bytes
+    /// @throws IllegalArgumentException
+    ///     if `maximumPacketSize` is not between 1 and 268435460
     public BrokerCapabilities withMaximumPacketSize(int maximumPacketSize) {
         if (maximumPacketSize < 1 || maximumPacketSize > LARGEST_PACKET_SIZE) {
             throw new IllegalArgumentException(
@@ -177,10 +195,13 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// Returns a copy with a different number of Topic Aliases that a client may set for its
-    /// connection; with 0, a client may set none.
+    /// {@return a copy with a different number of Topic Aliases that a client may set for its
+    /// connection; with 0, a client may set none}
     ///
-    /// @throws IllegalArgumentException if `topicAliasMaximum` is not between 0 and 65535
+    /// @param topicAliasMaximum
+    ///     the number of Topic Aliases that a client may set for its connection
+    /// @throws IllegalArgumentException
+    ///     if `topicAliasMaximum` is not between 0 and 65535
     public BrokerCapabilities withTopicAliasMaximum(int topicAliasMaximum) {
         if (topicAliasMaximum < 0 || topicAliasMaximum > 65_535) {
             throw new IllegalArgumentException("Topic Alias Maximum must be 0..65535");
@@ -196,37 +217,38 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// The highest QoS at which a client may publish, Wills included.
+    /// {@return the highest QoS at which a client may publish, Wills included}
     public Qos maximumQos() {
         return maximumQos;
     }
 
-    /// Whether a client may publish retained messages, Wills included.
+    /// {@return whether a client may publish retained messages, Wills included}
     public boolean retainAvailable() {
         return retainAvailable;
     }
 
-    /// Whether a client may subscribe to filters that contain wildcards.
+    /// {@return whether a client may subscribe to filters that contain wildcards}
     public boolean wildcardSubscriptionAvailable() {
         return wildcardSubscriptionAvailable;
     }
 
-    /// Whether a client may give its subscriptions Subscription Identifiers.
+    /// {@return whether a client may give its subscriptions Subscription Identifiers}
     public boolean subscriptionIdentifiersAvailable() {
         return subscriptionIdentifiersAvailable;
     }
 
-    /// The number of QoS 1 and QoS 2 publications that a client may have unanswered at once.
+    /// {@return the number of QoS 1 and QoS 2 publications that a client may have unanswered at
+    /// once}
     public int receiveMaximum() {
         return receiveMaximum;
     }
 
-    /// The largest packet, in bytes including the fixed header, that a client may send.
+    /// {@return the largest packet, in bytes including the fixed header, that a client may send}
     public int maximumPacketSize() {
         return maximumPacketSize;
     }
 
-    /// The number of Topic Aliases that a client may set for its connection.
+    /// {@return the number of Topic Aliases that a client may set for its connection}
     public int topicAliasMaximum() {
         return topicAliasMaximum;
     }

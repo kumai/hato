@@ -68,6 +68,9 @@ public final class DeliveryOptions {
 
     /// One delivery at a time, in receive order, on an internal thread: the behavior of
     /// [MqttSubscriber#subscribe(Subscribe, java.util.function.Consumer)].
+    ///
+    /// @return
+    ///     the options for serial delivery
     public static DeliveryOptions serial() {
         return SERIAL;
     }
@@ -81,7 +84,12 @@ public final class DeliveryOptions {
     /// receives the message rather than the delivery, so it cannot acknowledge it. An exception
     /// or a null result ends that delivery as a handler failure.
     ///
-    /// @throws NullPointerException if `selector` is null
+    /// @param selector
+    ///     the function that chooses the executor for each message
+    /// @return
+    ///     the options for the lanes that `selector` chooses
+    /// @throws NullPointerException
+    ///     if `selector` is null
     public static DeliveryOptions lanes(Function<MqttMessage, Executor> selector) {
         requireNonNull(selector, "selector");
         return new DeliveryOptions(new HandlerExecution.Lanes(selector));
@@ -93,19 +101,32 @@ public final class DeliveryOptions {
     /// can share a stripe and then wait for each other. A stripe runs on an internal thread while
     /// it has deliveries, or on the executor that [#withExecutor(Executor)] sets.
     ///
-    /// @throws IllegalArgumentException if `stripes` is less than 1 or greater than 256
+    /// @param stripes
+    ///     the number of stripes
+    /// @return
+    ///     the options for `stripes` stripes keyed by topic
+    /// @throws IllegalArgumentException
+    ///     if `stripes` is less than 1 or greater than 256
     public static DeliveryOptions striped(int stripes) {
         return striped(stripes, MqttMessage::topic);
     }
 
     /// Like [#striped(int)], with the key that `key` returns for each message in place of its
-    /// topic; keys are compared with `equals` and `hashCode`. The key function runs on an
-    /// internal thread, once for each delivery in receive order. It receives the message rather
-    /// than the delivery, so it cannot acknowledge it. An exception or a null result ends that
-    /// delivery as a handler failure.
+    /// topic; keys are compared with [equals][Object#equals(Object)] and
+    /// [hashCode][Object#hashCode()]. The key function runs on an internal thread, once for each
+    /// delivery in receive order. It receives the message rather than the delivery, so it cannot
+    /// acknowledge it. An exception or a null result ends that delivery as a handler failure.
     ///
-    /// @throws IllegalArgumentException if `stripes` is less than 1 or greater than 256
-    /// @throws NullPointerException if `key` is null
+    /// @param stripes
+    ///     the number of stripes
+    /// @param key
+    ///     the function that returns the key of each message
+    /// @return
+    ///     the options for `stripes` stripes keyed by `key`
+    /// @throws IllegalArgumentException
+    ///     if `stripes` is less than 1 or greater than 256
+    /// @throws NullPointerException
+    ///     if `key` is null
     public static DeliveryOptions striped(int stripes, Function<MqttMessage, ?> key) {
         return new DeliveryOptions(new HandlerExecution.Striped(stripes, key, null));
     }
@@ -114,7 +135,12 @@ public final class DeliveryOptions {
     /// on internal threads while deliveries wait, or on the executor that
     /// [#withExecutor(Executor)] sets.
     ///
-    /// @throws IllegalArgumentException if `parallelism` is less than 1 or greater than 256
+    /// @param parallelism
+    ///     the largest number of deliveries that run at the same time
+    /// @return
+    ///     the options for up to `parallelism` deliveries at the same time
+    /// @throws IllegalArgumentException
+    ///     if `parallelism` is less than 1 or greater than 256
     public static DeliveryOptions parallel(int parallelism) {
         return new DeliveryOptions(new HandlerExecution.Parallel(parallelism, null));
     }
@@ -126,18 +152,23 @@ public final class DeliveryOptions {
     /// subscriptions nor the broker's answers to publications, subscriptions, and keep-alive
     /// requests.
     ///
-    /// Inside the handler, `join()` and `get()` of a future that this client returned, or of a
-    /// future made from one, and the `receive` methods of this client's pull subscriptions throw
-    /// [IllegalStateException], even when they would not wait. Read a completed result with
-    /// `getNow`, or chain the next step instead. Other waits are not detected: a handler that
-    /// blocks, or that waits for anything that needs this connection, holds up every subscription
-    /// of the connection, and one that runs for about the keep-alive interval can lose the
-    /// connection.
+    /// Inside the handler, [join()][java.util.concurrent.CompletableFuture#join()] and
+    /// [get()][java.util.concurrent.CompletableFuture#get()] of a future that this client returned,
+    /// or of a future made from one, and the [receive][PullSubscription#receive()] methods of this
+    /// client's pull subscriptions throw [IllegalStateException], even when they would not wait.
+    /// Read a completed result with
+    /// [getNow][java.util.concurrent.CompletableFuture#getNow(Object)], or chain the next step
+    /// instead. Other waits are not detected: a handler that blocks, or that waits for anything
+    /// that needs this connection, holds up every subscription of the connection, and one that runs
+    /// for about the keep-alive interval can lose the connection.
     ///
     /// A delivery that the client cannot run as part of receiving runs on an internal thread, in
     /// the same order and under the same rules. The subscription's buffer, acknowledgement mode,
     /// and failure policy work as for [#serial()]. [#withExecutor(Executor)] rejects these
     /// options.
+    ///
+    /// @return
+    ///     the options for inline delivery
     public static DeliveryOptions inline() {
         return INLINE;
     }
@@ -145,9 +176,15 @@ public final class DeliveryOptions {
     /// Keeps the order, stripes, or parallelism of these options, with each handler running on
     /// `executor` instead of an internal thread. Replaces an executor chosen earlier.
     ///
-    /// @throws NullPointerException if `executor` is null
-    /// @throws IllegalArgumentException if these options are [#lanes(Function)], whose selector
-    ///         chooses the executors, or [#inline()], whose handler runs as part of receiving
+    /// @param executor
+    ///     the executor that runs the handlers
+    /// @return
+    ///     options like these that run each handler on `executor`
+    /// @throws NullPointerException
+    ///     if `executor` is null
+    /// @throws IllegalArgumentException
+    ///     if these options are [#lanes(Function)], whose selector chooses the executors, or
+    ///     [#inline()], whose handler runs as part of receiving
     public DeliveryOptions withExecutor(Executor executor) {
         requireNonNull(executor, "executor");
         return switch (execution) {

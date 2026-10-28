@@ -51,48 +51,51 @@ public final class ClientStats {
         return new ClientStats(snapshot);
     }
 
-    /// The connection's state and attempt numbers.
+    /// {@return the connection's state and attempt numbers}
     public Connection connection() {
         return connection;
     }
 
-    /// Incoming publications, their deliveries, and their acknowledgement exchanges.
+    /// {@return the values of incoming publications, their deliveries, and their
+    /// acknowledgement exchanges}
     public Receiving receiving() {
         return receiving;
     }
 
-    /// Outgoing writes and publication exchanges.
+    /// {@return the values of outgoing writes and publication exchanges}
     public Sending sending() {
         return sending;
     }
 
-    /// The subscription registrations and delivery lanes, in total.
+    /// {@return the values of the subscription registrations and delivery lanes, in total}
     public Subscribing subscribing() {
         return subscribing;
     }
 
-    /// The values of each subscription that the client holds, in no particular order. A
-    /// subscription joins the list when its handle is returned, before the client processes its
-    /// registration, and leaves it once its removal completes or it is closed; a handler that
-    /// still runs then keeps its lane counted in [Subscribing#lanes()]. Every snapshot collects
-    /// these values, so [MqttClient#stats()] takes time in proportion to the subscriptions held.
+    /// {@return the values of each subscription that the client holds, in no particular order}
+    /// A subscription joins the list when its handle is returned, before the client processes
+    /// its registration, and leaves it once its removal completes or it is closed; a handler
+    /// that still runs then keeps its lane counted in [Subscribing#lanes()]. Every snapshot
+    /// collects these values, so [MqttClient#stats()] takes time in proportion to the
+    /// subscriptions held.
     public List<SubscriptionStats> subscriptions() {
         return subscriptions;
     }
 
-    /// Lifetime counts of operations that the client refused for capacity, by the limit that
-    /// refused them. The refused operations failed with [MqttCapacityException].
+    /// {@return lifetime counts of operations that the client refused for capacity, by the limit
+    /// that refused them} The refused operations failed with [MqttCapacityException].
     public Map<CapacityLimit, Long> refusals() {
         return snapshot.refusals();
     }
 
-    /// Lifetime counts of connections that the client ended because it was overloaded, by
-    /// cause. The ending of each such connection carries a [MqttCapacityException].
+    /// {@return lifetime counts of connections that the client ended because it was overloaded,
+    /// by cause} The ending of each such connection carries a [MqttCapacityException].
     public Map<OverloadCause, Long> overloads() {
         return snapshot.overloads();
     }
 
-    /// A lifetime count of [MetricsListener] events dropped because the listener fell behind.
+    /// {@return a lifetime count of [MetricsListener] events dropped because the listener fell
+    /// behind}
     public long droppedMetricEvents() {
         return snapshot.droppedMetricEvents();
     }
@@ -115,8 +118,10 @@ public final class ClientStats {
 
     /// How much of a limit is in use.
     ///
-    /// @param used how much is in use
-    /// @param limit the most that may be in use
+    /// @param used
+    ///     how much is in use
+    /// @param limit
+    ///     the most that may be in use
     public record Usage(long used, long limit) {}
 
     /// The state of a client's connection.
@@ -197,24 +202,26 @@ public final class ClientStats {
             this.values = values;
         }
 
+        /// {@return the connection's state}
         public ConnectionState state() {
             return values.state();
         }
 
-        /// The number of the latest connection attempt, as [ConnAck#connectionAttempt()] and
-        /// [Disconnection#connectionAttempt()] number them, or 0 before the first attempt.
+        /// {@return the number of the latest connection attempt, as
+        /// [ConnAck#connectionAttempt()] and [Disconnection#connectionAttempt()] number them, or 0
+        /// before the first attempt}
         public long attempt() {
             return values.attempt();
         }
 
-        /// The number of the attempt that established the latest connection, or 0 if none has.
-        /// The difference from [#attempt()] counts the attempts since then.
+        /// {@return the number of the attempt that established the latest connection, or 0 if
+        /// none has} The difference from [#attempt()] counts the attempts since then.
         public long establishedAttempt() {
             return values.establishedAttempt();
         }
 
-        /// A lifetime count of [ConnectionListener] notifications dropped because the listener
-        /// fell behind.
+        /// {@return a lifetime count of [ConnectionListener] notifications dropped because the
+        /// listener fell behind}
         public long droppedNotifications() {
             return values.droppedNotifications();
         }
@@ -223,10 +230,10 @@ public final class ClientStats {
     /// Incoming publications, their deliveries, and their acknowledgement exchanges.
     ///
     /// Each unfinished QoS 1 or QoS 2 reception counts in one stage: awaiting its conditions
-    /// (a handler, a hand-off acceptor, or `ack()`, as its [AckMode] requires), awaiting its turn
-    /// (its acknowledgement is due but follows an earlier reception, in receive order, or waits
-    /// for send capacity), awaiting the write of its PUBACK or PUBREC, awaiting PUBREL, or
-    /// awaiting the write of its PUBCOMP.
+    /// (a handler, a hand-off acceptor, or [ack()][MqttDelivery#ack()], as its [AckMode]
+    /// requires), awaiting its turn (its acknowledgement is due but follows an earlier reception,
+    /// in receive order, or waits for send capacity), awaiting the write of its PUBACK or PUBREC,
+    /// awaiting PUBREL, or awaiting the write of its PUBCOMP.
     public static final class Receiving {
 
         private final ClientSnapshot.Receiving values;
@@ -235,97 +242,107 @@ public final class ClientStats {
             this.values = values;
         }
 
-        /// A lifetime count of the PUBLISH packets received at `qos`, retransmissions included.
+        /// {@return a lifetime count of the PUBLISH packets received at `qos`, retransmissions
+        /// included}
+        ///
+        /// @param qos
+        ///     the QoS of the packets to count
         public long publishes(Qos qos) {
             return values.publishes().getOrDefault(qos, 0L);
         }
 
-        /// A lifetime count of received publications that matched no subscription.
+        /// {@return a lifetime count of received publications that matched no subscription}
         public long unmatched() {
             return values.unmatched();
         }
 
-        /// A lifetime count of received QoS 0 publications that the client dropped before
-        /// routing them, because they arrived faster than it could route them. They reach no
-        /// subscription, and [#publishes(Qos)] counts them.
+        /// {@return a lifetime count of received QoS 0 publications that the client dropped
+        /// before routing them, because they arrived faster than it could route them} They reach
+        /// no subscription, and [#publishes(Qos)] counts them.
         public long unrouted() {
             return values.unrouted();
         }
 
-        /// A lifetime count of the deliveries that subscriptions took: one for each copy of a
-        /// received publication that a subscription's buffer took. A retransmission that joins
-        /// a copy still held adds none, and copies that did not fit, counted under
+        /// {@return a lifetime count of the deliveries that subscriptions took: one for each copy
+        /// of a received publication that a subscription's buffer took} A retransmission that
+        /// joins a copy still held adds none, and copies that did not fit, counted under
         /// [DropReason#SUBSCRIPTION_FULL] and [DropReason#CLIENT_FULL], are not included.
         public long deliveries() {
             return values.deliveries();
         }
 
-        /// Lifetime counts of deliveries that left their subscription unprocessed, by reason,
-        /// across all subscriptions, including those that have ended.
+        /// {@return lifetime counts of deliveries that left their subscription unprocessed, by
+        /// reason, across all subscriptions, including those that have ended}
         public Map<DropReason, Long> dropped() {
             return values.dropped();
         }
 
-        /// The deliveries that the client holds, against its limit for all subscriptions.
+        /// {@return the deliveries that the client holds, against its limit for all
+        /// subscriptions}
         public Usage heldDeliveries() {
             return values.heldDeliveries();
         }
 
-        /// The bytes that the deliveries the client holds count against its limit for all
-        /// subscriptions: the size of each received PUBLISH and an allowance for each of its
-        /// properties, which take more memory than their encoding.
+        /// {@return the bytes that the deliveries the client holds count against its limit for
+        /// all subscriptions: the size of each received PUBLISH and an allowance for each of its
+        /// properties, which take more memory than their encoding}
         public Usage heldBytes() {
             return values.heldBytes();
         }
 
-        /// The acknowledgement conditions that the client holds for unfinished QoS 1 and QoS 2
-        /// receptions, one for each subscription that took a copy, against its limit for all
-        /// subscriptions. A reception keeps them until it ends, also after its deliveries were
-        /// processed, so receptions that wait for an earlier one keep theirs. A reception that
-        /// would exceed the limit ends the connection, counted under
+        /// {@return the acknowledgement conditions that the client holds for unfinished QoS 1
+        /// and QoS 2 receptions, one for each subscription that took a copy, against its limit
+        /// for all subscriptions} A reception keeps them until it ends, also after its
+        /// deliveries were processed, so receptions that wait for an earlier one keep theirs. A
+        /// reception that would exceed the limit ends the connection, counted under
         /// [OverloadCause#DELIVERIES].
         public Usage heldConditions() {
             return values.heldConditions();
         }
 
-        /// Unfinished receptions whose acknowledgement awaits its conditions.
+        /// {@return the number of unfinished receptions whose acknowledgement awaits its
+        /// conditions}
         public long awaitingConditions() {
             return values.awaitingConditions();
         }
 
-        /// Unfinished receptions whose acknowledgement is due but awaits its turn.
+        /// {@return the number of unfinished receptions whose acknowledgement is due but awaits
+        /// its turn}
         public long awaitingTurn() {
             return values.awaitingTurn();
         }
 
-        /// Unfinished receptions whose PUBACK or PUBREC awaits its write.
+        /// {@return the number of unfinished receptions whose PUBACK or PUBREC awaits its write}
         public long awaitingAcknowledgementWrite() {
             return values.awaitingAcknowledgementWrite();
         }
 
-        /// QoS 2 receptions that await the broker's PUBREL, which has no deadline.
+        /// {@return the number of QoS 2 receptions that await the broker's PUBREL, which has no
+        /// deadline}
         public long awaitingRelease() {
             return values.awaitingRelease();
         }
 
-        /// QoS 2 receptions whose PUBCOMP awaits its write.
+        /// {@return the number of QoS 2 receptions whose PUBCOMP awaits its write}
         public long awaitingCompletionWrite() {
             return values.awaitingCompletionWrite();
         }
 
-        /// All unfinished QoS 1 and QoS 2 receptions, against the client's limit, which includes
-        /// receptions that a persistent session carries across connections.
+        /// {@return all unfinished QoS 1 and QoS 2 receptions, against the client's limit, which
+        /// includes receptions that a persistent session carries across connections}
         public Usage receptions() {
             return values.receptions();
         }
 
-        /// How long the oldest reception that awaits its conditions has done so, which also
-        /// holds back the acknowledgements counted as awaiting their turn; empty if none does.
+        /// {@return how long the oldest reception that awaits its conditions has done so, which
+        /// also holds back the acknowledgements counted as awaiting their turn; empty if none
+        /// does}
         public Optional<Duration> oldestAwaitingConditions() {
             return Optional.ofNullable(values.oldestAwaitingConditions());
         }
 
-        /// How long the oldest reception that awaits PUBREL has done so; empty if none does.
+        /// {@return how long the oldest reception that awaits PUBREL has done so; empty if none
+        /// does}
         public Optional<Duration> oldestAwaitingRelease() {
             return Optional.ofNullable(values.oldestAwaitingRelease());
         }
@@ -340,64 +357,67 @@ public final class ClientStats {
             this.values = values;
         }
 
-        /// The operation capacity in use, against its limit. A publication holds a slot until just
-        /// before its future completes, so its continuations can start another operation in its
-        /// place, and so does each concurrent [MqttClient#connect()] or [MqttClient#disconnect()]
-        /// call beyond the first of each.
+        /// {@return the operation capacity in use, against its limit} A publication holds a slot
+        /// until just before its future completes, so its continuations can start another
+        /// operation in its place, and so does each concurrent [MqttClient#connect()] or
+        /// [MqttClient#disconnect()] call beyond the first of each.
         public Usage operations() {
             return values.operations();
         }
 
-        /// The writes of any packet that the send queue accepted and has not written yet,
-        /// against its limit.
+        /// {@return the writes of any packet that the send queue accepted and has not written
+        /// yet, against its limit}
         public Usage queuedWrites() {
             return values.queuedWrites();
         }
 
-        /// The bytes of the writes counted by [#queuedWrites()], against the send queue's limit.
+        /// {@return the bytes of the writes counted by [#queuedWrites()], against the send
+        /// queue's limit}
         public Usage queuedBytes() {
             return values.queuedBytes();
         }
 
-        /// QoS 1 publications that await PUBACK, including those that wait to be sent.
+        /// {@return the number of QoS 1 publications that await PUBACK, including those that wait
+        /// to be sent}
         public long awaitingPubAck() {
             return values.awaitingPubAck();
         }
 
-        /// QoS 2 publications that await PUBREC, including those that wait to be sent.
+        /// {@return the number of QoS 2 publications that await PUBREC, including those that wait
+        /// to be sent}
         public long awaitingPubRec() {
             return values.awaitingPubRec();
         }
 
-        /// QoS 2 exchanges that await PUBCOMP.
+        /// {@return the number of QoS 2 exchanges that await PUBCOMP}
         public long awaitingPubComp() {
             return values.awaitingPubComp();
         }
 
-        /// All unfinished QoS 1 and QoS 2 publications, against
-        /// [MqttClientBuilder#maxInflightPublishes(int)].
+        /// {@return all unfinished QoS 1 and QoS 2 publications, against
+        /// [MqttClientBuilder#maxInflightPublishes(int)]}
         public Usage publications() {
             return values.publications();
         }
 
-        /// The bytes that unfinished publications keep, against their limit: a persistent
-        /// session keeps a publication until PUBACK or PUBREC, and a nonpersistent one only
-        /// while it waits to be sent.
+        /// {@return the bytes that unfinished publications keep, against their limit: a
+        /// persistent session keeps a publication until PUBACK or PUBREC, and a nonpersistent
+        /// one only while it waits to be sent}
         public Usage keptBytes() {
             return values.keptBytes();
         }
 
-        /// How many more QoS 1 and QoS 2 publications the established MQTT 5.0 connection lets
-        /// the client have in progress, within the broker's Receive Maximum; empty without an
-        /// established MQTT 5.0 connection.
+        /// {@return how many more QoS 1 and QoS 2 publications the established MQTT 5.0
+        /// connection lets the client have in progress, within the broker's Receive Maximum;
+        /// empty without an established MQTT 5.0 connection}
         public OptionalInt quota() {
             Integer quota = values.quota();
             return quota == null ? OptionalInt.empty() : OptionalInt.of(quota);
         }
 
-        /// How long the oldest response that the client awaits, a PUBACK, PUBREC, PUBCOMP,
-        /// SUBACK, or UNSUBACK, has been awaited since the write that it answers completed;
-        /// empty if none is awaited. The response timeout of
+        /// {@return how long the oldest response that the client awaits, a PUBACK, PUBREC,
+        /// PUBCOMP, SUBACK, or UNSUBACK, has been awaited since the write that it answers
+        /// completed; empty if none is awaited} The response timeout of
         /// [MqttClientBuilder#responseTimeout(Duration)] counts from the same time.
         public Optional<Duration> oldestResponseWait() {
             return Optional.ofNullable(values.oldestResponseWait());
@@ -413,32 +433,33 @@ public final class ClientStats {
             this.values = values;
         }
 
-        /// The registrations that the client has processed, against
+        /// {@return the registrations that the client has processed, against
         /// [MqttClientBuilder#maxSubscriptions(int)]: the sum of [#established()],
-        /// [#pending()], and [#removing()].
+        /// [#pending()], and [#removing()]}
         public Usage registrations() {
             return values.registrations();
         }
 
-        /// Registrations that the broker has granted.
+        /// {@return the number of registrations that the broker has granted}
         public long established() {
             return values.established();
         }
 
-        /// Registrations that wait for a connection or for the broker's SUBACK.
+        /// {@return the number of registrations that wait for a connection or for the broker's
+        /// SUBACK}
         public long pending() {
             return values.pending();
         }
 
-        /// Registrations whose removal waits for the broker's UNSUBACK or for a connection that
-        /// discards the session.
+        /// {@return the number of registrations whose removal waits for the broker's UNSUBACK or
+        /// for a connection that discards the session}
         public long removing() {
             return values.removing();
         }
 
-        /// The delivery lanes, one for each subscription, including the lanes of stopped
-        /// subscriptions whose handlers have not returned, against
-        /// [MqttClientBuilder#maxSubscriptions(int)]. These are not the application lanes that
+        /// {@return the delivery lanes, one for each subscription, including the lanes of
+        /// stopped subscriptions whose handlers have not returned, against
+        /// [MqttClientBuilder#maxSubscriptions(int)]} These are not the application lanes that
         /// [DeliveryOptions#lanes(java.util.function.Function)] chooses.
         public Usage lanes() {
             return values.lanes();
@@ -454,37 +475,39 @@ public final class ClientStats {
             this.values = values;
         }
 
-        /// The subscription's handle.
+        /// {@return the subscription's handle}
         public Subscription subscription() {
             return values.subscription();
         }
 
+        /// {@return the subscription's [filter][Subscription#filter()]}
         public TopicFilter filter() {
             return values.filter();
         }
 
-        /// Deliveries that wait for a handler, an acceptor, or a receiver.
+        /// {@return the number of deliveries that wait for a handler, an acceptor, or a receiver}
         public long waiting() {
             return values.waiting();
         }
 
-        /// Deliveries that a handler or a hand-off acceptor is processing.
+        /// {@return the number of deliveries that a handler or a hand-off acceptor is processing}
         public long running() {
             return values.running();
         }
 
-        /// Deliveries that a handler, an acceptor, or a receiver has processed, and whose
-        /// [MqttDelivery#ack()] has not been called yet.
+        /// {@return the number of deliveries that a handler, an acceptor, or a receiver has
+        /// processed, and whose [MqttDelivery#ack()] has not been called yet}
         public long awaitingAck() {
             return values.awaitingAck();
         }
 
-        /// [Subscribe#bufferCapacity()].
+        /// {@return the subscription's [buffer capacity][Subscribe#bufferCapacity()]}
         public int bufferCapacity() {
             return values.bufferCapacity();
         }
 
-        /// Lifetime counts of the subscription's deliveries that left it unprocessed, by reason.
+        /// {@return lifetime counts of the subscription's deliveries that left it unprocessed, by
+        /// reason}
         public Map<DropReason, Long> dropped() {
             return values.dropped();
         }

@@ -30,7 +30,7 @@ import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// Configures a client without opening a connection. Not thread safe.
-/// Set [#server(URI)] before calling [#build]; the other settings have defaults.
+/// Set [#server(URI)] before calling [#build()]; the other settings have defaults.
 /// Invalid or unsupported configuration is rejected with [IllegalArgumentException].
 public final class MqttClientBuilder {
 
@@ -124,10 +124,15 @@ public final class MqttClientBuilder {
     /// respectively; a broker's WebSocket listener often has its own port and path, such as
     /// `ws://broker.example.com:8080/mqtt`. A `ws` or `wss` URI keeps its path and query for the
     /// opening handshake, and connects directly, without a proxy that the JVM configures for
-    /// HTTP. Hosts must satisfy [URI#parseServerAuthority]; names containing underscores are
+    /// HTTP. Hosts must satisfy [URI#parseServerAuthority()]; names containing underscores are
     /// rejected. Schemes must be in lower case. User information and fragments are not accepted,
     /// nor are paths and queries for `mqtt` and `mqtts`. Rejection messages hide any user
     /// information in the given URI.
+    ///
+    /// @param value
+    ///     the broker URI
+    /// @return
+    ///     this builder
     public MqttClientBuilder server(URI value) {
         requireNonNull(value, "server");
         try {
@@ -176,6 +181,11 @@ public final class MqttClientBuilder {
     /// stop it. With a persistent session, a client that connects while another one runs with
     /// the same identifier also discards that client's session and the messages stored for it;
     /// see [MqttClient#connect()].
+    ///
+    /// @param value
+    ///     the client identifier
+    /// @return
+    ///     this builder
     public MqttClientBuilder clientId(String value) {
         requireNonNull(value, "clientId");
         MqttString.validate(value);
@@ -190,6 +200,11 @@ public final class MqttClientBuilder {
     /// broker without MQTT 5.0. An MQTT 5.0 broker announces limits when it accepts a
     /// connection, and the client keeps within them; see [ConnAck] and
     /// [MqttPublisher#publish(MqttMessage)].
+    ///
+    /// @param value
+    ///     the MQTT version
+    /// @return
+    ///     this builder
     public MqttClientBuilder version(MqttVersion value) {
         version = requireNonNull(value, "version");
         return this;
@@ -211,6 +226,11 @@ public final class MqttClientBuilder {
     /// zero selects Clean Session 1 and a positive value Clean Session 0, apart from the
     /// connection that discards a broker session, and the broker determines how long the
     /// session lasts.
+    ///
+    /// @param value
+    ///     how long the session outlasts a connection
+    /// @return
+    ///     this builder
     public MqttClientBuilder sessionExpiry(Duration value) {
         sessionExpiry = requireNonNull(value, "sessionExpiry");
         return this;
@@ -239,6 +259,11 @@ public final class MqttClientBuilder {
     /// with [ReasonCode#NOT_AUTHORIZED], the client reconnects and evaluates the supplier again.
     /// A broker that still sends an AUTH packet, or an Authentication Method in CONNACK, breaks
     /// the protocol: the attempt or the connection ends with [MqttProtocolException].
+    ///
+    /// @param value
+    ///     the credentials supplier
+    /// @return
+    ///     this builder
     public MqttClientBuilder credentials(Supplier<MqttCredentials> value) {
         credentials = requireNonNull(value, "credentials");
         return this;
@@ -254,6 +279,11 @@ public final class MqttClientBuilder {
     /// Wait for [MqttClient#disconnect()] to complete successfully before [MqttClient#close()]
     /// so closing cannot discard the pending DISCONNECT. Completion confirms the write;
     /// the broker does not acknowledge receipt.
+    ///
+    /// @param value
+    ///     the Will message
+    /// @return
+    ///     this builder
     public MqttClientBuilder will(MqttMessage value) {
         will = requireNonNull(value, "will");
         return this;
@@ -271,6 +301,11 @@ public final class MqttClientBuilder {
     /// HiveMQ CE then publish the old session's Will at once, while Mosquitto discards it.
     /// [#build()] rejects a positive delay without a [#will(MqttMessage)], and any positive
     /// delay for MQTT 3.1.1, which has no Will Delay.
+    ///
+    /// @param value
+    ///     the delay of the Will
+    /// @return
+    ///     this builder
     public MqttClientBuilder willDelay(Duration value) {
         willDelay = requireNonNull(value, "willDelay");
         return this;
@@ -280,6 +315,11 @@ public final class MqttClientBuilder {
     /// Idle time is measured from completed writes. The interval also bounds a PINGREQ write
     /// and the wait for its PINGRESP, together. An MQTT 5.0 broker can set another interval for
     /// a connection with Server Keep Alive, which the client then follows on that connection.
+    ///
+    /// @param value
+    ///     the keep-alive interval
+    /// @return
+    ///     this builder
     public MqttClientBuilder keepAlive(Duration value) {
         requireNonNull(value, "keepAlive");
         if (value.isNegative() || value.getNano() != 0
@@ -298,6 +338,11 @@ public final class MqttClientBuilder {
     /// session, as [MqttClient#connect()] describes, applies it to each of its connections and
     /// DISCONNECT writes, so it can take several times this duration.
     /// Defaults to 30 seconds. Must be positive and no greater than 2147483647 milliseconds.
+    ///
+    /// @param value
+    ///     the deadline for establishing each connection
+    /// @return
+    ///     this builder
     public MqttClientBuilder connectionTimeout(Duration value) {
         requireNonNull(value, "connectionTimeout");
         connectionTimeout = requireTimeout(value, "Connection timeout");
@@ -312,6 +357,11 @@ public final class MqttClientBuilder {
     /// and an unanswered SUBSCRIBE in either kind of session. Other responses and PINGRESP do
     /// not extend the deadline, and keep-alive does not change it, even when disabled.
     /// Defaults to 60 seconds. Must be positive and no greater than 2147483647 milliseconds.
+    ///
+    /// @param value
+    ///     how long the broker may take to answer
+    /// @return
+    ///     this builder
     public MqttClientBuilder responseTimeout(Duration value) {
         requireNonNull(value, "responseTimeout");
         responseTimeout = requireTimeout(value, "Response timeout");
@@ -325,6 +375,11 @@ public final class MqttClientBuilder {
     /// default classification of broker reason codes that [ReconnectPolicy] describes.
     /// [ReconnectPolicy#disabled()] leaves a client disconnected until the next
     /// [MqttClient#connect()].
+    ///
+    /// @param value
+    ///     the reconnect policy
+    /// @return
+    ///     this builder
     public MqttClientBuilder reconnectPolicy(ReconnectPolicy value) {
         reconnectPolicy = requireNonNull(value, "reconnectPolicy");
         return this;
@@ -341,6 +396,11 @@ public final class MqttClientBuilder {
     /// as a very large number of User Properties, also ends the connection with
     /// [MqttProtocolException] and [ReasonCode#PACKET_TOO_LARGE]. Brokers do not learn this
     /// limit.
+    ///
+    /// @param value
+    ///     the largest incoming packet size in bytes, including the fixed header
+    /// @return
+    ///     this builder
     public MqttClientBuilder maxPacketSize(int value) {
         if (value < MIN_PACKET_SIZE || value > MAX_PACKET_SIZE) {
             throw new IllegalArgumentException(
@@ -364,6 +424,11 @@ public final class MqttClientBuilder {
     /// The client keeps its other limits internal, and they may change: the bytes that unfinished
     /// publications keep, the operation and send capacity that publications use, which grow with
     /// this limit, and the capacity for incoming QoS 1 and QoS 2 exchanges.
+    ///
+    /// @param value
+    ///     the limit on unfinished QoS 1 and QoS 2 publications
+    /// @return
+    ///     this builder
     public MqttClientBuilder maxInflightPublishes(int value) {
         if (value < 1 || value > MAX_INFLIGHT_PUBLISHES) {
             throw new IllegalArgumentException(
@@ -389,6 +454,11 @@ public final class MqttClientBuilder {
     /// beyond the limit ends its handle, and [Subscription#established()] fails with
     /// [MqttCapacityException]. The client keeps the deliveries that it holds across all
     /// subscriptions within an internal limit.
+    ///
+    /// @param value
+    ///     the limit on the subscriptions that the client holds
+    /// @return
+    ///     this builder
     public MqttClientBuilder maxSubscriptions(int value) {
         if (value < 1 || value > MAX_SUBSCRIPTIONS) {
             throw new IllegalArgumentException("Subscriptions must be 1.." + MAX_SUBSCRIPTIONS);
@@ -398,12 +468,17 @@ public final class MqttClientBuilder {
     }
 
     /// Supplies monotonic time and delayed callbacks. Defaults to a shared daemon timer with
-    /// [System#nanoTime]. The scheduler is borrowed and is not closed with the client.
+    /// [System#nanoTime()]. The scheduler is borrowed and is not closed with the client.
     /// The default transports use it for connection deadlines, including the TLS handshake and
     /// the WebSocket opening handshake, and for the grace periods of closing TCP and TLS
     /// connections and the WebSocket closing handshake. JDK socket connection and name resolution
     /// waits, and the JDK's own deadline for the WebSocket opening handshake, still use real time.
     /// Custom transports manage their own clocks.
+    ///
+    /// @param value
+    ///     the timer scheduler
+    /// @return
+    ///     this builder
     public MqttClientBuilder timerScheduler(TimerScheduler value) {
         scheduler = requireNonNull(value, "timerScheduler");
         return this;
@@ -411,6 +486,11 @@ public final class MqttClientBuilder {
 
     /// Registers the single listener for connection and subscription notifications; defaults
     /// to no action.
+    ///
+    /// @param value
+    ///     the connection listener
+    /// @return
+    ///     this builder
     public MqttClientBuilder connectionListener(ConnectionListener value) {
         listener = requireNonNull(value, "connectionListener");
         return this;
@@ -419,6 +499,11 @@ public final class MqttClientBuilder {
     /// Registers the single listener for the timings of publications and deliveries; see
     /// [MetricsListener]. Without one, which is the default, the client reads no time and
     /// creates no event for them.
+    ///
+    /// @param value
+    ///     the metrics listener
+    /// @return
+    ///     this builder
     public MqttClientBuilder metricsListener(MetricsListener value) {
         metrics = requireNonNull(value, "metricsListener");
         return this;
@@ -429,6 +514,11 @@ public final class MqttClientBuilder {
     /// reused across connection attempts. Initialize it before building and do not reinitialize
     /// it while the client is in use. Explicit TLS settings require `mqtts` or `wss` and cannot
     /// be combined with [#transportFactory(Transport.Factory)].
+    ///
+    /// @param value
+    ///     the TLS context
+    /// @return
+    ///     this builder
     public MqttClientBuilder sslContext(SSLContext value) {
         sslContext = requireNonNull(value, "sslContext");
         return this;
@@ -459,6 +549,11 @@ public final class MqttClientBuilder {
     /// builder.sslParameters(parameters ->
     ///         parameters.setApplicationProtocols(new String[]{"x-amzn-mqtt-ca"}));
     /// ```
+    ///
+    /// @param value
+    ///     the customizer of the TLS parameters
+    /// @return
+    ///     this builder
     public MqttClientBuilder sslParameters(Consumer<SSLParameters> value) {
         sslParameters = requireNonNull(value, "sslParameters");
         return this;
@@ -470,19 +565,27 @@ public final class MqttClientBuilder {
     /// client owns and closes the returned transports.
     /// An explicit factory cannot be combined with [#sslContext(SSLContext)] or
     /// [#sslParameters(Consumer)]. The factory's transports must reject unsupported URI schemes.
+    ///
+    /// @param value
+    ///     the transport factory
+    /// @return
+    ///     this builder
     public MqttClientBuilder transportFactory(Transport.Factory value) {
         transportFactory = requireNonNull(value, "transportFactory");
         return this;
     }
 
-    /// Creates a disconnected client. Call [MqttClient#connect] to open the connection.
+    /// Creates a disconnected client. Call [MqttClient#connect()] to open the connection.
     ///
-    /// @throws IllegalStateException if the server has not been specified
-    /// @throws IllegalArgumentException if the session expiry is out of range, TLS settings are
-    ///     invalid or incompatible, a persistent session has no explicit client id, the Will
-    ///     payload exceeds 65535 bytes, the Will's properties exceed 65535 bytes, the Will delay
-    ///     is out of range or positive without a Will, or MQTT 3.1.1 is chosen with Will
-    ///     properties or a positive Will delay
+    /// @return
+    ///     the new client
+    /// @throws IllegalStateException
+    ///     if the server has not been specified
+    /// @throws IllegalArgumentException
+    ///     if the session expiry is out of range, TLS settings are invalid or incompatible, a
+    ///     persistent session has no explicit client id, the Will payload exceeds 65535 bytes,
+    ///     the Will's properties exceed 65535 bytes, the Will delay is out of range or positive
+    ///     without a Will, or MQTT 3.1.1 is chosen with Will properties or a positive Will delay
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null) {

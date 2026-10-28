@@ -27,12 +27,18 @@ public interface MetricsListener {
     /// Called once for each publication that the client admitted, when its future completes,
     /// whether it succeeded or failed. A publication refused at once, whose future has already
     /// failed when [MqttPublisher#publish(MqttMessage)] returns, produces none.
+    ///
+    /// @param completion
+    ///     how the publication completed
     default void onPublishCompleted(PublishCompletion completion) {
     }
 
     /// Called once for each delivery when application code receives it: when its handler
     /// starts, when its hand-off acceptor is called with it, or when a pull receive returns it.
     /// A delivery that the client discards before then produces none.
+    ///
+    /// @param start
+    ///     when application code received the delivery
     default void onDeliveryStarted(DeliveryStart start) {
     }
 
@@ -55,32 +61,47 @@ public interface MetricsListener {
             this.duration = duration;
         }
 
-        /// A publication at `qos` that succeeded `duration` after its admission.
+        /// {@return the completion of a publication at `qos` that succeeded `duration` after its
+        /// admission}
         ///
-        /// @throws IllegalArgumentException if `duration` is negative
+        /// @param qos
+        ///     the QoS that the publication was sent with
+        /// @param duration
+        ///     the time from the publication's admission to the completion of its future
+        /// @throws IllegalArgumentException
+        ///     if `duration` is negative
         public static PublishCompletion of(Qos qos, Duration duration) {
             return new PublishCompletion(qos, null, duration);
         }
 
-        /// A publication at `qos` whose future failed with `failure`, `duration` after its
-        /// admission.
+        /// {@return the completion of a publication at `qos` whose future failed with `failure`,
+        /// `duration` after its admission}
         ///
-        /// @throws IllegalArgumentException if `duration` is negative
+        /// @param qos
+        ///     the QoS that the publication was sent with
+        /// @param failure
+        ///     the exception with which the publication's future failed
+        /// @param duration
+        ///     the time from the publication's admission to the completion of its future
+        /// @throws IllegalArgumentException
+        ///     if `duration` is negative
         public static PublishCompletion of(Qos qos, Throwable failure, Duration duration) {
             return new PublishCompletion(qos, requireNonNull(failure, "failure"), duration);
         }
 
-        /// The QoS that the publication was sent with.
+        /// {@return the QoS that the publication was sent with}
         public Qos qos() {
             return qos;
         }
 
-        /// The exception with which the publication's future failed, or empty if it succeeded.
+        /// {@return the exception with which the publication's future failed, or empty if it
+        /// succeeded}
         public Optional<Throwable> failure() {
             return Optional.ofNullable(failure);
         }
 
-        /// The time from when the client admitted the publication to when its future completed.
+        /// {@return the time from when the client admitted the publication to when its future
+        /// completed}
         public Duration duration() {
             return duration;
         }
@@ -122,21 +143,26 @@ public interface MetricsListener {
             this.waited = waited;
         }
 
-        /// A delivery of `subscription` that application code received `waited` after the
-        /// client received its PUBLISH.
+        /// {@return the start of a delivery of `subscription` that application code received
+        /// `waited` after the client received its PUBLISH}
         ///
-        /// @throws IllegalArgumentException if `waited` is negative
+        /// @param subscription
+        ///     the subscription whose delivery this is
+        /// @param waited
+        ///     how long the delivery waited after the client received its PUBLISH
+        /// @throws IllegalArgumentException
+        ///     if `waited` is negative
         public static DeliveryStart of(Subscription subscription, Duration waited) {
             return new DeliveryStart(subscription, waited);
         }
 
-        /// The subscription whose delivery this is.
+        /// {@return the subscription whose delivery this is}
         public Subscription subscription() {
             return subscription;
         }
 
-        /// The time from when the client received the PUBLISH from its transport to when
-        /// application code received the delivery.
+        /// {@return the time from when the client received the PUBLISH from its transport to
+        /// when application code received the delivery}
         public Duration waited() {
             return waited;
         }

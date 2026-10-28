@@ -10,7 +10,16 @@ public sealed interface ReceiveResult {
 
     /// One delivery handed to this caller. Its acknowledgement follows the subscription's
     /// [AckMode]; receiving it does not imply that application processing has finished.
+    ///
+    /// @param delivery
+    ///     the delivery handed to this caller
     record Received(MqttDelivery delivery) implements ReceiveResult {
+        /// Creates the outcome that hands `delivery` to the caller.
+        ///
+        /// @param delivery
+        ///     the delivery handed to the caller
+        /// @throws NullPointerException
+        ///     if `delivery` is null
         public Received {
             requireNonNull(delivery, "delivery");
         }

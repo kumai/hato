@@ -11,11 +11,11 @@ import java.util.concurrent.CompletableFuture;
 /// or a SUBACK that violates the protocol ends the subscription permanently.
 public interface Subscription extends AutoCloseable {
 
-    /// The original filter sent to the broker, including any shared group name.
+    /// {@return the original filter sent to the broker, including any shared group name}
     TopicFilter filter();
 
-    /// The maximum QoS granted by the most recent successful SUBACK, which can be lower than
-    /// requested, or empty until a successful SUBACK has granted one. Re-creation can update
+    /// {@return the maximum QoS granted by the most recent successful SUBACK, which can be lower
+    /// than requested, or empty until a successful SUBACK has granted one} Re-creation can update
     /// this value; it retains its last value while disconnected or after the subscription ends.
     Optional<Qos> grantedQos();
 
@@ -44,6 +44,9 @@ public interface Subscription extends AutoCloseable {
     /// completion or cancellation does not release a pending slot before the client resolves the
     /// observation, so each call made while the subscription is not established holds one: a
     /// periodic check keeps one pending future and calls again only after it completes.
+    ///
+    /// @return
+    ///     a future that completes with the granted QoS on establishment
     CompletableFuture<Qos> established();
 
     /// Stops new local delivery when called and observes confirmed removal. Deliveries already
@@ -85,6 +88,9 @@ public interface Subscription extends AutoCloseable {
     /// nothing; deliveries an earlier call accepted still finish. Calls after client shutdown
     /// has been requested complete locally and discard queued deliveries. Handlers already
     /// running can finish.
+    ///
+    /// @return
+    ///     a future that completes once removal is confirmed
     CompletableFuture<Void> unsubscribe();
 
     /// Observes the end of this subscription's local work without requesting it. The future
@@ -108,7 +114,10 @@ public interface Subscription extends AutoCloseable {
     /// order to return, never completes. The default implementation throws
     /// [UnsupportedOperationException].
     ///
-    /// @throws UnsupportedOperationException if this implementation cannot observe termination
+    /// @return
+    ///     a future that completes once this subscription's local work has ended
+    /// @throws UnsupportedOperationException
+    ///     if this implementation cannot observe termination
     default CompletableFuture<Void> terminated() {
         throw new UnsupportedOperationException("This subscription does not observe termination");
     }

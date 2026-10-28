@@ -14,7 +14,7 @@ import static java.util.Objects.requireNonNull;
 /// observation that fails this way, such as one returned by [Subscription#unsubscribe()],
 /// leaves the request it observes in place.
 ///
-/// As a [Disconnection#cause], or the cause of [MqttConnectException] or
+/// As a [Disconnection#cause()], or the cause of [MqttConnectException] or
 /// [MqttConnectionLostException], this means overload ended the affected connection, and
 /// [#limit()] is empty; [ClientStats#overloads()] counts such endings by cause.
 /// Pending operations fail with that connection's termination.
@@ -26,18 +26,26 @@ public final class MqttCapacityException extends MqttException {
     private final @Nullable CapacityLimit limit;
 
     /// Describes an overload that ended a connection.
+    ///
+    /// @param message
+    ///     the detail message
     public MqttCapacityException(String message) {
         super(message);
         limit = null;
     }
 
     /// Describes an operation that `limit` refused.
+    ///
+    /// @param message
+    ///     the detail message
+    /// @param limit
+    ///     the limit that refused the operation
     public MqttCapacityException(String message, CapacityLimit limit) {
         super(message);
         this.limit = requireNonNull(limit, "limit");
     }
 
-    /// The limit that refused the operation, or empty when overload ended a connection.
+    /// {@return the limit that refused the operation, or empty when overload ended a connection}
     public Optional<CapacityLimit> limit() {
         return Optional.ofNullable(limit);
     }

@@ -10,6 +10,7 @@ public final class MqttNotConnectedException extends MqttException {
     @Serial
     private static final long serialVersionUID = 1L;
 
+    /// A failure of an operation attempted without an established connection.
     public MqttNotConnectedException() {
         super("Client is not connected");
     }

@@ -28,11 +28,16 @@ public interface PullSubscription extends Subscription {
     /// decides every later result; a later close or refusal does not change it. This overload
     /// waits without a deadline and never returns [ReceiveResult.TimedOut].
     ///
-    /// @throws InterruptedException if interrupted before claiming a delivery
-    /// @throws MqttSubscriptionRefusedException if the subscription was refused before its removal
-    ///         was requested
-    /// @throws MqttProtocolException if a SUBACK for this subscription violated the protocol
-    /// @throws MqttConnectionLostException if an internal failure closed the client first
+    /// @return
+    ///     the outcome of this receive
+    /// @throws InterruptedException
+    ///     if interrupted before claiming a delivery
+    /// @throws MqttSubscriptionRefusedException
+    ///     if the subscription was refused before its removal was requested
+    /// @throws MqttProtocolException
+    ///     if a SUBACK for this subscription violated the protocol
+    /// @throws MqttConnectionLostException
+    ///     if an internal failure closed the client first
     ReceiveResult receive() throws InterruptedException;
 
     /// Like [#receive()], but returns [ReceiveResult.TimedOut] if the wait expires while the
@@ -43,11 +48,19 @@ public interface PullSubscription extends Subscription {
     /// Registration rejection, a refusal, a SUBACK that violates the protocol, and an
     /// internal failure that closes the client throw as they do for [#receive()].
     ///
-    /// @throws IllegalArgumentException if `timeout` is negative
-    /// @throws InterruptedException if interrupted before claiming a delivery
-    /// @throws MqttSubscriptionRefusedException if the subscription was refused before its removal
-    ///         was requested
-    /// @throws MqttProtocolException if a SUBACK for this subscription violated the protocol
-    /// @throws MqttConnectionLostException if an internal failure closed the client first
+    /// @param timeout
+    ///     the longest time to wait for a delivery, or zero to poll
+    /// @return
+    ///     the outcome of this receive
+    /// @throws IllegalArgumentException
+    ///     if `timeout` is negative
+    /// @throws InterruptedException
+    ///     if interrupted before claiming a delivery
+    /// @throws MqttSubscriptionRefusedException
+    ///     if the subscription was refused before its removal was requested
+    /// @throws MqttProtocolException
+    ///     if a SUBACK for this subscription violated the protocol
+    /// @throws MqttConnectionLostException
+    ///     if an internal failure closed the client first
     ReceiveResult receive(Duration timeout) throws InterruptedException;
 }

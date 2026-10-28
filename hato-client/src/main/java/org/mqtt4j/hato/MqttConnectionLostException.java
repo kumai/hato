@@ -23,10 +23,15 @@ public final class MqttConnectionLostException extends MqttException {
     @Serial
     private static final long serialVersionUID = 1L;
 
+    /// A loss without a cause.
     public MqttConnectionLostException() {
         super("Connection ended before the operation completed");
     }
 
+    /// A loss with the failure that caused it.
+    ///
+    /// @param cause
+    ///     the failure that caused the loss
     public MqttConnectionLostException(Throwable cause) {
         super("Connection ended before the operation completed", cause);
     }

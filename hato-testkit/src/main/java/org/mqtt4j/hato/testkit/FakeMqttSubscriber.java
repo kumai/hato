@@ -42,6 +42,8 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     private final List<FakeSubscription> subscriptions = new ArrayList<>();
     private final Map<TopicFilter, Rule> rules = new HashMap<>();
 
+    /// Creates a fake with no subscriptions and no rules, which grants each subscription at once
+    /// at the requested QoS.
     public FakeMqttSubscriber() {
     }
 
@@ -51,7 +53,14 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// [Subscription#established()] fails with [MqttSubscriptionRefusedException] or
     /// [IllegalStateException].
     ///
-    /// @throws NullPointerException if `request` or `handler` is null
+    /// @param request
+    ///     the subscription request
+    /// @param handler
+    ///     the handler that receives the deliveries
+    /// @return
+    ///     the handle of the recorded subscription
+    /// @throws NullPointerException
+    ///     if `request` or `handler` is null
     @Override
     public synchronized FakeSubscription subscribe(
             Subscribe request,
@@ -93,7 +102,10 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// their [Subscription#established()] fails with [MqttSubscriptionRefusedException], and
     /// they end. A subscription made to the filter before stays as it was.
     ///
-    /// @throws NullPointerException if `filter` is null
+    /// @param filter
+    ///     the topic filter to refuse
+    /// @throws NullPointerException
+    ///     if `filter` is null
     public synchronized void refuseSubscriptions(TopicFilter filter) {
         rules.put(requireNonNull(filter, "filter must not be null"), new Refuse());
     }
@@ -101,7 +113,12 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// Grants later subscriptions to exactly `filter` the lower of `maximum` and the requested
     /// QoS.
     ///
-    /// @throws NullPointerException if `filter` or `maximum` is null
+    /// @param filter
+    ///     the topic filter to limit
+    /// @param maximum
+    ///     the highest QoS to grant
+    /// @throws NullPointerException
+    ///     if `filter` or `maximum` is null
     public synchronized void grantAtMost(TopicFilter filter, Qos maximum) {
         requireNonNull(filter, "filter must not be null");
         requireNonNull(maximum, "maximum must not be null");
@@ -111,21 +128,27 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// Removes the rule for `filter`, if there is one, so that later subscriptions to it are
     /// granted as requested.
     ///
-    /// @throws NullPointerException if `filter` is null
+    /// @param filter
+    ///     the topic filter whose rule to remove
+    /// @throws NullPointerException
+    ///     if `filter` is null
     public synchronized void clearSubscriptionRule(TopicFilter filter) {
         rules.remove(requireNonNull(filter, "filter must not be null"));
     }
 
-    /// The subscriptions made so far, ended ones included, in the order made, as an unmodifiable
-    /// list that later subscriptions do not affect.
+    /// {@return the subscriptions made so far, ended ones included, in the order made, as an
+    /// unmodifiable list that later subscriptions do not affect}
     public synchronized List<FakeSubscription> subscriptions() {
         return List.copyOf(subscriptions);
     }
 
-    /// The most recent subscription made to exactly `filter`, ended or not, or empty if none was
-    /// made.
+    /// {@return the most recent subscription made to exactly `filter`, ended or not, or empty if
+    /// none was made}
     ///
-    /// @throws NullPointerException if `filter` is null
+    /// @param filter
+    ///     the topic filter of the subscription
+    /// @throws NullPointerException
+    ///     if `filter` is null
     public synchronized Optional<FakeSubscription> subscription(TopicFilter filter) {
         requireNonNull(filter, "filter must not be null");
         return subscriptions.reversed().stream()
@@ -180,7 +203,7 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             return new FakeSubscription(request, handler, null, refusal);
         }
 
-        /// The request that the code under test subscribed with.
+        /// {@return the request that the code under test subscribed with}
         public Subscribe request() {
             return request;
         }
@@ -191,8 +214,14 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
         /// instead of being thrown here. Calls from several threads run the handler at the same
         /// time, which a client never does.
         ///
-        /// @throws NullPointerException if `message` is null
-        /// @throws IllegalStateException if this subscription has ended
+        /// @param message
+        ///     the message to deliver
+        /// @return
+        ///     the delivery that the handler received
+        /// @throws NullPointerException
+        ///     if `message` is null
+        /// @throws IllegalStateException
+        ///     if this subscription has ended
         public FakeMqttDelivery deliver(MqttMessage message) {
             requireNonNull(message, "message must not be null");
             synchronized (this) {
@@ -222,8 +251,8 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             return delivery;
         }
 
-        /// Whether this subscription has ended: the code under test closed or unsubscribed it,
-        /// or the fake refused it.
+        /// {@return whether this subscription has ended: the code under test closed or
+        /// unsubscribed it, or the fake refused it}
         public synchronized boolean ended() {
             return ending != null;
         }
@@ -238,7 +267,7 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             return Optional.ofNullable(granted);
         }
 
-        /// Returns a future completed with the granted QoS while this subscription is active.
+        /// {@return a future completed with the granted QoS while this subscription is active}
         /// Once it has ended, the future fails with the refusal, or with [IllegalStateException]
         /// after the code under test closed or unsubscribed it.
         @Override
@@ -251,14 +280,17 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
         }
 
         /// Ends this subscription at once and returns a completed future.
+        ///
+        /// @return
+        ///     a completed future
         @Override
         public CompletableFuture<Void> unsubscribe() {
             end(new IllegalStateException("The subscription was removed"));
             return CompletableFuture.completedFuture(null);
         }
 
-        /// Returns a future that completes once this subscription has ended and no handler of
-        /// it is running.
+        /// {@return a future that completes once this subscription has ended and no handler of
+        /// it is running}
         @Override
         public CompletableFuture<Void> terminated() {
             return terminated.copy();
@@ -305,13 +337,13 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             return message;
         }
 
-        /// Always false: the fake delivers no duplicates.
+        /// {@return false, as the fake delivers no duplicates}
         @Override
         public boolean dup() {
             return false;
         }
 
-        /// Always 1.
+        /// {@return 1}
         @Override
         public long connectionAttempt() {
             return 1;
@@ -328,12 +360,12 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             acked = true;
         }
 
-        /// Whether [#ack()] has been called, by the handler or later by any thread.
+        /// {@return whether [#ack()] has been called, by the handler or later by any thread}
         public boolean acked() {
             return acked;
         }
 
-        /// What the handler threw for this delivery, or empty if it returned normally.
+        /// {@return what the handler threw for this delivery, or empty if it returned normally}
         public Optional<Throwable> failure() {
             return Optional.ofNullable(failure);
         }

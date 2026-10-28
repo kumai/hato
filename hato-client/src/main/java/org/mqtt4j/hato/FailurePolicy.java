@@ -16,8 +16,8 @@ public enum FailurePolicy {
     /// request, as [MqttSubscriber#subscribe(Subscribe, java.util.function.Consumer)] describes,
     /// so the unacknowledged message can come back in a continued session instead of being lost
     /// silently. A failed delivery that holds back no acknowledgement (QoS 0,
-    /// [AckMode#ON_RECEIVE], or MANUAL after `ack()`) has nothing to protect, so it is skipped
-    /// as [#SKIP] skips it. The default.
+    /// [AckMode#ON_RECEIVE], or MANUAL after [ack()][MqttDelivery#ack()]) has nothing to
+    /// protect, so it is skipped as [#SKIP] skips it. The default.
     STOP,
 
     /// Skips every failed delivery: a QoS 1 or 2 delivery is acknowledged without processing,

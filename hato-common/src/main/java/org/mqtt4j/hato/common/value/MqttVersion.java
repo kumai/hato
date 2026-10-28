@@ -17,14 +17,19 @@ public enum MqttVersion {
         this.protocolLevel = protocolLevel;
     }
 
-    /// The protocol level sent in the CONNECT packet.
+    /// {@return the protocol level sent in the CONNECT packet}
     public int protocolLevel() {
         return protocolLevel;
     }
 
     /// Resolves the protocol level from a CONNECT packet.
     ///
-    /// @throws IllegalArgumentException if the protocol level is unsupported
+    /// @param protocolLevel
+    ///     the protocol level
+    /// @return
+    ///     the version with that protocol level
+    /// @throws IllegalArgumentException
+    ///     if the protocol level is unsupported
     public static MqttVersion of(int protocolLevel) {
         return switch (protocolLevel) {
             case 4 -> V3_1_1;

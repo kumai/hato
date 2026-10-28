@@ -72,7 +72,14 @@ public final class ReconnectPolicy {
     /// delay from `initialDelay` up to `maxDelay`. Both must be positive, `maxDelay` must not be
     /// shorter than `initialDelay`, and neither may exceed 2147483647 milliseconds.
     ///
-    /// @throws IllegalArgumentException if a delay is out of range
+    /// @param initialDelay
+    ///     the first bound of the random delay
+    /// @param maxDelay
+    ///     the largest bound of the random delay
+    /// @return
+    ///     the policy
+    /// @throws IllegalArgumentException
+    ///     if a delay is out of range
     public static ReconnectPolicy exponentialBackoff(Duration initialDelay, Duration maxDelay) {
         requireNonNull(initialDelay, "initialDelay");
         requireNonNull(maxDelay, "maxDelay");
@@ -89,35 +96,41 @@ public final class ReconnectPolicy {
 
     /// Never reconnects automatically. A connection that ends leaves the client disconnected
     /// until the application calls [MqttClient#connect()] again.
+    ///
+    /// @return
+    ///     the disabled policy
     public static ReconnectPolicy disabled() {
         return DISABLED;
     }
 
-    /// Returns a policy that also retries a connection request's failures before its first
+    /// {@return a policy that also retries a connection request's failures before its first
     /// successful connection, so its [MqttClient#connect()] future waits, possibly without
-    /// limit, until a connection is established or the client gives the request up.
+    /// limit, until a connection is established or the client gives the request up}
     ///
-    /// @throws IllegalStateException for [#disabled()], which never retries
+    /// @throws IllegalStateException
+    ///     for [#disabled()], which never retries
     public ReconnectPolicy withInitialRetry() {
         return with(rules.withInitialRetry());
     }
 
-    /// Returns a policy that also reconnects after an MQTT 5.0 broker ends the connection with
-    /// DISCONNECT 0x98 (Administrative action), with the same backoff as after other failures.
+    /// {@return a policy that also reconnects after an MQTT 5.0 broker ends the connection with
+    /// DISCONNECT 0x98 (Administrative action), with the same backoff as after other failures}
     /// By default, the client stays disconnected after an administrative action, because an
     /// administrator ended the connection on purpose.
     ///
-    /// @throws IllegalStateException for [#disabled()], which never retries
+    /// @throws IllegalStateException
+    ///     for [#disabled()], which never retries
     public ReconnectPolicy withAdministrativeActionRetry() {
         return with(rules.withAdministrativeActionRetry());
     }
 
-    /// Returns a policy that stops reconnecting when an MQTT 5.0 broker refuses a connection or
-    /// ends one with reason code 0x80 (Unspecified error), in CONNACK or DISCONNECT. By default,
-    /// the client retries an unspecified error, because the reason code does not say whether its
-    /// cause lasts.
+    /// {@return a policy that stops reconnecting when an MQTT 5.0 broker refuses a connection
+    /// or ends one with reason code 0x80 (Unspecified error), in CONNACK or DISCONNECT} By
+    /// default, the client retries an unspecified error, because the reason code does not say
+    /// whether its cause lasts.
     ///
-    /// @throws IllegalStateException for [#disabled()], which never retries
+    /// @throws IllegalStateException
+    ///     for [#disabled()], which never retries
     public ReconnectPolicy withoutUnspecifiedErrorRetry() {
         return with(rules.withoutUnspecifiedErrorRetry());
     }

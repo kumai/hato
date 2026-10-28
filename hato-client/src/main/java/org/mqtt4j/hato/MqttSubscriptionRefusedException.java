@@ -28,11 +28,19 @@ public final class MqttSubscriptionRefusedException extends MqttException {
     private final @Nullable String reasonString;
 
     /// A refusal without an explanation, such as the one that the client makes itself.
+    ///
+    /// @param reasonCode
+    ///     the reason for the refusal
     public MqttSubscriptionRefusedException(ReasonCode reasonCode) {
         this(reasonCode, null);
     }
 
     /// A refusal with the broker's explanation, if the broker sent one.
+    ///
+    /// @param reasonCode
+    ///     the reason for the refusal
+    /// @param reasonString
+    ///     the broker's explanation, or null when it sent none
     public MqttSubscriptionRefusedException(
             ReasonCode reasonCode,
             @Nullable String reasonString
@@ -42,14 +50,14 @@ public final class MqttSubscriptionRefusedException extends MqttException {
         this.reasonString = reasonString;
     }
 
-    /// The reason for the refusal, received in SUBACK, or the one that the broker would use for
-    /// a subscription that it announced it does not support.
+    /// {@return the reason for the refusal, received in SUBACK, or the one that the broker would
+    /// use for a subscription that it announced it does not support}
     public ReasonCode reasonCode() {
         return reasonCode;
     }
 
-    /// The broker's explanation for people diagnosing the refusal, received in SUBACK, or
-    /// empty when the broker sent none or the client refused without sending.
+    /// {@return the broker's explanation for people diagnosing the refusal, received in SUBACK,
+    /// or empty when the broker sent none or the client refused without sending}
     public Optional<String> reasonString() {
         return Optional.ofNullable(reasonString);
     }

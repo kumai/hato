@@ -82,10 +82,16 @@ public final class MqttMessage {
 
     /// Creates a message without properties, with a copy of the application bytes.
     ///
-    /// @param topic the published topic name
-    /// @param payload the application bytes, possibly empty
-    /// @param qos the requested or received quality of service
-    /// @param retain whether publication requests retention, or reception is a retained delivery
+    /// @param topic
+    ///     the published topic name
+    /// @param payload
+    ///     the application bytes, possibly empty
+    /// @param qos
+    ///     the requested or received quality of service
+    /// @param retain
+    ///     whether publication requests retention, or reception is a retained delivery
+    /// @return
+    ///     the message
     public static MqttMessage of(Topic topic, byte[] payload, Qos qos, boolean retain) {
         return new MqttMessage(
                 topic,
@@ -144,7 +150,10 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy with a different published topic.
+    /// {@return a copy with a different published topic}
+    ///
+    /// @param topic
+    ///     the published topic name
     public MqttMessage withTopic(Topic topic) {
         return new MqttMessage(
                 topic,
@@ -160,7 +169,10 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy with a different payload, copying the supplied bytes.
+    /// {@return a copy with a different payload, copying the supplied bytes}
+    ///
+    /// @param payload
+    ///     the application bytes, possibly empty
     public MqttMessage withPayload(byte[] payload) {
         return new MqttMessage(
                 topic,
@@ -176,7 +188,10 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy with a different requested or received quality of service.
+    /// {@return a copy with a different requested or received quality of service}
+    ///
+    /// @param qos
+    ///     the requested or received quality of service
     public MqttMessage withQos(Qos qos) {
         return new MqttMessage(
                 topic,
@@ -192,7 +207,10 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy with a different retention request or retained-delivery flag.
+    /// {@return a copy with a different retention request or retained-delivery flag}
+    ///
+    /// @param retain
+    ///     whether publication requests retention, or reception is a retained delivery
     public MqttMessage withRetain(boolean retain) {
         return new MqttMessage(
                 topic,
@@ -208,9 +226,12 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy that declares the payload as UTF-8 encoded character data (true, the MQTT
-    /// 5.0 Payload Format Indicator) or as unspecified bytes (false). Neither publication nor
+    /// {@return a copy that declares the payload as UTF-8 encoded character data (true, the MQTT
+    /// 5.0 Payload Format Indicator) or as unspecified bytes (false)} Neither publication nor
     /// reception checks the payload against the declaration.
+    ///
+    /// @param payloadUtf8
+    ///     whether the payload is declared as UTF-8 encoded character data
     public MqttMessage withPayloadUtf8(boolean payloadUtf8) {
         return new MqttMessage(
                 topic,
@@ -226,14 +247,16 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy with a lifetime (the MQTT 5.0 Message Expiry Interval) from zero to
-    /// 4294967295 seconds; a fraction of a second is rounded up when sent. When the lifetime
+    /// {@return a copy with a lifetime (the MQTT 5.0 Message Expiry Interval) from zero to
+    /// 4294967295 seconds; a fraction of a second is rounded up when sent} When the lifetime
     /// passes before the broker starts delivering the message to a subscriber, the broker
     /// discards it for that subscriber. The client sends the same lifetime however long the
     /// message waits to be sent, including a resend in a later connection.
     ///
-    /// @throws IllegalArgumentException if `messageExpiry` is negative or exceeds 4294967295
-    ///     seconds
+    /// @param messageExpiry
+    ///     the lifetime of the message
+    /// @throws IllegalArgumentException
+    ///     if `messageExpiry` is negative or exceeds 4294967295 seconds
     public MqttMessage withMessageExpiry(Duration messageExpiry) {
         requireNonNull(messageExpiry, "Message expiry must not be null");
         if (messageExpiry.isNegative() || messageExpiry.compareTo(MAX_MESSAGE_EXPIRY) > 0) {
@@ -253,12 +276,15 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy with a content type (the MQTT 5.0 Content Type) that describes the
-    /// payload, such as a MIME type. It is an MQTT UTF-8 string of at most 65535 bytes and may
+    /// {@return a copy with a content type (the MQTT 5.0 Content Type) that describes the
+    /// payload, such as a MIME type} It is an MQTT UTF-8 string of at most 65535 bytes and may
     /// be empty.
     ///
-    /// @throws IllegalArgumentException if `contentType` contains U+0000 or an unpaired
-    ///     surrogate, or exceeds 65535 bytes in UTF-8
+    /// @param contentType
+    ///     the content type that describes the payload
+    /// @throws IllegalArgumentException
+    ///     if `contentType` contains U+0000 or an unpaired surrogate, or exceeds 65535 bytes in
+    ///     UTF-8
     public MqttMessage withContentType(String contentType) {
         requireNonNull(contentType, "Content type must not be null");
         MqttString.validate(contentType);
@@ -276,7 +302,10 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy that names the topic for a reply (the MQTT 5.0 Response Topic).
+    /// {@return a copy that names the topic for a reply (the MQTT 5.0 Response Topic)}
+    ///
+    /// @param responseTopic
+    ///     the topic for a reply
     public MqttMessage withResponseTopic(Topic responseTopic) {
         requireNonNull(responseTopic, "Response topic must not be null");
         return new MqttMessage(
@@ -293,10 +322,13 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy with a copy of `correlationData` (the MQTT 5.0 Correlation Data), at most
-    /// 65535 bytes and possibly empty, which a reply can return to identify its request.
+    /// {@return a copy with a copy of `correlationData` (the MQTT 5.0 Correlation Data), at most
+    /// 65535 bytes and possibly empty, which a reply can return to identify its request}
     ///
-    /// @throws IllegalArgumentException if `correlationData` exceeds 65535 bytes
+    /// @param correlationData
+    ///     the Correlation Data
+    /// @throws IllegalArgumentException
+    ///     if `correlationData` exceeds 65535 bytes
     public MqttMessage withCorrelationData(byte[] correlationData) {
         requireNonNull(correlationData, "Correlation data must not be null");
         if (correlationData.length > 65_535) {
@@ -316,10 +348,13 @@ public final class MqttMessage {
         );
     }
 
-    /// Returns a copy whose User Properties are a copy of `userProperties`, in the same order.
+    /// {@return a copy whose User Properties are a copy of `userProperties`, in the same order}
     /// An empty list leaves the copy without User Properties.
     ///
-    /// @throws NullPointerException if `userProperties` or one of its elements is null
+    /// @param userProperties
+    ///     the User Properties in order
+    /// @throws NullPointerException
+    ///     if `userProperties` or one of its elements is null
     public MqttMessage withUserProperties(List<UserProperty> userProperties) {
         requireNonNull(userProperties, "User Properties must not be null");
         return new MqttMessage(
@@ -336,12 +371,12 @@ public final class MqttMessage {
         );
     }
 
-    /// The published topic name.
+    /// {@return the published topic name}
     public Topic topic() {
         return topic;
     }
 
-    /// A copy of the application bytes.
+    /// {@return a copy of the application bytes}
     public byte[] payload() {
         return payload.clone();
     }
@@ -352,52 +387,54 @@ public final class MqttMessage {
         return payload;
     }
 
-    /// The requested or received quality of service.
+    /// {@return the requested or received quality of service}
     public Qos qos() {
         return qos;
     }
 
-    /// Whether publication requests retention, or reception is a retained delivery: one that the
-    /// broker sent from its retained messages as it made the subscription. A subscription with
-    /// [Subscribe#retainAsPublished()] instead receives the retain flag that the publisher set.
+    /// {@return whether publication requests retention, or reception is a retained delivery: one
+    /// that the broker sent from its retained messages as it made the subscription} A
+    /// subscription with [Subscribe#retainAsPublished()] instead receives the retain flag that
+    /// the publisher set.
     public boolean retain() {
         return retain;
     }
 
-    /// Returns the payload byte count without copying its contents.
+    /// {@return the payload byte count without copying its contents}
     public int payloadSize() {
         return payload.length;
     }
 
-    /// Whether the payload is declared as UTF-8 encoded character data. False means unspecified
-    /// bytes, which is also what MQTT 5.0 assumes without a Payload Format Indicator.
+    /// {@return whether the payload is declared as UTF-8 encoded character data} False means
+    /// unspecified bytes, which is also what MQTT 5.0 assumes without a Payload Format Indicator.
     public boolean payloadUtf8() {
         return payloadUtf8;
     }
 
-    /// The lifetime of the message, or empty when it does not expire. A received message
-    /// reports the lifetime that remained when the broker forwarded it.
+    /// {@return the lifetime of the message, or empty when it does not expire} A received
+    /// message reports the lifetime that remained when the broker forwarded it.
     public Optional<Duration> messageExpiry() {
         return Optional.ofNullable(messageExpiry);
     }
 
-    /// The content type that describes the payload, or empty when absent.
+    /// {@return the content type that describes the payload, or empty when absent}
     public Optional<String> contentType() {
         return Optional.ofNullable(contentType);
     }
 
-    /// The topic for a reply, or empty when absent.
+    /// {@return the topic for a reply, or empty when absent}
     public Optional<Topic> responseTopic() {
         return Optional.ofNullable(responseTopic);
     }
 
-    /// A copy of the Correlation Data, or empty when absent. Present Correlation Data can be an
-    /// empty array.
+    /// {@return a copy of the Correlation Data, or empty when absent} Present Correlation Data
+    /// can be an empty array.
     public Optional<byte[]> correlationData() {
         return correlationData == null ? Optional.empty() : Optional.of(correlationData.clone());
     }
 
-    /// The User Properties in order, possibly repeating a name. The list cannot be modified.
+    /// {@return the User Properties in order, possibly repeating a name} The list cannot be
+    /// modified.
     public List<UserProperty> userProperties() {
         return userProperties;
     }

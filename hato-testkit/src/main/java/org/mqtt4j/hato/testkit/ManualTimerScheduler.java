@@ -21,6 +21,7 @@ public final class ManualTimerScheduler implements TimerScheduler {
     private long sequence;
     private boolean advancing;
 
+    /// Creates a scheduler whose clock reads zero and that has no tasks.
     public ManualTimerScheduler() {
     }
 
@@ -44,6 +45,9 @@ public final class ManualTimerScheduler implements TimerScheduler {
     }
 
     /// Advances time, including tasks newly scheduled within the elapsed interval.
+    ///
+    /// @param duration
+    ///     the time to advance by
     public void advance(Duration duration) {
         long target;
         synchronized (this) {
@@ -73,7 +77,8 @@ public final class ManualTimerScheduler implements TimerScheduler {
         }
     }
 
-    /// Tasks still retained by the scheduler, excluding cancelled or dispatched tasks.
+    /// {@return the number of tasks still retained by the scheduler, excluding cancelled or
+    /// dispatched tasks}
     public synchronized int pendingTaskCount() {
         return tasks.size();
     }

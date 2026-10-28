@@ -11,15 +11,26 @@ import java.time.Duration;
 /// that event unreported. Cancellation failures are logged and cleanup continues.
 public interface TimerScheduler {
 
-    /// A monotonic nanosecond counter, compared using differences, like System.nanoTime().
+    /// {@return a monotonic nanosecond counter, compared using differences, like
+    /// [System#nanoTime()]}
     long nanoTime();
 
     /// Runs a task once after a nonnegative delay.
+    ///
+    /// @param delay
+    ///     the delay before the task runs
+    /// @param task
+    ///     the task to run
+    /// @return
+    ///     a handle that cancels the task
     Cancellable schedule(Duration delay, Runnable task);
 
+    /// A handle to a task scheduled with [TimerScheduler#schedule(Duration, Runnable)].
     @FunctionalInterface
     interface Cancellable {
 
+        /// Cancels the task. Cancellation is best effort, so an already dispatched task may still
+        /// run.
         void cancel();
     }
 }

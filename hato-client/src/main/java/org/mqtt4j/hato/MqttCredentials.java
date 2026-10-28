@@ -33,26 +33,38 @@ public final class MqttCredentials {
 
     /// Creates credentials containing only a username.
     ///
-    /// @throws IllegalArgumentException if the username contains U+0000, an unpaired surrogate,
-    ///     or exceeds 65535 bytes in UTF-8
+    /// @param username
+    ///     the username, which may be empty
+    /// @return
+    ///     the credentials
+    /// @throws IllegalArgumentException
+    ///     if the username contains U+0000, an unpaired surrogate, or exceeds 65535 bytes in
+    ///     UTF-8
     public static MqttCredentials of(String username) {
         return new MqttCredentials(username, null);
     }
 
     /// Creates credentials with a copy of the binary password, which may be empty.
     ///
-    /// @throws IllegalArgumentException if the username contains U+0000, an unpaired surrogate,
-    ///     or exceeds 65535 bytes in UTF-8, or the password exceeds 65535 bytes
+    /// @param username
+    ///     the username, which may be empty
+    /// @param password
+    ///     the password, which may be empty
+    /// @return
+    ///     the credentials
+    /// @throws IllegalArgumentException
+    ///     if the username contains U+0000, an unpaired surrogate, or exceeds 65535 bytes in
+    ///     UTF-8, or the password exceeds 65535 bytes
     public static MqttCredentials of(String username, byte[] password) {
         return new MqttCredentials(username, requireNonNull(password, "password"));
     }
 
-    /// The username, which may be empty.
+    /// {@return the username, which may be empty}
     public String username() {
         return username;
     }
 
-    /// A copy of the password, or empty when no password was supplied.
+    /// {@return a copy of the password, or empty when no password was supplied}
     /// A supplied zero-length password produces a present result containing an empty array.
     public Optional<byte[]> password() {
         return password == null ? Optional.empty() : Optional.of(password.clone());

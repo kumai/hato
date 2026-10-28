@@ -65,7 +65,14 @@ public final class Subscribe {
     /// defaults for the subscription options: No Local and Retain As Published off, and
     /// [RetainHandling#SEND].
     ///
-    /// @throws IllegalArgumentException if shared syntax is invalid
+    /// @param filter
+    ///     the filter sent to the broker
+    /// @param qos
+    ///     the maximum quality of service requested
+    /// @return
+    ///     the request
+    /// @throws IllegalArgumentException
+    ///     if shared syntax is invalid
     public static Subscribe of(TopicFilter filter, Qos qos) {
         requireNonNull(filter, "Filter must not be null");
         requireNonNull(qos, "QoS must not be null");
@@ -82,7 +89,10 @@ public final class Subscribe {
         );
     }
 
-    /// Returns a copy that uses `ackMode` instead of the default.
+    /// {@return a copy that uses `ackMode` instead of the default}
+    ///
+    /// @param ackMode
+    ///     the acknowledgement mode
     public Subscribe withAckMode(AckMode ackMode) {
         requireNonNull(ackMode, "Ack mode must not be null");
         return new Subscribe(
@@ -97,9 +107,12 @@ public final class Subscribe {
         );
     }
 
-    /// Returns a copy with a different [buffer capacity][#bufferCapacity()].
+    /// {@return a copy with a different [buffer capacity][#bufferCapacity()]}
     ///
-    /// @throws IllegalArgumentException if `bufferCapacity` is not positive
+    /// @param bufferCapacity
+    ///     the maximum number of local deliveries this subscription holds at once
+    /// @throws IllegalArgumentException
+    ///     if `bufferCapacity` is not positive
     public Subscribe withBufferCapacity(int bufferCapacity) {
         if (bufferCapacity < 1) {
             throw new IllegalArgumentException("Buffer capacity must be positive");
@@ -116,8 +129,11 @@ public final class Subscribe {
         );
     }
 
-    /// Returns a copy that handles handler failures with `failurePolicy` instead of
-    /// [FailurePolicy#STOP].
+    /// {@return a copy that handles handler failures with `failurePolicy` instead of
+    /// [FailurePolicy#STOP]}
+    ///
+    /// @param failurePolicy
+    ///     what the subscription does when its handler throws
     public Subscribe withFailurePolicy(FailurePolicy failurePolicy) {
         requireNonNull(failurePolicy, "Failure policy must not be null");
         return new Subscribe(
@@ -132,11 +148,13 @@ public final class Subscribe {
         );
     }
 
-    /// Returns a copy that asks the broker not to deliver this client's own publications to this
-    /// subscription (the MQTT 5.0 No Local option), or to deliver them as usual.
+    /// {@return a copy that asks the broker not to deliver this client's own publications to this
+    /// subscription (the MQTT 5.0 No Local option), or to deliver them as usual}
     ///
-    /// @throws IllegalArgumentException if `noLocal` is true for a shared subscription, which
-    ///     MQTT 5.0 does not allow
+    /// @param noLocal
+    ///     whether the broker withholds this client's own publications from this subscription
+    /// @throws IllegalArgumentException
+    ///     if `noLocal` is true for a shared subscription, which MQTT 5.0 does not allow
     public Subscribe withNoLocal(boolean noLocal) {
         if (noLocal && SharedTopicFilter.parse(filter).isPresent()) {
             throw new IllegalArgumentException("A shared subscription cannot set No Local");
@@ -153,9 +171,13 @@ public final class Subscribe {
         );
     }
 
-    /// Returns a copy that asks the broker to keep the retain flag that each publisher set on
+    /// {@return a copy that asks the broker to keep the retain flag that each publisher set on
     /// the messages that it delivers to this subscription (the MQTT 5.0 Retain As Published
-    /// option), or to clear it as usual; see [MqttMessage#retain()].
+    /// option), or to clear it as usual; see [MqttMessage#retain()]}
+    ///
+    /// @param retainAsPublished
+    ///     whether the broker keeps the publisher's retain flag on the messages that it delivers
+    ///     to this subscription
     public Subscribe withRetainAsPublished(boolean retainAsPublished) {
         return new Subscribe(
                 filter,
@@ -169,8 +191,11 @@ public final class Subscribe {
         );
     }
 
-    /// Returns a copy that decides when the broker sends the matching retained messages as it
-    /// makes this subscription (the MQTT 5.0 Retain Handling option).
+    /// {@return a copy that decides when the broker sends the matching retained messages as it
+    /// makes this subscription (the MQTT 5.0 Retain Handling option)}
+    ///
+    /// @param retainHandling
+    ///     when the broker sends the matching retained messages
     public Subscribe withRetainHandling(RetainHandling retainHandling) {
         requireNonNull(retainHandling, "Retain handling must not be null");
         return new Subscribe(
@@ -185,28 +210,28 @@ public final class Subscribe {
         );
     }
 
-    /// The filter sent to the broker.
+    /// {@return the filter sent to the broker}
     public TopicFilter filter() {
         return filter;
     }
 
-    /// The maximum quality of service requested.
+    /// {@return the maximum quality of service requested}
     public Qos qos() {
         return qos;
     }
 
-    /// When this subscription permits acknowledgement of a QoS 1 or 2 delivery. Empty uses the
-    /// default: [AckMode#AFTER_HANDLER] with a handler, or [AckMode#ON_RECEIVE] for pull and
-    /// hand-off subscriptions.
+    /// {@return the acknowledgement mode: when this subscription permits acknowledgement of a
+    /// QoS 1 or 2 delivery} Empty uses the default: [AckMode#AFTER_HANDLER] with a handler, or
+    /// [AckMode#ON_RECEIVE] for pull and hand-off subscriptions.
     public Optional<AckMode> ackMode() {
         return Optional.ofNullable(ackMode);
     }
 
-    /// The maximum number of local deliveries this subscription holds at once. Pull subscriptions
-    /// count queued deliveries and QoS 1/2 MANUAL deliveries awaiting ack; ON_RECEIVE and QoS 0
-    /// release the slot at handoff. Hand-off subscriptions count deliveries waiting for their
-    /// acceptor and release the slot when it accepts one, in either acknowledgement mode. Push
-    /// subscriptions also count running handlers and deliveries whose PUBACK or PUBREC is
+    /// {@return the maximum number of local deliveries this subscription holds at once} Pull
+    /// subscriptions count queued deliveries and QoS 1/2 MANUAL deliveries awaiting ack; ON_RECEIVE
+    /// and QoS 0 release the slot at handoff. Hand-off subscriptions count deliveries waiting for
+    /// their acceptor and release the slot when it accepts one, in either acknowledgement mode.
+    /// Push subscriptions also count running handlers and deliveries whose PUBACK or PUBREC is
     /// pending; see [AckMode]. The client also bounds deliveries and bytes held across all of its
     /// subscriptions.
     ///
@@ -222,24 +247,26 @@ public final class Subscribe {
         return bufferCapacity;
     }
 
-    /// What this subscription does when its handler throws; see [FailurePolicy]. A pull
+    /// {@return what this subscription does when its handler throws; see [FailurePolicy]} A pull
     /// subscription has no handler and rejects [FailurePolicy#SKIP].
     public FailurePolicy failurePolicy() {
         return failurePolicy;
     }
 
-    /// Whether the broker withholds this client's own publications from this subscription.
+    /// {@return whether the broker withholds this client's own publications from this
+    /// subscription}
     public boolean noLocal() {
         return noLocal;
     }
 
-    /// Whether the broker keeps the publisher's retain flag on the messages that it delivers to
-    /// this subscription.
+    /// {@return whether the broker keeps the publisher's retain flag on the messages that it
+    /// delivers to this subscription}
     public boolean retainAsPublished() {
         return retainAsPublished;
     }
 
-    /// When the broker sends the matching retained messages as it makes this subscription.
+    /// {@return the Retain Handling option: when the broker sends the matching retained messages
+    /// as it makes this subscription}
     public RetainHandling retainHandling() {
         return retainHandling;
     }

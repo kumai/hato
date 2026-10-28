@@ -21,10 +21,13 @@ public final class UserProperty {
 
     /// Validates both strings.
     ///
-    /// @param name the property name
-    /// @param value the property value
-    /// @throws IllegalArgumentException if either string contains U+0000 or an unpaired
-    ///     surrogate, or exceeds 65535 bytes in UTF-8
+    /// @param name
+    ///     the property name
+    /// @param value
+    ///     the property value
+    /// @throws IllegalArgumentException
+    ///     if either string contains U+0000 or an unpaired surrogate, or exceeds 65535 bytes
+    ///     in UTF-8
     public UserProperty(String name, String value) {
         requireNonNull(name, "User Property name must not be null");
         requireNonNull(value, "User Property value must not be null");
@@ -45,12 +48,12 @@ public final class UserProperty {
         return new UserProperty(property);
     }
 
-    /// The property name, possibly empty.
+    /// {@return the property name, possibly empty}
     public String name() {
         return name;
     }
 
-    /// The property value, possibly empty.
+    /// {@return the property value, possibly empty}
     public String value() {
         return value;
     }

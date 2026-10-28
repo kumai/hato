@@ -10,8 +10,9 @@ import static java.util.Objects.requireNonNull;
 
 /// The end of an established connection, or of a connection attempt that established none.
 /// An empty cause means no failure is reported; it does not indicate a graceful MQTT
-/// disconnect. `userRequested` identifies disconnect or close, including a failed DISCONNECT
-/// write. These fields do not distinguish a successful disconnect from an immediate close.
+/// disconnect. [userRequested][#userRequested()] identifies disconnect or close, including a
+/// failed DISCONNECT write. These fields do not distinguish a successful disconnect from an
+/// immediate close.
 /// Locally detected packet failures use [MqttProtocolException] as the cause, and a DISCONNECT
 /// from an MQTT 5.0 broker uses [MqttBrokerDisconnectException].
 /// [#reconnectDelay()] tells whether the client scheduled another attempt.
@@ -45,7 +46,16 @@ public final class Disconnection {
     /// client does not reconnect, with the original `cause`, or no reported failure when it is
     /// null. `userRequested` is true when disconnect or close was requested, even if that failed.
     ///
-    /// @throws IllegalArgumentException if `connectionAttempt` is not positive
+    /// @param cause
+    ///     the original failure, or null when no failure is reported
+    /// @param userRequested
+    ///     whether disconnect or close was requested
+    /// @param connectionAttempt
+    ///     the number of the connection attempt
+    /// @return
+    ///     the ending
+    /// @throws IllegalArgumentException
+    ///     if `connectionAttempt` is not positive
     @SuppressWarnings("exports") // Nullness annotations are compile-time only.
     public static Disconnection of(
             @Nullable Throwable cause,
@@ -58,8 +68,18 @@ public final class Disconnection {
     /// Like [#of(Throwable, boolean, long)], but the client attempts to connect again after
     /// `reconnectDelay`.
     ///
-    /// @throws IllegalArgumentException if `connectionAttempt` is not positive or the delay is
-    /// negative
+    /// @param cause
+    ///     the original failure, or null when no failure is reported
+    /// @param userRequested
+    ///     whether disconnect or close was requested
+    /// @param connectionAttempt
+    ///     the number of the connection attempt
+    /// @param reconnectDelay
+    ///     the delay until the next connection attempt
+    /// @return
+    ///     the ending
+    /// @throws IllegalArgumentException
+    ///     if `connectionAttempt` is not positive or the delay is negative
     @SuppressWarnings("exports") // Nullness annotations are compile-time only.
     public static Disconnection of(
             @Nullable Throwable cause,
@@ -73,26 +93,27 @@ public final class Disconnection {
         return new Disconnection(cause, userRequested, connectionAttempt, reconnectDelay);
     }
 
-    /// The original failure, or empty when no failure is reported.
+    /// {@return the original failure, or empty when no failure is reported}
     public Optional<Throwable> cause() {
         return Optional.ofNullable(cause);
     }
 
-    /// Whether disconnect or close was requested by the application.
+    /// {@return whether disconnect or close was requested by the application}
     public boolean userRequested() {
         return userRequested;
     }
 
-    /// The number of the attempt that established the ended connection or that failed. When a
-    /// stop cancels a wait to reconnect, it is the number reserved for the cancelled attempt. See
-    /// [ConnAck#connectionAttempt()].
+    /// {@return the number of the attempt that established the ended connection or that
+    /// failed} When a stop cancels a wait to reconnect, it is the number reserved for the
+    /// cancelled attempt. See [ConnAck#connectionAttempt()].
     public long connectionAttempt() {
         return connectionAttempt;
     }
 
-    /// The delay, counted from when the client handled this ending, until its next connection
-    /// attempt, or empty when it will not attempt to connect again unless the application calls
-    /// [MqttClient#connect()]. A slow listener can receive the ending after the delay has passed.
+    /// {@return the delay, counted from when the client handled this ending, until its next
+    /// connection attempt, or empty when it will not attempt to connect again unless the
+    /// application calls [MqttClient#connect()]} A slow listener can receive the ending after
+    /// the delay has passed.
     public Optional<Duration> reconnectDelay() {
         return Optional.ofNullable(reconnectDelay);
     }

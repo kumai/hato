@@ -39,9 +39,12 @@ public final class BrokerReason {
         this.serverReference = serverReference;
     }
 
-    /// A reason with `reasonCode` alone.
+    /// {@return a reason with `reasonCode` alone}
     ///
-    /// @throws NullPointerException if `reasonCode` is null
+    /// @param reasonCode
+    ///     the reason code
+    /// @throws NullPointerException
+    ///     if `reasonCode` is null
     public static BrokerReason of(ReasonCode reasonCode) {
         return new BrokerReason(
                 requireNonNull(reasonCode, "reasonCode must not be null"),
@@ -50,10 +53,13 @@ public final class BrokerReason {
         );
     }
 
-    /// Returns a copy with `reasonString`, which the broker sends to MQTT 5.0 clients for
-    /// diagnostics.
+    /// {@return a copy with `reasonString`, which the broker sends to MQTT 5.0 clients for
+    /// diagnostics}
     ///
-    /// @throws NullPointerException if `reasonString` is null
+    /// @param reasonString
+    ///     the Reason String
+    /// @throws NullPointerException
+    ///     if `reasonString` is null
     public BrokerReason withReasonString(String reasonString) {
         return new BrokerReason(
                 reasonCode,
@@ -62,10 +68,14 @@ public final class BrokerReason {
         );
     }
 
-    /// Returns a copy with `serverReference`, which tells MQTT 5.0 clients the server or servers
-    /// to use instead, as a space-separated list of references whose form MQTT leaves open.
+    /// {@return a copy with `serverReference`, which tells MQTT 5.0 clients the server or
+    /// servers to use instead, as a space-separated list of references whose form MQTT leaves
+    /// open}
     ///
-    /// @throws NullPointerException if `serverReference` is null
+    /// @param serverReference
+    ///     the Server Reference
+    /// @throws NullPointerException
+    ///     if `serverReference` is null
     public BrokerReason withServerReference(String serverReference) {
         return new BrokerReason(
                 reasonCode,
@@ -74,17 +84,17 @@ public final class BrokerReason {
         );
     }
 
-    /// The reason code.
+    /// {@return the reason code}
     public ReasonCode reasonCode() {
         return reasonCode;
     }
 
-    /// The Reason String, if there is one.
+    /// {@return the Reason String, if there is one}
     public Optional<String> reasonString() {
         return Optional.ofNullable(reasonString);
     }
 
-    /// The Server Reference, if there is one.
+    /// {@return the Server Reference, if there is one}
     public Optional<String> serverReference() {
         return Optional.ofNullable(serverReference);
     }

@@ -55,5 +55,10 @@ public interface MqttPublisher {
     /// SUBACK does not itself block publication. Retained QoS 1 and QoS 2 exchanges also
     /// consume admission capacity until completed or discarded, even after their futures have
     /// failed.
+    ///
+    /// @param message
+    ///     the message to publish
+    /// @return
+    ///     a future that completes with the result of the publication
     CompletableFuture<PublishResult> publish(MqttMessage message);
 }

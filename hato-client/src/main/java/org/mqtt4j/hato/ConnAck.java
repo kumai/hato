@@ -52,7 +52,15 @@ public final class ConnAck {
     /// and whether the broker resumed a session, from a broker that announced no limits. The
     /// `with` methods describe the limits that a broker announced.
     ///
-    /// @throws IllegalArgumentException if `connectionAttempt` is not positive
+    /// @param sessionPresent
+    ///     whether the broker resumed an existing session
+    /// @param connectionAttempt
+    ///     the number of the connection attempt that this acknowledgement established
+    /// @return
+    ///     the acknowledgement, with the values that MQTT 5.0 assumes for limits that are not
+    ///     announced
+    /// @throws IllegalArgumentException
+    ///     if `connectionAttempt` is not positive
     public static ConnAck of(boolean sessionPresent, long connectionAttempt) {
         if (connectionAttempt < 1) {
             throw new IllegalArgumentException("Attempt numbers start at 1");
@@ -68,7 +76,10 @@ public final class ConnAck {
         );
     }
 
-    /// Returns a copy with a different highest QoS at which the broker accepts publications.
+    /// {@return a copy with a different highest QoS at which the broker accepts publications}
+    ///
+    /// @param maximumQos
+    ///     the highest QoS at which the broker accepts publications
     public ConnAck withMaximumQos(Qos maximumQos) {
         return new ConnAck(
                 sessionPresent,
@@ -81,8 +92,11 @@ public final class ConnAck {
         );
     }
 
-    /// Returns a copy with a different answer to whether the broker accepts retained
-    /// publications.
+    /// {@return a copy with a different answer to whether the broker accepts retained
+    /// publications}
+    ///
+    /// @param retainAvailable
+    ///     whether the broker accepts retained publications
     public ConnAck withRetainAvailable(boolean retainAvailable) {
         return new ConnAck(
                 sessionPresent,
@@ -95,8 +109,11 @@ public final class ConnAck {
         );
     }
 
-    /// Returns a copy with a different answer to whether the broker accepts wildcard
-    /// subscriptions.
+    /// {@return a copy with a different answer to whether the broker accepts wildcard
+    /// subscriptions}
+    ///
+    /// @param wildcardSubscriptionAvailable
+    ///     whether the broker accepts wildcard subscriptions
     public ConnAck withWildcardSubscriptionAvailable(boolean wildcardSubscriptionAvailable) {
         return new ConnAck(
                 sessionPresent,
@@ -109,8 +126,11 @@ public final class ConnAck {
         );
     }
 
-    /// Returns a copy with a different answer to whether the broker accepts shared
-    /// subscriptions.
+    /// {@return a copy with a different answer to whether the broker accepts shared
+    /// subscriptions}
+    ///
+    /// @param sharedSubscriptionAvailable
+    ///     whether the broker accepts shared subscriptions
     public ConnAck withSharedSubscriptionAvailable(boolean sharedSubscriptionAvailable) {
         return new ConnAck(
                 sessionPresent,
@@ -123,9 +143,12 @@ public final class ConnAck {
         );
     }
 
-    /// Returns a copy with a different largest packet that the broker accepts.
+    /// {@return a copy with a different largest packet that the broker accepts}
     ///
-    /// @throws IllegalArgumentException if `maximumPacketSize` is not between 1 and 268435460
+    /// @param maximumPacketSize
+    ///     the largest packet, in bytes including the fixed header, that the broker accepts
+    /// @throws IllegalArgumentException
+    ///     if `maximumPacketSize` is not between 1 and 268435460
     public ConnAck withMaximumPacketSize(int maximumPacketSize) {
         if (maximumPacketSize < 1 || maximumPacketSize > LARGEST_PACKET_SIZE) {
             throw new IllegalArgumentException(
@@ -143,40 +166,40 @@ public final class ConnAck {
         );
     }
 
-    /// Whether the broker resumed an existing session.
+    /// {@return whether the broker resumed an existing session}
     public boolean sessionPresent() {
         return sessionPresent;
     }
 
-    /// The number of the connection attempt that this acknowledgement established. A client
-    /// numbers its attempts consecutively from 1, whether the application's
+    /// {@return the number of the connection attempt that this acknowledgement established} A
+    /// client numbers its attempts consecutively from 1, whether the application's
     /// [MqttClient#connect()] or an automatic reconnection started them.
     public long connectionAttempt() {
         return connectionAttempt;
     }
 
-    /// The highest QoS at which the broker accepts publications on this connection.
+    /// {@return the highest QoS at which the broker accepts publications on this connection}
     public Qos maximumQos() {
         return maximumQos;
     }
 
-    /// Whether the broker accepts publications with the retain flag on this connection.
+    /// {@return whether the broker accepts publications with the retain flag on this connection}
     public boolean retainAvailable() {
         return retainAvailable;
     }
 
-    /// Whether the broker accepts subscriptions whose filters contain wildcards.
+    /// {@return whether the broker accepts subscriptions whose filters contain wildcards}
     public boolean wildcardSubscriptionAvailable() {
         return wildcardSubscriptionAvailable;
     }
 
-    /// Whether the broker accepts shared subscriptions.
+    /// {@return whether the broker accepts shared subscriptions}
     public boolean sharedSubscriptionAvailable() {
         return sharedSubscriptionAvailable;
     }
 
-    /// The largest packet, in bytes including the fixed header, that the broker accepts on this
-    /// connection.
+    /// {@return the largest packet, in bytes including the fixed header, that the broker accepts
+    /// on this connection}
     public int maximumPacketSize() {
         return maximumPacketSize;
     }

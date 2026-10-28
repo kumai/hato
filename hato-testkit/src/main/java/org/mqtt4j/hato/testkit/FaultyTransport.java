@@ -17,7 +17,8 @@ import static java.util.Objects.requireNonNull;
 /// An experimental wrapper that adds ordered receive delays, send delays, and disconnection.
 /// Use a long delay in either direction to simulate stopped traffic. A delay must fit in
 /// nanoseconds, and the scheduler must accept the resulting deadline. At most one send is
-/// outstanding; admission retains its array until `onSent` or the final `onClosed`.
+/// outstanding; admission retains its array until [onSent][Transport.Listener#onSent(long)] or
+/// the final [onClosed][Transport.Listener#onClosed(Throwable)].
 /// Incoming data is bounded to 256 chunks and 16 MiB; overload closes the transport with a
 /// capacity failure. The wrapper owns and closes the delegate, but borrows the scheduler.
 public final class FaultyTransport implements Transport {
@@ -46,6 +47,12 @@ public final class FaultyTransport implements Transport {
     private @Nullable Alarm alarm;
     private @Nullable Outgoing outgoing;
 
+    /// Wraps `delegate`, timing the delays with `scheduler`.
+    ///
+    /// @param delegate
+    ///     the transport to wrap, which the wrapper owns and closes
+    /// @param scheduler
+    ///     the scheduler of the delays, which the wrapper borrows
     public FaultyTransport(Transport delegate, TimerScheduler scheduler) {
         this.delegate = requireNonNull(delegate, "delegate");
         this.scheduler = requireNonNull(scheduler, "scheduler");
@@ -54,8 +61,14 @@ public final class FaultyTransport implements Transport {
     /// Changes the delay of subsequently received chunks. Earlier chunks keep their deadlines;
     /// later chunks never overtake them even when the delay is reduced.
     ///
-    /// @throws IllegalArgumentException if `value` is negative
-    /// @throws ArithmeticException if `value` does not fit in nanoseconds, about 292 years
+    /// @param value
+    ///     the receive delay
+    /// @return
+    ///     this transport
+    /// @throws IllegalArgumentException
+    ///     if `value` is negative
+    /// @throws ArithmeticException
+    ///     if `value` does not fit in nanoseconds, about 292 years
     public synchronized FaultyTransport receiveDelay(Duration value) {
         receiveDelayNanos = delayNanos(value);
         return this;
@@ -63,10 +76,17 @@ public final class FaultyTransport implements Transport {
 
     /// Changes the delay of subsequently admitted sends. An admitted send keeps its deadline.
     /// Zero delegates immediately; a positive delay postpones delegation, not write completion.
-    /// Closing before delegation discards the send; the final `onClosed` releases its array.
+    /// Closing before delegation discards the send; the final
+    /// [onClosed][Transport.Listener#onClosed(Throwable)] releases its array.
     ///
-    /// @throws IllegalArgumentException if `value` is negative
-    /// @throws ArithmeticException if `value` does not fit in nanoseconds, about 292 years
+    /// @param value
+    ///     the send delay
+    /// @return
+    ///     this transport
+    /// @throws IllegalArgumentException
+    ///     if `value` is negative
+    /// @throws ArithmeticException
+    ///     if `value` does not fit in nanoseconds, about 292 years
     public synchronized FaultyTransport sendDelay(Duration value) {
         sendDelayNanos = delayNanos(value);
         return this;
@@ -353,7 +373,11 @@ public final class FaultyTransport implements Transport {
 
     /// Ends the connection with `cause`: later sends are rejected, delayed and later input is
     /// discarded, and the delegate is closed. A write the delegate has already completed is
-    /// still reported through `onSent` before the final `onClosed`, which carries `cause`.
+    /// still reported through [onSent][Transport.Listener#onSent(long)] before the final
+    /// [onClosed][Transport.Listener#onClosed(Throwable)], which carries `cause`.
+    ///
+    /// @param cause
+    ///     the cause of the disconnection
     public void disconnect(Throwable cause) {
         Alarm cancelledReceive;
         Alarm cancelledSend;

@@ -18,14 +18,17 @@ public enum Qos {
         this.level = level;
     }
 
-    /// The numeric level as it appears on the wire.
+    /// {@return the numeric level as it appears on the wire}
     public int level() {
         return level;
     }
 
-    /// Returns the QoS for a wire-level value.
+    /// {@return the QoS for a wire-level value}
     ///
-    /// @throws IllegalArgumentException if `level` is not 0, 1, or 2
+    /// @param level
+    ///     the wire-level value
+    /// @throws IllegalArgumentException
+    ///     if `level` is not 0, 1, or 2
     public static Qos of(int level) {
         return switch (level) {
             case 0 -> AT_MOST_ONCE;

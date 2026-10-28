@@ -17,6 +17,11 @@ public interface MqttSubscriber {
     ///
     /// The default implementation throws [UnsupportedOperationException], so implementations
     /// of the subscribing role that only provide handlers need not implement pull delivery.
+    ///
+    /// @param request
+    ///     the subscription request
+    /// @return
+    ///     the handle of the subscription
     default PullSubscription subscribe(Subscribe request) {
         throw new UnsupportedOperationException("Pull subscriptions are not supported");
     }
@@ -100,6 +105,13 @@ public interface MqttSubscriber {
     /// removal. A SUBACK that violates the protocol ends both the subscription, with
     /// [MqttProtocolException], and the connection, so a later connection does not send the same
     /// SUBSCRIBE again.
+    ///
+    /// @param request
+    ///     the subscription request
+    /// @param handler
+    ///     the handler that runs each delivery
+    /// @return
+    ///     the handle of the subscription
     Subscription subscribe(Subscribe request, Consumer<MqttDelivery> handler);
 
     /// Registers a push subscription like [#subscribe(Subscribe, Consumer)], except that `options`
@@ -110,6 +122,15 @@ public interface MqttSubscriber {
     ///
     /// The default implementation throws [UnsupportedOperationException], so implementations of
     /// the subscribing role need not place handlers.
+    ///
+    /// @param request
+    ///     the subscription request
+    /// @param options
+    ///     where and how the handler runs
+    /// @param handler
+    ///     the handler that runs each delivery
+    /// @return
+    ///     the handle of the subscription
     default Subscription subscribe(
             Subscribe request,
             DeliveryOptions options,
@@ -135,9 +156,11 @@ public interface MqttSubscriber {
     /// Once it has accepted a delivery, the acceptor must neither return false nor throw,
     /// because the client cannot take the delivery back.
     ///
-    /// The acceptor must not wait, as `BlockingQueue.put` does; use `offer`. While it waits, the
-    /// client's other hand-off subscriptions wait too, and their deliveries can overflow. Waiting
-    /// there for the termination of this subscription or the client never ends.
+    /// The acceptor must not wait, as
+    /// [BlockingQueue.put][java.util.concurrent.BlockingQueue#put(Object)] does; use
+    /// [offer][java.util.concurrent.BlockingQueue#offer(Object)]. While it waits, the client's
+    /// other hand-off subscriptions wait too, and their deliveries can overflow. Waiting there for
+    /// the termination of this subscription or the client never ends.
     ///
     /// [AckMode#ON_RECEIVE], the default, acknowledges a QoS 1 or 2 delivery when it is accepted.
     /// With [AckMode#MANUAL], the application calls [MqttDelivery#ack()] once it has processed
@@ -147,15 +170,22 @@ public interface MqttSubscriber {
     /// [IllegalArgumentException], because the client cannot see when processing ends.
     ///
     /// [Subscription#close()], [Subscription#unsubscribe()], and closing the client end new
-    /// hand-offs; `unsubscribe()` first hands off the deliveries it already accepted. A call that
-    /// started before the stop can still return after it. Once [Subscription#terminated()]
-    /// completes, the acceptor is not called again, and the application can drain or discard its
-    /// mailbox. A connection's end discards the deliveries still waiting for hand-off. Each
-    /// delivery reports its [MqttDelivery#connectionAttempt()], so deliveries kept from an
-    /// earlier connection can be told apart.
+    /// hand-offs; [unsubscribe()][Subscription#unsubscribe()] first hands off the deliveries it
+    /// already accepted. A call that started before the stop can still return after it. Once
+    /// [Subscription#terminated()] completes, the acceptor is not called again, and the application
+    /// can drain or discard its mailbox. A connection's end discards the deliveries still waiting
+    /// for hand-off. Each delivery reports its [MqttDelivery#connectionAttempt()], so deliveries
+    /// kept from an earlier connection can be told apart.
     ///
     /// The default implementation throws [UnsupportedOperationException], so implementations of
     /// the subscribing role need not hand off deliveries.
+    ///
+    /// @param request
+    ///     the subscription request
+    /// @param acceptor
+    ///     the predicate that accepts each delivery by returning true
+    /// @return
+    ///     the handle of the subscription
     default Subscription handOff(Subscribe request, Predicate<MqttDelivery> acceptor) {
         throw new UnsupportedOperationException("Hand-off subscriptions are not supported");
     }

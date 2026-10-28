@@ -4,21 +4,21 @@ package org.mqtt4j.hato;
 /// acknowledgement condition.
 public interface MqttDelivery {
 
-    /// The received message, whose payload accessor returns an independent copy.
+    /// {@return the received message, whose payload accessor returns an independent copy}
     MqttMessage message();
 
-    /// Whether the broker marked the publication as a duplicate. Always false for QoS 0.
+    /// {@return whether the broker marked the publication as a duplicate} Always false for QoS 0.
     boolean dup();
 
-    /// The number of the connection attempt that established the connection delivering this
-    /// message, as [ConnAck#connectionAttempt()] reports it. A retransmission on a later
+    /// {@return the number of the connection attempt that established the connection delivering
+    /// this message, as [ConnAck#connectionAttempt()] reports it} A retransmission on a later
     /// connection carries the later attempt. An application that keeps deliveries after their
     /// connection ends can tell them from the current connection's by comparing the two.
     long connectionAttempt();
 
-    /// The original filter of the subscription that received this delivery, including any shared
-    /// group name, as [Subscription#filter()] returns it. A handler or hand-off acceptor shared
-    /// by several subscriptions can tell their deliveries apart by it, because the client
+    /// {@return the original filter of the subscription that received this delivery, including any
+    /// shared group name, as [Subscription#filter()] returns it} A handler or hand-off acceptor
+    /// shared by several subscriptions can tell their deliveries apart by it, because the client
     /// reserves a filter for one subscription while it is pending, active, or awaiting removal.
     /// Deliveries that a removed subscription accepted can still run or be received after the
     /// same filter is registered again; the deliveries of both subscriptions then name that

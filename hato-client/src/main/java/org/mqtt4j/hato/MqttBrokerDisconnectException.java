@@ -27,6 +27,15 @@ public final class MqttBrokerDisconnectException extends MqttException {
 
     private final @Nullable String serverReference;
 
+    /// A DISCONNECT from the broker, with the explanation and the server reference that it
+    /// carried, if any.
+    ///
+    /// @param reasonCode
+    ///     the reason code of the broker's DISCONNECT
+    /// @param reasonString
+    ///     the broker's explanation, or null when it sent none
+    /// @param serverReference
+    ///     the server that the broker named, or null when it named none
     public MqttBrokerDisconnectException(
             ReasonCode reasonCode,
             @Nullable String reasonString,
@@ -38,18 +47,19 @@ public final class MqttBrokerDisconnectException extends MqttException {
         this.serverReference = serverReference;
     }
 
-    /// The reason code of the broker's DISCONNECT.
+    /// {@return the reason code of the broker's DISCONNECT}
     public ReasonCode reasonCode() {
         return reasonCode;
     }
 
-    /// The broker's explanation for people diagnosing the end, or empty when it sent none.
+    /// {@return the broker's explanation for people diagnosing the end, or empty when it sent
+    /// none}
     public Optional<String> reasonString() {
         return Optional.ofNullable(reasonString);
     }
 
-    /// The server that the broker named for the client to use instead, or empty when it named
-    /// none.
+    /// {@return the server that the broker named for the client to use instead, or empty when
+    /// it named none}
     public Optional<String> serverReference() {
         return Optional.ofNullable(serverReference);
     }

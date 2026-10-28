@@ -2,7 +2,7 @@ package org.mqtt4j.hato.common.value;
 
 /// MQTT 5.0 reason codes shared by acknowledgements, disconnection, and authentication.
 ///
-/// Each distinct wire value has one constant. In particular, `SUCCESS` represents `0x00`:
+/// Each distinct wire value has one constant. In particular, [SUCCESS][#SUCCESS] represents `0x00`:
 /// Success in acknowledgements and AUTH, Normal disconnection in DISCONNECT, and Granted
 /// QoS 0 in SUBACK. The packet determines which meaning applies.
 ///
@@ -147,19 +147,22 @@ public enum ReasonCode {
         this.value = value;
     }
 
-    /// Returns the unsigned byte value used by MQTT 5.0 on the wire.
+    /// {@return the unsigned byte value used by MQTT 5.0 on the wire}
     public int value() {
         return value;
     }
 
     /// Resolves an unsigned MQTT 5.0 wire value to its reason code.
     ///
-    /// Zero always resolves to `SUCCESS`, including for DISCONNECT and SUBACK. The caller
-    /// must separately check whether the code is permitted for the packet being decoded.
+    /// Zero always resolves to [SUCCESS][#SUCCESS], including for DISCONNECT and SUBACK. The
+    /// caller must separately check whether the code is permitted for the packet being decoded.
     ///
-    /// @param value the unsigned byte value, represented as an `int`
-    /// @return the reason code for that value
-    /// @throws IllegalArgumentException if `value` is outside 0 to 255 or is undefined
+    /// @param value
+    ///     the unsigned byte value, represented as an `int`
+    /// @return
+    ///     the reason code for that value
+    /// @throws IllegalArgumentException
+    ///     if `value` is outside 0 to 255 or is undefined
     public static ReasonCode of(int value) {
         return switch (value) {
             case 0x00 -> SUCCESS;

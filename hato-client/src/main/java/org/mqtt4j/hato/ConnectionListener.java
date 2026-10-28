@@ -32,6 +32,9 @@ public interface ConnectionListener {
     /// connect future, subject to normal admission limits. Like any client call, they act on
     /// the client's current connection: this call can run after its connection has ended, and
     /// operations then reach a later connection or fail with [MqttNotConnectedException].
+    ///
+    /// @param connAck
+    ///     the CONNACK that established the connection
     default void onConnected(ConnAck connAck) {
     }
 
@@ -40,6 +43,9 @@ public interface ConnectionListener {
     /// broker ends the connection with DISCONNECT, the cause is [MqttBrokerDisconnectException]
     /// with the broker's reason code. [Disconnection#reconnectDelay()] tells when the client
     /// attempts to connect again.
+    ///
+    /// @param disconnection
+    ///     the end of the connection
     void onDisconnected(Disconnection disconnection);
 
     /// Called for each connection attempt that ends without an established connection,
@@ -53,6 +59,9 @@ public interface ConnectionListener {
     /// the same [MqttConnectException] with which the attempt fails a pending
     /// [MqttClient#connect()]; a broker refusal carries its reason code. To stop retrying on a
     /// particular cause, call [MqttClient#disconnect()] from here.
+    ///
+    /// @param failure
+    ///     the end of the attempt
     default void onConnectFailed(Disconnection failure) {
     }
 
@@ -62,6 +71,11 @@ public interface ConnectionListener {
     /// the connection continue. Waiting and later pull receives throw
     /// [MqttSubscriptionRefusedException] with the same refusal reason. The same filter can be
     /// registered again at once, also from within this callback.
+    ///
+    /// @param subscription
+    ///     the subscription whose re-creation was refused
+    /// @param failure
+    ///     the refusal
     default void onResubscribeFailed(
             Subscription subscription,
             MqttSubscriptionRefusedException failure

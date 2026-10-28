@@ -15,14 +15,19 @@ import java.util.Objects;
 /// - [MQTT 3.1.1 Plus Errata 01, section 4.7: Topic Names and Topic Filters](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os-complete.html#_Toc442180919)
 /// - [MQTT 5.0, section 4.8.2: Shared Subscriptions](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)
 ///
-/// @param pattern the complete filter to validate and match
+/// @param pattern
+///     the complete filter to validate and match
 public record TopicFilter(String pattern) {
 
     /// Creates a filter after validating its pattern.
     ///
-    /// @throws NullPointerException if `pattern` is null
-    /// @throws IllegalArgumentException if `pattern` is empty, contains NUL or an unpaired
-    ///         surrogate, exceeds 65535 UTF-8 bytes, or misplaces a wildcard
+    /// @param pattern
+    ///     the complete filter to validate and match
+    /// @throws NullPointerException
+    ///     if `pattern` is null
+    /// @throws IllegalArgumentException
+    ///     if `pattern` is empty, contains NUL or an unpaired surrogate, exceeds 65535 UTF-8
+    ///     bytes, or misplaces a wildcard
     public TopicFilter {
         // $share/{ShareName}/{filter} gets no special treatment here: SharedTopicFilter in
         // common.protocol interprets shared subscriptions. This keeps the public value type
@@ -53,9 +58,12 @@ public record TopicFilter(String pattern) {
     /// The entire pattern participates in matching, including any `$share/` prefix. A leading
     /// wildcard does not match a topic whose name starts with `$`.
     ///
-    /// @param topic the topic to match
-    /// @return whether the topic matches this filter
-    /// @throws NullPointerException if `topic` is null
+    /// @param topic
+    ///     the topic to match
+    /// @return
+    ///     whether the topic matches this filter
+    /// @throws NullPointerException
+    ///     if `topic` is null
     public boolean matches(Topic topic) {
         Objects.requireNonNull(topic, "Topic must not be null");
 

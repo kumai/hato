@@ -23,14 +23,21 @@ public final class PublishResult {
     }
 
     /// Describes a successfully completed publication with [ReasonCode#SUCCESS].
+    ///
+    /// @return
+    ///     a result whose [#reasonCode()] is [ReasonCode#SUCCESS]
     public static PublishResult of() {
         return SUCCESS;
     }
 
     /// Describes a successfully completed publication with `reasonCode`.
     ///
-    /// @throws IllegalArgumentException unless `reasonCode` is [ReasonCode#SUCCESS] or
-    ///     [ReasonCode#NO_MATCHING_SUBSCRIBERS]
+    /// @param reasonCode
+    ///     the reason code of the broker's acknowledgement
+    /// @return
+    ///     a result whose [#reasonCode()] is `reasonCode`
+    /// @throws IllegalArgumentException
+    ///     unless `reasonCode` is [ReasonCode#SUCCESS] or [ReasonCode#NO_MATCHING_SUBSCRIBERS]
     public static PublishResult of(ReasonCode reasonCode) {
         return switch (requireNonNull(reasonCode, "reasonCode must not be null")) {
             case SUCCESS -> SUCCESS;
@@ -42,8 +49,8 @@ public final class PublishResult {
         };
     }
 
-    /// The reason code of the MQTT 5.0 broker's acknowledgement: that of PUBACK for QoS 1, and
-    /// that of PUBREC for QoS 2. [ReasonCode#NO_MATCHING_SUBSCRIBERS] means that the broker
+    /// {@return the reason code of the MQTT 5.0 broker's acknowledgement: that of PUBACK for QoS 1,
+    /// and that of PUBREC for QoS 2} [ReasonCode#NO_MATCHING_SUBSCRIBERS] means that the broker
     /// accepted the message but had no subscription to deliver it to. Brokers may also report
     /// [ReasonCode#SUCCESS] in that case. QoS 0 and MQTT 3.1.1 report [ReasonCode#SUCCESS].
     public ReasonCode reasonCode() {

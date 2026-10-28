@@ -27,11 +27,19 @@ public final class MqttPublicationRefusedException extends MqttException {
     private final @Nullable String reasonString;
 
     /// A refusal without an explanation, such as the one that the client makes itself.
+    ///
+    /// @param reasonCode
+    ///     the reason for the refusal
     public MqttPublicationRefusedException(ReasonCode reasonCode) {
         this(reasonCode, null);
     }
 
     /// A refusal with the broker's explanation, if the broker sent one.
+    ///
+    /// @param reasonCode
+    ///     the reason for the refusal
+    /// @param reasonString
+    ///     the broker's explanation, or null when it sent none
     public MqttPublicationRefusedException(
             ReasonCode reasonCode,
             @Nullable String reasonString
@@ -41,14 +49,14 @@ public final class MqttPublicationRefusedException extends MqttException {
         this.reasonString = reasonString;
     }
 
-    /// The reason for the refusal, received in PUBACK or PUBREC, or the one that the broker
-    /// would use for a publication that exceeds its announced limits.
+    /// {@return the reason for the refusal, received in PUBACK or PUBREC, or the one that the
+    /// broker would use for a publication that exceeds its announced limits}
     public ReasonCode reasonCode() {
         return reasonCode;
     }
 
-    /// The broker's explanation for people diagnosing the refusal, received in PUBACK or PUBREC,
-    /// or empty when the broker sent none or the client refused without sending.
+    /// {@return the broker's explanation for people diagnosing the refusal, received in PUBACK
+    /// or PUBREC, or empty when the broker sent none or the client refused without sending}
     public Optional<String> reasonString() {
         return Optional.ofNullable(reasonString);
     }
