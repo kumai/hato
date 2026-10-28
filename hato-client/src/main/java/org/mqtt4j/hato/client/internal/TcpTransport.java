@@ -42,6 +42,11 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
 
     private static final int DEFAULT_TLS_PORT = 8883;
 
+    // Reads start into a small buffer, which each read that fills it doubles up to the full size:
+    // most connections read little at a time, and a busy one reaches the full size within a few
+    // reads.
+    private static final int FIRST_READ_BUFFER_SIZE = 1024;
+
     private static final int READ_BUFFER_SIZE = 8192;
 
     private static final int RESOLUTION_LIMIT = 64;
@@ -408,7 +413,7 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
 
     private void read(Connection socket, Listener receiver)
             throws IOException, InterruptedException {
-        var buffer = new byte[READ_BUFFER_SIZE];
+        var buffer = new byte[FIRST_READ_BUFFER_SIZE];
         InputStream input = socket.input();
         // A listener that borrows takes the bytes where they lie, which spares a copy of every
         // read.
@@ -442,6 +447,10 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                 }
             }
             worked += System.nanoTime() - started;
+            // The listener is done with the bytes, so a read that filled the buffer can double it.
+            if (count == buffer.length && buffer.length < READ_BUFFER_SIZE) {
+                buffer = new byte[buffer.length * 2];
+            }
             // A pause, which the listener may have asked for, leaves the peer to TCP flow control
             // until the client resumes. It waits after afterBorrowedBytes, whose work may resume
             // the reader. Waiting frees the carrier.
