@@ -18,7 +18,8 @@ public final class PacketIds {
 
     private static final int MAX_PACKET_ID = 65535;
 
-    private final BitSet inUse = new BitSet(MAX_PACKET_ID + 1);
+    // Grows to the highest identifier allocated, so a session that allocates few keeps it small.
+    private final BitSet inUse = new BitSet();
     private int nextId = 1;
 
     /// Reserves the next unused identifier in circular ascending order.
