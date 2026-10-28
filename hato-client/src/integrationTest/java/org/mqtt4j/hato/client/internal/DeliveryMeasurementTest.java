@@ -35,6 +35,7 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.client.internal.DeliveryToken.Origin;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 
@@ -418,7 +419,7 @@ class DeliveryMeasurementTest {
                         false
                 ))
                 .toArray(MqttMessage[]::new);
-        var token = new DeliveryToken(1, 1, 1, 0, DeliveryToken.UNTIMED);
+        var token = new DeliveryToken(new Origin(1, 1, 1), 0, DeliveryToken.UNTIMED);
         long copies = (long) HAND_OFFS * subscriptions;
         long start = System.nanoTime();
         for (int index = 0; index < HAND_OFFS; index++) {

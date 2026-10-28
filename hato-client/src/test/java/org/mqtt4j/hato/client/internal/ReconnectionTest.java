@@ -31,6 +31,7 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Topic;
+import org.mqtt4j.hato.client.internal.DeliveryToken.Origin;
 import org.mqtt4j.hato.client.internal.SessionPersistenceTest.Result;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
@@ -568,7 +569,7 @@ class ReconnectionTest {
 
         // Act
         sut.deliveryFailed(
-                new DeliveryToken(sut.sessionNumber(), 1, 1, 0, DeliveryToken.UNTIMED),
+                new DeliveryToken(new Origin(sut.sessionNumber(), 1, 1), 0, DeliveryToken.UNTIMED),
                 failure
         );
 
@@ -583,7 +584,7 @@ class ReconnectionTest {
         sut.failed(2, new IOException("lost again"));
         sut.timer(0, RECONNECT, 0);
         sut.deliveryFailed(
-                new DeliveryToken(sut.sessionNumber(), 2, 2, 0, DeliveryToken.UNTIMED),
+                new DeliveryToken(new Origin(sut.sessionNumber(), 2, 2), 0, DeliveryToken.UNTIMED),
                 failure
         );
 
@@ -645,7 +646,7 @@ class ReconnectionTest {
         // Act
         sut.timer(0, RECONNECT, 3);
         sut.deliveryFailed(
-                new DeliveryToken(sut.sessionNumber(), 1, 1, 0, DeliveryToken.UNTIMED),
+                new DeliveryToken(new Origin(sut.sessionNumber(), 1, 1), 0, DeliveryToken.UNTIMED),
                 new IllegalArgumentException("handler")
         );
 
@@ -903,7 +904,7 @@ class ReconnectionTest {
 
     private static void failHandler(SessionCore sut) {
         sut.deliveryFailed(
-                new DeliveryToken(sut.sessionNumber(), 1, 1, 0, DeliveryToken.UNTIMED),
+                new DeliveryToken(new Origin(sut.sessionNumber(), 1, 1), 0, DeliveryToken.UNTIMED),
                 new IllegalStateException("handler")
         );
     }

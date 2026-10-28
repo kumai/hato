@@ -41,6 +41,7 @@ import org.mqtt4j.hato.ReceiveResult;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.client.internal.DeliveryToken.Origin;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -191,8 +192,12 @@ class DeliveryLanesTest {
         // Arrange: the first copy arrives on the second connection of attempt 1, as when that
         // attempt replaced a broker session. One receiver takes it, and the other's copy is
         // discarded when the connection ends, so the continued session keeps the receipt.
-        var firstCopy = new DeliveryToken(SESSION, 2, 1, 10, DeliveryToken.UNTIMED);
-        var retransmission = new DeliveryToken(SESSION, 3, 2, 10, DeliveryToken.UNTIMED);
+        var firstCopy = new DeliveryToken(new Origin(SESSION, 2, 1), 10, DeliveryToken.UNTIMED);
+        var retransmission = new DeliveryToken(
+                new Origin(SESSION, 3, 2),
+                10,
+                DeliveryToken.UNTIMED
+        );
         DeliveryLanes.Receiver taken = registerPull(sut, 1, request(1));
         DeliveryLanes.Receiver discarded = registerPull(sut, 2, request(1));
         assertThat(sut.deliver(firstCopy, List.of(1L, 2L), qosOneMessage(), false, 10)).isTrue();
@@ -2726,7 +2731,7 @@ class DeliveryLanesTest {
             throws Exception {
         // Arrange
         var offers = new AtomicInteger();
-        var arrival = new DeliveryToken(SESSION, 3, 2, 10, DeliveryToken.UNTIMED);
+        var arrival = new DeliveryToken(new Origin(SESSION, 3, 2), 10, DeliveryToken.UNTIMED);
         assertThat(sut.registerHandOff(1, request(AckMode.ON_RECEIVE, 2), _ -> {
             offers.incrementAndGet();
             return false;
@@ -3319,9 +3324,7 @@ class DeliveryLanesTest {
     /// A token whose connection was established by an attempt of the same number.
     private DeliveryToken token(long connection, long acknowledgement) {
         return new DeliveryToken(
-                SESSION,
-                connection,
-                connection,
+                new Origin(SESSION, connection, connection),
                 acknowledgement,
                 DeliveryToken.UNTIMED
         );

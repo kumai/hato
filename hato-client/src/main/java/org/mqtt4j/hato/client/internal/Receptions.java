@@ -186,13 +186,7 @@ final class Receptions {
             return;
         }
         if (!port.deliver(
-                new DeliveryToken(
-                        core.sessionNumber(),
-                        core.generation(),
-                        core.attempt(),
-                        token,
-                        receivedAt
-                ),
+                new DeliveryToken(core.origin(), token, receivedAt),
                 matches,
                 publish,
                 bytes

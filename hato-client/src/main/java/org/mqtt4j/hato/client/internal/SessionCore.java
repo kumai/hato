@@ -28,6 +28,7 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.client.internal.ConnectionEstablishment.Outcome;
 import org.mqtt4j.hato.client.internal.ConnectionEstablishment.Step;
+import org.mqtt4j.hato.client.internal.DeliveryToken.Origin;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
@@ -226,10 +227,9 @@ final class SessionCore {
 
         long generation();
 
-        /// The number of the attempt that established the current connection.
-        long attempt();
-
-        long sessionNumber();
+        /// What the receptions of the current connection share in their tokens: its
+        /// session, its number, and the attempt that established it.
+        Origin origin();
 
         /// Numbers a write; tickets identify write completions across the client.
         long nextTicket();
@@ -663,6 +663,7 @@ final class SessionCore {
         current.receiveMaximum = established.receiveMaximum();
         current.subscriptionIdentifiers = established.subscriptionIdentifiers();
         current.topicAliasMaximum = established.topicAliasMaximum();
+        current.origin = new Origin(sessionNumber, generation, establishedAttempt);
         request.establish();
         port.admit(generation);
         // Reconcile before announcing, so connect() and onConnected already find continued
@@ -1288,13 +1289,8 @@ final class SessionCore {
         }
 
         @Override
-        public long attempt() {
-            return request.attempt();
-        }
-
-        @Override
-        public long sessionNumber() {
-            return sessionNumber;
+        public Origin origin() {
+            return requireNonNull(current.origin);
         }
 
         @Override
@@ -1398,6 +1394,8 @@ final class SessionCore {
         boolean subscriptionIdentifiers;
         // Set with the CONNACK: how many Topic Aliases the broker takes from the client.
         int topicAliasMaximum;
+        // Set with the CONNACK: what the tokens of this connection's receptions share.
+        @Nullable Origin origin;
         // Set when the client found this violation in what an MQTT 5.0 broker sent, and writes
         // DISCONNECT with its reason code before closing. It decides how the connection ends.
         @Nullable PacketDecodeException violation;
