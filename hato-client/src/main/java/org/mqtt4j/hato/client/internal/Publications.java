@@ -1,14 +1,14 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
-import java.util.SequencedMap;
 import java.util.SequencedSet;
 import java.util.Set;
 
@@ -75,7 +75,7 @@ final class Publications {
     // The session's exchanges by packet identifier. PUBLISH entries retain send order; replacing
     // one with PUBREL moves it to the end in PUBREC order. Both stages share the identifier and
     // count window across connections. A new session replaces them.
-    private SequencedMap<Integer, Inflight> inflight = new LinkedHashMap<>();
+    private Exchanges inflight = new Exchanges();
 
     // Retained PUBLISH wire sizes, counted only for a persistent session until PUBACK/REC.
     private long bytes;
@@ -181,7 +181,7 @@ final class Publications {
                     kept ? message : null,
                     byteCount
             );
-            inflight.put(packetId, publication);
+            inflight.putLast(publication);
             bytes += byteCount;
             if (waits) {
                 window.unsent.add(publication);
@@ -268,10 +268,7 @@ final class Publications {
                 core.responses().answered(ResponseDeadlines.Kind.PUBREC, packetId);
                 logReason("PUBREC", packetId, ack.properties());
                 // The result reports PUBREC's reason code once PUBCOMP completes the exchange.
-                inflight.putLast(
-                        packetId,
-                        new Release(packetId, publication.operation, ack.reasonCode())
-                );
+                inflight.putLast(new Release(packetId, publication.operation, ack.reasonCode()));
             }
             case Release pending -> {
                 // A PUBREL replay still waiting for capacity also answers this duplicate. The
@@ -325,7 +322,7 @@ final class Publications {
 
     /// Queues the session's exchanges for a connection that continues the session.
     void resume() {
-        for (Inflight exchange : inflight.values()) {
+        for (Inflight exchange : inflight.inOrder()) {
             switch (exchange) {
                 case Publication publication -> window.unsent.add(publication);
                 case Release release -> window.releaseReplays.add(release);
@@ -422,7 +419,8 @@ final class Publications {
     /// entry, and its PUBCOMP must not land on a new exchange using the same id, so the id stays
     /// unavailable until PUBCOMP, including the time after I/O admitted the response.
     boolean holds(int packetId) {
-        return window.unknownReleases.containsKey(packetId);
+        // Every allocation asks; looking up an empty table would only box the identifier.
+        return !window.unknownReleases.isEmpty() && window.unknownReleases.containsKey(packetId);
     }
 
     /// Settles the publications of an ended connection. QoS 0 publications belong to it and are
@@ -442,7 +440,7 @@ final class Publications {
     /// Fails the futures of the session's QoS 1 and QoS 2 publications with an unknown outcome.
     /// Their exchanges stay for a later connection unless the session goes too.
     void failPublications(Throwable failure) {
-        for (Inflight exchange : inflight.values()) {
+        for (Inflight exchange : inflight.inOrder()) {
             if (exchange.operation != 0) {
                 port.complete(exchange.operation, null, failure);
                 exchange.operation = 0;
@@ -454,7 +452,7 @@ final class Publications {
     /// unknown outcome.
     void sessionDiscarded() {
         failPublications(new MqttConnectionLostException());
-        inflight = new LinkedHashMap<>();
+        inflight = new Exchanges();
         bytes = 0;
     }
 
@@ -480,7 +478,7 @@ final class Publications {
         long pubAck = 0;
         long pubRec = 0;
         long pubComp = 0;
-        for (Inflight exchange : inflight.values()) {
+        for (Inflight exchange : inflight.inOrder()) {
             switch (exchange) {
                 case Publication publication when publication.qos == Qos.AT_LEAST_ONCE -> pubAck++;
                 case Publication _ -> pubRec++;
@@ -707,7 +705,10 @@ final class Publications {
             }
             window.unsent.remove(exchange);
             window.releaseReplays.remove(exchange);
-            window.releases.remove(packetId);
+            // Only QoS 2 queues releases; looking up an empty set would only box the identifier.
+            if (!window.releases.isEmpty()) {
+                window.releases.remove(packetId);
+            }
         }
     }
 
@@ -739,6 +740,74 @@ final class Publications {
         final Map<Integer, Integer> unknownReleases = new HashMap<>();
     }
 
+    /// The session's exchanges by packet identifier, without boxing it, and in session order
+    /// through the exchanges themselves.
+    private static final class Exchanges {
+
+        private final LongMap<Inflight> byId = new LongMap<>();
+
+        private @Nullable Inflight first;
+
+        private @Nullable Inflight last;
+
+        int size() {
+            return byId.size();
+        }
+
+        @Nullable Inflight get(int packetId) {
+            return byId.get(packetId);
+        }
+
+        /// Adds `exchange` last, in place of the exchange that held its identifier, if any.
+        void putLast(Inflight exchange) {
+            Inflight replaced = byId.put(exchange.packetId, exchange);
+            if (replaced != null) {
+                unlink(replaced);
+            }
+            exchange.before = last;
+            if (last == null) {
+                first = exchange;
+            } else {
+                last.after = exchange;
+            }
+            last = exchange;
+        }
+
+        @Nullable Inflight remove(int packetId) {
+            Inflight removed = byId.remove(packetId);
+            if (removed != null) {
+                unlink(removed);
+            }
+            return removed;
+        }
+
+        /// A copy of the exchanges in session order.
+        List<Inflight> inOrder() {
+            var exchanges = new ArrayList<Inflight>(byId.size());
+            for (Inflight exchange = first; exchange != null; exchange = exchange.after) {
+                exchanges.add(exchange);
+            }
+            return exchanges;
+        }
+
+        private void unlink(Inflight exchange) {
+            Inflight before = exchange.before;
+            Inflight after = exchange.after;
+            if (before == null) {
+                first = after;
+            } else {
+                before.after = after;
+            }
+            if (after == null) {
+                last = before;
+            } else {
+                after.before = before;
+            }
+            exchange.before = null;
+            exchange.after = null;
+        }
+    }
+
     /// @param awaitingPubAck QoS 1 publications that await PUBACK
     /// @param awaitingPubRec QoS 2 publications that await PUBREC
     /// @param awaitingPubComp QoS 2 exchanges that await PUBCOMP
@@ -756,6 +825,9 @@ final class Publications {
 
         final int packetId;
         long operation;
+        // Exchanges': the exchanges before and after this one in session order.
+        @Nullable Inflight before;
+        @Nullable Inflight after;
 
         Inflight(int packetId, long operation) {
             this.packetId = packetId;
