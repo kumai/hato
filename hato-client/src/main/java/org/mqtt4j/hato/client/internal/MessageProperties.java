@@ -5,11 +5,10 @@ import java.util.ArrayList;
 
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.UserProperty;
+import org.mqtt4j.hato.client.internal.common.protocol.MqttString;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 import org.mqtt4j.hato.client.internal.common.protocol.Property;
 import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 /// Maps the properties of an application message to MQTT 5.0 PUBLISH properties. Topic Alias and
 /// Subscription Identifier steer how the client handles a connection, so a message never carries
@@ -81,18 +80,22 @@ public final class MessageProperties {
     public static int size(MqttMessage message) {
         long bytes = 0;
         // Each property is a one-byte identifier and its value; strings and binary data have
-        // a two-byte length.
+        // a two-byte length. The strings are counted as the codec counts them, without encoding
+        // them; a message has checked its strings, so counting them does not fail.
         if (message.payloadUtf8()) {
             bytes += 2;
         }
         if (message.messageExpiry().isPresent()) {
             bytes += 5;
         }
-        bytes += message.contentType().map(type -> 3L + utf8Length(type)).orElse(0L);
-        bytes += message.responseTopic().map(topic -> 3L + utf8Length(topic.name())).orElse(0L);
+        bytes += message.contentType().map(type -> 1L + MqttString.encodedSize(type)).orElse(0L);
+        bytes += message.responseTopic()
+                .map(topic -> 1L + MqttString.encodedSize(topic.name()))
+                .orElse(0L);
         bytes += message.correlationData().map(data -> 3L + data.length).orElse(0L);
         for (UserProperty property : message.userProperties()) {
-            bytes += 5L + utf8Length(property.name()) + utf8Length(property.value());
+            bytes += 1L + MqttString.encodedSize(property.name())
+                    + MqttString.encodedSize(property.value());
         }
         return (int) Math.min(bytes, Integer.MAX_VALUE);
     }
@@ -100,9 +103,5 @@ public final class MessageProperties {
     // Rounding up never shortens the lifetime or the delay that the application asked for.
     private static long seconds(Duration duration) {
         return Math.ceilDiv(duration.toNanos(), 1_000_000_000L);
-    }
-
-    private static int utf8Length(String value) {
-        return value.getBytes(UTF_8).length;
     }
 }

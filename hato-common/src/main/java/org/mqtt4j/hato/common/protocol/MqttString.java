@@ -152,7 +152,7 @@ public final class MqttString {
     ///
     /// @throws IllegalArgumentException if `value` contains U+0000 or an unpaired surrogate,
     ///         or exceeds 65535 bytes in UTF-8
-    static int encodedSize(String value) {
+    public static int encodedSize(String value) {
         requireNonNull(value, "value must not be null");
         // Shared text constraints also appear in value.TopicText; that layer cannot use protocol.
         // One scan counts the UTF-8 length: a char below U+0080 takes one byte, below U+0800
