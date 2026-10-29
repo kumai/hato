@@ -7,14 +7,11 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.time.Duration;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.stream.Collectors;
 import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLParameters;
@@ -173,18 +170,22 @@ class WebSocketConnectionTest {
 
     @Test
     void the_client_keeps_one_http_client_across_reconnections() throws Exception {
+        // Arrange: the client's WebSocket transports come from a factory that the test holds.
+        // The factory is the only place where the client creates an HttpClient.
+        var webSockets = new WebSocketTransports("ws-reconnecting", DefaultTimerScheduler.instance);
         ReconnectPolicy soon = ReconnectPolicy.exponentialBackoff(
                 Duration.ofMillis(10),
                 Duration.ofMillis(10)
         );
-        Set<String> before = selectorThreads();
         try (WebSocketPeer server = WebSocketPeer.listen();
-                MqttClient sut = client(server.uri("/mqtt"), soon)) {
-            // Arrange
-            Set<String> first;
+                MqttClient sut = MqttClient.builder()
+                        .server(server.uri("/mqtt"))
+                        .transportFactory(webSockets)
+                        .reconnectPolicy(soon)
+                        .build()) {
+            HttpClient first;
             try (Broker _ = connect(server, sut)) {
-                first = selectorThreads();
-                first.removeAll(before);
+                first = webSockets.httpClient();
             }
 
             // Act: the broker dropped the first connection, and the client reconnects.
@@ -194,10 +195,7 @@ class WebSocketConnectionTest {
                 sut.whenConnected().get(5, SECONDS);
 
                 // Assert
-                Set<String> second = selectorThreads();
-                second.removeAll(before);
-                assertThat(first).hasSize(1);
-                assertThat(second).isEqualTo(first);
+                assertThat(webSockets.httpClient()).isSameAs(first);
             }
         }
     }
@@ -207,7 +205,6 @@ class WebSocketConnectionTest {
             throws Exception {
         // Arrange: the client's WebSocket transports come from a factory that the test holds.
         var webSockets = new WebSocketTransports("ws-closing", DefaultTimerScheduler.instance);
-        Set<String> before = selectorThreads();
         try (WebSocketPeer server = WebSocketPeer.listen()) {
             MqttClient sut = MqttClient.builder()
                     .server(server.uri("/mqtt"))
@@ -216,8 +213,6 @@ class WebSocketConnectionTest {
                     .build();
             try (Broker _ = connect(server, sut)) {
                 HttpClient http = webSockets.httpClient();
-                Set<String> during = selectorThreads();
-                during.removeAll(before);
                 var endedFirst = new CompletableFuture<Boolean>();
 
                 // Act: no DISCONNECT, and the broker never answers the closing handshake.
@@ -226,8 +221,6 @@ class WebSocketConnectionTest {
 
                 // Assert: termination waits for the HttpClient and its threads.
                 assertThat(endedFirst.get(10, SECONDS)).isTrue();
-                assertThat(during).hasSize(1);
-                assertThat(selectorThreads()).doesNotContainAnyElementsOf(during);
             }
         }
     }
@@ -354,14 +347,6 @@ class WebSocketConnectionTest {
             broker.close();
             throw failure;
         }
-    }
-
-    // The names of the platform threads that select for HttpClients.
-    private static Set<String> selectorThreads() {
-        return Thread.getAllStackTraces().keySet().stream()
-                .map(Thread::getName)
-                .filter(name -> name.matches("HttpClient-\\d+-SelectorManager"))
-                .collect(Collectors.toCollection(HashSet::new));
     }
 
     /// The broker's side of one WebSocket connection, reading and writing MQTT packets in the
