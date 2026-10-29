@@ -38,6 +38,7 @@ import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mqtt4j.hato.client.internal.Measurements.awaitCount;
@@ -51,6 +52,7 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// Measures what subscriptions cost and prints the results instead of asserting limits: the
 /// time to match a publication against many subscriptions and its share of receiving it, the
+/// time to receive the copies that an MQTT 5.0 broker sends for overlapping subscriptions, the
 /// memory that each subscription and each held acknowledgement condition takes, the time to
 /// make every subscription again on a new session, and the time to take the client's stats.
 /// Runs only with `-Phato.measure=true`.
@@ -88,15 +90,40 @@ class SubscriptionMeasurementTest {
         print(
                 "%s: one filter of the form devices/<n>/# selects each topic devices/<n>/temp."
                         + " Matching in the filter tree, and receiving a QoS 0 publication"
-                        + " through the client, median of %d runs",
+                        + " through the client over each MQTT version, median of %d runs; under"
+                        + " MQTT 5.0 each publication carries the identifier of its subscription",
                 runtime(),
                 RUNS
         );
-        print("%13s | %16s | %16s", "subscriptions", "ns per match", "ns per reception");
+        print(
+                "%13s | %12s | %22s | %20s",
+                "subscriptions",
+                "ns per match",
+                "ns per 3.1.1 reception",
+                "ns per 5.0 reception"
+        );
         for (int subscriptions : SUBSCRIPTIONS) {
             long match = median(RUNS, () -> matchNanos(subscriptions));
-            long reception = median(RUNS, () -> receiveNanos(subscriptions));
-            print("%13d | %16d | %16d", subscriptions, match, reception);
+            long mqtt3 = median(RUNS, () -> receiveNanos(subscriptions, MqttVersion.V3_1_1));
+            long mqtt5 = median(RUNS, () -> receiveNanos(subscriptions, MqttVersion.V5));
+            print("%13d | %12d | %22d | %20d", subscriptions, match, mqtt3, mqtt5);
+        }
+    }
+
+    @Test
+    void receiving_copies_for_overlapping_subscriptions_by_identifier_costs() throws Exception {
+        print(
+                "%s: up to 256 distinct filters of %s select it, and the peer sends a copy of"
+                        + " each QoS 0 publication for each subscription, carrying its"
+                        + " identifier, as an MQTT 5.0 broker that does not merge copies does."
+                        + " Time per copy through the client, median of %d runs",
+                runtime(),
+                CONDITION_TOPIC,
+                RUNS
+        );
+        print("%13s | %s", "subscriptions", "ns per copy");
+        for (int subscriptions : List.of(1, 16, 256)) {
+            print("%13d | %d", subscriptions, median(RUNS, () -> copyNanos(subscriptions)));
         }
     }
 
@@ -207,45 +234,105 @@ class SubscriptionMeasurementTest {
         return elapsed / MATCHES;
     }
 
-    /// Receives [#RECEPTIONS] QoS 0 publications through a client that holds `subscriptions`
-    /// subscriptions, of which only one, with a no-op handler, selects them. The others are pull
-    /// subscriptions, which add no delivery thread. Returns the time per publication.
-    private static long receiveNanos(int subscriptions) throws Exception {
-        var codec = PacketCodec.of(MqttVersion.V3_1_1);
-        var batches = new byte[RECEPTIONS / RECEIVE_BATCH][];
-        for (int batch = 0; batch < batches.length; batch++) {
-            var bytes = new ByteArrayOutputStream();
-            for (int index = 0; index < RECEIVE_BATCH; index++) {
-                bytes.writeBytes(codec.encode(new Packet.Publish(
-                        new Topic("devices/0/temp"),
-                        new byte[] {1},
-                        Qos.AT_MOST_ONCE,
-                        false,
-                        false,
-                        0,
-                        EMPTY
-                )));
-            }
-            batches[batch] = bytes.toByteArray();
-        }
+    /// Receives [#RECEPTIONS] QoS 0 publications over `version` through a client that holds
+    /// `subscriptions` subscriptions, of which only one, with a no-op handler, selects them. The
+    /// others are pull subscriptions, which add no delivery thread. Returns the time per
+    /// publication.
+    private static long receiveNanos(int subscriptions, MqttVersion version) throws Exception {
         var handled = new AtomicLong();
         try (ServerSocket server = ScriptedBroker.listen();
-                MqttClient sut = client(server, subscriptions, new LinkedBlockingQueue<>());
-                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
+                MqttClient sut = client(
+                        server,
+                        version,
+                        subscriptions,
+                        new LinkedBlockingQueue<>()
+                );
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut, version)) {
             var requests = new ArrayList<Subscription>();
             requests.add(sut.subscribe(request("devices/0/#"), _ -> handled.incrementAndGet()));
             for (int index = 1; index < subscriptions; index++) {
                 requests.add(sut.subscribe(request("devices/" + index + "/#")));
             }
-            establish(peer, requests);
-            long start = System.nanoTime();
-            for (int batch = 0; batch < batches.length; batch++) {
-                awaitCount(handled, (long) (batch + 1) * RECEIVE_BATCH - RECEIVE_WINDOW);
-                peer.send(batches[batch]);
-            }
-            awaitCount(handled, RECEPTIONS);
-            return (System.nanoTime() - start) / RECEPTIONS;
+            // The client sends its SUBSCRIBE packets in the order of the calls, so the first
+            // made the subscription that takes the publications.
+            List<Packet.Subscribe> made = establish(peer, requests);
+            byte[][] batches = batches(
+                    PacketCodec.of(version),
+                    new Topic("devices/0/temp"),
+                    List.of(ScriptedBroker.forwarding(made.getFirst()))
+            );
+            return feed(peer, batches, handled);
         }
+    }
+
+    /// Receives [#RECEPTIONS] QoS 0 copies through an MQTT 5.0 client whose `subscriptions`
+    /// subscriptions all select [#CONDITION_TOPIC], each with a no-op handler. Each copy carries
+    /// the identifier of one subscription, in turn, so it goes to that subscription alone.
+    /// Returns the time per copy.
+    private static long copyNanos(int subscriptions) throws Exception {
+        var handled = new AtomicLong();
+        try (ServerSocket server = ScriptedBroker.listen();
+                MqttClient sut = client(
+                        server,
+                        MqttVersion.V5,
+                        subscriptions,
+                        new LinkedBlockingQueue<>()
+                );
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut, MqttVersion.V5)) {
+            var requests = new ArrayList<Subscription>();
+            for (int mask = 0; mask < subscriptions; mask++) {
+                requests.add(sut.subscribe(
+                        request(conditionFilter(mask)),
+                        _ -> handled.incrementAndGet()
+                ));
+            }
+            List<Properties> copies = establish(peer, requests).stream()
+                    .map(ScriptedBroker::forwarding)
+                    .toList();
+            byte[][] batches = batches(
+                    PacketCodec.of(MqttVersion.V5),
+                    new Topic(CONDITION_TOPIC),
+                    copies
+            );
+            return feed(peer, batches, handled);
+        }
+    }
+
+    /// The writes that carry [#RECEPTIONS] QoS 0 publications to `topic`, [#RECEIVE_BATCH] in
+    /// each, encoded by `codec`. Each publication carries the next entry of `properties`, in
+    /// turn.
+    private static byte[][] batches(PacketCodec codec, Topic topic, List<Properties> properties) {
+        var batches = new byte[RECEPTIONS / RECEIVE_BATCH][];
+        for (int batch = 0; batch < batches.length; batch++) {
+            var bytes = new ByteArrayOutputStream();
+            for (int index = 0; index < RECEIVE_BATCH; index++) {
+                int publication = batch * RECEIVE_BATCH + index;
+                bytes.writeBytes(codec.encode(new Packet.Publish(
+                        topic,
+                        new byte[] {1},
+                        Qos.AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        properties.get(publication % properties.size())
+                )));
+            }
+            batches[batch] = bytes.toByteArray();
+        }
+        return batches;
+    }
+
+    /// Writes `batches` while at most [#RECEIVE_WINDOW] of their publications wait for their
+    /// handlers, and returns the time per publication until `handled` counts all of them.
+    private static long feed(ScriptedBroker peer, byte[][] batches, AtomicLong handled)
+            throws IOException {
+        long start = System.nanoTime();
+        for (int batch = 0; batch < batches.length; batch++) {
+            awaitCount(handled, (long) (batch + 1) * RECEIVE_BATCH - RECEIVE_WINDOW);
+            peer.send(batches[batch]);
+        }
+        awaitCount(handled, RECEPTIONS);
+        return (System.nanoTime() - start) / RECEPTIONS;
     }
 
     /// The heap per subscription of `kind` that a connected client holds once
@@ -422,15 +509,22 @@ class SubscriptionMeasurementTest {
         }
     }
 
-    /// Answers SUBSCRIBE packets at once until every one of `subscriptions` is established.
-    private static void establish(ScriptedBroker peer, List<Subscription> subscriptions)
-            throws Exception {
+    /// Answers SUBSCRIBE packets at once until every one of `subscriptions` is established, and
+    /// returns the packets in the order in which they arrived.
+    private static List<Packet.Subscribe> establish(
+            ScriptedBroker peer,
+            List<Subscription> subscriptions
+    ) throws Exception {
+        var made = new ArrayList<Packet.Subscribe>();
         for (int index = 0; index < subscriptions.size(); index++) {
-            peer.send(subAck((Packet.Subscribe) peer.receive()));
+            var subscribe = (Packet.Subscribe) peer.receive();
+            peer.send(subAck(subscribe));
+            made.add(subscribe);
         }
         for (Subscription subscription : subscriptions) {
             subscription.established().get(5, SECONDS);
         }
+        return made;
     }
 
     private static Packet.SubAck subAck(Packet.Subscribe subscribe) {
@@ -450,9 +544,19 @@ class SubscriptionMeasurementTest {
             int subscriptions,
             LinkedBlockingQueue<String> events
     ) {
+        return client(server, MqttVersion.V3_1_1, subscriptions, events);
+    }
+
+    /// A client like [#client(ServerSocket, int, LinkedBlockingQueue)] that speaks `version`.
+    private static MqttClient client(
+            ServerSocket server,
+            MqttVersion version,
+            int subscriptions,
+            LinkedBlockingQueue<String> events
+    ) {
         return MqttClient.builder()
                 .server(ScriptedBroker.endpoint(server))
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .maxSubscriptions(subscriptions)
                 .connectionListener(new ConnectionListener() {

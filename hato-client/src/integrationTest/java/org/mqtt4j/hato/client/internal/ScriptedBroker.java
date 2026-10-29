@@ -18,6 +18,8 @@ import org.mqtt4j.hato.client.internal.common.io.FrameReader;
 import org.mqtt4j.hato.client.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -28,9 +30,14 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 final class ScriptedBroker implements AutoCloseable {
 
     static MqttClient client(ServerSocket server) {
+        return client(server, MqttVersion.V3_1_1);
+    }
+
+    /// A client like [#client(ServerSocket)] that speaks `version`.
+    static MqttClient client(ServerSocket server, MqttVersion version) {
         return MqttClient.builder()
                 .server(endpoint(server))
-                .version(MqttVersion.V3_1_1)
+                .version(version)
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .build();
     }
@@ -53,6 +60,16 @@ final class ScriptedBroker implements AutoCloseable {
 
     static URI endpoint(ServerSocket server) {
         return URI.create("mqtt://127.0.0.1:" + server.getLocalPort());
+    }
+
+    /// The properties with which a broker forwards a publication to the subscription that
+    /// `request` made: the Subscription Identifier that an MQTT 5.0 client gives a broker that
+    /// takes identifiers, or none.
+    static Properties forwarding(Packet.Subscribe request) {
+        return request.properties()
+                .find(PropertyId.SUBSCRIPTION_IDENTIFIER)
+                .map(identifier -> new Properties(List.of(identifier)))
+                .orElse(EMPTY);
     }
 
     private final Socket socket;

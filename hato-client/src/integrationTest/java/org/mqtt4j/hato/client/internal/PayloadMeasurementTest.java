@@ -35,6 +35,8 @@ import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
+import org.mqtt4j.hato.client.internal.common.protocol.Properties;
+import org.mqtt4j.hato.client.internal.common.protocol.RemainingLength;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mqtt4j.hato.client.internal.Measurements.percentile;
@@ -48,11 +50,15 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// whole process, and the heap that every thread allocated. A raw peer reads and writes the bytes
 /// without decoding them and allocates nothing for each message, so beyond the socket the
 /// processor time and the allocation are nearly all the client's. Waits block instead of
-/// spinning, so that they do not count as processor time. Runs only with `-Phato.measure=true`;
+/// spinning, so that they do not count as processor time. Each MQTT version is measured; under
+/// MQTT 5.0 the peer gives each publication that it sends the Subscription Identifier of the
+/// subscription, as a broker that takes identifiers does. Runs only with `-Phato.measure=true`;
 /// the integrationTestSingleCarrier task measures the worst case of one carrier thread.
 @EnabledIfSystemProperty(named = "hato.measure", matches = "true")
 @Timeout(600)
 class PayloadMeasurementTest {
+
+    private static final List<MqttVersion> VERSIONS = List.of(MqttVersion.V3_1_1, MqttVersion.V5);
 
     private static final int RUNS = 5;
 
@@ -92,9 +98,11 @@ class PayloadMeasurementTest {
                 WINDOW_BYTES / (1024 * 1024)
         );
         printHeading();
-        for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
-            for (int size : SIZES) {
-                printRow(qos, size, median(() -> publishing(size, qos)));
+        for (MqttVersion version : VERSIONS) {
+            for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
+                for (int size : SIZES) {
+                    printRow(version, qos, size, median(() -> publishing(size, qos, version)));
+                }
             }
         }
     }
@@ -110,9 +118,11 @@ class PayloadMeasurementTest {
                 WINDOW_BYTES / (1024 * 1024)
         );
         printHeading();
-        for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
-            for (int size : SIZES) {
-                printRow(qos, size, median(() -> receiving(size, qos)));
+        for (MqttVersion version : VERSIONS) {
+            for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
+                for (int size : SIZES) {
+                    printRow(version, qos, size, median(() -> receiving(size, qos, version)));
+                }
             }
         }
     }
@@ -132,10 +142,10 @@ class PayloadMeasurementTest {
         void run() throws Exception;
     }
 
-    /// Publishes the run's messages of `size` bytes at `qos`, each a new message as an
-    /// application would make it, keeping a window outstanding, and returns the cost per
+    /// Publishes the run's messages of `size` bytes at `qos` over `version`, each a new message
+    /// as an application would make it, keeping a window outstanding, and returns the cost per
     /// publication until the last has completed: QoS 0 once written and QoS 1 at PUBACK.
-    private static Cost publishing(int size, Qos qos) throws Exception {
+    private static Cost publishing(int size, Qos qos, MqttVersion version) throws Exception {
         int messages = messages(size);
         var topic = new Topic("publish");
         var payload = new byte[size];
@@ -143,9 +153,9 @@ class PayloadMeasurementTest {
         var completed = new CountDownLatch(messages);
         var failure = new AtomicReference<@Nullable Throwable>();
         try (ServerSocket server = ScriptedBroker.listen();
-                MqttClient sut = ScriptedBroker.client(server);
-                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
-            Thread draining = Thread.ofPlatform().start(() -> drain(peer, messages));
+                MqttClient sut = ScriptedBroker.client(server, version);
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut, version)) {
+            Thread draining = Thread.ofPlatform().start(() -> drain(peer, messages, version));
             Cost cost = measure(messages, () -> {
                 for (int index = 0; index < messages; index++) {
                     if (!outstanding.tryAcquire(1, TimeUnit.MINUTES)) {
@@ -181,19 +191,16 @@ class PayloadMeasurementTest {
         }
     }
 
-    /// Sends the run's messages of `size` bytes at `qos` from the peer to a subscription whose
-    /// handler does nothing, keeping a window unfinished, and returns the cost per message until
-    /// the last has finished: QoS 0 once the handler has it and QoS 1 at PUBACK. The publications
-    /// are encoded before the clock starts and written again and again, so the time is mostly
-    /// the client's.
-    private static Cost receiving(int size, Qos qos) throws Exception {
+    /// Sends the run's messages of `size` bytes at `qos` over `version` from the peer to a
+    /// subscription whose handler does nothing, keeping a window unfinished, and returns the cost
+    /// per message until the last has finished: QoS 0 once the handler has it and QoS 1 at
+    /// PUBACK. The publications are encoded before the clock starts and written again and again,
+    /// so the time is mostly the client's.
+    private static Cost receiving(int size, Qos qos, MqttVersion version) throws Exception {
         int batch = Math.clamp(BATCH_BYTES / size, 1, RECEIVE_BATCH);
         int window = Math.max(batch, Math.min(RECEIVE_WINDOW, WINDOW_BYTES / size));
         int writes = Math.ceilDiv(messages(size), batch);
         int messages = writes * batch;
-        // Under QoS 1 a write reuses the packet identifiers of the write that used the same
-        // batch before it. More batches than the window holds leave that one finished.
-        byte[][] batches = batches(size, qos, batch, window / batch + 2);
         var room = new Semaphore(window);
         var finished = new CountDownLatch(messages);
         Runnable finish = () -> {
@@ -202,8 +209,8 @@ class PayloadMeasurementTest {
         };
         Consumer<MqttDelivery> handler = qos == Qos.AT_MOST_ONCE ? _ -> finish.run() : _ -> { };
         try (ServerSocket server = ScriptedBroker.listen();
-                MqttClient sut = ScriptedBroker.client(server);
-                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
+                MqttClient sut = ScriptedBroker.client(server, version);
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut, version)) {
             Subscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter("receive"), qos),
                     handler
@@ -215,6 +222,16 @@ class PayloadMeasurementTest {
                     EMPTY
             ));
             subscription.established().get(5, SECONDS);
+            // Under QoS 1 a write reuses the packet identifiers of the write that used the same
+            // batch before it. More batches than the window holds leave that one finished.
+            byte[][] batches = batches(
+                    size,
+                    qos,
+                    batch,
+                    window / batch + 2,
+                    PacketCodec.of(version),
+                    ScriptedBroker.forwarding(request)
+            );
             Thread counting = Thread.ofPlatform().start(() -> acknowledgements(
                     peer,
                     qos == Qos.AT_MOST_ONCE ? 0 : messages,
@@ -237,10 +254,17 @@ class PayloadMeasurementTest {
         }
     }
 
-    /// The prepared writes: `count` batches of `batch` publications of `size` bytes at `qos`.
-    /// Under QoS 1 every publication in them has its own packet identifier.
-    private static byte[][] batches(int size, Qos qos, int batch, int count) {
-        var codec = PacketCodec.of(MqttVersion.V3_1_1);
+    /// The prepared writes: `count` batches of `batch` publications of `size` bytes at `qos`,
+    /// encoded by `codec` with `properties`. Under QoS 1 every publication in them has its own
+    /// packet identifier.
+    private static byte[][] batches(
+            int size,
+            Qos qos,
+            int batch,
+            int count,
+            PacketCodec codec,
+            Properties properties
+    ) {
         var payload = new byte[size];
         var batches = new byte[count][];
         for (int index = 0; index < count; index++) {
@@ -254,7 +278,7 @@ class PayloadMeasurementTest {
                         false,
                         false,
                         packetId,
-                        EMPTY
+                        properties
                 )));
             }
             batches[index] = bytes.toByteArray();
@@ -262,10 +286,10 @@ class PayloadMeasurementTest {
         return batches;
     }
 
-    /// Reads the client's `messages` publications without decoding them, so that the peer
-    /// allocates nothing for each, and answers QoS 1 with PUBACK. The answers to publications
-    /// that arrived together go out in one write.
-    private static void drain(ScriptedBroker peer, int messages) {
+    /// Reads the client's `messages` publications in `version` without decoding them, so that
+    /// the peer allocates nothing for each, and answers QoS 1 with PUBACK. The answers to
+    /// publications that arrived together go out in one write.
+    private static void drain(ScriptedBroker peer, int messages, MqttVersion version) {
         try {
             InputStream input = peer.input();
             OutputStream output = peer.output();
@@ -279,8 +303,9 @@ class PayloadMeasurementTest {
                 if (header >>> 4 != 3 || qos > 1) {
                     throw new AssertionError("Unexpected packet: " + Integer.toHexString(header));
                 }
-                // An MQTT 3.1.1 PUBLISH names its topic, and gives a packet identifier at QoS 1,
-                // before the payload.
+                // A PUBLISH names its topic, and gives a packet identifier at QoS 1, before the
+                // payload. A PUBACK of two bytes after its fixed header means success in both
+                // versions.
                 int topicLength = (read(input) << 8) | read(input);
                 skip(input, scratch, topicLength);
                 length -= 2 + topicLength;
@@ -290,6 +315,11 @@ class PayloadMeasurementTest {
                     answers[answered++] = (byte) read(input);
                     answers[answered++] = (byte) read(input);
                     length -= 2;
+                }
+                // An MQTT 5.0 PUBLISH then gives the length of its properties, which the skip
+                // below passes over together with the payload.
+                if (version == MqttVersion.V5) {
+                    length -= RemainingLength.encodedSize(remainingLength(input));
                 }
                 skip(input, scratch, length);
                 if (answered > 0 && (answered == answers.length || input.available() == 0)) {
@@ -397,7 +427,8 @@ class PayloadMeasurementTest {
 
     private static void printHeading() {
         print(
-                "%-13s | %9s | %8s | %10s | %10s | %12s | %8s",
+                "%-7s | %-13s | %9s | %8s | %10s | %10s | %12s | %8s",
+                "version",
                 "qos",
                 "payload",
                 "messages",
@@ -408,9 +439,10 @@ class PayloadMeasurementTest {
         );
     }
 
-    private static void printRow(Qos qos, int size, Cost cost) {
+    private static void printRow(MqttVersion version, Qos qos, int size, Cost cost) {
         print(
-                "%-13s | %9d | %8d | %10d | %10d | %12d | %8.2f",
+                "%-7s | %-13s | %9d | %8d | %10d | %10d | %12d | %8.2f",
+                version,
                 qos,
                 size,
                 messages(size),
