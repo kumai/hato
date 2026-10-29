@@ -137,6 +137,17 @@ tasks.named("check") {
     dependsOn(testing.suites.named("integrationTest"))
 }
 
+// Tests run on the toolchain's JDK unless -Phato.testJava=<release> names another one. CI uses it
+// to run the tests on the newest JDK release while the classes still target Java 25.
+val testJava = providers.gradleProperty("hato.testJava").orNull
+if (testJava != null) {
+    tasks.withType<Test>().configureEach {
+        javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(testJava)
+        }
+    }
+}
+
 // Byte-for-byte reproducible jars.
 tasks.withType<AbstractArchiveTask>().configureEach {
     isPreserveFileTimestamps = false

@@ -100,6 +100,10 @@ one broker at a time. To do the same, add `-Phato.interop=emqx` (or `hivemq`,
 `nanomq`, `rabbitmq`) to the integration test tasks; `-Phato.interop=none` leaves
 them out, as the main CI job does.
 
+CI also runs the tests on the newest JDK release, with the classes still compiled
+for Java 25. To do the same, add `-Phato.testJava=27` to the test tasks; Gradle
+provisions that JDK as it does Java 25.
+
 CI runs the checks below on every pull request, and all of them must pass
 before merge. Run the ones that match what you changed.
 
