@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -40,6 +41,7 @@ import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.mqtt4j.hato.client.internal.Measurements.heapAfterGc;
 import static org.mqtt4j.hato.client.internal.Measurements.median;
 import static org.mqtt4j.hato.client.internal.Measurements.percentile;
 import static org.mqtt4j.hato.client.internal.Measurements.print;
@@ -50,10 +52,11 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// Measures the delivery modes and prints the results instead of asserting limits: how a slow
 /// handler backs up deliveries and their acknowledgements under serial and striped delivery, how
 /// long finished deliveries wait behind slower ones in the one receive-order acknowledgement
-/// queue, what handing deliveries from the dispatcher to drain tasks costs, and what receiving a
+/// queue, what handing deliveries from the dispatcher to drain tasks costs, what receiving a
 /// publication through the whole client costs for each way of receiving, with and without a
-/// metrics listener. Runs only with `-Phato.measure=true`; the integrationTestSingleCarrier task
-/// measures the worst case of one carrier thread.
+/// metrics listener, and how much heap a delivery takes while it waits behind a blocked handler.
+/// Runs only with `-Phato.measure=true`; the integrationTestSingleCarrier task measures the worst
+/// case of one carrier thread.
 @EnabledIfSystemProperty(named = "hato.measure", matches = "true")
 @Timeout(600)
 class DeliveryMeasurementTest {
@@ -95,6 +98,12 @@ class DeliveryMeasurementTest {
     private static final int RECEIVE_BATCH = 50;
 
     private static final int RECEIVE_WINDOW = 500;
+
+    // A blocked handler holds this many deliveries, all within its subscription's buffer and,
+    // at QoS 1, within the receipts that the client keeps open for acknowledgement.
+    private static final int WAITING = 4_000;
+
+    private static final int WAITING_PAYLOAD_BYTES = 16;
 
     @Test
     void a_slow_handler_backs_up_deliveries_and_acknowledgements() throws Exception {
@@ -233,6 +242,21 @@ class DeliveryMeasurementTest {
                 nanos[qos.ordinal()] = median(RUNS, () -> receiveNanos(qos, receiver));
             }
             print("%-24s | %12d | %13d | %12d", receiver.name(), nanos[0], nanos[1], nanos[2]);
+        }
+    }
+
+    @Test
+    void each_waiting_delivery_takes_memory() throws Exception {
+        print(
+                "%s: heap after GC per delivery held behind a blocked handler, %d deliveries of"
+                        + " %d-byte payloads over 64 topics",
+                runtime(),
+                WAITING,
+                WAITING_PAYLOAD_BYTES
+        );
+        print("%-14s | %s", "qos", "bytes per held delivery");
+        for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
+            print("%-14s | %d", qos, waitingBytes(qos));
         }
     }
 
@@ -508,6 +532,52 @@ class DeliveryMeasurementTest {
             long elapsed = System.nanoTime() - start;
             reader.join();
             return elapsed / RECEPTIONS;
+        }
+    }
+
+    /// Sends [#WAITING] publications at `qos` from a raw peer to a subscription whose handler
+    /// blocks on the first of them, and returns the heap that each delivery takes while the client
+    /// holds it: the one in the handler and the others waiting in the subscription's buffer, with
+    /// their acknowledgements held until the handler returns.
+    private static long waitingBytes(Qos qos) throws Exception {
+        var release = new CountDownLatch(1);
+        try (ServerSocket server = ScriptedBroker.listen();
+                MqttClient sut = ScriptedBroker.client(server);
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)) {
+            Subscription subscription = sut.subscribe(
+                    Subscribe.of(new TopicFilter("waiting/+"), qos).withBufferCapacity(WAITING),
+                    _ -> {
+                        try {
+                            release.await();
+                        } catch (InterruptedException _) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+            );
+            establish(peer, subscription, qos);
+            var actor = (ClientActor) sut;
+            long before = heapAfterGc();
+            for (int id = 1; id <= WAITING; id++) {
+                peer.send(new Packet.Publish(
+                        new Topic("waiting/" + id % 64),
+                        new byte[WAITING_PAYLOAD_BYTES],
+                        qos,
+                        false,
+                        false,
+                        qos == Qos.AT_MOST_ONCE ? 0 : id,
+                        EMPTY
+                ));
+            }
+            long deadline = System.nanoTime() + SECONDS.toNanos(60);
+            while (actor.usage().deliveries() < WAITING) {
+                if (System.nanoTime() > deadline) {
+                    throw new AssertionError("Held " + actor.usage().deliveries() + " deliveries");
+                }
+                Thread.sleep(1);
+            }
+            long after = heapAfterGc();
+            release.countDown();
+            return (after - before) / WAITING;
         }
     }
 
