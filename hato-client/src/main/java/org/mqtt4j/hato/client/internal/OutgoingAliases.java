@@ -12,9 +12,8 @@ import org.mqtt4j.hato.Topic;
 /// PUBLISH reaches the broker before any PUBLISH that carries the alias alone.
 final class OutgoingAliases {
 
-    // At most this many aliases, whatever the broker allows. A topic takes up to 65,535 bytes,
-    // so the table holds at most about 1 MiB. The value is provisional, as is the Topic Alias
-    // Maximum that the client announces, and measurements may change it.
+    // At most this many aliases, whatever the broker allows, as many as the client itself
+    // announces. A topic takes up to 65,535 bytes, so the table holds at most about 1 MiB.
     static final int LIMIT = 16;
 
     private final Map<Topic, Integer> aliases = new HashMap<>();

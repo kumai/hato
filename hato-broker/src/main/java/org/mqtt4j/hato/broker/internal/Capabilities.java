@@ -21,7 +21,7 @@ record Capabilities(
         @Nullable Integer serverKeepAlive
 ) {
 
-    // The broker's own: no limit, and up to 16 Topic Aliases, the client's own provisional value.
+    // The broker's own: no limit, and up to 16 Topic Aliases, the client's own value.
     // The aliases of one connection hold at most this many topics of up to 65,535 bytes each.
     static final Capabilities DEFAULT = new Capabilities(
             Qos.EXACTLY_ONCE,

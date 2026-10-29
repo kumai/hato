@@ -87,8 +87,8 @@ final class ConnectionEstablishment {
     private static final int DEFAULT_RECEIVE_MAXIMUM = 65_535;
 
     // The Topic Alias Maximum that the client announces in CONNECT. A topic takes up to 65,535
-    // bytes, so the mapping holds at most about 1 MiB. The value is provisional: it covers
-    // Mosquitto's default of 10 aliases, and measurements may change it.
+    // bytes, so the mapping holds at most about 1 MiB. It covers Mosquitto's default of 10
+    // aliases.
     static final int TOPIC_ALIAS_MAXIMUM = 16;
 
     private final String clientId;
