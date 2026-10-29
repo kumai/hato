@@ -41,6 +41,8 @@ import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
+import org.mqtt4j.hato.testsupport.Tls;
+import org.mqtt4j.hato.testsupport.TlsRelay;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mqtt4j.hato.client.internal.Measurements.heapAfterGc;
@@ -73,18 +75,36 @@ class EnduranceMeasurementTest {
         var events = new LinkedBlockingQueue<String>();
         try (MqttClient sut = builder(URI.create("mqtt://127.0.0.1:" + address.getPort()), events)
                 .build()) {
-            sut.connect().get(WAIT.toSeconds(), SECONDS);
-            await(events, "connected");
-            var traffic = new Traffic(sut);
-            var sampler = new Sampler("TCP reconnection to a restarting embedded broker");
-            run(sampler, () -> {
-                traffic.exchange();
-                broker.get().close();
-                await(events, "disconnected");
-                broker.set(MqttBroker.start(address));
-                await(events, "connected");
-            });
-            traffic.close();
+            reconnectThroughRestarts(
+                    sut,
+                    events,
+                    broker,
+                    address,
+                    "TCP reconnection to a restarting embedded broker"
+            );
+        } finally {
+            broker.get().close();
+        }
+    }
+
+    @Test
+    void reconnecting_over_tls_to_a_restarting_broker_leaks_nothing() throws Exception {
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), freePort());
+        var broker = new AtomicReference<MqttBroker>(MqttBroker.start(address));
+        var events = new LinkedBlockingQueue<String>();
+        // The relay connects to the broker anew for each connection, so a restarted broker
+        // ends the client's connection and takes its next one.
+        try (var relay = new TlsRelay(URI.create("mqtt://localhost:" + address.getPort()));
+                MqttClient sut = builder(relay.uri(), events)
+                        .sslContext(Tls.clientContext())
+                        .build()) {
+            reconnectThroughRestarts(
+                    sut,
+                    events,
+                    broker,
+                    address,
+                    "TLS reconnection to a restarting embedded broker"
+            );
         } finally {
             broker.get().close();
         }
@@ -189,6 +209,27 @@ class EnduranceMeasurementTest {
                     stats.refusals()
             );
         }
+    }
+
+    /// Connects `sut`, then keeps restarting the broker at `address` under it.
+    private static void reconnectThroughRestarts(
+            MqttClient sut,
+            LinkedBlockingQueue<String> events,
+            AtomicReference<MqttBroker> broker,
+            InetSocketAddress address,
+            String name
+    ) throws Exception {
+        sut.connect().get(WAIT.toSeconds(), SECONDS);
+        await(events, "connected");
+        var traffic = new Traffic(sut);
+        run(new Sampler(name), () -> {
+            traffic.exchange();
+            broker.get().close();
+            await(events, "disconnected");
+            broker.set(MqttBroker.start(address));
+            await(events, "connected");
+        });
+        traffic.close();
     }
 
     /// Repeats `cycle` for the configured time, sampling at even intervals.
@@ -363,8 +404,11 @@ class EnduranceMeasurementTest {
         }
     }
 
-    /// Samples, after GC, the heap in use, open file descriptors, platform threads, and the
-    /// measured client's threads, from a thread dump that includes virtual threads.
+    /// Samples, after GC, the heap in use, open file descriptors, platform threads, the measured
+    /// client's threads, from a thread dump that includes virtual threads, and the client's
+    /// connections that read on platform threads of their own. The JVM lends such a reader to as
+    /// many connections as it has processors, so a connection that kept its share would leave
+    /// later reconnections reading on virtual threads, and the last count would drop to zero.
     private static final class Sampler {
 
         private final String name;
@@ -382,13 +426,15 @@ class EnduranceMeasurementTest {
             var os = (UnixOperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
             long seconds = TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - start);
             rows.add(String.format(
-                    "%6d s | %8d cycles | %8.1f MiB heap | %5d fds | %4d platform | %5d client",
+                    "%6d s | %8d cycles | %8.1f MiB heap | %5d fds | %4d platform | %5d client"
+                            + " | %2d platform readers",
                     seconds,
                     cycles,
                     heap / (1024.0 * 1024.0),
                     os.getOpenFileDescriptorCount(),
                     ManagementFactory.getThreadMXBean().getThreadCount(),
-                    clientThreads()
+                    clientThreads(),
+                    platformReaders()
             ));
         }
 
@@ -412,6 +458,14 @@ class EnduranceMeasurementTest {
             } finally {
                 Files.deleteIfExists(file);
             }
+        }
+
+        // Only platform threads have stack traces here, so a reader on a virtual thread, which
+        // carries the same name, is not counted.
+        private static long platformReaders() {
+            return Thread.getAllStackTraces().keySet().stream()
+                    .filter(thread -> thread.getName().equals(CLIENT_THREADS + "reader"))
+                    .count();
         }
     }
 }
