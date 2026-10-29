@@ -32,6 +32,7 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.PublishResult;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
@@ -50,15 +51,16 @@ import static org.mqtt4j.hato.client.internal.Measurements.sorted;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
 /// Measures how the cost of publishing and of receiving grows with the payload, and the cost of
-/// publishing with message properties, and prints the results instead of asserting limits: per
-/// message, the elapsed time, the processor time of the whole process, and the heap that every
-/// thread allocated. A raw peer reads and writes the bytes without decoding them and allocates
-/// nothing for each message, so beyond the socket the processor time and the allocation are
-/// nearly all the client's. Waits block instead of spinning, so that they do not count as
-/// processor time. Each MQTT version is measured; under MQTT 5.0 the peer gives each publication
-/// that it sends the Subscription Identifier of the subscription, as a broker that takes
-/// identifiers does. Runs only with `-Phato.measure=true`; the integrationTestSingleCarrier task
-/// measures the worst case of one carrier thread.
+/// publishing with message properties in a clean session and in a persistent one, which keeps
+/// what it publishes at QoS 1 until it is acknowledged, and prints the results instead of
+/// asserting limits: per message, the elapsed time, the processor time of the whole process, and
+/// the heap that every thread allocated. A raw peer reads and writes the bytes without decoding
+/// them and allocates nothing for each message, so beyond the socket the processor time and the
+/// allocation are nearly all the client's. Waits block instead of spinning, so that they do not
+/// count as processor time. Each MQTT version is measured; under MQTT 5.0 the peer gives each
+/// publication that it sends the Subscription Identifier of the subscription, as a broker that
+/// takes identifiers does. Runs only with `-Phato.measure=true`; the
+/// integrationTestSingleCarrier task measures the worst case of one carrier thread.
 @EnabledIfSystemProperty(named = "hato.measure", matches = "true")
 @Timeout(600)
 class PayloadMeasurementTest {
@@ -127,9 +129,10 @@ class PayloadMeasurementTest {
                 PUBLISH_WINDOW
         );
         print(
-                "%-20s | %-13s | %10s | %10s | %12s",
+                "%-20s | %-13s | %-10s | %10s | %10s | %12s",
                 "properties",
                 "qos",
+                "session",
                 "ns",
                 "cpu ns",
                 "allocated B"
@@ -141,25 +144,34 @@ class PayloadMeasurementTest {
                     qos,
                     false
             );
+            // A persistent session keeps each QoS 1 PUBLISH until its PUBACK and counts it
+            // toward a byte budget, which a clean one does not; at QoS 0 both publish alike.
+            List<Boolean> sessions = qos == Qos.AT_MOST_ONCE
+                    ? List.of(false)
+                    : List.of(false, true);
             for (PropertySet set : List.of(
                     new PropertySet("none", plain),
                     new PropertySet("request", request(plain)),
                     new PropertySet("100 user properties", userProperties(plain, 100))
             )) {
-                Cost cost = median(() -> publishing(
-                        MOST_MESSAGES,
-                        PROPERTIES_PAYLOAD,
-                        MqttVersion.V5,
-                        set::message
-                ));
-                print(
-                        "%-20s | %-13s | %10d | %10d | %12d",
-                        set.name(),
-                        qos,
-                        cost.nanos(),
-                        cost.processorNanos(),
-                        cost.allocatedBytes()
-                );
+                for (boolean persistent : sessions) {
+                    Cost cost = median(() -> publishing(
+                            MOST_MESSAGES,
+                            PROPERTIES_PAYLOAD,
+                            MqttVersion.V5,
+                            persistent,
+                            set::message
+                    ));
+                    print(
+                            "%-20s | %-13s | %-10s | %10d | %10d | %12d",
+                            set.name(),
+                            qos,
+                            persistent ? "persistent" : "clean",
+                            cost.nanos(),
+                            cost.processorNanos(),
+                            cost.allocatedBytes()
+                    );
+                }
             }
         }
     }
@@ -238,24 +250,27 @@ class PayloadMeasurementTest {
                 messages(size),
                 size,
                 version,
+                false,
                 () -> MqttMessage.of(topic, payload, qos, false)
         );
     }
 
     /// Publishes `messages` messages of `size` payload bytes that `next` gives over `version`,
-    /// keeping a window outstanding, and returns the cost per publication until the last has
-    /// completed: QoS 0 once written and QoS 1 at PUBACK.
+    /// in a persistent session when `persistent`, keeping a window outstanding, and returns the
+    /// cost per publication until the last has completed: QoS 0 once written and QoS 1 at
+    /// PUBACK.
     private static Cost publishing(
             int messages,
             int size,
             MqttVersion version,
+            boolean persistent,
             Supplier<MqttMessage> next
     ) throws Exception {
         var outstanding = new Semaphore(Math.clamp(WINDOW_BYTES / size, 1, PUBLISH_WINDOW));
         var completed = new CountDownLatch(messages);
         var failure = new AtomicReference<@Nullable Throwable>();
         try (ServerSocket server = ScriptedBroker.listen();
-                MqttClient sut = ScriptedBroker.client(server, version);
+                MqttClient sut = client(server, version, persistent);
                 ScriptedBroker peer = ScriptedBroker.connect(server, sut, version)) {
             Thread draining = Thread.ofPlatform().start(() -> drain(peer, messages, version));
             Cost cost = measure(messages, () -> {
@@ -291,6 +306,21 @@ class PayloadMeasurementTest {
             }
             return cost;
         }
+    }
+
+    /// A client of `version` for the peer on `server`, whose session outlasts the connection
+    /// when `persistent`.
+    private static MqttClient client(ServerSocket server, MqttVersion version, boolean persistent) {
+        if (!persistent) {
+            return ScriptedBroker.client(server, version);
+        }
+        return MqttClient.builder()
+                .server(ScriptedBroker.endpoint(server))
+                .version(version)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .clientId("measurement")
+                .sessionExpiry(Duration.ofMinutes(1))
+                .build();
     }
 
     /// Sends the run's messages of `size` bytes at `qos` over `version` from the peer to a
