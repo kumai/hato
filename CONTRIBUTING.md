@@ -41,7 +41,6 @@ vulnerability reporting for this repository instead.
   protocol state machine, a module boundary, or anything a broker can observe
   on the wire. Agreeing on the direction up front is far less work for everyone
   than reworking it once the code is already written.
-- Pull requests from forks are welcome.
 - Keep a pull request to one concern. Fix the problem you describe; leave
   unrelated fixes and improvements for a separate pull request.
 
