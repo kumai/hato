@@ -8205,6 +8205,8 @@ class ClientActorTest {
             assertThat(taken).isEmpty();
             release.countDown();
             assertThat(taken.poll(5, SECONDS)).isEqualTo((byte) 1);
+            // b has room again only once its acceptor has returned.
+            await().until(() -> ((ClientActor) sut).usage().deliveries() == 0);
             transport.receive(publication("b", 3));
             assertThat(taken.poll(5, SECONDS)).isEqualTo((byte) 3);
             assertThat(ends).isEmpty();
