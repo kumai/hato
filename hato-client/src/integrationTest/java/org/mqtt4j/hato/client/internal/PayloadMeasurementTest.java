@@ -7,6 +7,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.net.ServerSocket;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -15,6 +17,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -33,6 +36,7 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
@@ -45,15 +49,16 @@ import static org.mqtt4j.hato.client.internal.Measurements.runtime;
 import static org.mqtt4j.hato.client.internal.Measurements.sorted;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 
-/// Measures how the cost of publishing and of receiving grows with the payload, and prints the
-/// results instead of asserting limits: per message, the elapsed time, the processor time of the
-/// whole process, and the heap that every thread allocated. A raw peer reads and writes the bytes
-/// without decoding them and allocates nothing for each message, so beyond the socket the
-/// processor time and the allocation are nearly all the client's. Waits block instead of
-/// spinning, so that they do not count as processor time. Each MQTT version is measured; under
-/// MQTT 5.0 the peer gives each publication that it sends the Subscription Identifier of the
-/// subscription, as a broker that takes identifiers does. Runs only with `-Phato.measure=true`;
-/// the integrationTestSingleCarrier task measures the worst case of one carrier thread.
+/// Measures how the cost of publishing and of receiving grows with the payload, and the cost of
+/// publishing with message properties, and prints the results instead of asserting limits: per
+/// message, the elapsed time, the processor time of the whole process, and the heap that every
+/// thread allocated. A raw peer reads and writes the bytes without decoding them and allocates
+/// nothing for each message, so beyond the socket the processor time and the allocation are
+/// nearly all the client's. Waits block instead of spinning, so that they do not count as
+/// processor time. Each MQTT version is measured; under MQTT 5.0 the peer gives each publication
+/// that it sends the Subscription Identifier of the subscription, as a broker that takes
+/// identifiers does. Runs only with `-Phato.measure=true`; the integrationTestSingleCarrier task
+/// measures the worst case of one carrier thread.
 @EnabledIfSystemProperty(named = "hato.measure", matches = "true")
 @Timeout(600)
 class PayloadMeasurementTest {
@@ -87,6 +92,9 @@ class PayloadMeasurementTest {
 
     private static final int BATCH_BYTES = 64 * 1024;
 
+    // The payload of the publications that measure message properties.
+    private static final int PROPERTIES_PAYLOAD = 16;
+
     @Test
     void publishing_costs_grow_with_the_payload() throws Exception {
         print(
@@ -103,6 +111,55 @@ class PayloadMeasurementTest {
                 for (int size : SIZES) {
                     printRow(version, qos, size, median(() -> publishing(size, qos, version)));
                 }
+            }
+        }
+    }
+
+    @Test
+    void publishing_costs_grow_with_the_message_properties() throws Exception {
+        print(
+                "%s: per MQTT 5.0 publication of %d bytes through the client, the same message"
+                        + " each time so that building it does not count, median of %d runs; at"
+                        + " most %d outstanding",
+                runtime(),
+                PROPERTIES_PAYLOAD,
+                RUNS,
+                PUBLISH_WINDOW
+        );
+        print(
+                "%-20s | %-13s | %10s | %10s | %12s",
+                "properties",
+                "qos",
+                "ns",
+                "cpu ns",
+                "allocated B"
+        );
+        for (Qos qos : List.of(Qos.AT_MOST_ONCE, Qos.AT_LEAST_ONCE)) {
+            var plain = MqttMessage.of(
+                    new Topic("publish"),
+                    new byte[PROPERTIES_PAYLOAD],
+                    qos,
+                    false
+            );
+            for (PropertySet set : List.of(
+                    new PropertySet("none", plain),
+                    new PropertySet("request", request(plain)),
+                    new PropertySet("100 user properties", userProperties(plain, 100))
+            )) {
+                Cost cost = median(() -> publishing(
+                        MOST_MESSAGES,
+                        PROPERTIES_PAYLOAD,
+                        MqttVersion.V5,
+                        set::message
+                ));
+                print(
+                        "%-20s | %-13s | %10d | %10d | %12d",
+                        set.name(),
+                        qos,
+                        cost.nanos(),
+                        cost.processorNanos(),
+                        cost.allocatedBytes()
+                );
             }
         }
     }
@@ -130,6 +187,35 @@ class PayloadMeasurementTest {
     /// What a run cost per message.
     private record Cost(long nanos, long processorNanos, long allocatedBytes) {}
 
+    /// A message that carries a set of properties, and the name of the set.
+    private record PropertySet(String name, MqttMessage message) {}
+
+    /// A message like `plain` with the properties of a request that asks for a reply: a UTF-8
+    /// payload, a minute's expiry, a content type, a response topic, 16 bytes of Correlation
+    /// Data, and three User Properties.
+    private static MqttMessage request(MqttMessage plain) {
+        return plain.withPayloadUtf8(true)
+                .withMessageExpiry(Duration.ofMinutes(1))
+                .withContentType("application/json")
+                .withResponseTopic(new Topic("replies/client-1"))
+                .withCorrelationData(new byte[16])
+                .withUserProperties(List.of(
+                        new UserProperty("trace-id", "4bf92f3577b34da6a3ce929d0e0e4736"),
+                        new UserProperty("source", "sensor-12"),
+                        new UserProperty("unit", "celsius")
+                ));
+    }
+
+    /// A message like `plain` with `count` User Properties, each a short name and a value of 32
+    /// characters.
+    private static MqttMessage userProperties(MqttMessage plain, int count) {
+        var properties = new ArrayList<UserProperty>();
+        for (int index = 0; index < count; index++) {
+            properties.add(new UserProperty("key-" + index, "v".repeat(32)));
+        }
+        return plain.withUserProperties(properties);
+    }
+
     @FunctionalInterface
     private interface CostRun {
 
@@ -146,9 +232,25 @@ class PayloadMeasurementTest {
     /// as an application would make it, keeping a window outstanding, and returns the cost per
     /// publication until the last has completed: QoS 0 once written and QoS 1 at PUBACK.
     private static Cost publishing(int size, Qos qos, MqttVersion version) throws Exception {
-        int messages = messages(size);
         var topic = new Topic("publish");
         var payload = new byte[size];
+        return publishing(
+                messages(size),
+                size,
+                version,
+                () -> MqttMessage.of(topic, payload, qos, false)
+        );
+    }
+
+    /// Publishes `messages` messages of `size` payload bytes that `next` gives over `version`,
+    /// keeping a window outstanding, and returns the cost per publication until the last has
+    /// completed: QoS 0 once written and QoS 1 at PUBACK.
+    private static Cost publishing(
+            int messages,
+            int size,
+            MqttVersion version,
+            Supplier<MqttMessage> next
+    ) throws Exception {
         var outstanding = new Semaphore(Math.clamp(WINDOW_BYTES / size, 1, PUBLISH_WINDOW));
         var completed = new CountDownLatch(messages);
         var failure = new AtomicReference<@Nullable Throwable>();
@@ -161,7 +263,7 @@ class PayloadMeasurementTest {
                     if (!outstanding.tryAcquire(1, TimeUnit.MINUTES)) {
                         throw new AssertionError("No publication completed for a minute");
                     }
-                    MqttMessage message = MqttMessage.of(topic, payload, qos, false);
+                    MqttMessage message = next.get();
                     CompletableFuture<PublishResult> publication = sut.publish(message);
                     // A publication's operation slot returns once the continuations of its
                     // future have returned, just after the one below has made room here, so a
