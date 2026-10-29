@@ -111,11 +111,13 @@ final class Publications {
         this.inflightLimit = inflightLimit;
     }
 
-    void publish(long operation, MqttMessage message) {
+    /// Publishes `message`, whose payload and properties take `bodySize` bytes as
+    /// [MessageProperties#bodySize] gives them, for `operation`.
+    void publish(long operation, MqttMessage message, int bodySize) {
         if (!ready(operation)) {
             return;
         }
-        Optional<ReasonCode> refusal = refusal(message);
+        Optional<ReasonCode> refusal = refusal(message, bodySize);
         if (refusal.isPresent()) {
             port.complete(
                     operation,
@@ -150,7 +152,7 @@ final class Publications {
             int byteCount = 0;
             if (kept) {
                 long remaining = INFLIGHT_BYTE_LIMIT - bytes;
-                if (MessageProperties.bodySize(message) > remaining) {
+                if (bodySize > remaining) {
                     capacityFailure(
                             operation,
                             CapacityLimit.PUBLICATION_BYTES,
@@ -183,6 +185,7 @@ final class Publications {
                     operation,
                     message.qos(),
                     kept ? message : null,
+                    bodySize,
                     byteCount
             );
             inflight.putLast(publication);
@@ -197,11 +200,12 @@ final class Publications {
         if (packetId == 0) {
             window.publications.put(ticket, operation);
         }
-        TopicAlias alias = alias(message);
+        TopicAlias alias = alias(message, bodySize);
         SendQueue.OfferResult result = port.publish(
                 core.generation(),
                 ticket,
                 message,
+                bodySize,
                 packetId,
                 receipt,
                 alias
@@ -357,17 +361,18 @@ final class Publications {
             MqttMessage message = requireNonNull(next.message);
             // A continued session can reach a broker with stricter limits. Sending would end the
             // connection, and every reconnection would replay the same publication.
-            Optional<ReasonCode> refusal = refusal(message);
+            Optional<ReasonCode> refusal = refusal(message, next.bodySize);
             if (refusal.isPresent()) {
                 refused(next, refusal.orElseThrow(), null);
                 continue;
             }
             long ticket = core.nextTicket();
-            TopicAlias alias = alias(message);
+            TopicAlias alias = alias(message, next.bodySize);
             SendQueue.OfferResult result = port.publish(
                     core.generation(),
                     ticket,
                     message,
+                    next.bodySize,
                     next.packetId,
                     next.receipt,
                     alias
@@ -585,13 +590,13 @@ final class Publications {
         }
     }
 
-    /// The reason code with which the broker would refuse `message`, by the limits that it
-    /// announced for the connection, or empty when it would accept the message. MQTT 5.0 forbids
-    /// sending such a publication ([MQTT-3.2.2-11], [MQTT-3.2.2-14], [MQTT-3.2.2-15]), and a
-    /// broker that receives one ends the connection with the same reason code. A PUBLISH larger
-    /// than the client can send is refused in the same way, before it could wait for room that
-    /// would never be enough.
-    private Optional<ReasonCode> refusal(MqttMessage message) {
+    /// The reason code with which the broker would refuse `message`, whose payload and
+    /// properties take `bodySize` bytes, by the limits that it announced for the connection, or
+    /// empty when it would accept the message. MQTT 5.0 forbids sending such a publication
+    /// ([MQTT-3.2.2-11], [MQTT-3.2.2-14], [MQTT-3.2.2-15]), and a broker that receives one ends
+    /// the connection with the same reason code. A PUBLISH larger than the client can send is
+    /// refused in the same way, before it could wait for room that would never be enough.
+    private Optional<ReasonCode> refusal(MqttMessage message, int bodySize) {
         ConnAck limits = core.limits();
         if (message.qos().level() > limits.maximumQos().level()) {
             return Optional.of(ReasonCode.QOS_NOT_SUPPORTED);
@@ -599,7 +604,7 @@ final class Publications {
         if (message.retain() && !limits.retainAvailable()) {
             return Optional.of(ReasonCode.RETAIN_NOT_SUPPORTED);
         }
-        if (exceeds(message, packetLimit())) {
+        if (exceeds(message, bodySize, packetLimit())) {
             return Optional.of(ReasonCode.PACKET_TOO_LARGE);
         }
         return Optional.empty();
@@ -611,10 +616,10 @@ final class Publications {
         return Math.min(core.limits().maximumPacketSize(), ClientIo.REGULAR_SEND_BYTE_LIMIT);
     }
 
-    /// Whether the PUBLISH that carries `message` is larger than `limit`. The size of the payload
-    /// and the properties settles it for most messages without encoding the header.
-    private boolean exceeds(MqttMessage message, int limit) {
-        long body = MessageProperties.bodySize(message);
+    /// Whether the PUBLISH that carries `message` is larger than `limit`. `bodySize`, the size of
+    /// the payload and the properties, settles it for most messages without encoding the header.
+    private boolean exceeds(MqttMessage message, int bodySize, int limit) {
+        long body = bodySize;
         if (body > limit) {
             return true;
         }
@@ -629,11 +634,12 @@ final class Publications {
         }
     }
 
-    /// The Topic Alias that a PUBLISH of `message` uses on this connection. It uses none when
-    /// the broker takes no aliases, or when the alias property could make it larger than the
-    /// connection sends: whether a publication fits is decided without its alias, because
-    /// aliases differ from one connection to the next.
-    private TopicAlias alias(MqttMessage message) {
+    /// The Topic Alias that a PUBLISH of `message`, whose payload and properties take `bodySize`
+    /// bytes, uses on this connection. It uses none when the broker takes no aliases, or when
+    /// the alias property could make it larger than the connection sends: whether a publication
+    /// fits is decided without its alias, because aliases differ from one connection to the
+    /// next.
+    private TopicAlias alias(MqttMessage message, int bodySize) {
         int maximum = core.topicAliasMaximum();
         if (maximum == 0) {
             return TopicAlias.NONE;
@@ -641,7 +647,8 @@ final class Publications {
         TopicAlias alias = window.aliases.choose(message.topic(), maximum);
         // Setting an alias adds it to the topic, which makes the longest form; the form that
         // carries the alias alone is never longer.
-        if (alias != TopicAlias.NONE && exceeds(message, packetLimit() - TOPIC_ALIAS_BYTES)) {
+        if (alias != TopicAlias.NONE
+                && exceeds(message, bodySize, packetLimit() - TOPIC_ALIAS_BYTES)) {
             return TopicAlias.NONE;
         }
         return alias;
@@ -854,6 +861,9 @@ final class Publications {
         // A persistent session keeps the PUBLISH until PUBACK or PUBREC so that it can resend
         // it; a clean one keeps it only until it is sent. The byte budget counts what is kept.
         @Nullable MqttMessage message;
+        // What the payload and the properties of the message take, as MessageProperties.bodySize
+        // gives it, for the checks before each send of the kept message.
+        final int bodySize;
         int bytes;
         final @Nullable SendReceipt receipt;
 
@@ -862,11 +872,13 @@ final class Publications {
                 long operation,
                 Qos qos,
                 @Nullable MqttMessage message,
+                int bodySize,
                 int bytes
         ) {
             super(packetId, operation);
             this.qos = qos;
             this.message = message;
+            this.bodySize = bodySize;
             this.bytes = bytes;
             receipt = message == null ? null : new SendReceipt();
         }

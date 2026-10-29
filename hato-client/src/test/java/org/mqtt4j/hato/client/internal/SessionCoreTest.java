@@ -2802,6 +2802,38 @@ class SessionCoreTest {
     }
 
     @Test
+    void a_replay_beyond_a_continued_sessions_maximum_packet_size_is_refused() {
+        // Arrange: a persistent session sends 100,000 bytes of payload on a connection that
+        // announces no packet size, and continues on one that takes 80,000 bytes at most, more
+        // than the longest PUBLISH header takes.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(1, connAck(), 0, 0);
+        mqtt5.publish(2, qosOneMessage().withPayload(new byte[100_000]));
+        mqtt5.failed(1, new IOException("connection lost"));
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+
+        // Act
+        mqtt5.received(
+                2,
+                new Packet.ConnAck(
+                        true,
+                        ReasonCode.SUCCESS,
+                        new Properties(List.of(maximumPacketSize(80_000)))
+                ),
+                0,
+                0
+        );
+
+        // Assert: the session ends the exchange instead of sending it again, which would end the
+        // connection. The publication's own operation ended with the first connection.
+        assertThat(port.publications).hasSize(1);
+        assertThat(mqtt5.values(0).sending().publications().used()).isZero();
+    }
+
+    @Test
     void a_qos_2_exchange_keeps_its_room_until_pubcomp_while_pubrel_still_flows() {
         // Arrange: the broker takes one publication at once, so the second one waits.
         SessionCore mqtt5 = connectedMqtt5(receiveMaximum(1));
@@ -5252,6 +5284,7 @@ class SessionCoreTest {
                 long generation,
                 long id,
                 MqttMessage message,
+                int bodySize,
                 int packetId,
                 @Nullable SendReceipt receipt,
                 TopicAlias alias

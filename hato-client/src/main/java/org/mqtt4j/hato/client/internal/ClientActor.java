@@ -1630,11 +1630,12 @@ public final class ClientActor implements MqttClient {
                 long generation,
                 long ticket,
                 MqttMessage message,
+                int bodySize,
                 int packetId,
                 @Nullable SendReceipt receipt,
                 TopicAlias alias
         ) {
-            return io.publish(generation, ticket, message, packetId, receipt, alias);
+            return io.publish(generation, ticket, message, bodySize, packetId, receipt, alias);
         }
 
         @Override
@@ -2474,7 +2475,8 @@ public final class ClientActor implements MqttClient {
                     }
                     MqttMessage published = requireNonNull(message);
                     message = null;
-                    core.publish(token, published);
+                    // The body size that publish() measured for the mailbox's byte bound.
+                    core.publish(token, published, bytes());
                 }
             }
         }

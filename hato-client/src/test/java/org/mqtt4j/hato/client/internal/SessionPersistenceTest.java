@@ -1311,6 +1311,7 @@ class SessionPersistenceTest {
                 long connection,
                 long id,
                 MqttMessage message,
+                int bodySize,
                 int packetId,
                 @Nullable SendReceipt receipt,
                 TopicAlias alias

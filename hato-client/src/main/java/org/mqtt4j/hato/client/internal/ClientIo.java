@@ -371,6 +371,8 @@ final class ClientIo {
         }
     }
 
+    /// Queues `message` like [#publish(long, long, MqttMessage, int, int, SendReceipt, TopicAlias)]
+    /// after measuring its payload and properties, for tests that drive the I/O directly.
     SendQueue.OfferResult publish(
             long generation,
             long ticket,
@@ -379,8 +381,29 @@ final class ClientIo {
             @Nullable SendReceipt receipt,
             TopicAlias alias
     ) {
-        // Measured outside the monitor: counting User Properties takes time in their length.
-        int bodySize = MessageProperties.bodySize(message);
+        return publish(
+                generation,
+                ticket,
+                message,
+                MessageProperties.bodySize(message),
+                packetId,
+                receipt,
+                alias
+        );
+    }
+
+    /// Queues `message`, whose payload and properties take `bodySize` bytes as
+    /// [MessageProperties#bodySize] gives them. The caller passes the size that it measured once
+    /// for the publication, because counting User Properties takes time in their length.
+    SendQueue.OfferResult publish(
+            long generation,
+            long ticket,
+            MqttMessage message,
+            int bodySize,
+            int packetId,
+            @Nullable SendReceipt receipt,
+            TopicAlias alias
+    ) {
         synchronized (sending) {
             Connection connection = current;
             if (shutdown || connection == null || connection.generation != generation) {

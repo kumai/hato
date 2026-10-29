@@ -768,6 +768,7 @@ class ReceivePersistenceTest {
                 long generation,
                 long ticket,
                 MqttMessage message,
+                int bodySize,
                 int packetId,
                 @Nullable SendReceipt receipt,
                 TopicAlias alias

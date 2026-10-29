@@ -131,12 +131,14 @@ final class SessionCore {
         );
 
         /// Reports admission at the exact wire size, not write completion. The payload is copied
-        /// only after admission. DUP comes from `receipt` when the packet is encoded, and `alias`
-        /// decides whether the packet sets or uses a Topic Alias.
+        /// only after admission. `bodySize` is what [MessageProperties#bodySize] gives for
+        /// `message`. DUP comes from `receipt` when the packet is encoded, and `alias` decides
+        /// whether the packet sets or uses a Topic Alias.
         SendQueue.OfferResult publish(
                 long generation,
                 long ticket,
                 MqttMessage message,
+                int bodySize,
                 int packetId,
                 @Nullable SendReceipt receipt,
                 TopicAlias alias
@@ -753,8 +755,17 @@ final class SessionCore {
         }
     }
 
+    /// Publishes `message` for `operation` after measuring its payload and properties, for tests
+    /// that drive the core without the shell.
     void publish(long operation, MqttMessage message) {
-        publications.publish(operation, message);
+        publish(operation, message, MessageProperties.bodySize(message));
+    }
+
+    /// Publishes `message` for `operation`. `bodySize` is what [MessageProperties#bodySize] gives
+    /// for `message`, which the shell measured when it admitted the publication; measuring the
+    /// properties again would copy and encode them again.
+    void publish(long operation, MqttMessage message, int bodySize) {
+        publications.publish(operation, message, bodySize);
     }
 
     void subscribe(long operation, Subscribe request) {
