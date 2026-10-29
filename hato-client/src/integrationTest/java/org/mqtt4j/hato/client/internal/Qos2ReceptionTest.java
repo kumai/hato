@@ -44,8 +44,11 @@ class Qos2ReceptionTest {
             assertThat(subscription.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
             original.ack();
             assertThat(peer.receive()).isEqualTo(new Packet.PubRec(7, ReasonCode.SUCCESS, EMPTY));
+            // A duplicate shares a PUBREC whose write the client has not seen finish, which the
+            // peer can already have read. The barrier's publication leaves after that write.
+            peer.roundTripBarrier(sut);
 
-            // After admission, the same duplicate gets another PUBREC and no delivery.
+            // After that write, the same duplicate gets another PUBREC and no delivery.
             peer.send(publication(7, (byte) 1, dup));
             assertThat(peer.receive()).isEqualTo(new Packet.PubRec(7, ReasonCode.SUCCESS, EMPTY));
             peer.send(new Packet.PubRel(7, ReasonCode.SUCCESS, EMPTY));
