@@ -108,6 +108,13 @@ final class Subscriptions {
     // insertion per publication and never hits; a bounded LRU would keep the hot ones.
     private final Map<String, List<Long>> routes = new HashMap<>();
 
+    // Whether some registration may be held without an identifier, as a SUBSCRIBE sent on a
+    // connection without Subscription Identifiers leaves it. Only then does a publication that
+    // carries identifiers need its topic matched too. A deliberate simplification: it stays set
+    // until a new session, even once no such registration is left; a count of them would clear
+    // it sooner.
+    private boolean someHeldWithoutIdentifier;
+
     // Where the search for the next registration's Subscription Identifier starts.
     private int nextIdentifier = 1;
 
@@ -271,11 +278,13 @@ final class Subscriptions {
             }
             // A broker that sends one copy for overlapping subscriptions names only those that
             // it holds with an identifier, so the others still need their filters matched.
-            byTopic.match(topic, local -> {
-                if (local.heldWithoutIdentifier) {
-                    matches.add(local);
-                }
-            });
+            if (someHeldWithoutIdentifier) {
+                byTopic.match(topic, local -> {
+                    if (local.heldWithoutIdentifier) {
+                        matches.add(local);
+                    }
+                });
+            }
         }
         // Most publications match one registration, which needs no ordering.
         if (matches.size() == 1) {
@@ -299,9 +308,12 @@ final class Subscriptions {
     /// subscriptions established on it.
     void connectionEstablished(boolean sessionPresent) {
         window.sessionPresent = sessionPresent;
+        // A new session holds none of the client's subscriptions yet.
+        if (!sessionPresent) {
+            someHeldWithoutIdentifier = false;
+        }
         for (LocalSubscription local : List.copyOf(registry.values())) {
             if (!sessionPresent) {
-                // A new session holds none of the client's subscriptions yet.
                 local.heldWithoutIdentifier = false;
             }
             if (local.removal != null) {
@@ -428,6 +440,7 @@ final class Subscriptions {
                 core.responses().add(ticket, ResponseDeadlines.Kind.SUBACK, id);
             }
             local.heldWithoutIdentifier = !core.subscriptionIdentifiers();
+            someHeldWithoutIdentifier |= local.heldWithoutIdentifier;
             window.registrations.removeFirst();
             window.subscribingInFlight++;
         }
