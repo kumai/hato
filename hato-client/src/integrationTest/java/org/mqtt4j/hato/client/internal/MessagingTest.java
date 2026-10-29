@@ -179,10 +179,13 @@ abstract class MessagingTest {
                 var workers = Executors.newVirtualThreadPerTaskExecutor()) {
             sut.connect().get(5, SECONDS);
             publisher.connect().get(5, SECONDS);
+            // The buffer holds every publication. Over MQTT 5.0 the broker may send up to the
+            // client's Receive Maximum before the receivers acknowledge, and a QoS 1 delivery
+            // beyond the buffer would end the connection.
             PullSubscription subscription = sut.subscribe(
                     Subscribe.of(new TopicFilter(topic), Qos.AT_LEAST_ONCE)
                             .withAckMode(mode)
-                            .withBufferCapacity(64)
+                            .withBufferCapacity(512)
             );
             subscription.established().get(5, SECONDS);
             var jobs = new ArrayList<Future<?>>();
