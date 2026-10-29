@@ -153,6 +153,35 @@ class IncomingFramesTest {
     }
 
     @ParameterizedTest
+    @ValueSource(ints = {0, 1, 16383})
+    void a_publication_whose_headers_come_first_allocates_for_received_bytes(int received) {
+        // Arrange
+        var packets = new ArrayList<Packet>();
+        var sut = new IncomingFrames(
+                268_435_460,
+                PacketCodec.of(MqttVersion.V3_1_1),
+                (packet, _) -> packets.add(packet)
+        );
+        // A QoS 0 PUBLISH of the maximum Remaining Length to the topic "a", whose headers
+        // locate its payload, followed by part of the payload.
+        byte[] start = HexFormat.of().parseHex("30ffffff7f000161");
+        byte[] chunk = Arrays.copyOf(start, start.length + received);
+
+        // Act
+        long before = allocatedBytes();
+        sut.accept(chunk);
+        long allocated = allocatedBytes() - before;
+
+        // Assert: neither the declared packet nor its payload is allocated up front.
+        assertThat(before).as("per-thread allocation measurement").isNotNegative();
+        assertThat(allocated).isLessThan(16L * 1024 * 1024);
+        assertThat(packets).isEmpty();
+        sut.clear();
+        sut.accept(HexFormat.of().parseHex("d000"));
+        assertThat(packets).containsExactly(new Packet.PingResp());
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"d08000", "d0808000", "d080808000"})
     void zero_length_frames_keep_nonminimal_headers_across_chunks(String hex) {
         var packets = new ArrayList<Packet>();

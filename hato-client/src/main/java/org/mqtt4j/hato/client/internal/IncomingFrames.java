@@ -19,12 +19,14 @@ import org.mqtt4j.hato.client.internal.common.protocol.TopicCache;
 /// A packet that lies whole within one chunk is decoded where it lies. A packet that spans
 /// chunks is copied, once, into storage of its own as its bytes arrive:
 ///
-/// - A PUBLISH of at most [#UPFRONT_LIMIT] bytes whose headers come with its fixed header goes
-///   into an array of its headers and one of its payload, which the decoded packet takes over.
-/// - Any other packet of at most [#UPFRONT_LIMIT] bytes goes into one array of its size.
-/// - A larger packet keeps the parts received so far and is joined once its last byte arrives,
-///   so that its storage follows the bytes received rather than the length that the peer
-///   declares, which could claim memory without sending it.
+/// - A PUBLISH whose headers come with its fixed header keeps them in an array of their own,
+///   and its payload in another, which the decoded packet takes over.
+/// - Any other packet goes into one array of its size.
+///
+/// A packet of at most [#UPFRONT_LIMIT] bytes gets that storage as soon as its fixed header
+/// arrives. A larger packet keeps the parts received so far and joins them once its last byte
+/// arrives, so that its storage follows the bytes received rather than the length that the
+/// peer declares, which could claim memory without sending it.
 ///
 /// A chunk is either handed over, and then kept as it is when a large packet needs parts of it,
 /// or lent, and then copied from before the call returns. A serialized transport callback owns
@@ -58,16 +60,17 @@ final class IncomingFrames {
     // The bytes of that packet received so far, counting its fixed header.
     private int position;
 
-    // The headers of a PUBLISH that is read apart from its payload, which `frame` then holds, or
-    // null.
+    // The headers of a PUBLISH that is read apart from its payload, which `frame` or the parts
+    // then hold, or null.
     private byte @Nullable [] publishHeaders;
 
     // The storage of the packet being read, at its size, or of its payload when its headers are
     // kept apart. Null for a packet beyond UPFRONT_LIMIT, which keeps parts instead.
     private byte @Nullable [] frame;
 
-    // The parts of the chunks that hold the body received so far of a packet beyond
-    // UPFRONT_LIMIT, in order of arrival.
+    // The parts of the chunks that hold what has arrived so far of a packet beyond UPFRONT_LIMIT
+    // after its fixed header, or after its headers when they are kept apart, in order of
+    // arrival.
     private final List<Part> parts = new ArrayList<>();
 
     IncomingFrames(int maxPacketSize, PacketCodec codec, BiConsumer<Packet, Integer> receiver) {
@@ -142,21 +145,23 @@ final class IncomingFrames {
     /// where the fixed header starts in the chunk, or -1 when it started in an earlier one, and
     /// the chunk ends at `to`.
     private int begin(byte[] bytes, int start, int offset, int to) {
-        if (packetSize > UPFRONT_LIMIT) {
-            return offset;
-        }
+        boolean upfront = packetSize <= UPFRONT_LIMIT;
         if (start >= 0 && (header[0] & 0xF0) == 0x30) {
             int headersSize = codec.publishHeadersSize(bytes, start, to - start);
             if (headersSize >= headerSize && headersSize <= packetSize) {
                 publishHeaders = Arrays.copyOfRange(bytes, start, start + headersSize);
-                frame = new byte[packetSize - headersSize];
+                if (upfront) {
+                    frame = new byte[packetSize - headersSize];
+                }
                 position = headersSize;
                 return start + headersSize;
             }
         }
-        var whole = new byte[packetSize];
-        System.arraycopy(header, 0, whole, 0, headerSize);
-        frame = whole;
+        if (upfront) {
+            var whole = new byte[packetSize];
+            System.arraycopy(header, 0, whole, 0, headerSize);
+            frame = whole;
+        }
         return offset;
     }
 
@@ -196,16 +201,21 @@ final class IncomingFrames {
         frame = null;
     }
 
-    /// The packet being read, copied once from its fixed header and the parts of its body.
+    /// The parts of the packet being read, copied once into one array: its payload when its
+    /// headers are kept apart, and otherwise the whole packet from its fixed header.
     private byte[] assembled() {
-        var packet = new byte[packetSize];
-        System.arraycopy(header, 0, packet, 0, headerSize);
-        int at = headerSize;
+        byte[] headers = publishHeaders;
+        var kept = new byte[headers == null ? packetSize : packetSize - headers.length];
+        int at = 0;
+        if (headers == null) {
+            System.arraycopy(header, 0, kept, 0, headerSize);
+            at = headerSize;
+        }
         for (Part part : parts) {
-            System.arraycopy(part.chunk(), part.offset(), packet, at, part.length());
+            System.arraycopy(part.chunk(), part.offset(), kept, at, part.length());
             at += part.length();
         }
-        return packet;
+        return kept;
     }
 
     /// The `length` bytes of `chunk` from `offset` that belong to the packet being read.
