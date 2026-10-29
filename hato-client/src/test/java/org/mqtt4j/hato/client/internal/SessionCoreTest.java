@@ -2693,16 +2693,26 @@ class SessionCoreTest {
         );
     }
 
-    @ParameterizedTest(name = "Maximum Packet Size {0} bytes beyond the publication")
-    @CsvSource({"2, false", "3, true"})
+    @ParameterizedTest(
+            name = "{0} payload bytes, Maximum Packet Size {1} bytes beyond the publication"
+    )
+    @CsvSource({
+            "2, 2, false",
+            "2, 3, true",
+            // The alias takes the Remaining Length from 125 to 128, which takes another byte.
+            "119, 3, false",
+            "119, 4, true"
+    })
     void a_publication_uses_an_alias_only_when_the_alias_fits_the_maximum_packet_size(
+            int payloadSize,
             int headroom,
             boolean aliased
     ) {
         // Arrange
+        var payload = new byte[payloadSize];
         int size = PacketCodec.of(MqttVersion.V5).encode(new Packet.Publish(
                 new Topic("a/b"),
-                new byte[] {1, 2},
+                payload,
                 Qos.AT_MOST_ONCE,
                 false,
                 false,
@@ -2715,7 +2725,7 @@ class SessionCoreTest {
         );
 
         // Act
-        mqtt5.publish(2, message());
+        mqtt5.publish(2, MqttMessage.of(new Topic("a/b"), payload, Qos.AT_MOST_ONCE, false));
 
         // Assert: the publication itself fits either way and is sent.
         assertThat(port.publications).hasSize(1);

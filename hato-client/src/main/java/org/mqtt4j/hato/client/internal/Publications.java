@@ -645,10 +645,13 @@ final class Publications {
             return TopicAlias.NONE;
         }
         TopicAlias alias = window.aliases.choose(message.topic(), maximum);
-        // Setting an alias adds it to the topic, which makes the longest form; the form that
-        // carries the alias alone is never longer.
+        // Setting an alias adds its property to the topic, which makes the longest form; the
+        // form that carries the alias alone is never longer. The property counts with the
+        // others, so that a length that it makes take another byte, of the properties or of the
+        // whole packet, counts too. Only a publication that fits without the alias comes here,
+        // so the sum cannot overflow.
         if (alias != TopicAlias.NONE
-                && exceeds(message, bodySize, packetLimit() - TOPIC_ALIAS_BYTES)) {
+                && exceeds(message, bodySize + TOPIC_ALIAS_BYTES, packetLimit())) {
             return TopicAlias.NONE;
         }
         return alias;
