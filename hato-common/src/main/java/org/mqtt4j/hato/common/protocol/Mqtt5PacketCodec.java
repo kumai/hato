@@ -184,6 +184,14 @@ final class Mqtt5PacketCodec implements PacketCodec {
     }
 
     @Override
+    public int publishSize(Topic topic, Qos qos, int propertiesSize, int payloadSize) {
+        if (propertiesSize < 0 || payloadSize < 0) {
+            throw new IllegalArgumentException("PUBLISH sizes must not be negative");
+        }
+        return PublishHeaders.packetSize(topic.name(), qos, propertiesSize, payloadSize);
+    }
+
+    @Override
     public byte[] encodeAliasPublishHeader(
             Qos qos,
             boolean retain,

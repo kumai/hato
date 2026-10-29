@@ -622,6 +622,85 @@ class PacketCodecTest {
         )).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("properties");
     }
 
+    @ParameterizedTest
+    @CsvSource(textBlock = """
+            V3_1_1, AT_MOST_ONCE, 0, 0
+            V3_1_1, AT_MOST_ONCE, 0, 124
+            V3_1_1, AT_MOST_ONCE, 0, 125
+            V3_1_1, EXACTLY_ONCE, 0, 268435450
+            V5, AT_MOST_ONCE, 0, 0
+            V5, AT_LEAST_ONCE, 0, 121
+            V5, AT_LEAST_ONCE, 0, 122
+            V5, AT_MOST_ONCE, 127, 0
+            V5, AT_MOST_ONCE, 128, 16250
+            V5, AT_MOST_ONCE, 128, 16251
+            V5, AT_LEAST_ONCE, 16383, 2080761
+            V5, AT_LEAST_ONCE, 16383, 2080762
+            V5, AT_LEAST_ONCE, 16384, 0
+            V5, AT_MOST_ONCE, 6, 268435445
+            """)
+    void a_publish_size_is_the_length_of_its_prepared_headers_and_its_payload(
+            MqttVersion version,
+            Qos qos,
+            int propertiesSize,
+            int payloadSize
+    ) {
+        // Arrange: the sizes reach each length that takes one more byte to state. Properties of
+        // `propertiesSize` bytes are one User Property, which takes six bytes besides its value.
+        var sut = PacketCodec.of(version);
+        var topic = new Topic("a");
+        int packetId = qos == Qos.AT_MOST_ONCE ? 0 : 1;
+        Properties properties = propertiesSize == 0
+                ? EMPTY
+                : new Properties(List.of(
+                        new Property.UserProperty("k", "v".repeat(propertiesSize - 6))
+                ));
+        byte[] header = sut.encodePublishHeader(
+                topic,
+                qos,
+                false,
+                false,
+                packetId,
+                properties,
+                payloadSize
+        );
+
+        // Act
+        int size = sut.publishSize(topic, qos, propertiesSize, payloadSize);
+
+        // Assert
+        assertThat(size).isEqualTo(header.length + payloadSize);
+    }
+
+    @ParameterizedTest
+    @CsvSource(textBlock = """
+            V3_1_1, 0, -1
+            V3_1_1, 1, 0
+            V3_1_1, 0, 268435453
+            V5, -1, 0
+            V5, 0, -1
+            V5, 0, 268435452
+            V5, 268435451, 0
+            V5, 2147483647, 0
+            """)
+    void publish_sizes_reject_negative_sizes_and_what_no_publish_can_carry(
+            MqttVersion version,
+            int propertiesSize,
+            int payloadSize
+    ) {
+        // Arrange
+        var sut = PacketCodec.of(version);
+        var topic = new Topic("a");
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.publishSize(
+                topic,
+                Qos.AT_MOST_ONCE,
+                propertiesSize,
+                payloadSize
+        )).isInstanceOf(IllegalArgumentException.class);
+    }
+
     @Test
     void an_assembled_publish_does_not_retain_its_header_or_payload() {
         // Arrange

@@ -10,7 +10,8 @@ import org.mqtt4j.hato.common.value.Qos;
 /// first bytes, so that a reader can give the payload an array of its own before the rest of the
 /// packet arrives; only the lengths that lead to the payload are read, and decoding checks the
 /// packet. Writing builds the headers of a PUBLISH, its properties included, in one array of
-/// their exact size.
+/// their exact size; sizing counts the bytes of a PUBLISH from the sizes of its parts, as writing
+/// would take them, without writing it.
 final class PublishHeaders {
 
     private PublishHeaders() {}
@@ -37,14 +38,12 @@ final class PublishHeaders {
         int propertiesSize = properties == null || properties.isEmpty()
                 ? 0
                 : Mqtt5Properties.size(properties, PacketType.PUBLISH);
-        int variableSize = 2 + name.length
-                + (qos == Qos.AT_MOST_ONCE ? 0 : 2)
-                + (properties == null ? 0 : RemainingLength.encodedSize(propertiesSize))
-                + propertiesSize;
-        if (payloadSize > 268435455 - variableSize) {
-            throw new IllegalArgumentException("PUBLISH exceeds the Remaining Length limit");
-        }
-        int remainingLength = variableSize + payloadSize;
+        int variableSize = variableSize(
+                2 + name.length,
+                qos,
+                properties == null ? -1 : propertiesSize
+        );
+        int remainingLength = remainingLength(variableSize, payloadSize);
         var header = new byte[1 + RemainingLength.encodedSize(remainingLength) + variableSize];
         int flags = (dup ? 8 : 0) | (qos.level() << 1) | (retain ? 1 : 0);
         header[0] = (byte) ((PacketType.PUBLISH.value() << 4) | flags);
@@ -62,6 +61,39 @@ final class PublishHeaders {
             Mqtt5Properties.write(header, at, properties);
         }
         return header;
+    }
+
+    /// The bytes of a PUBLISH of `topic`, which must be a valid MQTT string, whose payload takes
+    /// `payloadSize` bytes: the headers that [#write] writes for it and the payload. Under MQTT
+    /// 5.0 its properties take `propertiesSize` bytes without their length; MQTT 3.1.1 has none
+    /// and takes -1.
+    ///
+    /// @throws IllegalArgumentException if the packet exceeds the Remaining Length limit
+    static int packetSize(String topic, Qos qos, int propertiesSize, int payloadSize) {
+        int remainingLength = remainingLength(
+                variableSize(MqttString.encodedSize(topic), qos, propertiesSize),
+                payloadSize
+        );
+        return 1 + RemainingLength.encodedSize(remainingLength) + remainingLength;
+    }
+
+    // The bytes of the variable header of a PUBLISH whose topic name takes `topicSize` bytes with
+    // its length: the name, the packet identifier above QoS 0, and, unless `propertiesSize` is -1,
+    // the length of the properties and the `propertiesSize` bytes that they take.
+    private static int variableSize(int topicSize, Qos qos, int propertiesSize) {
+        return topicSize
+                + (qos == Qos.AT_MOST_ONCE ? 0 : 2)
+                + (propertiesSize < 0
+                        ? 0
+                        : RemainingLength.encodedSize(propertiesSize) + propertiesSize);
+    }
+
+    // The Remaining Length of a PUBLISH whose variable header and payload take these sizes.
+    private static int remainingLength(int variableSize, int payloadSize) {
+        if (payloadSize > RemainingLength.MAX_VALUE - variableSize) {
+            throw new IllegalArgumentException("PUBLISH exceeds the Remaining Length limit");
+        }
+        return variableSize + payloadSize;
     }
 
     /// The size of the fixed and variable headers of the PUBLISH whose first `available` bytes

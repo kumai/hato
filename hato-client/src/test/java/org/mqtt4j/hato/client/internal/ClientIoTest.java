@@ -1818,6 +1818,11 @@ class ClientIoTest {
         }
 
         @Override
+        public int publishSize(Topic topic, Qos qos, int propertiesSize, int payloadSize) {
+            return delegate.publishSize(topic, qos, propertiesSize, payloadSize);
+        }
+
+        @Override
         public byte[] encodeAliasPublishHeader(
                 Qos qos,
                 boolean retain,

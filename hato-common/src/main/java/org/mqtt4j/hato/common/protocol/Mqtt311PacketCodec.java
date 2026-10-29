@@ -200,6 +200,17 @@ final class Mqtt311PacketCodec implements PacketCodec {
         );
     }
 
+    @Override
+    public int publishSize(Topic topic, Qos qos, int propertiesSize, int payloadSize) {
+        if (propertiesSize != 0) {
+            throw new IllegalArgumentException("MQTT 3.1.1 PUBLISH cannot carry properties");
+        }
+        if (payloadSize < 0) {
+            throw new IllegalArgumentException("PUBLISH payload size must not be negative");
+        }
+        return PublishHeaders.packetSize(topic.name(), qos, -1, payloadSize);
+    }
+
     /// Decodes exactly one complete packet, rejecting truncation and extra bytes.
     ///
     /// An empty CONNECT client identifier with Clean Session false is retained so the server

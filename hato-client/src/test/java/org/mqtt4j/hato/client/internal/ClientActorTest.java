@@ -9338,6 +9338,11 @@ class ClientActorTest {
         }
 
         @Override
+        public int publishSize(Topic topic, Qos qos, int propertiesSize, int payloadSize) {
+            return codec.publishSize(topic, qos, propertiesSize, payloadSize);
+        }
+
+        @Override
         public byte[] encodeAliasPublishHeader(
                 Qos qos,
                 boolean retain,

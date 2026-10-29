@@ -160,7 +160,7 @@ final class Publications {
                     );
                     return;
                 }
-                byteCount = wireSize(message);
+                byteCount = wireSize(message, bodySize);
                 if (byteCount > remaining) {
                     capacityFailure(
                             operation,
@@ -617,7 +617,7 @@ final class Publications {
     }
 
     /// Whether the PUBLISH that carries `message` is larger than `limit`. `bodySize`, the size of
-    /// the payload and the properties, settles it for most messages without encoding the header.
+    /// the payload and the properties, settles it for most messages without sizing the headers.
     private boolean exceeds(MqttMessage message, int bodySize, int limit) {
         long body = bodySize;
         if (body > limit) {
@@ -627,7 +627,7 @@ final class Publications {
             return false;
         }
         try {
-            return wireSize(message) > limit;
+            return wireSize(message, bodySize) > limit;
         } catch (IllegalArgumentException _) {
             // No Remaining Length can describe the packet, so no limit admits it.
             return true;
@@ -654,19 +654,16 @@ final class Publications {
         return alias;
     }
 
-    /// The size of the PUBLISH that carries `message`, including its fixed header and its
-    /// properties.
-    private int wireSize(MqttMessage message) {
-        return codec.encodePublishHeader(
+    /// The size of the PUBLISH that carries `message`, whose payload and properties take
+    /// `bodySize` bytes, including its fixed header and its properties. The size comes from the
+    /// parts, as the codec writes them, without preparing the headers.
+    private int wireSize(MqttMessage message, int bodySize) {
+        return codec.publishSize(
                 message.topic(),
                 message.qos(),
-                message.retain(),
-                false,
-                message.qos() == Qos.AT_MOST_ONCE ? 0 : 1,
-                MessageProperties.of(message),
+                bodySize - message.payloadSize(),
                 message.payloadSize()
-        )
-                .length + message.payloadSize();
+        );
     }
 
     /// The broker did not accept the publication, which ends its exchange: the packet identifier
