@@ -5798,6 +5798,7 @@ class ClientActorTest {
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             Subscription established = subscribe(sut, transport);
+            await().until(() -> ((ClientActor) sut).usage().waiters() == 0);
             Subscription pending = sut.subscribe(
                     Subscribe.of(new TopicFilter("pending"), Qos.AT_MOST_ONCE),
                     _ -> { }
