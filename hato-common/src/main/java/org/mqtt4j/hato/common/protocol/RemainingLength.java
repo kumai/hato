@@ -16,7 +16,7 @@ import static org.mqtt4j.hato.common.value.ReasonCode.MALFORMED_PACKET;
 /// See [MQTT 3.1.1 Plus Errata 01, section 2.2.3: Remaining Length](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os-complete.html).
 public final class RemainingLength {
 
-    private static final int MAX_VALUE = 268435455;
+    static final int MAX_VALUE = 268435455;
 
     private RemainingLength() {}
 

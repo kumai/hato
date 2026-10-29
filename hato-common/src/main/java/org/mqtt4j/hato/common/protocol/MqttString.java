@@ -132,11 +132,27 @@ public final class MqttString {
         BinaryData.write(output, value.getBytes(StandardCharsets.UTF_8));
     }
 
+    /// Writes the byte-length prefix and UTF-8 content of `value`, which [#encodedSize] has
+    /// checked, into `output` from `offset`, and returns the offset after them.
+    static int write(byte[] output, int offset, String value) {
+        // getBytes would replace an unpaired surrogate, but sizing has rejected them all.
+        return BinaryData.write(output, offset, value.getBytes(StandardCharsets.UTF_8));
+    }
+
     /// Checks that `value` can be written as an MQTT UTF-8 string, without encoding it.
     ///
     /// @throws IllegalArgumentException if `value` contains U+0000 or an unpaired surrogate,
     ///         or exceeds 65535 bytes in UTF-8
     public static void validate(String value) {
+        int _ = encodedSize(value);
+    }
+
+    /// The bytes that `value` takes as an MQTT UTF-8 string, its byte-length prefix included,
+    /// after checking it as [#validate] does, without encoding it.
+    ///
+    /// @throws IllegalArgumentException if `value` contains U+0000 or an unpaired surrogate,
+    ///         or exceeds 65535 bytes in UTF-8
+    static int encodedSize(String value) {
         requireNonNull(value, "value must not be null");
         // Shared text constraints also appear in value.TopicText; that layer cannot use protocol.
         // One scan counts the UTF-8 length: a char below U+0080 takes one byte, below U+0800
@@ -167,5 +183,6 @@ public final class MqttString {
         if (bytes > 65535) {
             throw new IllegalArgumentException("MQTT string exceeds 65535 bytes in UTF-8");
         }
+        return 2 + (int) bytes;
     }
 }

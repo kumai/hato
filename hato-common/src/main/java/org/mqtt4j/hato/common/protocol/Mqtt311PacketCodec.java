@@ -195,7 +195,7 @@ final class Mqtt311PacketCodec implements PacketCodec {
                 packet.retain(),
                 packet.dup(),
                 packet.packetId(),
-                false,
+                null,
                 payloadSize
         );
     }

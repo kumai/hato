@@ -218,28 +218,8 @@ final class Mqtt5PacketCodec implements PacketCodec {
         if (payloadSize < 0) {
             throw new IllegalArgumentException("PUBLISH payload size must not be negative");
         }
-        if (properties.isEmpty()) {
-            // Without properties, the headers have a fixed shape that needs no buffer.
-            MqttString.validate(topic);
-            return PublishHeaders.write(topic, qos, retain, dup, packetId, true, payloadSize);
-        }
-        var variableHeader = new ByteArrayOutputStream();
-        MqttString.write(variableHeader, topic);
-        if (qos != Qos.AT_MOST_ONCE) {
-            writeUnsignedShort(variableHeader, packetId);
-        }
-        Mqtt5Properties.write(variableHeader, properties, PacketType.PUBLISH);
-        if (payloadSize > 268435455 - variableHeader.size()) {
-            throw new IllegalArgumentException("PUBLISH exceeds the Remaining Length limit");
-        }
-        int remainingLength = variableHeader.size() + payloadSize;
-        int headerSize = 1 + RemainingLength.encodedSize(remainingLength) + variableHeader.size();
-        var header = new ByteArrayOutputStream(headerSize);
-        int flags = (dup ? 8 : 0) | (qos.level() << 1) | (retain ? 1 : 0);
-        header.write((PacketType.PUBLISH.value() << 4) | flags);
-        RemainingLength.write(header, remainingLength);
-        header.writeBytes(variableHeader.toByteArray());
-        return header.toByteArray();
+        MqttString.validate(topic);
+        return PublishHeaders.write(topic, qos, retain, dup, packetId, properties, payloadSize);
     }
 
     @Override

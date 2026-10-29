@@ -56,4 +56,13 @@ public final class BinaryData {
         output.write(value.length & 0xFF);
         output.writeBytes(value);
     }
+
+    /// Writes the length prefix and a copy of `value`, which holds at most 65535 bytes, into
+    /// `output` from `offset`, and returns the offset after them.
+    static int write(byte[] output, int offset, byte[] value) {
+        output[offset] = (byte) (value.length >>> 8);
+        output[offset + 1] = (byte) value.length;
+        System.arraycopy(value, 0, output, offset + 2, value.length);
+        return offset + 2 + value.length;
+    }
 }

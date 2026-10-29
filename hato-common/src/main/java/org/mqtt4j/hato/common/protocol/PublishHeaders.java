@@ -2,34 +2,45 @@ package org.mqtt4j.hato.common.protocol;
 
 import java.nio.charset.StandardCharsets;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.common.value.Qos;
 
 /// The fixed and variable headers of a PUBLISH. Reading locates the payload from the packet's
 /// first bytes, so that a reader can give the payload an array of its own before the rest of the
 /// packet arrives; only the lengths that lead to the payload are read, and decoding checks the
-/// packet. Writing builds the headers of a PUBLISH without properties in one array.
+/// packet. Writing builds the headers of a PUBLISH, its properties included, in one array of
+/// their exact size.
 final class PublishHeaders {
 
     private PublishHeaders() {}
 
-    /// The headers of a PUBLISH of `topic`, which must be a valid MQTT string, that carries no
-    /// properties and is followed by `payloadSize` bytes. `properties` says whether the variable
-    /// header ends with a property length, which is then 0, as in MQTT 5.0.
+    /// The headers of a PUBLISH of `topic`, which must be a valid MQTT string, that is followed
+    /// by `payloadSize` bytes. Under MQTT 5.0 the variable header ends with `properties`; an
+    /// MQTT 3.1.1 header has none and takes null.
     ///
-    /// @throws IllegalArgumentException if the packet exceeds the Remaining Length limit
+    /// @throws IllegalArgumentException if a PUBLISH cannot carry `properties`, or the packet
+    ///         exceeds the Remaining Length limit
     static byte[] write(
             String topic,
             Qos qos,
             boolean retain,
             boolean dup,
             int packetId,
-            boolean properties,
+            @Nullable Properties properties,
             int payloadSize
     ) {
         byte[] name = topic.getBytes(StandardCharsets.UTF_8);
+        // Every field is sized before the array is made. Sizing the properties checks them, so
+        // that nothing is written for those that cannot be; most publications carry none, which
+        // need no checks.
+        int propertiesSize = properties == null || properties.isEmpty()
+                ? 0
+                : Mqtt5Properties.size(properties, PacketType.PUBLISH);
         int variableSize = 2 + name.length
                 + (qos == Qos.AT_MOST_ONCE ? 0 : 2)
-                + (properties ? 1 : 0);
+                + (properties == null ? 0 : RemainingLength.encodedSize(propertiesSize))
+                + propertiesSize;
         if (payloadSize > 268435455 - variableSize) {
             throw new IllegalArgumentException("PUBLISH exceeds the Remaining Length limit");
         }
@@ -44,9 +55,12 @@ final class PublishHeaders {
         at += name.length;
         if (qos != Qos.AT_MOST_ONCE) {
             header[at++] = (byte) (packetId >>> 8);
-            header[at] = (byte) packetId;
+            header[at++] = (byte) packetId;
         }
-        // An empty property length is the byte 0, which the new array already holds.
+        if (properties != null) {
+            at = RemainingLength.write(header, at, propertiesSize);
+            Mqtt5Properties.write(header, at, properties);
+        }
         return header;
     }
 
