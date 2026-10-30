@@ -1949,6 +1949,11 @@ class ClientIoTest {
             afterReads.incrementAndGet();
         }
 
+        @Override
+        public boolean runsHandlersAfterReads() {
+            return false;
+        }
+
         private void recordSenderCall(String call) {
             if (Thread.currentThread().getName().endsWith("-sender")) {
                 senderCalls.add(call);

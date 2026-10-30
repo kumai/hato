@@ -6497,6 +6497,29 @@ class ClientActorTest {
     }
 
     @Test
+    void reads_may_run_handlers_once_a_subscription_runs_its_handler_inline() throws Exception {
+        // Arrange: a subscription whose handler runs on a thread of its own.
+        try (MqttClient sut = client()) {
+            ScriptTransport transport = connect(sut);
+            var reader = (BorrowingListener) requireNonNull(transport.listener);
+            subscribeWith(
+                    sut,
+                    transport,
+                    devices(Qos.AT_LEAST_ONCE),
+                    DeliveryOptions.serial(),
+                    _ -> { }
+            );
+            assertThat(reader.runsHandlersAfterReads()).isFalse();
+
+            // Act
+            subscribeWith(sut, transport, qosOneRequest(), DeliveryOptions.inline(), _ -> { });
+
+            // Assert
+            assertThat(reader.runsHandlersAfterReads()).isTrue();
+        }
+    }
+
+    @Test
     void an_inline_handler_that_waits_for_its_own_client_is_refused_at_once() throws Exception {
         // Arrange: the inline handler publishes and waits for the result.
         var refused = new LinkedBlockingQueue<Throwable>();

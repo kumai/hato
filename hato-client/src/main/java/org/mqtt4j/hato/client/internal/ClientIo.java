@@ -70,6 +70,10 @@ final class ClientIo {
         /// receiving can then run on this thread too, after the events.
         void runAfterRead();
 
+        /// Whether [#runAfterRead()] may run handlers: some subscription's handler may run as
+        /// part of receiving.
+        boolean runsHandlersAfterReads();
+
         void ended(long generation, Throwable cause);
 
         void failed(long generation, Throwable cause);
@@ -305,6 +309,11 @@ final class ClientIo {
             @Override
             public void afterBorrowedBytes() {
                 events.runAfterRead();
+            }
+
+            @Override
+            public boolean runsHandlersAfterReads() {
+                return events.runsHandlersAfterReads();
             }
 
             @Override

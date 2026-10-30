@@ -23,6 +23,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import javax.net.ssl.SSLContext;
@@ -39,6 +40,7 @@ import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -380,6 +382,11 @@ class TcpTransportTest {
                 }
 
                 @Override
+                public boolean runsHandlersAfterReads() {
+                    return false;
+                }
+
+                @Override
                 public void onSent(long ticket) {
                     throw new AssertionError("Unexpected send completion");
                 }
@@ -407,7 +414,7 @@ class TcpTransportTest {
             throws Exception {
         // Arrange: one platform thread to spare for reading, and connections that a close ends
         // at once.
-        var slots = new Semaphore(1);
+        var slots = new PlatformReaders(1);
         var first = new ReadConnection();
         var second = new ReadConnection();
         var third = new ReadConnection();
@@ -447,7 +454,7 @@ class TcpTransportTest {
         // Arrange: a connection whose last read, which the close ends, returns only when told.
         var socket = new ReadConnection();
         var listener = new ConnectedListener();
-        try (TcpTransport sut = readingTransport("closing", socket, new Semaphore(1))) {
+        try (TcpTransport sut = readingTransport("closing", socket, new PlatformReaders(1))) {
             sut.start(SERVER, TIMEOUT, listener);
             Thread reader = requireNonNull(socket.readers.poll(5, SECONDS));
 
@@ -459,6 +466,239 @@ class TcpTransportTest {
             assertThat(listener.closed).isNotDone();
             socket.lastRead.complete(null);
             listener.closed.get(5, SECONDS);
+        }
+    }
+
+    @Test
+    void a_busy_connection_takes_the_platform_thread_of_a_quiet_one() throws Exception {
+        // Arrange: one platform thread to spare, which a connection that receives nothing takes
+        // first, and a second connection that reads on a virtual thread.
+        PlatformReaders slots = moving(1);
+        var quiet = new TimedConnection(false);
+        var busy = new TimedConnection(false);
+        for (TimedConnection connection : List.of(quiet, busy)) {
+            connection.lastRead.complete(null);
+        }
+        var quietListener = new ReadingListener();
+        var busyListener = new ReadingListener();
+        try (
+                TcpTransport quietSut = readingTransport("quiet", quiet, slots);
+                TcpTransport busySut = readingTransport("busy", busy, slots)
+        ) {
+            quietSut.start(SERVER, TIMEOUT, quietListener);
+            quietListener.connected.get(5, SECONDS);
+            busySut.start(SERVER, TIMEOUT, busyListener);
+            busyListener.connected.get(5, SECONDS);
+
+            // Act: the second receives a byte about every millisecond.
+            try (var _ = new Feeder(busy)) {
+                awaitPlatformReader(busy);
+            }
+
+            // Assert: the busy connection reads on a platform thread of the same name, the quiet
+            // one reads its next byte on a virtual thread, no byte is lost, and neither
+            // connection ends.
+            assertThat(busy.lastReader().getName()).isEqualTo("hato-busy-reader");
+            quiet.peer.add(1);
+            await().atMost(5, SECONDS).until(() -> quietListener.received.get() == 1);
+            assertThat(quiet.lastReader().isVirtual()).isTrue();
+            assertThat(quiet.lastReader().getName()).isEqualTo("hato-quiet-reader");
+            await().atMost(5, SECONDS).until(() -> busyListener.received.get() == busy.fed.get());
+            assertThat(quietListener.closed).isNotDone();
+            assertThat(busyListener.closed).isNotDone();
+        }
+    }
+
+    @Test
+    void a_connection_keeps_its_platform_thread_through_a_pause_of_its_reading()
+            throws Exception {
+        // Arrange: the connection on the only platform thread pauses its reading after its first
+        // read for longer than a counting window, while a busy connection asks for the thread.
+        PlatformReaders slots = moving(1);
+        var paused = new TimedConnection(false);
+        var busy = new TimedConnection(false);
+        for (TimedConnection connection : List.of(paused, busy)) {
+            connection.lastRead.complete(null);
+        }
+        var resumed = new CompletableFuture<Void>();
+        try (
+                TcpTransport pausedSut = readingTransport("paused", paused, slots);
+                TcpTransport busySut = readingTransport("busy", busy, slots)
+        ) {
+            var pausedListener = new ReadingListener();
+            var once = new AtomicBoolean();
+            pausedListener.afterRead = () -> {
+                if (once.compareAndSet(false, true)) {
+                    pausedSut.pauseReading();
+                    Thread.ofVirtual().start(() -> {
+                        LockSupport.parkNanos(Duration.ofMillis(300).toNanos());
+                        pausedSut.resumeReading();
+                        resumed.complete(null);
+                    });
+                }
+            };
+            pausedSut.start(SERVER, TIMEOUT, pausedListener);
+            pausedListener.connected.get(5, SECONDS);
+            var busyListener = new ReadingListener();
+            busySut.start(SERVER, TIMEOUT, busyListener);
+            busyListener.connected.get(5, SECONDS);
+            try (
+                    var _ = new Feeder(paused);
+                    var _ = new Feeder(busy)
+            ) {
+                // Act
+                resumed.get(5, SECONDS);
+
+                // Assert: the pause, which says nothing about the traffic, does not count as
+                // quiet once the connection reads again.
+                await().during(300, MILLISECONDS)
+                        .atMost(1, SECONDS)
+                        .until(() -> !paused.lastReader().isVirtual());
+            }
+        }
+    }
+
+    @Test
+    void a_quiet_connection_keeps_its_platform_thread_while_no_connection_asks_for_one()
+            throws Exception {
+        // Arrange: a connection on the only platform thread.
+        var socket = new TimedConnection(false);
+        socket.lastRead.complete(null);
+        var listener = new ReadingListener();
+        try (TcpTransport sut = readingTransport("alone", socket, moving(1))) {
+            sut.start(SERVER, TIMEOUT, listener);
+
+            // Act: its reads time out over several counting windows before a byte arrives.
+            await().atMost(5, SECONDS).until(() -> socket.timeouts.get() >= 20);
+            socket.peer.add(1);
+
+            // Assert: the byte arrives on the platform thread, and the timeouts did not end the
+            // connection.
+            await().atMost(5, SECONDS).until(() -> listener.received.get() == 1);
+            assertThat(socket.lastReader().isVirtual()).isFalse();
+            assertThat(listener.closed).isNotDone();
+        }
+    }
+
+    @Test
+    void connections_whose_reading_moved_report_their_close_once_the_new_threads_stop()
+            throws Exception {
+        // Arrange: a busy connection that took the platform thread of a quiet one, which reads
+        // on a virtual thread since. The last read of each, which a close ends, returns only when
+        // told.
+        PlatformReaders slots = moving(1);
+        var quiet = new TimedConnection(false);
+        var busy = new TimedConnection(false);
+        var quietListener = new ReadingListener();
+        var busyListener = new ReadingListener();
+        var freeAtClose = new CompletableFuture<Boolean>();
+        busyListener.onClose = () -> freeAtClose.complete(slots.take());
+        try (
+                TcpTransport quietSut = readingTransport("quiet", quiet, slots);
+                TcpTransport busySut = readingTransport("busy", busy, slots)
+        ) {
+            quietSut.start(SERVER, TIMEOUT, quietListener);
+            quietListener.connected.get(5, SECONDS);
+            busySut.start(SERVER, TIMEOUT, busyListener);
+            busyListener.connected.get(5, SECONDS);
+            try (var _ = new Feeder(busy)) {
+                awaitPlatformReader(busy);
+            }
+
+            // Act
+            busySut.close();
+            quietSut.close();
+
+            // Assert: each close waits for the thread that the reading moved to, and the busy
+            // connection's gives the platform thread back before the close is reported.
+            assertThat(busyListener.closed).isNotDone();
+            assertThat(quietListener.closed).isNotDone();
+            for (TimedConnection connection : List.of(quiet, busy)) {
+                connection.lastRead.complete(null);
+            }
+            busyListener.closed.get(5, SECONDS);
+            quietListener.closed.get(5, SECONDS);
+            assertThat(freeAtClose).isCompletedWithValue(true);
+        }
+    }
+
+    @Test
+    void a_connection_that_closes_after_a_read_reads_to_the_end_on_the_thread_that_it_has()
+            throws Exception {
+        // Arrange: a busy connection that asks for the only platform thread, which the test
+        // holds.
+        PlatformReaders slots = moving(1);
+        assertThat(slots.take()).isTrue();
+        var socket = new TimedConnection(false);
+        socket.lastRead.complete(null);
+        var listener = new ReadingListener();
+        try (
+                TcpTransport sut = readingTransport("closing", socket, slots);
+                var _ = new Feeder(socket)
+        ) {
+            sut.start(SERVER, TIMEOUT, listener);
+            // Two counting windows of bytes make it busy.
+            await().atMost(5, SECONDS).until(() -> listener.received.get() >= 120);
+
+            // Act: the next read closes the connection, and the platform thread comes free.
+            var once = new AtomicBoolean();
+            listener.afterRead = () -> {
+                if (once.compareAndSet(false, true)) {
+                    sut.close();
+                    slots.giveBack();
+                }
+            };
+
+            // Assert: the reading stays on its virtual thread to the end and leaves the platform
+            // thread free.
+            listener.closed.get(5, SECONDS);
+            assertThat(socket.lastReader().isVirtual()).isTrue();
+            assertThat(slots.take()).isTrue();
+        }
+    }
+
+    @Test
+    void graceful_closes_wait_for_the_threads_that_the_reading_moved_to() throws Exception {
+        // Arrange: two connections that close gracefully, the busy one of which took the platform
+        // thread of the quiet one.
+        PlatformReaders slots = moving(1);
+        var quiet = new TimedConnection(true);
+        var busy = new TimedConnection(true);
+        for (TimedConnection connection : List.of(quiet, busy)) {
+            connection.lastRead.complete(null);
+        }
+        var quietListener = new ReadingListener();
+        var busyListener = new ReadingListener();
+        try (
+                TcpTransport quietSut = readingTransport("quiet", quiet, slots);
+                TcpTransport busySut = readingTransport("busy", busy, slots)
+        ) {
+            quietSut.start(SERVER, TIMEOUT, quietListener);
+            quietListener.connected.get(5, SECONDS);
+            busySut.start(SERVER, TIMEOUT, busyListener);
+            busyListener.connected.get(5, SECONDS);
+            try (var _ = new Feeder(busy)) {
+                awaitPlatformReader(busy);
+            }
+
+            // Act
+            quietSut.close();
+            busySut.close();
+
+            // Assert: each socket is released only once the thread that reads it now has read to
+            // the end of the peer's stream, which ending the output lets the peer close.
+            for (TimedConnection connection : List.of(quiet, busy)) {
+                connection.outputEnded.get(5, SECONDS);
+            }
+            await().during(200, MILLISECONDS)
+                    .atMost(1, SECONDS)
+                    .until(() -> !quiet.aborted.isDone() && !busy.aborted.isDone());
+            for (TimedConnection connection : List.of(quiet, busy)) {
+                connection.peer.add(-1);
+                connection.aborted.get(5, SECONDS);
+            }
+            quietListener.closed.get(5, SECONDS);
+            busyListener.closed.get(5, SECONDS);
         }
     }
 
@@ -1137,7 +1377,7 @@ class TcpTransportTest {
     private TcpTransport readingTransport(
             String clientId,
             TcpTransport.Connection socket,
-            Semaphore platformReadingSlots
+            PlatformReaders platformReaders
     ) {
         return new TcpTransport(
                 clientId,
@@ -1146,8 +1386,31 @@ class TcpTransportTest {
                 this::resolve,
                 (_, _, _) -> socket,
                 clock,
-                platformReadingSlots
+                platformReaders
         );
+    }
+
+    // Platform readers that move as the production ones do on a machine with more processors,
+    // quicker: each reader counts its reads over 50 ms, five of which make a connection busy and
+    // fewer than two quiet, and a platform reader's reads time out after 10 ms.
+    private static PlatformReaders moving(int slots) {
+        return new PlatformReaders(
+                slots,
+                new PlatformReaders.Moves(
+                        Duration.ofMillis(50),
+                        5,
+                        2,
+                        Duration.ofMillis(10),
+                        true
+                )
+        );
+    }
+
+    private static void awaitPlatformReader(TimedConnection socket) {
+        await().atMost(5, SECONDS).until(() -> {
+            Thread reader = socket.lastReader;
+            return reader != null && !reader.isVirtual();
+        });
     }
 
     /// Records each thread that reads it. A read waits until the connection closes, and then
@@ -1179,6 +1442,170 @@ class TcpTransportTest {
         @Override
         public void close() {
             closed.complete(null);
+        }
+    }
+
+    /// A peer that hands over one byte per read, as the test feeds them, and records the thread of
+    /// the last read that returned. A read waits for a byte only as long as the timeout that the
+    /// transport set, and then times out as a socket does. Aborting sends the end of the stream,
+    /// and the read that takes it returns once `lastRead` completes.
+    private static final class TimedConnection implements TcpTransport.Connection {
+
+        final LinkedBlockingQueue<Integer> peer = new LinkedBlockingQueue<>();
+        final CompletableFuture<Void> lastRead = new CompletableFuture<>();
+        final CompletableFuture<Void> outputEnded = new CompletableFuture<>();
+        final CompletableFuture<Void> aborted = new CompletableFuture<>();
+        final AtomicInteger fed = new AtomicInteger();
+        final AtomicInteger timeouts = new AtomicInteger();
+        volatile @Nullable Thread lastReader;
+        private final boolean graceful;
+        private volatile Duration timeout = Duration.ZERO;
+
+        TimedConnection(boolean graceful) {
+            this.graceful = graceful;
+        }
+
+        Thread lastReader() {
+            return requireNonNull(lastReader);
+        }
+
+        @Override
+        public InputStream input() {
+            return new InputStream() {
+                @Override
+                public int read() throws IOException {
+                    var one = new byte[1];
+                    return read(one, 0, 1) == -1 ? -1 : one[0] & 0xff;
+                }
+
+                @Override
+                public int read(byte[] bytes, int offset, int length) throws IOException {
+                    Duration bound = timeout;
+                    Integer value;
+                    try {
+                        value = bound.isZero()
+                                ? peer.take()
+                                : peer.poll(bound.toNanos(), NANOSECONDS);
+                    } catch (InterruptedException _) {
+                        throw new InterruptedIOException();
+                    }
+                    if (value == null) {
+                        timeouts.incrementAndGet();
+                        throw new SocketTimeoutException("Read timed out");
+                    }
+                    lastReader = Thread.currentThread();
+                    if (value < 0) {
+                        lastRead.join();
+                        return -1;
+                    }
+                    bytes[offset] = value.byteValue();
+                    return 1;
+                }
+            };
+        }
+
+        @Override
+        public OutputStream output() {
+            return OutputStream.nullOutputStream();
+        }
+
+        @Override
+        public boolean closesGracefully() {
+            return graceful;
+        }
+
+        @Override
+        public void shutdownOutput() {
+            outputEnded.complete(null);
+        }
+
+        @Override
+        public void readTimeout(Duration timeout) {
+            this.timeout = timeout;
+        }
+
+        @Override
+        public void close() {
+            abort();
+        }
+
+        @Override
+        public void abort() {
+            aborted.complete(null);
+            peer.add(-1);
+        }
+    }
+
+    /// Hands the peer of `socket` a byte about every millisecond, until closed.
+    private static final class Feeder implements AutoCloseable {
+
+        private final Thread thread;
+
+        Feeder(TimedConnection socket) {
+            thread = Thread.ofVirtual().start(() -> {
+                try {
+                    while (true) {
+                        socket.fed.incrementAndGet();
+                        socket.peer.add(1);
+                        Thread.sleep(1);
+                    }
+                } catch (InterruptedException _) {
+                    // Closed.
+                }
+            });
+        }
+
+        @Override
+        public void close() throws InterruptedException {
+            thread.interrupt();
+            thread.join();
+        }
+    }
+
+    /// Counts the bytes that the transport lends, and runs `afterRead` after each read and
+    /// `onClose` as the close is reported.
+    private static final class ReadingListener implements BorrowingListener {
+
+        final CompletableFuture<Void> connected = new CompletableFuture<>();
+        final CompletableFuture<Throwable> closed = new CompletableFuture<>();
+        final AtomicInteger received = new AtomicInteger();
+        volatile Runnable afterRead = () -> { };
+        volatile Runnable onClose = () -> { };
+
+        @Override
+        public void onConnected() {
+            connected.complete(null);
+        }
+
+        @Override
+        public void onBytes(byte[] bytes) {
+            throw new AssertionError("The transport lends what it reads");
+        }
+
+        @Override
+        public void onBorrowedBytes(byte[] buffer, int offset, int length) {
+            received.addAndGet(length);
+        }
+
+        @Override
+        public void afterBorrowedBytes() {
+            afterRead.run();
+        }
+
+        @Override
+        public boolean runsHandlersAfterReads() {
+            return false;
+        }
+
+        @Override
+        public void onSent(long ticket) {
+            throw new AssertionError("Unexpected send completion");
+        }
+
+        @Override
+        public void onClosed(Throwable cause) {
+            onClose.run();
+            closed.complete(cause);
         }
     }
 

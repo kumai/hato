@@ -15,4 +15,8 @@ interface BorrowingListener extends Transport.Listener {
     /// the transport holds none of its locks, so that the listener can do work there that may
     /// call the transport.
     void afterBorrowedBytes();
+
+    /// Whether the work of [#afterBorrowedBytes] may run the application's handlers, on the
+    /// reading thread. The answer may change while the connection stays open.
+    boolean runsHandlersAfterReads();
 }
