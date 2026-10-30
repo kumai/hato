@@ -120,6 +120,22 @@ class ResponseDeadlinesTest {
     }
 
     @Test
+    void an_answer_reaches_a_duplicate_write_that_completes_after_a_later_one() {
+        // Arrange: of two writes of one response, the later completes first.
+        var sut = new ResponseDeadlines(TIMEOUT);
+        sut.add(1, Kind.PUBCOMP, 7);
+        sut.add(2, Kind.PUBCOMP, 7);
+        assertThat(sut.written(2, 10)).contains(TIMEOUT);
+
+        // Act
+        sut.answered(Kind.PUBCOMP, 7);
+
+        // Assert: the earlier write starts no wait when it completes after the answer.
+        assertThat(sut.written(1, 20)).isEmpty();
+        assertThat(sut.expired(110)).isEmpty();
+    }
+
+    @Test
     void the_two_qos_two_responses_have_independent_deadlines_for_the_same_id() {
         // Arrange
         var sut = new ResponseDeadlines(TIMEOUT);

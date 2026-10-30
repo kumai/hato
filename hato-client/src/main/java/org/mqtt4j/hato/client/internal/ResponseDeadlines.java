@@ -24,13 +24,12 @@ final class ResponseDeadlines {
     private final long timeout;
 
     // Admitted writes by ticket, each a wait of its own until its write completes, and the same
-    // writes in admission order, so that an answer can find those of its response without
-    // boxing a ticket or an identifier.
+    // writes by the response that they await: the last admitted write of each response, linked
+    // to the earlier ones. An answer then finds the writes of its own response without a pass
+    // over the others, whose number grows with the send queue.
     private final LongMap<Wait> writing = new LongMap<>();
 
-    private @Nullable Wait firstWriting;
-
-    private @Nullable Wait lastWriting;
+    private final LongMap<Wait> writingByResponse = new LongMap<>();
 
     // The awaited responses by kind and identifier, each the first completed write of its stage,
     // and the same waits in write completion order, which is deadline order.
@@ -53,13 +52,11 @@ final class ResponseDeadlines {
     void add(long ticket, Kind kind, int packetId) {
         var wait = new Wait(kind, packetId);
         writing.put(ticket, wait);
-        wait.before = lastWriting;
-        if (lastWriting == null) {
-            firstWriting = wait;
-        } else {
-            lastWriting.after = wait;
+        Wait earlier = writingByResponse.put(wait.key(), wait);
+        wait.before = earlier;
+        if (earlier != null) {
+            earlier.after = wait;
         }
-        lastWriting = wait;
     }
 
     /// Returns a delay only when this completion needs to arm the single response timer.
@@ -96,7 +93,8 @@ final class ResponseDeadlines {
     }
 
     void answered(Kind kind, int packetId) {
-        Wait wait = waiting.isEmpty() ? null : waiting.remove(key(kind, packetId));
+        long key = key(kind, packetId);
+        Wait wait = waiting.isEmpty() ? null : waiting.remove(key);
         if (wait != null) {
             Wait before = wait.before;
             Wait after = wait.after;
@@ -111,13 +109,10 @@ final class ResponseDeadlines {
                 after.before = before;
             }
         }
-        // Writes of this response still in flight start no wait when they complete. Pending writes
-        // are bounded by the core's exchange and write windows. Index them by response only if
-        // those windows grow enough to make this short scan significant.
-        for (Wait pending = firstWriting; pending != null; pending = pending.after) {
-            if (pending.kind == kind && pending.packetId == packetId) {
-                pending.answered = true;
-            }
+        // Writes of this response still in flight start no wait when they complete. A write
+        // admitted later, which may reuse the identifier, is not among them.
+        for (Wait pending = writingByResponse.get(key); pending != null; pending = pending.before) {
+            pending.answered = true;
         }
     }
 
@@ -153,15 +148,16 @@ final class ResponseDeadlines {
     private void unlinkWriting(Wait wait) {
         Wait before = wait.before;
         Wait after = wait.after;
-        if (before == null) {
-            firstWriting = after;
-        } else {
+        if (before != null) {
             before.after = after;
         }
-        if (after == null) {
-            lastWriting = before;
-        } else {
+        if (after != null) {
             after.before = before;
+        } else if (before == null) {
+            writingByResponse.remove(wait.key());
+        } else {
+            // The last admitted write of its response completed before an earlier one.
+            writingByResponse.put(wait.key(), before);
         }
         wait.before = null;
         wait.after = null;
@@ -171,8 +167,8 @@ final class ResponseDeadlines {
         return (long) kind.ordinal() << 16 | packetId;
     }
 
-    /// One admitted write and, once it completes, the wait for its response. It lies in the
-    /// writing order until then and in the waiting order after.
+    /// One admitted write and, once it completes, the wait for its response. Until then it lies
+    /// among the writes of its response, in admission order, and after in the waiting order.
     private static final class Wait {
 
         final Kind kind;
