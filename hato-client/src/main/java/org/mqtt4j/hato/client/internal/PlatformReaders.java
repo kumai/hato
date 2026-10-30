@@ -55,16 +55,19 @@ final class PlatformReaders {
     // A read that a platform thread makes in place of a virtual one saves some tens of
     // microseconds, so at a hundred reads a second a connection saves milliseconds of CPU each
     // second, and soon makes up for the start of a thread. A connection that reads a quarter of
-    // that keeps its thread, so that one near either bound does not move back and forth. An idle
-    // platform reader looks up twice a second, so that a connection that asks waits a second or
-    // two, while the wake-ups cost little.
-    private static final Duration WINDOW = Duration.ofSeconds(1);
+    // that keeps its thread, so that one near either bound does not move back and forth. The
+    // reads are counted over ten seconds, so that the threads go to connections that stay busy,
+    // and a connection that asks waits ten to twenty seconds. Counted over one second, they
+    // followed connections that took turns at being busy every two seconds, arrived about as
+    // each fell quiet, and cost more CPU than they saved. An idle platform reader looks up every
+    // five seconds, which ends its window at most that late and seldom wakes it.
+    private static final Duration WINDOW = Duration.ofSeconds(10);
 
-    private static final int BUSY_READS = 100;
+    private static final int BUSY_READS = 1_000;
 
-    private static final int QUIET_READS = 25;
+    private static final int QUIET_READS = 250;
 
-    private static final Duration READ_TIMEOUT = Duration.ofMillis(500);
+    private static final Duration READ_TIMEOUT = Duration.ofSeconds(5);
 
     private final Semaphore slots;
     private final @Nullable Moves moves;
