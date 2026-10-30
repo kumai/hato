@@ -375,18 +375,19 @@ would overlap. Use separate clients when you need those filters together.
 
 With a message handler alone, as in [Handling each message](#handling-each-message), a
 subscription runs its messages one at a time, in arrival order. The other ways change where
-your code runs, how many messages run at once, and which order is kept:
+your code runs, how many messages run at once, which order is kept, and what waits while your
+code blocks:
 
-| When you need | Use | Order | At once |
-| --- | --- | --- | --- |
-| The simplest code | [`client.subscribe(request, handler)`](#handling-each-message) | arrival | one |
-| Your own thread or pool | [`DeliveryOptions.serial().withExecutor(pool)`](#running-handlers-on-your-executor) | arrival | one |
-| The threads that own each device's state | [`DeliveryOptions.lanes(selector)`](#running-each-device-on-its-own-thread) | per lane | one per lane |
-| Each device in order, devices in parallel | [`DeliveryOptions.striped(n, key)`](#running-devices-in-parallel) | per key | up to `n` |
-| Independent messages, as fast as possible | [`DeliveryOptions.parallel(n)`](#running-independent-messages-in-parallel) | none | up to `n` |
-| The least overhead, for a handler that returns at once | [`DeliveryOptions.inline()`](#running-handlers-as-part-of-receiving) | arrival | one |
-| A queue that your application owns | [`client.handOff(request, mailbox::offer)`](#handing-messages-to-your-own-mailbox) | arrival, into your queue | your choice |
-| Your own threads taking messages | [`client.subscribe(request)` and `receive()`](#receiving-on-your-own-threads) | arrival, as taken | one per thread |
+| When you need | Use | Order | At once | While it blocks |
+| --- | --- | --- | --- | --- |
+| The simplest code | [`client.subscribe(request, handler)`](#handling-each-message) | arrival | one | its subscription waits |
+| Your own thread or pool | [`DeliveryOptions.serial().withExecutor(pool)`](#running-handlers-on-your-executor) | arrival | one | its subscription waits |
+| The threads that own each device's state | [`DeliveryOptions.lanes(selector)`](#running-each-device-on-its-own-thread) | per lane | one per lane | its lane waits |
+| Each device in order, devices in parallel | [`DeliveryOptions.striped(n, key)`](#running-devices-in-parallel) | per key | up to `n` | its stripe waits |
+| Independent messages, as fast as possible | [`DeliveryOptions.parallel(n)`](#running-independent-messages-in-parallel) | none | up to `n` | the others go on |
+| The least overhead, for a handler that returns at once | [`DeliveryOptions.inline()`](#running-handlers-as-part-of-receiving) | arrival | one | the whole connection waits, even its keep-alive |
+| A queue that your application owns | [`client.handOff(request, mailbox::offer)`](#handing-messages-to-your-own-mailbox) | arrival, one order across hand-offs | your choice | in the acceptor, every hand-off waits |
+| Your own threads taking messages | [`client.subscribe(request)` and `receive()`](#receiving-on-your-own-threads) | arrival, as taken | one per thread | the other threads go on |
 
 - Start with a handler alone. When it is slower than messages arrive, such as a wildcard
   subscription whose handler writes each reading to a database, messages queue up and their
@@ -397,9 +398,13 @@ your code runs, how many messages run at once, and which order is kept:
   hand-off to another thread, which matters only for a handler that takes microseconds.
 - Use lanes when the work must run on threads that your application already owns. Hand off
   when your application already has a queue, such as a mailbox that also takes work of its
-  own. Receive on your own threads when your loop should decide when to take each next
-  message, for example with a timeout.
-- Whichever you choose, acknowledgements keep arrival order across the connection; see
+  own. Hand off rather than offer to your queue from a handler: an acceptor can refuse a
+  message when your queue is full, which the client then treats as
+  [a full buffer](#when-a-buffer-is-full), while a handler can only drop it, fail, or wait.
+  Receive on your own threads when your loop should decide when to take each next message,
+  for example with a timeout.
+- Whichever you choose, a message that waits behind a blocked handler can hold back the
+  acknowledgements of later QoS 1 and 2 messages from every subscription; see
   [Keeping messages flowing](#keeping-messages-flowing).
 
 ### Running handlers on your executor
