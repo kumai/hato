@@ -9193,6 +9193,7 @@ class ClientActorTest {
                 cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 null,
                 null,
+                null,
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),

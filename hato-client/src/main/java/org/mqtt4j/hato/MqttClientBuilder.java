@@ -663,6 +663,7 @@ public final class MqttClientBuilder {
                 factory,
                 version,
                 sessionExpiry,
+                null,
                 credentials,
                 connectWill,
                 reconnectPolicy.backoff(),

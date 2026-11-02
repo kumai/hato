@@ -1214,6 +1214,7 @@ class AutomaticReconnectionTest {
                 cleanStart ? Duration.ZERO : Duration.ofHours(1),
                 null,
                 null,
+                null,
                 backoff,
                 initialRetry ? RetryRules.DEFAULT.withInitialRetry() : RetryRules.DEFAULT,
                 responseTimeout,

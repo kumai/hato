@@ -391,10 +391,11 @@ final class Subscriptions {
     /// A registration that the application made already takes the identifier with which the
     /// broker holds its filter, so that the broker's messages for the filter reach it. Every other
     /// registration takes a new identifier from `next` on, because the broker may still hold
-    /// messages under smaller ones for subscriptions that the earlier client object removed. A
-    /// recorded filter without a registration remains as a removal, which a continued session
-    /// confirms with UNSUBSCRIBE and a new session drops; its identifier stays reserved meanwhile,
-    /// so that its messages reach no registration.
+    /// messages under smaller ones for subscriptions that the earlier client object removed. Every
+    /// registration subscribes again once the session continues. A recorded filter without a
+    /// registration remains as a removal, which a continued session confirms with UNSUBSCRIBE and
+    /// a new session drops; its identifier stays reserved meanwhile, so that its messages reach no
+    /// registration.
     void restore(List<SessionState.Registration> recorded, int next) {
         var unclaimed = new LinkedHashMap<TopicFilter, SessionState.Registration>();
         for (SessionState.Registration registration : recorded) {
@@ -404,8 +405,12 @@ final class Subscriptions {
         byIdentifier.clear();
         var unrecorded = new ArrayList<LocalSubscription>();
         for (LocalSubscription local : registry.values()) {
+            // A registration that a discarded local session established does not count for the
+            // restored one.
+            local.established = false;
             SessionState.Registration held = unclaimed.remove(local.filter);
             if (held == null) {
+                local.heldWithoutIdentifier = false;
                 unrecorded.add(local);
             } else {
                 local.identifier = held.identifier();

@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -75,10 +76,28 @@ final class SessionCore {
 
     private enum EndReason {
         CONNECTION_FAILURE,
+        // Another client object took the stored session over, as only a writer that ignores the
+        // store's hold can. The request stops, as when the broker hands the session to another
+        // client.
+        SESSION_CLAIMED,
         DISCONNECT_WRITTEN,
         HANDLER_FAILURE,
         SCHEDULER_FAILURE,
         CLIENT_CLOSE
+    }
+
+    /// Where a client with a store stands with the stored session.
+    private enum Claim {
+        /// The client must claim the session before it connects: it has not claimed it yet, it
+        /// saved its state, which ends its ownership, or another client object holds the store or
+        /// has taken the session over.
+        UNCLAIMED,
+        CLAIMING,
+        /// The client holds the store, which marks the session as this client object's. Each
+        /// connection checks that it still does before it sends CONNECT.
+        OWNED,
+        /// The client saves its state over the session, and disconnections wait for the save.
+        SAVING
     }
 
     interface Port {
@@ -191,7 +210,24 @@ final class SessionCore {
                 boolean preserveSession,
                 boolean stopped
         );
+
+        /// Claims the session that the store keeps, which [SessionCore#claimed] then reports.
+        /// Called only for a client with a store.
+        void claimSession();
+
+        /// Checks that the store still marks the session as this client object's, for the
+        /// connection numbered `connection`, which [SessionCore#checked] then reports. Called
+        /// only for a client with a store.
+        void checkSession(long connection);
+
+        /// Saves `state` as the stored session, which [SessionCore#saved] then reports with
+        /// `disconnections`. Called only for a client with a store.
+        void saveSession(SessionState state, List<Completion> disconnections);
     }
+
+    /// A disconnect() call for the core to complete, with the failure, if any, that it completes
+    /// with.
+    record Completion(long operation, @Nullable Throwable failure) {}
 
     /// The core's values in [ClientSnapshot], read at one point.
     ///
@@ -348,6 +384,8 @@ final class SessionCore {
 
     private long nextTicket;
 
+    // When the current connection of the attempt must have been established, on the client's
+    // clock. Each connection of the attempt has the whole connection timeout.
     private long connectionDeadline;
 
     private Session session = new Session();
@@ -372,6 +410,18 @@ final class SessionCore {
     // it is not handed to a later client object.
     private boolean takenOver;
 
+    // Whether a store keeps the persistent session between client objects.
+    private final boolean stored;
+
+    // Where the client stands with the stored session. It claims the session before it sends
+    // CONNECT, which marks the session as its own in the store and may hand it an earlier client
+    // object's state; owning the session lets a disconnection save the client's state over it.
+    private Claim claim = Claim.UNCLAIMED;
+
+    // The disconnect() calls that completed while a claim or a save was in flight. A claim may
+    // hand the client the stored session, which they then save; a save completes them.
+    private final List<Completion> heldDisconnections = new ArrayList<>();
+
     // Lifetime counts of operations that the core refused for capacity, and of connections that
     // it ended for overload.
     private final long[] refusals = new long[CapacityLimit.values().length];
@@ -394,12 +444,51 @@ final class SessionCore {
             ClientActor.DisconnectionOf disconnectionOf,
             ClientLimits limits
     ) {
+        this(
+                port,
+                clientId,
+                timeout,
+                keepAlive,
+                version,
+                sessionExpiry,
+                maxPacketSize,
+                will,
+                credentialsRequired,
+                backoff,
+                rules,
+                responseTimeout,
+                disconnectionOf,
+                limits,
+                false
+        );
+    }
+
+    /// A core whose persistent session a store keeps between client objects when
+    /// `sessionStored`; a nonpersistent session is never stored.
+    SessionCore(
+            Port port,
+            String clientId,
+            Duration timeout,
+            Duration keepAlive,
+            MqttVersion version,
+            Duration sessionExpiry,
+            int maxPacketSize,
+            Packet.@Nullable Will will,
+            boolean credentialsRequired,
+            ReconnectBackoff backoff,
+            RetryRules rules,
+            Duration responseTimeout,
+            ClientActor.DisconnectionOf disconnectionOf,
+            ClientLimits limits,
+            boolean sessionStored
+    ) {
         this.port = port;
         this.clientId = clientId;
         this.timeout = timeout;
         this.responseTimeout = responseTimeout;
         this.disconnectionOf = disconnectionOf;
         cleanStart = sessionExpiry.isZero();
+        stored = sessionStored && !cleanStart;
         this.version = version;
         this.credentialsRequired = credentialsRequired;
         request = new ConnectionRequest(backoff, rules);
@@ -467,12 +556,12 @@ final class SessionCore {
 
     /// The local state of the persistent session, for a later client object to continue, or empty
     /// when there is none to hand over: without a persistent session, while a connection or an
-    /// attempt is open, after the broker ended the connection because another client took the
-    /// session over, or while outgoing QoS 1 or QoS 2 exchanges remain, whose messages the state
-    /// does not carry.
+    /// attempt is open, once the client is closed, after the broker ended the connection because
+    /// another client took the session over, or while outgoing QoS 1 or QoS 2 exchanges remain,
+    /// whose messages the state does not carry.
     Optional<SessionState> sessionState() {
-        if (cleanStart || !session.established || connectionActive() || takenOver
-                || !publications.idle()) {
+        if (cleanStart || !session.established || connectionActive() || state == State.CLOSED
+                || takenOver || !publications.idle()) {
             return Optional.empty();
         }
         return Optional.of(new SessionState(
@@ -494,14 +583,184 @@ final class SessionCore {
                     "Only a disconnected client without a session can continue a saved one"
             );
         }
-        // Every check precedes every change, so that a refusal leaves no part half restored.
+        eventTime = now;
+        takeOver(saved);
+    }
+
+    /// Takes `saved` over as the local session, which the client has none of yet. Every check
+    /// precedes every change, so that a refusal with [IllegalArgumentException] leaves no part
+    /// half restored.
+    private void takeOver(SessionState saved) {
         subscriptions.checkRestore(saved.registrations());
         receptions.checkRestore(saved.receptions());
-        eventTime = now;
         session.established = true;
         subscriptions.restore(saved.registrations(), saved.nextIdentifier());
         receptions.restore(saved.receptions());
         log.info("Restored session for {}", clientId);
+    }
+
+    /// The claim of the stored session finished. `failure` left the session unclaimed; otherwise
+    /// the client owns it, and `saved` is the state that an earlier client object saved, if the
+    /// store held one for this client. `ownSave` tells that the store still held this client
+    /// object's own latest save, which its local state matches.
+    ///
+    /// The claim applies even when the connection that requested it has ended, because the store
+    /// already marks the session as this client object's. The connection that waits for it, if
+    /// any, sends CONNECT, and disconnections that completed meanwhile save the session now.
+    void claimed(
+            @Nullable SessionState saved,
+            boolean ownSave,
+            @Nullable Throwable failure,
+            long now
+    ) {
+        eventTime = now;
+        if (state == State.CLOSED || claim != Claim.CLAIMING) {
+            return;
+        }
+        if (failure != null) {
+            unclaimed(new MqttConnectException("Cannot take over the session file", failure));
+            return;
+        }
+        claim = Claim.OWNED;
+        if (!ownSave) {
+            takeOverStored(saved);
+        }
+        completeHeldDisconnections();
+        if (awaitingClaim()) {
+            confirmClaim(now);
+        }
+    }
+
+    /// The store refused the claim, because another client object holds it. The connection that
+    /// waits for the claim fails without CONNECT, and the reconnect policy decides when the client
+    /// claims the session again.
+    void claimRefused(long now) {
+        eventTime = now;
+        if (state == State.CLOSED || claim != Claim.CLAIMING) {
+            return;
+        }
+        unclaimed(new MqttConnectException("Another client object holds the session file"));
+    }
+
+    /// The claim in flight took nothing. Disconnections that waited for it complete, and the
+    /// connection that waits for it, if any, fails with `failure`.
+    private void unclaimed(MqttConnectException failure) {
+        claim = Claim.UNCLAIMED;
+        completeHeldDisconnections();
+        if (awaitingClaim()) {
+            failed(generation, failure);
+        }
+    }
+
+    private void completeHeldDisconnections() {
+        List<Completion> held = List.copyOf(heldDisconnections);
+        heldDisconnections.clear();
+        completeDisconnections(held);
+    }
+
+    /// Sends CONNECT on the connection that waited for the store, unless the connection's
+    /// deadline passed before the store answered: the timer that ends the attempt then may not
+    /// have run yet.
+    private void confirmClaim(long now) {
+        if (connectionDeadline - now <= 0) {
+            failed(generation, new TimeoutException("Session claim deadline expired"));
+            return;
+        }
+        current.claimConfirmed = true;
+        sendConnect();
+    }
+
+    /// The check of the claim for the connection numbered `connection` finished. `held` tells
+    /// that the store still marks the session as this client object's, so the connection sends
+    /// CONNECT. Otherwise a writer that ignores the store's hold, as a network file system may
+    /// let one, has taken the session over and may already have changed the broker's session:
+    /// the client lets the other one continue it, and stops without sending CONNECT, as when the
+    /// broker hands the session to another client. A `failure` fails the attempt and keeps the
+    /// claim, which the next connection checks again.
+    void checked(long connection, boolean held, @Nullable Throwable failure, long now) {
+        eventTime = now;
+        if (connection != generation || claim != Claim.OWNED || !awaitingClaim()) {
+            return;
+        }
+        if (failure != null) {
+            failed(generation, new MqttConnectException("Cannot check the session file", failure));
+            return;
+        }
+        if (!held) {
+            claim = Claim.UNCLAIMED;
+            end(
+                    new MqttConnectException("Another client object took over the session file"),
+                    EndReason.SESSION_CLAIMED
+            );
+            return;
+        }
+        confirmClaim(now);
+    }
+
+    /// Replaces the local session, if any, with `saved`, the stored session that another client
+    /// object left, or with none when the store held none for this client.
+    private void takeOverStored(@Nullable SessionState saved) {
+        if (session.established) {
+            // Another client object continued the session after this one saved it, so the local
+            // state no longer describes the broker's session.
+            discardSession();
+        }
+        if (saved != null) {
+            try {
+                takeOver(saved);
+            } catch (IllegalArgumentException refused) {
+                log.warn("Starting a new session for {}: {}", clientId, refused.getMessage());
+            }
+        }
+    }
+
+    /// A save of the session finished, whether or not it reached the store. `disconnections`
+    /// waited for it, and so did those that completed while it ran, unless a connection has
+    /// claimed the session again since: the claim, which follows the save, completes them.
+    void saved(List<Completion> disconnections) {
+        finish(disconnections);
+        if (claim == Claim.SAVING) {
+            claim = Claim.UNCLAIMED;
+            List<Completion> held = List.copyOf(heldDisconnections);
+            heldDisconnections.clear();
+            finish(held);
+        }
+    }
+
+    /// Completes `disconnections`. A client that owns the stored session first saves its state
+    /// over it, and the next connection claims the session again. While a claim is in flight,
+    /// they wait for it, because it may hand the client the stored session; while a save is,
+    /// they wait for it, so that no disconnect() completes before the session is saved.
+    private void completeDisconnections(List<Completion> disconnections) {
+        if (disconnections.isEmpty()) {
+            return;
+        }
+        if (claim == Claim.CLAIMING || claim == Claim.SAVING) {
+            heldDisconnections.addAll(disconnections);
+            return;
+        }
+        Optional<SessionState> local = claim == Claim.OWNED ? sessionState() : Optional.empty();
+        if (local.isPresent()) {
+            claim = Claim.SAVING;
+            port.saveSession(local.orElseThrow(), disconnections);
+        } else {
+            finish(disconnections);
+        }
+    }
+
+    private void finish(List<Completion> disconnections) {
+        for (Completion disconnection : disconnections) {
+            port.complete(disconnection.operation(), null, disconnection.failure());
+        }
+    }
+
+    private static List<Completion> completions(
+            List<Long> operations,
+            @Nullable Throwable failure
+    ) {
+        return operations.stream()
+                .map(operation -> new Completion(operation, failure))
+                .toList();
     }
 
     void connect(ConnectionAttempt attempt, long now) {
@@ -571,6 +830,7 @@ final class SessionCore {
         generation++;
         port.continueAttempt(generation);
         // Each connection of the attempt has the whole connection timeout.
+        connectionDeadline = now + timeout.toNanos();
         port.schedule(generation, Timer.CONNECT, timeout);
         port.openTransport(generation, timeout);
     }
@@ -578,8 +838,38 @@ final class SessionCore {
     void opened(long connection) {
         if (connection == generation && attempting()) {
             current.transportConnected = true;
+            if (stored) {
+                awaitClaim();
+            }
             sendConnect();
         }
+    }
+
+    /// Asks the store, once the connection's transport is open, whether the client owns the
+    /// stored session, and holds CONNECT until it answers. A client that does not own the session
+    /// claims it, which holds the store until the client no longer owns the session and none of
+    /// its transports is open, so that no other client object claims the session, or connects
+    /// with it, however late this CONNECT goes out. One that owns the session checks that no
+    /// writer that ignores the hold has taken it over since.
+    private void awaitClaim() {
+        switch (claim) {
+            case UNCLAIMED, SAVING -> {
+                // A claim during a save follows it in the store, so it finds the save.
+                claim = Claim.CLAIMING;
+                port.claimSession();
+            }
+            case CLAIMING -> {
+                // The claim in flight, which may have outlived an earlier connection, answers
+                // this one too.
+            }
+            case OWNED -> port.checkSession(generation);
+        }
+    }
+
+    /// Whether the current connection has opened its transport and waits for the store before
+    /// it sends CONNECT.
+    private boolean awaitingClaim() {
+        return stored && attempting() && current.transportConnected && !current.claimConfirmed;
     }
 
     void credentials(
@@ -607,7 +897,10 @@ final class SessionCore {
     }
 
     private void sendConnect() {
-        if (current.transportConnected && credentialsReady && !current.connectSent) {
+        if (current.transportConnected
+                && credentialsReady
+                && (!stored || current.claimConfirmed)
+                && !current.connectSent) {
             current.connectSent = true;
             sendRequired(++nextTicket, establishment.connect(
                     current.step,
@@ -791,9 +1084,7 @@ final class SessionCore {
         } else {
             end(null, EndReason.DISCONNECT_WRITTEN);
         }
-        for (long operation : operations) {
-            port.complete(operation, null, null);
-        }
+        completeDisconnections(completions(operations, null));
     }
 
     /// Write completion retires PUBACK/PUBCOMP, while PUBREC retains the id for PUBREL. `now`
@@ -908,7 +1199,9 @@ final class SessionCore {
                 if (attempting()) {
                     String phase = !credentialsReady
                             ? "Credentials"
-                            : current.transportConnected ? "CONNACK" : "Transport connection";
+                            : !current.transportConnected
+                                    ? "Transport connection"
+                                    : awaitingClaim() ? "Session claim" : "CONNACK";
                     failed(connection, new TimeoutException(phase + " deadline expired"));
                 }
             }
@@ -992,7 +1285,7 @@ final class SessionCore {
                 // Publications held for the withdrawn reconnection keep an unknown outcome; a
                 // persistent session retains their exchanges.
                 publications.failPublications(new MqttConnectionLostException());
-                port.complete(operation, null, null);
+                completeDisconnections(List.of(new Completion(operation, null)));
                 return;
             }
             request.awaitDisconnection(operation);
@@ -1122,8 +1415,8 @@ final class SessionCore {
         boolean disconnectRequested = state == State.DISCONNECTING && !request.requested();
         boolean shutdownRequested = switch (reason) {
             case CLIENT_CLOSE -> cause == null || disconnectRequested;
-            case DISCONNECT_WRITTEN, CONNECTION_FAILURE, HANDLER_FAILURE, SCHEDULER_FAILURE ->
-                    disconnectRequested;
+            case DISCONNECT_WRITTEN, CONNECTION_FAILURE, SESSION_CLAIMED, HANDLER_FAILURE,
+                 SCHEDULER_FAILURE -> disconnectRequested;
         };
         boolean permanent = reason == EndReason.CLIENT_CLOSE;
         // The ended connection keeps only what this end still settles; the core sees fresh
@@ -1284,9 +1577,7 @@ final class SessionCore {
         // broker may then publish the connection's Will.
         @Nullable Throwable disconnectFailure =
                 ended.ack != null || ended.abandoned || permanent ? pendingFailure : null;
-        for (long operation : request.takeDisconnections()) {
-            port.complete(operation, null, disconnectFailure);
-        }
+        completeDisconnections(completions(request.takeDisconnections(), disconnectFailure));
     }
 
     private void completeConnections(@Nullable ConnAck ack, @Nullable Throwable failure) {
@@ -1473,6 +1764,9 @@ final class SessionCore {
         long disconnectTicket;
         long lastSent;
         boolean transportConnected;
+        // For a client with a store: set once the store has answered that the client owns the
+        // stored session, after which the connection may send CONNECT.
+        boolean claimConfirmed;
         boolean connectSent;
         boolean awaitingPing;
         // Set when the attempt gives this connection up after its CONNACK. Once DISCONNECT is

@@ -34,6 +34,9 @@ final class ClientTermination {
         /// A credentials supplier call that has not returned.
         CREDENTIALS,
 
+        /// A call of the session store that has not returned.
+        SESSION_STORE,
+
         /// A started transport that has not reported its close, the I/O sender, or the HttpClient
         /// that WebSocket transports share.
         TRANSPORTS,
@@ -68,6 +71,8 @@ final class ClientTermination {
     private @Nullable ListenerLane metrics;
 
     private @Nullable CredentialsEvaluator credentials;
+
+    private @Nullable SessionKeeper sessionKeeper;
 
     // Set once by the actor; until then nothing can complete, and checks skip the lock.
     private volatile boolean actorEnded;
@@ -104,15 +109,18 @@ final class ClientTermination {
     }
 
     /// Binds the parts that report here when they become idle. Without a metrics listener, no
-    /// timing is reported, and without credentials, none is evaluated.
+    /// timing is reported, without credentials, none is evaluated, and without a session store,
+    /// none is called.
     synchronized void watch(
             ListenerLane listeners,
             @Nullable ListenerLane metrics,
-            @Nullable CredentialsEvaluator credentials
+            @Nullable CredentialsEvaluator credentials,
+            @Nullable SessionKeeper sessionKeeper
     ) {
         this.listeners = listeners;
         this.metrics = metrics;
         this.credentials = credentials;
+        this.sessionKeeper = sessionKeeper;
     }
 
     /// An observation within the client-wide waiter limit; a completed one after termination.
@@ -204,6 +212,10 @@ final class ClientTermination {
         CredentialsEvaluator evaluator = credentials;
         if (evaluator != null && !evaluator.idle()) {
             pending.add(Pending.CREDENTIALS);
+        }
+        SessionKeeper keeper = sessionKeeper;
+        if (keeper != null && !keeper.idle()) {
+            pending.add(Pending.SESSION_STORE);
         }
         if (!transportsClosed) {
             pending.add(Pending.TRANSPORTS);

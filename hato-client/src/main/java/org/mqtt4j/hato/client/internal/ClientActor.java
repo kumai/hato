@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.net.URI;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -160,6 +161,8 @@ public final class ClientActor implements MqttClient {
 
     private final @Nullable CredentialsEvaluator credentials;
 
+    private final @Nullable SessionKeeper sessionKeeper;
+
     private final Mailbox mailbox;
 
     // The wake that tells the core of ready deliveries. The mailbox queues it at most once, so
@@ -282,6 +285,7 @@ public final class ClientActor implements MqttClient {
             Transport.Factory transportFactory,
             MqttVersion version,
             Duration sessionExpiry,
+            @Nullable Path sessionFile,
             @Nullable Supplier<MqttCredentials> credentials,
             Packet.@Nullable Will will,
             ReconnectBackoff backoff,
@@ -309,6 +313,7 @@ public final class ClientActor implements MqttClient {
                 PacketCodec.of(version),
                 version,
                 sessionExpiry,
+                sessionFile == null ? null : new FileSessionStore(sessionFile),
                 credentials,
                 will,
                 backoff,
@@ -338,6 +343,7 @@ public final class ClientActor implements MqttClient {
             PacketCodec codec,
             MqttVersion version,
             Duration sessionExpiry,
+            @Nullable SessionStore sessionStore,
             @Nullable Supplier<MqttCredentials> credentials,
             Packet.@Nullable Will will,
             ReconnectBackoff backoff,
@@ -434,7 +440,8 @@ public final class ClientActor implements MqttClient {
                 rules,
                 responseTimeout,
                 disconnectionOf,
-                limits
+                limits,
+                sessionStore != null
         );
         deliveriesReady = new Mailbox.Event(
                 0,
@@ -448,7 +455,16 @@ public final class ClientActor implements MqttClient {
                 () -> post(0, this::applyCredentials, Mailbox.Kind.CREDENTIALS_READY, 0),
                 termination::check
         );
-        termination.watch(listenerLane, metricsLane, this.credentials);
+        sessionKeeper = sessionStore == null ? null : new SessionKeeper(
+                threadName("session"),
+                clientId,
+                sessionStore,
+                new SessionCodec(clientId, version),
+                () -> post(0, this::applySessionStore, Mailbox.Kind.SESSION_STORE_READY, 0),
+                termination::check,
+                io::transportsOpen
+        );
+        termination.watch(listenerLane, metricsLane, this.credentials, sessionKeeper);
         completions = new Completions(
                 endpoint,
                 clientId,
@@ -784,6 +800,11 @@ public final class ClientActor implements MqttClient {
                 // Drops a waiting result before the remaining cleanup.
                 credentials.close();
             }
+            if (sessionKeeper != null) {
+                // Drops waiting requests and results; a running store call finishes on its own.
+                // The keeper gives the store up once no transport is open.
+                sessionKeeper.close();
+            }
             try {
                 try {
                     if (failure != null) {
@@ -807,7 +828,9 @@ public final class ClientActor implements MqttClient {
                     lanes.close(failure);
                     mailbox.discard(0);
                     Throwable cause = failure;
-                    // The core has completed started operations; the remainder never started.
+                    // The core has completed started operations, apart from disconnections that
+                    // wait for the session store; those and the operations that never started
+                    // complete as closed.
                     operations.keySet().forEach(token -> completeOperation(
                             token,
                             null,
@@ -1067,7 +1090,7 @@ public final class ClientActor implements MqttClient {
                 case INCOMING, AT_MOST_ONCE -> "Incoming";
                 case KEEP_ALIVE -> "Keep-alive";
                 case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE,
-                        CREDENTIALS_READY, RECONNECT, STATS -> "Control";
+                        CREDENTIALS_READY, SESSION_STORE_READY, RECONNECT, STATS -> "Control";
             };
             signalOverload(
                     event.generation(),
@@ -1124,6 +1147,24 @@ public final class ClientActor implements MqttClient {
                     result.failure(),
                     nanoTime(openedGeneration)
             );
+        }
+    }
+
+    /// Hands the session store's results to the core in the order of their requests. A claim
+    /// belongs to the session rather than to a connection, so the core applies it even after the
+    /// connection that requested it has ended; a check answers its own connection only.
+    private void applySessionStore() {
+        for (SessionKeeper.Outcome outcome : requireNonNull(sessionKeeper).take()) {
+            switch (outcome) {
+                case SessionKeeper.Outcome.Claimed(var state, var ownSave, var failure) ->
+                        core.claimed(state, ownSave, failure, nanoTime(openedGeneration));
+                case SessionKeeper.Outcome.Refused _ ->
+                        core.claimRefused(nanoTime(openedGeneration));
+                case SessionKeeper.Outcome.Checked(var connection, var held, var failure) ->
+                        core.checked(connection, held, failure, nanoTime(openedGeneration));
+                case SessionKeeper.Outcome.Saved(var disconnections) ->
+                        core.saved(disconnections);
+            }
         }
     }
 
@@ -1574,6 +1615,21 @@ public final class ClientActor implements MqttClient {
         @Override
         public void cancelCredentials(ConnectionAttempt attempt) {
             requireNonNull(credentials).cancel(attempt);
+        }
+
+        @Override
+        public void claimSession() {
+            requireNonNull(sessionKeeper).claim();
+        }
+
+        @Override
+        public void checkSession(long connection) {
+            requireNonNull(sessionKeeper).check(connection);
+        }
+
+        @Override
+        public void saveSession(SessionState state, List<SessionCore.Completion> disconnections) {
+            requireNonNull(sessionKeeper).save(state, disconnections);
         }
 
         @Override
@@ -2066,6 +2122,14 @@ public final class ClientActor implements MqttClient {
         @Override
         public void fatal(Throwable failure) {
             stopFor(failure);
+        }
+
+        @Override
+        public void transportsClosed() {
+            if (sessionKeeper != null) {
+                // Nothing that this client object sends can follow the claim of another one now.
+                sessionKeeper.transportsClosed();
+            }
         }
 
         @Override

@@ -5417,5 +5417,20 @@ class SessionCoreTest {
             ends.add(end);
             return Map.of();
         }
+
+        @Override
+        public void claimSession() {
+            throw new AssertionError("The client has no session store");
+        }
+
+        @Override
+        public void checkSession(long connection) {
+            throw new AssertionError("The client has no session store");
+        }
+
+        @Override
+        public void saveSession(SessionState state, List<SessionCore.Completion> disconnections) {
+            throw new AssertionError("The client has no session store");
+        }
     }
 }
