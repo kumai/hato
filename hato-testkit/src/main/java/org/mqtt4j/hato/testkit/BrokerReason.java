@@ -42,9 +42,9 @@ public final class BrokerReason {
     /// {@return a reason with `reasonCode` alone}
     ///
     /// @param reasonCode
-    ///     the reason code
+    ///   the reason code
     /// @throws NullPointerException
-    ///     if `reasonCode` is null
+    ///   if `reasonCode` is null
     public static BrokerReason of(ReasonCode reasonCode) {
         return new BrokerReason(
                 requireNonNull(reasonCode, "reasonCode must not be null"),
@@ -57,9 +57,9 @@ public final class BrokerReason {
     /// diagnostics}
     ///
     /// @param reasonString
-    ///     the Reason String
+    ///   the Reason String
     /// @throws NullPointerException
-    ///     if `reasonString` is null
+    ///   if `reasonString` is null
     public BrokerReason withReasonString(String reasonString) {
         return new BrokerReason(
                 reasonCode,
@@ -73,9 +73,9 @@ public final class BrokerReason {
     /// open}
     ///
     /// @param serverReference
-    ///     the Server Reference
+    ///   the Server Reference
     /// @throws NullPointerException
-    ///     if `serverReference` is null
+    ///   if `serverReference` is null
     public BrokerReason withServerReference(String serverReference) {
         return new BrokerReason(
                 reasonCode,

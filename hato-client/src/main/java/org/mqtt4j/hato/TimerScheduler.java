@@ -18,11 +18,11 @@ public interface TimerScheduler {
     /// Runs a task once after a nonnegative delay.
     ///
     /// @param delay
-    ///     the delay before the task runs
+    ///   the delay before the task runs
     /// @param task
-    ///     the task to run
+    ///   the task to run
     /// @return
-    ///     a handle that cancels the task
+    ///   a handle that cancels the task
     Cancellable schedule(Duration delay, Runnable task);
 
     /// A handle to a task scheduled with [TimerScheduler#schedule(Duration, Runnable)].

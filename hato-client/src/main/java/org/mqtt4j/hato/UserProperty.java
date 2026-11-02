@@ -22,12 +22,12 @@ public final class UserProperty {
     /// Validates both strings.
     ///
     /// @param name
-    ///     the property name
+    ///   the property name
     /// @param value
-    ///     the property value
+    ///   the property value
     /// @throws IllegalArgumentException
-    ///     if either string contains U+0000 or an unpaired surrogate, or exceeds 65535 bytes
-    ///     in UTF-8
+    ///   if either string contains U+0000 or an unpaired surrogate, or exceeds 65535 bytes
+    ///   in UTF-8
     public UserProperty(String name, String value) {
         requireNonNull(name, "User Property name must not be null");
         requireNonNull(value, "User Property value must not be null");

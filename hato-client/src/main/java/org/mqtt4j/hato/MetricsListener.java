@@ -29,7 +29,7 @@ public interface MetricsListener {
     /// failed when [MqttPublisher#publish(MqttMessage)] returns, produces none.
     ///
     /// @param completion
-    ///     how the publication completed
+    ///   how the publication completed
     default void onPublishCompleted(PublishCompletion completion) {
     }
 
@@ -38,7 +38,7 @@ public interface MetricsListener {
     /// A delivery that the client discards before then produces none.
     ///
     /// @param start
-    ///     when application code received the delivery
+    ///   when application code received the delivery
     default void onDeliveryStarted(DeliveryStart start) {
     }
 
@@ -65,11 +65,11 @@ public interface MetricsListener {
         /// admission}
         ///
         /// @param qos
-        ///     the QoS that the publication was sent with
+        ///   the QoS that the publication was sent with
         /// @param duration
-        ///     the time from the publication's admission to the completion of its future
+        ///   the time from the publication's admission to the completion of its future
         /// @throws IllegalArgumentException
-        ///     if `duration` is negative
+        ///   if `duration` is negative
         public static PublishCompletion of(Qos qos, Duration duration) {
             return new PublishCompletion(qos, null, duration);
         }
@@ -78,13 +78,13 @@ public interface MetricsListener {
         /// `duration` after its admission}
         ///
         /// @param qos
-        ///     the QoS that the publication was sent with
+        ///   the QoS that the publication was sent with
         /// @param failure
-        ///     the exception with which the publication's future failed
+        ///   the exception with which the publication's future failed
         /// @param duration
-        ///     the time from the publication's admission to the completion of its future
+        ///   the time from the publication's admission to the completion of its future
         /// @throws IllegalArgumentException
-        ///     if `duration` is negative
+        ///   if `duration` is negative
         public static PublishCompletion of(Qos qos, Throwable failure, Duration duration) {
             return new PublishCompletion(qos, requireNonNull(failure, "failure"), duration);
         }
@@ -147,11 +147,11 @@ public interface MetricsListener {
         /// `waited` after the client received its PUBLISH}
         ///
         /// @param subscription
-        ///     the subscription whose delivery this is
+        ///   the subscription whose delivery this is
         /// @param waited
-        ///     how long the delivery waited after the client received its PUBLISH
+        ///   how long the delivery waited after the client received its PUBLISH
         /// @throws IllegalArgumentException
-        ///     if `waited` is negative
+        ///   if `waited` is negative
         public static DeliveryStart of(Subscription subscription, Duration waited) {
             return new DeliveryStart(subscription, waited);
         }

@@ -66,13 +66,13 @@ public final class Subscribe {
     /// [RetainHandling#SEND].
     ///
     /// @param filter
-    ///     the filter sent to the broker
+    ///   the filter sent to the broker
     /// @param qos
-    ///     the maximum quality of service requested
+    ///   the maximum quality of service requested
     /// @return
-    ///     the request
+    ///   the request
     /// @throws IllegalArgumentException
-    ///     if shared syntax is invalid
+    ///   if shared syntax is invalid
     public static Subscribe of(TopicFilter filter, Qos qos) {
         requireNonNull(filter, "Filter must not be null");
         requireNonNull(qos, "QoS must not be null");
@@ -92,7 +92,7 @@ public final class Subscribe {
     /// {@return a copy that uses `ackMode` instead of the default}
     ///
     /// @param ackMode
-    ///     the acknowledgement mode
+    ///   the acknowledgement mode
     public Subscribe withAckMode(AckMode ackMode) {
         requireNonNull(ackMode, "Ack mode must not be null");
         return new Subscribe(
@@ -110,9 +110,9 @@ public final class Subscribe {
     /// {@return a copy with a different [buffer capacity][#bufferCapacity()]}
     ///
     /// @param bufferCapacity
-    ///     the maximum number of local deliveries this subscription holds at once
+    ///   the maximum number of local deliveries this subscription holds at once
     /// @throws IllegalArgumentException
-    ///     if `bufferCapacity` is not positive
+    ///   if `bufferCapacity` is not positive
     public Subscribe withBufferCapacity(int bufferCapacity) {
         if (bufferCapacity < 1) {
             throw new IllegalArgumentException("Buffer capacity must be positive");
@@ -133,7 +133,7 @@ public final class Subscribe {
     /// [FailurePolicy#STOP]}
     ///
     /// @param failurePolicy
-    ///     what the subscription does when its handler throws
+    ///   what the subscription does when its handler throws
     public Subscribe withFailurePolicy(FailurePolicy failurePolicy) {
         requireNonNull(failurePolicy, "Failure policy must not be null");
         return new Subscribe(
@@ -152,9 +152,9 @@ public final class Subscribe {
     /// subscription (the MQTT 5.0 No Local option), or to deliver them as usual}
     ///
     /// @param noLocal
-    ///     whether the broker withholds this client's own publications from this subscription
+    ///   whether the broker withholds this client's own publications from this subscription
     /// @throws IllegalArgumentException
-    ///     if `noLocal` is true for a shared subscription, which MQTT 5.0 does not allow
+    ///   if `noLocal` is true for a shared subscription, which MQTT 5.0 does not allow
     public Subscribe withNoLocal(boolean noLocal) {
         if (noLocal && SharedTopicFilter.parse(filter).isPresent()) {
             throw new IllegalArgumentException("A shared subscription cannot set No Local");
@@ -176,8 +176,8 @@ public final class Subscribe {
     /// option), or to clear it as usual; see [MqttMessage#retain()]}
     ///
     /// @param retainAsPublished
-    ///     whether the broker keeps the publisher's retain flag on the messages that it delivers
-    ///     to this subscription
+    ///   whether the broker keeps the publisher's retain flag on the messages that it delivers
+    ///   to this subscription
     public Subscribe withRetainAsPublished(boolean retainAsPublished) {
         return new Subscribe(
                 filter,
@@ -195,7 +195,7 @@ public final class Subscribe {
     /// makes this subscription (the MQTT 5.0 Retain Handling option)}
     ///
     /// @param retainHandling
-    ///     when the broker sends the matching retained messages
+    ///   when the broker sends the matching retained messages
     public Subscribe withRetainHandling(RetainHandling retainHandling) {
         requireNonNull(retainHandling, "Retain handling must not be null");
         return new Subscribe(

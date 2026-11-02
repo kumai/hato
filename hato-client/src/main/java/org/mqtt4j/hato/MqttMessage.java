@@ -83,15 +83,15 @@ public final class MqttMessage {
     /// Creates a message without properties, with a copy of the application bytes.
     ///
     /// @param topic
-    ///     the published topic name
+    ///   the published topic name
     /// @param payload
-    ///     the application bytes, possibly empty
+    ///   the application bytes, possibly empty
     /// @param qos
-    ///     the requested or received quality of service
+    ///   the requested or received quality of service
     /// @param retain
-    ///     whether publication requests retention, or reception is a retained delivery
+    ///   whether publication requests retention, or reception is a retained delivery
     /// @return
-    ///     the message
+    ///   the message
     public static MqttMessage of(Topic topic, byte[] payload, Qos qos, boolean retain) {
         return new MqttMessage(
                 topic,
@@ -153,7 +153,7 @@ public final class MqttMessage {
     /// {@return a copy with a different published topic}
     ///
     /// @param topic
-    ///     the published topic name
+    ///   the published topic name
     public MqttMessage withTopic(Topic topic) {
         return new MqttMessage(
                 topic,
@@ -172,7 +172,7 @@ public final class MqttMessage {
     /// {@return a copy with a different payload, copying the supplied bytes}
     ///
     /// @param payload
-    ///     the application bytes, possibly empty
+    ///   the application bytes, possibly empty
     public MqttMessage withPayload(byte[] payload) {
         return new MqttMessage(
                 topic,
@@ -191,7 +191,7 @@ public final class MqttMessage {
     /// {@return a copy with a different requested or received quality of service}
     ///
     /// @param qos
-    ///     the requested or received quality of service
+    ///   the requested or received quality of service
     public MqttMessage withQos(Qos qos) {
         return new MqttMessage(
                 topic,
@@ -210,7 +210,7 @@ public final class MqttMessage {
     /// {@return a copy with a different retention request or retained-delivery flag}
     ///
     /// @param retain
-    ///     whether publication requests retention, or reception is a retained delivery
+    ///   whether publication requests retention, or reception is a retained delivery
     public MqttMessage withRetain(boolean retain) {
         return new MqttMessage(
                 topic,
@@ -231,7 +231,7 @@ public final class MqttMessage {
     /// reception checks the payload against the declaration.
     ///
     /// @param payloadUtf8
-    ///     whether the payload is declared as UTF-8 encoded character data
+    ///   whether the payload is declared as UTF-8 encoded character data
     public MqttMessage withPayloadUtf8(boolean payloadUtf8) {
         return new MqttMessage(
                 topic,
@@ -254,9 +254,9 @@ public final class MqttMessage {
     /// message waits to be sent, including a resend in a later connection.
     ///
     /// @param messageExpiry
-    ///     the lifetime of the message
+    ///   the lifetime of the message
     /// @throws IllegalArgumentException
-    ///     if `messageExpiry` is negative or exceeds 4294967295 seconds
+    ///   if `messageExpiry` is negative or exceeds 4294967295 seconds
     public MqttMessage withMessageExpiry(Duration messageExpiry) {
         requireNonNull(messageExpiry, "Message expiry must not be null");
         if (messageExpiry.isNegative() || messageExpiry.compareTo(MAX_MESSAGE_EXPIRY) > 0) {
@@ -281,10 +281,10 @@ public final class MqttMessage {
     /// be empty.
     ///
     /// @param contentType
-    ///     the content type that describes the payload
+    ///   the content type that describes the payload
     /// @throws IllegalArgumentException
-    ///     if `contentType` contains U+0000 or an unpaired surrogate, or exceeds 65535 bytes in
-    ///     UTF-8
+    ///   if `contentType` contains U+0000 or an unpaired surrogate, or exceeds 65535 bytes in
+    ///   UTF-8
     public MqttMessage withContentType(String contentType) {
         requireNonNull(contentType, "Content type must not be null");
         MqttString.validate(contentType);
@@ -305,7 +305,7 @@ public final class MqttMessage {
     /// {@return a copy that names the topic for a reply (the MQTT 5.0 Response Topic)}
     ///
     /// @param responseTopic
-    ///     the topic for a reply
+    ///   the topic for a reply
     public MqttMessage withResponseTopic(Topic responseTopic) {
         requireNonNull(responseTopic, "Response topic must not be null");
         return new MqttMessage(
@@ -326,9 +326,9 @@ public final class MqttMessage {
     /// 65535 bytes and possibly empty, which a reply can return to identify its request}
     ///
     /// @param correlationData
-    ///     the Correlation Data
+    ///   the Correlation Data
     /// @throws IllegalArgumentException
-    ///     if `correlationData` exceeds 65535 bytes
+    ///   if `correlationData` exceeds 65535 bytes
     public MqttMessage withCorrelationData(byte[] correlationData) {
         requireNonNull(correlationData, "Correlation data must not be null");
         if (correlationData.length > 65_535) {
@@ -352,9 +352,9 @@ public final class MqttMessage {
     /// An empty list leaves the copy without User Properties.
     ///
     /// @param userProperties
-    ///     the User Properties in order
+    ///   the User Properties in order
     /// @throws NullPointerException
-    ///     if `userProperties` or one of its elements is null
+    ///   if `userProperties` or one of its elements is null
     public MqttMessage withUserProperties(List<UserProperty> userProperties) {
         requireNonNull(userProperties, "User Properties must not be null");
         return new MqttMessage(

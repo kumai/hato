@@ -34,7 +34,7 @@ public interface ConnectionListener {
     /// operations then reach a later connection or fail with [MqttNotConnectedException].
     ///
     /// @param connAck
-    ///     the CONNACK that established the connection
+    ///   the CONNACK that established the connection
     default void onConnected(ConnAck connAck) {
     }
 
@@ -45,7 +45,7 @@ public interface ConnectionListener {
     /// attempts to connect again.
     ///
     /// @param disconnection
-    ///     the end of the connection
+    ///   the end of the connection
     void onDisconnected(Disconnection disconnection);
 
     /// Called for each connection attempt that ends without an established connection,
@@ -61,7 +61,7 @@ public interface ConnectionListener {
     /// particular cause, call [MqttClient#disconnect()] from here.
     ///
     /// @param failure
-    ///     the end of the attempt
+    ///   the end of the attempt
     default void onConnectFailed(Disconnection failure) {
     }
 
@@ -73,9 +73,9 @@ public interface ConnectionListener {
     /// registered again at once, also from within this callback.
     ///
     /// @param subscription
-    ///     the subscription whose re-creation was refused
+    ///   the subscription whose re-creation was refused
     /// @param failure
-    ///     the refusal
+    ///   the refusal
     default void onResubscribeFailed(
             Subscription subscription,
             MqttSubscriptionRefusedException failure

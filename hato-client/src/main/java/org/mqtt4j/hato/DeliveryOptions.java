@@ -70,7 +70,7 @@ public final class DeliveryOptions {
     /// [MqttSubscriber#subscribe(Subscribe, java.util.function.Consumer)].
     ///
     /// @return
-    ///     the options for serial delivery
+    ///   the options for serial delivery
     public static DeliveryOptions serial() {
         return SERIAL;
     }
@@ -85,11 +85,11 @@ public final class DeliveryOptions {
     /// or a null result ends that delivery as a handler failure.
     ///
     /// @param selector
-    ///     the function that chooses the executor for each message
+    ///   the function that chooses the executor for each message
     /// @return
-    ///     the options for the lanes that `selector` chooses
+    ///   the options for the lanes that `selector` chooses
     /// @throws NullPointerException
-    ///     if `selector` is null
+    ///   if `selector` is null
     public static DeliveryOptions lanes(Function<MqttMessage, Executor> selector) {
         requireNonNull(selector, "selector");
         return new DeliveryOptions(new HandlerExecution.Lanes(selector));
@@ -102,11 +102,11 @@ public final class DeliveryOptions {
     /// on the executor that [#withExecutor(Executor)] sets.
     ///
     /// @param stripes
-    ///     the number of stripes
+    ///   the number of stripes
     /// @return
-    ///     the options for `stripes` stripes keyed by topic
+    ///   the options for `stripes` stripes keyed by topic
     /// @throws IllegalArgumentException
-    ///     if `stripes` is less than 1 or greater than 256
+    ///   if `stripes` is less than 1 or greater than 256
     public static DeliveryOptions striped(int stripes) {
         return striped(stripes, MqttMessage::topic);
     }
@@ -118,15 +118,15 @@ public final class DeliveryOptions {
     /// acknowledge it. An exception or a null result ends that delivery as a handler failure.
     ///
     /// @param stripes
-    ///     the number of stripes
+    ///   the number of stripes
     /// @param key
-    ///     the function that returns the key of each message
+    ///   the function that returns the key of each message
     /// @return
-    ///     the options for `stripes` stripes keyed by `key`
+    ///   the options for `stripes` stripes keyed by `key`
     /// @throws IllegalArgumentException
-    ///     if `stripes` is less than 1 or greater than 256
+    ///   if `stripes` is less than 1 or greater than 256
     /// @throws NullPointerException
-    ///     if `key` is null
+    ///   if `key` is null
     public static DeliveryOptions striped(int stripes, Function<MqttMessage, ?> key) {
         return new DeliveryOptions(new HandlerExecution.Striped(stripes, key, null));
     }
@@ -135,11 +135,11 @@ public final class DeliveryOptions {
     /// on internal threads, or on the executor that [#withExecutor(Executor)] sets.
     ///
     /// @param parallelism
-    ///     the largest number of deliveries that run at the same time
+    ///   the largest number of deliveries that run at the same time
     /// @return
-    ///     the options for up to `parallelism` deliveries at the same time
+    ///   the options for up to `parallelism` deliveries at the same time
     /// @throws IllegalArgumentException
-    ///     if `parallelism` is less than 1 or greater than 256
+    ///   if `parallelism` is less than 1 or greater than 256
     public static DeliveryOptions parallel(int parallelism) {
         return new DeliveryOptions(new HandlerExecution.Parallel(parallelism, null));
     }
@@ -167,7 +167,7 @@ public final class DeliveryOptions {
     /// options.
     ///
     /// @return
-    ///     the options for inline delivery
+    ///   the options for inline delivery
     public static DeliveryOptions inline() {
         return INLINE;
     }
@@ -176,14 +176,14 @@ public final class DeliveryOptions {
     /// `executor` instead of an internal thread. Replaces an executor chosen earlier.
     ///
     /// @param executor
-    ///     the executor that runs the handlers
+    ///   the executor that runs the handlers
     /// @return
-    ///     options like these that run each handler on `executor`
+    ///   options like these that run each handler on `executor`
     /// @throws NullPointerException
-    ///     if `executor` is null
+    ///   if `executor` is null
     /// @throws IllegalArgumentException
-    ///     if these options are [#lanes(Function)], whose selector chooses the executors, or
-    ///     [#inline()], whose handler runs as part of receiving
+    ///   if these options are [#lanes(Function)], whose selector chooses the executors, or
+    ///   [#inline()], whose handler runs as part of receiving
     public DeliveryOptions withExecutor(Executor executor) {
         requireNonNull(executor, "executor");
         return switch (execution) {

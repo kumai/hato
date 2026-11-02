@@ -31,11 +31,11 @@ public final class MqttBrokerDisconnectException extends MqttException {
     /// carried, if any.
     ///
     /// @param reasonCode
-    ///     the reason code of the broker's DISCONNECT
+    ///   the reason code of the broker's DISCONNECT
     /// @param reasonString
-    ///     the broker's explanation, or null when it sent none
+    ///   the broker's explanation, or null when it sent none
     /// @param serverReference
-    ///     the server that the broker named, or null when it named none
+    ///   the server that the broker named, or null when it named none
     public MqttBrokerDisconnectException(
             ReasonCode reasonCode,
             @Nullable String reasonString,

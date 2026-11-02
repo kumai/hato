@@ -53,9 +53,9 @@ public final class FaultyTransport implements Transport {
     /// Wraps `delegate`, timing the delays with `scheduler`.
     ///
     /// @param delegate
-    ///     the transport to wrap, which the wrapper owns and closes
+    ///   the transport to wrap, which the wrapper owns and closes
     /// @param scheduler
-    ///     the scheduler of the delays, which the wrapper borrows
+    ///   the scheduler of the delays, which the wrapper borrows
     public FaultyTransport(Transport delegate, TimerScheduler scheduler) {
         this.delegate = requireNonNull(delegate, "delegate");
         this.scheduler = requireNonNull(scheduler, "scheduler");
@@ -65,13 +65,13 @@ public final class FaultyTransport implements Transport {
     /// later chunks never overtake them even when the delay is reduced.
     ///
     /// @param value
-    ///     the receive delay
+    ///   the receive delay
     /// @return
-    ///     this transport
+    ///   this transport
     /// @throws IllegalArgumentException
-    ///     if `value` is negative
+    ///   if `value` is negative
     /// @throws ArithmeticException
-    ///     if `value` does not fit in nanoseconds, about 292 years
+    ///   if `value` does not fit in nanoseconds, about 292 years
     public synchronized FaultyTransport receiveDelay(Duration value) {
         receiveDelayNanos = delayNanos(value);
         return this;
@@ -83,13 +83,13 @@ public final class FaultyTransport implements Transport {
     /// [onClosed][Transport.Listener#onClosed(Throwable)] releases its array.
     ///
     /// @param value
-    ///     the send delay
+    ///   the send delay
     /// @return
-    ///     this transport
+    ///   this transport
     /// @throws IllegalArgumentException
-    ///     if `value` is negative
+    ///   if `value` is negative
     /// @throws ArithmeticException
-    ///     if `value` does not fit in nanoseconds, about 292 years
+    ///   if `value` does not fit in nanoseconds, about 292 years
     public synchronized FaultyTransport sendDelay(Duration value) {
         sendDelayNanos = delayNanos(value);
         return this;
@@ -381,7 +381,7 @@ public final class FaultyTransport implements Transport {
     /// is sent, so the peer sees the connection fail, as on a network failure.
     ///
     /// @param cause
-    ///     the cause of the disconnection
+    ///   the cause of the disconnection
     public void disconnect(Throwable cause) {
         Alarm cancelledReceive;
         Alarm cancelledSend;

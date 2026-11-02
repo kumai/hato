@@ -31,7 +31,7 @@ public final class MqttConnectionLostException extends MqttException {
     /// A loss with the failure that caused it.
     ///
     /// @param cause
-    ///     the failure that caused the loss
+    ///   the failure that caused the loss
     public MqttConnectionLostException(Throwable cause) {
         super("Connection ended before the operation completed", cause);
     }

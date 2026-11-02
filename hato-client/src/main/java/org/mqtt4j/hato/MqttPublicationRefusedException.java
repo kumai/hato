@@ -31,7 +31,7 @@ public final class MqttPublicationRefusedException extends MqttException {
     /// A refusal without an explanation, such as the one that the client makes itself.
     ///
     /// @param reasonCode
-    ///     the reason for the refusal
+    ///   the reason for the refusal
     public MqttPublicationRefusedException(ReasonCode reasonCode) {
         this(reasonCode, null);
     }
@@ -39,9 +39,9 @@ public final class MqttPublicationRefusedException extends MqttException {
     /// A refusal with the broker's explanation, if the broker sent one.
     ///
     /// @param reasonCode
-    ///     the reason for the refusal
+    ///   the reason for the refusal
     /// @param reasonString
-    ///     the broker's explanation, or null when it sent none
+    ///   the broker's explanation, or null when it sent none
     public MqttPublicationRefusedException(
             ReasonCode reasonCode,
             @Nullable String reasonString

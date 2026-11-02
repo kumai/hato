@@ -26,9 +26,9 @@ public enum Qos {
     /// {@return the QoS for a wire-level value}
     ///
     /// @param level
-    ///     the wire-level value
+    ///   the wire-level value
     /// @throws IllegalArgumentException
-    ///     if `level` is not 0, 1, or 2
+    ///   if `level` is not 0, 1, or 2
     public static Qos of(int level) {
         return switch (level) {
             case 0 -> AT_MOST_ONCE;

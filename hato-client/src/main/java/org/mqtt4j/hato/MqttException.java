@@ -27,7 +27,7 @@ public sealed class MqttException extends RuntimeException permits
     /// A failure with a detail message.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     MqttException(String message) {
         super(message);
     }
@@ -35,9 +35,9 @@ public sealed class MqttException extends RuntimeException permits
     /// A failure with a detail message and a cause.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     /// @param cause
-    ///     the cause of the failure
+    ///   the cause of the failure
     MqttException(String message, Throwable cause) {
         super(message, requireNonNull(cause, "cause must not be null"));
     }

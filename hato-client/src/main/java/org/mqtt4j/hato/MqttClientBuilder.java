@@ -135,9 +135,9 @@ public final class MqttClientBuilder {
     /// information in the given URI.
     ///
     /// @param value
-    ///     the broker URI
+    ///   the broker URI
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder server(URI value) {
         requireNonNull(value, "server");
         try {
@@ -186,9 +186,9 @@ public final class MqttClientBuilder {
     /// messages stored for it; see [MqttClient#connect()].
     ///
     /// @param value
-    ///     the client identifier
+    ///   the client identifier
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder clientId(String value) {
         requireNonNull(value, "clientId");
         MqttString.validate(value);
@@ -205,9 +205,9 @@ public final class MqttClientBuilder {
     /// [MqttPublisher#publish(MqttMessage)].
     ///
     /// @param value
-    ///     the MQTT version
+    ///   the MQTT version
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder version(MqttVersion value) {
         version = requireNonNull(value, "version");
         return this;
@@ -231,9 +231,9 @@ public final class MqttClientBuilder {
     /// the session lasts.
     ///
     /// @param value
-    ///     how long the session outlasts a connection
+    ///   how long the session outlasts a connection
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder sessionExpiry(Duration value) {
         requireNonNull(value, "sessionExpiry");
         if (!value.isZero()
@@ -272,9 +272,9 @@ public final class MqttClientBuilder {
     /// the protocol: the attempt or the connection ends with [MqttProtocolException].
     ///
     /// @param value
-    ///     the credentials supplier
+    ///   the credentials supplier
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder credentials(Supplier<MqttCredentials> value) {
         credentials = requireNonNull(value, "credentials");
         return this;
@@ -292,9 +292,9 @@ public final class MqttClientBuilder {
     /// the broker does not acknowledge receipt.
     ///
     /// @param value
-    ///     the Will message
+    ///   the Will message
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder will(MqttMessage value) {
         requireNonNull(value, "will");
         if (value.payloadSize() > MAX_WILL_PAYLOAD_BYTES) {
@@ -318,9 +318,9 @@ public final class MqttClientBuilder {
     /// delay for MQTT 3.1.1, which has no Will Delay.
     ///
     /// @param value
-    ///     the delay of the Will
+    ///   the delay of the Will
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder willDelay(Duration value) {
         requireNonNull(value, "willDelay");
         if (value.isNegative() || value.compareTo(MAX_WILL_DELAY) > 0) {
@@ -336,9 +336,9 @@ public final class MqttClientBuilder {
     /// a connection with Server Keep Alive, which the client then follows on that connection.
     ///
     /// @param value
-    ///     the keep-alive interval
+    ///   the keep-alive interval
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder keepAlive(Duration value) {
         requireNonNull(value, "keepAlive");
         if (value.isNegative() || value.getNano() != 0
@@ -359,9 +359,9 @@ public final class MqttClientBuilder {
     /// Defaults to 30 seconds. Must be positive and no greater than 2147483647 milliseconds.
     ///
     /// @param value
-    ///     the deadline for establishing each connection
+    ///   the deadline for establishing each connection
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder connectionTimeout(Duration value) {
         requireNonNull(value, "connectionTimeout");
         connectionTimeout = requireTimeout(value, "Connection timeout");
@@ -378,9 +378,9 @@ public final class MqttClientBuilder {
     /// Defaults to 60 seconds. Must be positive and no greater than 2147483647 milliseconds.
     ///
     /// @param value
-    ///     how long the broker may take to answer
+    ///   how long the broker may take to answer
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder responseTimeout(Duration value) {
         requireNonNull(value, "responseTimeout");
         responseTimeout = requireTimeout(value, "Response timeout");
@@ -396,9 +396,9 @@ public final class MqttClientBuilder {
     /// [MqttClient#connect()].
     ///
     /// @param value
-    ///     the reconnect policy
+    ///   the reconnect policy
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder reconnectPolicy(ReconnectPolicy value) {
         reconnectPolicy = requireNonNull(value, "reconnectPolicy");
         return this;
@@ -417,9 +417,9 @@ public final class MqttClientBuilder {
     /// limit.
     ///
     /// @param value
-    ///     the largest incoming packet size in bytes, including the fixed header
+    ///   the largest incoming packet size in bytes, including the fixed header
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder maxPacketSize(int value) {
         if (value < MIN_PACKET_SIZE || value > MAX_PACKET_SIZE) {
             throw new IllegalArgumentException(
@@ -445,9 +445,9 @@ public final class MqttClientBuilder {
     /// this limit, and the capacity for incoming QoS 1 and QoS 2 exchanges.
     ///
     /// @param value
-    ///     the limit on unfinished QoS 1 and QoS 2 publications
+    ///   the limit on unfinished QoS 1 and QoS 2 publications
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder maxInflightPublishes(int value) {
         if (value < 1 || value > MAX_INFLIGHT_PUBLISHES) {
             throw new IllegalArgumentException(
@@ -472,9 +472,9 @@ public final class MqttClientBuilder {
     /// internal limit.
     ///
     /// @param value
-    ///     the limit on the subscriptions that the client holds
+    ///   the limit on the subscriptions that the client holds
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder maxSubscriptions(int value) {
         if (value < 1 || value > MAX_SUBSCRIPTIONS) {
             throw new IllegalArgumentException("Subscriptions must be 1.." + MAX_SUBSCRIPTIONS);
@@ -492,9 +492,9 @@ public final class MqttClientBuilder {
     /// Custom transports manage their own clocks.
     ///
     /// @param value
-    ///     the timer scheduler
+    ///   the timer scheduler
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder timerScheduler(TimerScheduler value) {
         scheduler = requireNonNull(value, "timerScheduler");
         return this;
@@ -504,9 +504,9 @@ public final class MqttClientBuilder {
     /// to no action.
     ///
     /// @param value
-    ///     the connection listener
+    ///   the connection listener
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder connectionListener(ConnectionListener value) {
         listener = requireNonNull(value, "connectionListener");
         return this;
@@ -517,9 +517,9 @@ public final class MqttClientBuilder {
     /// creates no event for them.
     ///
     /// @param value
-    ///     the metrics listener
+    ///   the metrics listener
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder metricsListener(MetricsListener value) {
         metrics = requireNonNull(value, "metricsListener");
         return this;
@@ -532,9 +532,9 @@ public final class MqttClientBuilder {
     /// be combined with [#transportFactory(Transport.Factory)].
     ///
     /// @param value
-    ///     the TLS context
+    ///   the TLS context
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder sslContext(SSLContext value) {
         sslContext = requireNonNull(value, "sslContext");
         return this;
@@ -567,9 +567,9 @@ public final class MqttClientBuilder {
     /// ```
     ///
     /// @param value
-    ///     the customizer of the TLS parameters
+    ///   the customizer of the TLS parameters
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder sslParameters(Consumer<SSLParameters> value) {
         sslParameters = requireNonNull(value, "sslParameters");
         return this;
@@ -583,9 +583,9 @@ public final class MqttClientBuilder {
     /// [#sslParameters(Consumer)]. The factory's transports must reject unsupported URI schemes.
     ///
     /// @param value
-    ///     the transport factory
+    ///   the transport factory
     /// @return
-    ///     this builder
+    ///   this builder
     public MqttClientBuilder transportFactory(Transport.Factory value) {
         transportFactory = requireNonNull(value, "transportFactory");
         return this;
@@ -594,14 +594,14 @@ public final class MqttClientBuilder {
     /// Creates a disconnected client. Call [MqttClient#connect()] to open the connection.
     ///
     /// @return
-    ///     the new client
+    ///   the new client
     /// @throws IllegalStateException
-    ///     if the server has not been specified
+    ///   if the server has not been specified
     /// @throws IllegalArgumentException
-    ///     if TLS settings are invalid or incompatible, a persistent session has no explicit
-    ///     client id, the Will's properties exceed 65535 bytes with the Will delay, the Will delay
-    ///     is positive without a Will, or MQTT 3.1.1 is chosen with Will properties or a positive
-    ///     Will delay
+    ///   if TLS settings are invalid or incompatible, a persistent session has no explicit
+    ///   client id, the Will's properties exceed 65535 bytes with the Will delay, the Will delay
+    ///   is positive without a Will, or MQTT 3.1.1 is chosen with Will properties or a positive
+    ///   Will delay
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null) {

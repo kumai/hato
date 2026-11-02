@@ -53,14 +53,14 @@ public final class ConnAck {
     /// `with` methods describe the limits that a broker announced.
     ///
     /// @param sessionPresent
-    ///     whether the broker resumed an existing session
+    ///   whether the broker resumed an existing session
     /// @param connectionAttempt
-    ///     the number of the connection attempt that this acknowledgement established
+    ///   the number of the connection attempt that this acknowledgement established
     /// @return
-    ///     the acknowledgement, with the values that MQTT 5.0 assumes for limits that are not
-    ///     announced
+    ///   the acknowledgement, with the values that MQTT 5.0 assumes for limits that are not
+    ///   announced
     /// @throws IllegalArgumentException
-    ///     if `connectionAttempt` is not positive
+    ///   if `connectionAttempt` is not positive
     public static ConnAck of(boolean sessionPresent, long connectionAttempt) {
         if (connectionAttempt < 1) {
             throw new IllegalArgumentException("Attempt numbers start at 1");
@@ -79,7 +79,7 @@ public final class ConnAck {
     /// {@return a copy with a different highest QoS at which the broker accepts publications}
     ///
     /// @param maximumQos
-    ///     the highest QoS at which the broker accepts publications
+    ///   the highest QoS at which the broker accepts publications
     public ConnAck withMaximumQos(Qos maximumQos) {
         return new ConnAck(
                 sessionPresent,
@@ -96,7 +96,7 @@ public final class ConnAck {
     /// publications}
     ///
     /// @param retainAvailable
-    ///     whether the broker accepts retained publications
+    ///   whether the broker accepts retained publications
     public ConnAck withRetainAvailable(boolean retainAvailable) {
         return new ConnAck(
                 sessionPresent,
@@ -113,7 +113,7 @@ public final class ConnAck {
     /// subscriptions}
     ///
     /// @param wildcardSubscriptionAvailable
-    ///     whether the broker accepts wildcard subscriptions
+    ///   whether the broker accepts wildcard subscriptions
     public ConnAck withWildcardSubscriptionAvailable(boolean wildcardSubscriptionAvailable) {
         return new ConnAck(
                 sessionPresent,
@@ -130,7 +130,7 @@ public final class ConnAck {
     /// subscriptions}
     ///
     /// @param sharedSubscriptionAvailable
-    ///     whether the broker accepts shared subscriptions
+    ///   whether the broker accepts shared subscriptions
     public ConnAck withSharedSubscriptionAvailable(boolean sharedSubscriptionAvailable) {
         return new ConnAck(
                 sessionPresent,
@@ -146,9 +146,9 @@ public final class ConnAck {
     /// {@return a copy with a different largest packet that the broker accepts}
     ///
     /// @param maximumPacketSize
-    ///     the largest packet, in bytes including the fixed header, that the broker accepts
+    ///   the largest packet, in bytes including the fixed header, that the broker accepts
     /// @throws IllegalArgumentException
-    ///     if `maximumPacketSize` is not between 1 and 268435460
+    ///   if `maximumPacketSize` is not between 1 and 268435460
     public ConnAck withMaximumPacketSize(int maximumPacketSize) {
         if (maximumPacketSize < 1 || maximumPacketSize > LARGEST_PACKET_SIZE) {
             throw new IllegalArgumentException(

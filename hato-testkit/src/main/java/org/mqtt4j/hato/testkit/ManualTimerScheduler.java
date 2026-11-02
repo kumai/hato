@@ -48,9 +48,9 @@ public final class ManualTimerScheduler implements TimerScheduler {
     /// Advances time, including tasks newly scheduled within the elapsed interval.
     ///
     /// @param duration
-    ///     the time to advance by
+    ///   the time to advance by
     /// @throws IllegalArgumentException
-    ///     if `duration` is negative
+    ///   if `duration` is negative
     public void advance(Duration duration) {
         long target;
         synchronized (this) {

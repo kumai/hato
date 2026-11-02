@@ -57,8 +57,8 @@ public interface MqttPublisher {
     /// failed.
     ///
     /// @param message
-    ///     the message to publish
+    ///   the message to publish
     /// @return
-    ///     a future that completes with the result of the publication
+    ///   a future that completes with the result of the publication
     CompletableFuture<PublishResult> publish(MqttMessage message);
 }

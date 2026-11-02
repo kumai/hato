@@ -28,7 +28,7 @@ public final class MqttCapacityException extends MqttException {
     /// Describes an overload that ended a connection.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     public MqttCapacityException(String message) {
         super(message);
         limit = null;
@@ -37,9 +37,9 @@ public final class MqttCapacityException extends MqttException {
     /// Describes an operation that `limit` refused.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     /// @param limit
-    ///     the limit that refused the operation
+    ///   the limit that refused the operation
     public MqttCapacityException(String message, CapacityLimit limit) {
         super(message);
         this.limit = requireNonNull(limit, "limit");

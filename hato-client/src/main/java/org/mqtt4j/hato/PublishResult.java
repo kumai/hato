@@ -25,7 +25,7 @@ public final class PublishResult {
     /// Describes a successfully completed publication with [ReasonCode#SUCCESS].
     ///
     /// @return
-    ///     a result whose [#reasonCode()] is [ReasonCode#SUCCESS]
+    ///   a result whose [#reasonCode()] is [ReasonCode#SUCCESS]
     public static PublishResult of() {
         return SUCCESS;
     }
@@ -33,11 +33,11 @@ public final class PublishResult {
     /// Describes a successfully completed publication with `reasonCode`.
     ///
     /// @param reasonCode
-    ///     the reason code of the broker's acknowledgement
+    ///   the reason code of the broker's acknowledgement
     /// @return
-    ///     a result whose [#reasonCode()] is `reasonCode`
+    ///   a result whose [#reasonCode()] is `reasonCode`
     /// @throws IllegalArgumentException
-    ///     unless `reasonCode` is [ReasonCode#SUCCESS] or [ReasonCode#NO_MATCHING_SUBSCRIBERS]
+    ///   unless `reasonCode` is [ReasonCode#SUCCESS] or [ReasonCode#NO_MATCHING_SUBSCRIBERS]
     public static PublishResult of(ReasonCode reasonCode) {
         return switch (requireNonNull(reasonCode, "reasonCode must not be null")) {
             case SUCCESS -> SUCCESS;

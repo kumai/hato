@@ -73,13 +73,13 @@ public final class ReconnectPolicy {
     /// shorter than `initialDelay`, and neither may exceed 2147483647 milliseconds.
     ///
     /// @param initialDelay
-    ///     the first bound of the random delay
+    ///   the first bound of the random delay
     /// @param maxDelay
-    ///     the largest bound of the random delay
+    ///   the largest bound of the random delay
     /// @return
-    ///     the policy
+    ///   the policy
     /// @throws IllegalArgumentException
-    ///     if a delay is out of range
+    ///   if a delay is out of range
     public static ReconnectPolicy exponentialBackoff(Duration initialDelay, Duration maxDelay) {
         requireNonNull(initialDelay, "initialDelay");
         requireNonNull(maxDelay, "maxDelay");
@@ -98,7 +98,7 @@ public final class ReconnectPolicy {
     /// until the application calls [MqttClient#connect()] again.
     ///
     /// @return
-    ///     the disabled policy
+    ///   the disabled policy
     public static ReconnectPolicy disabled() {
         return DISABLED;
     }
@@ -108,7 +108,7 @@ public final class ReconnectPolicy {
     /// limit, until a connection is established or the client gives the request up}
     ///
     /// @throws IllegalStateException
-    ///     for [#disabled()], which never retries
+    ///   for [#disabled()], which never retries
     public ReconnectPolicy withInitialRetry() {
         return with(rules.withInitialRetry());
     }
@@ -119,7 +119,7 @@ public final class ReconnectPolicy {
     /// administrator ended the connection on purpose.
     ///
     /// @throws IllegalStateException
-    ///     for [#disabled()], which never retries
+    ///   for [#disabled()], which never retries
     public ReconnectPolicy withAdministrativeActionRetry() {
         return with(rules.withAdministrativeActionRetry());
     }
@@ -130,7 +130,7 @@ public final class ReconnectPolicy {
     /// whether its cause lasts.
     ///
     /// @throws IllegalStateException
-    ///     for [#disabled()], which never retries
+    ///   for [#disabled()], which never retries
     public ReconnectPolicy withoutUnspecifiedErrorRetry() {
         return with(rules.withoutUnspecifiedErrorRetry());
     }

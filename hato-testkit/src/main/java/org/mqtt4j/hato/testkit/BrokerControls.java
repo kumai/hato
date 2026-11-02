@@ -74,9 +74,9 @@ public final class BrokerControls {
     /// {@return the controls of `broker`}
     ///
     /// @param broker
-    ///     the broker to control
+    ///   the broker to control
     /// @throws NullPointerException
-    ///     if `broker` is null
+    ///   if `broker` is null
     public static BrokerControls of(MqttBroker broker) {
         requireNonNull(broker, "broker must not be null");
         return new BrokerControls(ControlPort.of(broker));
@@ -85,9 +85,9 @@ public final class BrokerControls {
     /// Refuses later subscriptions to exactly `filter`.
     ///
     /// @param filter
-    ///     the topic filter to refuse
+    ///   the topic filter to refuse
     /// @throws NullPointerException
-    ///     if `filter` is null
+    ///   if `filter` is null
     public void refuseSubscriptions(TopicFilter filter) {
         port.refuseSubscriptions(requireNonNull(filter, "filter must not be null").pattern());
     }
@@ -97,14 +97,14 @@ public final class BrokerControls {
     /// Reason String of the first filter refused with one.
     ///
     /// @param filter
-    ///     the topic filter to refuse
+    ///   the topic filter to refuse
     /// @param reason
-    ///     the reason to refuse with
+    ///   the reason to refuse with
     /// @throws NullPointerException
-    ///     if `filter` or `reason` is null
+    ///   if `filter` or `reason` is null
     /// @throws IllegalArgumentException
-    ///     if the reason code is not such a failure, `reason` has a Server Reference, or its
-    ///     Reason String is not an MQTT UTF-8 string
+    ///   if the reason code is not such a failure, `reason` has a Server Reference, or its
+    ///   Reason String is not an MQTT UTF-8 string
     public void refuseSubscriptions(TopicFilter filter, BrokerReason reason) {
         requireNonNull(filter, "filter must not be null");
         requireNonNull(reason, "reason must not be null");
@@ -119,11 +119,11 @@ public final class BrokerControls {
     /// Grants later subscriptions to exactly `filter` at most `maximum`.
     ///
     /// @param filter
-    ///     the topic filter to limit
+    ///   the topic filter to limit
     /// @param maximum
-    ///     the highest QoS to grant
+    ///   the highest QoS to grant
     /// @throws NullPointerException
-    ///     if `filter` or `maximum` is null
+    ///   if `filter` or `maximum` is null
     public void grantAtMost(TopicFilter filter, Qos maximum) {
         requireNonNull(filter, "filter must not be null");
         requireNonNull(maximum, "maximum must not be null");
@@ -134,9 +134,9 @@ public final class BrokerControls {
     /// granted as requested.
     ///
     /// @param filter
-    ///     the topic filter whose rule to remove
+    ///   the topic filter whose rule to remove
     /// @throws NullPointerException
-    ///     if `filter` is null
+    ///   if `filter` is null
     public void clearSubscriptionRule(TopicFilter filter) {
         port.clearSubscriptionRule(requireNonNull(filter, "filter must not be null").pattern());
     }
@@ -146,14 +146,14 @@ public final class BrokerControls {
     /// sections 3.4.2.1 and 3.5.2.1).
     ///
     /// @param filter
-    ///     the topic filter that matches the topics to refuse
+    ///   the topic filter that matches the topics to refuse
     /// @param reason
-    ///     the reason to refuse with
+    ///   the reason to refuse with
     /// @throws NullPointerException
-    ///     if `filter` or `reason` is null
+    ///   if `filter` or `reason` is null
     /// @throws IllegalArgumentException
-    ///     if the reason code is not such a failure, `reason` has a Server Reference, or its
-    ///     Reason String is not an MQTT UTF-8 string
+    ///   if the reason code is not such a failure, `reason` has a Server Reference, or its
+    ///   Reason String is not an MQTT UTF-8 string
     public void refusePublications(TopicFilter filter, BrokerReason reason) {
         requireNonNull(filter, "filter must not be null");
         requireNonNull(reason, "reason must not be null");
@@ -169,9 +169,9 @@ public final class BrokerControls {
     /// its topics go through unless another rule refuses them.
     ///
     /// @param filter
-    ///     the topic filter whose publication rule to remove
+    ///   the topic filter whose publication rule to remove
     /// @throws NullPointerException
-    ///     if `filter` is null
+    ///   if `filter` is null
     public void clearPublicationRule(TopicFilter filter) {
         port.clearPublicationRule(requireNonNull(filter, "filter must not be null").pattern());
     }
@@ -180,14 +180,14 @@ public final class BrokerControls {
     /// must be a failure that MQTT 5.0 allows in CONNACK (MQTT 5.0 section 3.2.2.2).
     ///
     /// @param clientId
-    ///     the client identifier to refuse
+    ///   the client identifier to refuse
     /// @param reason
-    ///     the reason to refuse with
+    ///   the reason to refuse with
     /// @throws NullPointerException
-    ///     if `clientId` or `reason` is null
+    ///   if `clientId` or `reason` is null
     /// @throws IllegalArgumentException
-    ///     if the reason code is not such a failure, a Server Reference goes with another reason
-    ///     code, or a string is not an MQTT UTF-8 string
+    ///   if the reason code is not such a failure, a Server Reference goes with another reason
+    ///   code, or a string is not an MQTT UTF-8 string
     public void refuseConnections(String clientId, BrokerReason reason) {
         requireNonNull(clientId, "clientId must not be null");
         requireNonNull(reason, "reason must not be null");
@@ -203,9 +203,9 @@ public final class BrokerControls {
     /// the client are accepted again.
     ///
     /// @param clientId
-    ///     the client identifier whose connection rule to remove
+    ///   the client identifier whose connection rule to remove
     /// @throws NullPointerException
-    ///     if `clientId` is null
+    ///   if `clientId` is null
     public void clearConnectionRule(String clientId) {
         port.clearConnectionRule(requireNonNull(clientId, "clientId must not be null"));
     }
@@ -214,11 +214,11 @@ public final class BrokerControls {
     /// [#releaseResponses(ResponseKind, String)].
     ///
     /// @param kind
-    ///     the kind of response to hold back
+    ///   the kind of response to hold back
     /// @param clientId
-    ///     the identifier of the client
+    ///   the identifier of the client
     /// @throws NullPointerException
-    ///     if `kind` or `clientId` is null
+    ///   if `kind` or `clientId` is null
     public void holdResponses(ResponseKind kind, String clientId) {
         requireNonNull(kind, "kind must not be null");
         requireNonNull(clientId, "clientId must not be null");
@@ -241,11 +241,11 @@ public final class BrokerControls {
     /// those held in the order held.
     ///
     /// @param kind
-    ///     the kind of response to release
+    ///   the kind of response to release
     /// @param clientId
-    ///     the identifier of the client
+    ///   the identifier of the client
     /// @throws NullPointerException
-    ///     if `kind` or `clientId` is null
+    ///   if `kind` or `clientId` is null
     public void releaseResponses(ResponseKind kind, String clientId) {
         requireNonNull(kind, "kind must not be null");
         requireNonNull(clientId, "clientId must not be null");
@@ -265,9 +265,9 @@ public final class BrokerControls {
     /// connection.
     ///
     /// @param clientId
-    ///     the identifier of the client to disconnect
+    ///   the identifier of the client to disconnect
     /// @throws NullPointerException
-    ///     if `clientId` is null
+    ///   if `clientId` is null
     public void disconnect(String clientId) {
         port.disconnect(requireNonNull(clientId, "clientId must not be null"));
     }
@@ -279,14 +279,14 @@ public final class BrokerControls {
     /// disconnect.
     ///
     /// @param clientId
-    ///     the identifier of the client to disconnect
+    ///   the identifier of the client to disconnect
     /// @param reason
-    ///     the reason that DISCONNECT carries
+    ///   the reason that DISCONNECT carries
     /// @throws NullPointerException
-    ///     if `clientId` or `reason` is null
+    ///   if `clientId` or `reason` is null
     /// @throws IllegalArgumentException
-    ///     if a server cannot send the reason code, a Server Reference goes with another reason
-    ///     code, or a string is not an MQTT UTF-8 string
+    ///   if a server cannot send the reason code, a Server Reference goes with another reason
+    ///   code, or a string is not an MQTT UTF-8 string
     public void disconnect(String clientId, BrokerReason reason) {
         requireNonNull(clientId, "clientId must not be null");
         requireNonNull(reason, "reason must not be null");
@@ -303,9 +303,9 @@ public final class BrokerControls {
     /// back to what the broker announces by itself.
     ///
     /// @param capabilities
-    ///     the capabilities to announce
+    ///   the capabilities to announce
     /// @throws NullPointerException
-    ///     if `capabilities` is null
+    ///   if `capabilities` is null
     public void announce(BrokerCapabilities capabilities) {
         requireNonNull(capabilities, "capabilities must not be null");
         port.announce(

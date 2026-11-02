@@ -34,12 +34,12 @@ public final class MqttCredentials {
     /// Creates credentials containing only a username.
     ///
     /// @param username
-    ///     the username, which may be empty
+    ///   the username, which may be empty
     /// @return
-    ///     the credentials
+    ///   the credentials
     /// @throws IllegalArgumentException
-    ///     if the username contains U+0000, an unpaired surrogate, or exceeds 65535 bytes in
-    ///     UTF-8
+    ///   if the username contains U+0000, an unpaired surrogate, or exceeds 65535 bytes in
+    ///   UTF-8
     public static MqttCredentials of(String username) {
         return new MqttCredentials(username, null);
     }
@@ -47,14 +47,14 @@ public final class MqttCredentials {
     /// Creates credentials with a copy of the binary password, which may be empty.
     ///
     /// @param username
-    ///     the username, which may be empty
+    ///   the username, which may be empty
     /// @param password
-    ///     the password, which may be empty
+    ///   the password, which may be empty
     /// @return
-    ///     the credentials
+    ///   the credentials
     /// @throws IllegalArgumentException
-    ///     if the username contains U+0000, an unpaired surrogate, or exceeds 65535 bytes in
-    ///     UTF-8, or the password exceeds 65535 bytes
+    ///   if the username contains U+0000, an unpaired surrogate, or exceeds 65535 bytes in
+    ///   UTF-8, or the password exceeds 65535 bytes
     public static MqttCredentials of(String username, byte[] password) {
         return new MqttCredentials(username, requireNonNull(password, "password"));
     }

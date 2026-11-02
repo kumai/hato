@@ -59,13 +59,13 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// [IllegalStateException].
     ///
     /// @param request
-    ///     the subscription request
+    ///   the subscription request
     /// @param handler
-    ///     the handler that receives the deliveries
+    ///   the handler that receives the deliveries
     /// @return
-    ///     the handle of the recorded subscription
+    ///   the handle of the recorded subscription
     /// @throws NullPointerException
-    ///     if `request` or `handler` is null
+    ///   if `request` or `handler` is null
     @Override
     public FakeSubscription subscribe(Subscribe request, Consumer<MqttDelivery> handler) {
         requireNonNull(request, "request must not be null");
@@ -77,15 +77,15 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// test's thread, whatever `options` say.
     ///
     /// @param request
-    ///     the subscription request
+    ///   the subscription request
     /// @param options
-    ///     where and how the handler would run on a client, which the fake ignores
+    ///   where and how the handler would run on a client, which the fake ignores
     /// @param handler
-    ///     the handler that receives the deliveries
+    ///   the handler that receives the deliveries
     /// @return
-    ///     the handle of the recorded subscription
+    ///   the handle of the recorded subscription
     /// @throws NullPointerException
-    ///     if an argument is null
+    ///   if an argument is null
     @Override
     public FakeSubscription subscribe(
             Subscribe request,
@@ -101,16 +101,16 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// `acceptor` on the test's thread, and the delivery shows whether the acceptor refused it.
     ///
     /// @param request
-    ///     the subscription request
+    ///   the subscription request
     /// @param acceptor
-    ///     the predicate that accepts each delivery by returning true
+    ///   the predicate that accepts each delivery by returning true
     /// @return
-    ///     the handle of the recorded subscription
+    ///   the handle of the recorded subscription
     /// @throws NullPointerException
-    ///     if `request` or `acceptor` is null
+    ///   if `request` or `acceptor` is null
     /// @throws IllegalArgumentException
-    ///     if the request acknowledges with [AckMode#AFTER_HANDLER], as
-    ///     [MqttSubscriber#handOff(Subscribe, Predicate)] states
+    ///   if the request acknowledges with [AckMode#AFTER_HANDLER], as
+    ///   [MqttSubscriber#handOff(Subscribe, Predicate)] states
     @Override
     public FakeSubscription handOff(Subscribe request, Predicate<MqttDelivery> acceptor) {
         requireNonNull(request, "request must not be null");
@@ -167,9 +167,9 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// they end. A subscription made to the filter before stays as it was.
     ///
     /// @param filter
-    ///     the topic filter to refuse
+    ///   the topic filter to refuse
     /// @throws NullPointerException
-    ///     if `filter` is null
+    ///   if `filter` is null
     public synchronized void refuseSubscriptions(TopicFilter filter) {
         rules.put(requireNonNull(filter, "filter must not be null"), new Refuse());
     }
@@ -178,11 +178,11 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// QoS.
     ///
     /// @param filter
-    ///     the topic filter to limit
+    ///   the topic filter to limit
     /// @param maximum
-    ///     the highest QoS to grant
+    ///   the highest QoS to grant
     /// @throws NullPointerException
-    ///     if `filter` or `maximum` is null
+    ///   if `filter` or `maximum` is null
     public synchronized void grantAtMost(TopicFilter filter, Qos maximum) {
         requireNonNull(filter, "filter must not be null");
         requireNonNull(maximum, "maximum must not be null");
@@ -193,9 +193,9 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// granted as requested.
     ///
     /// @param filter
-    ///     the topic filter whose rule to remove
+    ///   the topic filter whose rule to remove
     /// @throws NullPointerException
-    ///     if `filter` is null
+    ///   if `filter` is null
     public synchronized void clearSubscriptionRule(TopicFilter filter) {
         rules.remove(requireNonNull(filter, "filter must not be null"));
     }
@@ -210,9 +210,9 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
     /// none was made}
     ///
     /// @param filter
-    ///     the topic filter of the subscription
+    ///   the topic filter of the subscription
     /// @throws NullPointerException
-    ///     if `filter` is null
+    ///   if `filter` is null
     public synchronized Optional<FakeSubscription> subscription(TopicFilter filter) {
         requireNonNull(filter, "filter must not be null");
         return subscriptions.reversed().stream()
@@ -281,13 +281,13 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
         /// client does only where the subscription's [DeliveryOptions] let deliveries run at once.
         ///
         /// @param message
-        ///     the message to deliver
+        ///   the message to deliver
         /// @return
-        ///     the delivery that the handler or the acceptor received
+        ///   the delivery that the handler or the acceptor received
         /// @throws NullPointerException
-        ///     if `message` is null
+        ///   if `message` is null
         /// @throws IllegalStateException
-        ///     if this subscription has ended
+        ///   if this subscription has ended
         public FakeMqttDelivery deliver(MqttMessage message) {
             requireNonNull(message, "message must not be null");
             synchronized (this) {
@@ -348,7 +348,7 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
         /// Ends this subscription at once and returns a completed future.
         ///
         /// @return
-        ///     a completed future
+        ///   a completed future
         @Override
         public CompletableFuture<Void> unsubscribe() {
             end(new IllegalStateException("The subscription was removed"));

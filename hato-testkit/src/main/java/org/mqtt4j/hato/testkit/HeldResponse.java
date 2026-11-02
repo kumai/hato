@@ -7,23 +7,23 @@ import static java.util.Objects.requireNonNull;
 /// [BrokerControls].
 ///
 /// @param kind
-///     the kind of the response
+///   the kind of the response
 /// @param clientId
-///     the identifier of the client that the response is for
+///   the identifier of the client that the response is for
 /// @param packetId
-///     the packet identifier of the request that the response answers
+///   the packet identifier of the request that the response answers
 public record HeldResponse(ResponseKind kind, String clientId, int packetId) {
 
     /// Creates a held response.
     ///
     /// @param kind
-    ///     the kind of the response
+    ///   the kind of the response
     /// @param clientId
-    ///     the identifier of the client that the response is for
+    ///   the identifier of the client that the response is for
     /// @param packetId
-    ///     the packet identifier of the request that the response answers
+    ///   the packet identifier of the request that the response answers
     /// @throws NullPointerException
-    ///     if `kind` or `clientId` is null
+    ///   if `kind` or `clientId` is null
     public HeldResponse {
         requireNonNull(kind, "kind must not be null");
         requireNonNull(clientId, "clientId must not be null");

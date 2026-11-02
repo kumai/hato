@@ -109,9 +109,9 @@ public final class MqttBroker implements AutoCloseable {
     /// Starts on a system-assigned port on the loopback address.
     ///
     /// @return
-    ///     the started broker
+    ///   the started broker
     /// @throws IOException
-    ///     if the listening socket cannot be opened
+    ///   if the listening socket cannot be opened
     public static MqttBroker start() throws IOException {
         return start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
     }
@@ -119,11 +119,11 @@ public final class MqttBroker implements AutoCloseable {
     /// Starts listening at `address`; port zero selects a system-assigned port.
     ///
     /// @param address
-    ///     the address to listen at
+    ///   the address to listen at
     /// @return
-    ///     the started broker
+    ///   the started broker
     /// @throws IOException
-    ///     if the listening socket cannot be opened
+    ///   if the listening socket cannot be opened
     public static MqttBroker start(InetSocketAddress address) throws IOException {
         return new MqttBroker(BrokerServer.start(address));
     }

@@ -55,7 +55,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// Starts configuration without opening a connection.
     ///
     /// @return
-    ///     a new builder
+    ///   a new builder
     static MqttClientBuilder builder() {
         return new MqttClientBuilder();
     }
@@ -121,7 +121,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// needs only one connection.
     ///
     /// @return
-    ///     a future that completes with the successful CONNACK that establishes the connection
+    ///   a future that completes with the successful CONNACK that establishes the connection
     CompletableFuture<ConnAck> connect();
 
     /// Observes the current or next established connection without requesting one. Returns an
@@ -142,7 +142,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// is closed or the limit is full.
     ///
     /// @return
-    ///     a future that completes with the CONNACK of the current or next established connection
+    ///   a future that completes with the CONNACK of the current or next established connection
     CompletableFuture<ConnAck> whenConnected();
 
     /// Withdraws the connection request: the client stops reconnecting, and an established
@@ -181,7 +181,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// removals wait for confirmation on a later connection.
     ///
     /// @return
-    ///     a future that completes when the client has disconnected
+    ///   a future that completes when the client has disconnected
     CompletableFuture<Void> disconnect();
 
     /// Requests immediate, permanent shutdown without sending DISCONNECT or waiting for I/O
@@ -224,7 +224,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// or on a thread that such code needs in order to return, never completes.
     ///
     /// @return
-    ///     a future that completes at the end of this client's work
+    ///   a future that completes at the end of this client's work
     CompletableFuture<Void> terminated();
 
     /// Takes a snapshot of what this client holds and has counted, which only the client can
@@ -242,7 +242,7 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// this default method does.
     ///
     /// @return
-    ///     a future that completes with the snapshot
+    ///   a future that completes with the snapshot
     default CompletableFuture<ClientStats> stats() {
         return CompletableFuture.failedFuture(
                 new UnsupportedOperationException("This client keeps no statistics")

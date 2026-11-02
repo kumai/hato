@@ -12,18 +12,18 @@ package org.mqtt4j.hato.common.value;
 /// - [Section 4.7: Topic Names and Topic Filters](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os-complete.html#_Toc442180919)
 ///
 /// @param name
-///     the topic name
+///   the topic name
 public record Topic(String name) {
 
     /// Creates a topic after validating its name.
     ///
     /// @param name
-    ///     the topic name
+    ///   the topic name
     /// @throws NullPointerException
-    ///     if `name` is null
+    ///   if `name` is null
     /// @throws IllegalArgumentException
-    ///     if `name` is empty, contains NUL, a wildcard, or an unpaired surrogate, or exceeds
-    ///     65535 bytes in UTF-8
+    ///   if `name` is empty, contains NUL, a wildcard, or an unpaired surrogate, or exceeds
+    ///   65535 bytes in UTF-8
     public Topic {
         TopicText.validate(name, "Topic name");
 

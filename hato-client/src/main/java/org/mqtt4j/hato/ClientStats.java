@@ -119,9 +119,9 @@ public final class ClientStats {
     /// How much of a limit is in use.
     ///
     /// @param used
-    ///     how much is in use
+    ///   how much is in use
     /// @param limit
-    ///     the most that may be in use
+    ///   the most that may be in use
     public record Usage(long used, long limit) {}
 
     /// The state of a client's connection.
@@ -246,7 +246,7 @@ public final class ClientStats {
         /// included}
         ///
         /// @param qos
-        ///     the QoS of the packets to count
+        ///   the QoS of the packets to count
         public long publishes(Qos qos) {
             return values.publishes().getOrDefault(qos, 0L);
         }

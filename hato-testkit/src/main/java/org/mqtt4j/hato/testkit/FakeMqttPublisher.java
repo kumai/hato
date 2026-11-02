@@ -34,11 +34,11 @@ public final class FakeMqttPublisher implements MqttPublisher {
     /// at once, or held until the test completes or fails it through [#heldPublications()].
     ///
     /// @param message
-    ///     the message to record
+    ///   the message to record
     /// @return
-    ///     the result of the publication
+    ///   the result of the publication
     /// @throws NullPointerException
-    ///     if `message` is null
+    ///   if `message` is null
     @Override
     public synchronized CompletableFuture<PublishResult> publish(MqttMessage message) {
         published.add(requireNonNull(message, "message must not be null"));
@@ -63,9 +63,9 @@ public final class FakeMqttPublisher implements MqttPublisher {
     /// [PublishResult#of()]. Publications held before stay held.
     ///
     /// @param result
-    ///     the result to complete them with
+    ///   the result to complete them with
     /// @throws NullPointerException
-    ///     if `result` is null
+    ///   if `result` is null
     public synchronized void completePublications(PublishResult result) {
         outcome = new Complete(requireNonNull(result, "result must not be null"));
     }
@@ -75,9 +75,9 @@ public final class FakeMqttPublisher implements MqttPublisher {
     /// Publications held before stay held.
     ///
     /// @param failure
-    ///     the exception to fail them with
+    ///   the exception to fail them with
     /// @throws NullPointerException
-    ///     if `failure` is null
+    ///   if `failure` is null
     public synchronized void failPublications(Throwable failure) {
         outcome = new Fail(requireNonNull(failure, "failure must not be null"));
     }
@@ -117,11 +117,11 @@ public final class FakeMqttPublisher implements MqttPublisher {
         /// Completes this publication with `result`.
         ///
         /// @param result
-        ///     the result to complete it with
+        ///   the result to complete it with
         /// @throws NullPointerException
-        ///     if `result` is null
+        ///   if `result` is null
         /// @throws IllegalStateException
-        ///     if the test already completed or failed it
+        ///   if the test already completed or failed it
         public void complete(PublishResult result) {
             requireNonNull(result, "result must not be null");
             release();
@@ -131,11 +131,11 @@ public final class FakeMqttPublisher implements MqttPublisher {
         /// Fails this publication with `failure`.
         ///
         /// @param failure
-        ///     the exception to fail it with
+        ///   the exception to fail it with
         /// @throws NullPointerException
-        ///     if `failure` is null
+        ///   if `failure` is null
         /// @throws IllegalStateException
-        ///     if the test already completed or failed it
+        ///   if the test already completed or failed it
         public void fail(Throwable failure) {
             requireNonNull(failure, "failure must not be null");
             release();

@@ -29,15 +29,15 @@ public final class MqttProtocolException extends MqttException {
     /// A failure without an underlying cause.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     /// @param reasonCode
-    ///     the local failure classification
+    ///   the local failure classification
     /// @throws IllegalArgumentException
-    ///     if the reason is not [MALFORMED_PACKET][ReasonCode#MALFORMED_PACKET],
-    ///     [PROTOCOL_ERROR][ReasonCode#PROTOCOL_ERROR],
-    ///     [PACKET_TOO_LARGE][ReasonCode#PACKET_TOO_LARGE],
-    ///     [TOPIC_ALIAS_INVALID][ReasonCode#TOPIC_ALIAS_INVALID], or
-    ///     [RECEIVE_MAXIMUM_EXCEEDED][ReasonCode#RECEIVE_MAXIMUM_EXCEEDED]
+    ///   if the reason is not [MALFORMED_PACKET][ReasonCode#MALFORMED_PACKET],
+    ///   [PROTOCOL_ERROR][ReasonCode#PROTOCOL_ERROR],
+    ///   [PACKET_TOO_LARGE][ReasonCode#PACKET_TOO_LARGE],
+    ///   [TOPIC_ALIAS_INVALID][ReasonCode#TOPIC_ALIAS_INVALID], or
+    ///   [RECEIVE_MAXIMUM_EXCEEDED][ReasonCode#RECEIVE_MAXIMUM_EXCEEDED]
     public MqttProtocolException(String message, ReasonCode reasonCode) {
         super(requireNonNull(message, "message must not be null"));
         this.reasonCode = requireNonNull(reasonCode, "reasonCode must not be null");
@@ -57,17 +57,17 @@ public final class MqttProtocolException extends MqttException {
     /// A failure with an underlying cause, which is retained for diagnostics.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     /// @param reasonCode
-    ///     the local failure classification
+    ///   the local failure classification
     /// @param cause
-    ///     the underlying cause
+    ///   the underlying cause
     /// @throws IllegalArgumentException
-    ///     if the reason is not [MALFORMED_PACKET][ReasonCode#MALFORMED_PACKET],
-    ///     [PROTOCOL_ERROR][ReasonCode#PROTOCOL_ERROR],
-    ///     [PACKET_TOO_LARGE][ReasonCode#PACKET_TOO_LARGE],
-    ///     [TOPIC_ALIAS_INVALID][ReasonCode#TOPIC_ALIAS_INVALID], or
-    ///     [RECEIVE_MAXIMUM_EXCEEDED][ReasonCode#RECEIVE_MAXIMUM_EXCEEDED]
+    ///   if the reason is not [MALFORMED_PACKET][ReasonCode#MALFORMED_PACKET],
+    ///   [PROTOCOL_ERROR][ReasonCode#PROTOCOL_ERROR],
+    ///   [PACKET_TOO_LARGE][ReasonCode#PACKET_TOO_LARGE],
+    ///   [TOPIC_ALIAS_INVALID][ReasonCode#TOPIC_ALIAS_INVALID], or
+    ///   [RECEIVE_MAXIMUM_EXCEEDED][ReasonCode#RECEIVE_MAXIMUM_EXCEEDED]
     public MqttProtocolException(
             String message,
             ReasonCode reasonCode,

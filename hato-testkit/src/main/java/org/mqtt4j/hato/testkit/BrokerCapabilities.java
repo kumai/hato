@@ -78,9 +78,9 @@ public final class BrokerCapabilities {
     /// included} The broker grants subscriptions at most this QoS as well.
     ///
     /// @param maximumQos
-    ///     the highest QoS at which a client may publish
+    ///   the highest QoS at which a client may publish
     /// @throws NullPointerException
-    ///     if `maximumQos` is null
+    ///   if `maximumQos` is null
     public BrokerCapabilities withMaximumQos(Qos maximumQos) {
         return new BrokerCapabilities(
                 requireNonNull(maximumQos, "maximumQos must not be null"),
@@ -97,7 +97,7 @@ public final class BrokerCapabilities {
     /// messages, Wills included}
     ///
     /// @param retainAvailable
-    ///     whether a client may publish retained messages
+    ///   whether a client may publish retained messages
     public BrokerCapabilities withRetainAvailable(boolean retainAvailable) {
         return new BrokerCapabilities(
                 maximumQos,
@@ -114,7 +114,7 @@ public final class BrokerCapabilities {
     /// that contain wildcards}
     ///
     /// @param wildcardSubscriptionAvailable
-    ///     whether a client may subscribe to filters that contain wildcards
+    ///   whether a client may subscribe to filters that contain wildcards
     public BrokerCapabilities withWildcardSubscriptionAvailable(
             boolean wildcardSubscriptionAvailable
     ) {
@@ -133,7 +133,7 @@ public final class BrokerCapabilities {
     /// Subscription Identifiers, which the broker returns with their deliveries}
     ///
     /// @param subscriptionIdentifiersAvailable
-    ///     whether a client may give its subscriptions Subscription Identifiers
+    ///   whether a client may give its subscriptions Subscription Identifiers
     public BrokerCapabilities withSubscriptionIdentifiersAvailable(
             boolean subscriptionIdentifiersAvailable
     ) {
@@ -153,9 +153,9 @@ public final class BrokerCapabilities {
     /// PUBCOMP, so one whose response [BrokerControls] holds back goes on counting.
     ///
     /// @param receiveMaximum
-    ///     the number of publications that a client may have unanswered at once
+    ///   the number of publications that a client may have unanswered at once
     /// @throws IllegalArgumentException
-    ///     if `receiveMaximum` is not between 1 and 65535
+    ///   if `receiveMaximum` is not between 1 and 65535
     public BrokerCapabilities withReceiveMaximum(int receiveMaximum) {
         if (receiveMaximum < 1 || receiveMaximum > 65_535) {
             throw new IllegalArgumentException("Receive Maximum must be 1..65535");
@@ -175,9 +175,9 @@ public final class BrokerCapabilities {
     /// that a client may send}
     ///
     /// @param maximumPacketSize
-    ///     the largest packet that a client may send, in bytes
+    ///   the largest packet that a client may send, in bytes
     /// @throws IllegalArgumentException
-    ///     if `maximumPacketSize` is not between 1 and 268435460
+    ///   if `maximumPacketSize` is not between 1 and 268435460
     public BrokerCapabilities withMaximumPacketSize(int maximumPacketSize) {
         if (maximumPacketSize < 1 || maximumPacketSize > LARGEST_PACKET_SIZE) {
             throw new IllegalArgumentException(
@@ -199,9 +199,9 @@ public final class BrokerCapabilities {
     /// connection; with 0, a client may set none}
     ///
     /// @param topicAliasMaximum
-    ///     the number of Topic Aliases that a client may set for its connection
+    ///   the number of Topic Aliases that a client may set for its connection
     /// @throws IllegalArgumentException
-    ///     if `topicAliasMaximum` is not between 0 and 65535
+    ///   if `topicAliasMaximum` is not between 0 and 65535
     public BrokerCapabilities withTopicAliasMaximum(int topicAliasMaximum) {
         if (topicAliasMaximum < 0 || topicAliasMaximum > 65_535) {
             throw new IllegalArgumentException("Topic Alias Maximum must be 0..65535");

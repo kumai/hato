@@ -44,7 +44,7 @@ public interface Subscription extends AutoCloseable {
     /// future: a periodic check keeps one pending future and calls again only after it completes.
     ///
     /// @return
-    ///     a future that completes with the granted QoS on establishment
+    ///   a future that completes with the granted QoS on establishment
     CompletableFuture<Qos> established();
 
     /// Stops new local delivery when called and observes confirmed removal. Deliveries already
@@ -88,7 +88,7 @@ public interface Subscription extends AutoCloseable {
     /// running can finish.
     ///
     /// @return
-    ///     a future that completes once removal is confirmed
+    ///   a future that completes once removal is confirmed
     CompletableFuture<Void> unsubscribe();
 
     /// Observes the end of this subscription's local work without requesting it. The future
@@ -113,9 +113,9 @@ public interface Subscription extends AutoCloseable {
     /// [UnsupportedOperationException].
     ///
     /// @return
-    ///     a future that completes once this subscription's local work has ended
+    ///   a future that completes once this subscription's local work has ended
     /// @throws UnsupportedOperationException
-    ///     if this implementation cannot observe termination
+    ///   if this implementation cannot observe termination
     default CompletableFuture<Void> terminated() {
         throw new UnsupportedOperationException("This subscription does not observe termination");
     }

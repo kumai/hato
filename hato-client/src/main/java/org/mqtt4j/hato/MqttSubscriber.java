@@ -19,9 +19,9 @@ public interface MqttSubscriber {
     /// of the subscribing role that only provide handlers need not implement pull delivery.
     ///
     /// @param request
-    ///     the subscription request
+    ///   the subscription request
     /// @return
-    ///     the handle of the subscription
+    ///   the handle of the subscription
     default PullSubscription subscribe(Subscribe request) {
         throw new UnsupportedOperationException("Pull subscriptions are not supported");
     }
@@ -107,11 +107,11 @@ public interface MqttSubscriber {
     /// SUBSCRIBE again.
     ///
     /// @param request
-    ///     the subscription request
+    ///   the subscription request
     /// @param handler
-    ///     the handler that runs each delivery
+    ///   the handler that runs each delivery
     /// @return
-    ///     the handle of the subscription
+    ///   the handle of the subscription
     Subscription subscribe(Subscribe request, Consumer<MqttDelivery> handler);
 
     /// Registers a push subscription like [#subscribe(Subscribe, Consumer)], except that `options`
@@ -124,13 +124,13 @@ public interface MqttSubscriber {
     /// the subscribing role need not place handlers.
     ///
     /// @param request
-    ///     the subscription request
+    ///   the subscription request
     /// @param options
-    ///     where and how the handler runs
+    ///   where and how the handler runs
     /// @param handler
-    ///     the handler that runs each delivery
+    ///   the handler that runs each delivery
     /// @return
-    ///     the handle of the subscription
+    ///   the handle of the subscription
     default Subscription subscribe(
             Subscribe request,
             DeliveryOptions options,
@@ -182,11 +182,11 @@ public interface MqttSubscriber {
     /// the subscribing role need not hand off deliveries.
     ///
     /// @param request
-    ///     the subscription request
+    ///   the subscription request
     /// @param acceptor
-    ///     the predicate that accepts each delivery by returning true
+    ///   the predicate that accepts each delivery by returning true
     /// @return
-    ///     the handle of the subscription
+    ///   the handle of the subscription
     default Subscription handOff(Subscribe request, Predicate<MqttDelivery> acceptor) {
         throw new UnsupportedOperationException("Hand-off subscriptions are not supported");
     }

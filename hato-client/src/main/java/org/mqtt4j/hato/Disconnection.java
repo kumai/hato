@@ -47,15 +47,15 @@ public final class Disconnection {
     /// null. `userRequested` is true when disconnect or close was requested, even if that failed.
     ///
     /// @param cause
-    ///     the original failure, or null when no failure is reported
+    ///   the original failure, or null when no failure is reported
     /// @param userRequested
-    ///     whether disconnect or close was requested
+    ///   whether disconnect or close was requested
     /// @param connectionAttempt
-    ///     the number of the connection attempt
+    ///   the number of the connection attempt
     /// @return
-    ///     the ending
+    ///   the ending
     /// @throws IllegalArgumentException
-    ///     if `connectionAttempt` is not positive
+    ///   if `connectionAttempt` is not positive
     @SuppressWarnings("exports") // Nullness annotations are compile-time only.
     public static Disconnection of(
             @Nullable Throwable cause,
@@ -69,17 +69,17 @@ public final class Disconnection {
     /// `reconnectDelay`.
     ///
     /// @param cause
-    ///     the original failure, or null when no failure is reported
+    ///   the original failure, or null when no failure is reported
     /// @param userRequested
-    ///     whether disconnect or close was requested
+    ///   whether disconnect or close was requested
     /// @param connectionAttempt
-    ///     the number of the connection attempt
+    ///   the number of the connection attempt
     /// @param reconnectDelay
-    ///     the delay until the next connection attempt
+    ///   the delay until the next connection attempt
     /// @return
-    ///     the ending
+    ///   the ending
     /// @throws IllegalArgumentException
-    ///     if `connectionAttempt` is not positive or the delay is negative
+    ///   if `connectionAttempt` is not positive or the delay is negative
     @SuppressWarnings("exports") // Nullness annotations are compile-time only.
     public static Disconnection of(
             @Nullable Throwable cause,

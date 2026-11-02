@@ -34,7 +34,7 @@ public final class MqttConnectException extends MqttException {
     /// A failure with neither a reason code nor a cause.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     public MqttConnectException(String message) {
         super(message);
         this.reasonCode = null;
@@ -45,9 +45,9 @@ public final class MqttConnectException extends MqttException {
     /// A broker refusal without an explanation or a server reference.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     /// @param reasonCode
-    ///     the broker's refusal reason
+    ///   the broker's refusal reason
     public MqttConnectException(String message, ReasonCode reasonCode) {
         this(message, reasonCode, null, null);
     }
@@ -56,13 +56,13 @@ public final class MqttConnectException extends MqttException {
     /// any.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     /// @param reasonCode
-    ///     the broker's refusal reason
+    ///   the broker's refusal reason
     /// @param reasonString
-    ///     the broker's explanation, or null when it sent none
+    ///   the broker's explanation, or null when it sent none
     /// @param serverReference
-    ///     the server that the broker named, or null when it named none
+    ///   the server that the broker named, or null when it named none
     public MqttConnectException(
             String message,
             ReasonCode reasonCode,
@@ -79,9 +79,9 @@ public final class MqttConnectException extends MqttException {
     /// expiry.
     ///
     /// @param message
-    ///     the detail message
+    ///   the detail message
     /// @param cause
-    ///     the cause of the failure
+    ///   the cause of the failure
     public MqttConnectException(String message, Throwable cause) {
         super(message, cause);
         this.reasonCode = null;

@@ -12,14 +12,14 @@ public sealed interface ReceiveResult {
     /// [AckMode]; receiving it does not imply that application processing has finished.
     ///
     /// @param delivery
-    ///     the delivery handed to this caller
+    ///   the delivery handed to this caller
     record Received(MqttDelivery delivery) implements ReceiveResult {
         /// Creates the outcome that hands `delivery` to the caller.
         ///
         /// @param delivery
-        ///     the delivery handed to the caller
+        ///   the delivery handed to the caller
         /// @throws NullPointerException
-        ///     if `delivery` is null
+        ///   if `delivery` is null
         public Received {
             requireNonNull(delivery, "delivery");
         }

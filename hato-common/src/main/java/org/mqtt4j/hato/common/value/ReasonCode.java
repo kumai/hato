@@ -158,11 +158,11 @@ public enum ReasonCode {
     /// caller must separately check whether the code is permitted for the packet being decoded.
     ///
     /// @param value
-    ///     the unsigned byte value, represented as an `int`
+    ///   the unsigned byte value, represented as an `int`
     /// @return
-    ///     the reason code for that value
+    ///   the reason code for that value
     /// @throws IllegalArgumentException
-    ///     if `value` is outside 0 to 255 or is undefined
+    ///   if `value` is outside 0 to 255 or is undefined
     public static ReasonCode of(int value) {
         return switch (value) {
             case 0x00 -> SUCCESS;
