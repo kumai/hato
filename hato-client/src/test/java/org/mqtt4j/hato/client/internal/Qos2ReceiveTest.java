@@ -16,6 +16,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.ConnAck;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttProtocolException;
 import org.mqtt4j.hato.MqttVersion;
@@ -52,6 +53,7 @@ class Qos2ReceiveTest {
             ReconnectBackoff.disabled(),
             RetryRules.DEFAULT,
             Duration.ofSeconds(60),
+            DisconnectionAccess::of,
             ClientLimits.DEFAULT
     );
     private long nextOperation;

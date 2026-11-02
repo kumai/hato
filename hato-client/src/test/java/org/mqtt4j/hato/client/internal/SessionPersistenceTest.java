@@ -24,6 +24,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
@@ -944,6 +945,7 @@ class SessionPersistenceTest {
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
     }

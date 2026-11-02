@@ -78,7 +78,7 @@ class AutomaticReconnectionTest {
             // Assert: the announced delay is the scheduled one, and nothing starts before it.
             assertThat(listener.next()).isEqualTo("connected " + ConnAck.of(false, 1));
             assertThat(listener.next()).isEqualTo(
-                    "disconnected " + Disconnection.of(cause, false, 1, FIRST_DELAY)
+                    "disconnected " + DisconnectionAccess.of(cause, false, 1, FIRST_DELAY)
             );
             assertThat(delays.getLast()).isEqualTo(FIRST_DELAY);
             scheduler.advance(FIRST_DELAY.minusNanos(1));
@@ -135,7 +135,7 @@ class AutomaticReconnectionTest {
             // Assert
             Throwable failure = failureOf(connection);
             assertThat(listener.next())
-                    .isEqualTo("failed " + Disconnection.of(failure, false, 1));
+                    .isEqualTo("failed " + DisconnectionAccess.of(failure, false, 1));
             assertThat(scheduler.pendingTaskCount()).isZero();
         }
     }
@@ -326,7 +326,7 @@ class AutomaticReconnectionTest {
             assertThat(observation).isNotDone();
             assertThat(listener.next()).isEqualTo("connected " + ConnAck.of(false, 2));
             assertThat(listener.next())
-                    .isEqualTo("disconnected " + Disconnection.of(null, true, 2));
+                    .isEqualTo("disconnected " + DisconnectionAccess.of(null, true, 2));
             assertThat(scheduler.pendingTaskCount()).isZero();
         }
     }
@@ -501,7 +501,7 @@ class AutomaticReconnectionTest {
 
             // Assert: the stop reports the reserved attempt, and nothing reconnects.
             assertThat(listener.next())
-                    .isEqualTo("failed " + Disconnection.of(failure, false, 2));
+                    .isEqualTo("failed " + DisconnectionAccess.of(failure, false, 2));
             assertThat(failureOf(held)).isInstanceOf(MqttConnectionLostException.class);
             assertThat(scheduler.pendingTaskCount()).isZero();
 
@@ -553,7 +553,7 @@ class AutomaticReconnectionTest {
 
             // Assert: the stop ends the attempt, closes its transport, and schedules nothing.
             assertThat(listener.next())
-                    .isEqualTo("failed " + Disconnection.of(failure, false, 2));
+                    .isEqualTo("failed " + DisconnectionAccess.of(failure, false, 2));
             await().untilAsserted(() -> assertThat(attempt.closed).isTrue());
             assertThat(scheduler.pendingTaskCount()).isZero();
             assertThat(sut.whenConnected()).isNotDone();
@@ -880,7 +880,7 @@ class AutomaticReconnectionTest {
 
             // Assert: the stop announces no reconnection, and an explicit connect resumes.
             assertThat(listener.next())
-                    .isEqualTo("disconnected " + Disconnection.of(failure, false, 1));
+                    .isEqualTo("disconnected " + DisconnectionAccess.of(failure, false, 1));
             assertThat(scheduler.pendingTaskCount()).isZero();
             CompletableFuture<ConnAck> restored = sut.connect();
             nextTransport().accept();
@@ -1223,6 +1223,7 @@ class AutomaticReconnectionTest {
                 ClientStatsAccess::of,
                 MetricsListenerAccess::completion,
                 MetricsListenerAccess::start,
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
     }

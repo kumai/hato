@@ -61,7 +61,7 @@ abstract class WebSocketRoundTripTest {
                 ).delivery().message()).isEqualTo(message);
             }
             sut.disconnect().get(5, SECONDS);
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 1));
         }
     }
 

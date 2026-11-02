@@ -15,6 +15,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
@@ -99,10 +100,12 @@ abstract class ConnectionTest {
                 assertThat(events).containsExactly(first);
                 assertThat(events.poll(5, SECONDS)).isEqualTo(first);
                 release.countDown();
-                assertThat(events.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+                assertThat(events.poll(5, SECONDS))
+                        .isEqualTo(DisconnectionAccess.of(null, true, 1));
                 assertThat(events.poll(5, SECONDS)).isEqualTo(second);
                 sut.disconnect().get(5, SECONDS);
-                assertThat(events.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
+                assertThat(events.poll(5, SECONDS))
+                        .isEqualTo(DisconnectionAccess.of(null, true, 2));
                 assertThat(events).isEmpty();
             } finally {
                 release.countDown();
@@ -135,7 +138,7 @@ abstract class ConnectionTest {
                 await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isEqualTo(1));
             }
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 1));
             await().untilAsserted(() -> assertThat(scheduler.pendingTaskCount()).isZero());
         }
     }

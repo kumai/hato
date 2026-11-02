@@ -24,6 +24,7 @@ import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttDelivery;
 import org.mqtt4j.hato.MqttMessage;
@@ -221,7 +222,7 @@ abstract class DeliveryModesIntegrationTest {
             );
             subscription.established().get(5, SECONDS);
             publisher.publish(message(prefix + "/0", 1, Qos.AT_LEAST_ONCE)).get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(failure, false, 1));
 
             // Act
             assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
@@ -407,7 +408,7 @@ abstract class DeliveryModesIntegrationTest {
             );
             subscription.established().get(5, SECONDS);
             publisher.publish(message(prefix + "/0", 1, Qos.AT_LEAST_ONCE)).get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(failure, false, 1));
 
             // Act
             assertThat(sut.connect().get(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));

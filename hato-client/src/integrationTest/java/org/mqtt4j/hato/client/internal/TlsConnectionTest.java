@@ -31,6 +31,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttMessage;
@@ -150,7 +151,7 @@ class TlsConnectionTest {
             assertThat(received.delivery().message()).isEqualTo(publication);
             subscription.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 1));
             assertThat(ended).isEmpty();
         }
     }

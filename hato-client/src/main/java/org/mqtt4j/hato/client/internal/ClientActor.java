@@ -293,6 +293,7 @@ public final class ClientActor implements MqttClient {
             Function<ClientSnapshot, ClientStats> statsOf,
             PublishCompletionOf publishCompletionOf,
             BiFunction<Subscription, Duration, MetricsListener.DeliveryStart> deliveryStartOf,
+            DisconnectionOf disconnectionOf,
             ClientLimits limits
     ) {
         this(
@@ -319,6 +320,7 @@ public final class ClientActor implements MqttClient {
                 statsOf,
                 publishCompletionOf,
                 deliveryStartOf,
+                disconnectionOf,
                 limits
         );
     }
@@ -347,6 +349,7 @@ public final class ClientActor implements MqttClient {
             Function<ClientSnapshot, ClientStats> statsOf,
             PublishCompletionOf publishCompletionOf,
             BiFunction<Subscription, Duration, MetricsListener.DeliveryStart> deliveryStartOf,
+            DisconnectionOf disconnectionOf,
             ClientLimits limits
     ) {
         this.endpoint = endpoint;
@@ -430,6 +433,7 @@ public final class ClientActor implements MqttClient {
                 backoff,
                 rules,
                 responseTimeout,
+                disconnectionOf,
                 limits
         );
         deliveriesReady = new Mailbox.Event(
@@ -2412,6 +2416,19 @@ public final class ClientActor implements MqttClient {
                 Qos qos,
                 @Nullable Throwable failure,
                 Duration duration
+        );
+    }
+
+    /// Creates the ending of a connection or of an attempt, which only the API package can do:
+    /// the builder passes the package-private factory of [Disconnection].
+    @FunctionalInterface
+    public interface DisconnectionOf {
+
+        Disconnection of(
+                @Nullable Throwable cause,
+                boolean userRequested,
+                long connectionAttempt,
+                @Nullable Duration reconnectDelay
         );
     }
 

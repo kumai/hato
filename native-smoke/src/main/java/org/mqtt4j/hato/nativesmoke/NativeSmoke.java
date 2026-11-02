@@ -212,7 +212,12 @@ public final class NativeSmoke {
             client.disconnect().get(5, SECONDS);
             // Removal and disconnect also complete without a connection, so only the listener
             // shows that the connection lasted until the requested disconnect.
-            if (!Disconnection.of(null, true, 1).equals(ended.poll(5, SECONDS))) {
+            Disconnection end = ended.poll(5, SECONDS);
+            if (end == null
+                    || end.cause().isPresent()
+                    || !end.userRequested()
+                    || end.connectionAttempt() != 1
+                    || end.reconnectDelay().isPresent()) {
                 throw new AssertionError(route + " connection ended before the disconnect");
             }
             // Termination waits for the queued metrics events: one for each of the nine

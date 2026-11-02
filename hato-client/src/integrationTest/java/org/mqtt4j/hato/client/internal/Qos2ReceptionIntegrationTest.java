@@ -115,7 +115,7 @@ abstract class Qos2ReceptionIntegrationTest {
                     }
             ).established().get(5, SECONDS);
             publisher.publish(message(topic, (byte) 1)).get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(cause, false, 1));
 
             // Act
             assertSession(sut.connect().get(5, SECONDS), true, 2);
@@ -265,7 +265,7 @@ abstract class Qos2ReceptionIntegrationTest {
             // Act
             var cause = new IOException("cut " + cut);
             transport.disconnect(cause);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(cause, false, 1));
             assertThat(scheduler.pendingTaskCount()).isZero();
             if (!sessionPresent) {
                 try (MqttClient replacement = MqttClient.builder()

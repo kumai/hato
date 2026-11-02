@@ -16,8 +16,8 @@ class DisconnectionTest {
     @ValueSource(booleans = {false, true})
     void absent_causes_preserve_the_request_flag_and_compare_by_value(boolean userRequested) {
         // Act
-        var sut = Disconnection.of(null, userRequested, 1);
-        var same = Disconnection.of(null, userRequested, 1);
+        var sut = Disconnection.of(null, userRequested, 1, null);
+        var same = Disconnection.of(null, userRequested, 1, null);
 
         // Assert
         assertThat(sut.cause()).isEmpty();
@@ -25,7 +25,7 @@ class DisconnectionTest {
         assertThat(sut.connectionAttempt()).isEqualTo(1);
         assertThat(sut.reconnectDelay()).isEmpty();
         assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same)
-                .isNotEqualTo(Disconnection.of(null, !userRequested, 1));
+                .isNotEqualTo(Disconnection.of(null, !userRequested, 1, null));
         assertThat(same).isEqualTo(sut);
         assertThat(sut.toString()).contains(
                 "cause=null",
@@ -42,21 +42,22 @@ class DisconnectionTest {
         var cause = new IOException("connection failed");
 
         // Act
-        var sut = Disconnection.of(cause, userRequested, 7);
-        var same = Disconnection.of(cause, userRequested, 7);
+        var sut = Disconnection.of(cause, userRequested, 7, null);
+        var same = Disconnection.of(cause, userRequested, 7, null);
 
         // Assert
         assertThat(sut.cause()).containsSame(cause);
         assertThat(sut.userRequested()).isEqualTo(userRequested);
         assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same)
-                .isNotEqualTo(Disconnection.of(cause, !userRequested, 7))
+                .isNotEqualTo(Disconnection.of(cause, !userRequested, 7, null))
                 .isNotEqualTo(Disconnection.of(
                         new IOException("connection failed"),
                         userRequested,
-                        7
+                        7,
+                        null
                 ))
-                .isNotEqualTo(Disconnection.of(null, userRequested, 7))
-                .isNotEqualTo(Disconnection.of(cause, userRequested, 8))
+                .isNotEqualTo(Disconnection.of(null, userRequested, 7, null))
+                .isNotEqualTo(Disconnection.of(cause, userRequested, 8, null))
                 .isNotEqualTo(Disconnection.of(cause, userRequested, 7, Duration.ZERO));
         assertThat(same).isEqualTo(sut);
         assertThat(sut.toString()).contains("cause=" + cause, "userRequested=" + userRequested);
@@ -72,13 +73,14 @@ class DisconnectionTest {
         assertThat(sut.connectionAttempt()).isEqualTo(2);
         assertThat(sut).isEqualTo(Disconnection.of(null, false, 2, Duration.ofMillis(1500)))
                 .isNotEqualTo(Disconnection.of(null, false, 2, Duration.ofMillis(1499)))
-                .isNotEqualTo(Disconnection.of(null, false, 2));
+                .isNotEqualTo(Disconnection.of(null, false, 2, null));
         assertThat(sut.toString()).contains("reconnectDelay=PT1.5S");
     }
 
     @Test
     void invalid_attempt_numbers_and_negative_delays_are_rejected() {
-        assertThatIllegalArgumentException().isThrownBy(() -> Disconnection.of(null, false, 0));
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> Disconnection.of(null, false, 0, null));
         assertThatIllegalArgumentException()
                 .isThrownBy(() -> Disconnection.of(null, false, 0, Duration.ZERO));
         assertThatIllegalArgumentException()

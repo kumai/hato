@@ -66,7 +66,7 @@ abstract class AcceptanceTest {
 
             // Assert
             assertThat(connAck).isEqualTo(ConnAck.of(false, 1));
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 1));
             assertThat(sut.terminated()).succeedsWithin(Duration.ofSeconds(5));
         }
     }
@@ -304,7 +304,7 @@ abstract class AcceptanceTest {
             requireNonNull(transport.get()).disconnect(cause);
 
             // Assert
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(cause, false, 1));
             assertThat(receive(subscription)).isEqualTo(will);
         }
     }

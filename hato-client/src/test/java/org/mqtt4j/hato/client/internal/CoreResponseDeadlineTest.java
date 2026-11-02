@@ -10,6 +10,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
@@ -283,6 +284,7 @@ class CoreResponseDeadlineTest {
                 backoff,
                 RetryRules.DEFAULT,
                 RESPONSE_TIMEOUT,
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
         core.connect(new ConnectionAttempt(1), 0);

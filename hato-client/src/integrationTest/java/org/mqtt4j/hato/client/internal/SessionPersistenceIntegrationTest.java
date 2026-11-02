@@ -26,6 +26,7 @@ import org.mqtt4j.hato.AckMode;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttDelivery;
@@ -287,7 +288,7 @@ class SessionPersistenceIntegrationTest {
                     release.countDown();
                     peer.expectClosed();
                     assertThat(ended.poll(5, SECONDS))
-                            .isEqualTo(Disconnection.of(failure, false, 2));
+                            .isEqualTo(DisconnectionAccess.of(failure, false, 2));
                 }
             } else {
                 release.countDown();
@@ -375,7 +376,8 @@ class SessionPersistenceIntegrationTest {
                 old = requireNonNull(failed.poll(5, SECONDS));
                 release.countDown();
                 peer.expectClosed();
-                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+                assertThat(ended.poll(5, SECONDS))
+                        .isEqualTo(DisconnectionAccess.of(failure, false, 1));
             }
 
             // Act
@@ -689,7 +691,8 @@ class SessionPersistenceIntegrationTest {
             assertThat(stored.receive(Duration.ZERO)).isEqualTo(new ReceiveResult.TimedOut());
             // The replaced connections produced no notification of their own.
             assertThat(notifications.poll(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
-            assertThat(notifications.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(notifications.poll(5, SECONDS))
+                    .isEqualTo(DisconnectionAccess.of(null, true, 1));
             assertThat(notifications).isEmpty();
         }
     }
@@ -842,7 +845,7 @@ class SessionPersistenceIntegrationTest {
             publisher.publish(held).get(5, SECONDS);
             MqttDelivery stale = requireNonNull(mailbox.poll(5, SECONDS));
             publisher.publish(message(failing, (byte) 2)).get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(failure, false, 1));
 
             // Act: the application acknowledges the delivery it held, then connects again.
             stale.ack();
@@ -925,7 +928,7 @@ class SessionPersistenceIntegrationTest {
                 assertThat(received(after).message()).isEqualTo(kept);
                 assertThat(notifications.poll(5, SECONDS)).isEqualTo(ConnAck.of(false, 1));
                 assertThat(notifications.poll(5, SECONDS))
-                        .isEqualTo(Disconnection.of(null, true, 1));
+                        .isEqualTo(DisconnectionAccess.of(null, true, 1));
                 assertThat(notifications.poll(5, SECONDS)).isEqualTo(ConnAck.of(true, 2));
                 sut.disconnect().get(5, SECONDS);
             }

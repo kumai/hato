@@ -89,7 +89,6 @@ class DistributionTest {
                     || cause.getCause() != null) {
                 throw new AssertionError("Public protocol failure is not usable");
             }
-            var disconnection = org.mqtt4j.hato.Disconnection.of(cause, false, 1);
             var message = org.mqtt4j.hato.MqttMessage.of(
                     new org.mqtt4j.hato.Topic("a/b"),
                     new byte[0],
@@ -99,16 +98,7 @@ class DistributionTest {
                     .withPayload(new byte[] {42})
                     .withQos(org.mqtt4j.hato.Qos.AT_LEAST_ONCE)
                     .withRetain(true);
-            if (disconnection.cause().orElseThrow() != cause
-                    || disconnection.userRequested()
-                    || org.mqtt4j.hato.Disconnection.of(null, true, 1).cause().isPresent()
-                    || !org.mqtt4j.hato.Disconnection.of(
-                            null,
-                            false,
-                            2,
-                            java.time.Duration.ofSeconds(1)
-                    ).reconnectDelay().isPresent()
-                    || !org.mqtt4j.hato.ConnAck.of(true, 1).sessionPresent()
+            if (!org.mqtt4j.hato.ConnAck.of(true, 1).sessionPresent()
                     || !org.mqtt4j.hato.ReconnectPolicy.exponentialBackoff(
                             java.time.Duration.ofSeconds(1),
                             java.time.Duration.ofSeconds(2)
@@ -238,8 +228,13 @@ class DistributionTest {
                     sut.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
                     // Removal and disconnect also complete without a connection, so only the
                     // listener shows that the connection lasted until the requested disconnect.
-                    if (!org.mqtt4j.hato.Disconnection.of(null, true, 1)
-                            .equals(ended.poll(5, java.util.concurrent.TimeUnit.SECONDS))) {
+                    org.mqtt4j.hato.Disconnection end =
+                            ended.poll(5, java.util.concurrent.TimeUnit.SECONDS);
+                    if (end == null
+                            || end.cause().isPresent()
+                            || !end.userRequested()
+                            || end.connectionAttempt() != 1
+                            || end.reconnectDelay().isPresent()) {
                         throw new AssertionError(version + " connection ended before disconnect");
                     }
                 }

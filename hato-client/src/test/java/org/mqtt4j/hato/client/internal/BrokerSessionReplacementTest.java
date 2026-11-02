@@ -22,6 +22,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 
 import org.mqtt4j.hato.ConnAck;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
@@ -988,6 +989,7 @@ class BrokerSessionReplacementTest {
                 backoff,
                 initialRetry ? RetryRules.DEFAULT.withInitialRetry() : RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
     }

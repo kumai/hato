@@ -31,6 +31,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectException;
 import org.mqtt4j.hato.MqttConnectionLostException;
@@ -89,6 +90,7 @@ class SessionCoreTest {
             ReconnectBackoff.disabled(),
             RetryRules.DEFAULT,
             Duration.ofSeconds(60),
+            DisconnectionAccess::of,
             ClientLimits.DEFAULT
     );
 
@@ -960,7 +962,7 @@ class SessionCoreTest {
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         Throwable cause = port.ends.getFirst().cause().orElseThrow();
         assertThat(cause).isInstanceOf(MqttCapacityException.class);
-        assertThat(port.ends).containsExactly(Disconnection.of(cause, true, 1));
+        assertThat(port.ends).containsExactly(DisconnectionAccess.of(cause, true, 1));
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasCause(cause);
@@ -990,7 +992,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasCause(failure);
-        assertThat(port.ends).containsExactly(Disconnection.of(failure, true, 1));
+        assertThat(port.ends).containsExactly(DisconnectionAccess.of(failure, true, 1));
     }
 
     @Test
@@ -1148,7 +1150,7 @@ class SessionCoreTest {
         assertThat(sut.state()).isEqualTo(DISCONNECTED);
         assertThat(requireNonNull(port.results.get(2L)).failure()).isNull();
         assertThat(requireNonNull(port.results.get(3L)).failure()).isNull();
-        assertThat(port.ends).containsExactly(Disconnection.of(null, true, 1));
+        assertThat(port.ends).containsExactly(DisconnectionAccess.of(null, true, 1));
     }
 
     @Test
@@ -1210,7 +1212,7 @@ class SessionCoreTest {
         assertThat(requireNonNull(port.results.get(2L)).failure())
                 .isInstanceOf(MqttConnectionLostException.class)
                 .hasNoCause();
-        assertThat(port.ends).containsExactly(Disconnection.of(null, true, 1));
+        assertThat(port.ends).containsExactly(DisconnectionAccess.of(null, true, 1));
     }
 
     @Test
@@ -3647,7 +3649,7 @@ class SessionCoreTest {
                     }
                 },
                 () -> {
-                    expected.add(Disconnection.of(failure, false, 2));
+                    expected.add(DisconnectionAccess.of(failure, false, 2));
                     sut.deliveryFailed(port.deliveries.getLast().delivery(), failure);
                 }
         )));
@@ -4177,7 +4179,7 @@ class SessionCoreTest {
         sut.failed(1, failure);
 
         // Assert
-        assertThat(port.ends).containsExactly(Disconnection.of(failure, false, 1));
+        assertThat(port.ends).containsExactly(DisconnectionAccess.of(failure, false, 1));
     }
 
     /// Publishes, then reports the write completion and PUBACK in a seed-chosen order.
@@ -4994,6 +4996,7 @@ class SessionCoreTest {
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
+                DisconnectionAccess::of,
                 limits
         );
     }
@@ -5071,6 +5074,7 @@ class SessionCoreTest {
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
     }

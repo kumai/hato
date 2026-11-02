@@ -21,6 +21,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttBrokerDisconnectException;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectException;
@@ -534,6 +535,7 @@ class ReconnectionTest {
                 ),
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
         sut.connect(attempt(1), 0);
@@ -637,6 +639,7 @@ class ReconnectionTest {
                 ),
                 RetryRules.DEFAULT.withInitialRetry(),
                 Duration.ofSeconds(60),
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
         ConnectionAttempt first = attempt(1);
@@ -943,6 +946,7 @@ class ReconnectionTest {
                 ),
                 rules,
                 Duration.ofSeconds(60),
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
     }

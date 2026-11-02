@@ -674,6 +674,7 @@ public final class MqttClientBuilder {
                 ClientStats::of,
                 MetricsListener.PublishCompletion::of,
                 MetricsListener.DeliveryStart::of,
+                Disconnection::of,
                 new ClientLimits(maxInflightPublishes, maxSubscriptions)
         );
     }

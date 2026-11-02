@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.ClientStats.OverloadCause;
 import org.mqtt4j.hato.ClientStats.Usage;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
@@ -39,6 +40,7 @@ class ReceiveStatsTest {
             ReconnectBackoff.disabled(),
             RetryRules.DEFAULT,
             Duration.ofSeconds(60),
+            DisconnectionAccess::of,
             ClientLimits.DEFAULT
     );
     private long generation;

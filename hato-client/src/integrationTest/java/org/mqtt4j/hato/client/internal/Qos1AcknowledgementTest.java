@@ -439,7 +439,8 @@ class Qos1AcknowledgementTest {
 
                 // Assert: EOF is the first response to the failed delivery.
                 peer.expectClosed();
-                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+                assertThat(ended.poll(5, SECONDS))
+                        .isEqualTo(DisconnectionAccess.of(failure, false, 1));
             }
         }
     }

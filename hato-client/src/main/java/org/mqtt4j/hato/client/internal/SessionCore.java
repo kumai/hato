@@ -304,6 +304,10 @@ final class SessionCore {
 
     private final Duration responseTimeout;
 
+    // Only the API package creates the endings that the core reports; the builder passes their
+    // package-private factory.
+    private final ClientActor.DisconnectionOf disconnectionOf;
+
     // Zero session expiry starts a new session with every connection.
     private final boolean cleanStart;
 
@@ -382,12 +386,14 @@ final class SessionCore {
             ReconnectBackoff backoff,
             RetryRules rules,
             Duration responseTimeout,
+            ClientActor.DisconnectionOf disconnectionOf,
             ClientLimits limits
     ) {
         this.port = port;
         this.clientId = clientId;
         this.timeout = timeout;
         this.responseTimeout = responseTimeout;
+        this.disconnectionOf = disconnectionOf;
         cleanStart = sessionExpiry.isZero();
         this.version = version;
         this.credentialsRequired = credentialsRequired;
@@ -1175,9 +1181,12 @@ final class SessionCore {
             // failed attempts report the exception that fails their connect() calls.
             boolean stopped = reason == EndReason.HANDLER_FAILURE;
             @Nullable Throwable reported = established || stopped ? cause : attemptFailure;
-            Disconnection disconnection = (delay == null)
-                    ? Disconnection.of(reported, shutdownRequested, request.attempt())
-                    : Disconnection.of(reported, shutdownRequested, request.attempt(), delay);
+            Disconnection disconnection = disconnectionOf.of(
+                    reported,
+                    shutdownRequested,
+                    request.attempt(),
+                    delay
+            );
             // Retire queued recipients before removing subscriptions, without acknowledging
             // work that never reached the application. Persistent handed work keeps its state.
             Map<Long, Boolean> handedReadiness = port.end(

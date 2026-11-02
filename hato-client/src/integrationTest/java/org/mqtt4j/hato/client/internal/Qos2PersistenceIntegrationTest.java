@@ -227,7 +227,7 @@ class Qos2PersistenceIntegrationTest {
             // Act: the first connection fails even if the retained exchange later completes.
             var cause = new IOException("cut " + cut);
             transport.disconnect(cause);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(cause, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(cause, false, 1));
             Throwable failure = failureOf(publication);
             assertThat(failure).isInstanceOf(MqttConnectionLostException.class).hasCause(cause);
             assertThat(scheduler.pendingTaskCount()).isZero();

@@ -69,7 +69,7 @@ class SubscriptionContinuityTest {
                 survivor = peer.subscribePull(sut, "survivor", AckMode.ON_RECEIVE, 4);
                 sut.disconnect().get(5, SECONDS);
             }
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 1));
             var receiving = new CountDownLatch(1);
             var received = new CompletableFuture<ReceiveResult>();
             executor.submit(() -> {
@@ -124,7 +124,7 @@ class SubscriptionContinuityTest {
                 peer.expectAcknowledgements(7, 1);
                 peer.roundTripBarrier(sut);
                 sut.disconnect().get(5, SECONDS);
-                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
+                assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 2));
                 assertThat(refused).isEmpty();
             }
         }

@@ -126,7 +126,8 @@ class MosquittoTlsTest {
             // the WebSocket; the requested disconnection is still a clean one.
             assertThat(connAck.sessionPresent()).isFalse();
             assertThat(connections.poll(5, SECONDS)).isEqualTo(connAck);
-            assertThat(connections.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(connections.poll(5, SECONDS))
+                    .isEqualTo(DisconnectionAccess.of(null, true, 1));
             assertThat(connections).isEmpty();
             assertThat(failures).isEmpty();
         }
@@ -144,7 +145,8 @@ class MosquittoTlsTest {
             // Assert
             assertThat(connAck.sessionPresent()).isFalse();
             assertThat(connections.poll(5, SECONDS)).isEqualTo(connAck);
-            assertThat(connections.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(connections.poll(5, SECONDS))
+                    .isEqualTo(DisconnectionAccess.of(null, true, 1));
             assertThat(connections).isEmpty();
             assertThat(failures).isEmpty();
         }
@@ -166,7 +168,7 @@ class MosquittoTlsTest {
                     .hasCauseInstanceOf(MqttConnectException.class)
                     .hasRootCauseInstanceOf(IOException.class);
             assertThat(failures.poll(5, SECONDS))
-                    .isEqualTo(Disconnection.of(connected.exceptionNow(), false, 1));
+                    .isEqualTo(DisconnectionAccess.of(connected.exceptionNow(), false, 1));
             assertThat(failures).isEmpty();
             assertThat(connections).isEmpty();
         }

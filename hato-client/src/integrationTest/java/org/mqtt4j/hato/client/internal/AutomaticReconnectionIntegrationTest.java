@@ -490,7 +490,7 @@ class AutomaticReconnectionIntegrationTest {
             publisher.publish(message(topic, Qos.AT_LEAST_ONCE)).get(5, SECONDS);
 
             // Assert: the stop announces no reconnection and schedules none.
-            assertThat(ends.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(ends.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(failure, false, 1));
             assertThat(clock.pendingTaskCount()).isZero();
 
             // Act & Assert: an explicit connection receives the redelivery and restores

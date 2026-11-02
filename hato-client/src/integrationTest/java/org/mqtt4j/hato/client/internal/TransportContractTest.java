@@ -34,6 +34,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReconnectPolicy;
@@ -122,7 +123,7 @@ class TransportContractTest {
 
                 // Assert: onSent must reach the core before onClosed for this to succeed.
                 disconnected.get(5, SECONDS);
-                assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+                assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 1));
                 assertThat(ended).isEmpty();
             }
         }

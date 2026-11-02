@@ -22,6 +22,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttConnectionLostException;
 import org.mqtt4j.hato.MqttMessage;
@@ -520,7 +521,7 @@ class ReceivePersistenceTest {
         var handlerFailure = new IOException("late handler failure for seed " + seed);
         var expectedEnds = new ArrayList<>(port.ends);
         if (present) {
-            expectedEnds.add(Disconnection.of(handlerFailure, false, port.attempt));
+            expectedEnds.add(DisconnectionAccess.of(handlerFailure, false, port.attempt));
         }
         var completions = new ArrayList<Runnable>();
         for (int i = 0; i < originals.size(); i++) {
@@ -556,6 +557,7 @@ class ReceivePersistenceTest {
                 ReconnectBackoff.disabled(),
                 RetryRules.DEFAULT,
                 Duration.ofSeconds(60),
+                DisconnectionAccess::of,
                 ClientLimits.DEFAULT
         );
     }

@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.DisconnectionAccess;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -65,7 +66,7 @@ class ListenerLaneTest {
         logger.addHandler(handler);
         try {
             ListenerLane sut = lane();
-            var ending = Disconnection.of(null, true, 1);
+            Disconnection ending = DisconnectionAccess.of(null, true, 1);
 
             // Act
             sut.submit(() -> listener.onConnected(ConnAck.of(false, 1)));
@@ -117,7 +118,7 @@ class ListenerLaneTest {
         ListenerLane sut = lane();
         sut.submit(() -> listener.onConnected(ConnAck.of(false, 1)));
         assertThat(entered.await(5, SECONDS)).isTrue();
-        sut.submit(() -> listener.onDisconnected(Disconnection.of(null, true, 1)));
+        sut.submit(() -> listener.onDisconnected(DisconnectionAccess.of(null, true, 1)));
         sut.submit(() -> listener.onConnected(ConnAck.of(true, 2)));
 
         // Act: returning the first callback runs the queued ones on the same thread.
@@ -165,7 +166,11 @@ class ListenerLaneTest {
 
         // Act
         for (long attempt = 2; attempt <= 71; attempt++) {
-            var failure = Disconnection.of(new IllegalStateException("refused"), false, attempt);
+            Disconnection failure = DisconnectionAccess.of(
+                    new IllegalStateException("refused"),
+                    false,
+                    attempt
+            );
             sut.submit(() -> listener.onConnectFailed(failure));
         }
 

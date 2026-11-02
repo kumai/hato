@@ -374,7 +374,7 @@ abstract class MessagingTest {
             assertThatThrownBy(() -> publication.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class)
                     .hasRootCause(failure);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(failure, false, 1));
             assertThat(scheduler.pendingTaskCount()).isZero();
             scheduler.advance(Duration.ofSeconds(30));
             assertThat(ended).isEmpty();
@@ -616,7 +616,7 @@ abstract class MessagingTest {
                 sut.disconnect().get(5, SECONDS);
             }
             assertThat(ended.poll(5, SECONDS))
-                    .isEqualTo(Disconnection.of(failure ? cause : null, !failure, 1));
+                    .isEqualTo(DisconnectionAccess.of(failure ? cause : null, !failure, 1));
             sut.connect().get(5, SECONDS);
             var next = MqttMessage.of(new Topic(topic), new byte[] {2}, Qos.AT_LEAST_ONCE, false);
             // One restoration fits the send capacity, before this same connection's PUBLISH.
@@ -663,7 +663,7 @@ abstract class MessagingTest {
             // delivery holds back its acknowledgement until the handler returns, so the
             // failure stops the client.
             publisher.publish(message(topic, (byte) 1).withQos(Qos.AT_LEAST_ONCE)).get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(failure, false, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(failure, false, 1));
             sut.connect().get(5, SECONDS);
             // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -771,7 +771,7 @@ abstract class MessagingTest {
             sut.publish(message(topic, (byte) 1)).get(5, SECONDS);
             assertThat(entered.await(5, SECONDS)).isTrue();
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 1));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 1));
             sut.connect().get(5, SECONDS);
             // This PUBLISH follows the single restored SUBSCRIBE on the same connection.
             sut.publish(message(topic, (byte) 2)).get(5, SECONDS);
@@ -786,7 +786,7 @@ abstract class MessagingTest {
                     .containsExactly((byte) 2);
             subscription.unsubscribe().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
-            assertThat(ended.poll(5, SECONDS)).isEqualTo(Disconnection.of(null, true, 2));
+            assertThat(ended.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(null, true, 2));
             assertThat(ended).isEmpty();
         } finally {
             release.countDown();

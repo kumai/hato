@@ -6,8 +6,6 @@ import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
 
-import static java.util.Objects.requireNonNull;
-
 /// The end of an established connection, or of a connection attempt that established none.
 /// An empty cause means no failure is reported; it does not indicate a graceful MQTT
 /// disconnect. [userRequested][#userRequested()] identifies disconnect or close, including a
@@ -36,60 +34,26 @@ public final class Disconnection {
         if (connectionAttempt < 1) {
             throw new IllegalArgumentException("Attempt numbers start at 1");
         }
+        if (reconnectDelay != null && reconnectDelay.isNegative()) {
+            throw new IllegalArgumentException("Reconnect delay must not be negative");
+        }
         this.cause = cause;
         this.userRequested = userRequested;
         this.connectionAttempt = connectionAttempt;
         this.reconnectDelay = reconnectDelay;
     }
 
-    /// Describes an ending of connection attempt number `connectionAttempt` after which the
-    /// client does not reconnect, with the original `cause`, or no reported failure when it is
-    /// null. `userRequested` is true when disconnect or close was requested, even if that failed.
-    ///
-    /// @param cause
-    ///   the original failure, or null when no failure is reported
-    /// @param userRequested
-    ///   whether disconnect or close was requested
-    /// @param connectionAttempt
-    ///   the number of the connection attempt
-    /// @return
-    ///   the ending
-    /// @throws IllegalArgumentException
-    ///   if `connectionAttempt` is not positive
-    @SuppressWarnings("exports") // Nullness annotations are compile-time only.
-    public static Disconnection of(
-            @Nullable Throwable cause,
-            boolean userRequested,
-            long connectionAttempt
-    ) {
-        return new Disconnection(cause, userRequested, connectionAttempt, null);
-    }
-
-    /// Like [#of(Throwable, boolean, long)], but the client attempts to connect again after
-    /// `reconnectDelay`.
-    ///
-    /// @param cause
-    ///   the original failure, or null when no failure is reported
-    /// @param userRequested
-    ///   whether disconnect or close was requested
-    /// @param connectionAttempt
-    ///   the number of the connection attempt
-    /// @param reconnectDelay
-    ///   the delay until the next connection attempt
-    /// @return
-    ///   the ending
-    /// @throws IllegalArgumentException
-    ///   if `connectionAttempt` is not positive or the delay is negative
-    @SuppressWarnings("exports") // Nullness annotations are compile-time only.
-    public static Disconnection of(
+    /// The ending of connection attempt number `connectionAttempt` with the original `cause`, or
+    /// no reported failure when it is null, after which the client attempts to connect again
+    /// after `reconnectDelay`, or does not when it is null. `userRequested` is true when
+    /// disconnect or close was requested, even if that failed. Only the client creates endings;
+    /// the builder hands this to it.
+    static Disconnection of(
             @Nullable Throwable cause,
             boolean userRequested,
             long connectionAttempt,
-            Duration reconnectDelay
+            @Nullable Duration reconnectDelay
     ) {
-        if (requireNonNull(reconnectDelay, "reconnectDelay").isNegative()) {
-            throw new IllegalArgumentException("Reconnect delay must not be negative");
-        }
         return new Disconnection(cause, userRequested, connectionAttempt, reconnectDelay);
     }
 
