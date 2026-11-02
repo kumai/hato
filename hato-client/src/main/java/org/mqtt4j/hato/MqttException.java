@@ -5,7 +5,21 @@ import java.io.Serial;
 import static java.util.Objects.requireNonNull;
 
 /// Base class for failures of MQTT operations.
-public class MqttException extends RuntimeException {
+public sealed class MqttException extends RuntimeException permits
+        MqttBrokerDisconnectException,
+        MqttCapacityException,
+        MqttConnectException,
+        MqttConnectionLostException,
+        MqttNotConnectedException,
+        MqttProtocolException,
+        MqttPublicationRefusedException,
+        MqttSubscriptionRefusedException {
+
+    // The class stays concrete although the client never throws it directly. A pattern switch over
+    // an abstract sealed class may leave out its default once it names every permitted subclass,
+    // and an application written that way would stop compiling, or fail with MatchException, when
+    // a later version adds a subclass. A concrete class keeps a case for MqttException itself
+    // required.
 
     @Serial
     private static final long serialVersionUID = 1L;
@@ -14,7 +28,7 @@ public class MqttException extends RuntimeException {
     ///
     /// @param message
     ///     the detail message
-    protected MqttException(String message) {
+    MqttException(String message) {
         super(message);
     }
 
@@ -24,7 +38,7 @@ public class MqttException extends RuntimeException {
     ///     the detail message
     /// @param cause
     ///     the cause of the failure
-    protected MqttException(String message, Throwable cause) {
+    MqttException(String message, Throwable cause) {
         super(message, requireNonNull(cause, "cause must not be null"));
     }
 }
