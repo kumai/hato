@@ -116,9 +116,11 @@ nothing until a deployment passes validation:
 
 Once the Portal shows the deployment as published, verify that a fresh consumer
 resolves the published version and compare the published artifacts' SHA-256
-checksums with a rebuild from the tag using the same JDK. The tagged commit has the
-SNAPSHOT version, so pass the released version to the rebuild, as in
-`-Pversion=0.3.0`.
+checksums with a rebuild from the tag using the same JDK. The JDK must match down to
+the patch release, because the Javadoc jars include files that the JDK supplies; the
+Java setup step in the release run's log names it, such as Temurin 25.0.5+8. The
+tagged commit has the SNAPSHOT version, so pass the released version to the rebuild,
+as in `-Pversion=0.3.0`.
 
 The upload follows the
 [Central Publisher API](https://central.sonatype.org/publish/publish-portal-api/).
