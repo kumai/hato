@@ -46,6 +46,16 @@
         <property name="message" value="Line has trailing whitespace."/>
     </module>
 
+    <!-- Markdown doc comments render a block tag description that starts on the next line as
+         code when it is indented four or more spaces past the comment's common indentation,
+         usually the one space after ///. Such descriptions are indented three spaces after ///. -->
+    <module name="RegexpMultiline">
+        <property name="format"
+                  value="^[ \t]*///[ \t]*@(return|(param|throws|exception)[ \t]+\S+)[ \t]*\r?\n[ \t]*/// {4}"/>
+        <property name="message"
+                  value="Indent a block tag description on the next line by three spaces after ///."/>
+    </module>
+
     <module name="LineLength">
         <property name="max" value="100"/>
         <property name="ignorePattern" value="^(package|import) |https?://"/>
