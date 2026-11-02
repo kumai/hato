@@ -7,7 +7,8 @@ public interface MqttDelivery {
     /// {@return the received message, whose payload accessor returns an independent copy}
     MqttMessage message();
 
-    /// {@return whether the broker marked the publication as a duplicate} Always false for QoS 0.
+    /// {@return `true` if the broker marked the publication as a duplicate} Always `false` for
+    /// QoS 0.
     boolean dup();
 
     /// {@return the number of the connection attempt that established the connection delivering

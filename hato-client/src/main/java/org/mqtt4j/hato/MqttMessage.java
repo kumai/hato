@@ -207,7 +207,7 @@ public final class MqttMessage {
         );
     }
 
-    /// {@return a copy with a different retention request or retained-delivery flag}
+    /// {@return a copy whose [retain flag][#retain()] is `retain`}
     ///
     /// @param retain
     ///   whether publication requests retention, or reception is a retained delivery
@@ -392,8 +392,9 @@ public final class MqttMessage {
         return qos;
     }
 
-    /// {@return whether publication requests retention, or reception is a retained delivery: one
-    /// that the broker sent from its retained messages as it made the subscription} A
+    /// {@return `true` if this message, when published, asks the broker to retain it, or, when
+    /// received, is a retained delivery: one that the broker sent from its retained messages as it
+    /// made the subscription} A
     /// subscription with [Subscribe#retainAsPublished()] instead receives the retain flag that
     /// the publisher set.
     public boolean retain() {
@@ -405,8 +406,8 @@ public final class MqttMessage {
         return payload.length;
     }
 
-    /// {@return whether the payload is declared as UTF-8 encoded character data} False means
-    /// unspecified bytes, which is also what MQTT 5.0 assumes without a Payload Format Indicator.
+    /// {@return `true` if the payload is declared as UTF-8 encoded character data, or `false` for
+    /// unspecified bytes, which is also what MQTT 5.0 assumes without a Payload Format Indicator}
     public boolean payloadUtf8() {
         return payloadUtf8;
     }

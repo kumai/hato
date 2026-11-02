@@ -93,8 +93,8 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// {@return a copy with a different answer to whether a client may publish retained
-    /// messages, Wills included}
+    /// {@return a copy in which a client may publish retained messages, Wills included, if
+    /// `retainAvailable` is `true`, or may not if it is `false`}
     ///
     /// @param retainAvailable
     ///   whether a client may publish retained messages
@@ -110,8 +110,8 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// {@return a copy with a different answer to whether a client may subscribe to filters
-    /// that contain wildcards}
+    /// {@return a copy in which a client may subscribe to filters that contain wildcards if
+    /// `wildcardSubscriptionAvailable` is `true`, or may not if it is `false`}
     ///
     /// @param wildcardSubscriptionAvailable
     ///   whether a client may subscribe to filters that contain wildcards
@@ -129,8 +129,9 @@ public final class BrokerCapabilities {
         );
     }
 
-    /// {@return a copy with a different answer to whether a client may give its subscriptions
-    /// Subscription Identifiers, which the broker returns with their deliveries}
+    /// {@return a copy in which a client may give its subscriptions Subscription Identifiers,
+    /// which the broker returns with their deliveries, if `subscriptionIdentifiersAvailable` is
+    /// `true`, or may not if it is `false`}
     ///
     /// @param subscriptionIdentifiersAvailable
     ///   whether a client may give its subscriptions Subscription Identifiers
@@ -222,17 +223,17 @@ public final class BrokerCapabilities {
         return maximumQos;
     }
 
-    /// {@return whether a client may publish retained messages, Wills included}
+    /// {@return `true` if a client may publish retained messages, Wills included}
     public boolean retainAvailable() {
         return retainAvailable;
     }
 
-    /// {@return whether a client may subscribe to filters that contain wildcards}
+    /// {@return `true` if a client may subscribe to filters that contain wildcards}
     public boolean wildcardSubscriptionAvailable() {
         return wildcardSubscriptionAvailable;
     }
 
-    /// {@return whether a client may give its subscriptions Subscription Identifiers}
+    /// {@return `true` if a client may give its subscriptions Subscription Identifiers}
     public boolean subscriptionIdentifiersAvailable() {
         return subscriptionIdentifiersAvailable;
     }

@@ -98,7 +98,7 @@ public final class Disconnection {
         return Optional.ofNullable(cause);
     }
 
-    /// {@return whether disconnect or close was requested by the application}
+    /// {@return `true` if the application requested disconnect or close, even if that failed}
     public boolean userRequested() {
         return userRequested;
     }

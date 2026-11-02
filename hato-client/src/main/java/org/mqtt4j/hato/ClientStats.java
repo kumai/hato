@@ -283,9 +283,9 @@ public final class ClientStats {
             return values.heldDeliveries();
         }
 
-        /// {@return the bytes that the deliveries the client holds count against its limit for
-        /// all subscriptions: the size of each received PUBLISH and an allowance for each of its
-        /// properties, which take more memory than their encoding}
+        /// {@return the bytes counted for the deliveries that the client holds, against its limit
+        /// for all subscriptions: the size of each received PUBLISH plus an allowance for each of
+        /// its properties, which take more memory than their encoding}
         public Usage heldBytes() {
             return values.heldBytes();
         }

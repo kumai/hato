@@ -148,8 +148,9 @@ public final class Subscribe {
         );
     }
 
-    /// {@return a copy that asks the broker not to deliver this client's own publications to this
-    /// subscription (the MQTT 5.0 No Local option), or to deliver them as usual}
+    /// {@return a copy that, if `noLocal` is `true`, asks the broker not to deliver this client's
+    /// own publications to this subscription (the MQTT 5.0 No Local option), or, if it is `false`,
+    /// to deliver them as usual}
     ///
     /// @param noLocal
     ///   whether the broker withholds this client's own publications from this subscription
@@ -171,9 +172,10 @@ public final class Subscribe {
         );
     }
 
-    /// {@return a copy that asks the broker to keep the retain flag that each publisher set on
-    /// the messages that it delivers to this subscription (the MQTT 5.0 Retain As Published
-    /// option), or to clear it as usual; see [MqttMessage#retain()]}
+    /// {@return a copy that, if `retainAsPublished` is `true`, asks the broker to keep the retain
+    /// flag that each publisher set on the messages that it delivers to this subscription (the
+    /// MQTT 5.0 Retain As Published option), or, if it is `false`, to clear it as usual; see
+    /// [MqttMessage#retain()]}
     ///
     /// @param retainAsPublished
     ///   whether the broker keeps the publisher's retain flag on the messages that it delivers
@@ -253,14 +255,14 @@ public final class Subscribe {
         return failurePolicy;
     }
 
-    /// {@return whether the broker withholds this client's own publications from this
+    /// {@return `true` if the broker withholds this client's own publications from this
     /// subscription}
     public boolean noLocal() {
         return noLocal;
     }
 
-    /// {@return whether the broker keeps the publisher's retain flag on the messages that it
-    /// delivers to this subscription}
+    /// {@return `true` if the broker keeps the publisher's retain flag on the messages that it
+    /// delivers to this subscription, or `false` if it clears it as usual}
     public boolean retainAsPublished() {
         return retainAsPublished;
     }

@@ -317,7 +317,7 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             return delivery;
         }
 
-        /// {@return whether this subscription has ended: the code under test closed or
+        /// {@return `true` if this subscription has ended: the code under test closed or
         /// unsubscribed it, or the fake refused it}
         public synchronized boolean ended() {
             return ending != null;
@@ -404,7 +404,7 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             return message;
         }
 
-        /// {@return false, as the fake delivers no duplicates}
+        /// {@return `false`, as the fake delivers no duplicates}
         @Override
         public boolean dup() {
             return false;
@@ -427,14 +427,14 @@ public final class FakeMqttSubscriber implements MqttSubscriber {
             acked = true;
         }
 
-        /// {@return whether [#ack()] has been called, by the handler or the acceptor, or later by
-        /// any thread}
+        /// {@return `true` if [#ack()] has been called, by the handler or the acceptor, or later
+        /// by any thread}
         public boolean acked() {
             return acked;
         }
 
-        /// {@return whether the acceptor of a hand-off subscription returned false for this
-        /// delivery, which is always false for a subscription with a handler}
+        /// {@return `true` if the acceptor of a hand-off subscription returned `false` for this
+        /// delivery} Always `false` for a subscription with a handler.
         public boolean refused() {
             return refused;
         }

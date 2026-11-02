@@ -92,8 +92,8 @@ public final class ConnAck {
         );
     }
 
-    /// {@return a copy with a different answer to whether the broker accepts retained
-    /// publications}
+    /// {@return a copy in which the broker accepts retained publications if `retainAvailable` is
+    /// `true`, or refuses them if it is `false`}
     ///
     /// @param retainAvailable
     ///   whether the broker accepts retained publications
@@ -109,8 +109,8 @@ public final class ConnAck {
         );
     }
 
-    /// {@return a copy with a different answer to whether the broker accepts wildcard
-    /// subscriptions}
+    /// {@return a copy in which the broker accepts wildcard subscriptions if
+    /// `wildcardSubscriptionAvailable` is `true`, or refuses them if it is `false`}
     ///
     /// @param wildcardSubscriptionAvailable
     ///   whether the broker accepts wildcard subscriptions
@@ -126,8 +126,8 @@ public final class ConnAck {
         );
     }
 
-    /// {@return a copy with a different answer to whether the broker accepts shared
-    /// subscriptions}
+    /// {@return a copy in which the broker accepts shared subscriptions if
+    /// `sharedSubscriptionAvailable` is `true`, or refuses them if it is `false`}
     ///
     /// @param sharedSubscriptionAvailable
     ///   whether the broker accepts shared subscriptions
@@ -166,7 +166,8 @@ public final class ConnAck {
         );
     }
 
-    /// {@return whether the broker resumed an existing session}
+    /// {@return `true` if the broker resumed an existing session, or `false` if it started a new
+    /// one}
     public boolean sessionPresent() {
         return sessionPresent;
     }
@@ -183,17 +184,18 @@ public final class ConnAck {
         return maximumQos;
     }
 
-    /// {@return whether the broker accepts publications with the retain flag on this connection}
+    /// {@return `true` if the broker accepts publications with the retain flag on this
+    /// connection}
     public boolean retainAvailable() {
         return retainAvailable;
     }
 
-    /// {@return whether the broker accepts subscriptions whose filters contain wildcards}
+    /// {@return `true` if the broker accepts subscriptions whose filters contain wildcards}
     public boolean wildcardSubscriptionAvailable() {
         return wildcardSubscriptionAvailable;
     }
 
-    /// {@return whether the broker accepts shared subscriptions}
+    /// {@return `true` if the broker accepts shared subscriptions}
     public boolean sharedSubscriptionAvailable() {
         return sharedSubscriptionAvailable;
     }
