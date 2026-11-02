@@ -367,6 +367,11 @@ final class SessionCore {
     // The number of the attempt that established the latest connection, or 0 if none has.
     private long establishedAttempt;
 
+    // Whether an MQTT 5.0 broker ended the latest established connection because another client
+    // took the session over. The local state then no longer describes the broker's session, so
+    // it is not handed to a later client object.
+    private boolean takenOver;
+
     // Lifetime counts of operations that the core refused for capacity, and of connections that
     // it ended for overload.
     private final long[] refusals = new long[CapacityLimit.values().length];
@@ -458,6 +463,45 @@ final class SessionCore {
     /// The time of the latest event that brought one, on the client's clock.
     long eventTime() {
         return eventTime;
+    }
+
+    /// The local state of the persistent session, for a later client object to continue, or empty
+    /// when there is none to hand over: without a persistent session, while a connection or an
+    /// attempt is open, after the broker ended the connection because another client took the
+    /// session over, or while outgoing QoS 1 or QoS 2 exchanges remain, whose messages the state
+    /// does not carry.
+    Optional<SessionState> sessionState() {
+        if (cleanStart || !session.established || connectionActive() || takenOver
+                || !publications.idle()) {
+            return Optional.empty();
+        }
+        return Optional.of(new SessionState(
+                subscriptions.registrations(),
+                subscriptions.nextIdentifier(),
+                receptions.acknowledged()
+        ));
+    }
+
+    /// Continues the persistent session that `saved` describes, which an earlier client object
+    /// left: the next connection asks the broker to continue it, and a CONNACK without Session
+    /// Present discards it as any lost session. `now` is the time on the client's clock; the
+    /// restored receptions await PUBREL from then on. Only a disconnected client without a
+    /// session of its own can take one over. A saved state that does not fit the client's limits
+    /// is refused with [IllegalArgumentException], and the client stays as it was.
+    void restore(SessionState saved, long now) {
+        if (cleanStart || session.established || state != State.DISCONNECTED) {
+            throw new IllegalStateException(
+                    "Only a disconnected client without a session can continue a saved one"
+            );
+        }
+        // Every check precedes every change, so that a refusal leaves no part half restored.
+        subscriptions.checkRestore(saved.registrations());
+        receptions.checkRestore(saved.receptions());
+        eventTime = now;
+        session.established = true;
+        subscriptions.restore(saved.registrations(), saved.nextIdentifier());
+        receptions.restore(saved.receptions());
+        log.info("Restored session for {}", clientId);
     }
 
     void connect(ConnectionAttempt attempt, long now) {
@@ -651,6 +695,7 @@ final class SessionCore {
     /// session when it has Session Present and otherwise starts a new one.
     private void establish(Outcome.Established established, long now) {
         establishedAttempt = request.attempt();
+        takenOver = false;
         ConnAck result = established.ack();
         boolean sessionPresent = result.sessionPresent();
         if (!sessionPresent) {
@@ -1092,6 +1137,10 @@ final class SessionCore {
                     failure.reasonCode(),
                     failure
             );
+        }
+        if (cause instanceof MqttBrokerDisconnectException ending
+                && ending.reasonCode() == ReasonCode.SESSION_TAKEN_OVER) {
+            takenOver = true;
         }
         MqttConnectException refusal = ended.sessionRefusal;
         // A clock or handler failure stops the request with its own cause, while the policy

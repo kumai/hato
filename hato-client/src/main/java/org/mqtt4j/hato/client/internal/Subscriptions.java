@@ -41,6 +41,7 @@ import org.mqtt4j.hato.client.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.client.internal.common.protocol.SharedTopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Objects.requireNonNull;
 import static org.mqtt4j.hato.client.internal.SessionCore.isFailure;
 import static org.mqtt4j.hato.client.internal.SessionCore.protocolError;
 import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
@@ -118,6 +119,10 @@ final class Subscriptions {
     // Where the search for the next registration's Subscription Identifier starts.
     private int nextIdentifier = 1;
 
+    // The id of the latest filter that only an earlier client object registered. These ids count
+    // down from -1, apart from the ids of the application's registrations.
+    private long restoredId;
+
     // The current connection's exchanges; a connection end replaces them.
     private Window window = new Window();
 
@@ -142,7 +147,10 @@ final class Subscriptions {
             port.complete(operation, null, new IllegalStateException("Client is closed"));
             return;
         }
-        if (byFilter.containsKey(request.filter())) {
+        // A filter that only an earlier client object registered is still to be removed; a new
+        // registration of the filter takes it over instead.
+        LocalSubscription previous = byFilter.get(request.filter());
+        if (previous != null && previous.handle != null) {
             port.complete(operation, null, new IllegalStateException(
                     "Subscription already exists: " + request.filter().pattern()
             ));
@@ -153,10 +161,12 @@ final class Subscriptions {
         TopicFilter matchingFilter = sharedFilter.map(SharedTopicFilter::filter)
                 .orElse(request.filter());
         // A shared subscription is compared with every registration, in time that grows with
-        // them, and any other one only with the shared subscriptions, which are few.
+        // them, and any other one only with the shared subscriptions, which are few. Filters that
+        // only an earlier client object registered reach no handler, so they conflict with none.
         Collection<LocalSubscription> candidates = shared ? registry.values() : sharedRegistrations;
         Optional<LocalSubscription> conflict = candidates.stream()
-                .filter(existing -> filtersOverlap(matchingFilter, existing.matchingFilter))
+                .filter(existing -> existing.handle != null
+                        && filtersOverlap(matchingFilter, existing.matchingFilter))
                 .findFirst();
         if (conflict.isPresent()) {
             port.complete(operation, null, new IllegalStateException(
@@ -166,7 +176,8 @@ final class Subscriptions {
             ));
             return;
         }
-        if (registry.size() >= registrationLimit) {
+        // A filter that the new registration takes over gives up its place.
+        if (registry.size() - (previous == null ? 0 : 1) >= registrationLimit) {
             core.refused(CapacityLimit.SUBSCRIPTIONS);
             port.complete(
                     operation,
@@ -193,8 +204,9 @@ final class Subscriptions {
                 shared,
                 matchingFilter,
                 registered.orElseThrow(),
-                allocateIdentifier()
+                previous == null ? allocateIdentifier() : takeOver(previous)
         );
+        local.heldWithoutIdentifier = previous != null && previous.heldWithoutIdentifier;
         register(local);
         if (core.state() == State.CONNECTED) {
             window.registrations.addLast(local);
@@ -328,7 +340,8 @@ final class Subscriptions {
                 local.established = false;
                 window.registrations.addLast(local);
             } else {
-                port.subscribed(local.handle, local.granted);
+                // A filter without a handle is always being removed.
+                port.subscribed(requireNonNull(local.handle), local.granted);
             }
         }
     }
@@ -356,6 +369,80 @@ final class Subscriptions {
         window.subscribing.keySet().forEach(core::releasePacketId);
         window.unsubscribing.keySet().forEach(core::releasePacketId);
         window = new Window();
+    }
+
+    /// Checks that the registrations and `recorded` together stay within the registration limit,
+    /// counting a filter that both hold once, before [#restore(List, int)] takes any of them.
+    void checkRestore(List<SessionState.Registration> recorded) {
+        long added = recorded.stream()
+                .filter(registration -> !byFilter.containsKey(registration.filter()))
+                .count();
+        if (registry.size() + added > registrationLimit) {
+            throw new IllegalArgumentException(
+                    "Saved and registered subscriptions exceed the limit: "
+                            + (registry.size() + added) + " > " + registrationLimit
+            );
+        }
+    }
+
+    /// Takes over `recorded`, the filters that the broker may hold for a persistent session that
+    /// an earlier client object left, before the first connection continues the session.
+    ///
+    /// A registration that the application made already takes the identifier with which the
+    /// broker holds its filter, so that the broker's messages for the filter reach it. Every other
+    /// registration takes a new identifier from `next` on, because the broker may still hold
+    /// messages under smaller ones for subscriptions that the earlier client object removed. A
+    /// recorded filter without a registration remains as a removal, which a continued session
+    /// confirms with UNSUBSCRIBE and a new session drops; its identifier stays reserved meanwhile,
+    /// so that its messages reach no registration.
+    void restore(List<SessionState.Registration> recorded, int next) {
+        var unclaimed = new LinkedHashMap<TopicFilter, SessionState.Registration>();
+        for (SessionState.Registration registration : recorded) {
+            unclaimed.put(registration.filter(), registration);
+        }
+        // Every identifier is assigned anew, so none that the registrations took stays reserved.
+        byIdentifier.clear();
+        var unrecorded = new ArrayList<LocalSubscription>();
+        for (LocalSubscription local : registry.values()) {
+            SessionState.Registration held = unclaimed.remove(local.filter);
+            if (held == null) {
+                unrecorded.add(local);
+            } else {
+                local.identifier = held.identifier();
+                local.heldWithoutIdentifier = held.heldWithoutIdentifier();
+                byIdentifier.put(local.identifier, local);
+            }
+        }
+        for (SessionState.Registration held : unclaimed.values()) {
+            register(leftover(held));
+        }
+        nextIdentifier = next;
+        for (LocalSubscription local : unrecorded) {
+            local.identifier = allocateIdentifier();
+            byIdentifier.put(local.identifier, local);
+        }
+        someHeldWithoutIdentifier = recorded.stream()
+                .anyMatch(SessionState.Registration::heldWithoutIdentifier);
+        routes.clear();
+    }
+
+    /// The filters that the broker may hold for the session, in registration order, for a later
+    /// client object to take over. Every registration counts, including those whose SUBSCRIBE or
+    /// UNSUBSCRIBE the broker has not answered: an unanswered SUBSCRIBE may still have created the
+    /// subscription.
+    List<SessionState.Registration> registrations() {
+        return registry.values().stream()
+                .map(local -> new SessionState.Registration(
+                        local.filter,
+                        local.identifier,
+                        local.heldWithoutIdentifier
+                ))
+                .toList();
+    }
+
+    /// Where the search for the next Subscription Identifier starts.
+    int nextIdentifier() {
+        return nextIdentifier;
     }
 
     void drainClosures() {
@@ -477,7 +564,8 @@ final class Subscriptions {
             local.confirmed = true;
             local.established = true;
             local.granted = Qos.of(reason.value());
-            port.subscribed(local.handle, local.granted);
+            // Only the application's registrations send SUBSCRIBE.
+            port.subscribed(requireNonNull(local.handle), local.granted);
         }
     }
 
@@ -519,7 +607,8 @@ final class Subscriptions {
             removeSubscription(local, refusal);
         } else {
             unregister(local);
-            port.resubscribeFailed(local.handle, refusal);
+            // Only the application's registrations send SUBSCRIBE, which a broker can refuse.
+            port.resubscribeFailed(requireNonNull(local.handle), refusal);
         }
         finishRemoval(local);
     }
@@ -567,7 +656,7 @@ final class Subscriptions {
             removeSubscription(local, violation);
             finishRemoval(local);
         } else {
-            port.removeSubscription(local.id, local.handle, violation);
+            endHandle(local, violation);
             if (local.removal == null) {
                 // No caller observes this removal; it only keeps the filter until confirmed.
                 local.removal = new UnsubscribeOperation(0, local);
@@ -654,6 +743,35 @@ final class Subscriptions {
         return identifier;
     }
 
+    /// A registration that keeps `held`, a filter that only an earlier client object registered,
+    /// until the broker confirms its removal. It has no handle, and no caller observes its
+    /// removal.
+    private LocalSubscription leftover(SessionState.Registration held) {
+        Optional<SharedTopicFilter> sharedFilter = SharedTopicFilter.parse(held.filter());
+        var local = new LocalSubscription(
+                --restoredId,
+                Subscribe.of(held.filter(), Qos.AT_MOST_ONCE),
+                sharedFilter.isPresent(),
+                sharedFilter.map(SharedTopicFilter::filter).orElse(held.filter()),
+                null,
+                held.identifier()
+        );
+        local.heldWithoutIdentifier = held.heldWithoutIdentifier();
+        local.removal = new UnsubscribeOperation(0, local);
+        return local;
+    }
+
+    /// Gives `previous`, a filter that only an earlier client object registered, up to a new
+    /// registration of the same filter, and returns the identifier with which the broker holds
+    /// the filter, so that its messages reach the new registration. The removal of `previous`
+    /// lapses, unless its UNSUBSCRIBE is already out; the new registration's SUBSCRIBE then
+    /// follows it.
+    private int takeOver(LocalSubscription previous) {
+        unregister(previous);
+        previous.removal = null;
+        return previous.identifier;
+    }
+
     /// The first identifier that is not `inUse`, searching from `start` on and continuing from 1
     /// past the largest. The registration limit stays within the identifiers, so one is free;
     /// identifiers only increase, so the search usually ends at `start`.
@@ -693,7 +811,15 @@ final class Subscriptions {
 
     private void removeSubscription(LocalSubscription local, @Nullable Throwable cause) {
         unregister(local);
-        port.removeSubscription(local.id, local.handle, cause);
+        endHandle(local, cause);
+    }
+
+    /// Ends the application's handle of `local` with `cause`. A filter that only an earlier client
+    /// object registered has no handle to end.
+    private void endHandle(LocalSubscription local, @Nullable Throwable cause) {
+        if (local.handle != null) {
+            port.removeSubscription(local.id, local.handle, cause);
+        }
     }
 
     /// Completes the pending removal of `local`, if any. A queued removal leaves the queue when
@@ -796,7 +922,9 @@ final class Subscriptions {
 
     private static final class LocalSubscription {
 
-        // A client-lifetime registration id shared with the shell and its delivery lane.
+        // A client-lifetime registration id shared with the shell and its delivery lane. A filter
+        // that only an earlier client object registered has a negative id that the shell never
+        // sees.
         final long id;
         final TopicFilter filter;
         final TopicFilter matchingFilter;
@@ -806,10 +934,14 @@ final class Subscriptions {
         final boolean retainAsPublished;
         final RetainHandling retainHandling;
         final boolean shared;
-        final Subscription handle;
+        // The application's handle; null for a filter that only an earlier client object
+        // registered, which this client only removes and never subscribes.
+        final @Nullable Subscription handle;
         // Sent in every SUBSCRIBE for this registration on a connection with Subscription
-        // Identifiers, and unique among the registrations.
-        final int identifier;
+        // Identifiers, and unique among the registrations. Restoring a session reassigns it
+        // before the first connection, so that the broker's messages for the filter reach this
+        // registration.
+        int identifier;
         boolean confirmed;
         boolean established;
         // Whether the session's broker holds the subscription without the identifier: its last
@@ -824,7 +956,7 @@ final class Subscriptions {
                 Subscribe request,
                 boolean shared,
                 TopicFilter matchingFilter,
-                Subscription handle,
+                @Nullable Subscription handle,
                 int identifier
         ) {
             this.id = id;

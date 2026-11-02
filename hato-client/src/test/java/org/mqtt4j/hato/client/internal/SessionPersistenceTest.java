@@ -1171,6 +1171,9 @@ class SessionPersistenceTest {
         final List<ConnectionAttempt> cancellations = new ArrayList<>();
         final List<ConnectionAttempt> evaluations = new ArrayList<>();
         final List<String> events = new ArrayList<>();
+        // What the shell reports for receptions handed to recipients: by token, whether every
+        // recipient met its acknowledgement condition.
+        final Map<Long, Boolean> handed = new HashMap<>();
         int disconnecting;
         int stopsDiscarded;
         SessionCore.@Nullable Timer failingTimer;
@@ -1399,7 +1402,7 @@ class SessionPersistenceTest {
 
         @Override
         public Map<Long, Boolean> receiveState() {
-            return Map.of();
+            return Map.copyOf(handed);
         }
 
         @Override
@@ -1434,7 +1437,7 @@ class SessionPersistenceTest {
             latestReconnectDelay = disconnection.reconnectDelay().orElse(null);
             disconnection.reconnectDelay().ifPresent(reconnectDelays::add);
             events.add("end");
-            return Map.of();
+            return Map.copyOf(handed);
         }
     }
 }
