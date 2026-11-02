@@ -861,6 +861,12 @@ final class DeliveryLanes {
         return true;
     }
 
+    /// Whether some lane is inline, so that the thread that reads the connection may run its
+    /// handler; see [#runReading]. A stale answer is harmless, as for runReading.
+    boolean hasInlineLanes() {
+        return inlineLanes > 0;
+    }
+
     /// Runs `events`, the client's events of a read, on the thread that read the connection.
     /// The deliveries that they admit for inline lanes whose dispatchers sleep wait for this
     /// thread, which then runs their handlers in the dispatchers' place, without a lock, so that

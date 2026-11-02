@@ -2040,6 +2040,11 @@ public final class ClientActor implements MqttClient {
         }
 
         @Override
+        public boolean runsHandlersAfterReads() {
+            return lanes.hasInlineLanes();
+        }
+
+        @Override
         public void ended(long generation, Throwable cause) {
             // FIFO termination keeps preceding input and write completions, such as a final
             // CONNACK refusal that arrived just before EOF.

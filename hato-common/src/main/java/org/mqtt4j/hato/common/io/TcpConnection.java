@@ -26,7 +26,7 @@ import static java.util.Objects.requireNonNull;
 /// See [JDK 25 Socket](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/net/Socket.html).
 public final class TcpConnection implements Closeable {
 
-    private static final Duration MAX_CONNECT_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
+    private static final Duration MAX_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
 
     private final Socket socket;
 
@@ -122,7 +122,7 @@ public final class TcpConnection implements Closeable {
     private static int timeoutMillis(Duration connectTimeout) {
         requireNonNull(connectTimeout, "connectTimeout must not be null");
         if (connectTimeout.isZero() || connectTimeout.isNegative()
-                || connectTimeout.compareTo(MAX_CONNECT_TIMEOUT) > 0) {
+                || connectTimeout.compareTo(MAX_TIMEOUT) > 0) {
             throw new IllegalArgumentException(
                     "Connect timeout must be positive and at most 2147483647 milliseconds"
             );
@@ -133,9 +133,29 @@ public final class TcpConnection implements Closeable {
 
     /// Returns the borrowed input stream, for one reader at a time.
     ///
-    /// Reads block until data, EOF, or failure; [#close] can cancel a pending read.
+    /// Reads block until data, EOF, or failure, or until a [#readTimeout(Duration)] expires;
+    /// [#close] can cancel a pending read.
     public InputStream input() {
         return input;
+    }
+
+    /// Bounds how long each later read of [#input()] waits for data: once the timeout expires,
+    /// the read throws a [java.net.SocketTimeoutException] and the connection stays usable.
+    /// Zero, as for a new connection, waits without a bound. A read that already waits keeps
+    /// the bound that it started with. Fractional milliseconds are rounded up, so a positive
+    /// duration never becomes the zero bound.
+    ///
+    /// @throws IllegalArgumentException if the timeout is negative or exceeds
+    ///         [Integer#MAX_VALUE] milliseconds
+    /// @throws IOException if the connection is closed
+    public void readTimeout(Duration timeout) throws IOException {
+        requireNonNull(timeout, "timeout must not be null");
+        if (timeout.isNegative() || timeout.compareTo(MAX_TIMEOUT) > 0) {
+            throw new IllegalArgumentException(
+                    "Read timeout must be between 0 and 2147483647 milliseconds"
+            );
+        }
+        socket.setSoTimeout((int) Math.ceilDiv(timeout.toNanos(), 1_000_000L));
     }
 
     /// Returns the borrowed output stream, for one writer at a time.

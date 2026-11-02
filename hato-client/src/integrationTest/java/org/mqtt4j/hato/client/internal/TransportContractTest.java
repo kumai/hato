@@ -1,13 +1,17 @@
 package org.mqtt4j.hato.client.internal;
 
+import java.io.ByteArrayOutputStream;
+import java.io.FilterInputStream;
 import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
@@ -20,6 +24,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongConsumer;
 import java.util.function.UnaryOperator;
@@ -259,6 +264,70 @@ class TransportContractTest {
             }
         } finally {
             result.completeExceptionally(new IllegalStateException("Test cleanup"));
+        }
+    }
+
+    @ParameterizedTest(name = "{displayName}, {0}")
+    @EnumSource(value = Kind.class, names = {"TCP", "TLS"})
+    void a_platform_reader_whose_reads_time_out_within_a_write_of_the_peer_reads_it_whole(
+            Kind kind
+    ) throws Exception {
+        // Arrange: the only platform reader, whose reads time out after 20 ms and whose counting
+        // never ends, so that the reading stays on it; and a peer whose writes, once it pauses,
+        // leave in three pieces 100 ms apart. A TLS record then arrives split within its 5-byte
+        // header and within its body. The case holds TcpTransport's reading, so only the kinds
+        // built on it run it.
+        var timeouts = new AtomicInteger();
+        TcpTransport.Connector connector = kind.connector();
+        var receiver = new Receiver();
+        try (
+                var server = new PausingServerSocket(kind == Kind.TLS);
+                var sut = new TcpTransport(
+                        "timeouts",
+                        kind.scheme,
+                        new Semaphore(1),
+                        InetAddress::getByName,
+                        (host, address, timeout) -> countingTimeouts(
+                                connector.connect(host, address, timeout),
+                                timeouts
+                        ),
+                        DefaultTimerScheduler.instance,
+                        new PlatformReaders(
+                                1,
+                                new PlatformReaders.Moves(
+                                        Duration.ofDays(1),
+                                        Integer.MAX_VALUE,
+                                        0,
+                                        Duration.ofMillis(20),
+                                        true
+                                )
+                        )
+                )
+        ) {
+            sut.start(kind.endpoint(server.getLocalPort()), Duration.ofSeconds(5), receiver);
+            try (Socket peer = server.acceptPeer()) {
+                assertThat(receiver.events.poll(5, SECONDS)).isEqualTo("connected");
+                var payload = new byte[64];
+                for (int index = 0; index < payload.length; index++) {
+                    payload[index] = (byte) index;
+                }
+                server.pausing = true;
+                timeouts.set(0);
+
+                // Act
+                peer.getOutputStream().write(payload);
+                peer.getOutputStream().flush();
+
+                // Assert: the bytes arrive whole after reads that timed out between the pieces,
+                // and the connection stays open.
+                var received = new ByteArrayOutputStream();
+                while (received.size() < payload.length) {
+                    received.writeBytes(requireNonNull(receiver.bytes.poll(5, SECONDS)));
+                }
+                assertThat(received.toByteArray()).isEqualTo(payload);
+                assertThat(timeouts).hasValueGreaterThanOrEqualTo(2);
+                assertThat(receiver.events).isEmpty();
+            }
         }
     }
 
@@ -814,6 +883,64 @@ class TransportContractTest {
         };
     }
 
+    // Counts the reads of `connection` that time out.
+    private static TcpTransport.Connection countingTimeouts(
+            TcpTransport.Connection connection,
+            AtomicInteger timeouts
+    ) {
+        return new TcpTransport.Connection() {
+            @Override
+            public InputStream input() throws IOException {
+                return new FilterInputStream(connection.input()) {
+                    @Override
+                    public int read(byte[] bytes, int offset, int length) throws IOException {
+                        try {
+                            return super.read(bytes, offset, length);
+                        } catch (SocketTimeoutException timeout) {
+                            timeouts.incrementAndGet();
+                            throw timeout;
+                        }
+                    }
+                };
+            }
+
+            @Override
+            public OutputStream output() throws IOException {
+                return connection.output();
+            }
+
+            @Override
+            public void handshake() throws IOException {
+                connection.handshake();
+            }
+
+            @Override
+            public boolean closesGracefully() {
+                return connection.closesGracefully();
+            }
+
+            @Override
+            public void shutdownOutput() throws IOException {
+                connection.shutdownOutput();
+            }
+
+            @Override
+            public void close() throws IOException {
+                connection.close();
+            }
+
+            @Override
+            public void abort() throws IOException {
+                connection.abort();
+            }
+
+            @Override
+            public void readTimeout(Duration timeout) throws IOException {
+                connection.readTimeout(timeout);
+            }
+        };
+    }
+
     // The default parameters of `context`, verifying the server's name as HTTPS does.
     private static SSLParameters verifyingParameters(SSLContext context) {
         SSLParameters parameters = context.getDefaultSSLParameters();
@@ -952,6 +1079,76 @@ class TransportContractTest {
         @Override
         public void close() throws IOException {
             connection.close();
+        }
+    }
+
+    /// A loopback peer whose larger writes, once `pausing` is set, leave in three pieces, 100 ms
+    /// apart: within the first 23 bytes, which with TLS end inside a record's body after its
+    /// 5-byte header. With TLS, it layers server-side TLS on the sockets that it accepts.
+    private static final class PausingServerSocket extends ServerSocket {
+
+        volatile boolean pausing;
+
+        private final boolean tls;
+
+        PausingServerSocket(boolean tls) throws IOException {
+            super(0, 1, InetAddress.getLoopbackAddress());
+            this.tls = tls;
+            setSoTimeout(5000);
+        }
+
+        /// Waits for the next connection, and completes its TLS handshake where it has TLS.
+        Socket acceptPeer() throws Exception {
+            Socket raw = accept();
+            if (!tls) {
+                return raw;
+            }
+            var secure = (SSLSocket) Tls.serverContext().getSocketFactory().createSocket(
+                    raw,
+                    "localhost",
+                    raw.getPort(),
+                    true
+            );
+            secure.setUseClientMode(false);
+            secure.setSoTimeout(5000);
+            secure.startHandshake();
+            return secure;
+        }
+
+        @Override
+        public Socket accept() throws IOException {
+            var socket = new Socket() {
+                @Override
+                public OutputStream getOutputStream() throws IOException {
+                    OutputStream out = super.getOutputStream();
+                    return new FilterOutputStream(out) {
+                        @Override
+                        public void write(byte[] bytes, int offset, int length)
+                                throws IOException {
+                            if (!pausing || length < 24) {
+                                out.write(bytes, offset, length);
+                                return;
+                            }
+                            out.write(bytes, offset, 3);
+                            pause();
+                            out.write(bytes, offset + 3, 20);
+                            pause();
+                            out.write(bytes, offset + 23, length - 23);
+                        }
+
+                        private void pause() throws IOException {
+                            out.flush();
+                            try {
+                                Thread.sleep(100);
+                            } catch (InterruptedException _) {
+                                throw new InterruptedIOException();
+                            }
+                        }
+                    };
+                }
+            };
+            implAccept(socket);
+            return socket;
         }
     }
 

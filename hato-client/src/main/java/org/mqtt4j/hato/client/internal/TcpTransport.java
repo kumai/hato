@@ -96,27 +96,22 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         default @Nullable GatheringByteChannel channel() {
             return null;
         }
+
+        // Bounds each later read of input(), which then throws SocketTimeoutException and leaves
+        // the connection readable; zero waits without a bound, as a new connection does. A
+        // connection that cannot bound its reads returns from them only with bytes or an end.
+        default void readTimeout(Duration timeout) throws IOException {
+        }
     }
 
     // DNS resolution is not reliably cancellable. Bound active lookups across the JVM;
     // replace the resolver if applications need a stronger per-host cancellation contract.
     private static final Semaphore resolving = new Semaphore(RESOLUTION_LIMIT, true);
 
-    // A virtual thread that waits for its socket is woken by the JDK's poller, a hand-off that
-    // each read pays when it arrives after a pause. On Linux, where the poller runs on virtual
-    // threads too, a connection receiving 20,000 messages a second spent 40 to 60 percent less
-    // CPU per message when a platform thread read it, blocking in the read itself. A platform
-    // thread per connection does not scale, though: with a thousand of them, a message to every
-    // connection took 14 to 50 times as long to reach them all. So, once connected, as many
-    // connections as the JVM has processors read on platform threads of their own, and the
-    // others go on reading on the virtual thread that connected them. The connections that come
-    // up first take them, busy or not; a shared event loop would serve every connection without
-    // either cost. The build's single-carrier suite sets hato.client.platformReaders to 0, so
-    // that it tests virtual readers on one carrier; the property is not a supported setting.
-    private static final Semaphore platformReading = new Semaphore(Integer.getInteger(
-            "hato.client.platformReaders",
-            Runtime.getRuntime().availableProcessors()
-    ));
+    // Once connected, a connection reads on a platform thread of its own while the JVM has one
+    // to spare, and otherwise on the virtual thread that connected it; between reads, the
+    // reading can move between the two kinds. See PlatformReaders.
+    private static final PlatformReaders platformReading = PlatformReaders.forThisJvm();
 
     private final String threadName;
     private final String scheme;
@@ -124,13 +119,14 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     private final Resolver resolver;
     private final Connector connector;
     private final TimerScheduler timer;
-    private final Semaphore platformReadingSlots;
+    private final PlatformReaders platformReaders;
     private final Object callbacks = new Object();
 
     private @Nullable Listener listener;
     private @Nullable Connection connection;
-    // The thread that connects and then reads, or the platform thread that it hands the reading
-    // to once connected.
+    // The thread that connects and then reads, or the thread that the reading moved to since,
+    // which moves it on in turn. Only the reading thread moves it, under callbacks, and never
+    // once closed.
     private @Nullable Thread reader;
     private @Nullable Throwable terminalCause;
     private @Nullable Write pending;
@@ -219,7 +215,7 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             Resolver resolver,
             Connector connector,
             TimerScheduler timer,
-            Semaphore platformReadingSlots
+            PlatformReaders platformReaders
     ) {
         threadName = "hato-" + requireNonNull(clientId, "clientId");
         this.scheme = scheme;
@@ -227,7 +223,7 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         this.resolver = resolver;
         this.connector = connector;
         this.timer = timer;
-        this.platformReadingSlots = platformReadingSlots;
+        this.platformReaders = platformReaders;
     }
 
     @Override
@@ -319,7 +315,10 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                             return;
                         }
                     }
-                    read(socket, receiver);
+                    if (read(socket, receiver)) {
+                        // The reading moved to a thread that ends this worker when it stops.
+                        attached = false;
+                    }
                 } catch (Throwable failure) {
                     terminate(failure);
                 } finally {
@@ -332,36 +331,79 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         }
     }
 
-    /// Caller holds callbacks, once connected. Hands the reading to a platform thread of its own
-    /// while the JVM has one to spare, and returns whether it did; otherwise the caller reads.
+    /// Caller holds callbacks, once connected and still open. Hands the reading to a platform
+    /// thread of its own while the JVM has one to spare, and returns whether it did; otherwise
+    /// the caller reads on.
     private boolean readOnPlatformThread(Connection socket, Listener receiver) {
-        if (!platformReadingSlots.tryAcquire()) {
+        if (!platformReaders.take()) {
             return false;
         }
         Thread platform = Thread.ofPlatform()
                 .daemon()
                 .name(threadName + "-reader")
-                .unstarted(() -> {
-                    try {
-                        read(socket, receiver);
-                    } catch (Throwable failure) {
-                        terminate(failure);
-                    } finally {
-                        // Before onClosed, so that a connection that replaces this one can take
-                        // the slot.
-                        platformReadingSlots.release();
-                        workerEnded();
-                    }
-                });
+                .unstarted(() -> readAfterMove(socket, receiver, true));
         try {
             platform.start();
         } catch (OutOfMemoryError _) {
             // The system refused another thread; the caller reads instead.
-            platformReadingSlots.release();
+            platformReaders.giveBack();
             return false;
         }
         reader = platform;
         return true;
+    }
+
+    /// Caller holds callbacks, on a platform reader of a connection that is still open. Hands
+    /// the reading to a virtual thread and gives the platform thread back, and returns whether it
+    /// did; otherwise the caller reads on.
+    private boolean readOnVirtualThread(Connection socket, Listener receiver) {
+        Thread virtual = Thread.ofVirtual()
+                .name(threadName + "-reader")
+                .unstarted(() -> readAfterMove(socket, receiver, false));
+        try {
+            virtual.start();
+        } catch (OutOfMemoryError _) {
+            // The system refused another thread; the caller reads instead.
+            return false;
+        }
+        platformReaders.giveBack();
+        reader = virtual;
+        return true;
+    }
+
+    /// Runs on a thread that the reading moved to: reads until the reading ends or moves on
+    /// again, and ends the worker unless it moved.
+    private void readAfterMove(Connection socket, Listener receiver, boolean platform) {
+        boolean moved = false;
+        try {
+            moved = read(socket, receiver);
+        } catch (Throwable failure) {
+            terminate(failure);
+        } finally {
+            if (!moved) {
+                if (platform) {
+                    // Before onClosed, so that a connection that replaces this one can take the
+                    // slot.
+                    platformReaders.giveBack();
+                }
+                workerEnded();
+            }
+        }
+    }
+
+    /// Called by the reading thread between reads, with no lock held: moves the reading to a
+    /// platform thread of its own when `toPlatform`, and otherwise to a virtual thread, unless
+    /// the transport has closed; returns whether it did. Once closed, the thread that reads
+    /// reads to the end, which closeGracefully waits for.
+    private boolean moveReading(Connection socket, Listener receiver, boolean toPlatform) {
+        synchronized (callbacks) {
+            if (closed) {
+                return false;
+            }
+            return toPlatform
+                    ? readOnPlatformThread(socket, receiver)
+                    : readOnVirtualThread(socket, receiver);
+        }
     }
 
     private InetAddress resolve(String host, long deadline)
@@ -411,7 +453,9 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         }
     }
 
-    private void read(Connection socket, Listener receiver)
+    /// Reads until the peer ends its stream, which ends the transport, and returns false; or
+    /// moves the reading, between reads, to a thread of the other kind and returns true.
+    private boolean read(Connection socket, Listener receiver)
             throws IOException, InterruptedException {
         var buffer = new byte[FIRST_READ_BUFFER_SIZE];
         InputStream input = socket.input();
@@ -420,57 +464,108 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         BorrowingListener borrower = receiver instanceof BorrowingListener lender ? lender : null;
         // A platform reader holds no carrier that others wait for.
         boolean sharesCarrier = Thread.currentThread().isVirtual();
-        // The time spent on what arrived since the reader last let others run. A read that waits
-        // for the peer frees the carrier, so only the work on the bytes counts.
-        long worked = 0;
-        int count;
-        while ((count = input.read(buffer)) != -1) {
-            long started = System.nanoTime();
-            BorrowingListener lent = null;
-            try {
-                synchronized (callbacks) {
-                    // After a close, keep reading and drop what arrives until the peer ends its
-                    // stream, so that closeGracefully can release a socket that receives nothing.
-                    if (!closed) {
-                        if (borrower != null) {
-                            lent = borrower;
-                            borrower.onBorrowedBytes(buffer, 0, count);
-                        } else {
-                            receiver.onBytes(Arrays.copyOf(buffer, count));
+        // Tells this thread when the reading should move to a thread of the other kind; null
+        // where the platform readers stay with the connections that took them.
+        PlatformReaders.Watch watch = platformReaders.watch(
+                !sharesCarrier,
+                receiver,
+                System.nanoTime()
+        );
+        try {
+            if (watch != null) {
+                // Also clears the bound that a platform reader left behind.
+                socket.readTimeout(watch.readTimeout());
+            }
+            // The time spent on what arrived since the reader last let others run. A read that
+            // waits for the peer frees the carrier, so only the work on the bytes counts.
+            long worked = 0;
+            while (true) {
+                int count;
+                try {
+                    count = input.read(buffer);
+                } catch (SocketTimeoutException timeout) {
+                    // Only a platform reader whose thread may move bounds its reads, to look up
+                    // from a connection that receives nothing; the connection reads on.
+                    if (watch == null || sharesCarrier) {
+                        throw timeout;
+                    }
+                    long now = System.nanoTime();
+                    if (watch.afterTimeout(now)) {
+                        if (moveReading(socket, receiver, false)) {
+                            return true;
+                        }
+                        watch.stay(now);
+                    }
+                    continue;
+                }
+                if (count == -1) {
+                    break;
+                }
+                long started = System.nanoTime();
+                BorrowingListener lent = null;
+                try {
+                    synchronized (callbacks) {
+                        // After a close, keep reading and drop what arrives until the peer ends
+                        // its stream, so that closeGracefully can release a socket that receives
+                        // nothing.
+                        if (!closed) {
+                            if (borrower != null) {
+                                lent = borrower;
+                                borrower.onBorrowedBytes(buffer, 0, count);
+                            } else {
+                                receiver.onBytes(Arrays.copyOf(buffer, count));
+                            }
                         }
                     }
-                }
-            } finally {
-                if (lent != null) {
-                    // Without the lock, where what the listener does may call this transport.
-                    lent.afterBorrowedBytes();
-                }
-            }
-            worked += System.nanoTime() - started;
-            // The listener is done with the bytes, so a read that filled the buffer can double it.
-            if (count == buffer.length && buffer.length < READ_BUFFER_SIZE) {
-                buffer = new byte[buffer.length * 2];
-            }
-            // A pause, which the listener may have asked for, leaves the peer to TCP flow control
-            // until the client resumes. It waits after afterBorrowedBytes, whose work may resume
-            // the reader. Waiting frees the carrier.
-            if (readingPaused) {
-                synchronized (callbacks) {
-                    while (readingPaused && !closed) {
-                        callbacks.wait();
+                } finally {
+                    if (lent != null) {
+                        // Without the lock, where what the listener does may call this transport.
+                        lent.afterBorrowedBytes();
                     }
                 }
-                worked = 0;
+                worked += System.nanoTime() - started;
+                // The listener is done with the bytes, so a read that filled the buffer can
+                // double it.
+                if (count == buffer.length && buffer.length < READ_BUFFER_SIZE) {
+                    buffer = new byte[buffer.length * 2];
+                }
+                // A pause, which the listener may have asked for, leaves the peer to TCP flow
+                // control until the client resumes. It waits after afterBorrowedBytes, whose work
+                // may resume the reader. Waiting frees the carrier.
+                if (readingPaused) {
+                    synchronized (callbacks) {
+                        while (readingPaused && !closed) {
+                            callbacks.wait();
+                        }
+                    }
+                    worked = 0;
+                    if (watch != null) {
+                        watch.restart(System.nanoTime());
+                    }
+                }
+                // The client is done with what this read returned, so another thread can read
+                // next.
+                if (watch != null && watch.afterRead(started)) {
+                    if (moveReading(socket, receiver, sharesCarrier)) {
+                        return true;
+                    }
+                    watch.stay(started);
+                }
+                // A peer that never pauses keeps every read from blocking, and a virtual reader
+                // from freeing its carrier for the writer, the closing worker, and the client, so
+                // the reader parks once its work fills a slice.
+                if (sharesCarrier && CarrierShare.spent(worked)) {
+                    CarrierShare.share();
+                    worked = 0;
+                }
             }
-            // A peer that never pauses keeps every read from blocking, and a virtual reader from
-            // freeing its carrier for the writer, the closing worker, and the client, so the
-            // reader parks once its work fills a slice.
-            if (sharesCarrier && CarrierShare.spent(worked)) {
-                CarrierShare.share();
-                worked = 0;
+        } finally {
+            if (watch != null) {
+                watch.stop();
             }
         }
         terminate(new EOFException("Peer closed the byte stream"));
+        return false;
     }
 
     private void writeSends(FrameWriter writer) {
@@ -650,8 +745,13 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             // the reset can drop what it received but had not read yet, such as a DISCONNECT.
             // So abort only once the reader has read to the end of the peer's stream, which
             // ending the output lets the peer close. For a peer that keeps the connection open,
-            // the grace timer aborts, which ends the reader.
-            requireNonNull(reader).join();
+            // the grace timer aborts, which ends the reader. The reading no longer moves once
+            // closed, so the thread that reads now is the one that reads to the end.
+            Thread last;
+            synchronized (callbacks) {
+                last = requireNonNull(reader);
+            }
+            last.join();
         } catch (Throwable failure) {
             cause.addSuppressed(failure);
         } finally {
@@ -708,6 +808,11 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             @Override
             public @Nullable GatheringByteChannel channel() {
                 return socket.channel();
+            }
+
+            @Override
+            public void readTimeout(Duration timeout) throws IOException {
+                socket.readTimeout(timeout);
             }
         };
     }
@@ -768,6 +873,13 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                 @Override
                 public void abort() throws IOException {
                     tcp.close();
+                }
+
+                // A read that times out keeps what it read of a TLS record, and the next read
+                // goes on with it.
+                @Override
+                public void readTimeout(Duration timeout) throws IOException {
+                    tcp.readTimeout(timeout);
                 }
             };
         } catch (IOException | RuntimeException | Error failure) {
