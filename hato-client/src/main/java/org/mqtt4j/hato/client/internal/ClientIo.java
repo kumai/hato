@@ -117,10 +117,10 @@ final class ClientIo {
     // from 128 KiB to 1 MiB published 13 to 22% faster. Such a send goes alone anyway.
     static final int APART_PAYLOAD_BYTES = 128 * 1024;
 
-    // On a transport that gathers, a payload this small is joined to the headers around it
-    // rather than written where its message keeps it: copying it costs less than another buffer
-    // in the gathering write.
-    static final int JOIN_PAYLOAD_BYTES = 4 * 1024;
+    // On a transport that gathers, a PUBLISH header or payload this small is joined to the arrays
+    // around it rather than written where it lies: copying it costs less than another buffer in
+    // the gathering write. Message properties can make a header as large as any payload.
+    static final int JOIN_BYTES = 4 * 1024;
 
     // Receive capacity counts each property of a received packet with this many bytes beyond
     // the packet's size. Decoded, a User Property takes up to 118 bytes of memory beyond its
@@ -665,7 +665,7 @@ final class ClientIo {
         if (connection.transport instanceof BlockingWriteTransport direct && direct.gathers()) {
             ByteBuffer[] parts = parts(sends);
             // Packets that join into one part, as small ones do, go as one array by the plain
-            // write that they took before; only writes with a large payload gather.
+            // write that they took before; only writes with a large header or payload gather.
             return parts.length == 1
                     ? new Encoded.Whole(parts[0].array())
                     : new Encoded.Gathered(parts);
@@ -683,9 +683,9 @@ final class ClientIo {
         return new Encoded.Whole(encode(sends));
     }
 
-    /// The parts of the one gathering write that carries `sends`: the headers and the payloads
-    /// under [#JOIN_PAYLOAD_BYTES], joined in runs, and each larger payload where its message
-    /// keeps it, so that no such payload is copied on its way out.
+    /// The parts of the one gathering write that carries `sends`: each PUBLISH header or payload
+    /// of at least [#JOIN_BYTES] in the array that holds it, so that no such array is copied on its
+    /// way out, and the smaller ones and the other packets between them joined in runs.
     private ByteBuffer[] parts(List<SendQueue.Send<Outbound>> sends) {
         var parts = new ArrayList<ByteBuffer>();
         var run = new ArrayList<byte[]>();
@@ -706,19 +706,28 @@ final class ClientIo {
             byte[] payload = payloadOf.apply(message);
             log.trace("Write attempt for ticket {}: {} bytes of header and {} of payload",
                     send.ticket(), header.length, payload.length);
-            run.add(header);
-            if (payload.length < JOIN_PAYLOAD_BYTES) {
-                run.add(payload);
-            } else {
-                parts.add(ByteBuffer.wrap(joined(run)));
-                run.clear();
-                parts.add(ByteBuffer.wrap(payload));
-            }
+            add(parts, run, header);
+            add(parts, run, payload);
         }
         if (!run.isEmpty()) {
             parts.add(ByteBuffer.wrap(joined(run)));
         }
         return parts.toArray(ByteBuffer[]::new);
+    }
+
+    /// Adds `array` to the gathering write being made: an array under [#JOIN_BYTES] to the `run`
+    /// of arrays that join into one part, and a larger one to the `parts` as a part of its own,
+    /// after the run joined so far.
+    private static void add(List<ByteBuffer> parts, List<byte[]> run, byte[] array) {
+        if (array.length < JOIN_BYTES) {
+            run.add(array);
+            return;
+        }
+        if (!run.isEmpty()) {
+            parts.add(ByteBuffer.wrap(joined(run)));
+            run.clear();
+        }
+        parts.add(ByteBuffer.wrap(array));
     }
 
     private static boolean withoutPayloads(List<SendQueue.Send<Outbound>> sends) {
