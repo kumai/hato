@@ -1,24 +1,30 @@
-# Hato
+<p align="center">
+  <img src="site/src/assets/seal-hakubun.png" alt="" width="96" height="96">
+</p>
 
-Hato is an MQTT client for Java 25 and later. It supports MQTT 3.1.1 and 5.0 over TCP, TLS,
-and WebSocket, ships as one jar with no runtime dependencies, and uses no reflection or
-bytecode generation.
+<h1 align="center">Hato</h1>
 
-- Operations return [`CompletableFuture`s](hato-client/README.md#working-without-blocking).
-  The handlers that process received messages
-  [run on threads of the client by default, or on your own executors](hato-client/README.md#where-your-code-runs),
-  and may block.
-- The client [reconnects by itself](hato-client/README.md#staying-connected) and subscribes
-  again after each reconnection.
-- A message handler processes one message at a time by default.
-  [Parallel processing, your own executors, handlers that run as part of receiving, hand-off to your own queue, and pull delivery](hato-client/README.md#choosing-how-messages-run)
-  are there when you need them.
+<p align="center">
+  An MQTT client for Java.<br>
+  <a href="https://hato.mqtt4j.org">Website</a> ·
+  <a href="hato-client/README.md">User Guide</a> ·
+  <a href="https://hato.mqtt4j.org/api/client/">API</a> ·
+  <a href="examples/README.md">Examples</a>
+</p>
 
-An embedded in-memory broker and a test kit are separate modules, for local development,
-tests, and device simulators.
+## Features
 
-The [client guide](hato-client/README.md) is the user guide: it takes you from your first
-messages to tuning, and points out the places where the client may surprise you.
+- MQTT 5.0 and 3.1.1, over TCP, TLS, and WebSocket.
+- Java 25 or later, with no runtime dependencies and no reflection.
+- Message handlers may block, and run one message at a time unless you
+  [choose otherwise](hato-client/README.md#choosing-how-messages-run).
+- Operations return `CompletableFuture`s: join one, or chain the next step.
+- The client reconnects and subscribes again by itself.
+- [Stats and timings](hato-client/README.md#watching-the-client) for monitoring are built in.
+- A [test kit](hato-testkit/README.md) tests your code without a broker, including lost
+  connections and timeouts.
+- An [embedded broker](hato-broker/README.md) for local development, tests, and device
+  simulators.
 
 ## Getting it
 
@@ -96,30 +102,26 @@ To try Hato without setting up a broker, clone the repository and run
 
 ## Next steps
 
-Read [How the client works](hato-client/README.md#how-the-client-works) next: the few
-behaviors that shape everything else. The client guide also shows how to:
+The [client guide](hato-client/README.md) is the user guide: it takes you from your first
+messages to tuning, and points out the places where the client may surprise you. Read
+[How the client works](hato-client/README.md#how-the-client-works) first: the few behaviors
+that shape everything else. The guide also shows how to:
 
 - [connect over TLS or WebSocket](hato-client/README.md#connecting-over-tls-or-websocket),
   and [authenticate](hato-client/README.md#authenticating)
 - [choose when messages are acknowledged](hato-client/README.md#choosing-when-to-acknowledge)
-- [process messages in parallel or on your own threads](hato-client/README.md#choosing-how-messages-run)
 - [keep messages flowing when handlers fall behind](hato-client/README.md#keeping-messages-flowing)
 - [reconnect, keep a session, and shut down](hato-client/README.md#staying-connected)
 - [work without blocking](hato-client/README.md#working-without-blocking), and see
   [where your code runs](hato-client/README.md#where-your-code-runs)
-- [watch the client](hato-client/README.md#watching-the-client) through logs, stats, and
-  Micrometer
-- [test your code](hato-client/README.md#testing-your-code) without a broker
 - [troubleshoot](hato-client/README.md#troubleshooting) and
   [tune settings](hato-client/README.md#tuning-the-client)
 
 ## Other guides
 
-| Guide | What you will find |
-| --- | --- |
-| [Embedded broker](hato-broker/README.md) | A broker for local or trusted environments, including its supported features and limitations |
-| [Test kit](hato-testkit/README.md) | Test doubles, connection failures, controlled time, and broker behavior in tests |
-| [Examples](examples/README.md) | Complete programs compiled and checked by the build |
+- [Embedded broker](hato-broker/README.md): A broker for local or trusted environments, including its supported features and limitations
+- [Test kit](hato-testkit/README.md): Test doubles, connection failures, controlled time, and broker behavior in tests
+- [Examples](examples/README.md): Complete programs compiled and checked by the build
 
 ## Contributing
 
