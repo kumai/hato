@@ -15,6 +15,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongFunction;
@@ -117,6 +118,12 @@ public final class ClientActor implements MqttClient {
     private final @Nullable MetricsListener metrics;
 
     private final @Nullable ListenerLane metricsLane;
+
+    // Only the API package creates metrics events; the builder passes their package-private
+    // factories.
+    private final PublishCompletionOf publishCompletionOf;
+
+    private final BiFunction<Subscription, Duration, MetricsListener.DeliveryStart> deliveryStartOf;
 
     // MQTT 3.1.1 cannot carry message properties, so publish() refuses them before admission.
     private final MqttVersion version;
@@ -284,6 +291,8 @@ public final class ClientActor implements MqttClient {
             Function<Packet.Publish, MqttMessage> messageOf,
             Function<MqttMessage, byte[]> payloadOf,
             Function<ClientSnapshot, ClientStats> statsOf,
+            PublishCompletionOf publishCompletionOf,
+            BiFunction<Subscription, Duration, MetricsListener.DeliveryStart> deliveryStartOf,
             ClientLimits limits
     ) {
         this(
@@ -308,6 +317,8 @@ public final class ClientActor implements MqttClient {
                 messageOf,
                 payloadOf,
                 statsOf,
+                publishCompletionOf,
+                deliveryStartOf,
                 limits
         );
     }
@@ -334,6 +345,8 @@ public final class ClientActor implements MqttClient {
             Function<Packet.Publish, MqttMessage> messageOf,
             Function<MqttMessage, byte[]> payloadOf,
             Function<ClientSnapshot, ClientStats> statsOf,
+            PublishCompletionOf publishCompletionOf,
+            BiFunction<Subscription, Duration, MetricsListener.DeliveryStart> deliveryStartOf,
             ClientLimits limits
     ) {
         this.endpoint = endpoint;
@@ -369,6 +382,8 @@ public final class ClientActor implements MqttClient {
                 termination::check
         );
         this.metrics = metrics;
+        this.publishCompletionOf = publishCompletionOf;
+        this.deliveryStartOf = deliveryStartOf;
         metricsLane = metrics == null ? null : new ListenerLane(
                 endpoint,
                 clientId,
@@ -1190,9 +1205,11 @@ public final class ClientActor implements MqttClient {
             return;
         }
         Duration duration = Duration.ofNanos(Math.max(0, now - timing.admittedAt()));
-        MetricsListener.PublishCompletion completion = failure == null
-                ? MetricsListener.PublishCompletion.of(timing.qos(), duration)
-                : MetricsListener.PublishCompletion.of(timing.qos(), failure, duration);
+        MetricsListener.PublishCompletion completion = publishCompletionOf.of(
+                timing.qos(),
+                failure,
+                duration
+        );
         lane.submit(() -> metricsListener.onPublishCompleted(completion));
     }
 
@@ -1213,7 +1230,7 @@ public final class ClientActor implements MqttClient {
         } catch (RuntimeException _) {
             return;
         }
-        var start = MetricsListener.DeliveryStart.of(
+        MetricsListener.DeliveryStart start = deliveryStartOf.apply(
                 subscription,
                 Duration.ofNanos(Math.max(0, now - receivedAt))
         );
@@ -2384,6 +2401,18 @@ public final class ClientActor implements MqttClient {
                         });
             }
         });
+    }
+
+    /// Creates the completion of a publication, which only the API package can do: the builder
+    /// passes the package-private factory of [MetricsListener.PublishCompletion].
+    @FunctionalInterface
+    public interface PublishCompletionOf {
+
+        MetricsListener.PublishCompletion of(
+                Qos qos,
+                @Nullable Throwable failure,
+                Duration duration
+        );
     }
 
     /// A timed publication's QoS and the time the client admitted it.

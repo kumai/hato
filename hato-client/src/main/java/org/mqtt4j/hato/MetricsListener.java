@@ -61,32 +61,11 @@ public interface MetricsListener {
             this.duration = duration;
         }
 
-        /// {@return the completion of a publication at `qos` that succeeded `duration` after its
-        /// admission}
-        ///
-        /// @param qos
-        ///   the QoS that the publication was sent with
-        /// @param duration
-        ///   the time from the publication's admission to the completion of its future
-        /// @throws IllegalArgumentException
-        ///   if `duration` is negative
-        public static PublishCompletion of(Qos qos, Duration duration) {
-            return new PublishCompletion(qos, null, duration);
-        }
-
-        /// {@return the completion of a publication at `qos` whose future failed with `failure`,
-        /// `duration` after its admission}
-        ///
-        /// @param qos
-        ///   the QoS that the publication was sent with
-        /// @param failure
-        ///   the exception with which the publication's future failed
-        /// @param duration
-        ///   the time from the publication's admission to the completion of its future
-        /// @throws IllegalArgumentException
-        ///   if `duration` is negative
-        public static PublishCompletion of(Qos qos, Throwable failure, Duration duration) {
-            return new PublishCompletion(qos, requireNonNull(failure, "failure"), duration);
+        /// The completion of a publication at `qos` whose future failed with `failure`, or
+        /// succeeded when it is null, `duration` after its admission. Only the client creates
+        /// completions; the builder hands this to it.
+        static PublishCompletion of(Qos qos, @Nullable Throwable failure, Duration duration) {
+            return new PublishCompletion(qos, failure, duration);
         }
 
         /// {@return the QoS that the publication was sent with}
@@ -143,16 +122,10 @@ public interface MetricsListener {
             this.waited = waited;
         }
 
-        /// {@return the start of a delivery of `subscription` that application code received
-        /// `waited` after the client received its PUBLISH}
-        ///
-        /// @param subscription
-        ///   the subscription whose delivery this is
-        /// @param waited
-        ///   how long the delivery waited after the client received its PUBLISH
-        /// @throws IllegalArgumentException
-        ///   if `waited` is negative
-        public static DeliveryStart of(Subscription subscription, Duration waited) {
+        /// The start of a delivery of `subscription` that application code received `waited`
+        /// after the client received its PUBLISH. Only the client creates starts; the builder
+        /// hands this to it.
+        static DeliveryStart of(Subscription subscription, Duration waited) {
             return new DeliveryStart(subscription, waited);
         }
 

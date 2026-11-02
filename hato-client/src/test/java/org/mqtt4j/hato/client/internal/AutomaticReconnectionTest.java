@@ -1221,6 +1221,8 @@ class AutomaticReconnectionTest {
                 MqttMessageAccess::received,
                 MqttMessageAccess::payloadArray,
                 ClientStatsAccess::of,
+                MetricsListenerAccess::completion,
+                MetricsListenerAccess::start,
                 ClientLimits.DEFAULT
         );
     }

@@ -25,6 +25,7 @@ import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.MetricsListener;
 import org.mqtt4j.hato.MetricsListener.DeliveryStart;
 import org.mqtt4j.hato.MetricsListener.PublishCompletion;
+import org.mqtt4j.hato.MetricsListenerAccess;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttClientBuilder;
 import org.mqtt4j.hato.MqttConnectionLostException;
@@ -94,15 +95,15 @@ class MetricsTest {
             qosTwo.get(5, SECONDS);
 
             // Assert
-            assertThat(poll(completions)).isEqualTo(PublishCompletion.of(
+            assertThat(poll(completions)).isEqualTo(MetricsListenerAccess.completion(
                     Qos.AT_MOST_ONCE,
                     Duration.ZERO
             ));
-            assertThat(poll(completions)).isEqualTo(PublishCompletion.of(
+            assertThat(poll(completions)).isEqualTo(MetricsListenerAccess.completion(
                     Qos.AT_LEAST_ONCE,
                     Duration.ofMillis(5)
             ));
-            assertThat(poll(completions)).isEqualTo(PublishCompletion.of(
+            assertThat(poll(completions)).isEqualTo(MetricsListenerAccess.completion(
                     Qos.EXACTLY_ONCE,
                     Duration.ofMillis(3)
             ));
@@ -127,7 +128,7 @@ class MetricsTest {
             // Assert
             assertThatThrownBy(() -> published.get(5, SECONDS))
                     .hasCauseInstanceOf(MqttConnectionLostException.class);
-            assertThat(poll(completions)).isEqualTo(PublishCompletion.of(
+            assertThat(poll(completions)).isEqualTo(MetricsListenerAccess.completion(
                     Qos.AT_LEAST_ONCE,
                     published.exceptionNow(),
                     Duration.ofMillis(2)
@@ -178,7 +179,8 @@ class MetricsTest {
             }
 
             // Assert: the manual clock stood still, so the delivery waited no time.
-            assertThat(poll(starts)).isEqualTo(DeliveryStart.of(subscription, Duration.ZERO));
+            assertThat(poll(starts))
+                    .isEqualTo(MetricsListenerAccess.start(subscription, Duration.ZERO));
             assertThat(starts.poll(100, MILLISECONDS)).isNull();
         }
     }
@@ -209,9 +211,10 @@ class MetricsTest {
             release.countDown();
 
             // Assert
-            assertThat(poll(starts)).isEqualTo(DeliveryStart.of(subscription, Duration.ZERO));
             assertThat(poll(starts))
-                    .isEqualTo(DeliveryStart.of(subscription, Duration.ofMillis(7)));
+                    .isEqualTo(MetricsListenerAccess.start(subscription, Duration.ZERO));
+            assertThat(poll(starts))
+                    .isEqualTo(MetricsListenerAccess.start(subscription, Duration.ofMillis(7)));
         } finally {
             release.countDown();
         }

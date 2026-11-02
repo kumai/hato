@@ -58,6 +58,7 @@ import org.mqtt4j.hato.DeliveryOptions;
 import org.mqtt4j.hato.DeliveryOptionsAccess;
 import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.FailurePolicy;
+import org.mqtt4j.hato.MetricsListenerAccess;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttConnectException;
@@ -9170,6 +9171,8 @@ class ClientActorTest {
                 MqttMessageAccess::received,
                 MqttMessageAccess::payloadArray,
                 ClientStatsAccess::of,
+                MetricsListenerAccess::completion,
+                MetricsListenerAccess::start,
                 limits
         );
     }

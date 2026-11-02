@@ -18,16 +18,16 @@ class MetricsListenerTest {
     @Test
     void a_successful_completion_preserves_its_values_and_compares_by_value() {
         // Act
-        var sut = PublishCompletion.of(Qos.AT_LEAST_ONCE, Duration.ofMillis(5));
-        var same = PublishCompletion.of(Qos.AT_LEAST_ONCE, Duration.ofMillis(5));
+        var sut = PublishCompletion.of(Qos.AT_LEAST_ONCE, null, Duration.ofMillis(5));
+        var same = PublishCompletion.of(Qos.AT_LEAST_ONCE, null, Duration.ofMillis(5));
 
         // Assert
         assertThat(sut.qos()).isEqualTo(Qos.AT_LEAST_ONCE);
         assertThat(sut.failure()).isEmpty();
         assertThat(sut.duration()).isEqualTo(Duration.ofMillis(5));
         assertThat(sut).isEqualTo(same).hasSameHashCodeAs(same)
-                .isNotEqualTo(PublishCompletion.of(Qos.EXACTLY_ONCE, Duration.ofMillis(5)))
-                .isNotEqualTo(PublishCompletion.of(Qos.AT_LEAST_ONCE, Duration.ofMillis(6)));
+                .isNotEqualTo(PublishCompletion.of(Qos.EXACTLY_ONCE, null, Duration.ofMillis(5)))
+                .isNotEqualTo(PublishCompletion.of(Qos.AT_LEAST_ONCE, null, Duration.ofMillis(6)));
         assertThat(sut.toString())
                 .contains("qos=AT_LEAST_ONCE", "failure=null", "duration=PT0.005S");
     }
@@ -49,7 +49,7 @@ class MetricsListenerTest {
                         new MqttConnectionLostException(),
                         Duration.ZERO
                 ))
-                .isNotEqualTo(PublishCompletion.of(Qos.AT_MOST_ONCE, Duration.ZERO));
+                .isNotEqualTo(PublishCompletion.of(Qos.AT_MOST_ONCE, null, Duration.ZERO));
         assertThat(sut.toString()).contains("failure=" + failure);
     }
 
@@ -82,7 +82,7 @@ class MetricsListenerTest {
 
         // Act & Assert
         assertThatIllegalArgumentException()
-                .isThrownBy(() -> PublishCompletion.of(Qos.AT_LEAST_ONCE, negative));
+                .isThrownBy(() -> PublishCompletion.of(Qos.AT_LEAST_ONCE, null, negative));
         assertThatIllegalArgumentException().isThrownBy(() -> PublishCompletion.of(
                 Qos.AT_LEAST_ONCE,
                 new MqttConnectionLostException(),
@@ -100,9 +100,7 @@ class MetricsListenerTest {
 
         // Act & Assert
         assertThatNullPointerException()
-                .isThrownBy(() -> PublishCompletion.of(Qos.AT_LEAST_ONCE, null, Duration.ZERO));
-        assertThatNullPointerException()
-                .isThrownBy(() -> PublishCompletion.of(null, Duration.ZERO));
+                .isThrownBy(() -> PublishCompletion.of(null, null, Duration.ZERO));
         assertThatNullPointerException()
                 .isThrownBy(() -> DeliveryStart.of(subscription, null));
         assertThatNullPointerException()
