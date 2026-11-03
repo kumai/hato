@@ -13,7 +13,7 @@ import org.mqtt4j.hato.broker.internal.common.value.Qos;
 
 // One publication on its way to one session, sized for the session's protocol version. The
 // packet identifier and whether it was sent belong to routing.
-final class Delivery implements Outgoing {
+final class Delivery implements Outgoing, Pending {
 
     private final Packet.Publish publication;
 

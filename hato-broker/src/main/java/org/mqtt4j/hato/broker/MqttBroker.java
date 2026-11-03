@@ -81,10 +81,12 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// stops reading from it until there is room for the next response, rather than closing its
 /// connection. QoS 1/2 deliveries wait when unacknowledged deliveries reach their count or size
 /// limit. Deliveries also wait while a subscriber's connection is slow to accept data. The
-/// number and total size of waiting deliveries are bounded; the retained messages sent to a new
-/// subscription wait among them. A subscriber that falls further behind misses deliveries,
-/// whatever their QoS, while its connection and session go on. A delivery too large for the
-/// broker's internal size limits does not reach its subscriber either.
+/// number and total size of waiting deliveries are bounded, and a subscriber that falls further
+/// behind misses deliveries, whatever their QoS, while its connection and session go on. The
+/// retained messages for a new subscription wait apart from them, so the subscription receives
+/// every retained message that it matches. Those still waiting go when the client unsubscribes,
+/// and a client that keeps subscribing faster than it takes them misses the oldest. A delivery
+/// too large for the broker's internal size limits does not reach its subscriber either.
 /// A new persistent session is refused with Server unavailable when the
 /// persistent-session limit is reached. The number and total size of retained messages are
 /// bounded too: a retained publication beyond either limit is delivered but not kept, which

@@ -87,15 +87,21 @@ final class Session {
     // so the 16-bit identifier space bounds it to 16 KiB.
     final BitSet received = new BitSet();
 
-    // The deliveries that wait for the window or for room in the connection's send queue, in the
-    // order they arrived. QoS 0 deliveries and acknowledged ones count against rooms of their
-    // own, each as large as the queue limits, so that QoS 0 deliveries that a client falls behind
-    // on cannot push out acknowledged ones.
-    private final ArrayDeque<Delivery> pending = new ArrayDeque<>();
+    // What waits for the window or for room in the connection's send queue, in the order it came:
+    // deliveries, and the cursors of the retained messages that new subscriptions matched. QoS 0
+    // deliveries and acknowledged ones count against rooms of their own, each as large as the
+    // queue limits, so that QoS 0 deliveries that a client falls behind on cannot push out
+    // acknowledged ones.
+    private final ArrayDeque<Pending> pending = new ArrayDeque<>();
 
     private final Room atMostOnceRoom = new Room();
 
     private final Room acknowledgedRoom = new Room();
+
+    // The retained messages that the cursors still hold. Their room is as large as the retained
+    // limits, so that one subscription can take everything that the broker retains, while the
+    // cursors of a client that subscribes again and again without taking them never hold more.
+    private final Room retainedRoom = new Room();
 
     // Whether the session has logged a dropped delivery at warning level yet.
     private boolean dropLogged;
@@ -279,29 +285,63 @@ final class Session {
     // withhold the retained messages of the subscriber's own client: brokers differ here,
     // and Mosquitto and HiveMQ CE send them while EMQX withholds them.
     //
-    // Retained messages take the window and the queue of every other delivery, so a
-    // subscription that matches more of them than those hold loses some of them, like any other
-    // overflow. A deliberate simplification: sending them as the window frees up would lift that
-    // ceiling.
+    // They take the window like every other delivery, but wait as one cursor in the queue,
+    // which no delivery queue limit drops, so the subscription receives all of them, however
+    // many it matches. A cursor that still waits for the same filter stays: replacing the
+    // subscription must lose none of its messages, while Retain Handling 0 sends the retained
+    // ones again [MQTT-3.8.4-3].
     void deliverRetained(Subscribed subscribed) {
         Packet.Subscription subscription = subscribed.subscription();
         // They result from this subscription alone, and carry its identifier [MQTT-3.3.4-3].
         List<Integer> identifiers = subscribed.identifier() == 0
                 ? List.of()
                 : List.of(subscribed.identifier());
+        var matched = new ArrayList<Routing.Retained>();
         for (Routing.Retained entry : routing.retainedMessages()) {
-            Packet.Publish publication = entry.publication();
-            if (!subscription.filter().matches(publication.topic())) {
-                continue;
+            if (subscription.filter().matches(entry.publication().topic())) {
+                matched.add(entry);
+                retainedRoom.add(entry.byteCount());
             }
-            // The connection ended and took a session without expiry with it; the rest would
-            // only fill a dead one.
-            if (routing.sessions.get(clientId) != this) {
-                return;
-            }
-            int level = Math.min(subscription.qos().level(), publication.qos().level());
-            deliver(publication, entry.received(), Qos.of(level), true, identifiers);
         }
+        if (matched.isEmpty()) {
+            return;
+        }
+        pending.addLast(new RetainedCursor(subscription, identifiers, matched, version));
+        dropOldestRetained();
+        drain();
+    }
+
+    // Drops the oldest retained messages that the cursors hold until their room holds its limits
+    // again. The newest cursor holds part of what the broker retains and fits the room alone, so
+    // only older cursors lose any, which takes SUBSCRIBEs faster than the client takes their
+    // retained messages.
+    private void dropOldestRetained() {
+        for (Pending queued : pending) {
+            if (queued instanceof RetainedCursor cursor) {
+                while (retainedOverflows() && cursor.hasNext()) {
+                    retainedRoom.remove(cursor.advance());
+                    dropped("its retained messages wait beyond what the broker retains");
+                }
+            }
+        }
+    }
+
+    // Drops the retained messages that still wait for `filter`, which the client unsubscribed
+    // from: the broker need not deliver what it holds for the subscription any more
+    // [MQTT-3.10.4-3].
+    void dropRetained(TopicFilter filter) {
+        Iterator<Pending> queued = pending.iterator();
+        while (queued.hasNext()) {
+            if (queued.next() instanceof RetainedCursor cursor && cursor.filter.equals(filter)) {
+                queued.remove();
+                retainedRoom.remove(cursor.remainingCount(), cursor.remainingBytes());
+            }
+        }
+    }
+
+    private boolean retainedOverflows() {
+        return retainedRoom.count > settings.maxRetained()
+                || retainedRoom.bytes > settings.maxRetainedBytes();
     }
 
     private void deliver(
@@ -327,14 +367,13 @@ final class Session {
             return;
         }
         // A frame that can never fit must not block the head indefinitely, so it goes alone.
-        if (delivery.byteCount > settings.sendBytes()
-                || (qos != Qos.AT_MOST_ONCE && delivery.byteCount > settings.maxInflightBytes())) {
+        if (neverFits(delivery)) {
             dropped("it is larger than the send window");
             return;
         }
         pending.addLast(delivery);
         Room room = roomOf(delivery);
-        room.add(delivery);
+        room.add(delivery.byteCount);
         drain();
         if (!overflows(room)) {
             return;
@@ -344,7 +383,7 @@ final class Session {
         if (delivery.byteCount > settings.maxQueuedBytes()) {
             // It would never fit, so it goes alone rather than with the older ones.
             pending.removeLast();
-            room.remove(delivery);
+            room.remove(delivery.byteCount);
             dropped("it is larger than the delivery queue");
             return;
         }
@@ -359,15 +398,21 @@ final class Session {
     // which its limits keep short; a queue for each kind, merged by arrival as they are sent,
     // would make it constant if the limits grow.
     private void dropOldest(Room room) {
-        Iterator<Delivery> queued = pending.iterator();
+        Iterator<Pending> queued = pending.iterator();
         while (overflows(room) && queued.hasNext()) {
-            Delivery oldest = queued.next();
-            if (roomOf(oldest) == room) {
+            if (queued.next() instanceof Delivery oldest && roomOf(oldest) == room) {
                 queued.remove();
-                room.remove(oldest);
+                room.remove(oldest.byteCount);
                 dropped("its delivery queue is full");
             }
         }
+    }
+
+    // Whether `delivery` is larger than the send queue or, if acknowledged, the window ever takes.
+    private boolean neverFits(Delivery delivery) {
+        return delivery.byteCount > settings.sendBytes()
+                || (delivery.qos != Qos.AT_MOST_ONCE
+                        && delivery.byteCount > settings.maxInflightBytes());
     }
 
     private Room roomOf(Delivery delivery) {
@@ -445,18 +490,39 @@ final class Session {
         // timer each, so they keep their place in the queue limits until the queue moves; a timer
         // would release them at once, if productization needs that.
         long now = settings.scheduler().nanoTime();
-        Delivery delivery;
-        while ((delivery = pending.peekFirst()) != null) {
-            if (delivery.expired(now)) {
+        Pending head;
+        while ((head = pending.peekFirst()) != null) {
+            Delivery delivery = switch (head) {
+                case Delivery queued -> queued;
+                case RetainedCursor cursor -> cursor.current();
+            };
+            // The cursor has sent all of its retained messages.
+            if (delivery == null) {
                 pending.removeFirst();
-                roomOf(delivery).remove(delivery);
                 continue;
             }
-            // A delivery queued for an earlier connection can be larger than this one takes.
-            // It goes as if sent and answered, without an identifier or a place in the window.
+            // A retained QoS 0 message whose connection ended goes, like a queued QoS 0
+            // delivery.
+            if (head instanceof RetainedCursor cursor && cursor.leavesOut(delivery)) {
+                consume(head);
+                continue;
+            }
+            if (delivery.expired(now)) {
+                consume(head);
+                continue;
+            }
+            // A delivery queued for an earlier connection, or a retained one, can be larger than
+            // this one takes. It goes as if sent and answered, without an identifier or a place in
+            // the window.
             if (tooLargeFor(peer, delivery)) {
-                pending.removeFirst();
-                roomOf(delivery).remove(delivery);
+                consume(head);
+                continue;
+            }
+            // A retained message can also be larger than the broker ever sends; a queued delivery
+            // cannot, as it was dropped before it was queued.
+            if (neverFits(delivery)) {
+                consume(head);
+                dropped("it is larger than the send window");
                 continue;
             }
             boolean acknowledged = delivery.qos != Qos.AT_MOST_ONCE;
@@ -477,13 +543,24 @@ final class Session {
                 // An ACK can free the logical window before the writer frees physical space.
                 return;
             }
-            pending.removeFirst();
-            roomOf(delivery).remove(delivery);
+            consume(head);
             if (acknowledged) {
                 inflight.put(delivery.packetId, delivery);
                 inflightBytes += delivery.byteCount;
                 countOutstanding(delivery.packetId);
             }
+        }
+    }
+
+    // Moves the queue past the delivery at `head`: a queued delivery leaves the queue and its
+    // room, and a cursor moves on to its next retained message, which leaves the retained room.
+    private void consume(Pending head) {
+        switch (head) {
+            case Delivery queued -> {
+                pending.removeFirst();
+                roomOf(queued).remove(queued.byteCount);
+            }
+            case RetainedCursor cursor -> retainedRoom.remove(cursor.advance());
         }
     }
 
@@ -590,7 +667,17 @@ final class Session {
         }
         detachedAt = settings.scheduler().nanoTime();
         // QoS 0 belongs to the connection; only acknowledged deliveries survive it.
-        pending.removeIf(delivery -> delivery.qos == Qos.AT_MOST_ONCE);
+        Iterator<Pending> queued = pending.iterator();
+        while (queued.hasNext()) {
+            switch (queued.next()) {
+                case Delivery delivery -> {
+                    if (delivery.qos == Qos.AT_MOST_ONCE) {
+                        queued.remove();
+                    }
+                }
+                case RetainedCursor cursor -> cursor.keepAcknowledgedOnly();
+            }
+        }
         atMostOnceRoom.clear();
     }
 
@@ -606,6 +693,7 @@ final class Session {
         pending.clear();
         atMostOnceRoom.clear();
         acknowledgedRoom.clear();
+        retainedRoom.clear();
         inflightBytes = 0;
         connection = null;
         cancelWill();
@@ -631,21 +719,26 @@ final class Session {
     record Subscribed(Packet.Subscription subscription, int identifier) {
     }
 
-    // The number and bytes of the queued deliveries of one kind.
+    // The number and bytes of what waits of one kind: queued deliveries, or the retained messages
+    // that cursors hold.
     private static final class Room {
 
         int count;
 
         long bytes;
 
-        void add(Delivery delivery) {
+        void add(long size) {
             count++;
-            bytes += delivery.byteCount;
+            bytes += size;
         }
 
-        void remove(Delivery delivery) {
-            count--;
-            bytes -= delivery.byteCount;
+        void remove(long size) {
+            remove(1, size);
+        }
+
+        void remove(int number, long size) {
+            count -= number;
+            bytes -= size;
         }
 
         void clear() {

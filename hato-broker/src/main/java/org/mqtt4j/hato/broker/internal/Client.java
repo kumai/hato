@@ -511,6 +511,7 @@ final class Client {
                 var results = new ArrayList<ReasonCode>();
                 for (TopicFilter filter : request.filters()) {
                     boolean existed = owner.subscriptions.remove(filter) != null;
+                    owner.dropRetained(filter);
                     results.add(
                             existed ? ReasonCode.SUCCESS : ReasonCode.NO_SUBSCRIPTION_EXISTED
                     );
