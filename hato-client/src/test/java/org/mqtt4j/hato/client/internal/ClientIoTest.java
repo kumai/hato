@@ -773,23 +773,11 @@ class ClientIoTest {
             throws Exception {
         // Arrange: a transport that gathers, and publications with small and large payloads.
         var transport = new GatheringTransport();
-        var io = new ClientIo(
-                URI.create("mqtt://localhost"),
-                "io-test",
-                16 * 1024 * 1024,
-                128,
-                0,
-                _ -> transport,
-                events,
-                codec,
-                MqttMessageAccess::payloadArray
-        );
-        batching.add(io);
-        io.open(1, Duration.ofSeconds(30));
+        ClientIo io = gatheringIo(transport, codec);
         var small = MqttMessage.of(new Topic("small"), new byte[] {1, 2}, Qos.AT_MOST_ONCE, false);
         var large = MqttMessage.of(
                 new Topic("large"),
-                new byte[ClientIo.JOIN_PAYLOAD_BYTES],
+                new byte[ClientIo.JOIN_BYTES],
                 Qos.AT_MOST_ONCE,
                 false
         );
@@ -816,6 +804,93 @@ class ClientIoTest {
         byte[] own = MqttMessageAccess.payloadArray(large);
         assertThat(transport.bytes.toByteArray()).isEqualTo(expected.toByteArray());
         assertThat(transport.arrays).anySatisfy(array -> assertThat(array).isSameAs(own));
+    }
+
+    @Test
+    void a_transport_that_gathers_gets_a_large_header_apart_from_a_small_payload() {
+        // Arrange: Correlation Data makes the header as large as a payload that leaves apart.
+        PacketCodec mqtt5 = PacketCodec.of(MqttVersion.V5);
+        var transport = new GatheringTransport();
+        ClientIo sut = gatheringIo(transport, mqtt5);
+        MqttMessage message = withHeaderOf(mqtt5, ClientIo.JOIN_BYTES);
+
+        // Act
+        assertThat(sut.publish(1, 1, message, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+
+        // Assert: the header leaves without being copied to join the message's own payload.
+        await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
+        assertThat(transport.arrays).hasSize(2);
+        assertThat(transport.arrays.getFirst()).hasSize(ClientIo.JOIN_BYTES);
+        assertThat(transport.arrays.getLast()).isSameAs(MqttMessageAccess.payloadArray(message));
+        assertThat(transport.bytes.toByteArray()).isEqualTo(encoded(mqtt5, message));
+    }
+
+    @Test
+    void a_header_below_the_join_size_still_leaves_with_a_small_payload_in_one_array() {
+        // Arrange
+        PacketCodec mqtt5 = PacketCodec.of(MqttVersion.V5);
+        var transport = new GatheringTransport();
+        ClientIo sut = gatheringIo(transport, mqtt5);
+        MqttMessage message = withHeaderOf(mqtt5, ClientIo.JOIN_BYTES - 1);
+
+        // Act
+        assertThat(sut.publish(1, 1, message, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
+
+        // Assert
+        await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
+        assertThat(transport.arrays).hasSize(1);
+        assertThat(transport.arrays.getFirst()).isEqualTo(encoded(mqtt5, message));
+    }
+
+    /// A client I/O whose one connection gathers the parts of its writes, opened, which writes
+    /// one send at a time.
+    private ClientIo gatheringIo(GatheringTransport transport, PacketCodec codec) {
+        var io = new ClientIo(
+                URI.create("mqtt://localhost"),
+                "io-test",
+                16 * 1024 * 1024,
+                128,
+                0,
+                _ -> transport,
+                events,
+                codec,
+                MqttMessageAccess::payloadArray
+        );
+        batching.add(io);
+        io.open(1, Duration.ofSeconds(30));
+        return io;
+    }
+
+    /// A QoS 0 message with a 16-byte payload whose PUBLISH header takes `headerSize` bytes in
+    /// `codec`, nearly all of them its Correlation Data.
+    private static MqttMessage withHeaderOf(PacketCodec codec, int headerSize) {
+        var plain = MqttMessage.of(new Topic("large"), new byte[16], Qos.AT_MOST_ONCE, false);
+        // A header with `headerSize` bytes of Correlation Data has length prefixes as wide as the
+        // result's, so its other fields take as many bytes.
+        byte[] probe = codec.encodePublishHeader(
+                plain.topic(),
+                plain.qos(),
+                plain.retain(),
+                false,
+                0,
+                MessageProperties.of(plain.withCorrelationData(new byte[headerSize])),
+                plain.payloadSize()
+        );
+        int otherFields = probe.length - headerSize;
+        return plain.withCorrelationData(new byte[headerSize - otherFields]);
+    }
+
+    /// `message` as a QoS 0 PUBLISH in `codec`.
+    private static byte[] encoded(PacketCodec codec, MqttMessage message) {
+        return codec.encode(new Packet.Publish(
+                message.topic(),
+                MqttMessageAccess.payloadArray(message),
+                message.qos(),
+                message.retain(),
+                false,
+                0,
+                MessageProperties.of(message)
+        ));
     }
 
     @Test
