@@ -276,15 +276,23 @@ class BrokerRoutingTest {
     }
 
     @Test
-    void a_delivery_larger_than_the_send_byte_budget_disconnects_its_subscriber() throws Exception {
+    void a_delivery_larger_than_the_send_byte_budget_is_dropped_and_its_subscriber_stays()
+            throws Exception {
         try (var sut = limitedBroker(64, 128);
                 var subscriber = connected(sut.port(), "subscriber");
                 var publisher = connected(sut.port(), "publisher")) {
+            // Arrange
             subscriber.subscribe("bounded", AT_MOST_ONCE);
-            // A single oversized frame deterministically exceeds capacity without filling
+
+            // Act: a single oversized frame deterministically exceeds capacity without filling
             // kernel socket buffers or depending on when the writer is scheduled.
             publisher.publish("bounded", "x".repeat(128), AT_LEAST_ONCE, 7);
-            subscriber.expectClosed();
+            publisher.publish("bounded", "fits", AT_LEAST_ONCE, 7);
+
+            // Assert
+            assertThat(subscriber.expect(Packet.Publish.class))
+                    .isEqualTo(publication("bounded", "fits", AT_MOST_ONCE, 0));
+            subscriber.ping();
             publisher.ping();
         }
     }

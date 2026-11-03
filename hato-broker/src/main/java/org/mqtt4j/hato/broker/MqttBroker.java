@@ -57,11 +57,11 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// identifiers of the subscriptions that receive that copy. A delivery keeps the identifiers that
 /// it was matched with even if the subscription is made again before it is sent. A Will with a Will
 /// Delay Interval waits that many seconds after its connection ends, unless the session ends first:
-/// at once for a session without expiry, and otherwise as the Session Expiry Interval passes, as
-/// the broker discards the session, or as a connection with the same client identifier starts a new
-/// session. A connection that resumes the session within the delay, also by taking over, cancels
-/// the Will. The properties of a Will, except the delay, reach MQTT 5.0 subscribers as publication
-/// properties, and its Message Expiry Interval counts from its publication. By default, CONNACK
+/// at once for a session without expiry, and otherwise as the Session Expiry Interval passes, or as
+/// a connection with the same client identifier starts a new session. A connection that resumes
+/// the session within the delay, also by taking over, cancels the Will. The properties of a
+/// Will, except the delay, reach MQTT 5.0 subscribers as publication properties, and its Message
+/// Expiry Interval counts from its publication. By default, CONNACK
 /// announces only that shared subscriptions are not supported, and a Topic Alias Maximum of 16: the
 /// aliases that a client sets last for its connection. A test can make the broker announce smaller
 /// limits with the test kit's `BrokerControls`, and the broker then holds clients to them; the test
@@ -82,10 +82,9 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// connection. QoS 1/2 deliveries wait when unacknowledged deliveries reach their count or size
 /// limit. Deliveries also wait while a subscriber's connection is slow to accept data. The
 /// number and total size of waiting deliveries are bounded; the retained messages sent to a new
-/// subscription wait among them. Exceeding either limit discards that session and closes its
-/// connection, if any; its next connection has Session Present false. A delivery too large for
-/// the broker's internal size limits also discards its target session, even an otherwise empty
-/// one.
+/// subscription wait among them. A subscriber that falls further behind misses deliveries,
+/// whatever their QoS, while its connection and session go on. A delivery too large for the
+/// broker's internal size limits does not reach its subscriber either.
 /// A new persistent session is refused with Server unavailable when the
 /// persistent-session limit is reached. The number and total size of retained messages are
 /// bounded too: a retained publication beyond either limit is delivered but not kept, which

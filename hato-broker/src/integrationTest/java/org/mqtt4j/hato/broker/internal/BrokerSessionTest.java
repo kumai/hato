@@ -179,75 +179,117 @@ class BrokerSessionTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
-    void overflowing_count_or_bytes_discards_only_the_target_session(
-            boolean offline,
+    @ValueSource(booleans = {false, true})
+    void a_connected_subscriber_that_falls_behind_loses_its_oldest_queued_delivery(
             boolean byteLimit
     ) throws Exception {
-        long bytes = codec.encode(publication("bounded", "0001", AT_LEAST_ONCE, 1)).length;
-        try (BrokerServer sut = broker(1, 1024, byteLimit ? 16 : 2,
-                byteLimit ? 2 * bytes : 1024, 8);
-                RawSession previous = connected(sut.port(), "bounded-client", false, false);
-                RawSession unaffected = connected(sut.port(), "unaffected");
+        try (BrokerServer sut = boundedBroker(byteLimit);
+                RawSession subscriber = connected(sut.port(), "bounded-client", false, false);
                 RawSession publisher = connected(sut.port(), "publisher")) {
-            previous.subscribe("bounded", AT_LEAST_ONCE);
-            unaffected.subscribe("bounded", AT_MOST_ONCE);
-            if (offline) {
-                previous.disconnect();
-            } else {
-                publisher.publish("bounded", "held", AT_LEAST_ONCE, 7);
-                expectDelivery(previous, "bounded", "held");
-                assertThat(unaffected.expect(Packet.Publish.class))
-                        .isEqualTo(publication("bounded", "held", AT_MOST_ONCE, 0));
-            }
-            for (String payload : List.of("0001", "0002")) {
-                publisher.publish("bounded", payload, AT_LEAST_ONCE, 7);
-                assertThat(unaffected.expect(Packet.Publish.class))
-                        .isEqualTo(publication("bounded", payload, AT_MOST_ONCE, 0));
-            }
-            if (!offline) {
-                previous.ping();
-            }
+            // Arrange: two deliveries fill the queue behind one that takes the whole window.
+            subscriber.subscribe("bounded", AT_LEAST_ONCE);
+            publisher.publish("bounded", "held", AT_LEAST_ONCE, 7);
+            Packet.Publish held = expectDelivery(subscriber, "bounded", "held");
+            publisher.publish("bounded", "0001", AT_LEAST_ONCE, 7);
+            publisher.publish("bounded", "0002", AT_LEAST_ONCE, 7);
 
+            // Act
             publisher.publish("bounded", "0003", AT_LEAST_ONCE, 7);
 
-            if (!offline) {
-                previous.expectClosed();
-            }
-            assertThat(unaffected.expect(Packet.Publish.class))
-                    .isEqualTo(publication("bounded", "0003", AT_MOST_ONCE, 0));
-            try (RawSession replacement = connected(sut.port(), "bounded-client", false, false)) {
-                publisher.publish("bounded", "after discard", AT_LEAST_ONCE, 7);
-                assertThat(unaffected.expect(Packet.Publish.class))
-                        .isEqualTo(publication("bounded", "after discard", AT_MOST_ONCE, 0));
-                replacement.ping();
-            }
-            unaffected.ping();
+            // Assert: the connection goes on, and the newest deliveries follow the held one.
+            subscriber.ping();
+            acknowledge(subscriber, held);
+            acknowledge(subscriber, expectDelivery(subscriber, "bounded", "0002"));
+            acknowledge(subscriber, expectDelivery(subscriber, "bounded", "0003"));
+            subscriber.ping();
             publisher.ping();
         }
     }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void a_delivery_that_can_never_fit_the_window_discards_the_session(boolean offline)
-            throws Exception {
+    void a_session_that_overflows_while_away_resumes_with_its_newest_deliveries(
+            boolean byteLimit
+    ) throws Exception {
+        try (BrokerServer sut = boundedBroker(byteLimit);
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: two deliveries fill the queue of the session while it is away.
+            try (RawSession previous = connected(sut.port(), "bounded-client", false, false)) {
+                previous.subscribe("bounded", AT_LEAST_ONCE);
+                previous.disconnect();
+            }
+            publisher.publish("bounded", "0001", AT_LEAST_ONCE, 7);
+            publisher.publish("bounded", "0002", AT_LEAST_ONCE, 7);
+
+            // Act
+            publisher.publish("bounded", "0003", AT_LEAST_ONCE, 7);
+
+            // Assert
+            try (RawSession resumed = connected(sut.port(), "bounded-client", false, true)) {
+                acknowledge(resumed, expectDelivery(resumed, "bounded", "0002"));
+                acknowledge(resumed, expectDelivery(resumed, "bounded", "0003"));
+                resumed.ping();
+            }
+            publisher.ping();
+        }
+    }
+
+    @Test
+    void queued_qos_zero_deliveries_cannot_push_out_acknowledged_ones() throws Exception {
+        try (BrokerServer sut = broker(1, 1024, 2, 1024, 8);
+                RawSession subscriber = connected(sut.port(), "mixed-client");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: an acknowledged delivery waits for the window, ahead of QoS 0 ones.
+            subscriber.subscribe("mixed", AT_LEAST_ONCE);
+            publisher.publish("mixed", "held", AT_LEAST_ONCE, 7);
+            Packet.Publish held = expectDelivery(subscriber, "mixed", "held");
+            publisher.publish("mixed", "acknowledged", AT_LEAST_ONCE, 7);
+
+            // Act: one QoS 0 delivery more than the queue holds.
+            for (String payload : List.of("0001", "0002", "0003")) {
+                publisher.publish("mixed", payload, AT_MOST_ONCE, 0);
+            }
+            publisher.ping();
+
+            // Assert
+            acknowledge(subscriber, held);
+            acknowledge(subscriber, expectDelivery(subscriber, "mixed", "acknowledged"));
+            assertThat(subscriber.expect(Packet.Publish.class))
+                    .isEqualTo(publication("mixed", "0002", AT_MOST_ONCE, 0));
+            assertThat(subscriber.expect(Packet.Publish.class))
+                    .isEqualTo(publication("mixed", "0003", AT_MOST_ONCE, 0));
+            subscriber.ping();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void a_delivery_that_can_never_fit_the_window_is_dropped_and_the_session_goes_on(
+            boolean offline
+    ) throws Exception {
         try (BrokerServer sut = broker(2, 32, 4, 1024, 8);
                 RawSession previous = connected(sut.port(), "oversized", false, false);
                 RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange
             previous.subscribe("oversized", AT_LEAST_ONCE);
             if (offline) {
                 previous.disconnect();
             }
 
-            // This fits the pending queue and socket queue, but never the inflight byte window.
+            // Act: this fits the pending queue and socket queue, but never the inflight byte
+            // window.
             publisher.publish("oversized", "x".repeat(64), AT_LEAST_ONCE, 7);
+            publisher.publish("oversized", "small", AT_LEAST_ONCE, 7);
 
-            if (!offline) {
-                previous.expectClosed();
-            }
-            try (RawSession replacement = connected(sut.port(), "oversized", false, false)) {
-                publisher.publish("oversized", "small", AT_LEAST_ONCE, 7);
-                replacement.ping();
+            // Assert: only the delivery that fits arrives, in the same session.
+            if (offline) {
+                try (RawSession resumed = connected(sut.port(), "oversized", false, true)) {
+                    acknowledge(resumed, expectDelivery(resumed, "oversized", "small"));
+                    resumed.ping();
+                }
+            } else {
+                acknowledge(previous, expectDelivery(previous, "oversized", "small"));
+                previous.ping();
             }
             publisher.ping();
         }
@@ -401,6 +443,15 @@ class BrokerSessionTest {
 
     private static BrokerServer broker(int maxInflight) throws IOException {
         return broker(maxInflight, 64 * 1024, 16, 64 * 1024, 16);
+    }
+
+    // A broker whose queue holds two of the equally sized deliveries in these tests, by count or
+    // by bytes, behind a window of one.
+    private static BrokerServer boundedBroker(boolean byteLimit) throws IOException {
+        long bytes = codec.encode(publication("bounded", "0001", AT_LEAST_ONCE, 1)).length;
+        return byteLimit
+                ? broker(1, 1024, 16, 2 * bytes, 8)
+                : broker(1, 1024, 2, 1024, 8);
     }
 
     private static BrokerServer broker(

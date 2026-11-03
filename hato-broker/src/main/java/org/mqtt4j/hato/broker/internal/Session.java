@@ -87,13 +87,22 @@ final class Session {
     // so the 16-bit identifier space bounds it to 16 KiB.
     final BitSet received = new BitSet();
 
+    // The deliveries that wait for the window or for room in the connection's send queue, in the
+    // order they arrived. QoS 0 deliveries and acknowledged ones count against rooms of their
+    // own, each as large as the queue limits, so that QoS 0 deliveries that a client falls behind
+    // on cannot push out acknowledged ones.
     private final ArrayDeque<Delivery> pending = new ArrayDeque<>();
+
+    private final Room atMostOnceRoom = new Room();
+
+    private final Room acknowledgedRoom = new Room();
+
+    // Whether the session has logged a dropped delivery at warning level yet.
+    private boolean dropLogged;
 
     @Nullable Connection connection;
 
     private long inflightBytes;
-
-    private long pendingBytes;
 
     Session(Routing routing, String clientId, MqttVersion version, long expiry) {
         this.routing = routing;
@@ -271,23 +280,22 @@ final class Session {
     // and Mosquitto and HiveMQ CE send them while EMQX withholds them.
     //
     // Retained messages take the window and the queue of every other delivery, so a
-    // subscription that matches more of them than those hold discards the session like any
-    // other overflow. A deliberate simplification: sending them as the window frees up would
-    // lift that ceiling, if productization needs it.
+    // subscription that matches more of them than those hold loses some of them, like any other
+    // overflow. A deliberate simplification: sending them as the window frees up would lift that
+    // ceiling.
     void deliverRetained(Subscribed subscribed) {
         Packet.Subscription subscription = subscribed.subscription();
         // They result from this subscription alone, and carry its identifier [MQTT-3.3.4-3].
         List<Integer> identifiers = subscribed.identifier() == 0
                 ? List.of()
                 : List.of(subscribed.identifier());
-        // A copy, because a delivery that overflows closes the connection, and the Will that
-        // its end publishes can change the retained messages.
         for (Routing.Retained entry : routing.retainedMessages()) {
             Packet.Publish publication = entry.publication();
             if (!subscription.filter().matches(publication.topic())) {
                 continue;
             }
-            // An overflow discarded the session; the rest would only fill a dead one.
+            // The connection ended and took a session without expiry with it; the rest would
+            // only fill a dead one.
             if (routing.sessions.get(clientId) != this) {
                 return;
             }
@@ -312,23 +320,74 @@ final class Session {
             return;
         }
         var delivery = new Delivery(publication, received, qos, retain, identifiers, version);
-        // A connected client that takes no packet this large loses only this delivery, before
-        // the broker's own limits below could discard the whole session.
+        // A connected client that takes no packet this large loses this delivery before it
+        // takes room in the queue.
         Connection current = connection;
         if (current != null && tooLargeFor(current, delivery)) {
             return;
         }
-        // A frame that can never fit must not block the head indefinitely.
+        // A frame that can never fit must not block the head indefinitely, so it goes alone.
         if (delivery.byteCount > settings.sendBytes()
                 || (qos != Qos.AT_MOST_ONCE && delivery.byteCount > settings.maxInflightBytes())) {
-            discard("delivery exceeds send window");
+            dropped("it is larger than the send window");
             return;
         }
         pending.addLast(delivery);
-        pendingBytes += delivery.byteCount;
+        Room room = roomOf(delivery);
+        room.add(delivery);
         drain();
-        if (pending.size() > settings.maxQueued() || pendingBytes > settings.maxQueuedBytes()) {
-            discard("delivery queue full");
+        if (!overflows(room)) {
+            return;
+        }
+        // The room held its limits before this delivery, and draining takes the queue from its
+        // head, so a room that overflows still holds this delivery, last in the queue.
+        if (delivery.byteCount > settings.maxQueuedBytes()) {
+            // It would never fit, so it goes alone rather than with the older ones.
+            pending.removeLast();
+            room.remove(delivery);
+            dropped("it is larger than the delivery queue");
+            return;
+        }
+        dropOldest(room);
+        drain();
+    }
+
+    // Drops the oldest queued deliveries of the kind that `room` counts until it holds its
+    // limits again, so that a client that falls behind gets the newest ones. Deliveries in the
+    // connection's send queue or in flight are on their way and stay. A deliberate
+    // simplification: finding and removing them takes time in proportion to the queue's length,
+    // which its limits keep short; a queue for each kind, merged by arrival as they are sent,
+    // would make it constant if the limits grow.
+    private void dropOldest(Room room) {
+        Iterator<Delivery> queued = pending.iterator();
+        while (overflows(room) && queued.hasNext()) {
+            Delivery oldest = queued.next();
+            if (roomOf(oldest) == room) {
+                queued.remove();
+                room.remove(oldest);
+                dropped("its delivery queue is full");
+            }
+        }
+    }
+
+    private Room roomOf(Delivery delivery) {
+        return (delivery.qos == Qos.AT_MOST_ONCE) ? atMostOnceRoom : acknowledgedRoom;
+    }
+
+    private boolean overflows(Room room) {
+        return room.count > settings.maxQueued() || room.bytes > settings.maxQueuedBytes();
+    }
+
+    // Logs a delivery that the session goes without: the first at warning level, so that the
+    // client that falls behind shows, and later ones at debug level.
+    private void dropped(String cause) {
+        if (!dropLogged) {
+            dropLogged = true;
+            log.warn("Broker on port {} dropped a delivery for client {}: {}; later ones are"
+                    + " logged at debug level", routing.port, clientId, cause);
+        } else {
+            log.debug("Broker on port {} dropped a delivery for client {}: {}",
+                    routing.port, clientId, cause);
         }
     }
 
@@ -390,14 +449,14 @@ final class Session {
         while ((delivery = pending.peekFirst()) != null) {
             if (delivery.expired(now)) {
                 pending.removeFirst();
-                pendingBytes -= delivery.byteCount;
+                roomOf(delivery).remove(delivery);
                 continue;
             }
             // A delivery queued for an earlier connection can be larger than this one takes.
             // It goes as if sent and answered, without an identifier or a place in the window.
             if (tooLargeFor(peer, delivery)) {
                 pending.removeFirst();
-                pendingBytes -= delivery.byteCount;
+                roomOf(delivery).remove(delivery);
                 continue;
             }
             boolean acknowledged = delivery.qos != Qos.AT_MOST_ONCE;
@@ -419,7 +478,7 @@ final class Session {
                 return;
             }
             pending.removeFirst();
-            pendingBytes -= delivery.byteCount;
+            roomOf(delivery).remove(delivery);
             if (acknowledged) {
                 inflight.put(delivery.packetId, delivery);
                 inflightBytes += delivery.byteCount;
@@ -531,13 +590,8 @@ final class Session {
         }
         detachedAt = settings.scheduler().nanoTime();
         // QoS 0 belongs to the connection; only acknowledged deliveries survive it.
-        pending.removeIf(delivery -> {
-            if (delivery.qos == Qos.AT_MOST_ONCE) {
-                pendingBytes -= delivery.byteCount;
-                return true;
-            }
-            return false;
-        });
+        pending.removeIf(delivery -> delivery.qos == Qos.AT_MOST_ONCE);
+        atMostOnceRoom.clear();
     }
 
     // Drops the session state, the Will that waits with it included, which a closing broker
@@ -550,16 +604,16 @@ final class Session {
         outstanding.clear();
         outstandingCount = 0;
         pending.clear();
+        atMostOnceRoom.clear();
+        acknowledgedRoom.clear();
         inflightBytes = 0;
-        pendingBytes = 0;
         connection = null;
         cancelWill();
     }
 
-    // Ends the session, which no connection continues, as its expiry passes or its deliveries
-    // overflow. Its state goes, and a Will that waits with it goes out now, because the session
-    // ends before the delay [MQTT-3.1.2-8]. Discarding it again does nothing. Called under
-    // routing.
+    // Ends the session, which no connection continues, as its expiry passes. Its state goes, and
+    // a Will that waits with it goes out now, because the session ends before the delay
+    // [MQTT-3.1.2-8]. Discarding it again does nothing. Called under routing.
     void discard() {
         if (!routing.sessions.remove(clientId, this)) {
             return;
@@ -571,17 +625,32 @@ final class Session {
         }
     }
 
-    private void discard(String reason) {
-        Connection peer = connection;
-        discard();
-        if (peer != null) {
-            peer.close(reason);
-        }
-    }
-
     // A subscription with the Subscription Identifier that its SUBSCRIBE gave it, or 0, which no
     // identifier takes, for none. Making the subscription again replaces both (MQTT 5.0 section
     // 3.8.4).
     record Subscribed(Packet.Subscription subscription, int identifier) {
+    }
+
+    // The number and bytes of the queued deliveries of one kind.
+    private static final class Room {
+
+        int count;
+
+        long bytes;
+
+        void add(Delivery delivery) {
+            count++;
+            bytes += delivery.byteCount;
+        }
+
+        void remove(Delivery delivery) {
+            count--;
+            bytes -= delivery.byteCount;
+        }
+
+        void clear() {
+            count = 0;
+            bytes = 0;
+        }
     }
 }
