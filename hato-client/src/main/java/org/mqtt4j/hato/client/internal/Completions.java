@@ -3,25 +3,42 @@ package org.mqtt4j.hato.client.internal;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.client.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 
-/// Runs a client's operation completions, independently of I/O, in the order they are submitted.
+/// Runs a client's operation completions, independently of I/O, in the order they are submitted,
+/// on threads that run no other client's completions, so that thread state that one client's
+/// continuations leave behind never reaches another client's.
 ///
-/// One platform thread takes the completions while each returns promptly, so that a stream of
-/// them costs no thread start apiece; starting a virtual thread for each completion made small
-/// publications cost about twice the processor time. A completion whose synchronous
-/// continuations run past the takeover limit while others wait hands those others to a new
-/// thread, so that one blocked continuation delays the other completions by about that limit
-/// and never keeps them from completing. The thread that ran it ends once it returns. A thread
-/// that waits for the idle limit without a completion ends too, and the next completion starts
-/// another.
+/// A virtual thread of the client takes the completions while each returns promptly, and parks
+/// while there are none, so that a stream of them costs no thread start apiece; starting a
+/// virtual thread for each completion made small publications cost about twice the processor
+/// time. On a single carrier, though, a virtual thread runs the completions in turn with the
+/// threads that read and write, and pipelined publications lost about a third of their rate. So
+/// when completions pile up behind the virtual thread, a platform thread of the client takes
+/// them over, which runs beside those threads. At most as many clients as the JVM has
+/// processors hold a platform thread at once, like the platform readers; the others stay on
+/// their virtual threads.
 ///
-/// Both limits are real time, like the blocking that they detect, so the timer here is a real
-/// one rather than the client's TimerScheduler.
+/// A completion whose synchronous continuations run past the takeover limit while others wait
+/// hands those others to a new thread, so that one blocked continuation delays the other
+/// completions by about that limit and never keeps them from completing. The thread that ran it
+/// ends once it returns. A thread that has parked for the idle limit ends too, and gives back
+/// the client's platform thread if it was one; the next completion starts a virtual thread.
+///
+/// Each thread runs with the context class loader of the thread that created the client, which
+/// the client's other threads inherit, and inherits no inheritable thread-local values.
+///
+/// Both limits are real time, like the blocking and the idleness that they detect, so the timer
+/// here is a real one rather than the client's TimerScheduler. A lock rather than this monitor
+/// guards the state, so that a virtual thread that waits for it resumes without the JDK's
+/// unblocker thread.
 final class Completions {
 
     /// How long a running completion may hold up waiting ones before a new thread takes them
@@ -29,10 +46,20 @@ final class Completions {
     /// start for each continuation that merely runs long.
     static final Duration TAKEOVER = Duration.ofMillis(10);
 
-    /// How long a thread waits without a completion before it ends.
+    /// How long a thread parks without a completion before it ends.
     static final Duration IDLE = Duration.ofSeconds(10);
 
+    /// The completions that, waiting behind a virtual thread as it finishes one, have it hand
+    /// them to a platform thread of the client. A client that completes its operations one or a
+    /// few at a time stays on its virtual thread, which costs it less.
+    static final int STREAMING = 8;
+
     private static final Log log = Log.of(Completions.class);
+
+    // The platform threads that all clients may hold at once, one each.
+    private static final Semaphore platformThreads = new Semaphore(
+            Runtime.getRuntime().availableProcessors()
+    );
 
     private final URI endpoint;
 
@@ -47,14 +74,28 @@ final class Completions {
 
     private final long idleNanos;
 
-    // The fields below are guarded by this monitor.
+    // The platform threads that this client draws from: those of all clients, but in tests.
+    private final Semaphore slots;
+
+    // The context class loader of the thread that created the client, which constructs this.
+    private final @Nullable ClassLoader contextLoader;
+
+    private final ReentrantLock lock = new ReentrantLock();
+
+    // The fields below are guarded by the lock.
     private final ArrayDeque<Runnable> waiting = new ArrayDeque<>();
 
     // The thread that takes waiting completions, or null when none runs. A thread that has been
     // replaced finishes its running completion and takes no other.
     private @Nullable Taker active;
 
+    // Whether the client holds one of the platform threads, so that its threads are platform
+    // threads until the last of them ends for idleness.
+    private boolean streaming;
+
     private boolean checkScheduled;
+
+    private boolean idleCheckScheduled;
 
     private int started;
 
@@ -66,40 +107,77 @@ final class Completions {
             Duration takeover,
             Duration idle
     ) {
+        this(endpoint, clientId, threadName, timer, takeover, idle, platformThreads);
+    }
+
+    Completions(
+            URI endpoint,
+            String clientId,
+            String threadName,
+            Timer timer,
+            Duration takeover,
+            Duration idle,
+            Semaphore slots
+    ) {
         this.endpoint = endpoint;
         this.clientId = clientId;
         this.threadName = threadName;
         this.timer = timer;
         this.takeoverNanos = takeover.toNanos();
         this.idleNanos = idle.toNanos();
+        this.slots = slots;
+        contextLoader = Thread.currentThread().getContextClassLoader();
     }
 
     /// Queues `completion` behind the earlier ones, and starts a thread to run it if none runs.
-    synchronized void submit(Runnable completion) {
-        waiting.addLast(completion);
-        Taker taker = active;
-        if (taker == null) {
-            start();
-        } else if (taker.idle) {
-            notifyAll();
-        } else {
-            scheduleCheck(taker);
+    void submit(Runnable completion) {
+        Thread parked = queue(completion);
+        if (parked != null) {
+            // Woken once the lock is free, so that it does not wait for the lock at once.
+            LockSupport.unpark(parked);
         }
     }
 
-    // Caller holds this monitor. Starts a thread that takes the waiting completions from now on.
-    private void start() {
-        var taker = new Taker();
-        active = taker;
-        Thread.ofPlatform()
-                .daemon()
-                .name(threadName + started++)
-                .start(() -> run(taker));
+    // Queues `completion`, and returns the thread to wake if the one that takes completions
+    // has parked.
+    private @Nullable Thread queue(Runnable completion) {
+        lock.lock();
+        try {
+            waiting.addLast(completion);
+            Taker taker = active;
+            if (taker == null) {
+                start(streaming);
+                return null;
+            }
+            if (taker.parked) {
+                taker.parked = false;
+                return taker.thread;
+            }
+            scheduleCheck(taker);
+            return null;
+        } finally {
+            lock.unlock();
+        }
     }
 
-    // Caller holds this monitor. While `taker` runs a completion that others wait behind,
+    // Caller holds the lock. Starts a thread of the client, a platform one if `platform`, that
+    // takes the waiting completions from now on. A thread that the JVM cannot start leaves the
+    // current one in charge.
+    private void start(boolean platform) {
+        var taker = new Taker(platform);
+        Thread.Builder builder = platform ? Thread.ofPlatform().daemon() : Thread.ofVirtual();
+        Thread thread = builder.name(threadName + started++)
+                .inheritInheritableThreadLocals(false)
+                .unstarted(() -> run(taker));
+        thread.setContextClassLoader(contextLoader);
+        taker.thread = thread;
+        thread.start();
+        active = taker;
+    }
+
+    // Caller holds the lock. While `taker` runs a completion that others wait behind,
     // schedules one check of whether that completion has run past the takeover limit. The
-    // timer may run the check at once, which then holds this monitor again on this thread.
+    // timer may run the check at once, which then takes the lock again on this thread.
     private void scheduleCheck(Taker taker) {
         if (checkScheduled || !taker.running || waiting.isEmpty()) {
             return;
@@ -109,18 +187,59 @@ final class Completions {
         timer.schedule(Duration.ofNanos(Math.max(takeoverNanos - ran, 0)), this::check);
     }
 
-    private synchronized void check() {
-        checkScheduled = false;
-        Taker taker = active;
-        if (taker == null || !taker.running || waiting.isEmpty()) {
-            return;
+    private void check() {
+        lock.lock();
+        try {
+            checkScheduled = false;
+            Taker taker = active;
+            if (taker == null || !taker.running || waiting.isEmpty()) {
+                return;
+            }
+            if (timer.nanoTime() - taker.since >= takeoverNanos) {
+                // The running completion holds up the waiting ones, so a new thread takes them.
+                start(streaming);
+            } else {
+                // A later completion has started since the check was scheduled.
+                scheduleCheck(taker);
+            }
+        } finally {
+            lock.unlock();
         }
-        if (timer.nanoTime() - taker.since >= takeoverNanos) {
-            // The running completion holds up the waiting ones, so a new thread takes them.
-            start();
-        } else {
-            // A later completion has started since the check was scheduled.
-            scheduleCheck(taker);
+    }
+
+    // Caller holds the lock. Unless one is pending, schedules a check, after `delayNanos`, of
+    // whether the parked thread has parked for the idle limit.
+    private void scheduleIdleCheck(long delayNanos) {
+        if (!idleCheckScheduled) {
+            idleCheckScheduled = true;
+            timer.schedule(Duration.ofNanos(delayNanos), this::idleCheck);
+        }
+    }
+
+    private void idleCheck() {
+        lock.lock();
+        try {
+            idleCheckScheduled = false;
+            Taker taker = active;
+            if (taker == null || !taker.parked) {
+                // A thread that runs a completion schedules another check when it parks.
+                return;
+            }
+            long parkedFor = timer.nanoTime() - taker.parkedSince;
+            if (parkedFor < idleNanos) {
+                scheduleIdleCheck(idleNanos - parkedFor);
+                return;
+            }
+            // The thread ends once it wakes, and the next completion starts a virtual one.
+            active = null;
+            if (streaming) {
+                streaming = false;
+                slots.release();
+            }
+            taker.parked = false;
+            LockSupport.unpark(taker.thread);
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -141,46 +260,81 @@ final class Completions {
         }
     }
 
-    // The next completion for `self`, waiting for one while there is none, or null once `self`
-    // has been replaced or has waited for the idle limit.
-    private synchronized @Nullable Runnable next(Taker self) {
-        self.running = false;
-        long idleSince = timer.nanoTime();
-        while (active == self) {
-            Runnable completion = waiting.pollFirst();
-            if (completion != null) {
-                self.running = true;
-                self.since = timer.nanoTime();
-                scheduleCheck(self);
-                return completion;
+    // The next completion for `self`, parking while there is none, or null once `self` has been
+    // replaced or has parked for the idle limit.
+    private @Nullable Runnable next(Taker self) {
+        lock.lock();
+        try {
+            self.running = false;
+            while (active == self) {
+                if (!self.platform
+                        && !self.platformFailed
+                        && waiting.size() >= STREAMING
+                        && slots.tryAcquire()) {
+                    // The completions pile up, so a platform thread of the client takes them.
+                    try {
+                        start(true);
+                        streaming = true;
+                        return null;
+                    } catch (OutOfMemoryError failure) {
+                        // The JVM could not start another thread, so this one goes on.
+                        slots.release();
+                        self.platformFailed = true;
+                        log.warn("Completing operations for {} at {} stays on a virtual thread",
+                                clientId, endpoint, failure);
+                    }
+                }
+                Runnable completion = waiting.pollFirst();
+                if (completion != null) {
+                    self.running = true;
+                    self.since = timer.nanoTime();
+                    scheduleCheck(self);
+                    return completion;
+                }
+                self.parked = true;
+                self.parkedSince = timer.nanoTime();
+                scheduleIdleCheck(idleNanos);
+                lock.unlock();
+                try {
+                    LockSupport.park(this);
+                } finally {
+                    lock.lock();
+                }
+                self.parked = false;
+                // Park returns at once while the interrupt status is set, which only a
+                // continuation can have set, so clear it before parking again.
+                boolean _ = Thread.interrupted();
             }
-            long left = idleNanos - (timer.nanoTime() - idleSince);
-            if (left <= 0) {
-                active = null;
-                return null;
-            }
-            self.idle = true;
-            try {
-                wait(Math.max(left / 1_000_000, 1));
-            } catch (InterruptedException _) {
-                // Only a continuation can have reached this thread to interrupt it; the loop
-                // waits again for the time that is left.
-            } finally {
-                self.idle = false;
-            }
+            return null;
+        } finally {
+            lock.unlock();
         }
-        return null;
     }
 
-    // One thread that takes completions, guarded by the monitor of its Completions.
+    // One thread that takes completions, guarded by the lock of its Completions.
     private static final class Taker {
+
+        // Whether it is a platform thread, which only a client that holds one has.
+        private final boolean platform;
+
+        // Set before the thread starts.
+        private @Nullable Thread thread;
 
         // Whether it runs a completion, which started at since.
         private boolean running;
 
         private long since;
 
-        // Whether it waits for a completion.
-        private boolean idle;
+        // Whether it parks for want of a completion, as it has since parkedSince.
+        private boolean parked;
+
+        private long parkedSince;
+
+        // Whether the JVM could not start a platform thread to take over from this one.
+        private boolean platformFailed;
+
+        Taker(boolean platform) {
+            this.platform = platform;
+        }
     }
 }
