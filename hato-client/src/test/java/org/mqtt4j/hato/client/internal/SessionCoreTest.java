@@ -2456,6 +2456,36 @@ class SessionCoreTest {
         );
     }
 
+    @ParameterizedTest
+    @MethodSource("publicationPropertiesWithOtherProperties")
+    void other_properties_do_not_change_which_registrations_a_publication_reaches(
+            Properties properties,
+            List<Long> expected
+    ) {
+        // Arrange: two overlapping registrations, with identifiers 1 and 2.
+        SessionCore sut = connectedMqtt5();
+        sut.subscribe(2, subscription("a/#"));
+        sut.subscribe(3, subscription("a/b"));
+
+        // Act
+        sut.received(1, qosOnePublication(7, "a/b", properties), 0, 0);
+
+        // Assert
+        assertThat(port.deliveries).singleElement()
+                .extracting(Received::ids)
+                .isEqualTo(expected);
+    }
+
+    static Stream<Arguments> publicationPropertiesWithOtherProperties() {
+        var contentType = new Property.StringValue(PropertyId.CONTENT_TYPE, "text/plain");
+        var identifier = new Property.VariableByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER, 2);
+        return Stream.of(
+                Arguments.of(new Properties(List.of(contentType)), List.of(2L, 3L)),
+                Arguments.of(new Properties(List.of(contentType, identifier)), List.of(3L)),
+                Arguments.of(new Properties(List.of(identifier, contentType)), List.of(3L))
+        );
+    }
+
     @Test
     void a_publication_whose_identifiers_name_no_live_registration_is_acknowledged_unmatched() {
         // Arrange: the registration with identifier 1 awaits its UNSUBACK.
@@ -2554,6 +2584,45 @@ class SessionCoreTest {
 
         // Assert
         assertThat(identifierOf(held)).isEmpty();
+        assertThat(port.deliveries).singleElement()
+                .extracting(Received::ids)
+                .isEqualTo(List.of(2L, 4L));
+    }
+
+    @Test
+    void a_held_registration_does_not_make_unnamed_identified_registrations_match_by_topic() {
+        // Arrange: a persistent session starts on a connection without identifiers, and
+        // continues on one with them, where two more overlapping registrations take identifiers
+        // 2 and 3.
+        SessionCore mqtt5 = mqtt5Core(Duration.ofHours(1));
+        mqtt5.connect(attempt(1), 0);
+        mqtt5.opened(1);
+        mqtt5.received(
+                1,
+                connAck(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0)),
+                0,
+                0
+        );
+        mqtt5.subscribe(2, subscription("a/#"));
+        var held = (Packet.Subscribe) port.sent.getLast();
+        mqtt5.received(
+                1,
+                new Packet.SubAck(held.packetId(), List.of(ReasonCode.SUCCESS), EMPTY),
+                0,
+                0
+        );
+        mqtt5.failed(1, new IOException("connection lost"));
+        mqtt5.connect(attempt(3), 0);
+        mqtt5.opened(2);
+        mqtt5.received(2, new Packet.ConnAck(true, ReasonCode.SUCCESS, EMPTY), 0, 0);
+        mqtt5.subscribe(4, subscription("a/b"));
+        mqtt5.subscribe(5, subscription("a/+"));
+
+        // Act: a broker that sends a copy for each subscription names one identifier in each.
+        mqtt5.received(2, publication("a/b", 2), 0, 0);
+
+        // Assert: the held registration matches by topic, but the one with identifier 3, which
+        // this copy does not name, does not.
         assertThat(port.deliveries).singleElement()
                 .extracting(Received::ids)
                 .isEqualTo(List.of(2L, 4L));
