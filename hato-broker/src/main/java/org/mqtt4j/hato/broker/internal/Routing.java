@@ -20,24 +20,22 @@ import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 // What the connections of one broker share: its sessions and connections, its retained
-// messages, and the rules that tests set. The monitor of this object is the routing lock, under
-// which connections handle their packets: it guards every session and the fields of each
-// connection that say they belong to routing. What is shared here can also be read without it:
-// the session table, the connection set, and the rules are concurrent or replaced as a whole,
-// and the retained messages have a lock of their own, the topic lock.
+// messages, and the rules that tests set. Each session's actor handles the packets of its
+// connections (see Session), and what they share here is concurrent or replaced as a whole;
+// the retained messages have a lock of their own, the topic lock.
 //
-// This global lock and linear session/subscription scan bound routing throughput. Replace
-// them with an index and finer ownership if broker measurements justify productization.
-// Lock order is routing -> topic lock -> Connection. Readers/writers release their monitor
-// before routing; connection timers stop I/O without routing, and reader/writer cleanup detaches
-// the connection later. The timer of a waiting Will takes routing while it holds no Connection
-// monitor.
+// Routing a publication looks through every session and its subscriptions, which bounds its
+// throughput with many sessions; an index of the subscriptions would replace the scan if broker
+// measurements justify productization. Lock order is topic lock -> session inbox -> Connection.
 final class Routing {
 
     final BrokerSettings settings;
 
     // The port that the broker listens on, for thread names and logs.
     final int port;
+
+    // The name of the virtual threads that run the events of sessions.
+    final String runnerName;
 
     final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 
@@ -71,11 +69,12 @@ final class Routing {
     // What the broker announces to the MQTT 5.0 connections that it accepts from now on.
     volatile Capabilities capabilities;
 
-    boolean closed;
+    volatile boolean closed;
 
     Routing(BrokerSettings settings, int port) {
         this.settings = settings;
         this.port = port;
+        runnerName = "hato-broker-" + port + "-session";
         retained = new RetainedMessages(settings, port);
         capabilities = settings.capabilities();
     }
@@ -126,59 +125,50 @@ final class Routing {
     }
 
     void releaseResponses(Class<? extends Packet> type, String clientId) {
-        var hold = new Hold(type, clientId);
-        // Routing also guards the responses that connections send and hold, so none that comes
-        // after the release goes ahead of those held.
-        synchronized (this) {
-            holds.remove(hold);
-            for (Connection connection : connections) {
-                if (connection.clientId.equals(clientId)) {
-                    connection.client.release(type);
-                }
+        holds.remove(new Hold(type, clientId));
+        // A response that a connection sends from now on still queues behind those held, so none
+        // goes ahead of them.
+        for (Connection connection : connections) {
+            if (connection.clientId.equals(clientId)) {
+                connection.client.release(type);
             }
         }
     }
 
     List<BrokerServer.Held> heldResponses() {
-        synchronized (this) {
-            var all = new ArrayList<BrokerServer.Held>();
-            for (Connection connection : connections) {
-                for (Packet response : connection.client.held) {
-                    all.add(new BrokerServer.Held(connection.clientId, response));
-                }
+        var all = new ArrayList<BrokerServer.Held>();
+        for (Connection connection : connections) {
+            for (Packet response : connection.client.heldResponses()) {
+                all.add(new BrokerServer.Held(connection.clientId, response));
             }
-            return List.copyOf(all);
         }
+        return List.copyOf(all);
     }
 
     Set<String> connectedClients() {
-        synchronized (this) {
-            var clients = new HashSet<String>();
-            for (Session session : sessions.values()) {
-                Connection peer = session.connection;
-                if (peer != null && !peer.isEnded()) {
-                    clients.add(session.clientId);
-                }
+        var clients = new HashSet<String>();
+        for (Session session : sessions.values()) {
+            Connection peer = session.connection;
+            if (peer != null && !peer.isEnded()) {
+                clients.add(session.clientId);
             }
-            return Set.copyOf(clients);
         }
+        return Set.copyOf(clients);
     }
 
     void disconnect(String clientId, Reason reason) {
-        synchronized (this) {
-            Session session = sessions.get(clientId);
-            Connection peer = (session == null) ? null : session.connection;
-            if (peer != null) {
-                Packet.Disconnect disconnect = reason.fitted(
-                        properties -> new Packet.Disconnect(reason.code(), properties),
-                        peer.client.sendLimit
-                );
-                peer.disconnect(disconnect, "disconnected by a test");
-            }
+        Session session = sessions.get(clientId);
+        Connection peer = (session == null) ? null : session.connection;
+        if (peer != null) {
+            Packet.Disconnect disconnect = reason.fitted(
+                    properties -> new Packet.Disconnect(reason.code(), properties),
+                    peer.client.sendLimit
+            );
+            peer.disconnect(disconnect, "disconnected by a test");
         }
     }
 
-    // A connection copies the capabilities as routing accepts it, so each one works by those
+    // A connection copies the capabilities as it accepts the CONNECT, so each one works by those
     // before or those after this replacement, never by a mix.
     void announce(Capabilities value) {
         capabilities = value;
@@ -212,8 +202,17 @@ final class Routing {
     }
 
     // Takes a place among the persistent sessions for a session that a CONNECT makes, and returns
-    // false when the session limit leaves none.
+    // false when the session limit leaves none, even after the sessions whose expiry has passed
+    // have given theirs up.
     boolean takePersistentPlace() {
+        if (takePlace()) {
+            return true;
+        }
+        discardExpiredSessions();
+        return takePlace();
+    }
+
+    private boolean takePlace() {
         int limit = settings.maxSessions();
         int before = persistentSessions.getAndUpdate(count -> (count < limit) ? count + 1 : count);
         return before < limit;
@@ -225,27 +224,26 @@ final class Routing {
     }
 
     // Discards the sessions whose expiry has passed since their connection ended
-    // [MQTT-4.1.0-2], and publishes the Wills that wait with them. The broker looks for them
-    // when it looks a session up for a CONNECT and when it routes, in place of a timer per
-    // session; only a session with a waiting Will has a timer, which comes at its expiry if the
-    // Will's delay is longer. So an expired session keeps its queued deliveries, within the
-    // session limits, until then. A timer for every session would release them at once, if
-    // productization needs that. Called under routing.
-    void discardExpiredSessions() {
+    // [MQTT-4.1.0-2], which frees their places and publishes the Wills that wait with them. Each
+    // ends on its actor: here if no thread holds its turn, and otherwise soon after, too late for
+    // the CONNECT that looks. The broker looks for them only when a CONNECT finds the session
+    // limit reached, and a CONNECT looks at its own session, in place of a timer per session;
+    // only a session with a waiting Will has a timer, which comes at its expiry if the Will's
+    // delay is longer. So an expired session keeps its queued deliveries, within the session
+    // limits, until then. A timer for every session would release them at once, if
+    // productization needs that. Called on the actor of the CONNECT.
+    private void discardExpiredSessions() {
         long now = settings.scheduler().nanoTime();
-        // A Will routes, and routing looks for expired sessions again, so they are listed before
-        // any of them is discarded; discarding one twice does nothing.
-        List<Session> expired = sessions.values().stream()
-                .filter(session -> session.expired(now))
-                .toList();
-        for (Session session : expired) {
-            session.discard();
+        for (Session session : sessions.values()) {
+            if (session.expired(now)) {
+                session.post(session::checkExpiry, Session.ALONE);
+            }
         }
     }
 
     // Publishes `will` as its client would have published the message, from the session of
     // `publisher`. A closing broker publishes none, because every session goes with it. Called
-    // under routing.
+    // on the actor of `publisher`.
     void publishWill(Packet.Will will, Session publisher) {
         if (closed) {
             return;
@@ -269,10 +267,10 @@ final class Routing {
     }
 
     // Delivers `publication` from `publisher`'s client to every matching subscription, after
-    // making it the retained message of its topic if its RETAIN flag asks for that. Called under
-    // routing.
+    // making it the retained message of its topic if its RETAIN flag asks for that. Called on the
+    // actor of `publisher`, which drains the sessions that it delivers to, here where no thread
+    // holds their turn: under the topic lock for a retained publication.
     void route(Packet.Publish publication, Session publisher) {
-        discardExpiredSessions();
         // A Message Expiry Interval counts from here.
         long received = settings.scheduler().nanoTime();
         if (!publication.retain()) {
@@ -292,13 +290,13 @@ final class Routing {
         }
     }
 
-    // Ends every connection and forgets every session and retained message, as the broker
-    // closes. Called under routing.
+    // Ends every connection and session and forgets every retained message, as the broker
+    // closes. Each session ends here if no thread holds its turn, and otherwise soon after.
     void clear() {
         for (Connection connection : connections) {
             connection.close("broker closed");
         }
-        sessions.values().forEach(Session::clear);
+        sessions.values().forEach(Session::close);
         sessions.clear();
         persistentSessions.set(0);
         synchronized (retained) {

@@ -12,9 +12,9 @@ import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 
 // One publication on its way to one session, sized for the session's protocol version. The
-// packet identifier belongs to routing. Whether it was sent is set by the writer of the
-// connection that it went to, while that connection has not ended, and read by routing for the
-// DUP flag of a resend.
+// packet identifier belongs to the session's actor. Whether it was sent is set by the writer of
+// the connection that it went to, while that connection has not ended, and read by the actor for
+// the DUP flag of a resend.
 final class Delivery implements Outgoing, Pending {
 
     private final Packet.Publish publication;

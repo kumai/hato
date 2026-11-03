@@ -28,8 +28,8 @@ import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 
 import static java.util.Objects.requireNonNull;
 
-// One network connection of the broker, with its own reader and writer. Its client handles the
-// packets that the reader decodes, under routing.
+// One network connection of the broker, with its own reader and writer. The reader hands the
+// packets that it decodes to the session that the CONNECT attached, whose actor handles them.
 final class Connection {
 
     private static final Log log = Log.of(Connection.class);
@@ -68,9 +68,9 @@ final class Connection {
 
     final Client client;
 
-    // The identifier is assigned once under both locks on acceptance and can then be read
-    // under either lock for timer/logging purposes.
-    String clientId = "";
+    // The identifier is assigned once on acceptance, before the session attaches the connection,
+    // and read by timers, logs, and the test controls.
+    volatile String clientId = "";
 
     // Remaining state is guarded by this connection's monitor.
 
@@ -83,6 +83,13 @@ final class Connection {
     private MqttVersion version = MqttVersion.V3_1_1;
 
     boolean ended;
+
+    // Whether the end of the connection has gone to its session, or found none attached.
+    private boolean endHandled;
+
+    // The responses that the reader has reserved room for and the session has yet to queue: the
+    // reader hands the requests to the session, which answers them on its actor.
+    private int owed;
 
     // Why the connection ended first; later failures are consequences of that end.
     private String endReason = "";
@@ -166,6 +173,7 @@ final class Connection {
             if (!client.connect(request)) {
                 return;
             }
+            Session owner = requireNonNull(client.session);
             PacketCodec codec = PacketCodec.of(request.version());
             while (true) {
                 Optional<byte[]> bytes = reader.read();
@@ -177,17 +185,12 @@ final class Connection {
                 settings.beforeProcess().accept(packet);
                 log.debug("Broker received {} from {}", packet.getClass().getSimpleName(),
                         socket.getRemoteSocketAddress());
-                // Packets without a response, such as QoS 0 publications, never wait.
-                if (answered(packet) && !awaitResponseRoom()) {
+                // Packets without a response, such as QoS 0 publications, never wait here.
+                boolean answered = answered(packet);
+                if (answered && !reserveResponse()) {
                     return;
                 }
-                synchronized (routing) {
-                    Session owner = client.currentSession();
-                    if (owner == null) {
-                        return;
-                    }
-                    client.process(owner, packet);
-                }
+                owner.receive(this, packet, answered, bytes.get().length);
             }
         } catch (Throwable failure) {
             reason = failureReason("reader", failure);
@@ -287,31 +290,44 @@ final class Connection {
         };
     }
 
-    /// Holds the reader, outside the routing lock, until the reserved quota has room for one
-    /// more response, so that answering the next request never finds it full. Only this
-    /// reader queues responses, so the room stays until the response takes it. A deliberate
-    /// simplification: the wait counts responses, not their bytes. Only a backlog of SUBACKs
-    /// for SUBSCRIBE packets with many thousands of filters reaches the byte limit, which
-    /// still closes the connection; waiting for the size of each response would remove that
-    /// limit. Returns false once the connection has ended. A connection that is to end with
-    /// a last packet drops responses, so its reader does not wait.
-    private synchronized boolean awaitResponseRoom() throws InterruptedException {
+    /// Holds the reader until the reserved quota has room for one more response besides those
+    /// that the session still owes, and reserves it, so that answering the next request never
+    /// finds the quota full. Only responses to this reader's requests take the reserved quota,
+    /// so the room stays until the response takes it. A deliberate simplification: the wait
+    /// counts responses, not their bytes. Only a backlog of SUBACKs for SUBSCRIBE packets with
+    /// many thousands of filters reaches the byte limit, which still closes the connection;
+    /// waiting for the size of each response would remove that limit. Returns false once the
+    /// connection has ended. A connection that is to end with a last packet drops responses, so
+    /// its reader does not wait.
+    private synchronized boolean reserveResponse() throws InterruptedException {
         while (lastPacket == null && responseRoomTaken()) {
             wait();
         }
-        return !ended;
+        if (ended) {
+            return false;
+        }
+        owed++;
+        return true;
     }
 
-    // Whether a response now would find no room: the reserved quota is full, or responses
-    // that a test released wait for it first. Called under the connection monitor.
+    // Whether a response now would find no room: the reserved quota is full with the responses
+    // owed, or responses that a test released wait for it first. Called under the connection
+    // monitor.
     private boolean responseRoomTaken() {
         return !released.isEmpty()
-                || outgoing.checkCapacity(0, true) == SendQueue.OfferResult.FULL;
+                || outgoing.checkCapacity(0, true, owed) == SendQueue.OfferResult.FULL;
+    }
+
+    // Returns the room that the reader reserved for the response to a request, which the
+    // session has answered or passed over.
+    synchronized void responseSettled() {
+        owed--;
+        notifyAll();
     }
 
     // Queues a response to the client's request in the reserved quota, behind the responses
-    // that a test released, and ends the connection when the quota is full. Called under
-    // routing.
+    // that a test released, and ends the connection when the quota is full. Called on the
+    // session's actor, which holds no monitor, so that closing can take the session's inbox.
     void respond(Packet packet) {
         boolean accepted;
         synchronized (this) {
@@ -331,7 +347,7 @@ final class Connection {
     }
 
     // Queues `responses`, which a test held back and now releases, behind any released before,
-    // and sends what fits. Called under routing.
+    // and sends what fits. Called by the test controls.
     synchronized void release(List<Packet> responses) {
         released.addAll(responses);
         sendReleased();
@@ -365,7 +381,7 @@ final class Connection {
         }
     }
 
-    // Called under the connection monitor; no socket I/O occurs on a routing thread.
+    // Called under the connection monitor; no socket I/O occurs on a session's actor.
     boolean enqueue(Packet packet) {
         if (ended || lastPacket != null) {
             return false;
@@ -412,10 +428,10 @@ final class Connection {
                 boolean skip = false;
                 if (delivery != null) {
                     settings.beforeDeliveryWrite().run();
-                    // This monitor, not routing, decides. A session ends the connection that it
-                    // leaves, under this monitor, before it resends the connection's deliveries
-                    // elsewhere, so a delivery is marked as sent before the resend reads the
-                    // mark, or is never written here.
+                    // This monitor decides. A session ends the connection that it leaves, under
+                    // this monitor, before it resends the connection's deliveries elsewhere, so
+                    // a delivery is marked as sent before the resend reads the mark, or is never
+                    // written here.
                     synchronized (this) {
                         if (!ended && lastPacket == null) {
                             delivery.sent = true;
@@ -432,22 +448,19 @@ final class Connection {
                     writer.write(send.value().bytes());
                 }
                 boolean resume;
+                Session owner;
                 synchronized (this) {
                     outgoing.completed(send.ticket());
                     sendReleased();
                     // Refusal and completion share this monitor, so no wakeup is lost.
                     resume = awaitingSpace;
                     awaitingSpace = false;
+                    owner = client.session;
                     // The reader may wait for room for its next response.
                     notifyAll();
                 }
-                if (resume) {
-                    synchronized (routing) {
-                        Session owner = client.currentSession();
-                        if (owner != null) {
-                            owner.drain();
-                        }
-                    }
+                if (resume && owner != null) {
+                    owner.requestDrain(settings.inPlace());
                 }
             }
         } catch (Throwable failure) {
@@ -490,7 +503,7 @@ final class Connection {
         }
     }
 
-    // Whether routing must leave this connection: it has ended or ends with its last packet.
+    // Whether sessions must leave this connection: it has ended or ends with its last packet.
     synchronized boolean isEnded() {
         return ended || lastPacket != null;
     }
@@ -598,7 +611,7 @@ final class Connection {
                     return;
                 }
                 // Mark the deadline under the same lock as receipt; a late frame cannot
-                // revive this connection while removal waits for an ongoing route.
+                // revive this connection while its end goes to the session.
                 if (clientId.isEmpty()) {
                     terminate("CONNECT timeout");
                 } else {
@@ -611,11 +624,11 @@ final class Connection {
                 terminate("timer failure");
             }
         }
-        // Ending the connection releases reader/writer, which remove the session. Do not
-        // make the shared timer wait for the routing lock before checking another peer.
+        // Ending the connection releases reader/writer, which hand its end to the session. The
+        // shared timer waits for no session before checking another peer.
     }
 
-    // Stops I/O without the routing lock; the exiting reader and writer remove the connection.
+    // Stops I/O; the exiting reader and writer hand the connection's end to the session.
     private void terminate(String reason) {
         if (ended) {
             return;
@@ -635,13 +648,42 @@ final class Connection {
         }
     }
 
+    // Ends the connection and hands its end, once, to the session that it is attached to.
     void close(String reason) {
+        Session owner;
         synchronized (this) {
             terminate(reason);
+            if (endHandled) {
+                return;
+            }
+            endHandled = true;
+            owner = client.session;
         }
-        synchronized (routing) {
-            routing.connections.remove(this);
-            client.connectionEnded();
+        routing.connections.remove(this);
+        if (owner != null) {
+            owner.post(client::connectionEnded, settings.inPlace());
+        }
+    }
+
+    // Has the connection's client belong to `session`, whose actor accepted the CONNECT, and
+    // queues `connAck`. Returns false if the connection's end has come already and found no
+    // session. Called under the session's inbox.
+    synchronized boolean attach(Session session, Packet.ConnAck connAck) {
+        client.session = session;
+        enqueue(connAck);
+        return !endHandled;
+    }
+
+    // Ends the connection for a failure in handling one of its packets, as the reader ends it for
+    // one in reading: a packet that breaks the protocol with DISCONNECT, after which the writer
+    // closes it.
+    void failed(Throwable failure) {
+        String reason = failureReason("reader", failure);
+        if (failure instanceof PacketDecodeException violation) {
+            disconnect(violation.reasonCode(), reason);
+        }
+        if (!endsWithLastPacket()) {
+            close(reason);
         }
     }
 

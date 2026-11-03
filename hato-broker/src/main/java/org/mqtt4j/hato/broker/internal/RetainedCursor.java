@@ -14,8 +14,8 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 // subscription and ahead of those queued after it, and go out one at a time as the window and
 // the send queue take them. They count against the session's room for retained messages rather
 // than the delivery queue's. Each arrives with RETAIN 1 at the lower of its QoS and the granted
-// one, and carries the subscription's identifier [MQTT-3.3.4-3]. Like the session, it belongs to
-// routing.
+// one, and carries the subscription's identifier [MQTT-3.3.4-3]. It belongs to the session's
+// actor, and waits under the session's inbox.
 final class RetainedCursor implements Pending {
 
     final TopicFilter filter;

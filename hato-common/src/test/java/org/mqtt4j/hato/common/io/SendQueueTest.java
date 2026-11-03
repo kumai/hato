@@ -40,6 +40,19 @@ class SendQueueTest {
     }
 
     @Test
+    void a_capacity_check_with_headroom_leaves_room_for_promised_sends() {
+        // Arrange: one of three reserved sends is queued.
+        var sut = new SendQueue<String>(0, 0, 3, 100);
+        assertThat(sut.offer(1, "queued", 1, true)).isEqualTo(ACCEPTED);
+
+        // Act & Assert: one more send fits besides one promised, but not besides two.
+        assertThat(sut.checkCapacity(0, true, 1)).isEqualTo(ACCEPTED);
+        assertThat(sut.checkCapacity(0, true, 2)).isEqualTo(FULL);
+        sut.close();
+        assertThat(sut.checkCapacity(0, true, 0)).isEqualTo(CLOSED);
+    }
+
+    @Test
     void active_write_retains_its_bytes_and_reserved_sends_follow_fifo() {
         // Arrange
         var sut = new SendQueue<String>(2, 10, 1, 2);
