@@ -52,6 +52,7 @@ final class Mailbox {
         DELIVERY_READY,
         SEND_CAPACITY,
         CREDENTIALS_READY,
+        SESSION_STORE_READY,
         SUBSCRIPTION_CLOSE,
         RECONNECT,
         STATS;
@@ -68,6 +69,7 @@ final class Mailbox {
                      DELIVERY_READY,
                      SEND_CAPACITY,
                      CREDENTIALS_READY,
+                     SESSION_STORE_READY,
                      SUBSCRIPTION_CLOSE,
                      RECONNECT,
                      STATS -> false;
@@ -87,6 +89,7 @@ final class Mailbox {
                 case DELIVERY_READY,
                      SEND_CAPACITY,
                      CREDENTIALS_READY,
+                     SESSION_STORE_READY,
                      SUBSCRIPTION_CLOSE,
                      RECONNECT,
                      STATS -> true;
@@ -284,7 +287,7 @@ final class Mailbox {
             case CONTROL -> controlCount >= controlLimit;
             case KEEP_ALIVE -> keepAlive.size() >= KEEP_ALIVE_LIMIT;
             case DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE, CREDENTIALS_READY,
-                    RECONNECT, STATS -> false;
+                    SESSION_STORE_READY, RECONNECT, STATS -> false;
         };
         if (full) {
             return OfferResult.FULL;

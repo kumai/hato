@@ -84,6 +84,10 @@ final class ClientIo {
         /// transport has reported its close and the sender has exited. I/O calls no Transport
         /// method afterwards.
         void closed();
+
+        /// Called, without the send monitor, whenever the last open transport reports its close
+        /// or fails to start, so that none can send until I/O starts another one.
+        void transportsClosed();
     }
 
     private static final Log log = Log.of(ClientIo.class);
@@ -1033,9 +1037,18 @@ final class ClientIo {
         }
     }
 
+    /// Whether a transport that I/O started has not yet reported its close, so that it may still
+    /// send what it took.
+    boolean transportsOpen() {
+        synchronized (sending) {
+            return openTransports > 0;
+        }
+    }
+
     /// A transport reported its close or failed to start; each counts once, even if a transport
     /// reports again.
     private void released(Connection connection) {
+        boolean none;
         boolean closed;
         synchronized (sending) {
             if (connection.released) {
@@ -1043,7 +1056,11 @@ final class ClientIo {
             }
             connection.released = true;
             openTransports--;
+            none = openTransports == 0;
             closed = closedLocked();
+        }
+        if (none) {
+            events.transportsClosed();
         }
         if (closed) {
             events.closed();

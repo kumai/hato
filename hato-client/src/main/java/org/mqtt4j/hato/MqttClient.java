@@ -76,10 +76,12 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// The future fails with [MqttConnectException] when the client gives up the request:
     /// when the first attempt of a request fails, unless the policy retries initial failures;
     /// when the broker refuses the connection with a reason that reconnecting cannot change;
-    /// when the client's [TimerScheduler] fails; or when [#disconnect()], [#close()], or a handler
-    /// failure withdraws the request first. Its reason code or cause tells which, as for
+    /// when another client object has taken over the client's
+    /// [session file][MqttClientBuilder#sessionFile(java.nio.file.Path)]; when the client's
+    /// [TimerScheduler] fails; or when [#disconnect()], [#close()], or a handler failure
+    /// withdraws the request first. Its reason code or cause tells which, as for
     /// [ConnectionListener#onConnectFailed(Disconnection)]; a request that [#disconnect()] or
-    /// [#close()] withdraws carries neither. With
+    /// [#close()] withdraws, or that ends because of the session file, carries neither. With
     /// [ReconnectPolicy#withInitialRetry()], and for a call that joins an automatic reconnection,
     /// the future can wait without a deadline. Timing out the returned future does not stop the
     /// attempts; [#disconnect()] does.
@@ -95,9 +97,11 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// Registrations still awaiting their first SUBACK are sent after CONNACK as well.
     /// [Subscription#established()] can observe each subscription independently of this future.
     ///
-    /// Local session state is held only in this client object's memory, so a new client object,
-    /// for example after the application restarts, has none for a session that the broker
-    /// kept. Its first successful attempt replaces such a session with a new one, so messages
+    /// Local session state is held in this client object's memory, so a new client object, for
+    /// example after the application restarts, has none for a session that the broker kept,
+    /// unless it takes over the state that an earlier client object saved in a
+    /// [session file][MqttClientBuilder#sessionFile(java.nio.file.Path)]. Without local state,
+    /// its first successful attempt replaces such a session with a new one, so messages
     /// that the broker stored for the old session, including those that arrived while the
     /// application was stopped, are not received. With MQTT 5.0, the attempt connects with
     /// Clean Start, which makes the broker discard the old session. With MQTT 3.1.1, the broker
@@ -148,21 +152,23 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// Withdraws the connection request: the client stops reconnecting, and an established
     /// connection ends with DISCONNECT. Completes after writing DISCONNECT and requesting
     /// transport closure. Completion does not confirm that the broker received DISCONNECT.
-    /// Wait for successful completion before calling [#close()]; closing earlier may discard
-    /// the pending DISCONNECT and cause the broker to publish the Will.
+    /// With a [session file][MqttClientBuilder#sessionFile(java.nio.file.Path)], it also
+    /// completes only after saving the session there, as that method describes, even when the
+    /// save fails. Wait for successful completion before calling [#close()]; closing earlier may
+    /// discard the pending DISCONNECT and cause the broker to publish the Will.
     /// A pending [#connect()] fails.
     ///
-    /// With no connection or attempt, including while the client waits to reconnect, completes
-    /// at once. During an attempt, waits for CONNACK and, on success, sends DISCONNECT before
-    /// closing. If the attempt ends without a connection, for example because the broker
-    /// refuses it, this completes normally. An attempt that is replacing a broker session
-    /// without local state, as [#connect()] describes, stops in the same way at its current
-    /// connection and opens no further one. The old session then remains on the broker unless
-    /// the broker accepts the connection that discards it, which this call does not prevent
-    /// once that connection has started; an attempt that stops at the connection that starts the
-    /// new session keeps that session, as any other attempt would. Concurrent calls observe the
-    /// same disconnection. If a connection that the broker accepted, including one that such an
-    /// attempt is closing, fails before its DISCONNECT is written, this fails with
+    /// With no connection or attempt, including while the client waits to reconnect, completes at
+    /// once, or once the session is saved to a session file. During an attempt, waits for CONNACK
+    /// and, on success, sends DISCONNECT before closing. If the attempt ends without a connection,
+    /// for example because the broker refuses it, this completes normally. An attempt that is
+    /// replacing a broker session without local state, as [#connect()] describes, stops in the same
+    /// way at its current connection and opens no further one. The old session then remains on the
+    /// broker unless the broker accepts the connection that discards it, which this call does not
+    /// prevent once that connection has started; an attempt that stops at the connection that
+    /// starts the new session keeps that session, as any other attempt would. Concurrent calls
+    /// observe the same disconnection. If a connection that the broker accepted, including one that
+    /// such an attempt is closing, fails before its DISCONNECT is written, this fails with
     /// [MqttConnectionLostException]. Its write deadline is the configured
     /// [connection timeout][MqttClientBuilder#connectionTimeout(java.time.Duration)].
     ///
@@ -190,8 +196,11 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// No delivery is handed off after this returns: handlers start and receivers return only
     /// for deliveries taken before. Those handlers, and other application code that the client
     /// is already running, may still run; [#terminated()] observes the end of all of it.
-    /// Discards local session state; a persistent session may remain on the broker until a
-    /// later client object with the same identifier replaces it on connecting.
+    /// Discards local session state without saving it to a
+    /// [session file][MqttClientBuilder#sessionFile(java.nio.file.Path)], which the client gives
+    /// up once its connections have ended, by the time [#terminated()] completes; a persistent
+    /// session may remain on the broker until a later client object with the same identifier
+    /// replaces it on connecting.
     /// A Will registered with the broker may be published. For a graceful disconnect,
     /// wait for [#disconnect()] to complete successfully before calling this method.
     @Override

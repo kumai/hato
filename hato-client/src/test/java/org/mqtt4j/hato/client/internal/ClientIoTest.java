@@ -1581,6 +1581,23 @@ class ClientIoTest {
         assertThat(events.closures).hasValue(1);
     }
 
+    @Test
+    void the_events_tell_when_the_last_open_transport_has_closed() {
+        // Arrange: an ended connection's transport is still closing when the next one opens.
+        SingleWriteTransport earlier = open(1);
+        sut.close();
+        SingleWriteTransport current = open(2);
+
+        // Act & Assert: the earlier transport's close leaves the current one open.
+        earlier.end(new IOException("Transport closed"));
+        assertThat(sut.transportsOpen()).isTrue();
+        assertThat(events.quiets).hasValue(0);
+        sut.close();
+        current.end(new IOException("Transport closed"));
+        assertThat(sut.transportsOpen()).isFalse();
+        assertThat(events.quiets).hasValue(1);
+    }
+
     private SingleWriteTransport open(long generation) {
         sut.open(generation, Duration.ofSeconds(30));
         return transports.getLast();
@@ -1969,6 +1986,8 @@ class ClientIoTest {
         final List<Long> written = new CopyOnWriteArrayList<>();
         final List<Long> capacityGenerations = new CopyOnWriteArrayList<>();
         final AtomicInteger closures = new AtomicInteger();
+        // How often no started transport remained open.
+        final AtomicInteger quiets = new AtomicInteger();
         volatile Runnable beforeSent = () -> { };
 
         @Override
@@ -2053,6 +2072,11 @@ class ClientIoTest {
         @Override
         public void closed() {
             closures.incrementAndGet();
+        }
+
+        @Override
+        public void transportsClosed() {
+            quiets.incrementAndGet();
         }
     }
 }

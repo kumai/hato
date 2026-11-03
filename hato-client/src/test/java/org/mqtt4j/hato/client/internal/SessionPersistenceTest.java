@@ -1171,6 +1171,15 @@ class SessionPersistenceTest {
         final List<ConnectionAttempt> cancellations = new ArrayList<>();
         final List<ConnectionAttempt> evaluations = new ArrayList<>();
         final List<String> events = new ArrayList<>();
+        // What the shell reports for receptions handed to recipients: by token, whether every
+        // recipient met its acknowledgement condition.
+        final Map<Long, Boolean> handed = new HashMap<>();
+        // The claims, checks, and saves that the core asked of the session store: the connection
+        // of each check, and the disconnections that waited for each save.
+        int claims;
+        final List<Long> checks = new ArrayList<>();
+        final List<SessionState> saves = new ArrayList<>();
+        final List<List<SessionCore.Completion>> savedDisconnections = new ArrayList<>();
         int disconnecting;
         int stopsDiscarded;
         SessionCore.@Nullable Timer failingTimer;
@@ -1399,7 +1408,7 @@ class SessionPersistenceTest {
 
         @Override
         public Map<Long, Boolean> receiveState() {
-            return Map.of();
+            return Map.copyOf(handed);
         }
 
         @Override
@@ -1434,7 +1443,23 @@ class SessionPersistenceTest {
             latestReconnectDelay = disconnection.reconnectDelay().orElse(null);
             disconnection.reconnectDelay().ifPresent(reconnectDelays::add);
             events.add("end");
-            return Map.of();
+            return Map.copyOf(handed);
+        }
+
+        @Override
+        public void claimSession() {
+            claims++;
+        }
+
+        @Override
+        public void checkSession(long connection) {
+            checks.add(connection);
+        }
+
+        @Override
+        public void saveSession(SessionState state, List<SessionCore.Completion> disconnections) {
+            saves.add(state);
+            savedDisconnections.add(disconnections);
         }
     }
 }

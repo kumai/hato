@@ -481,6 +481,12 @@ final class Publications {
         port.complete(operation, null, new MqttCapacityException(message, limit));
     }
 
+    /// Whether the session has no outgoing QoS 1 or QoS 2 exchange, counting those that wait for a
+    /// reconnection.
+    boolean idle() {
+        return inflight.size() == 0;
+    }
+
     /// The publications' values in [ClientSnapshot.Sending] that the core knows. Publications
     /// that wait to be sent count in their first stage.
     Values values() {

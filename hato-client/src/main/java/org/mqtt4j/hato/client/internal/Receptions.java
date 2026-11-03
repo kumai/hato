@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -139,6 +140,14 @@ final class Receptions {
                         return;
                     }
                     if (acknowledgements.contains(earlier, kind)) {
+                        return;
+                    }
+                    if (earlier.restored()) {
+                        // An earlier client object's application acknowledged this reception, and
+                        // no recipient here has it, so its resend is acknowledged without a
+                        // delivery.
+                        acknowledgements.add(earlier, kind);
+                        core.sendCapacityAvailable();
                         return;
                     }
                     // A continued reception joins this connection only when its resend arrives.
@@ -326,12 +335,78 @@ final class Receptions {
                 // receipt until CONNACK can settle whether PUBREC made the exchange persistent:
                 // the single I/O sender returns from this send before it writes the next CONNECT.
                 port.forgetDelivery(entry.token());
-            } else if (entry.stage() == Stage.COMPLETING || accepted || ready == null
+            } else if (entry.stage() == Stage.COMPLETING || accepted
+                    // A restored reception has no recipient here and waits for its resend.
+                    || (ready == null && !entry.restored())
                     || received.find(entry.packetId()).orElse(null) != entry) {
                 received.remove(entry);
                 port.forgetDelivery(entry.token());
-            } else {
+            } else if (ready != null) {
                 received.ready(entry.token(), ready);
+            }
+        }
+    }
+
+    /// The receptions that a later client object takes over and whose resends it acknowledges
+    /// without a delivery: the QoS 1 receptions that the application acknowledged before their
+    /// PUBACK went to the send queue, and the QoS 2 receptions that the application acknowledged,
+    /// including those that await PUBREL.
+    ///
+    /// Once a PUBACK may have reached the broker, the broker may use its identifier for another
+    /// message, and a resend of that message must be delivered. Such a reception is left out, so
+    /// that the later client object delivers a resend of it again rather than lose another
+    /// message. A PUBREC frees no identifier, because the broker keeps a QoS 2 identifier until
+    /// PUBCOMP. Receptions that the application has not acknowledged are left out too, so that
+    /// their resends reach the later client object's subscriptions.
+    List<SessionState.Reception> acknowledged() {
+        var acknowledged = new ArrayList<SessionState.Reception>();
+        for (ReceiveTable.Entry entry : received.entries()) {
+            boolean kept = switch (entry.stage()) {
+                // The transport may accept a PUBACK only after the connection's end, so whether
+                // the broker has it stays unknown once it went to the send queue.
+                case RECEIVING -> entry.ready()
+                        && (entry.qos() == Qos.EXACTLY_ONCE || entry.receipt() == null);
+                case WAITING_PUBREL -> true;
+                // PUBREL has arrived. A repeated one meets an unknown identifier, which PUBCOMP
+                // answers too.
+                case COMPLETING -> false;
+            };
+            if (kept) {
+                acknowledged.add(new SessionState.Reception(entry.packetId(), entry.qos()));
+            }
+        }
+        return acknowledged;
+    }
+
+    /// Checks that the receive table has room for `restored` before [#restore(List)] takes any of
+    /// it.
+    void checkRestore(List<SessionState.Reception> restored) {
+        if (restored.size() > received.room()) {
+            throw new IllegalArgumentException(
+                    "Saved receptions exceed the receive table: " + restored.size()
+            );
+        }
+    }
+
+    /// Takes over `restored`, the receptions that an earlier client object left with the
+    /// session. A QoS 2 reception awaits PUBREL, as after its PUBREC: a resent PUBLISH is
+    /// answered with PUBREC and never delivered, and PUBREL with PUBCOMP. A QoS 1 reception is
+    /// marked restored, so that a resend with DUP is acknowledged without a delivery, while a new
+    /// publication with its identifier replaces it as any reuse does.
+    void restore(List<SessionState.Reception> restored) {
+        for (SessionState.Reception reception : restored) {
+            Optional<ReceiveTable.Entry> added = received.add(
+                    ++nextDelivery,
+                    reception.packetId(),
+                    reception.qos(),
+                    core.now()
+            );
+            // checkRestore() found room, and the saved identifiers differ from one another.
+            ReceiveTable.Entry entry = added.orElseThrow();
+            if (reception.qos() == Qos.EXACTLY_ONCE) {
+                entry.pubrecAccepted(core.now());
+            } else {
+                entry.restore();
             }
         }
     }

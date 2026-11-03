@@ -105,6 +105,9 @@ final class ReceiveTable {
         private long awaitingReleaseSince;
         private Stage stage = Stage.RECEIVING;
         private boolean ready;
+        // Whether an earlier client object received this QoS 1 reception and its application met
+        // the acknowledgement condition: a resend is acknowledged without a delivery.
+        private boolean restored;
         private @Nullable SendReceipt receipt;
         // AckSequencer's: the acknowledgement that this reception awaits on the connection, and
         // the receptions before and after it in the acknowledgement order.
@@ -137,6 +140,17 @@ final class ReceiveTable {
 
         boolean ready() {
             return ready;
+        }
+
+        boolean restored() {
+            return restored;
+        }
+
+        /// Marks a QoS 1 reception that an earlier client object's application acknowledged. It
+        /// has no recipient here and is ready for the acknowledgement of its resend.
+        void restore() {
+            restored = true;
+            ready = true;
         }
 
         @Nullable SendReceipt receipt() {
