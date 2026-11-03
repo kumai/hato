@@ -730,13 +730,50 @@ session.
 
 The client keeps its side of a session in memory. A new client object, for example after your
 application restarts, therefore starts a new session: messages that the broker stored for the
-old one, including those published while your application was stopped, are not received.
+old one, including those published while your application was stopped, are not received,
+unless you [keep the session in a file](#continuing-a-session-after-a-restart).
 
 While the client reconnects, unfinished QoS 1 and 2 publications keep waiting. They complete
 if the broker still has the session, and fail if it has lost the session or the client gives
 up reconnecting; see [MqttPublisher](src/main/java/org/mqtt4j/hato/MqttPublisher.java).
 Some brokers keep no session for a client without subscriptions, so a client that only
 publishes sees these publications fail whenever its connection ends.
+
+### Continuing a session after a restart
+
+To let a new client object, for example after your application restarts, continue the session
+and receive the messages that the broker stored meanwhile, give the client a file for its side
+of the session:
+
+```java
+MqttClient client = MqttClient.builder()
+        .server(URI.create("mqtt://broker.example.com:1883"))
+        .clientId("orders-worker-1")
+        .sessionExpiry(Duration.ofDays(1))
+        .sessionFile(Path.of("/var/lib/orders-worker/mqtt-session"))
+        .build();
+// Stored messages arrive as soon as the client connects, so subscribe first.
+client.subscribe(
+        Subscribe.of(new TopicFilter("orders/#"), Qos.AT_LEAST_ONCE),
+        delivery -> repository.save(delivery.message())
+);
+client.connect().join();
+```
+
+- `disconnect()` saves the session to the file before it completes, and the next client object
+  with the file continues the session when it connects. Wait for your QoS 1 and 2 publications
+  before disconnecting: the client saves nothing while one is unfinished.
+- Closing the client without `disconnect()`, or a crash, saves nothing. The next client object
+  then starts a new session, as it would without the file.
+- Messages that you acknowledge after `disconnect()` completes arrive again.
+- Give each `clientId` its own file, on a local disk that stays with it, such as a volume that
+  belongs to the instance. A client object holds the file from its connection until its
+  connections have ended after `disconnect()` saved the session or after `close()`, and others
+  with the file cannot connect meanwhile. With `withInitialRetry()`, the new instance of a
+  rolling update keeps trying, and continues the session once the old one disconnects.
+
+The [builder](src/main/java/org/mqtt4j/hato/MqttClientBuilder.java) describes what the file
+keeps and how the client uses it.
 
 ### Leaving a last Will
 
@@ -758,6 +795,9 @@ try {
     client.close();
 }
 ```
+
+With a `sessionFile`, waiting for `disconnect()` also saves the session for the next client
+object; see [Continuing a session after a restart](#continuing-a-session-after-a-restart).
 
 `close()`, including leaving a try-with-resources block, shuts down at once and can cut a
 pending DISCONNECT short. It does not wait for message handlers, listeners, or other callbacks
@@ -973,10 +1013,10 @@ rather than adding them to a `Counter` on each snapshot.
 
 | Symptom | What to check |
 | --- | --- |
-| `connect()` fails at startup | The exception's cause tells why: the address and port of the broker's listener, TLS trust and hostname, credentials, or the MQTT version. The first attempt is retried only when you [ask for it](#choosing-when-to-reconnect). |
+| `connect()` fails at startup | The exception's cause tells why: the address and port of the broker's listener, TLS trust and hostname, credentials, or the MQTT version. With a `sessionFile`, another client object may hold the file, as the message says. The first attempt is retried only when you [ask for it](#choosing-when-to-reconnect). |
 | `publish()` fails while the client reconnects | Publications need a connection and are not queued. Wait with `whenConnected()`, and still expect the connection to end again. |
 | `established()` never completes | A subscription waits for a connection: call `connect()`. It also waits while the client reconnects. |
-| The client stops reconnecting | The [connection listener's](#reacting-to-connection-changes) ending gives the cause, such as a message handler that threw while holding back an acknowledgement, a ban by the broker, or another client taking over the `clientId`. |
+| The client stops reconnecting | The [connection listener's](#reacting-to-connection-changes) ending gives the cause, such as a message handler that threw while holding back an acknowledgement, a ban by the broker, or another client taking over the `clientId` or the `sessionFile`. |
 | Every subscription stalls behind one slow topic | One acknowledgement [holds up the rest](#acknowledgements-keep-arrival-order). Look at `oldestAwaitingConditions()` and at each subscription's `waiting()`, `running()`, and `awaitingAck()`. |
 | `MqttCapacityException`, or connections that end under load | `refusals()` names the limit that refused an operation, and `overloads()` why the client ended a connection. Compare the `used` and `limit` values before you change a setting. |
 | Messages are missing | `receiving().dropped()` gives drops by reason, and `unrouted()` QoS 0 messages that arrived faster than the client could take them. Also check the acknowledgement mode, the session expiry, application restarts, and whether your own queue finished the work. |
@@ -1034,6 +1074,7 @@ refuses work or ends a connection, `refusals()` and `overloads()` name it.
 | `version(...)` | MQTT 5.0 | Use `MqttVersion.V3_1_1` for a broker without MQTT 5.0; the client does not fall back by itself. |
 | `clientId(...)` | A generated identifier | Give a stable, unique identifier, which a persistent session needs. |
 | `sessionExpiry(...)` | Zero: a fresh session for each connection | Keep the session across this client object's connections; see [sessions](#keeping-a-session-between-connections). |
+| `sessionFile(...)` | None: a new client object starts a new session | Continue the session in the next client object, for example after a restart; see [Continuing a session after a restart](#continuing-a-session-after-a-restart). |
 | `keepAlive(...)` | 60 seconds | Detect a dead connection sooner, or send less traffic. Zero turns keep-alive off. |
 | `connectionTimeout(...)` | 30 seconds | Bound how long a connection may take to set up, from fetching credentials to the broker's answer. |
 | `responseTimeout(...)` | 60 seconds | Bound how long the broker takes to answer a subscription request or a step of a QoS 1 or 2 publication; expiry ends the connection. It is not a deadline for the whole `publish()`. |

@@ -27,9 +27,12 @@ import static java.util.Objects.requireNonNull;
 /// client with the same identifier, an administrative action, a redirection, and the reason
 /// codes for malformed packets, protocol errors, invalid topics or payloads, and broker limits
 /// or features that the client exceeded (0x81, 0x82, 0x8F, 0x90, 0x93 to 0x95, 0x99 to 0x9B,
-/// 0x9E, 0xA1, and 0xA2). It also stops when the client's [timer scheduler][TimerScheduler] fails.
-/// Other refusals and failures are retried, including bad credentials, missing authorization, an
-/// unspecified error, and a reason code that this client does not know.
+/// 0x9E, 0xA1, and 0xA2). It also stops when the client's [timer scheduler][TimerScheduler]
+/// fails, and when another client object takes over the client's
+/// [session file][MqttClientBuilder#sessionFile(java.nio.file.Path)]. Other refusals and
+/// failures are retried, including bad credentials, missing authorization, an unspecified
+/// error, a reason code that this client does not know, and a session file that another client
+/// object holds.
 /// [ConnectionListener#onConnectFailed(Disconnection)] reports each failed attempt, so an
 /// application that wants to stop on a particular cause can call [MqttClient#disconnect()].
 ///
@@ -41,8 +44,8 @@ import static java.util.Objects.requireNonNull;
 ///
 /// By default, the first failure of a connection request ends that request and fails its
 /// [MqttClient#connect()] future, because it usually reveals a configuration error at startup.
-/// [#withInitialRetry()] retries that failure with the same backoff instead, unless its reason
-/// code stops reconnecting.
+/// [#withInitialRetry()] retries that failure with the same backoff instead, unless it is one
+/// that stops reconnecting.
 ///
 /// Instances are immutable values with equality.
 public final class ReconnectPolicy {

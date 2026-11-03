@@ -2,6 +2,7 @@ package org.mqtt4j.hato;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -19,6 +20,7 @@ import javax.net.ssl.SSLParameters;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -487,6 +489,53 @@ class MqttClientBuilderTest {
                 .sessionExpiry(Duration.ofSeconds(1));
 
         assertThatThrownBy(sut::build).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void a_session_file_needs_a_persistent_session_with_an_explicit_identifier(
+            @TempDir Path directory
+    ) {
+        // Arrange
+        Path file = directory.resolve("session");
+        MqttClientBuilder clean = configuredBuilder()
+                .clientId("session-client")
+                .sessionFile(file);
+        MqttClientBuilder generated = configuredBuilder()
+                .sessionExpiry(Duration.ofSeconds(1))
+                .sessionFile(file);
+
+        // Act & Assert
+        assertThatThrownBy(clean::build).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(generated::build).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void a_session_file_needs_an_existing_directory(@TempDir Path directory) {
+        MqttClientBuilder sut = configuredBuilder()
+                .clientId("session-client")
+                .sessionExpiry(Duration.ofSeconds(1))
+                .sessionFile(directory.resolve("missing").resolve("session"));
+
+        assertThatThrownBy(sut::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("missing");
+    }
+
+    @Test
+    void a_session_file_may_be_named_relative_to_the_working_directory() {
+        MqttClientBuilder sut = configuredBuilder()
+                .clientId("session-client")
+                .sessionExpiry(Duration.ofSeconds(1))
+                .sessionFile(Path.of("session"));
+
+        assertThatCode(() -> sut.build().close()).doesNotThrowAnyException();
+    }
+
+    @Test
+    @SuppressWarnings("NullAway") // Deliberately violates the setter's non-null contract.
+    void a_session_file_cannot_be_null() {
+        assertThatThrownBy(() -> configuredBuilder().sessionFile(null))
+                .isInstanceOf(NullPointerException.class);
     }
 
     @ParameterizedTest(name = "rejects expiry {0} at once")

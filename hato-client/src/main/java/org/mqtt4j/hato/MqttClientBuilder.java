@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.Arrays;
@@ -32,8 +34,8 @@ import static org.mqtt4j.hato.client.internal.common.protocol.Properties.EMPTY;
 /// Configures a client without opening a connection. Not thread safe.
 /// Set [#server(URI)] before calling [#build()]; the other settings have defaults.
 /// Each setter rejects a value that is invalid on its own with [IllegalArgumentException] at
-/// once. [#build()] rejects settings that do not work together, and TLS settings that it cannot
-/// use, in the same way.
+/// once. [#build()] rejects settings that do not work together, TLS settings that it cannot use,
+/// and a session file in a missing directory, in the same way.
 public final class MqttClientBuilder {
 
     private static final Duration DEFAULT_KEEP_ALIVE = Duration.ofSeconds(60);
@@ -96,6 +98,8 @@ public final class MqttClientBuilder {
     private ReconnectPolicy reconnectPolicy = DEFAULT_RECONNECT_POLICY;
 
     private Duration sessionExpiry = Duration.ZERO;
+
+    private @Nullable Path sessionFile;
 
     private int maxPacketSize = DEFAULT_MAX_PACKET_SIZE;
 
@@ -220,7 +224,8 @@ public final class MqttClientBuilder {
     /// ask the broker to resume it. A session that the broker kept for the identifier without
     /// local state in this client object, for example from before the application restarted,
     /// is not resumed: the attempt that finds it discards it and starts a new session, so
-    /// messages that the broker stored for it are not received; see [MqttClient#connect()].
+    /// messages that the broker stored for it are not received; see [MqttClient#connect()]. A
+    /// [#sessionFile(Path)] lets a later client object continue the session instead.
     /// Accepts zero, or durations from 1 through 4294967295 seconds inclusive, and rejects any
     /// other duration at once. Fractional seconds are accepted within that range, such as 1.5
     /// seconds. The client does not enforce the duration locally. MQTT 5.0 sends it as the
@@ -244,6 +249,62 @@ public final class MqttClientBuilder {
             );
         }
         sessionExpiry = value;
+        return this;
+    }
+
+    /// Keeps this client's side of the persistent session in a file, so that a later client
+    /// object, for example after the application restarts, continues the session and receives
+    /// the messages that the broker stored for it meanwhile. Without a file, which is the
+    /// default, a new client object starts a new session; see [#sessionExpiry(Duration)].
+    /// [#build()] rejects a file without a positive [#sessionExpiry(Duration)], which in turn
+    /// needs an explicit [#clientId(String)], and a file in a directory that does not exist.
+    ///
+    /// [MqttClient#disconnect()] saves the session to the file before it completes, without message
+    /// payloads: the subscriptions that the broker holds, and which messages the application has
+    /// acknowledged. Before a connection, the client takes the session over from the file unless it
+    /// already holds it: it continues the session last saved there, if any, and holds the file,
+    /// which keeps other client objects from taking the session over. The connection then resumes
+    /// the session if the broker still has it. Register subscriptions before [MqttClient#connect()]
+    /// to receive the stored messages, which can arrive as soon as the connection is established: a
+    /// message that arrives before a subscription for it is registered is dropped, as
+    /// [ClientStats.Receiving#unmatched()] counts. When the connection is established, the client
+    /// unsubscribes from the saved session's filters that no subscription has registered.
+    ///
+    /// The client saves nothing, and the next client object starts a new session as it would
+    /// without a file, when the client object ends without a completed
+    /// [MqttClient#disconnect()] after taking the session over, as when it is closed while
+    /// connected or the process crashes; when a disconnection leaves exchanges of QoS 1 or QoS 2
+    /// publications for a later connection, as [MqttClient#disconnect()] describes; and after an
+    /// MQTT 5.0 broker has handed the session to another client. Messages that the application
+    /// acknowledges after [MqttClient#disconnect()] completes arrive again in the next client
+    /// object. A failure to save does not fail [MqttClient#disconnect()]. A failure to read or
+    /// write the file before a connection fails the connection attempt with
+    /// [MqttConnectException], like a connection that cannot be established. A file that the
+    /// client cannot use, such as a damaged one or one written for another client identifier or
+    /// protocol version, is ignored, and the client starts a new session.
+    ///
+    /// Give each client identifier its own file, where every client object with that identifier
+    /// finds it, such as on a volume that belongs to the instance, and on a local file system
+    /// rather than a network one. The client keeps files of its own beside the file, so the
+    /// directory must be writable. A client object holds the file from the connection that takes
+    /// the session over until [MqttClient#disconnect()] has saved the session or the client object
+    /// is closed, and then until its connections have ended, which after a close is by the time
+    /// [MqttClient#terminated()] completes, or until its process ends. Meanwhile, the connection
+    /// attempts of other client objects with the file fail with [MqttConnectException] without
+    /// sending CONNECT, and their reconnect policies decide whether they try again. With
+    /// [ReconnectPolicy#withInitialRetry()], a client object that starts while an earlier one still
+    /// runs, as during a rolling update, connects once the earlier one has disconnected, and
+    /// continues its session. Should another client object take the session over regardless, as a
+    /// network file system may let it, this one saves nothing and stops at its next connection
+    /// without sending CONNECT: that attempt fails with [MqttConnectException], and the client does
+    /// not reconnect, as when an MQTT 5.0 broker hands the session to another client.
+    ///
+    /// @param value
+    ///   the file that keeps the session
+    /// @return
+    ///   this builder
+    public MqttClientBuilder sessionFile(Path value) {
+        sessionFile = requireNonNull(value, "sessionFile");
         return this;
     }
 
@@ -599,9 +660,9 @@ public final class MqttClientBuilder {
     ///   if the server has not been specified
     /// @throws IllegalArgumentException
     ///   if TLS settings are invalid or incompatible, a persistent session has no explicit
-    ///   client id, the Will's properties exceed 65535 bytes with the Will delay, the Will delay
-    ///   is positive without a Will, or MQTT 3.1.1 is chosen with Will properties or a positive
-    ///   Will delay
+    ///   client id, a session file has no persistent session or no existing directory, the
+    ///   Will's properties exceed 65535 bytes with the Will delay, the Will delay is positive
+    ///   without a Will, or MQTT 3.1.1 is chosen with Will properties or a positive Will delay
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null) {
@@ -619,6 +680,19 @@ public final class MqttClientBuilder {
         }
         // The CONNECT form checks the payload limit here, before the client starts any thread.
         Packet.Will connectWill = (will == null) ? null : connectWill(will);
+        Path file = sessionFile;
+        if (file != null) {
+            if (sessionExpiry.isZero()) {
+                throw new IllegalArgumentException("A session file needs a persistent session");
+            }
+            // The client replaces the file through other files in the same directory.
+            Path directory = file.toAbsolutePath().normalize().getParent();
+            if (directory == null || !Files.isDirectory(directory)) {
+                throw new IllegalArgumentException(
+                        "A session file needs an existing directory: " + file
+                );
+            }
+        }
         String id = clientId;
         if (id == null) {
             if (!sessionExpiry.isZero()) {
@@ -663,7 +737,7 @@ public final class MqttClientBuilder {
                 factory,
                 version,
                 sessionExpiry,
-                null,
+                file,
                 credentials,
                 connectWill,
                 reconnectPolicy.backoff(),

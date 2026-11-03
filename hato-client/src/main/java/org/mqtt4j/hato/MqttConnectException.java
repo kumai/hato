@@ -19,6 +19,9 @@ import static java.util.Objects.requireNonNull;
 /// failure while closing the connection that found the session is attached as a suppressed
 /// exception. If the client's [TimerScheduler] fails meanwhile,
 /// that failure is the cause instead, and the refusal is attached as a suppressed exception.
+/// An attempt also fails with neither when another client object holds the client's
+/// [session file][MqttClientBuilder#sessionFile(java.nio.file.Path)] or has taken its session
+/// over.
 @SuppressWarnings("exports") // Nullness annotations are compile-time only.
 public final class MqttConnectException extends MqttException {
 
