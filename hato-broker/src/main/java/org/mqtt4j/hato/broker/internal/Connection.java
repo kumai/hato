@@ -412,10 +412,14 @@ final class Connection {
                 boolean skip = false;
                 if (delivery != null) {
                     settings.beforeDeliveryWrite().run();
-                    synchronized (routing) {
-                        if (client.currentSession() != null) {
+                    // This monitor, not routing, decides. A session ends the connection that it
+                    // leaves, under this monitor, before it resends the connection's deliveries
+                    // elsewhere, so a delivery is marked as sent before the resend reads the
+                    // mark, or is never written here.
+                    synchronized (this) {
+                        if (!ended && lastPacket == null) {
                             delivery.sent = true;
-                        } else if (endsWithLastPacket()) {
+                        } else if (lastPacket != null) {
                             // The delivery stays unsent for the session's next connection;
                             // the last packet still follows.
                             skip = true;

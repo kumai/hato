@@ -241,7 +241,9 @@ final class Client {
                 };
                 connection.enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, properties));
             }
-            // Do not hold the new peer's monitor while ending the old peer.
+            // Do not hold the new peer's monitor while ending the old peer. The old peer ends
+            // before the session resumes below: its writer marks a delivery as sent only until
+            // then, and the resend reads that mark for its DUP flag.
             if (previous != null) {
                 previous.disconnect(
                         ReasonCode.SESSION_TAKEN_OVER,
