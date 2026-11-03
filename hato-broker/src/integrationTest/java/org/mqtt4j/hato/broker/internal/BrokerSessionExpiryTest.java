@@ -168,6 +168,54 @@ class BrokerSessionExpiryTest {
         }
     }
 
+    @Test
+    void a_disconnect_with_no_expiry_frees_the_place_of_its_session() throws Exception {
+        try (BrokerServer sut = broker(1); RawSession watcher = watching(sut)) {
+            // Arrange: the only persistent session that the broker keeps.
+            RawSession client = open(sut, "first", true, 10);
+
+            // Act
+            client.send(disconnectWithWill(0));
+            leave(client, watcher, "first");
+
+            // Assert
+            open(sut, "second", true, 10).close();
+        }
+    }
+
+    @Test
+    void a_connection_that_resumes_a_session_with_no_expiry_frees_its_place() throws Exception {
+        try (BrokerServer sut = broker(1); RawSession watcher = watching(sut)) {
+            // Arrange: the only persistent session that the broker keeps.
+            leave(open(sut, "first", true, 10), watcher, "first");
+
+            // Act: the session now ends with this connection.
+            try (RawSession resumed = resumed(sut, "first", 0, true)) {
+                // Assert
+                open(sut, "second", true, 10).close();
+                resumed.ping();
+            }
+        }
+    }
+
+    @Test
+    void a_clean_start_takes_over_the_place_of_the_session_that_it_replaces() throws Exception {
+        try (BrokerServer sut = broker(1); RawSession watcher = watching(sut)) {
+            // Arrange: the only persistent session that the broker keeps.
+            leave(open(sut, "first", true, 10), watcher, "first");
+
+            // Act: a new persistent session in place of that one.
+            leave(open(sut, "first", true, 10), watcher, "first");
+
+            // Assert: the new session holds the only place.
+            try (var refused = RawSession.open(sut.port(), MqttVersion.V5)) {
+                refused.send(connectV5("second", true, 0, 10));
+                assertThat(refused.expect(Packet.ConnAck.class).reasonCode())
+                        .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
+            }
+        }
+    }
+
     private BrokerServer broker() throws IOException {
         return broker(16);
     }

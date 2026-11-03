@@ -24,7 +24,7 @@ final class RetainedCursor implements Pending {
 
     private final List<Integer> identifiers;
 
-    private final List<Routing.Retained> matched;
+    private final List<RetainedMessages.Message> matched;
 
     private final MqttVersion version;
 
@@ -41,7 +41,7 @@ final class RetainedCursor implements Pending {
     RetainedCursor(
             Packet.Subscription subscription,
             List<Integer> identifiers,
-            List<Routing.Retained> matched,
+            List<RetainedMessages.Message> matched,
             MqttVersion version
     ) {
         filter = subscription.filter();
@@ -59,7 +59,7 @@ final class RetainedCursor implements Pending {
     // The delivery of the next retained message, or null once none is left.
     @Nullable Delivery current() {
         if (current == null && hasNext()) {
-            Routing.Retained entry = matched.get(next);
+            RetainedMessages.Message entry = matched.get(next);
             Packet.Publish publication = entry.publication();
             current = new Delivery(
                     publication,

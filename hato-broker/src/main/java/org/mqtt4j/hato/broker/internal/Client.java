@@ -186,15 +186,18 @@ final class Client {
                         && existing != null
                         && existing.kept()
                         && existing.version == request.version();
-                // Resuming or replacing a kept session reuses its place in the limit.
-                if (keep && (existing == null || !existing.kept())
-                        && routing.sessions.values().stream().filter(Session::kept).count()
-                        >= settings.maxSessions()) {
+                // A session that resumes or replaces a kept one takes over its place in the
+                // limit, and frees it if it is not kept itself.
+                boolean placed = existing != null && existing.kept();
+                if (keep && !placed && !routing.takePersistentPlace()) {
                     connection.refuse(
                             ReasonCode.SERVER_UNAVAILABLE,
                             "persistent session capacity for client '" + id + "'"
                     );
                     return false;
+                }
+                if (placed && !keep) {
+                    routing.freePersistentPlace();
                 }
                 previous = existing == null ? null : existing.connection;
                 if (present) {
@@ -434,8 +437,6 @@ final class Client {
                 // The first refusal with a Reason String, which SUBACK carries; it has room for
                 // one.
                 Reason described = null;
-                // The subscriptions that receive retained messages after SUBACK.
-                var retaining = new ArrayList<Session.Subscribed>();
                 for (Packet.Subscription requested : request.subscriptions()) {
                     // An MQTT 3.1.1 client cannot learn that shared subscriptions are missing,
                     // so the broker refuses the filter rather than match it as written: a
@@ -477,43 +478,26 @@ final class Client {
                                     requested.retainHandling()
                             )
                             : requested;
-                    var subscribed = new Session.Subscribed(subscription, identifier);
-                    Session.Subscribed replaced = owner.subscriptions.put(
-                            subscription.filter(),
-                            subscribed
-                    );
+                    owner.subscribe(new Session.Subscribed(subscription, identifier));
                     ReasonCode granted = switch (subscription.qos()) {
                         case AT_MOST_ONCE -> ReasonCode.SUCCESS;
                         case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
                         case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
                     };
                     grants.add(granted);
-                    // Retain Handling 0 sends retained messages for every SUBSCRIBE, 1 only
-                    // for a new subscription, and 2, the only other value, never
-                    // [MQTT-3.3.1-9] [MQTT-3.3.1-10] [MQTT-3.3.1-11]. MQTT 3.1.1 uses 0.
-                    boolean sendsRetained = switch (subscription.retainHandling()) {
-                        case 0 -> true;
-                        case 1 -> replaced == null;
-                        default -> false;
-                    };
-                    if (sendsRetained) {
-                        retaining.add(subscribed);
-                    }
                 }
                 send(acknowledgement(
                         owner,
                         described,
                         properties -> new Packet.SubAck(request.packetId(), grants, properties)
                 ));
-                for (Session.Subscribed subscribed : retaining) {
-                    owner.deliverRetained(subscribed);
-                }
+                // The retained messages that the subscriptions queued follow SUBACK.
+                owner.drain();
             }
             case Packet.Unsubscribe request -> {
                 var results = new ArrayList<ReasonCode>();
                 for (TopicFilter filter : request.filters()) {
-                    boolean existed = owner.subscriptions.remove(filter) != null;
-                    owner.dropRetained(filter);
+                    boolean existed = owner.unsubscribe(filter);
                     results.add(
                             existed ? ReasonCode.SUCCESS : ReasonCode.NO_SUBSCRIPTION_EXISTED
                     );
@@ -546,6 +530,10 @@ final class Client {
                                 ReasonCode.PROTOCOL_ERROR,
                                 "Session Expiry Interval on DISCONNECT after none on CONNECT"
                         );
+                    }
+                    // A session that ends with its connection frees its place in the limit.
+                    if (owner.expiry != 0 && expiry.getAsLong() == 0) {
+                        routing.freePersistentPlace();
                     }
                     owner.expiry = expiry.getAsLong();
                 }
@@ -724,7 +712,7 @@ final class Client {
         return reason.fitted(build, sendLimit);
     }
 
-    // Called under routing, which guards the test controls.
+    // Called under routing, which guards the held responses and their release.
     private void send(Packet packet) {
         // A response that a test holds back waits outside the send queue, and so do the later
         // ones of its kind, until the test releases them.

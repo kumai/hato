@@ -4,7 +4,6 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,7 +24,8 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 import static java.util.Objects.requireNonNull;
 
-// Every session field, including the active connection, belongs to routing.
+// Every session field, including the active connection, belongs to routing. The subscriptions
+// are replaced rather than changed, so they can also be read without it.
 final class Session {
 
     private static final Log log = Log.of(Session.class);
@@ -62,8 +62,9 @@ final class Session {
 
     private Timer.@Nullable Cancellable willTimer;
 
-    // Each filter's subscription with the options that the client requested.
-    final Map<TopicFilter, Subscribed> subscriptions = new HashMap<>();
+    // Each filter's subscription with the options that the client requested, in the order the
+    // client made them. A change replaces the map, which is never changed once set.
+    private volatile Map<TopicFilter, Subscribed> subscriptions = Map.of();
 
     private final PacketIds packetIds = new PacketIds();
 
@@ -279,8 +280,47 @@ final class Session {
         return added;
     }
 
-    // Sends the retained messages that match `subscription`, which the client has just made
-    // or replaced. Each one arrives with RETAIN 1, whatever Retain As Published says, at the
+    // Makes or replaces the subscription to its filter. Retain Handling 0 queues the retained
+    // messages that it matches for every SUBSCRIBE, 1 only for a new subscription, and 2, the
+    // only other value, never [MQTT-3.3.1-9] [MQTT-3.3.1-10] [MQTT-3.3.1-11]; MQTT 3.1.1 uses 0.
+    // They wait for the next drain, which follows SUBACK. Under the topic lock, a retained
+    // publication either is among them or is delivered to the subscription, and the deliveries
+    // after the subscription queue behind them.
+    void subscribe(Subscribed subscribed) {
+        Packet.Subscription subscription = subscribed.subscription();
+        synchronized (routing.retained) {
+            Map<TopicFilter, Subscribed> current = subscriptions;
+            boolean sendsRetained = switch (subscription.retainHandling()) {
+                case 0 -> true;
+                case 1 -> !current.containsKey(subscription.filter());
+                default -> false;
+            };
+            if (sendsRetained) {
+                queueRetained(subscribed);
+            }
+            var changed = new LinkedHashMap<>(current);
+            changed.put(subscription.filter(), subscribed);
+            subscriptions = changed;
+        }
+    }
+
+    // Ends the subscription to `filter`, and returns whether there was one. The retained
+    // messages that still wait for it go too: the broker completes only the deliveries that it
+    // has started [MQTT-3.10.4-3], and they have not started.
+    boolean unsubscribe(TopicFilter filter) {
+        dropRetained(filter);
+        Map<TopicFilter, Subscribed> current = subscriptions;
+        if (!current.containsKey(filter)) {
+            return false;
+        }
+        var changed = new LinkedHashMap<>(current);
+        changed.remove(filter);
+        subscriptions = changed;
+        return true;
+    }
+
+    // Queues the retained messages that match `subscribed`, which the client is making or
+    // replacing. Each one arrives with RETAIN 1, whatever Retain As Published says, at the
     // lower of its QoS and the granted one ([MQTT-3.3.1-8] in MQTT 3.1.1). No Local does not
     // withhold the retained messages of the subscriber's own client: brokers differ here,
     // and Mosquitto and HiveMQ CE send them while EMQX withholds them.
@@ -289,26 +329,22 @@ final class Session {
     // which no delivery queue limit drops, so the subscription receives all of them, however
     // many it matches. A cursor that still waits for the same filter stays: replacing the
     // subscription must lose none of its messages, while Retain Handling 0 sends the retained
-    // ones again [MQTT-3.8.4-3].
-    void deliverRetained(Subscribed subscribed) {
+    // ones again [MQTT-3.8.4-3]. Called under the topic lock.
+    private void queueRetained(Subscribed subscribed) {
         Packet.Subscription subscription = subscribed.subscription();
+        List<RetainedMessages.Message> matched = routing.retained.matching(subscription.filter());
+        if (matched.isEmpty()) {
+            return;
+        }
+        for (RetainedMessages.Message message : matched) {
+            retainedRoom.add(message.byteCount());
+        }
         // They result from this subscription alone, and carry its identifier [MQTT-3.3.4-3].
         List<Integer> identifiers = subscribed.identifier() == 0
                 ? List.of()
                 : List.of(subscribed.identifier());
-        var matched = new ArrayList<Routing.Retained>();
-        for (Routing.Retained entry : routing.retainedMessages()) {
-            if (subscription.filter().matches(entry.publication().topic())) {
-                matched.add(entry);
-                retainedRoom.add(entry.byteCount());
-            }
-        }
-        if (matched.isEmpty()) {
-            return;
-        }
         pending.addLast(new RetainedCursor(subscription, identifiers, matched, version));
         dropOldestRetained();
-        drain();
     }
 
     // Drops the oldest retained messages that the cursors hold until their room holds its limits
@@ -326,10 +362,8 @@ final class Session {
         }
     }
 
-    // Drops the retained messages that still wait for `filter`, which the client unsubscribed
-    // from: the broker need not deliver what it holds for the subscription any more
-    // [MQTT-3.10.4-3].
-    void dropRetained(TopicFilter filter) {
+    // Drops the retained messages that still wait for `filter`.
+    private void dropRetained(TopicFilter filter) {
         Iterator<Pending> queued = pending.iterator();
         while (queued.hasNext()) {
             if (queued.next() instanceof RetainedCursor cursor && cursor.filter.equals(filter)) {
@@ -684,7 +718,7 @@ final class Session {
     // Drops the session state, the Will that waits with it included, which a closing broker
     // does not publish.
     void clear() {
-        subscriptions.clear();
+        subscriptions = Map.of();
         received.clear();
         inflight.clear();
         deferred.clear();
@@ -705,6 +739,9 @@ final class Session {
     void discard() {
         if (!routing.sessions.remove(clientId, this)) {
             return;
+        }
+        if (kept()) {
+            routing.freePersistentPlace();
         }
         Packet.Will waiting = takeWill();
         clear();

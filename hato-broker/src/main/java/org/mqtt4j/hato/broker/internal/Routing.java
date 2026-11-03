@@ -1,144 +1,134 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.jspecify.annotations.Nullable;
 
-import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
-import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
 import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
-import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
-// What the connections of one broker share: its sessions, its retained messages, and the rules
-// that tests set. The monitor of this object is the routing lock, which guards all of it, every
-// session, and the fields of each connection that say they belong to routing.
+// What the connections of one broker share: its sessions and connections, its retained
+// messages, and the rules that tests set. The monitor of this object is the routing lock, under
+// which connections handle their packets: it guards every session and the fields of each
+// connection that say they belong to routing. What is shared here can also be read without it:
+// the session table, the connection set, and the rules are concurrent or replaced as a whole,
+// and the retained messages have a lock of their own, the topic lock.
 //
 // This global lock and linear session/subscription scan bound routing throughput. Replace
 // them with an index and finer ownership if broker measurements justify productization.
-// Lock order is routing -> Connection. Readers/writers release their monitor before routing;
-// connection timers stop I/O without routing, and reader/writer cleanup detaches the connection
-// later. The timer of a waiting Will takes routing while it holds no Connection monitor.
+// Lock order is routing -> topic lock -> Connection. Readers/writers release their monitor
+// before routing; connection timers stop I/O without routing, and reader/writer cleanup detaches
+// the connection later. The timer of a waiting Will takes routing while it holds no Connection
+// monitor.
 final class Routing {
-
-    private static final Log log = Log.of(Routing.class);
 
     final BrokerSettings settings;
 
     // The port that the broker listens on, for thread names and logs.
     final int port;
 
-    final Set<Connection> connections = new HashSet<>();
+    final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 
-    final Map<String, Session> sessions = new HashMap<>();
+    final Map<String, Session> sessions = new ConcurrentHashMap<>();
 
-    // The retained message of each topic, guarded by routing, in the order they were stored.
-    // A new subscription scans them all, which the retained limits keep short; an index by topic
-    // level would replace the scan if productization needs it.
-    private final Map<Topic, Retained> retained = new LinkedHashMap<>();
+    // How many sessions in the table outlive their connection, which the session limit bounds.
+    // A CONNECT that makes such a session takes a place, unless the session that it resumes or
+    // replaces had one, and the place goes as the session ends or stops outliving its
+    // connection.
+    private final AtomicInteger persistentSessions = new AtomicInteger();
 
-    private long retainedBytes;
+    final RetainedMessages retained;
 
-    // Whether the retained limits have refused a message yet; only the first refusal warns.
-    private boolean retainedLimitReached;
-
-    // The test controls, guarded by routing like the packets they act on. Until a test sets
-    // them, they change nothing.
+    // The test controls. Until a test sets them, they change nothing.
 
     // Rules for later subscriptions to exactly these filters.
-    private final Map<TopicFilter, SubscriptionRule> subscriptionRules = new HashMap<>();
+    private final Map<TopicFilter, SubscriptionRule> subscriptionRules = new ConcurrentHashMap<>();
 
     // Rules that refuse later publications to the topics that their filters match, in the order
-    // set. A topic that several of them match takes the one set last.
-    private final LinkedHashMap<TopicFilter, Reason> publicationRules = new LinkedHashMap<>();
+    // set. A topic that several of them match takes the one set last. A change replaces the map,
+    // which is never changed once set, so the order changes at once for every reader.
+    private final AtomicReference<Map<TopicFilter, Reason>> publicationRules =
+            new AtomicReference<>(Map.of());
 
     // Rules that refuse later CONNECT requests with exactly these client identifiers.
-    private final Map<String, Reason> connectionRules = new HashMap<>();
+    private final Map<String, Reason> connectionRules = new ConcurrentHashMap<>();
 
     // The kinds of response that the connections of these clients hold back.
-    private final Set<Hold> holds = new HashSet<>();
+    private final Set<Hold> holds = ConcurrentHashMap.newKeySet();
 
     // What the broker announces to the MQTT 5.0 connections that it accepts from now on.
-    Capabilities capabilities;
+    volatile Capabilities capabilities;
 
     boolean closed;
 
     Routing(BrokerSettings settings, int port) {
         this.settings = settings;
         this.port = port;
+        retained = new RetainedMessages(settings, port);
         capabilities = settings.capabilities();
     }
 
     void refuseSubscriptions(String filter, Reason reason) {
-        var rule = new SubscriptionRule.Refusal(reason);
-        var key = new TopicFilter(filter);
-        synchronized (this) {
-            subscriptionRules.put(key, rule);
-        }
+        subscriptionRules.put(new TopicFilter(filter), new SubscriptionRule.Refusal(reason));
     }
 
     void grantAtMost(String filter, int maximumLevel) {
         var rule = new SubscriptionRule.Limit(Qos.of(maximumLevel));
-        var key = new TopicFilter(filter);
-        synchronized (this) {
-            subscriptionRules.put(key, rule);
-        }
+        subscriptionRules.put(new TopicFilter(filter), rule);
     }
 
     void clearSubscriptionRule(String filter) {
-        var key = new TopicFilter(filter);
-        synchronized (this) {
-            subscriptionRules.remove(key);
-        }
+        subscriptionRules.remove(new TopicFilter(filter));
     }
 
     void refusePublications(String filter, Reason reason) {
         var key = new TopicFilter(filter);
-        synchronized (this) {
+        publicationRules.updateAndGet(rules -> {
+            var changed = new LinkedHashMap<>(rules);
             // Setting a rule again makes it the last one set.
-            publicationRules.remove(key);
-            publicationRules.put(key, reason);
-        }
+            changed.remove(key);
+            changed.put(key, reason);
+            return changed;
+        });
     }
 
     void clearPublicationRule(String filter) {
         var key = new TopicFilter(filter);
-        synchronized (this) {
-            publicationRules.remove(key);
-        }
+        publicationRules.updateAndGet(rules -> {
+            var changed = new LinkedHashMap<>(rules);
+            changed.remove(key);
+            return changed;
+        });
     }
 
     void refuseConnections(String clientId, Reason reason) {
-        synchronized (this) {
-            connectionRules.put(clientId, reason);
-        }
+        connectionRules.put(clientId, reason);
     }
 
     void clearConnectionRule(String clientId) {
-        synchronized (this) {
-            connectionRules.remove(clientId);
-        }
+        connectionRules.remove(clientId);
     }
 
     void holdResponses(Class<? extends Packet> type, String clientId) {
-        var hold = new Hold(type, clientId);
-        synchronized (this) {
-            holds.add(hold);
-        }
+        holds.add(new Hold(type, clientId));
     }
 
     void releaseResponses(Class<? extends Packet> type, String clientId) {
         var hold = new Hold(type, clientId);
+        // Routing also guards the responses that connections send and hold, so none that comes
+        // after the release goes ahead of those held.
         synchronized (this) {
             holds.remove(hold);
             for (Connection connection : connections) {
@@ -191,22 +181,19 @@ final class Routing {
     // A connection copies the capabilities as routing accepts it, so each one works by those
     // before or those after this replacement, never by a mix.
     void announce(Capabilities value) {
-        synchronized (this) {
-            capabilities = value;
-        }
+        capabilities = value;
     }
 
-    // The test rule for subscriptions to exactly `filter`, or null without one. Called under
-    // routing.
+    // The test rule for subscriptions to exactly `filter`, or null without one.
     @Nullable SubscriptionRule subscriptionRule(TopicFilter filter) {
         return subscriptionRules.get(filter);
     }
 
     // The reason for refusing a publication to `topic`: that of the rule set last among those
-    // whose filters match it, or null when none does. Called under routing.
+    // whose filters match it, or null when none does.
     @Nullable Reason publicationRefusal(Topic topic) {
         Reason refusal = null;
-        for (Map.Entry<TopicFilter, Reason> rule : publicationRules.entrySet()) {
+        for (Map.Entry<TopicFilter, Reason> rule : publicationRules.get().entrySet()) {
             if (rule.getKey().matches(topic)) {
                 refusal = rule.getValue();
             }
@@ -215,14 +202,26 @@ final class Routing {
     }
 
     // The reason for refusing a CONNECT with exactly `clientId`, or null without a rule.
-    // Called under routing.
     @Nullable Reason connectionRefusal(String clientId) {
         return connectionRules.get(clientId);
     }
 
-    // Whether a test holds back the responses of `type` to `clientId`. Called under routing.
+    // Whether a test holds back the responses of `type` to `clientId`.
     boolean holdsBack(Class<? extends Packet> type, String clientId) {
         return holds.contains(new Hold(type, clientId));
+    }
+
+    // Takes a place among the persistent sessions for a session that a CONNECT makes, and returns
+    // false when the session limit leaves none.
+    boolean takePersistentPlace() {
+        int limit = settings.maxSessions();
+        int before = persistentSessions.getAndUpdate(count -> (count < limit) ? count + 1 : count);
+        return before < limit;
+    }
+
+    // Frees the place of a session that ends, or stops outliving its connection.
+    void freePersistentPlace() {
+        persistentSessions.decrementAndGet();
     }
 
     // Discards the sessions whose expiry has passed since their connection ended
@@ -276,99 +275,34 @@ final class Routing {
         discardExpiredSessions();
         // A Message Expiry Interval counts from here.
         long received = settings.scheduler().nanoTime();
-        if (publication.retain()) {
-            retain(publication, received);
+        if (!publication.retain()) {
+            deliver(publication, publisher, received);
+            return;
         }
-        // Snapshot permits an overloaded target to remove itself during delivery.
-        for (Session target : List.copyOf(sessions.values())) {
-            target.deliverMatching(publication, publisher, received);
+        synchronized (retained) {
+            retained.store(publication, received);
+            deliver(publication, publisher, received);
         }
     }
 
-    // A copy of the retained messages, in the order they were stored, after discarding those
-    // whose Message Expiry Interval has passed (MQTT 5.0 section 3.3.1.3). They are looked for
-    // here rather than with a timer each, so an expired one keeps its share of the retained
-    // limits until a subscription looks; a timer would release it at once, if productization
-    // needs that. Called under routing.
-    List<Retained> retainedMessages() {
-        long now = settings.scheduler().nanoTime();
-        retained.values().removeIf(entry -> {
-            if (!entry.expired(now)) {
-                return false;
-            }
-            retainedBytes -= entry.byteCount();
-            return true;
-        });
-        return List.copyOf(retained.values());
+    private void deliver(Packet.Publish publication, Session publisher, long received) {
+        // The table lets a target leave it during delivery, as one whose connection ended does.
+        for (Session target : sessions.values()) {
+            target.deliverMatching(publication, publisher, received);
+        }
     }
 
     // Ends every connection and forgets every session and retained message, as the broker
     // closes. Called under routing.
     void clear() {
-        for (Connection connection : List.copyOf(connections)) {
+        for (Connection connection : connections) {
             connection.close("broker closed");
         }
         sessions.values().forEach(Session::clear);
         sessions.clear();
-        retained.clear();
-        retainedBytes = 0;
-    }
-
-    // Makes `publication` the retained message of its topic in place of the previous one
-    // [MQTT-3.3.1-5]. An empty payload only removes the previous one [MQTT-3.3.1-6]
-    // [MQTT-3.3.1-7]. A message beyond the retained limits is not kept either, which leaves its
-    // topic without a retained message rather than with an outdated one.
-    private void retain(Packet.Publish publication, long received) {
-        Retained previous = retained.remove(publication.topic());
-        if (previous != null) {
-            retainedBytes -= previous.byteCount();
-        }
-        if (publication.payload().length == 0) {
-            return;
-        }
-        // A retained message counts as the MQTT 5.0 PUBLISH that carries it with its properties.
-        byte[] header = PacketCodec.of(MqttVersion.V5).encodePublishHeader(
-                publication.topic(),
-                publication.qos(),
-                true,
-                false,
-                (publication.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
-                publication.properties(),
-                publication.payload().length
-        );
-        var entry = new Retained(
-                publication,
-                header.length + publication.payload().length,
-                received
-        );
-        if (retained.size() >= settings.maxRetained()
-                || entry.byteCount() > settings.maxRetainedBytes() - retainedBytes) {
-            if (!retainedLimitReached) {
-                retainedLimitReached = true;
-                log.warn(
-                        "Broker on port {} reached its retained message limits and keeps no"
-                                + " retained message for topic {}; later refusals log at DEBUG",
-                        port,
-                        publication.topic().name()
-                );
-            } else {
-                log.debug(
-                        "Broker on port {} keeps no retained message for topic {}: limits reached",
-                        port,
-                        publication.topic().name()
-                );
-            }
-            return;
-        }
-        retained.put(publication.topic(), entry);
-        retainedBytes += entry.byteCount();
-    }
-
-    // A retained message, its share of the retained size limit, and when the broker received it.
-    record Retained(Packet.Publish publication, long byteCount, long received) {
-
-        boolean expired(long now) {
-            return Delivery.expired(Delivery.lifetimeOf(publication), received, now);
+        persistentSessions.set(0);
+        synchronized (retained) {
+            retained.clear();
         }
     }
 
