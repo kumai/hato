@@ -2,6 +2,7 @@ package org.mqtt4j.hato.client.internal;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Optional;
@@ -14,6 +15,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -31,7 +33,8 @@ import static org.mqtt4j.hato.client.internal.MessagingTest.uniqueTopic;
 
 /// The client's MQTT 3.1.1 connections to each broker product: connecting and a refused
 /// connection, publications at every QoS, a persistent session that goes on or that the broker
-/// dropped, automatic reconnection, the Will, and retained messages.
+/// dropped, a session that a session file carries to a restarted client, automatic reconnection,
+/// the Will, and retained messages.
 ///
 /// Each product's subclass starts its broker and states its capability profile: where the
 /// recorded behavior of its pinned image differs from what these tests expect of a broker by
@@ -54,6 +57,9 @@ abstract class AcceptanceTest {
     private static final Duration RELEASE_PAUSE = Duration.ofMillis(500);
 
     private static final int RELEASE_TRIES = 10;
+
+    @TempDir
+    Path directory;
 
     @Test
     void a_client_connects_disconnects_and_closes() throws Exception {
@@ -194,6 +200,58 @@ abstract class AcceptanceTest {
             MqttMessage after = message(topic, (byte) 3);
             publisher.publish(after).get(5, SECONDS);
             assertThat(receive(subscription)).isEqualTo(after);
+        }
+    }
+
+    @Test
+    void a_restarted_client_continues_its_session_from_a_session_file() throws Exception {
+        var topic = new Topic(uniqueTopic());
+        String clientId = clientId();
+        var connections = new AtomicInteger();
+        try (MqttClient publisher = client()) {
+            // Arrange: an earlier client object subscribes and saves the session when it
+            // disconnects, and then a message arrives for the session.
+            publisher.connect().get(5, SECONDS);
+            MqttClient earlier = sessionFileBuilder(clientId).build();
+            try (earlier) {
+                earlier.connect().get(5, SECONDS);
+                subscribe(earlier, topic, Qos.AT_LEAST_ONCE);
+                earlier.disconnect().get(5, SECONDS);
+            }
+            // The earlier client object holds the file until its connection has ended.
+            earlier.terminated().get(5, SECONDS);
+            MqttMessage away = message(topic, (byte) 1);
+            publisher.publish(away).get(5, SECONDS);
+            try (
+                    MqttClient sut = sessionFileBuilder(clientId)
+                            .transportFactory(id -> {
+                                connections.incrementAndGet();
+                                return Transport.tcp(id);
+                            })
+                            .build()
+            ) {
+                PullSubscription subscription = sut.subscribe(
+                        Subscribe.of(new TopicFilter(topic.name()), Qos.AT_LEAST_ONCE)
+                );
+
+                // Act
+                letTheBrokerRelease();
+                ConnAck connAck = sut.connect().get(5, SECONDS);
+                MqttMessage after = message(topic, (byte) 2);
+                publisher.publish(after).get(5, SECONDS);
+
+                // Assert: one connection continues the session. A broker that drops what
+                // arrived for the absent client still keeps its subscription.
+                assertThat(connAck).isEqualTo(ConnAck.of(true, 1));
+                assertThat(connections).hasValue(1);
+                if (keepsMessagesForAbsentClients()) {
+                    assertThat(receive(subscription)).isEqualTo(away);
+                }
+                assertThat(receive(subscription)).isEqualTo(after);
+                assertThat(subscription.receive(Duration.ZERO))
+                        .isEqualTo(new ReceiveResult.TimedOut());
+                sut.disconnect().get(5, SECONDS);
+            }
         }
     }
 
@@ -580,6 +638,15 @@ abstract class AcceptanceTest {
 
     private MqttClient persistentClient(String clientId) {
         return builder().clientId(clientId).sessionExpiry(Duration.ofMinutes(1)).build();
+    }
+
+    /// A builder of the client objects that keep the session of `clientId` in the test's
+    /// session file, one after another, as the starts of an application would.
+    private MqttClientBuilder sessionFileBuilder(String clientId) {
+        return builder()
+                .clientId(clientId)
+                .sessionExpiry(Duration.ofMinutes(1))
+                .sessionFile(directory.resolve("session"));
     }
 
     private static String clientId() {

@@ -3,12 +3,15 @@ package org.mqtt4j.hato.client.internal;
 import java.io.EOFException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -20,9 +23,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 /// The client's MQTT 5.0 connections, shared by Mosquitto, EMQX, HiveMQ CE, NanoMQ, RabbitMQ,
 /// and the embedded broker: publications at every QoS, message properties, repeated publications
 /// on one topic, overlapping subscriptions, a persistent session that keeps messages while the
-/// client is away, and a session that another client takes over.
+/// client is away, a session that a session file carries with its Subscription Identifiers to a
+/// restarted client, and a session that another client takes over.
 @Timeout(30)
 abstract class Mqtt5RoundTripTest {
+
+    @TempDir
+    Path directory;
 
     @ParameterizedTest
     @EnumSource(Qos.class)
@@ -243,6 +250,79 @@ abstract class Mqtt5RoundTripTest {
     }
 
     @Test
+    void a_restarted_client_routes_stored_messages_by_the_identifiers_in_its_session_file()
+            throws Exception {
+        String unique = UUID.randomUUID().toString().replace("-", "");
+        var first = new TopicFilter("hato/mqtt5/file/" + unique + "/first");
+        var second = new TopicFilter("hato/mqtt5/file/" + unique + "/second");
+        var toFirst = MqttMessage.of(
+                new Topic(first.pattern()),
+                new byte[] {1},
+                Qos.AT_LEAST_ONCE,
+                false
+        );
+        var toSecond = MqttMessage.of(
+                new Topic(second.pattern()),
+                new byte[] {2},
+                Qos.AT_LEAST_ONCE,
+                false
+        );
+        var receivedByFirst = new LinkedBlockingQueue<MqttMessage>();
+        var receivedBySecond = new LinkedBlockingQueue<MqttMessage>();
+        String clientId = "mqtt5-file-" + unique.substring(0, 12);
+        try (MqttClient publisher = client("mqtt5-file-publisher", Duration.ZERO)) {
+            // Arrange: an earlier client object subscribes to the first filter under identifier
+            // 1 and to the second under 2, and saves the session when it disconnects. Then a
+            // message arrives for each filter.
+            publisher.connect().get(5, SECONDS);
+            MqttClient earlier = sessionFileClient(clientId);
+            try (earlier) {
+                earlier.connect().get(5, SECONDS);
+                earlier.subscribe(Subscribe.of(first, Qos.AT_LEAST_ONCE))
+                        .established()
+                        .get(5, SECONDS);
+                earlier.subscribe(Subscribe.of(second, Qos.AT_LEAST_ONCE))
+                        .established()
+                        .get(5, SECONDS);
+                earlier.disconnect().get(5, SECONDS);
+            }
+            // The earlier client object holds the file until its connection has ended.
+            earlier.terminated().get(5, SECONDS);
+            publisher.publish(toFirst).get(5, SECONDS);
+            publisher.publish(toSecond).get(5, SECONDS);
+            try (MqttClient sut = sessionFileClient(clientId)) {
+                // The next client object registers the filters in the other order, so that new
+                // identifiers would give the first one to the second filter.
+                Subscription _ = sut.subscribe(
+                        Subscribe.of(second, Qos.AT_LEAST_ONCE),
+                        delivery -> receivedBySecond.add(delivery.message())
+                );
+                Subscription _ = sut.subscribe(
+                        Subscribe.of(first, Qos.AT_LEAST_ONCE),
+                        delivery -> receivedByFirst.add(delivery.message())
+                );
+
+                // Act
+                ConnAck connAck = sut.connect().get(5, SECONDS);
+
+                // Assert: each stored message reaches the subscription to its filter. A broker
+                // that drops the session leaves the client to start a new one, and the messages
+                // are lost.
+                if (keepsSessionsThatCleanStartBegan()) {
+                    assertThat(connAck.sessionPresent()).isTrue();
+                    assertThat(receivedByFirst.poll(5, SECONDS)).isEqualTo(toFirst);
+                    assertThat(receivedBySecond.poll(5, SECONDS)).isEqualTo(toSecond);
+                } else {
+                    assertThat(connAck.sessionPresent()).isFalse();
+                    assertThat(receivedByFirst.poll(1, SECONDS)).isNull();
+                    assertThat(receivedBySecond).isEmpty();
+                }
+                sut.disconnect().get(5, SECONDS);
+            }
+        }
+    }
+
+    @Test
     void a_taken_over_client_stays_disconnected_unless_the_broker_closes_without_a_reason()
             throws Exception {
         var endings = new LinkedBlockingQueue<Disconnection>();
@@ -306,6 +386,19 @@ abstract class Mqtt5RoundTripTest {
                 .version(MqttVersion.V5)
                 .clientId(clientId)
                 .sessionExpiry(sessionExpiry)
+                .reconnectPolicy(ReconnectPolicy.disabled())
+                .build();
+    }
+
+    /// A client object that keeps the session of `clientId` in the test's session file, as each
+    /// start of an application would build it.
+    private MqttClient sessionFileClient(String clientId) {
+        return MqttClient.builder()
+                .server(endpoint())
+                .version(MqttVersion.V5)
+                .clientId(clientId)
+                .sessionExpiry(Duration.ofMinutes(1))
+                .sessionFile(directory.resolve("session"))
                 .reconnectPolicy(ReconnectPolicy.disabled())
                 .build();
     }
