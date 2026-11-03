@@ -94,7 +94,9 @@ final class Subscriptions {
 
     private final Map<TopicFilter, LocalSubscription> byFilter = new HashMap<>();
 
-    private final Map<Integer, LocalSubscription> byIdentifier = new HashMap<>();
+    // Most publications on a connection with Subscription Identifiers find their registration
+    // here, by a key that is never boxed.
+    private final LongMap<LocalSubscription> byIdentifier = new LongMap<>();
 
     // Shared subscriptions, which no other subscription may overlap, in registration order.
     private final Set<LocalSubscription> sharedRegistrations = new LinkedHashSet<>();
@@ -254,11 +256,28 @@ final class Subscriptions {
     /// broker holds without an identifier and whose filter matches its topic. Any other
     /// publication goes to the registrations whose filter matches its topic.
     List<Long> matching(Packet.Publish publish) {
-        List<Integer> identifiers = core.subscriptionIdentifiers()
-                ? identifiers(publish.properties())
-                : List.of();
-        if (!identifiers.isEmpty()) {
-            return matching(publish.topic(), identifiers);
+        if (core.subscriptionIdentifiers()) {
+            // Most publications carry one identifier, alone or among other properties, so the
+            // identifiers are first counted by index, without a list or a boxed value.
+            List<Property> entries = publish.properties().entries();
+            int count = 0;
+            int identifier = 0;
+            for (int i = 0; i < entries.size(); i++) {
+                if (entries.get(i) instanceof Property.VariableByteValue(var id, var value)
+                        && id == PropertyId.SUBSCRIPTION_IDENTIFIER) {
+                    count++;
+                    identifier = value;
+                }
+            }
+            // Unless the broker may hold a registration without an identifier, whose filter
+            // must then be matched as well, a lone identifier names the only registration that
+            // the publication goes to.
+            if (count == 1 && !someHeldWithoutIdentifier) {
+                return routeTo(byIdentifier.get(identifier));
+            }
+            if (count > 0) {
+                return matching(publish.topic(), identifiers(publish.properties()));
+            }
         }
         // Without identifiers, the answer depends on the topic and the registrations alone, and
         // most streams repeat a few topics, so the answer for a topic is kept until the
@@ -269,7 +288,7 @@ final class Subscriptions {
             if (routes.size() == ROUTE_LIMIT) {
                 routes.clear();
             }
-            route = List.copyOf(matching(publish.topic(), identifiers));
+            route = List.copyOf(matching(publish.topic(), List.of()));
             routes.put(name, route);
         }
         return route;
@@ -300,8 +319,7 @@ final class Subscriptions {
         }
         // Most publications match one registration, which needs no ordering.
         if (matches.size() == 1) {
-            LocalSubscription only = matches.getFirst();
-            return only.removal == null ? List.of(only.id) : List.of();
+            return routeTo(matches.getFirst());
         }
         // Registration order, which is the order of the ids, decides the order in which the
         // lanes take their copies; a registration named twice, or named and matched, goes once.
@@ -313,6 +331,12 @@ final class Subscriptions {
             }
         }
         return ids;
+    }
+
+    /// The registrations to which a publication goes when `local` is the only one that may take
+    /// it: none when there is no such registration or its removal has begun.
+    private static List<Long> routeTo(@Nullable LocalSubscription local) {
+        return local != null && local.removal == null ? local.route : List.of();
     }
 
     /// Reconciles the registry with the broker after a successful CONNACK and before the core
@@ -931,6 +955,9 @@ final class Subscriptions {
         // that only an earlier client object registered has a negative id that the shell never
         // sees.
         final long id;
+        // What matching() returns for a publication that this registration alone takes, as most
+        // are: made once, so that answering them allocates nothing.
+        final List<Long> route;
         final TopicFilter filter;
         final TopicFilter matchingFilter;
         final Qos requestedQos;
@@ -965,6 +992,7 @@ final class Subscriptions {
                 int identifier
         ) {
             this.id = id;
+            route = List.of(id);
             filter = request.filter();
             requestedQos = request.qos();
             noLocal = request.noLocal();

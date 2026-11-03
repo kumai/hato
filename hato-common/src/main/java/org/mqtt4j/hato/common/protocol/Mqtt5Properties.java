@@ -4,7 +4,6 @@ import java.io.ByteArrayOutputStream;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.List;
 
 import static org.mqtt4j.hato.common.value.ReasonCode.MALFORMED_PACKET;
@@ -71,7 +70,30 @@ final class Mqtt5Properties {
         }
         ByteBuffer values = input.slice(input.position(), length);
         input.position(input.position() + length);
+        List<Property> entries = entries(values, type, will);
+        Properties properties = entries.isEmpty() ? Properties.EMPTY : new Properties(entries);
+        try {
+            checkProperties(properties, type, will);
+        } catch (IllegalArgumentException e) {
+            throw new PacketDecodeException(PROTOCOL_ERROR, "Invalid MQTT property", e);
+        }
+        return properties;
+    }
+
+    /// The properties in `values`, in their order. Most packets carry none or one, such as a
+    /// PUBLISH with the Subscription Identifier of its subscription, so they go into an
+    /// immutable list, which [Properties] keeps as it is; only a second property needs a growable
+    /// list, which it then copies.
+    private static List<Property> entries(ByteBuffer values, PacketType type, boolean will) {
+        if (!values.hasRemaining()) {
+            return List.of();
+        }
+        Property first = entry(values, type, will);
+        if (!values.hasRemaining()) {
+            return List.of(first);
+        }
         var entries = new ArrayList<Property>();
+        entries.add(first);
         while (values.hasRemaining()) {
             if (entries.size() == PacketCodec.MAX_PROPERTIES) {
                 throw new PacketDecodeException(
@@ -79,38 +101,37 @@ final class Mqtt5Properties {
                         "More than " + PacketCodec.MAX_PROPERTIES + " MQTT properties"
                 );
             }
-            PropertyId id;
-            try {
-                id = PropertyId.of(RemainingLength.readMinimal(values));
-                checkAllowed(id, type, will);
-            } catch (IllegalArgumentException e) {
-                // Section 2.2.2.2 classifies unknown or misplaced identifiers as malformed.
-                throw new PacketDecodeException(
-                        MALFORMED_PACKET,
-                        "Unknown or misplaced property",
-                        e
-                );
-            }
-            try {
-                entries.add(readValue(values, id));
-            } catch (BufferUnderflowException e) {
-                throw new PacketDecodeException(MALFORMED_PACKET, "Truncated property value", e);
-            } catch (IllegalArgumentException e) {
-                // Section 3.3.4 assigns a specific disconnect reason to the forbidden alias zero.
-                throw new PacketDecodeException(
-                        id == PropertyId.TOPIC_ALIAS ? TOPIC_ALIAS_INVALID : PROTOCOL_ERROR,
-                        "Invalid MQTT property",
-                        e
-                );
-            }
+            entries.add(entry(values, type, will));
         }
-        var properties = new Properties(entries);
+        return entries;
+    }
+
+    /// The next property in `values`.
+    private static Property entry(ByteBuffer values, PacketType type, boolean will) {
+        PropertyId id;
         try {
-            checkProperties(properties, type, will);
+            id = PropertyId.of(RemainingLength.readMinimal(values));
+            checkAllowed(id, type, will);
         } catch (IllegalArgumentException e) {
-            throw new PacketDecodeException(PROTOCOL_ERROR, "Invalid MQTT property", e);
+            // Section 2.2.2.2 classifies unknown or misplaced identifiers as malformed.
+            throw new PacketDecodeException(
+                    MALFORMED_PACKET,
+                    "Unknown or misplaced property",
+                    e
+            );
         }
-        return properties;
+        try {
+            return readValue(values, id);
+        } catch (BufferUnderflowException e) {
+            throw new PacketDecodeException(MALFORMED_PACKET, "Truncated property value", e);
+        } catch (IllegalArgumentException e) {
+            // Section 3.3.4 assigns a specific disconnect reason to the forbidden alias zero.
+            throw new PacketDecodeException(
+                    id == PropertyId.TOPIC_ALIAS ? TOPIC_ALIAS_INVALID : PROTOCOL_ERROR,
+                    "Invalid MQTT property",
+                    e
+            );
+        }
     }
 
     private static Property readValue(ByteBuffer input, PropertyId id) {
@@ -174,24 +195,34 @@ final class Mqtt5Properties {
     }
 
     private static void checkProperties(Properties properties, PacketType type, boolean will) {
-        var seen = EnumSet.noneOf(PropertyId.class);
-        for (Property property : properties.entries()) {
-            PropertyId id = property.id();
+        // The identifiers seen so far, a bit each, so that the check allocates nothing: the codec
+        // checks every PUBLISH that it reads, and every one that it sizes before writing. The 27
+        // identifiers of MQTT 5.0 fit in a long; more than 64 would need an EnumSet again.
+        long seen = 0;
+        List<Property> entries = properties.entries();
+        for (int i = 0; i < entries.size(); i++) {
+            PropertyId id = entries.get(i).id();
             checkAllowed(id, type, will);
             boolean repeated = id == PropertyId.USER_PROPERTY
                     || id == PropertyId.SUBSCRIPTION_IDENTIFIER && type == PacketType.PUBLISH;
-            if (!seen.add(id) && !repeated) {
+            if ((seen & bit(id)) != 0 && !repeated) {
                 throw new IllegalArgumentException("Duplicate property: " + id);
             }
+            seen |= bit(id);
         }
         // Later packets depend on the method agreed on in CONNECT, which the codec cannot know.
         if (!will && type == PacketType.CONNECT
-                && seen.contains(PropertyId.AUTHENTICATION_DATA)
-                && !seen.contains(PropertyId.AUTHENTICATION_METHOD)) {
+                && (seen & bit(PropertyId.AUTHENTICATION_DATA)) != 0
+                && (seen & bit(PropertyId.AUTHENTICATION_METHOD)) == 0) {
             throw new IllegalArgumentException(
                     "Authentication Data requires Authentication Method"
             );
         }
+    }
+
+    /// The bit of `id` among the identifiers that [#checkProperties] has seen.
+    private static long bit(PropertyId id) {
+        return 1L << id.ordinal();
     }
 
     private static void checkAllowed(PropertyId id, PacketType type, boolean will) {
