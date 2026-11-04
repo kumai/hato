@@ -9,5 +9,8 @@ module org.mqtt4j.hato.testkit {
     requires transitive org.mqtt4j.hato.client;
     requires transitive org.mqtt4j.hato.broker;
 
+    // The embedded log looks for a logging bridge that the JDK's own search cannot reach.
+    uses java.lang.System.LoggerFinder;
+
     exports org.mqtt4j.hato.testkit;
 }

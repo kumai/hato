@@ -2,7 +2,9 @@ package org.mqtt4j.hato.common.log;
 
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.Optional;
 import java.util.ResourceBundle;
+import java.util.ServiceLoader;
 
 import org.jspecify.annotations.Nullable;
 
@@ -26,7 +28,20 @@ import static java.util.Objects.requireNonNull;
 /// A failing backend never reaches the caller. Logging happens in cleanup, notification, and
 /// failure-reporting paths, so a throwing handler must not interrupt them or replace the
 /// failure being reported.
+///
+/// The JDK looks for a `System.LoggerFinder` on the system class loader only. A launcher of nested
+/// jars or an application server loads this class and the logging bridge from a child of that
+/// loader, so the JDK sees no bridge and settles on `java.util.logging`. In that case this facade
+/// uses the finder that its own class loader sees, and applications add the bridge the same way
+/// wherever the jar runs. This is the one use of `ServiceLoader` in the project: no explicit wiring
+/// can replace it without a public API that every application would have to call before any class
+/// of the distribution initializes. It hinders neither native images, which need no metadata for
+/// it, nor the AOT cache.
 public final class Log implements System.Logger {
+
+    // Null when the JDK found a provider itself or none exists, where System.getLogger is right.
+    private static final System.@Nullable LoggerFinder ownLoaderFinder =
+            findOwnLoaderFinder().orElse(null);
 
     private final System.Logger logger;
 
@@ -36,18 +51,41 @@ public final class Log implements System.Logger {
 
     /// Returns the log with the given `System.Logger` name.
     public static Log of(String name) {
-        return of(System.getLogger(requireNonNull(name, "name must not be null")));
+        requireNonNull(name, "name must not be null");
+        if (ownLoaderFinder != null) {
+            try {
+                return of(ownLoaderFinder.getLogger(name, Log.class.getModule()));
+            } catch (Throwable _) {
+                // A broken bridge must not keep the class asking for its log from initializing.
+            }
+        }
+        return of(System.getLogger(name));
     }
 
     /// Returns the log named after `type`. After embedding, the name carries the distribution's
     /// package, so client and broker diagnostics never share a name.
     public static Log of(Class<?> type) {
         requireNonNull(type, "type must not be null");
-        return of(System.getLogger(type.getName()));
+        return of(type.getName());
     }
 
     static Log of(System.Logger logger) {
         return new Log(requireNonNull(logger, "logger must not be null"));
+    }
+
+    private static Optional<System.LoggerFinder> findOwnLoaderFinder() {
+        try {
+            // The JDK's own finders are boot classes. Any other finder is a provider that the JDK
+            // found, and looking again would only create a second instance of it.
+            if (System.LoggerFinder.getLoggerFinder().getClass().getClassLoader() != null) {
+                return Optional.empty();
+            }
+            return ServiceLoader.load(System.LoggerFinder.class, Log.class.getClassLoader())
+                    .findFirst();
+        } catch (Throwable _) {
+            // As the JDK does with a broken provider, carry on without it.
+            return Optional.empty();
+        }
     }
 
     /// The `System.Logger` name.

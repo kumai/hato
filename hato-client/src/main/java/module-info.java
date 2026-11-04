@@ -8,5 +8,8 @@ module org.mqtt4j.hato.client {
     // WebSocket transports use the JDK's HTTP client.
     requires java.net.http;
 
+    // The embedded log looks for a logging bridge that the JDK's own search cannot reach.
+    uses java.lang.System.LoggerFinder;
+
     exports org.mqtt4j.hato;
 }

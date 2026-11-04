@@ -241,6 +241,90 @@ class DistributionTest {
             }
             """;
 
+    private static final String CONNECT_PROBE = """
+            try (var broker = org.mqtt4j.hato.broker.MqttBroker.start();
+                    org.mqtt4j.hato.MqttClient client = org.mqtt4j.hato.MqttClient.builder()
+                            .server(java.net.URI.create("mqtt://localhost:" + broker.port()))
+                            .build()) {
+                client.connect().get(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
+            """;
+    /// Plays the part of `slf4j-jdk-platform-logging`, and can fail where a broken bridge would.
+    private static final String BRIDGE = """
+            package probe;
+
+            public class Bridge extends System.LoggerFinder {
+                public static final java.util.Set<String> LOGGERS =
+                        java.util.concurrent.ConcurrentHashMap.newKeySet();
+                public static final java.util.concurrent.atomic.AtomicInteger INSTANCES =
+                        new java.util.concurrent.atomic.AtomicInteger();
+
+                public Bridge() {
+                    if ("constructor".equals(System.getProperty("bridge.fails.in"))) {
+                        throw new IllegalStateException("Broken bridge");
+                    }
+                    INSTANCES.incrementAndGet();
+                }
+
+                @Override
+                public System.Logger getLogger(String name, Module module) {
+                    if ("getLogger".equals(System.getProperty("bridge.fails.in"))) {
+                        throw new IllegalStateException("Broken bridge");
+                    }
+                    LOGGERS.add(name);
+                    return new System.Logger() {
+                        @Override
+                        public String getName() {
+                            return name;
+                        }
+
+                        @Override
+                        public boolean isLoggable(Level level) {
+                            return false;
+                        }
+
+                        @Override
+                        public void log(
+                                Level level,
+                                java.util.ResourceBundle bundle,
+                                String message,
+                                Throwable thrown
+                        ) {
+                        }
+
+                        @Override
+                        public void log(
+                                Level level,
+                                java.util.ResourceBundle bundle,
+                                String format,
+                                Object... parameters
+                        ) {
+                        }
+                    };
+                }
+            }
+            """;
+    /// Stands in for a launcher of nested jars: its arguments load below the system class loader.
+    private static final String LAUNCHER = """
+            package launcher;
+
+            public class Launcher {
+                public static void main(String[] args) throws Exception {
+                    var urls = new java.net.URL[args.length];
+                    for (int i = 0; i < args.length; i++) {
+                        urls[i] = java.nio.file.Path.of(args[i]).toUri().toURL();
+                    }
+                    var loader = new java.net.URLClassLoader(
+                            urls,
+                            ClassLoader.getSystemClassLoader()
+                    );
+                    loader.loadClass("probe.Probe")
+                            .getMethod("main", String[].class)
+                            .invoke(null, (Object) new String[0]);
+                }
+            }
+            """;
+
     @TempDir
     Path temporaryDirectory;
 
@@ -310,6 +394,56 @@ class DistributionTest {
                     throw new AssertionError("Testkit did not resolve both libraries");
                 }
                 """);
+    }
+
+    @Test
+    void logs_reach_a_bridge_that_only_the_class_loader_of_the_jars_can_see() throws Exception {
+        runBelowTheSystemClassLoader("nestedBridge", List.of(), CONNECT_PROBE + """
+                for (String owner : java.util.List.of("client", "broker")) {
+                    if (probe.Bridge.LOGGERS.stream()
+                            .noneMatch(name -> name.startsWith("org.mqtt4j.hato." + owner + "."))) {
+                        throw new AssertionError(owner + " missed: " + probe.Bridge.LOGGERS);
+                    }
+                }
+                """);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"constructor", "getLogger"})
+    void a_broken_bridge_leaves_the_jars_working(String failingPart) throws Exception {
+        runBelowTheSystemClassLoader(
+                "brokenBridge",
+                List.of("-Dbridge.fails.in=" + failingPart),
+                CONNECT_PROBE
+        );
+    }
+
+    @Test
+    void a_bridge_that_the_jdk_found_is_not_created_again() throws Exception {
+        Path root = temporaryDirectory.resolve("bridgeOnClassPath");
+        compileBridgeAndProbe(root, CONNECT_PROBE + """
+                if (probe.Bridge.INSTANCES.get() != 1) {
+                    throw new AssertionError("Bridges: " + probe.Bridge.INSTANCES);
+                }
+                """);
+        succeed(
+                root,
+                "java",
+                "-cp",
+                String.join(File.pathSeparator, applicationPaths(root)),
+                "probe.Probe"
+        );
+    }
+
+    @Test
+    void named_modules_may_look_for_a_logging_bridge() throws Exception {
+        for (Path jar : List.of(CLIENT, BROKER, testkitJar())) {
+            ModuleDescriptor descriptor = ModuleFinder.of(jar).findAll().iterator().next()
+                    .descriptor();
+            assertThat(descriptor.uses())
+                    .as("Services of %s", jar)
+                    .containsExactly("java.lang.System$LoggerFinder");
+        }
     }
 
     @Test
@@ -797,6 +931,51 @@ class DistributionTest {
                 classes + File.pathSeparator + modulepath,
                 "-m",
                 "probe/probe.Probe"
+        );
+    }
+
+    /// Runs the probe with only the launcher on the system class loader, so that the JDK cannot
+    /// see the bridge beside the distributed jars.
+    private void runBelowTheSystemClassLoader(
+            String name,
+            List<String> jvmOptions,
+            String body
+    ) throws Exception {
+        Path root = temporaryDirectory.resolve(name);
+        compileBridgeAndProbe(root, body);
+        Path source = write(root.resolve("src/launcher/Launcher.java"), LAUNCHER);
+        Path launcher = Files.createDirectories(root.resolve("launcher"));
+        succeed(root, "javac", "-d", launcher.toString(), source.toString());
+        var command = new ArrayList<>(jvmOptions);
+        command.addAll(List.of("-cp", launcher.toString(), "launcher.Launcher"));
+        command.addAll(applicationPaths(root));
+        succeed(root, "java", command.toArray(String[]::new));
+    }
+
+    private void compileBridgeAndProbe(Path root, String body) throws Exception {
+        Path bridgeSource = write(root.resolve("src/probe/Bridge.java"), BRIDGE);
+        Path bridge = Files.createDirectories(root.resolve("bridge"));
+        succeed(root, "javac", "-d", bridge.toString(), bridgeSource.toString());
+        write(bridge.resolve("META-INF/services/java.lang.System$LoggerFinder"), "probe.Bridge\n");
+        Path probeSource = write(root.resolve("src/probe/Probe.java"), probeSource(body));
+        Path application = Files.createDirectories(root.resolve("application"));
+        succeed(
+                root,
+                "javac",
+                "-cp",
+                String.join(File.pathSeparator, applicationPaths(root)),
+                "-d",
+                application.toString(),
+                probeSource.toString()
+        );
+    }
+
+    private static List<String> applicationPaths(Path root) {
+        return List.of(
+                root.resolve("application").toString(),
+                CLIENT.toString(),
+                BROKER.toString(),
+                root.resolve("bridge").toString()
         );
     }
 
