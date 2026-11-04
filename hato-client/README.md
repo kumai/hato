@@ -27,7 +27,7 @@ Gradle:
 
 ```kotlin
 dependencies {
-    implementation("org.mqtt4j:hato-client:1.0.0")
+    implementation("org.mqtt4j:hato-client:1.0.1")
 }
 ```
 
@@ -37,7 +37,7 @@ Maven:
 <dependency>
     <groupId>org.mqtt4j</groupId>
     <artifactId>hato-client</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
 </dependency>
 ```
 
@@ -928,7 +928,10 @@ connection or its keep-alive.
 
 The client logs through `System.Logger`, so its logs go to `java.util.logging` by default. To
 send them to SLF4J or Log4j, add the bridge `org.slf4j:slf4j-jdk-platform-logging` or
-`org.apache.logging.log4j:log4j-jpl`. The loggers are named under `org.mqtt4j.hato`:
+`org.apache.logging.log4j:log4j-jpl` next to the client jar, which also works inside an executable
+jar. Spring Boot applications should add it as well: Spring Boot stops forwarding
+`java.util.logging` before it destroys beans, so without the bridge the logs of a client closing
+with its bean are lost. The loggers are named under `org.mqtt4j.hato`:
 
 | Level | What the client logs |
 | --- | --- |

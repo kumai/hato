@@ -174,8 +174,10 @@ A few points sit outside code style and are checked in review:
 - No reflection, `ServiceLoader`, dynamic proxies, `Unsafe`, Java
   serialization, or runtime class generation. Everything is wired explicitly
   through builders. This is what keeps native-image builds working without
-  reachability metadata. Build-time source generation, package relocation, and
-  bytecode processing are allowed; they must preserve the distribution contracts.
+  reachability metadata and leaves ahead-of-time optimization unhindered. A use
+  that demonstrably hinders neither may be an exception. Build-time source
+  generation, package relocation, and bytecode processing are allowed; they must
+  preserve the distribution contracts.
 - The public API is exactly what the module descriptors export. Everything else
   is internal and may change at any time. Adding a public type or method is a
   design decision; open an issue first.

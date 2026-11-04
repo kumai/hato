@@ -10,4 +10,7 @@ module org.mqtt4j.hato.broker {
     requires static org.jspecify;
 
     // The shared implementation is embedded privately, so the client module is not required.
+
+    // The embedded log looks for a logging bridge that the JDK's own search cannot reach.
+    uses java.lang.System.LoggerFinder;
 }
