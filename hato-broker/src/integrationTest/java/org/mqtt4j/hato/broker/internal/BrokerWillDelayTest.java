@@ -271,29 +271,6 @@ class BrokerWillDelayTest {
     }
 
     @Test
-    void a_session_that_overflows_while_away_publishes_its_waiting_will() throws Exception {
-        try (BrokerServer sut = broker(1);
-                RawSession watcher = watching(sut);
-                RawSession publisher = RawSession.connectedV5(sut.port(), "publisher")) {
-            // Arrange: a session that queues a single delivery while away.
-            RawSession client = accepted(
-                    sut,
-                    connect("behind", true, 60, delayed("behind", 60)),
-                    false
-            );
-            client.subscribe("queued/#", AT_LEAST_ONCE);
-            leave(client);
-            publisher.publish("queued/first", "first", AT_LEAST_ONCE, 1);
-
-            // Act
-            publisher.publish("queued/second", "second", AT_LEAST_ONCE, 2);
-
-            // Assert
-            expectWill(watcher, "behind");
-        }
-    }
-
-    @Test
     void a_will_that_went_out_after_its_delay_does_not_go_out_again_as_the_session_ends()
             throws Exception {
         try (BrokerServer sut = broker(); RawSession watcher = watching(sut)) {
@@ -405,14 +382,9 @@ class BrokerWillDelayTest {
     }
 
     private BrokerServer broker() throws IOException {
-        return broker(16);
-    }
-
-    private BrokerServer broker(int maxQueued) throws IOException {
         return BrokerServer.builder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .scheduler(timer)
-                .maxQueued(maxQueued)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
     }
 

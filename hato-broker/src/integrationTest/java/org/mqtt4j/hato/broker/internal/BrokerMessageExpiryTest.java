@@ -5,6 +5,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.Test;
 
@@ -17,7 +19,9 @@ import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mqtt4j.hato.broker.internal.BrokerSessionRaceTest.awaitRelease;
 import static org.mqtt4j.hato.broker.internal.RawSession.acceptedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
@@ -50,6 +54,50 @@ class BrokerMessageExpiryTest {
             // Assert: 10 seconds less the 3 whole seconds waited.
             assertThat(subscriber.expect(Packet.Publish.class))
                     .isEqualTo(expiring("expiring/second", AT_LEAST_ONCE, 2, 7));
+        }
+    }
+
+    @Test
+    void a_message_that_waits_behind_a_write_carries_what_is_left_of_its_lifetime_once_written()
+            throws Exception {
+        // Arrange: the subscriber's writer is held on a first delivery, and a second one waits
+        // behind it in the connection's queue while the clock moves.
+        var holding = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(Duration.ofSeconds(5))
+                        .scheduler(timer)
+                        .beforeDeliveryWrite(() -> {
+                            if (holding.compareAndSet(true, false)) {
+                                held.countDown();
+                                awaitRelease(release);
+                            }
+                        })
+                        .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession subscriber = connectedV5(sut.port(), "subscriber");
+                RawSession publisher = connectedV5(sut.port(), "publisher")
+        ) {
+            subscriber.subscribe("expiring/#", AT_MOST_ONCE);
+            holding.set(true);
+            publisher.publish("expiring/first", "first", AT_MOST_ONCE, 0);
+            assertThat(held.await(5, SECONDS)).isTrue();
+            publisher.publish(expiring("expiring/second", AT_MOST_ONCE, 0, 10));
+            // The broker has queued the delivery for the subscriber before it answers this ping.
+            publisher.ping();
+            timer.clock.advance(Duration.ofMillis(3_500));
+
+            // Act
+            release.countDown();
+
+            // Assert: 10 seconds less the 3 whole seconds waited, in the queue too.
+            assertThat(subscriber.expect(Packet.Publish.class).topic())
+                    .isEqualTo(new Topic("expiring/first"));
+            assertThat(subscriber.expect(Packet.Publish.class))
+                    .isEqualTo(expiring("expiring/second", AT_MOST_ONCE, 0, 7));
+        } finally {
+            release.countDown();
         }
     }
 

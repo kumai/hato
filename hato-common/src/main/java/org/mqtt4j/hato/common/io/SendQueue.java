@@ -101,10 +101,21 @@ public final class SendQueue<T> {
 
     /// Checks current capacity without reserving it; [#offer] makes the final admission decision.
     public synchronized OfferResult checkCapacity(long byteCount, boolean reserved) {
+        return checkCapacity(byteCount, reserved, 0);
+    }
+
+    /// Checks current capacity as [#checkCapacity(long, boolean)] does, but only if the selected
+    /// quota would still take `countHeadroom` more sends, such as those that a caller has
+    /// promised and not offered yet.
+    public synchronized OfferResult checkCapacity(
+            long byteCount,
+            boolean reserved,
+            int countHeadroom
+    ) {
         if (closed) {
             return OfferResult.CLOSED;
         }
-        return budget.available(byteCount, reserved, 0, 0)
+        return budget.available(byteCount, reserved, countHeadroom, 0)
                 ? OfferResult.ACCEPTED : OfferResult.FULL;
     }
 

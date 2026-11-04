@@ -12,10 +12,15 @@ import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 
 // One publication on its way to one session, sized for the session's protocol version. The
-// packet identifier and whether it was sent belong to routing.
-final class Delivery implements Outgoing {
+// packet identifier belongs to the session's actor. Whether it was sent is set by the writer of
+// the connection that it went to, while that connection has not ended, and read by the actor for
+// the DUP flag of a resend. The payload stays the publication's, which its deliveries to other
+// sessions share: the writer prepares the headers as it writes them, before the payload.
+final class Delivery implements Outgoing, Pending {
 
     private final Packet.Publish publication;
+
+    private final PacketCodec codec;
 
     final Qos qos;
 
@@ -40,7 +45,7 @@ final class Delivery implements Outgoing {
 
     int packetId;
 
-    boolean sent;
+    volatile boolean sent;
 
     Delivery(
             Packet.Publish publication,
@@ -59,16 +64,13 @@ final class Delivery implements Outgoing {
             case V3_1_1 -> Properties.EMPTY;
             case V5 -> withIdentifiers(publication.properties(), identifiers);
         };
-        byte[] encodedHeader = PacketCodec.of(version).encodePublishHeader(
+        codec = PacketCodec.of(version);
+        byteCount = codec.publishSize(
                 publication.topic(),
                 qos,
-                retain,
-                false,
-                (qos == Qos.AT_MOST_ONCE) ? 0 : 1,
                 properties,
                 publication.payload().length
         );
-        byteCount = encodedHeader.length + publication.payload().length;
     }
 
     private static Properties withIdentifiers(Properties properties, List<Integer> identifiers) {
@@ -107,17 +109,23 @@ final class Delivery implements Outgoing {
         return lifetime >= 0 && now - received >= lifetime * 1_000_000_000L;
     }
 
-    @Override
-    public Packet.Publish packet(long now) {
-        return new Packet.Publish(
+    // The headers of the PUBLISH that carries the delivery at `now`, before its payload. DUP
+    // marks a resend of a delivery that an earlier connection started to send, as `sentBefore`
+    // says [MQTT-3.3.1-1], but never one at QoS 0 [MQTT-3.3.1-2].
+    byte[] header(boolean sentBefore, long now) {
+        return codec.encodePublishHeader(
                 publication.topic(),
-                publication.payload(),
                 qos,
                 retain,
-                qos != Qos.AT_MOST_ONCE && sent,
+                qos != Qos.AT_MOST_ONCE && sentBefore,
                 packetId,
-                remainingAt(now)
+                remainingAt(now),
+                publication.payload().length
         );
+    }
+
+    byte[] payload() {
+        return publication.payload();
     }
 
     // The properties with the Message Expiry Interval less the whole seconds waited, which is

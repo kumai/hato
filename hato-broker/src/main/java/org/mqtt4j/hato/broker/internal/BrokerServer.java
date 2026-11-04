@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.channels.ServerSocketChannel;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
@@ -50,6 +51,9 @@ public final class BrokerServer implements AutoCloseable {
     // Every response that a test holds takes one of the client's packet identifiers, so a client
     // that follows the protocol never holds more.
     private static final int MAX_HELD = 65_535;
+
+    // A few, so that a reader or writer that runs its session's events gets back to its socket.
+    private static final int IN_PLACE = 16;
 
     private final ServerSocket listener;
 
@@ -103,11 +107,15 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxHeld = MAX_HELD;
 
+        private int inPlace = IN_PLACE;
+
         private Capabilities capabilities = Capabilities.DEFAULT;
 
         private Timer scheduler = TimerService.instance;
 
         private Consumer<Packet> beforeProcess = _ -> { };
+
+        private Consumer<Packet> beforeHandle = _ -> { };
 
         private Runnable beforeDeliveryWrite = () -> { };
 
@@ -164,6 +172,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder inPlace(int value) {
+            inPlace = value;
+            return this;
+        }
+
         Builder capabilities(Capabilities value) {
             capabilities = requireNonNull(value, "capabilities must not be null");
             return this;
@@ -176,6 +189,11 @@ public final class BrokerServer implements AutoCloseable {
 
         Builder beforeProcess(Consumer<Packet> value) {
             beforeProcess = requireNonNull(value, "beforeProcess must not be null");
+            return this;
+        }
+
+        Builder beforeHandle(Consumer<Packet> value) {
+            beforeHandle = requireNonNull(value, "beforeHandle must not be null");
             return this;
         }
 
@@ -199,6 +217,7 @@ public final class BrokerServer implements AutoCloseable {
                 || maxRetained <= 0
                 || maxRetainedBytes <= 0
                 || maxHeld <= 0
+                || inPlace < 0
             ) {
                 throw new IllegalArgumentException(
                         "Broker limits must be positive and window fit queue"
@@ -215,12 +234,16 @@ public final class BrokerServer implements AutoCloseable {
                     maxRetained,
                     maxRetainedBytes,
                     maxHeld,
+                    inPlace,
                     capabilities,
                     scheduler,
                     beforeProcess,
+                    beforeHandle,
                     beforeDeliveryWrite
             );
-            var listener = new ServerSocket();
+            // The sockets that a channel's listener accepts have channels too, through which a
+            // connection's writer sends several packets in one gathering write.
+            ServerSocket listener = ServerSocketChannel.open().socket();
             try {
                 listener.bind(address);
                 var server = new BrokerServer(listener, settings);
@@ -249,15 +272,18 @@ public final class BrokerServer implements AutoCloseable {
                 Socket socket = listener.accept();
                 Connection connection = null;
                 try {
-                    synchronized (routing) {
-                        if (routing.closed) {
-                            socket.close();
-                            return;
-                        }
-                        connection = new Connection(socket, routing);
-                        routing.connections.add(connection);
-                        connection.start();
+                    if (routing.closed) {
+                        socket.close();
+                        return;
                     }
+                    connection = new Connection(socket, routing);
+                    routing.connections.add(connection);
+                    // A close that began meanwhile may have missed the connection.
+                    if (routing.closed) {
+                        connection.close("broker closed");
+                        return;
+                    }
+                    connection.start();
                 } catch (Throwable failure) {
                     if (connection != null) {
                         connection.close("start failed");
@@ -283,10 +309,8 @@ public final class BrokerServer implements AutoCloseable {
                 }
             }
         } catch (Throwable failure) {
-            synchronized (routing) {
-                if (!routing.closed) {
-                    log.error("Broker listener on port {} failed", port(), failure);
-                }
+            if (!routing.closed) {
+                log.error("Broker listener on port {} failed", port(), failure);
             }
             close();
         }
@@ -294,18 +318,18 @@ public final class BrokerServer implements AutoCloseable {
 
     @Override
     public void close() {
-        synchronized (routing) {
+        synchronized (this) {
             if (routing.closed) {
                 return;
             }
             routing.closed = true;
-            try {
-                listener.close();
-            } catch (IOException failure) {
-                log.warn("Closing broker listener on port {} failed", port(), failure);
-            }
-            routing.clear();
         }
+        try {
+            listener.close();
+        } catch (IOException failure) {
+            log.warn("Closing broker listener on port {} failed", port(), failure);
+        }
+        routing.clear();
     }
 
     /// Refuses later subscriptions to exactly `filter`: SUBACK answers them with failure 0x80,

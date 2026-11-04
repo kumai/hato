@@ -16,6 +16,7 @@ import org.jspecify.annotations.Nullable;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
+import org.mqtt4j.hato.client.internal.common.io.WriteParts;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.IncomingAliases;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
@@ -120,11 +121,6 @@ final class ClientIo {
     // slower that way, because the extra write cost as much as the copy it saved, and payloads
     // from 128 KiB to 1 MiB published 13 to 22% faster. Such a send goes alone anyway.
     static final int APART_PAYLOAD_BYTES = 128 * 1024;
-
-    // On a transport that gathers, a PUBLISH header or payload this small is joined to the arrays
-    // around it rather than written where it lies: copying it costs less than another buffer in
-    // the gathering write. Message properties can make a header as large as any payload.
-    static final int JOIN_BYTES = 4 * 1024;
 
     // Receive capacity counts each property of a received packet with this many bytes beyond
     // the packet's size. Decoded, a User Property takes up to 118 bytes of memory beyond its
@@ -687,12 +683,10 @@ final class ClientIo {
         return new Encoded.Whole(encode(sends));
     }
 
-    /// The parts of the one gathering write that carries `sends`: each PUBLISH header or payload
-    /// of at least [#JOIN_BYTES] in the array that holds it, so that no such array is copied on its
-    /// way out, and the smaller ones and the other packets between them joined in runs.
+    /// The parts of the one gathering write that carries `sends`, which [WriteParts] makes from
+    /// each packet, or each PUBLISH header and payload.
     private ByteBuffer[] parts(List<SendQueue.Send<Outbound>> sends) {
-        var parts = new ArrayList<ByteBuffer>();
-        var run = new ArrayList<byte[]>();
+        var parts = new WriteParts();
         for (SendQueue.Send<Outbound> send : sends) {
             Outbound outbound = send.value();
             MqttMessage message = outbound.message();
@@ -703,35 +697,17 @@ final class ClientIo {
                 } else {
                     log.trace("Write attempt for ticket {}: {}", send.ticket(), outbound.header());
                 }
-                run.add(outbound.header());
+                parts.add(outbound.header());
                 continue;
             }
             byte[] header = outbound.currentHeader();
             byte[] payload = payloadOf.apply(message);
             log.trace("Write attempt for ticket {}: {} bytes of header and {} of payload",
                     send.ticket(), header.length, payload.length);
-            add(parts, run, header);
-            add(parts, run, payload);
+            parts.add(header);
+            parts.add(payload);
         }
-        if (!run.isEmpty()) {
-            parts.add(ByteBuffer.wrap(joined(run)));
-        }
-        return parts.toArray(ByteBuffer[]::new);
-    }
-
-    /// Adds `array` to the gathering write being made: an array under [#JOIN_BYTES] to the `run`
-    /// of arrays that join into one part, and a larger one to the `parts` as a part of its own,
-    /// after the run joined so far.
-    private static void add(List<ByteBuffer> parts, List<byte[]> run, byte[] array) {
-        if (array.length < JOIN_BYTES) {
-            run.add(array);
-            return;
-        }
-        if (!run.isEmpty()) {
-            parts.add(ByteBuffer.wrap(joined(run)));
-            run.clear();
-        }
-        parts.add(ByteBuffer.wrap(array));
+        return parts.toArray();
     }
 
     private static boolean withoutPayloads(List<SendQueue.Send<Outbound>> sends) {
@@ -761,24 +737,6 @@ final class ClientIo {
             at += header.length;
         }
         return bytes;
-    }
-
-    /// `arrays` one after another in one array, or the only one itself.
-    private static byte[] joined(List<byte[]> arrays) {
-        if (arrays.size() == 1) {
-            return arrays.getFirst();
-        }
-        int length = 0;
-        for (byte[] array : arrays) {
-            length += array.length;
-        }
-        var joined = new byte[length];
-        int at = 0;
-        for (byte[] array : arrays) {
-            System.arraycopy(array, 0, joined, at, array.length);
-            at += array.length;
-        }
-        return joined;
     }
 
     /// The bytes of `sends`, one after another, as the one write that carries them.

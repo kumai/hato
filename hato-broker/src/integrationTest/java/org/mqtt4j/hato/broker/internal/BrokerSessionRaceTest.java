@@ -12,6 +12,7 @@ import java.util.SplittableRandom;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.stream.IntStream;
 
@@ -28,6 +29,7 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.withDup;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
@@ -156,6 +158,51 @@ class BrokerSessionRaceTest {
                 replacement.send(new Packet.PubAck(next.packetId(), SUCCESS, EMPTY));
                 replacement.ping();
                 assertThat(timer.clock.pendingTaskCount()).isZero();
+            }
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void every_delivery_that_one_write_carried_is_resent_as_a_duplicate() throws Exception {
+        // Arrange: the subscriber's writer is held on a first delivery while three more queue
+        // behind it, which its next write then carries together.
+        var holding = new AtomicBoolean();
+        var heldWriter = new CompletableFuture<Thread>();
+        var release = new CountDownLatch(1);
+        try (BrokerServer sut = BrokerServer.builder()
+                .beforeDeliveryWrite(() -> {
+                    if (holding.get() && heldWriter.complete(Thread.currentThread())) {
+                        awaitRelease(release);
+                    }
+                })
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            var written = new ArrayList<Packet.Publish>();
+            try (RawSession previous = connected(sut.port(), "subscriber", false, false)) {
+                previous.subscribe("written", AT_LEAST_ONCE);
+                holding.set(true);
+                publisher.publish("written", "first", AT_LEAST_ONCE, 1);
+                heldWriter.get(5, SECONDS);
+                for (int i = 0; i < 3; i++) {
+                    publisher.publish("written", "together-" + i, AT_LEAST_ONCE, 2 + i);
+                }
+                release.countDown();
+                for (int i = 0; i < 4; i++) {
+                    written.add(previous.expect(Packet.Publish.class));
+                }
+            }
+
+            // Act: the session goes on with its deliveries unacknowledged.
+            try (RawSession resumed = connected(sut.port(), "subscriber", false, true)) {
+                // Assert
+                for (Packet.Publish delivery : written) {
+                    Packet.Publish resent = resumed.expect(Packet.Publish.class);
+                    assertThat(resent).isEqualTo(withDup(delivery, true));
+                    resumed.send(new Packet.PubAck(resent.packetId(), SUCCESS, EMPTY));
+                }
+                resumed.ping();
             }
         } finally {
             release.countDown();

@@ -7,6 +7,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
 import org.jspecify.annotations.Nullable;
@@ -27,9 +28,10 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 import static java.util.Objects.requireNonNull;
 
 // The client on one connection, as the broker sees it: it accepts the CONNECT that opens the
-// connection, then handles each packet that the client sends. Its state belongs to routing: the
-// session that the CONNECT attached, what CONNACK announced, the Will, the Topic Aliases, and
-// the responses that a test holds back.
+// connection, then handles each packet that the client sends. Once the CONNECT is accepted, its
+// state belongs to the actor of the session that the CONNECT attached: what CONNACK announced,
+// the Will, and the Topic Aliases. The responses that a test holds back are guarded by the
+// connection's monitor, under which the test controls read and release them.
 final class Client {
 
     private static final Log log = Log.of(Client.class);
@@ -40,7 +42,9 @@ final class Client {
 
     private final BrokerSettings settings;
 
-    private @Nullable Session session;
+    // The session that the CONNECT attached, written under the connection's monitor, under which
+    // the end of the connection reads it.
+    @Nullable Session session;
 
     // The Will of the accepted connection, until the connection's end publishes it or a
     // normal DISCONNECT discards it.
@@ -55,8 +59,8 @@ final class Client {
     private @Nullable IncomingAliases aliases;
 
     // The responses that a test holds back from this connection, in the order held. They end
-    // with the connection.
-    final ArrayDeque<Packet> held = new ArrayDeque<>();
+    // with the connection. Guarded by the connection's monitor.
+    private final ArrayDeque<Packet> held = new ArrayDeque<>();
 
     // The publications that the client sent on this connection and that have no response yet,
     // for an announced Receive Maximum: QoS 2 publications until PUBREL, and the PUBACKs,
@@ -65,6 +69,7 @@ final class Client {
     // maximum is never closed.
     private final BitSet unreleased = new BitSet();
 
+    // The held responses that answer publications, guarded by the connection's monitor.
     private int heldAcknowledgements;
 
     // Whether the client takes a Reason String on acknowledgements: an MQTT 5.0 client can ask
@@ -86,7 +91,8 @@ final class Client {
     }
 
     // Accepts the CONNECT that opens the connection, or refuses it, and returns whether it was
-    // accepted. Called by the reader, which holds neither lock.
+    // accepted. Called by the reader, which checks the request alone and waits while the actor of
+    // the client identifier's session takes the connection over.
     boolean connect(Packet.Connect request) {
         // MQTT 3.1.1 refuses an empty identifier for a persistent session [MQTT-3.1.3-8];
         // MQTT 5.0 assigns one below whatever the session.
@@ -106,6 +112,9 @@ final class Client {
             );
             return false;
         }
+        if (connection.isEnded()) {
+            return false;
+        }
         Packet.Will requestedWill = request.will();
         // MQTT 3.1.1 leaves the retention of a Clean Session 0 session to the broker, which
         // keeps it without end.
@@ -113,154 +122,172 @@ final class Client {
             case V3_1_1 -> request.cleanStart() ? 0 : Session.NEVER;
             case V5 -> expiryOf(request.properties()).orElse(0);
         };
-        boolean keep = expiry > 0;
-        String id;
-        synchronized (routing) {
-            // An expired session is gone, for resuming and for the limit alike, and the Will
-            // that waits with it goes out. That routes to other connections, so it happens
-            // before the new peer's monitor is taken.
-            routing.discardExpiredSessions();
-            Connection previous;
-            Session accepted;
-            // The Will that waits with the session goes out after CONNACK when this CONNECT
-            // ends the session, or when it continues the session after the Will's delay has
-            // passed; a connection within the delay cancels it [MQTT-3.1.3-9].
-            Packet.Will waited = null;
-            synchronized (connection) {
-                if (connection.ended) {
-                    return false;
-                }
-                // A test rule can refuse the client before anything else, which leaves the
-                // session and the Will of its identifier as they were.
-                Reason refusal = routing.connectionRefusal(request.clientId());
-                if (refusal != null) {
-                    Packet.ConnAck answer = switch (request.version()) {
-                        case V3_1_1 -> new Packet.ConnAck(false, refusal.code(), Properties.EMPTY);
-                        case V5 -> refusal.fitted(
-                                properties -> new Packet.ConnAck(false, refusal.code(), properties),
-                                sendLimitOf(request)
-                        );
-                    };
-                    connection.refuse(answer, "client '" + request.clientId() + "' by a test rule");
-                    return false;
-                }
-                // The connection keeps what its CONNACK announces. MQTT 3.1.1 announces nothing.
-                Capabilities offered = switch (request.version()) {
-                    case V3_1_1 -> Capabilities.UNANNOUNCED;
-                    case V5 -> routing.capabilities;
-                };
-                // A Will that the announced capabilities cannot carry is refused [MQTT-3.2.2-12]
-                // [MQTT-3.2.2-13].
-                if (requestedWill != null
-                        && requestedWill.qos().level() > offered.maximumQos().level()) {
-                    connection.refuse(
-                            ReasonCode.QOS_NOT_SUPPORTED,
-                            "a Will above the maximum QoS for client '" + request.clientId() + "'"
-                    );
-                    return false;
-                }
-                if (requestedWill != null && requestedWill.retain() && !offered.retainAvailable()) {
-                    connection.refuse(
-                            ReasonCode.RETAIN_NOT_SUPPORTED,
-                            "a retained Will for client '" + request.clientId() + "'"
-                    );
-                    return false;
-                }
-                // Inline expiry or a scheduling failure must happen before taking over a peer.
-                // A Server Keep Alive replaces the client's own [MQTT-3.2.2-21] [MQTT-3.2.2-22].
-                Integer serverKeepAlive = offered.serverKeepAlive();
-                connection.keepAlive(
-                        (serverKeepAlive == null) ? request.keepAliveSeconds() : serverKeepAlive
+        // A test rule can refuse the client before anything else, which leaves the session and
+        // the Will of its identifier as they were.
+        Reason refusal = routing.connectionRefusal(request.clientId());
+        if (refusal != null) {
+            Packet.ConnAck answer = switch (request.version()) {
+                case V3_1_1 -> new Packet.ConnAck(false, refusal.code(), Properties.EMPTY);
+                case V5 -> refusal.fitted(
+                        properties -> new Packet.ConnAck(false, refusal.code(), properties),
+                        sendLimitOf(request)
                 );
-                if (connection.ended) {
-                    return false;
-                }
-                id = request.clientId();
-                if (id.isEmpty()) {
-                    do {
-                        id = "hato" + UUID.randomUUID().toString().replace("-", "");
-                    } while (routing.sessions.containsKey(id));
-                }
-                Session existing = routing.sessions.get(id);
-                boolean present = !request.cleanStart()
-                        && existing != null
-                        && existing.kept()
-                        && existing.version == request.version();
-                // Resuming or replacing a kept session reuses its place in the limit.
-                if (keep && (existing == null || !existing.kept())
-                        && routing.sessions.values().stream().filter(Session::kept).count()
-                        >= settings.maxSessions()) {
-                    connection.refuse(
-                            ReasonCode.SERVER_UNAVAILABLE,
-                            "persistent session capacity for client '" + id + "'"
-                    );
-                    return false;
-                }
-                previous = existing == null ? null : existing.connection;
-                if (present) {
-                    accepted = requireNonNull(existing);
-                    if (previous != null) {
-                        accepted.detach(previous);
-                        previous.client.cancelDelayedWill();
-                    }
-                    // The timer may not have come yet for a Will whose delay has passed.
-                    if (accepted.willDue(settings.scheduler().nanoTime())) {
-                        waited = accepted.takeWill();
-                    } else {
-                        accepted.cancelWill();
-                    }
-                    accepted.expiry = expiry;
-                } else {
-                    // A new session ends the old one, and with it the delay of its Will (MQTT
-                    // 5.0 sections 3.1.3.2.2 and 3.1.4).
-                    if (existing != null) {
-                        waited = existing.takeWill();
-                        existing.clear();
-                    }
-                    accepted = new Session(routing, id, request.version(), expiry);
-                    routing.sessions.put(id, accepted);
-                }
-                connection.clientId = id;
-                session = accepted;
-                will = requestedWill;
-                limits = offered;
-                sendQuota = sendQuotaOf(request);
-                sendLimit = sendLimitOf(request);
-                problemInformation = problemInformationOf(request);
-                if (offered.topicAliasMaximum() > 0) {
-                    aliases = new IncomingAliases(offered.topicAliasMaximum());
-                }
-                Integer maximumPacketSize = offered.maximumPacketSize();
-                if (maximumPacketSize != null) {
-                    connection.limitPacketSize(maximumPacketSize);
-                }
-                accepted.connection = connection;
-                Properties properties = switch (request.version()) {
-                    case V3_1_1 -> Properties.EMPTY;
-                    case V5 -> acceptanceV5(id, request.clientId().isEmpty(), offered);
-                };
-                connection.enqueue(new Packet.ConnAck(present, ReasonCode.SUCCESS, properties));
-            }
-            // Do not hold the new peer's monitor while ending the old peer.
-            if (previous != null) {
-                previous.disconnect(
-                        ReasonCode.SESSION_TAKEN_OVER,
-                        "taken over by " + connection.remoteAddress()
-                );
-            }
-            // CONNACK, retransmissions, and queued deliveries stay ahead of later publications,
-            // including the Will of the connection that this one took over and the Will that
-            // waited with the session.
-            accepted.resume();
-            if (previous != null) {
-                previous.client.publishWill();
-            }
-            if (waited != null) {
-                routing.publishWill(waited, accepted);
-            }
+            };
+            connection.refuse(answer, "client '" + request.clientId() + "' by a test rule");
+            return false;
+        }
+        // The connection keeps what its CONNACK announces. MQTT 3.1.1 announces nothing.
+        Capabilities offered = switch (request.version()) {
+            case V3_1_1 -> Capabilities.UNANNOUNCED;
+            case V5 -> routing.capabilities;
+        };
+        // A Will that the announced capabilities cannot carry is refused [MQTT-3.2.2-12]
+        // [MQTT-3.2.2-13].
+        if (requestedWill != null
+                && requestedWill.qos().level() > offered.maximumQos().level()) {
+            connection.refuse(
+                    ReasonCode.QOS_NOT_SUPPORTED,
+                    "a Will above the maximum QoS for client '" + request.clientId() + "'"
+            );
+            return false;
+        }
+        if (requestedWill != null && requestedWill.retain() && !offered.retainAvailable()) {
+            connection.refuse(
+                    ReasonCode.RETAIN_NOT_SUPPORTED,
+                    "a retained Will for client '" + request.clientId() + "'"
+            );
+            return false;
+        }
+        // Inline expiry or a scheduling failure must happen before taking over a peer.
+        // A Server Keep Alive replaces the client's own [MQTT-3.2.2-21] [MQTT-3.2.2-22].
+        Integer serverKeepAlive = offered.serverKeepAlive();
+        connection.keepAlive(
+                (serverKeepAlive == null) ? request.keepAliveSeconds() : serverKeepAlive
+        );
+        if (connection.isEnded()) {
+            return false;
+        }
+        String id = request.clientId();
+        if (id.isEmpty()) {
+            do {
+                id = "hato" + UUID.randomUUID().toString().replace("-", "");
+            } while (routing.sessions.containsKey(id));
+        }
+        var acceptance = new Acceptance(request, id, offered, expiry);
+        acceptance.post(settings.inPlace());
+        if (!acceptance.accepted.join()) {
+            return false;
+        }
+        Integer maximumPacketSize = offered.maximumPacketSize();
+        if (maximumPacketSize != null) {
+            connection.limitPacketSize(maximumPacketSize);
         }
         log.info("Broker accepted client {} from {} on port {}",
                 id, connection.remoteAddress(), routing.port);
+        return true;
+    }
+
+    // Has the connection take over the session of `id` on `actor`, which continues the session or
+    // starts a new one, ends the connection that had it, and sends CONNACK and what the session
+    // sends again. Returns whether it accepted the connection. Runs on the actor.
+    private boolean takeOver(
+            Session actor,
+            Packet.Connect request,
+            String id,
+            Capabilities offered,
+            long expiry
+    ) {
+        if (routing.closed || connection.isEnded()) {
+            actor.leaveIfUnused();
+            return false;
+        }
+        long now = settings.scheduler().nanoTime();
+        // An expired session is gone, for resuming and for the limit alike, and the Will that
+        // waits with it goes out, even if its timer has not come yet.
+        if (actor.expired(now)) {
+            Packet.Will expiredWill = actor.expire();
+            if (expiredWill != null) {
+                routing.publishWill(expiredWill, actor);
+            }
+        }
+        boolean keep = expiry > 0;
+        boolean present = !request.cleanStart()
+                && actor.kept()
+                && actor.version == request.version();
+        // A session that resumes or replaces a kept one takes over its place in the limit, and
+        // frees it if it is not kept itself.
+        boolean placed = actor.kept();
+        if (keep && !placed && !routing.takePersistentPlace()) {
+            connection.refuse(
+                    ReasonCode.SERVER_UNAVAILABLE,
+                    "persistent session capacity for client '" + id + "'"
+            );
+            actor.leaveIfUnused();
+            return false;
+        }
+        if (placed && !keep) {
+            routing.freePersistentPlace();
+        }
+        Connection previous = actor.connection;
+        // The Will that waits with the session goes out after CONNACK when this CONNECT ends
+        // the session, or when it continues the session after the Will's delay has passed; a
+        // connection within the delay cancels it [MQTT-3.1.3-9].
+        Packet.Will waited;
+        if (present) {
+            if (previous != null) {
+                actor.detach(previous);
+                previous.client.cancelDelayedWill();
+            }
+            // The timer may not have come yet for a Will whose delay has passed.
+            if (actor.willDue(now)) {
+                waited = actor.takeWill();
+            } else {
+                waited = null;
+                actor.cancelWill();
+            }
+            actor.expiry = expiry;
+        } else {
+            // A new session ends the old one, and with it the delay of its Will (MQTT 5.0
+            // sections 3.1.3.2.2 and 3.1.4).
+            waited = actor.takeWill();
+            actor.reset(request.version(), expiry);
+        }
+        connection.clientId = id;
+        will = request.will();
+        limits = offered;
+        sendQuota = sendQuotaOf(request);
+        sendLimit = sendLimitOf(request);
+        problemInformation = problemInformationOf(request);
+        if (offered.topicAliasMaximum() > 0) {
+            aliases = new IncomingAliases(offered.topicAliasMaximum());
+        }
+        Properties properties = switch (request.version()) {
+            case V3_1_1 -> Properties.EMPTY;
+            case V5 -> acceptanceV5(id, request.clientId().isEmpty(), offered);
+        };
+        var connAck = new Packet.ConnAck(present, ReasonCode.SUCCESS, properties);
+        if (!actor.attach(connection, connAck)) {
+            // The connection ended before the session had it, so its end comes now.
+            actor.post(this::connectionEnded, Session.ALONE);
+        }
+        // The old peer ends before the session resumes below: its writer marks a delivery as
+        // sent only until then, and the resend reads that mark for its DUP flag.
+        if (previous != null) {
+            previous.disconnect(
+                    ReasonCode.SESSION_TAKEN_OVER,
+                    "taken over by " + connection.remoteAddress()
+            );
+        }
+        // CONNACK, retransmissions, and queued deliveries stay ahead of later publications,
+        // including the Will of the connection that this one took over and the Will that
+        // waited with the session.
+        actor.resume();
+        if (previous != null) {
+            previous.client.publishWill();
+        }
+        if (waited != null) {
+            routing.publishWill(waited, actor);
+        }
         return true;
     }
 
@@ -363,17 +390,8 @@ final class Client {
         };
     }
 
-    // The session of this connection while it is attached and the connection has not ended.
-    // Called under routing.
-    @Nullable Session currentSession() {
-        Session owner = session;
-        return (owner != null && owner.connection == connection && !connection.isEnded())
-                ? owner
-                : null;
-    }
-
     // Publishes the Will of this connection, which ended without a DISCONNECT that discards
-    // it. Called under routing; taking the Will means that no later end publishes it again.
+    // it. Runs on the actor; taking the Will means that no later end publishes it again.
     void publishWill() {
         Packet.Will last = will;
         Session owner = session;
@@ -385,7 +403,7 @@ final class Client {
 
     // Drops the Will of this connection if it has a delay, because the connection that takes
     // over continues the session before the delay could pass [MQTT-3.1.3-9]. A Will without a
-    // delay still goes out as this connection ends. Called under routing.
+    // delay still goes out as this connection ends. Runs on the actor.
     void cancelDelayedWill() {
         Packet.Will last = will;
         if (last != null && delayOf(last) > 0) {
@@ -393,7 +411,8 @@ final class Client {
         }
     }
 
-    // Handles one packet that the client sent on its accepted connection. Called under routing.
+    // Handles one packet that the client sent on its accepted connection. Runs on the actor of
+    // `owner`.
     void process(Session owner, Packet packet) {
         switch (packet) {
             case Packet.Subscribe request -> {
@@ -432,8 +451,6 @@ final class Client {
                 // The first refusal with a Reason String, which SUBACK carries; it has room for
                 // one.
                 Reason described = null;
-                // The subscriptions that receive retained messages after SUBACK.
-                var retaining = new ArrayList<Session.Subscribed>();
                 for (Packet.Subscription requested : request.subscriptions()) {
                     // An MQTT 3.1.1 client cannot learn that shared subscriptions are missing,
                     // so the broker refuses the filter rather than match it as written: a
@@ -475,42 +492,26 @@ final class Client {
                                     requested.retainHandling()
                             )
                             : requested;
-                    var subscribed = new Session.Subscribed(subscription, identifier);
-                    Session.Subscribed replaced = owner.subscriptions.put(
-                            subscription.filter(),
-                            subscribed
-                    );
+                    owner.subscribe(new Session.Subscribed(subscription, identifier));
                     ReasonCode granted = switch (subscription.qos()) {
                         case AT_MOST_ONCE -> ReasonCode.SUCCESS;
                         case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
                         case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
                     };
                     grants.add(granted);
-                    // Retain Handling 0 sends retained messages for every SUBSCRIBE, 1 only
-                    // for a new subscription, and 2, the only other value, never
-                    // [MQTT-3.3.1-9] [MQTT-3.3.1-10] [MQTT-3.3.1-11]. MQTT 3.1.1 uses 0.
-                    boolean sendsRetained = switch (subscription.retainHandling()) {
-                        case 0 -> true;
-                        case 1 -> replaced == null;
-                        default -> false;
-                    };
-                    if (sendsRetained) {
-                        retaining.add(subscribed);
-                    }
                 }
                 send(acknowledgement(
                         owner,
                         described,
                         properties -> new Packet.SubAck(request.packetId(), grants, properties)
                 ));
-                for (Session.Subscribed subscribed : retaining) {
-                    owner.deliverRetained(subscribed);
-                }
+                // The retained messages that the subscriptions queued follow SUBACK.
+                owner.drain();
             }
             case Packet.Unsubscribe request -> {
                 var results = new ArrayList<ReasonCode>();
                 for (TopicFilter filter : request.filters()) {
-                    boolean existed = owner.subscriptions.remove(filter) != null;
+                    boolean existed = owner.unsubscribe(filter);
                     results.add(
                             existed ? ReasonCode.SUCCESS : ReasonCode.NO_SUBSCRIPTION_EXISTED
                     );
@@ -543,6 +544,10 @@ final class Client {
                                 ReasonCode.PROTOCOL_ERROR,
                                 "Session Expiry Interval on DISCONNECT after none on CONNECT"
                         );
+                    }
+                    // A session that ends with its connection frees its place in the limit.
+                    if (owner.expiry != 0 && expiry.getAsLong() == 0) {
+                        routing.freePersistentPlace();
                     }
                     owner.expiry = expiry.getAsLong();
                 }
@@ -632,7 +637,7 @@ final class Client {
         boolean unanswered = publish.qos() == Qos.AT_LEAST_ONCE
                 || (publish.qos() == Qos.EXACTLY_ONCE && !unreleased.get(publish.packetId()));
         if (receiveMaximum != null && unanswered
-                && unreleased.cardinality() + heldAcknowledgements >= receiveMaximum) {
+                && unreleased.cardinality() + heldAcknowledgements() >= receiveMaximum) {
             throw new PacketDecodeException(
                     ReasonCode.RECEIVE_MAXIMUM_EXCEEDED,
                     "more unanswered QoS 1 and 2 publications than the Receive Maximum"
@@ -721,39 +726,72 @@ final class Client {
         return reason.fitted(build, sendLimit);
     }
 
-    // Called under routing, which guards the test controls.
+    // A response that a test holds back waits outside the send queue, and so do the later ones of
+    // its kind, until the test releases them. One that comes as the test releases them still
+    // queues behind those held, so that none overtakes them. Runs on the actor.
     private void send(Packet packet) {
-        // A response that a test holds back waits outside the send queue, and so do the later
-        // ones of its kind, until the test releases them.
-        if (routing.holdsBack(packet.getClass(), connection.clientId)) {
-            if (held.size() >= settings.maxHeld()) {
-                connection.close("held responses over their limit");
-            } else {
+        Class<? extends Packet> type = packet.getClass();
+        boolean overLimit;
+        synchronized (connection) {
+            boolean holding = routing.holdsBack(type, connection.clientId) || holds(type);
+            overLimit = holding && held.size() >= settings.maxHeld();
+            if (holding && !overLimit) {
                 held.addLast(packet);
                 if (answersPublication(packet)) {
                     heldAcknowledgements++;
                 }
+                return;
             }
+        }
+        // Closing takes the session's inbox, which comes before the connection's monitor.
+        if (overLimit) {
+            connection.close("held responses over their limit");
             return;
         }
         connection.respond(packet);
     }
 
-    // Moves the held responses of `type` behind any released before, in the order held, and
-    // sends what fits. Called under routing.
-    void release(Class<? extends Packet> type) {
-        var released = new ArrayList<Packet>();
-        for (Iterator<Packet> responses = held.iterator(); responses.hasNext(); ) {
-            Packet response = responses.next();
+    // Whether a response of `type` is held. Called under the connection's monitor.
+    private boolean holds(Class<? extends Packet> type) {
+        for (Packet response : held) {
             if (type.isInstance(response)) {
-                responses.remove();
-                released.add(response);
-                if (answersPublication(response)) {
-                    heldAcknowledgements--;
-                }
+                return true;
             }
         }
-        connection.release(released);
+        return false;
+    }
+
+    // Moves the held responses of `type` behind any released before, in the order held, and
+    // sends what fits. Called by the test controls.
+    void release(Class<? extends Packet> type) {
+        synchronized (connection) {
+            var released = new ArrayList<Packet>();
+            for (Iterator<Packet> responses = held.iterator(); responses.hasNext(); ) {
+                Packet response = responses.next();
+                if (type.isInstance(response)) {
+                    responses.remove();
+                    released.add(response);
+                    if (answersPublication(response)) {
+                        heldAcknowledgements--;
+                    }
+                }
+            }
+            connection.release(released);
+        }
+    }
+
+    // The responses that a test holds back from this connection, in the order held; none once
+    // the connection has ended, which they end with.
+    List<Packet> heldResponses() {
+        synchronized (connection) {
+            return connection.ended ? List.of() : List.copyOf(held);
+        }
+    }
+
+    private int heldAcknowledgements() {
+        synchronized (connection) {
+            return heldAcknowledgements;
+        }
     }
 
     // Whether `response` ends the client's QoS 1 or 2 publication, as far as the client's
@@ -770,10 +808,10 @@ final class Client {
         return filter.pattern().contains("+") || filter.pattern().contains("#");
     }
 
-    // Detaches the session from the connection, which has ended, and publishes the Will. A Will
-    // with a delay waits with the session instead when the session outlives the connection,
-    // and never goes out when another connection has already continued the session
-    // [MQTT-3.1.3-9]. Called under routing.
+    // Detaches the session from the connection, which has ended, sets the session's timer, and
+    // publishes the Will. A Will with a delay waits with the session instead when the session
+    // outlives the connection, and never goes out when another connection has already continued
+    // the session [MQTT-3.1.3-9]. Runs on the actor, once the connection's end reaches it.
     void connectionEnded() {
         Session owner = session;
         if (owner == null) {
@@ -787,12 +825,69 @@ final class Client {
             if (owner.connection == null) {
                 owner.awaitWill(last, delay);
             }
-            return;
         }
+        // The session's one timer serves its expiry and the Will that now waits with it, if any.
+        owner.armTimer();
         // The Will follows the end of the network connection ([MQTT-3.1.2-8] in MQTT
         // 3.1.1), so a persistent session that subscribes to it receives it as an
         // absent client.
         publishWill();
+    }
+
+    // The acceptance of this connection's CONNECT, which the actor of its client identifier's
+    // session runs while the reader waits for it.
+    private final class Acceptance implements Runnable {
+
+        private final Packet.Connect request;
+
+        private final String id;
+
+        private final Capabilities offered;
+
+        private final long expiry;
+
+        final CompletableFuture<Boolean> accepted = new CompletableFuture<>();
+
+        private @Nullable Session actor;
+
+        Acceptance(Packet.Connect request, String id, Capabilities offered, long expiry) {
+            this.request = request;
+            this.id = id;
+            this.offered = offered;
+            this.expiry = expiry;
+        }
+
+        // Posts the acceptance to the actor that serves the identifier now, which may be new.
+        void post(int inPlace) {
+            try {
+                Session next = routing.sessions.computeIfAbsent(
+                        id,
+                        key -> new Session(routing, key, request.version())
+                );
+                actor = next;
+                next.post(this, inPlace);
+            } catch (RuntimeException | Error failure) {
+                accepted.complete(false);
+                throw failure;
+            }
+        }
+
+        @Override
+        public void run() {
+            Session current = requireNonNull(actor);
+            // A session that ended before this came to it left the table, and the identifier's
+            // next actor takes the connection over.
+            if (current.hasEnded()) {
+                post(Session.ALONE);
+                return;
+            }
+            boolean result = false;
+            try {
+                result = takeOver(current, request, id, offered, expiry);
+            } finally {
+                accepted.complete(result);
+            }
+        }
     }
 
     // The Will Delay Interval of `will` in seconds, 0 without one (MQTT 5.0 section 3.1.3.2.2).

@@ -622,6 +622,19 @@ class PacketCodecTest {
         )).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("properties");
     }
 
+    @Test
+    void mqtt_3_1_1_publish_sizes_reject_properties() {
+        // Arrange
+        var sut = PacketCodec.of(MqttVersion.V3_1_1);
+        var topic = new Topic("a");
+        var properties = new Properties(List.of(new Property.UserProperty("name", "value")));
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.publishSize(topic, Qos.AT_MOST_ONCE, properties, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("properties");
+    }
+
     @ParameterizedTest
     @CsvSource(textBlock = """
             V3_1_1, AT_MOST_ONCE, 0, 0
@@ -667,9 +680,11 @@ class PacketCodecTest {
 
         // Act
         int size = sut.publishSize(topic, qos, propertiesSize, payloadSize);
+        int sizeWithProperties = sut.publishSize(topic, qos, properties, payloadSize);
 
         // Assert
         assertThat(size).isEqualTo(header.length + payloadSize);
+        assertThat(sizeWithProperties).isEqualTo(header.length + payloadSize);
     }
 
     @ParameterizedTest
