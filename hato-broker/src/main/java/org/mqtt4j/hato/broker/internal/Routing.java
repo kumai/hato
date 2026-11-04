@@ -202,17 +202,9 @@ final class Routing {
     }
 
     // Takes a place among the persistent sessions for a session that a CONNECT makes, and returns
-    // false when the session limit leaves none, even after the sessions whose expiry has passed
-    // have given theirs up.
+    // false when the session limit leaves none. An expired session gives its place up as its
+    // timer comes [MQTT-4.1.0-2].
     boolean takePersistentPlace() {
-        if (takePlace()) {
-            return true;
-        }
-        discardExpiredSessions();
-        return takePlace();
-    }
-
-    private boolean takePlace() {
         int limit = settings.maxSessions();
         int before = persistentSessions.getAndUpdate(count -> (count < limit) ? count + 1 : count);
         return before < limit;
@@ -221,24 +213,6 @@ final class Routing {
     // Frees the place of a session that ends, or stops outliving its connection.
     void freePersistentPlace() {
         persistentSessions.decrementAndGet();
-    }
-
-    // Discards the sessions whose expiry has passed since their connection ended
-    // [MQTT-4.1.0-2], which frees their places and publishes the Wills that wait with them. Each
-    // ends on its actor: here if no thread holds its turn, and otherwise soon after, too late for
-    // the CONNECT that looks. The broker looks for them only when a CONNECT finds the session
-    // limit reached, and a CONNECT looks at its own session, in place of a timer per session;
-    // only a session with a waiting Will has a timer, which comes at its expiry if the Will's
-    // delay is longer. So an expired session keeps its queued deliveries, within the session
-    // limits, until then. A timer for every session would release them at once, if
-    // productization needs that. Called on the actor of the CONNECT.
-    private void discardExpiredSessions() {
-        long now = settings.scheduler().nanoTime();
-        for (Session session : sessions.values()) {
-            if (session.expired(now)) {
-                session.post(session::checkExpiry, Session.ALONE);
-            }
-        }
     }
 
     // Publishes `will` as its client would have published the message, from the session of

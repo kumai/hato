@@ -18,6 +18,7 @@ import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.broker.internal.RawSession.acceptedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectV5;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
@@ -27,8 +28,10 @@ import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.SUCCESS;
 /// How long MQTT 5.0 sessions outlive their connections, on a clock that the test advances.
 ///
 /// Each client leaves with a Will that a watcher receives. The broker publishes it only after it
-/// has detached the session from the connection, from which the expiry counts, so the test
-/// advances the clock after the Will arrives.
+/// has detached the session from the connection, from which the expiry counts, and set the
+/// session's timer, so the test advances the clock after the Will arrives. An expired session ends
+/// on its own soon after its timer comes, and no connection waits for that, so a test that needs
+/// its place waits until a CONNECT takes it.
 class BrokerSessionExpiryTest {
 
     private final BrokerDeadlineTest.ManualTimer timer = new BrokerDeadlineTest.ManualTimer();
@@ -164,7 +167,46 @@ class BrokerSessionExpiryTest {
             timer.clock.advance(Duration.ofSeconds(10));
 
             // Assert
-            open(sut, "second", true, 10).close();
+            awaitPlace(sut, "second");
+        }
+    }
+
+    @Test
+    void a_session_frees_its_place_as_it_expires_after_its_will_went_out() throws Exception {
+        try (BrokerServer sut = broker(1); RawSession watcher = watching(sut)) {
+            // Arrange: the only persistent session that the broker keeps, whose Will waits five of
+            // its ten seconds. The test waits for the timer that the broker sets as it detaches
+            // the session, and then for the Will.
+            RawSession client = RawSession.open(sut.port(), MqttVersion.V5);
+            client.send(connect("first", true, 10, delayedWill("first", 5)));
+            assertThat(client.expect(Packet.ConnAck.class)).isEqualTo(acceptedV5(false));
+            client.close();
+            timer.awaitPendingTasks(1);
+            timer.clock.advance(Duration.ofSeconds(5));
+            assertThat(watcher.expect(Packet.Publish.class).topic())
+                    .isEqualTo(new Topic("left/first"));
+            timer.awaitPendingTasks(1);
+
+            // Act
+            timer.clock.advance(Duration.ofSeconds(5));
+
+            // Assert
+            awaitPlace(sut, "second");
+        }
+    }
+
+    @Test
+    void a_connection_that_continues_the_session_releases_its_timer() throws Exception {
+        try (BrokerServer sut = broker(); RawSession watcher = watching(sut)) {
+            // Arrange
+            leave(open(sut, "returning", true, 10), watcher, "returning");
+            assertThat(timer.clock.pendingTaskCount()).isEqualTo(1);
+
+            // Act
+            try (RawSession _ = resumed(sut, "returning", 10, true)) {
+                // Assert: a session with a connection has no timer.
+                assertThat(timer.clock.pendingTaskCount()).isZero();
+            }
         }
     }
 
@@ -271,14 +313,29 @@ class BrokerSessionExpiryTest {
                 .isEqualTo(new Topic("left/" + clientId));
     }
 
+    /// Waits until a CONNECT of `clientId` takes a place among the persistent sessions.
+    private static void awaitPlace(BrokerServer broker, String clientId) {
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                RawSession.connectedV5(broker.port(), clientId, true, 10, false).close());
+    }
+
     private static Packet.Connect connect(String clientId, boolean cleanStart, long expiry) {
+        return connect(clientId, cleanStart, expiry, will(clientId));
+    }
+
+    private static Packet.Connect connect(
+            String clientId,
+            boolean cleanStart,
+            long expiry,
+            Packet.Will will
+    ) {
         var interval = new Property.FourByteValue(PropertyId.SESSION_EXPIRY_INTERVAL, expiry);
         return new Packet.Connect(
                 clientId,
                 MqttVersion.V5,
                 cleanStart,
                 0,
-                will(clientId),
+                will,
                 null,
                 null,
                 new Properties(List.of(interval))
@@ -292,6 +349,18 @@ class BrokerSessionExpiryTest {
                 AT_MOST_ONCE,
                 false,
                 EMPTY
+        );
+    }
+
+    /// The Will of `clientId` with a Will Delay Interval of `delay` seconds.
+    private static Packet.Will delayedWill(String clientId, long delay) {
+        var interval = new Property.FourByteValue(PropertyId.WILL_DELAY_INTERVAL, delay);
+        return new Packet.Will(
+                new Topic("left/" + clientId),
+                "gone".getBytes(UTF_8),
+                AT_MOST_ONCE,
+                false,
+                new Properties(List.of(interval))
         );
     }
 

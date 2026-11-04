@@ -203,7 +203,7 @@ final class Client {
         }
         long now = settings.scheduler().nanoTime();
         // An expired session is gone, for resuming and for the limit alike, and the Will that
-        // waits with it goes out.
+        // waits with it goes out, even if its timer has not come yet.
         if (actor.expired(now)) {
             Packet.Will expiredWill = actor.expire();
             if (expiredWill != null) {
@@ -808,10 +808,10 @@ final class Client {
         return filter.pattern().contains("+") || filter.pattern().contains("#");
     }
 
-    // Detaches the session from the connection, which has ended, and publishes the Will. A Will
-    // with a delay waits with the session instead when the session outlives the connection,
-    // and never goes out when another connection has already continued the session
-    // [MQTT-3.1.3-9]. Runs on the actor, once the connection's end reaches it.
+    // Detaches the session from the connection, which has ended, sets the session's timer, and
+    // publishes the Will. A Will with a delay waits with the session instead when the session
+    // outlives the connection, and never goes out when another connection has already continued
+    // the session [MQTT-3.1.3-9]. Runs on the actor, once the connection's end reaches it.
     void connectionEnded() {
         Session owner = session;
         if (owner == null) {
@@ -825,8 +825,9 @@ final class Client {
             if (owner.connection == null) {
                 owner.awaitWill(last, delay);
             }
-            return;
         }
+        // The session's one timer serves its expiry and the Will that now waits with it, if any.
+        owner.armTimer();
         // The Will follows the end of the network connection ([MQTT-3.1.2-8] in MQTT
         // 3.1.1), so a persistent session that subscribes to it receives it as an
         // absent client.

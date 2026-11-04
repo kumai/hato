@@ -88,12 +88,15 @@ final class Session {
 
     // The Will of the connection that ended last, which waits `willDelay` seconds before it goes
     // out, or less if the session ends first [MQTT-3.1.2-8]; none waits while a connection is
-    // attached. The timer comes when the delay or the expiry has passed, whichever is earlier.
+    // attached.
     private Packet.@Nullable Will will;
 
     private long willDelay;
 
-    private Timer.@Nullable Cancellable willTimer;
+    // The timer of the session while no connection has it, which comes when the delay of its
+    // Will or its expiry passes, whichever is earlier. A session that lasts without end and has
+    // no Will waiting has none.
+    private Timer.@Nullable Cancellable timer;
 
     // Each filter's subscription with the options that the client requested, in the order the
     // client made them. A change replaces the map under the inbox, and the map is never changed
@@ -341,28 +344,10 @@ final class Session {
 
     // Keeps the Will of the connection that just ended until `delay` seconds have passed since
     // the session lost it, or until the session ends if that comes first [MQTT-3.1.2-8]. Called
-    // after the detachment from which both count.
-    //
-    // The broker decides from the time whether the Will goes out, as with the expiry: when a
-    // connection continues the session, when the session ends, and when the timer comes. The
-    // timer only makes sure that someone looks once the time has come, so a timer that comes
-    // late, or after its cancellation, changes nothing.
+    // after the detachment from which both count, before the timer is set.
     void awaitWill(Packet.Will lastWill, long delay) {
         will = lastWill;
         willDelay = delay;
-        try {
-            // A Session Expiry Interval of NEVER is at least any delay.
-            willTimer = settings.scheduler().schedule(
-                    Duration.ofSeconds(Math.min(delay, expiry)),
-                    this::willTimeUp
-            );
-        } catch (RuntimeException failure) {
-            // Publishing the Will early beats never publishing it.
-            log.warn("Broker on port {} could not delay the Will of client {}",
-                    routing.port, clientId, failure);
-            will = null;
-            routing.publishWill(lastWill, this);
-        }
     }
 
     // Whether a Will waits with the session and its delay has passed by `now`, so that a
@@ -371,11 +356,10 @@ final class Session {
         return will != null && now - detachedAt >= willDelay * 1_000_000_000L;
     }
 
-    // Takes the Will that waits with the session, to publish it, and cancels its timer; null
-    // when none waits.
+    // Takes the Will that waits with the session, to publish it; null when none waits.
     Packet.@Nullable Will takeWill() {
         Packet.Will waiting = will;
-        cancelWill();
+        will = null;
         return waiting;
     }
 
@@ -383,40 +367,82 @@ final class Session {
     // session within the delay does [MQTT-3.1.3-9].
     void cancelWill() {
         will = null;
-        Timer.Cancellable timer = willTimer;
-        willTimer = null;
-        if (timer == null) {
+    }
+
+    // Sets the session's timer anew if no connection has the session: it comes when the delay of
+    // the Will that waits or the session's expiry passes, whichever is earlier. Both count from
+    // the detachment, so a timer set late still comes on time.
+    //
+    // The broker decides from the time whether the Will goes out and the session ends: when a
+    // connection continues the session, when the session ends, and when the timer comes. The
+    // timer only makes sure that someone looks once the time has come, so a timer that comes
+    // late, or after its cancellation, changes nothing. Runs on the actor.
+    void armTimer() {
+        cancelTimer();
+        if (connection != null || ended || !kept()) {
+            return;
+        }
+        Packet.Will waiting = will;
+        long seconds = expiry;
+        if (waiting == null && seconds == NEVER) {
+            return;
+        }
+        // Seconds from the detachment. A Session Expiry Interval of NEVER is at least any delay.
+        long due = (waiting == null) ? seconds : Math.min(willDelay, seconds);
+        try {
+            long left = due * 1_000_000_000L - (settings.scheduler().nanoTime() - detachedAt);
+            timer = settings.scheduler().schedule(
+                    Duration.ofNanos(Math.max(left, 0)),
+                    this::timeUp
+            );
+        } catch (RuntimeException failure) {
+            // Publishing the Will early beats never publishing it. The session lasts until a
+            // connection for it finds it expired.
+            log.warn("Broker on port {} could not set the timer of client {}",
+                    routing.port, clientId, failure);
+            if (waiting != null) {
+                will = null;
+                routing.publishWill(waiting, this);
+            }
+        }
+    }
+
+    private void cancelTimer() {
+        Timer.Cancellable set = timer;
+        timer = null;
+        if (set == null) {
             return;
         }
         try {
-            timer.cancel();
+            set.cancel();
         } catch (Throwable failure) {
             // A failing injected timer must not keep the session from ending.
-            log.warn("Cancelling the Will timer of client {} on port {} failed",
+            log.warn("Cancelling the timer of client {} on port {} failed",
                     clientId, routing.port, failure);
         }
     }
 
-    // The timer of the waiting Will, which comes once its delay or the session's expiry has
-    // passed. It only posts, so that the shared timer thread, which the other timers of the
-    // distribution share, waits for no session.
-    private void willTimeUp() {
+    // The session's timer, which only posts, so that the shared timer thread, which the other
+    // timers of the distribution share, waits for no session.
+    private void timeUp() {
         try {
             post(this::checkExpiry, ELSEWHERE);
         } catch (Throwable failure) {
-            log.warn("Broker on port {} failed to look at the Will of client {}",
+            log.warn("Broker on port {} failed to look at the session of client {}",
                     routing.port, clientId, failure);
         }
     }
 
     // Ends the session if its expiry has passed, which publishes its Will, and otherwise
-    // publishes a Will whose delay has passed.
-    void checkExpiry() {
+    // publishes a Will whose delay has passed and sets the timer again for the expiry.
+    private void checkExpiry() {
         long now = settings.scheduler().nanoTime();
         if (expired(now)) {
             discard();
         } else if (willDue(now)) {
-            routing.publishWill(requireNonNull(takeWill()), this);
+            Packet.Will due = requireNonNull(takeWill());
+            armTimer();
+            routing.publishWill(due, this);
         }
     }
 
@@ -738,9 +764,11 @@ final class Session {
     }
 
     // Attaches `peer`, which a CONNECT accepted, and queues its CONNACK, so that publishers find
-    // the connection only behind it. Returns false if the connection's end has come already,
-    // and then did not reach the session.
+    // the connection only behind it. The session's timer stops, because a session with a
+    // connection neither expires nor has a Will waiting. Returns false if the connection's end
+    // has come already, and then did not reach the session.
     boolean attach(Connection peer, Packet.ConnAck connAck) {
+        cancelTimer();
         synchronized (this) {
             connection = peer;
             return peer.attach(this, connAck);
@@ -1030,8 +1058,8 @@ final class Session {
         routing.sessions.remove(clientId, this);
     }
 
-    // Drops the session state, the Will that waits with it included, which leaves the actor
-    // without a session.
+    // Drops the session state, the Will that waits with it and the timer included, which leaves
+    // the actor without a session.
     void clear() {
         synchronized (this) {
             subscriptions = Map.of();
@@ -1049,6 +1077,7 @@ final class Session {
         outstandingCount = 0;
         inflightBytes = 0;
         cancelWill();
+        cancelTimer();
     }
 
     // Starts a new session of `newVersion` that outlives its connection for `newExpiry` seconds
