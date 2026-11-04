@@ -9,7 +9,6 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
-import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
@@ -56,20 +55,13 @@ final class RetainedMessages {
             return;
         }
         // A retained message counts as the MQTT 5.0 PUBLISH that carries it with its properties.
-        byte[] header = PacketCodec.of(MqttVersion.V5).encodePublishHeader(
+        int byteCount = PacketCodec.of(MqttVersion.V5).publishSize(
                 publication.topic(),
                 publication.qos(),
-                true,
-                false,
-                (publication.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
                 publication.properties(),
                 publication.payload().length
         );
-        var message = new Message(
-                publication,
-                header.length + publication.payload().length,
-                received
-        );
+        var message = new Message(publication, byteCount, received);
         if (messages.size() >= settings.maxRetained()
                 || message.byteCount() > settings.maxRetainedBytes() - bytes) {
             if (!limitReached) {

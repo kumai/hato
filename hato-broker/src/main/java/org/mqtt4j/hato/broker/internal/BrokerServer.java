@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.channels.ServerSocketChannel;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
@@ -240,7 +241,9 @@ public final class BrokerServer implements AutoCloseable {
                     beforeHandle,
                     beforeDeliveryWrite
             );
-            var listener = new ServerSocket();
+            // The sockets that a channel's listener accepts have channels too, through which a
+            // connection's writer sends several packets in one gathering write.
+            ServerSocket listener = ServerSocketChannel.open().socket();
             try {
                 listener.bind(address);
                 var server = new BrokerServer(listener, settings);

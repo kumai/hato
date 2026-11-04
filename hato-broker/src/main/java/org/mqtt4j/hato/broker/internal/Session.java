@@ -839,9 +839,8 @@ final class Session {
         // timer each, so they keep their place in the queue limits until the queue moves; a timer
         // would release them at once, if productization needs that.
         long now = settings.scheduler().nanoTime();
-        // Publishers queue for the session meanwhile only behind what this takes. A deliberate
-        // simplification: they wait while this encodes, which moving the encoding to the writer
-        // would end.
+        // Publishers queue for the session meanwhile only behind what this takes, which hands
+        // the deliveries over as they are: the connection's writer prepares their packets.
         synchronized (this) {
             Pending head;
             while ((head = pending.peekFirst()) != null) {

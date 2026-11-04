@@ -3,6 +3,7 @@ package org.mqtt4j.hato.broker.internal;
 import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketAddress;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.EnumSet;
@@ -16,6 +17,7 @@ import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.io.FrameReader;
 import org.mqtt4j.hato.broker.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.broker.internal.common.io.SendQueue;
+import org.mqtt4j.hato.broker.internal.common.io.WriteParts;
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
@@ -40,6 +42,11 @@ final class Connection {
     );
 
     static final int SEND_COUNT = 128;
+
+    // Sends that wait together go out in one write, up to this many bytes, rather than one write
+    // each: every write is a call into the operating system, which costs more than a small packet
+    // itself. A larger send goes alone.
+    static final int BATCH_BYTES = 64 * 1024;
 
     // Responses to a client's requests queue apart from deliveries and PUBRELs, up to the 128
     // the regular queue allowed them before sessions. While they are all waiting, the reader
@@ -127,7 +134,7 @@ final class Connection {
         this.socket = socket;
         socket.setTcpNoDelay(true);
         reader = new FrameReader(socket.getInputStream(), MAX_PACKET_SIZE);
-        writer = new FrameWriter(socket.getOutputStream());
+        writer = new FrameWriter(socket.getOutputStream(), socket.getChannel());
         client = new Client(this, routing);
     }
 
@@ -243,23 +250,28 @@ final class Connection {
         if (lastPacket != null) {
             return SendQueue.OfferResult.CLOSED;
         }
-        Delivery delivery = message instanceof Delivery value ? value : null;
         // PUBLISH and PUBREL share the regular queue, whose window always fits a resumed
         // session, and leave the reserved queue to responses to the client's requests.
-        // Only a PUBLISH is checked before encoding, so a full queue never copies its payload;
-        // the offer decides with the encoded size.
-        SendQueue.OfferResult result = delivery == null
-                ? SendQueue.OfferResult.ACCEPTED
-                : outgoing.checkCapacity(delivery.byteCount, false);
-        if (result == SendQueue.OfferResult.ACCEPTED) {
-            byte[] bytes = PacketCodec.of(version).encode(message.packet(scheduler.nanoTime()));
-            result = outgoing.offer(
+        SendQueue.OfferResult result = switch (message) {
+            // The writer prepares a delivery as it writes it. A session queues a delivery here
+            // only once the connection that had it before has ended, so whether that connection
+            // started to send it no longer changes.
+            case Delivery delivery -> outgoing.offer(
                     ++ticket,
-                    new Outbound(bytes, delivery),
-                    bytes.length,
+                    new Outbound.Publish(delivery, delivery.sent),
+                    delivery.byteCount,
                     false
             );
-        }
+            case Release release -> {
+                byte[] bytes = PacketCodec.of(version).encode(release.packet());
+                yield outgoing.offer(
+                        ++ticket,
+                        new Outbound.Encoded(bytes),
+                        bytes.length,
+                        false
+                );
+            }
+        };
         if (result == SendQueue.OfferResult.ACCEPTED) {
             notifyAll();
         } else {
@@ -369,7 +381,7 @@ final class Connection {
             }
             SendQueue.OfferResult result = outgoing.offer(
                     ++ticket,
-                    new Outbound(bytes, null),
+                    new Outbound.Encoded(bytes),
                     bytes.length,
                     true
             );
@@ -389,7 +401,7 @@ final class Connection {
         byte[] bytes = PacketCodec.of(version).encode(packet);
         boolean enqueueFailed = outgoing.offer(
                 ++ticket,
-                new Outbound(bytes, null),
+                new Outbound.Encoded(bytes),
                 bytes.length,
                 true
         ) != SendQueue.OfferResult.ACCEPTED;
@@ -406,27 +418,29 @@ final class Connection {
         String reason = "last packet written";
         try {
             while (true) {
-                Optional<SendQueue.Send<Outbound>> next;
+                List<SendQueue.Send<Outbound>> sends;
                 byte[] last;
                 synchronized (this) {
-                    next = outgoing.poll();
-                    while (!ended && next.isEmpty() && lastPacket == null) {
+                    sends = outgoing.pollBatch(BATCH_BYTES);
+                    while (!ended && sends.isEmpty() && lastPacket == null) {
                         wait();
-                        next = outgoing.poll();
+                        sends = outgoing.pollBatch(BATCH_BYTES);
                     }
                     if (ended) {
                         return;
                     }
                     last = lastPacket;
                 }
-                if (next.isEmpty()) {
+                if (sends.isEmpty()) {
                     writer.write(requireNonNull(last));
                     return;
                 }
-                SendQueue.Send<Outbound> send = next.get();
-                Delivery delivery = send.value().delivery();
+                boolean delivers = false;
+                for (SendQueue.Send<Outbound> send : sends) {
+                    delivers |= send.value() instanceof Outbound.Publish;
+                }
                 boolean skip = false;
-                if (delivery != null) {
+                if (delivers) {
                     settings.beforeDeliveryWrite().run();
                     // This monitor decides. A session ends the connection that it leaves, under
                     // this monitor, before it resends the connection's deliveries elsewhere, so
@@ -434,9 +448,13 @@ final class Connection {
                     // written here.
                     synchronized (this) {
                         if (!ended && lastPacket == null) {
-                            delivery.sent = true;
+                            for (SendQueue.Send<Outbound> send : sends) {
+                                if (send.value() instanceof Outbound.Publish publish) {
+                                    publish.delivery().sent = true;
+                                }
+                            }
                         } else if (lastPacket != null) {
-                            // The delivery stays unsent for the session's next connection;
+                            // The deliveries stay unsent for the session's next connection;
                             // the last packet still follows.
                             skip = true;
                         } else {
@@ -444,13 +462,14 @@ final class Connection {
                         }
                     }
                 }
-                if (!skip) {
-                    writer.write(send.value().bytes());
+                ByteBuffer[] parts = parts(sends, skip);
+                if (parts.length > 0) {
+                    writer.writeParts(parts);
                 }
                 boolean resume;
                 Session owner;
                 synchronized (this) {
-                    outgoing.completed(send.ticket());
+                    outgoing.completed(sends.getLast().ticket());
                     sendReleased();
                     // Refusal and completion share this monitor, so no wakeup is lost.
                     resume = awaitingSpace;
@@ -471,6 +490,27 @@ final class Connection {
             // Each started connection has one writer, so every end is logged exactly once.
             logEnd();
         }
+    }
+
+    // The parts of the one write that carries `sends`: the bytes of each packet that was queued
+    // encoded, and the headers of each delivery, prepared now, before the payload that it shares
+    // with the publication's deliveries to other sessions. The deliveries that `skip` leaves
+    // unsent have none.
+    private ByteBuffer[] parts(List<SendQueue.Send<Outbound>> sends, boolean skip) {
+        var parts = new WriteParts();
+        long now = scheduler.nanoTime();
+        for (SendQueue.Send<Outbound> send : sends) {
+            switch (send.value()) {
+                case Outbound.Encoded(var bytes) -> parts.add(bytes);
+                case Outbound.Publish(var delivery, var sentBefore) -> {
+                    if (!skip) {
+                        parts.add(delivery.header(sentBefore, now));
+                        parts.add(delivery.payload());
+                    }
+                }
+            }
+        }
+        return parts.toArray();
     }
 
     // Peer I/O and protocol errors end only this connection. Anything else is a broker
@@ -687,6 +727,12 @@ final class Connection {
         }
     }
 
-    private record Outbound(byte[] bytes, @Nullable Delivery delivery) {
+    // What waits in the send queue: a packet that was encoded as it was queued, or a delivery
+    // with whether a connection before this one started to send it.
+    private sealed interface Outbound {
+
+        record Encoded(byte[] bytes) implements Outbound {}
+
+        record Publish(Delivery delivery, boolean sentBefore) implements Outbound {}
     }
 }

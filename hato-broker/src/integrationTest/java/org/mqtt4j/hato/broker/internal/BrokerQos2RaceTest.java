@@ -166,12 +166,14 @@ class BrokerQos2RaceTest {
             }
 
             try (RawSession resumed = RawSession.open(sut.port())) {
-                // The writer sends CONNACK and is then held on the replayed PUBLISH.
+                // The writer is held on the write that carries the replayed PUBLISH. That write
+                // can carry CONNACK too, which keeps its place among the responses until the
+                // write is over, so the requests leave one place for it.
                 writer.hold();
                 resumed.send(connect("subscriber", false, 0));
                 writer.awaitHeld();
                 var burst = new ByteArrayOutputStream();
-                for (int id = 1; id <= RESPONSES; id++) {
+                for (int id = 1; id < RESPONSES; id++) {
                     write(burst, publication("requests", "request", AT_LEAST_ONCE, id));
                 }
                 write(burst, MARKER);
@@ -190,7 +192,7 @@ class BrokerQos2RaceTest {
                     assertThat(resumed.expect(Packet.PubRel.class))
                             .isEqualTo(new Packet.PubRel(delivery.packetId(), SUCCESS, EMPTY));
                 }
-                for (int id = 1; id <= RESPONSES; id++) {
+                for (int id = 1; id < RESPONSES; id++) {
                     assertThat(resumed.expect(Packet.PubAck.class))
                             .isEqualTo(new Packet.PubAck(id, SUCCESS, EMPTY));
                 }

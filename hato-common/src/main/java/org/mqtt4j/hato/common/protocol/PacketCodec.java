@@ -80,6 +80,21 @@ public interface PacketCodec {
     ///         properties, or Remaining Length exceeds its limit
     int publishSize(Topic topic, Qos qos, int propertiesSize, int payloadSize);
 
+    /// The bytes of a PUBLISH of `topic` at `qos` that carries `properties` and a payload of
+    /// `payloadSize` bytes, as [#publishSize(Topic, Qos, int, int)] counts them. The properties
+    /// are sized and checked as [#encodePublishHeader] sizes and checks them; nothing is prepared.
+    ///
+    /// @throws IllegalArgumentException if `payloadSize` is negative, this version cannot carry
+    ///         the properties in a PUBLISH, or Remaining Length exceeds its limit
+    default int publishSize(Topic topic, Qos qos, Properties properties, int payloadSize) {
+        // Most publications carry no properties, which need no checks. The MQTT 3.1.1 codec
+        // refuses properties by their size.
+        int propertiesSize = properties.isEmpty()
+                ? 0
+                : Mqtt5Properties.size(properties, PacketType.PUBLISH);
+        return publishSize(topic, qos, propertiesSize, payloadSize);
+    }
+
     /// Prepares the headers of an MQTT 5.0 PUBLISH that omits its topic name, like
     /// [#encodePublishHeader] for an [Packet.AliasPublish]: `properties` must carry the Topic
     /// Alias that stands for the topic.

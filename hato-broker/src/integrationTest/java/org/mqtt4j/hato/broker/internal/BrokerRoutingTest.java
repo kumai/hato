@@ -12,14 +12,19 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.broker.MqttBroker;
+import org.mqtt4j.hato.broker.internal.common.io.WriteParts;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
+import org.mqtt4j.hato.broker.internal.common.protocol.Property;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
+import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.acknowledge;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
+import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
@@ -198,6 +203,57 @@ class BrokerRoutingTest {
                 );
                 assertThat(first.expect(Packet.Publish.class)).isEqualTo(expected);
                 assertThat(second.expect(Packet.Publish.class)).isEqualTo(expected);
+            }
+        }
+    }
+
+    @Test
+    void large_payloads_and_headers_reach_each_subscriber_whole_and_in_order() throws Exception {
+        // Arrange: payloads on both sides of the size from which a write sends an array from
+        // where it lies rather than joining it to the others, one larger than one write takes
+        // together, and properties that make an MQTT 5.0 header as large.
+        var large = new Properties(List.of(
+                new Property.UserProperty("large", "v".repeat(WriteParts.JOIN_BYTES))
+        ));
+        List<Packet.Publish> publications = List.of(
+                publication("sized/small", "small", AT_MOST_ONCE, 0),
+                publication("sized/joined", "j".repeat(WriteParts.JOIN_BYTES - 1), AT_MOST_ONCE, 0),
+                publication("sized/apart", "a".repeat(WriteParts.JOIN_BYTES), AT_MOST_ONCE, 0),
+                publication("sized/alone", "x".repeat(Connection.BATCH_BYTES + 1), AT_MOST_ONCE, 0),
+                new Packet.Publish(
+                        new Topic("sized/header"),
+                        "header".getBytes(UTF_8),
+                        AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        large
+                )
+        );
+        try (var sut = MqttBroker.start();
+                RawSession older = connected(sut.port(), "older");
+                RawSession newer = connectedV5(sut.port(), "newer");
+                RawSession publisher = connectedV5(sut.port(), "publisher")) {
+            older.subscribe("sized/#", AT_MOST_ONCE);
+            newer.subscribe("sized/#", AT_MOST_ONCE);
+
+            // Act
+            for (Packet.Publish publication : publications) {
+                publisher.publish(publication);
+            }
+
+            // Assert: the MQTT 3.1.1 subscriber receives them without properties.
+            for (Packet.Publish publication : publications) {
+                assertThat(newer.expect(Packet.Publish.class)).isEqualTo(publication);
+                assertThat(older.expect(Packet.Publish.class)).isEqualTo(new Packet.Publish(
+                        publication.topic(),
+                        publication.payload(),
+                        AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        EMPTY
+                ));
             }
         }
     }
