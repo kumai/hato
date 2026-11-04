@@ -9,7 +9,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.jspecify.annotations.Nullable;
@@ -731,17 +730,15 @@ class ClientStatsTest {
 
     @Test
     void a_clock_failure_fails_the_pending_calls_and_ends_the_connection() throws Exception {
-        // Arrange: the next clock read on the actor fails.
+        // Arrange: every clock read on the actor fails. The actor also reads the clock when it
+        // learns of a write, and the CONNECT's completion can reach it before the call does; that
+        // read then ends the connection, and the call's own read still fails.
         var failure = new IllegalStateException("Clock unavailable");
-        var failing = new AtomicBoolean();
         try (MqttClient sut = builder().build()) {
             connect(sut);
             beforeActorTime = () -> {
-                if (failing.getAndSet(false)) {
-                    throw failure;
-                }
+                throw failure;
             };
-            failing.set(true);
 
             // Act
             CompletableFuture<ClientStats> failed = sut.stats();
@@ -749,6 +746,7 @@ class ClientStatsTest {
             // Assert
             assertThatThrownBy(() -> failed.get(5, SECONDS)).hasCause(failure);
             assertThat(requireNonNull(ends.poll(5, SECONDS)).cause()).contains(failure);
+            beforeActorTime = () -> { };
             assertThat(stats(sut).connection().state()).isEqualTo(ConnectionState.DISCONNECTED);
         }
     }
