@@ -31,8 +31,8 @@ abstract class Mqtt5SubscriptionOptionsTest {
             // Arrange
             PullSubscription subscription = subscribe(sut, request(topic).withNoLocal(true));
 
-            // Act: a broker has matched a publication with the subscriptions once it
-            // acknowledges it.
+            // Act: the second publication follows the first one's acknowledgement, so a broker
+            // that delivered the first one to this subscription would normally do so first.
             sut.publish(message(topic, 1)).get(5, SECONDS);
             other.publish(message(topic, 2)).get(5, SECONDS);
 
@@ -76,7 +76,7 @@ abstract class Mqtt5SubscriptionOptionsTest {
                 MqttClient publisher = connected(Duration.ZERO)
         ) {
             // Arrange
-            publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
+            publishRetained(publisher, topic, 1);
 
             // Act
             PullSubscription subscription = subscribe(
@@ -100,7 +100,7 @@ abstract class Mqtt5SubscriptionOptionsTest {
                 MqttClient publisher = connected(Duration.ZERO)
         ) {
             // Arrange
-            publisher.publish(message(topic, 1).withRetain(true)).get(5, SECONDS);
+            publishRetained(publisher, topic, 1);
 
             // Act
             PullSubscription subscription = subscribe(
@@ -127,6 +127,22 @@ abstract class Mqtt5SubscriptionOptionsTest {
                 .build();
         client.connect().get(5, SECONDS);
         return client;
+    }
+
+    /// Publishes a retained message, and returns once a subscriber has received it: NanoMQ can
+    /// handle a publication after its PUBACK, so a subscription made right after the PUBACK could
+    /// receive the publication itself, without the retain flag, or miss the retained message. The
+    /// subscriber takes QoS 0, because RabbitMQ can hold back the PUBACK of a publication that
+    /// meets the end of a subscriber at QoS 1.
+    void publishRetained(MqttClient publisher, String topic, int payload) throws Exception {
+        try (MqttClient witness = connected(Duration.ZERO)) {
+            PullSubscription handled = subscribe(
+                    witness,
+                    Subscribe.of(new TopicFilter(topic), Qos.AT_MOST_ONCE)
+            );
+            publisher.publish(message(topic, payload).withRetain(true)).get(5, SECONDS);
+            receive(handled);
+        }
     }
 
     static Subscribe request(String topic) {
