@@ -43,6 +43,7 @@ import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
+import org.mqtt4j.hato.client.internal.common.io.WriteParts;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
@@ -777,7 +778,7 @@ class ClientIoTest {
         var small = MqttMessage.of(new Topic("small"), new byte[] {1, 2}, Qos.AT_MOST_ONCE, false);
         var large = MqttMessage.of(
                 new Topic("large"),
-                new byte[ClientIo.JOIN_BYTES],
+                new byte[WriteParts.JOIN_BYTES],
                 Qos.AT_MOST_ONCE,
                 false
         );
@@ -812,7 +813,7 @@ class ClientIoTest {
         PacketCodec mqtt5 = PacketCodec.of(MqttVersion.V5);
         var transport = new GatheringTransport();
         ClientIo sut = gatheringIo(transport, mqtt5);
-        MqttMessage message = withHeaderOf(mqtt5, ClientIo.JOIN_BYTES);
+        MqttMessage message = withHeaderOf(mqtt5, WriteParts.JOIN_BYTES);
 
         // Act
         assertThat(sut.publish(1, 1, message, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
@@ -820,7 +821,7 @@ class ClientIoTest {
         // Assert: the header leaves without being copied to join the message's own payload.
         await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
         assertThat(transport.arrays).hasSize(2);
-        assertThat(transport.arrays.getFirst()).hasSize(ClientIo.JOIN_BYTES);
+        assertThat(transport.arrays.getFirst()).hasSize(WriteParts.JOIN_BYTES);
         assertThat(transport.arrays.getLast()).isSameAs(MqttMessageAccess.payloadArray(message));
         assertThat(transport.bytes.toByteArray()).isEqualTo(encoded(mqtt5, message));
     }
@@ -831,7 +832,7 @@ class ClientIoTest {
         PacketCodec mqtt5 = PacketCodec.of(MqttVersion.V5);
         var transport = new GatheringTransport();
         ClientIo sut = gatheringIo(transport, mqtt5);
-        MqttMessage message = withHeaderOf(mqtt5, ClientIo.JOIN_BYTES - 1);
+        MqttMessage message = withHeaderOf(mqtt5, WriteParts.JOIN_BYTES - 1);
 
         // Act
         assertThat(sut.publish(1, 1, message, 0, null, TopicAlias.NONE)).isEqualTo(ACCEPTED);
