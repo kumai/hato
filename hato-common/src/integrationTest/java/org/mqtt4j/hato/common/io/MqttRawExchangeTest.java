@@ -182,7 +182,11 @@ abstract class MqttRawExchangeTest {
                 first.send(new Packet.Disconnect(SUCCESS, EMPTY));
                 first.expectEndOfStream();
             }
-            publish(publisher, topic, KEPT, qos);
+            // A publication that the broker handled after the resumption would count as kept.
+            try (RawSession witness = witness(clientId + "-witness", topic)) {
+                publish(publisher, topic, KEPT, qos);
+                awaitDelivery(witness, KEPT);
+            }
             try (RawSession resumed = open()) {
                 resumed.send(persistentConnect(clientId));
                 boolean sessionPresent = resumed.expect(Packet.ConnAck.class).sessionPresent();
@@ -363,10 +367,15 @@ abstract class MqttRawExchangeTest {
         }
     }
 
-    /// Publishes `payload` to `topic` with RETAIN set at QoS 1 and waits for the PUBACK, so the
-    /// broker has stored it, or removed it for an empty payload, before this returns.
+    /// Publishes `payload` to `topic` with RETAIN set at QoS 1 and waits for its delivery to a
+    /// [#witness], so the broker has stored it, or removed it for an empty payload, before this
+    /// returns.
     private void retain(Topic topic, byte[] payload) throws Exception {
-        try (RawSession publisher = connected("hato-three-retain-" + topic.name().hashCode())) {
+        String clientId = "hato-three-retain-" + topic.name().hashCode();
+        try (
+                RawSession witness = witness(clientId + "-witness", topic);
+                RawSession publisher = connected(clientId)
+        ) {
             publisher.send(new Packet.Publish(
                     topic,
                     payload,
@@ -378,6 +387,38 @@ abstract class MqttRawExchangeTest {
             ));
             assertThat(publisher.expect(Packet.PubAck.class))
                     .isEqualTo(new Packet.PubAck(1, SUCCESS, EMPTY));
+            awaitDelivery(witness, payload);
+        }
+    }
+
+    /// Connects a session subscribed to `topic`, whose deliveries show that the broker has handled
+    /// a publication. A PUBACK does not show that, as NanoMQ can handle a publication after it,
+    /// and a QoS 0 publication has none. The session takes QoS 0, because RabbitMQ can hold back
+    /// the PUBACK of a publication that meets the end of a subscriber at QoS 1.
+    private RawSession witness(String clientId, Topic topic) throws Exception {
+        RawSession witness = connected(clientId);
+        try {
+            var filter = new TopicFilter(topic.name());
+            var subscription = new Packet.Subscription(filter, Qos.AT_MOST_ONCE, false, false, 0);
+            witness.send(new Packet.Subscribe(1, List.of(subscription), EMPTY));
+            // What the topic retains can arrive before the SUBACK.
+            Packet packet = witness.expect(Packet.class);
+            while (!(packet instanceof Packet.SubAck)) {
+                packet = witness.expect(Packet.class);
+            }
+            return witness;
+        } catch (Exception | AssertionError e) {
+            witness.close();
+            throw e;
+        }
+    }
+
+    /// Waits for the delivery of `payload` to `witness`, past what the topic retained before.
+    private static void awaitDelivery(RawSession witness, byte[] payload) throws Exception {
+        Packet packet = witness.expect(Packet.class);
+        while (!(packet instanceof Packet.Publish publish
+                && Arrays.equals(publish.payload(), payload))) {
+            packet = witness.expect(Packet.class);
         }
     }
 
