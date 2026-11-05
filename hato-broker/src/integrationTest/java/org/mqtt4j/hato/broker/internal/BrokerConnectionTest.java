@@ -2,14 +2,19 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.net.BindException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
+import com.sun.management.HotSpotDiagnosticMXBean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -256,6 +261,38 @@ class BrokerConnectionTest {
                 assertThat(client.expect(Packet.PubAck.class).packetId()).isEqualTo(id);
             }
             client.ping();
+        }
+    }
+
+    @Test
+    void the_threads_of_a_connection_end_with_the_connection() throws Exception {
+        try (var sut = MqttBroker.start()) {
+            try (RawSession client = connected(sut.port(), "threads")) {
+                client.ping();
+                assertThat(connectionThreads(sut.port())).isEqualTo(2);
+            }
+            await().until(() -> connectionThreads(sut.port()) == 0);
+        }
+    }
+
+    // How many threads read or write the connections of the broker on `port`. A thread dump counts
+    // them because Thread.getAllStackTraces() leaves virtual threads out.
+    private static long connectionThreads(int port) throws IOException {
+        HotSpotDiagnosticMXBean diagnostic =
+                ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+        Path file = Files.createTempFile("hato-threads", ".json");
+        try {
+            Files.delete(file);
+            diagnostic.dumpThreads(
+                    file.toString(),
+                    HotSpotDiagnosticMXBean.ThreadDumpFormat.JSON
+            );
+            Pattern threads = Pattern.compile(
+                    "\"name\": \"hato-broker-" + port + "-[^\"]*-(reader|writer)\""
+            );
+            return threads.matcher(Files.readString(file)).results().count();
+        } finally {
+            Files.deleteIfExists(file);
         }
     }
 

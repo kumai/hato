@@ -11,6 +11,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.locks.LockSupport;
 
 import org.jspecify.annotations.Nullable;
 
@@ -77,11 +78,25 @@ final class Connection {
 
     final Client client;
 
+    private final Thread readerThread;
+
+    // The thread that writes to the socket. It parks while it has nothing to write, rather than
+    // waiting on this connection's monitor: the JDK resumes a virtual thread that a monitor wakes
+    // through a platform thread of its own, which leaves it behind the work that the carriers
+    // queue for themselves. While readers kept the carriers busy, writers then fell behind what
+    // the readers took in, and subscribers lost messages to their queue limits. A virtual thread
+    // that unparks the writer queues it on its own carrier.
+    private final Thread writerThread;
+
     // The identifier is assigned once on acceptance, before the session attaches the connection,
     // and read by timers, logs, and the test controls.
     volatile String clientId = "";
 
     // Remaining state is guarded by this connection's monitor.
+
+    // Set by the writer when it finds nothing to write, before it parks; cleared by the thread
+    // that unparks it.
+    private boolean writerIdle;
 
     // Responses that a test released, waiting for room in the reserved quota in order. Later
     // responses queue behind them, so that none overtakes a released one.
@@ -141,6 +156,9 @@ final class Connection {
         reader = new FrameReader(new BufferedInputStream(socket.getInputStream()), MAX_PACKET_SIZE);
         writer = new FrameWriter(socket.getOutputStream(), socket.getChannel());
         client = new Client(this, routing);
+        String name = "hato-broker-" + routing.port + "-" + socket.getRemoteSocketAddress();
+        readerThread = Thread.ofVirtual().name(name + "-reader").unstarted(this::readLoop);
+        writerThread = Thread.ofVirtual().name(name + "-writer").unstarted(this::writeLoop);
     }
 
     SocketAddress remoteAddress() {
@@ -155,9 +173,8 @@ final class Connection {
 
     synchronized void start() {
         armTimer(receiveTimeout - (scheduler.nanoTime() - lastReceived));
-        String name = "hato-broker-" + routing.port + "-" + socket.getRemoteSocketAddress();
-        Thread.ofVirtual().name(name + "-writer").start(this::writeLoop);
-        Thread.ofVirtual().name(name + "-reader").start(this::readLoop);
+        writerThread.start();
+        readerThread.start();
     }
 
     private void readLoop() {
@@ -290,7 +307,7 @@ final class Connection {
             }
         };
         if (result == SendQueue.OfferResult.ACCEPTED) {
-            notifyAll();
+            unparkWriter();
         } else {
             awaitingSpace = true;
         }
@@ -406,6 +423,8 @@ final class Connection {
                 return;
             }
             released.removeFirst();
+            unparkWriter();
+            // The reader may wait for the released responses to go first.
             notifyAll();
         }
     }
@@ -425,8 +444,16 @@ final class Connection {
         if (enqueueFailed) {
             return false;
         }
-        notifyAll();
+        unparkWriter();
         return true;
+    }
+
+    // Unparks the writer if it has gone idle. Called under the connection monitor.
+    private void unparkWriter() {
+        if (writerIdle) {
+            writerIdle = false;
+            LockSupport.unpark(writerThread);
+        }
     }
 
     private void writeLoop() {
@@ -437,16 +464,25 @@ final class Connection {
             while (true) {
                 List<SendQueue.Send<Outbound>> sends;
                 byte[] last;
-                synchronized (this) {
-                    sends = outgoing.pollBatch(BATCH_BYTES);
-                    while (!ended && sends.isEmpty() && lastPacket == null) {
-                        wait();
+                while (true) {
+                    synchronized (this) {
                         sends = outgoing.pollBatch(BATCH_BYTES);
+                        if (ended) {
+                            return;
+                        }
+                        last = lastPacket;
+                        if (!sends.isEmpty() || last != null) {
+                            break;
+                        }
+                        writerIdle = true;
                     }
-                    if (ended) {
-                        return;
+                    // Parks outside the monitor, so that the threads that give the writer work can
+                    // take it. An unpark in between leaves a permit, and a spurious return only
+                    // makes the writer look again.
+                    LockSupport.park(this);
+                    if (Thread.interrupted()) {
+                        throw new InterruptedException();
                     }
-                    last = lastPacket;
                 }
                 if (sends.isEmpty()) {
                     writer.write(requireNonNull(last));
@@ -600,6 +636,8 @@ final class Connection {
         }
         lastPacket = bytes;
         endReason = reason;
+        unparkWriter();
+        // The reader may wait for room for a response, which is dropped from now on.
         notifyAll();
     }
 
@@ -697,6 +735,8 @@ final class Connection {
         }
         cancelTimer();
         outgoing.close();
+        unparkWriter();
+        // The reader may wait for room for a response.
         notifyAll();
         try {
             socket.close();
