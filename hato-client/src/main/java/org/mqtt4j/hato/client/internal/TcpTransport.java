@@ -23,6 +23,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.Transport;
+import org.mqtt4j.hato.client.internal.common.concurrent.CarrierShare;
 import org.mqtt4j.hato.client.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.client.internal.common.io.TcpConnection;
 import org.mqtt4j.hato.client.internal.common.log.Log;
