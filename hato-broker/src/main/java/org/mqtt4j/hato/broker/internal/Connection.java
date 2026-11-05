@@ -14,6 +14,7 @@ import java.util.Set;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.broker.internal.common.concurrent.CarrierShare;
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.io.FrameReader;
 import org.mqtt4j.hato.broker.internal.common.io.FrameWriter;
@@ -186,11 +187,15 @@ final class Connection {
             }
             Session owner = requireNonNull(client.session);
             PacketCodec codec = PacketCodec.of(request.version());
+            // The time spent on packets since the reader last let others run. A read that waits
+            // frees the carrier anyway, so only what follows a read counts.
+            long worked = 0;
             while (true) {
                 Optional<byte[]> bytes = reader.read();
                 if (bytes.isEmpty()) {
                     return;
                 }
+                long started = System.nanoTime();
                 received();
                 Packet packet = codec.decode(bytes.get());
                 settings.beforeProcess().accept(packet);
@@ -202,6 +207,14 @@ final class Connection {
                     return;
                 }
                 owner.receive(this, packet, answered, bytes.get().length);
+                worked += System.nanoTime() - started;
+                // A publisher that never pauses keeps every read from blocking, and this reader
+                // from freeing its carrier for the writers that send what it takes in, so the
+                // reader parks once its work fills a slice.
+                if (CarrierShare.spent(worked)) {
+                    CarrierShare.share();
+                    worked = 0;
+                }
             }
         } catch (Throwable failure) {
             reason = failureReason("reader", failure);
