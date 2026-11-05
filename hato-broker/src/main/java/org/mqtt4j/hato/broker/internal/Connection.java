@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketAddress;
@@ -133,7 +134,10 @@ final class Connection {
         receiveTimeout = settings.connectTimeout();
         this.socket = socket;
         socket.setTcpNoDelay(true);
-        reader = new FrameReader(socket.getInputStream(), MAX_PACKET_SIZE);
+        // The frame reader takes a packet's fixed header a byte at a time, and every read of the
+        // socket is a call into the operating system. Packets still in this buffer when the
+        // connection ends can reach the session, which handles none from an ended connection.
+        reader = new FrameReader(new BufferedInputStream(socket.getInputStream()), MAX_PACKET_SIZE);
         writer = new FrameWriter(socket.getOutputStream(), socket.getChannel());
         client = new Client(this, routing);
     }
