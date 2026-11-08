@@ -31,7 +31,7 @@ public final class BrokerServer implements AutoCloseable {
     private static final Log log = Log.of(BrokerServer.class);
 
     // How the test controls find the server of a broker. MqttBroker, which alone can reach its
-    // server, sets it once as its class initializes.
+    // server, sets it as it starts each broker, before the broker exists.
     private static volatile @Nullable Function<MqttBroker, BrokerServer> servers;
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
@@ -68,14 +68,15 @@ public final class BrokerServer implements AutoCloseable {
         return builder().start(address);
     }
 
-    /// Lets [#of(MqttBroker)] find the server of each broker. MqttBroker calls this once.
+    /// Lets [#of(MqttBroker)] find the server of each broker. MqttBroker calls this as it starts
+    /// each broker, with the same lookup every time.
     public static void serversOf(Function<MqttBroker, BrokerServer> lookup) {
         servers = requireNonNull(lookup, "lookup must not be null");
     }
 
     /// The server of `broker`, for the test controls.
     public static BrokerServer of(MqttBroker broker) {
-        // A broker exists, so MqttBroker has initialized and set the lookup.
+        // A broker exists, so MqttBroker has set the lookup.
         return requireNonNull(servers, "MqttBroker sets the lookup").apply(broker);
     }
 

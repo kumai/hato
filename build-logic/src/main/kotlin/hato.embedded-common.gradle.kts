@@ -26,6 +26,18 @@ sourceSets.main {
     java.srcDir(embedCommonSources.flatMap { it.outputDirectory })
 }
 
+// The embedded ClassPreload loads and initializes every class of the jar, as this index names
+// them, before the library runs on virtual threads. It reads the index next to its embedded copy.
+val writeClassIndex = tasks.register<WriteClassIndex>("writeClassIndex") {
+    classDirectories.from(sourceSets.main.map { it.output.classesDirs })
+    resourcePath = embedCommonSources.flatMap { it.destinationPackage }
+        .map { it.replace('.', '/') + "/concurrent/classes.txt" }
+    outputDirectory = layout.buildDirectory.dir("generated/resources/classIndex/main")
+}
+sourceSets.main {
+    resources.srcDir(writeClassIndex.flatMap { it.outputDirectory })
+}
+
 // The embedded copies are checked at their source in hato-common. Checking them again here would
 // report findings in generated files, and the longer package names can push a line over the limit.
 tasks.named<Checkstyle>("checkstyleMain") {
