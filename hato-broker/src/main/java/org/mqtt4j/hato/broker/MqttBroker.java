@@ -5,6 +5,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 
 import org.mqtt4j.hato.broker.internal.BrokerServer;
+import org.mqtt4j.hato.broker.internal.common.concurrent.ClassPreload;
 
 /// An experimental, in-memory MQTT 3.1.1 and 5.0 broker for tests.
 ///
@@ -94,12 +95,6 @@ import org.mqtt4j.hato.broker.internal.BrokerServer;
 /// promise.
 public final class MqttBroker implements AutoCloseable {
 
-    static {
-        // The testkit's controls reach a broker's server through the internal control port,
-        // which the module exports to the testkit alone.
-        BrokerServer.serversOf(broker -> broker.server);
-    }
-
     private final BrokerServer server;
 
     private MqttBroker(BrokerServer server) {
@@ -125,6 +120,11 @@ public final class MqttBroker implements AutoCloseable {
     /// @throws IOException
     ///   if the listening socket cannot be opened
     public static MqttBroker start(InetSocketAddress address) throws IOException {
+        // First, before anything touches the other classes of the broker.
+        ClassPreload.awaitLoaded();
+        // The testkit's controls reach a broker's server through the internal control port,
+        // which the module exports to the testkit alone.
+        BrokerServer.serversOf(broker -> broker.server);
         return new MqttBroker(BrokerServer.start(address));
     }
 
