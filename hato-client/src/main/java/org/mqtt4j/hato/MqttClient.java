@@ -2,6 +2,8 @@ package org.mqtt4j.hato;
 
 import java.util.concurrent.CompletableFuture;
 
+import org.mqtt4j.hato.client.internal.common.concurrent.ClassPreload;
+
 /// Owns an MQTT connection. [#connect()] requests a connection, which the client keeps
 /// re-establishing after a connection ends, as its [ReconnectPolicy] allows, until
 /// [#disconnect()] or [#close()] withdraws the request or a failure that the policy does not
@@ -57,6 +59,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// @return
     ///   a new builder
     static MqttClientBuilder builder() {
+        // First, since initializing the builder already loads classes of the client.
+        ClassPreload.awaitLoaded();
         return new MqttClientBuilder();
     }
 
