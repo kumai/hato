@@ -121,6 +121,10 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     private final Connector connector;
     private final TimerScheduler timer;
     private final PlatformReaders platformReaders;
+    // The kind of the thread that connects and then reads. A transport of a client whose core
+    // runs on platform threads connects and reads on a platform thread of its own, which leaves
+    // the platform readers to other connections and never moves; see CoreThreads.
+    private final CoreThreads cores;
     private final Object callbacks = new Object();
 
     private @Nullable Listener listener;
@@ -148,13 +152,19 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     private volatile boolean readingPaused;
 
     public TcpTransport(String clientId, TimerScheduler timer) {
+        this(clientId, timer, CoreThreads.virtual());
+    }
+
+    public TcpTransport(String clientId, TimerScheduler timer, CoreThreads cores) {
         this(
                 clientId,
                 "mqtt",
                 resolving,
                 InetAddress::getByName,
                 (_, address, timeout) -> plain(TcpConnection.connect(address, timeout)),
-                timer
+                timer,
+                platformReading,
+                cores
         );
     }
 
@@ -180,13 +190,25 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             SSLParameters parameters,
             TimerScheduler timer
     ) {
+        this(clientId, context, parameters, timer, CoreThreads.virtual());
+    }
+
+    public TcpTransport(
+            String clientId,
+            SSLContext context,
+            SSLParameters parameters,
+            TimerScheduler timer,
+            CoreThreads cores
+    ) {
         this(
                 clientId,
                 "mqtts",
                 resolving,
                 InetAddress::getByName,
                 (host, address, timeout) -> tls(host, address, timeout, context, parameters),
-                timer
+                timer,
+                platformReading,
+                cores
         );
     }
 
@@ -218,6 +240,28 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
             TimerScheduler timer,
             PlatformReaders platformReaders
     ) {
+        this(
+                clientId,
+                scheme,
+                resolutionSlots,
+                resolver,
+                connector,
+                timer,
+                platformReaders,
+                CoreThreads.virtual()
+        );
+    }
+
+    TcpTransport(
+            String clientId,
+            String scheme,
+            Semaphore resolutionSlots,
+            Resolver resolver,
+            Connector connector,
+            TimerScheduler timer,
+            PlatformReaders platformReaders,
+            CoreThreads cores
+    ) {
         threadName = "hato-" + requireNonNull(clientId, "clientId");
         this.scheme = scheme;
         this.resolutionSlots = resolutionSlots;
@@ -225,6 +269,7 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         this.connector = connector;
         this.timer = timer;
         this.platformReaders = platformReaders;
+        this.cores = cores;
     }
 
     @Override
@@ -252,7 +297,7 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                 notifyClosed();
                 return;
             }
-            reader = Thread.ofVirtual().name(threadName + "-reader").unstarted(() -> {
+            reader = cores.builder().name(threadName + "-reader").unstarted(() -> {
                 boolean attached = false;
                 try {
                     String host = endpoint.getHost();
@@ -310,7 +355,8 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                         if (closed) {
                             return;
                         }
-                        if (readOnPlatformThread(socket, receiver)) {
+                        // A thread of a core on platform threads reads on itself.
+                        if (!cores.platform() && readOnPlatformThread(socket, receiver)) {
                             // That thread ends this worker when it stops reading.
                             attached = false;
                             return;
@@ -466,12 +512,15 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
         // A platform reader holds no carrier that others wait for.
         boolean sharesCarrier = Thread.currentThread().isVirtual();
         // Tells this thread when the reading should move to a thread of the other kind; null
-        // where the platform readers stay with the connections that took them.
-        PlatformReaders.Watch watch = platformReaders.watch(
-                !sharesCarrier,
-                receiver,
-                System.nanoTime()
-        );
+        // where the platform readers stay with the connections that took them, and for a core on
+        // platform threads, whose reading stays on its thread and holds no platform reader.
+        PlatformReaders.Watch watch = cores.platform()
+                ? null
+                : platformReaders.watch(
+                        !sharesCarrier,
+                        receiver,
+                        System.nanoTime()
+                );
         try {
             if (watch != null) {
                 // Also clears the bound that a platform reader left behind.

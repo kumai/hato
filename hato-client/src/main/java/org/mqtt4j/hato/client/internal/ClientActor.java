@@ -149,6 +149,10 @@ public final class ClientActor implements MqttClient {
 
     private final ClientTermination termination;
 
+    // The kind of thread that runs the actor, the sender, the completions, and the TCP or TLS
+    // transport's connecting and reading; a place on platform threads goes back as the actor ends.
+    private final CoreThreads cores;
+
     private final Completions completions;
 
     private final ListenerLane listenerLane;
@@ -284,6 +288,7 @@ public final class ClientActor implements MqttClient {
             ConnectionListener listener,
             @Nullable MetricsListener metrics,
             Transport.Factory transportFactory,
+            CoreThreads cores,
             MqttVersion version,
             Duration sessionExpiry,
             @Nullable Path sessionFile,
@@ -311,6 +316,7 @@ public final class ClientActor implements MqttClient {
                 listener,
                 metrics,
                 transportFactory,
+                cores,
                 PacketCodec.of(version),
                 version,
                 sessionExpiry,
@@ -341,6 +347,7 @@ public final class ClientActor implements MqttClient {
             ConnectionListener listener,
             @Nullable MetricsListener metrics,
             Transport.Factory transportFactory,
+            CoreThreads cores,
             PacketCodec codec,
             MqttVersion version,
             Duration sessionExpiry,
@@ -367,6 +374,7 @@ public final class ClientActor implements MqttClient {
         this.messageOf = messageOf;
         this.statsOf = statsOf;
         this.limits = limits;
+        this.cores = cores;
         cleanStart = sessionExpiry.isZero();
         reconnects = backoff.enabled();
         operationSlots = new Semaphore(limits.operations());
@@ -423,6 +431,7 @@ public final class ClientActor implements MqttClient {
                 limits.regularSends(),
                 ClientIo.BATCH_BYTE_LIMIT,
                 transportFactory,
+                cores,
                 new IoEvents(),
                 codec,
                 payloadOf
@@ -472,9 +481,10 @@ public final class ClientActor implements MqttClient {
                 threadName("complete-"),
                 TimerService.instance,
                 Completions.TAKEOVER,
-                Completions.IDLE
+                Completions.IDLE,
+                cores
         );
-        Thread.ofVirtual().name(threadName("actor")).start(this::run);
+        cores.builder().name(threadName("actor")).start(this::run);
     }
 
     @Override
@@ -767,7 +777,11 @@ public final class ClientActor implements MqttClient {
         try {
             Optional<Mailbox.Event> next;
             // The time spent on events since the actor last let others run. Waiting for an event
-            // frees the carrier, so only the handling counts.
+            // frees the carrier, so only the handling counts. An actor on a platform thread holds
+            // no carrier, but parks after its slice too: the moment that it parks lets the threads
+            // that take its deliveries catch up on a busy processor. Without it, a subscription
+            // that handled a QoS 0 flood at full speed handled a fifth as many of its messages on
+            // one processor, and three fifths as many on two, before its buffer overflowed.
             long worked = 0;
             while ((next = mailbox.take(stopping::get)).isPresent()) {
                 long started = System.nanoTime();
@@ -843,10 +857,17 @@ public final class ClientActor implements MqttClient {
                     try {
                         io.shutdown();
                     } finally {
-                        recordLastStats();
-                        synchronized (lifecycleLock) {
-                            cleanedUp = true;
-                            checkLanesEnded();
+                        try {
+                            recordLastStats();
+                            synchronized (lifecycleLock) {
+                                cleanedUp = true;
+                                checkLanesEnded();
+                            }
+                        } finally {
+                            // The actor has closed the transports and stopped the sender, whose
+                            // threads end with them, so another client may take the place, even
+                            // one that its application builds once this one has terminated.
+                            cores.giveBack();
                         }
                         // The actor calls no application code from here on.
                         termination.actorEnded();

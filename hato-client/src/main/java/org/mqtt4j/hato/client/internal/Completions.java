@@ -16,7 +16,9 @@ import org.mqtt4j.hato.client.internal.common.log.Log;
 /// on threads that run no other client's completions, so that thread state that one client's
 /// continuations leave behind never reaches another client's.
 ///
-/// A virtual thread of the client takes the completions while each returns promptly, and parks
+/// A client whose core runs on platform threads, as CoreThreads describes, takes its completions
+/// on platform threads only, so that they never wait for a carrier. For the other clients, a
+/// virtual thread of the client takes the completions while each returns promptly, and parks
 /// while there are none, so that a stream of them costs no thread start apiece; starting a
 /// virtual thread for each completion made small publications cost about twice the processor
 /// time. On a single carrier, though, a virtual thread runs the completions in turn with the
@@ -77,6 +79,9 @@ final class Completions {
     // The platform threads that this client draws from: those of all clients, but in tests.
     private final Semaphore slots;
 
+    // Whether every thread is a platform thread, which the client's core holds a place for.
+    private final boolean platformCore;
+
     // The context class loader of the thread that created the client, which constructs this.
     private final @Nullable ClassLoader contextLoader;
 
@@ -105,9 +110,10 @@ final class Completions {
             String threadName,
             Timer timer,
             Duration takeover,
-            Duration idle
+            Duration idle,
+            CoreThreads cores
     ) {
-        this(endpoint, clientId, threadName, timer, takeover, idle, platformThreads);
+        this(endpoint, clientId, threadName, timer, takeover, idle, cores, platformThreads);
     }
 
     Completions(
@@ -117,6 +123,7 @@ final class Completions {
             Timer timer,
             Duration takeover,
             Duration idle,
+            CoreThreads cores,
             Semaphore slots
     ) {
         this.endpoint = endpoint;
@@ -126,6 +133,7 @@ final class Completions {
         this.takeoverNanos = takeover.toNanos();
         this.idleNanos = idle.toNanos();
         this.slots = slots;
+        platformCore = cores.platform();
         contextLoader = Thread.currentThread().getContextClassLoader();
     }
 
@@ -160,12 +168,13 @@ final class Completions {
         }
     }
 
-    // Caller holds the lock. Starts a thread of the client, a platform one if `platform`, that
-    // takes the waiting completions from now on. A thread that the JVM cannot start leaves the
-    // current one in charge.
+    // Caller holds the lock. Starts a thread of the client, a platform one if `platform` or if
+    // the client's core runs on platform threads, that takes the waiting completions from now on.
+    // A thread that the JVM cannot start leaves the current one in charge.
     private void start(boolean platform) {
-        var taker = new Taker(platform);
-        Thread.Builder builder = platform ? Thread.ofPlatform().daemon() : Thread.ofVirtual();
+        boolean onPlatform = platform || platformCore;
+        var taker = new Taker(onPlatform);
+        Thread.Builder builder = onPlatform ? Thread.ofPlatform().daemon() : Thread.ofVirtual();
         Thread thread = builder.name(threadName + started++)
                 .inheritInheritableThreadLocals(false)
                 .unstarted(() -> run(taker));
@@ -314,7 +323,8 @@ final class Completions {
     // One thread that takes completions, guarded by the lock of its Completions.
     private static final class Taker {
 
-        // Whether it is a platform thread, which only a client that holds one has.
+        // Whether it is a platform thread, which only a client that holds one of the platform
+        // threads, or whose core runs on platform threads, has.
         private final boolean platform;
 
         // Set before the thread starts.
