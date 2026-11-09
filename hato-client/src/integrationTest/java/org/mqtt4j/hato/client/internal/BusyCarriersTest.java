@@ -1,0 +1,113 @@
+package org.mqtt4j.hato.client.internal;
+
+import java.net.ServerSocket;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import org.mqtt4j.hato.*;
+import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+/// A raw broker checks that a client keeps answering while the application's virtual threads keep
+/// every carrier busy, as an application that computes on virtual threads of its own can. Only a
+/// client whose core runs on platform threads can; the single-carrier suite runs every core on
+/// virtual threads, so these tests run only where clients take platform cores.
+class BusyCarriersTest {
+
+    @Test
+    @Timeout(30)
+    void a_client_keeps_alive_while_virtual_threads_keep_every_carrier_busy() throws Exception {
+        assumeTrue(platformCores());
+        try (
+                ServerSocket server = ScriptedBroker.listen();
+                MqttClient sut = MqttClient.builder()
+                        .server(ScriptedBroker.endpoint(server))
+                        .version(MqttVersion.V3_1_1)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
+                        .keepAlive(Duration.ofSeconds(1))
+                        .build();
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)
+        ) {
+            // Arrange
+            BusyCarriers busy = BusyCarriers.start();
+            try {
+                // Act & Assert: the PINGREQ goes out after a second of silence, as without the
+                // busy carriers.
+                assertThat(peer.receive()).isInstanceOf(Packet.PingReq.class);
+            } finally {
+                busy.stop();
+            }
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void a_client_completes_a_publication_while_virtual_threads_keep_every_carrier_busy()
+            throws Exception {
+        assumeTrue(platformCores());
+        try (
+                ServerSocket server = ScriptedBroker.listen();
+                MqttClient sut = ScriptedBroker.client(server);
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)
+        ) {
+            // Arrange
+            BusyCarriers busy = BusyCarriers.start();
+            try {
+                // Act & Assert: the PUBLISH goes out, and the PUBACK completes it within five
+                // seconds.
+                peer.roundTripBarrier(sut);
+            } finally {
+                busy.stop();
+            }
+        }
+    }
+
+    // Whether this JVM gives clients platform cores; the single-carrier suite gives none.
+    private static boolean platformCores() {
+        return Integer.getInteger("hato.client.platformCores", CoreThreads.PLATFORM_CORES) > 0;
+    }
+
+    /// As many virtual threads as the scheduler has carriers, each computing without blocking
+    /// until stopped, which keeps every carrier busy meanwhile.
+    private static final class BusyCarriers {
+
+        private final AtomicBoolean stopped = new AtomicBoolean();
+
+        private final List<Thread> threads = new ArrayList<>();
+
+        static BusyCarriers start() throws InterruptedException {
+            int carriers = Integer.getInteger(
+                    "jdk.virtualThreadScheduler.parallelism",
+                    Runtime.getRuntime().availableProcessors()
+            );
+            var busy = new BusyCarriers();
+            var running = new CountDownLatch(carriers);
+            for (int i = 0; i < carriers; i++) {
+                busy.threads.add(Thread.ofVirtual().start(() -> {
+                    running.countDown();
+                    while (!busy.stopped.get()) {
+                        Thread.onSpinWait();
+                    }
+                }));
+            }
+            // Each thread counts down on a carrier that it then keeps.
+            running.await();
+            return busy;
+        }
+
+        void stop() throws InterruptedException {
+            stopped.set(true);
+            for (Thread thread : threads) {
+                thread.join();
+            }
+        }
+    }
+}

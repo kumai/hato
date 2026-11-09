@@ -1209,6 +1209,7 @@ class AutomaticReconnectionTest {
                     transports.add(transport);
                     return transport;
                 },
+                CoreThreads.virtual(),
                 PacketCodec.of(MqttVersion.V3_1_1),
                 MqttVersion.V3_1_1,
                 cleanStart ? Duration.ZERO : Duration.ofHours(1),

@@ -442,6 +442,36 @@ class TcpTransportTest {
     }
 
     @Test
+    void a_core_on_platform_threads_reads_on_the_thread_that_connected_and_leaves_platform_readers()
+            throws Exception {
+        // Arrange: one platform reader to spare, and a transport of a client whose core runs on
+        // platform threads.
+        var slots = new Semaphore(1);
+        var socket = new ReadConnection();
+        socket.lastRead.complete(null);
+        try (var sut = new TcpTransport(
+                "core",
+                "mqtt",
+                resolutionSlots,
+                this::resolve,
+                (_, _, _) -> socket,
+                clock,
+                slots,
+                new CoreThreads.Places(1).take()
+        )) {
+            // Act
+            sut.start(SERVER, TIMEOUT, new ConnectedListener());
+            Thread reader = requireNonNull(socket.readers.poll(5, SECONDS));
+
+            // Assert: a platform thread of the transport reads, and the platform reader stays
+            // free for another connection.
+            assertThat(reader.isVirtual()).isFalse();
+            assertThat(reader.getName()).isEqualTo("hato-core-reader");
+            assertThat(slots.tryAcquire()).isTrue();
+        }
+    }
+
+    @Test
     void a_connection_read_on_a_platform_thread_reports_its_close_once_that_thread_stops()
             throws Exception {
         // Arrange: a connection whose last read, which the close ends, returns only when told.

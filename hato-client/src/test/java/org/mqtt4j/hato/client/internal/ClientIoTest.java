@@ -84,6 +84,7 @@ class ClientIoTest {
                 transports.add(transport);
                 return transport;
             },
+            CoreThreads.virtual(),
             events,
             codec,
             MqttMessageAccess::payloadArray
@@ -228,6 +229,7 @@ class ClientIoTest {
                     transports.add(transport);
                     return transport;
                 },
+                CoreThreads.virtual(),
                 events,
                 codec,
                 MqttMessageAccess::payloadArray
@@ -570,6 +572,7 @@ class ClientIoTest {
                 128,
                 0,
                 _ -> transport,
+                CoreThreads.virtual(),
                 events,
                 codec,
                 MqttMessageAccess::payloadArray
@@ -602,6 +605,7 @@ class ClientIoTest {
                 128,
                 0,
                 _ -> transport,
+                CoreThreads.virtual(),
                 events,
                 codec,
                 MqttMessageAccess::payloadArray
@@ -711,6 +715,7 @@ class ClientIoTest {
                 128,
                 0,
                 _ -> transport,
+                CoreThreads.virtual(),
                 events,
                 codec,
                 MqttMessageAccess::payloadArray
@@ -736,6 +741,7 @@ class ClientIoTest {
                     transports.add(transport);
                     return transport;
                 },
+                CoreThreads.virtual(),
                 events,
                 codec,
                 MqttMessageAccess::payloadArray
@@ -780,6 +786,7 @@ class ClientIoTest {
                 128,
                 0,
                 _ -> transport,
+                CoreThreads.virtual(),
                 events,
                 codec,
                 MqttMessageAccess::payloadArray

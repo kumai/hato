@@ -381,6 +381,7 @@ class CompletionsTest {
                 TimerService.instance,
                 takeover,
                 idle,
+                CoreThreads.virtual(),
                 platformThreads
         );
     }
