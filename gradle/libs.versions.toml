@@ -10,7 +10,7 @@ graalvm-native = "1.1.18"
 jspecify = "1.0.1"
 errorprone = "2.52.0"
 nullaway = "0.14.3"
-errorprone-plugin = "5.1.1"
+errorprone-plugin = "5.2.0"
 checkstyle = "14.4.0"
 micrometer = "1.17.2"
 
