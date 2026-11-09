@@ -56,6 +56,7 @@ import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.Transport;
+import org.mqtt4j.hato.client.internal.common.concurrent.CarrierShare;
 import org.mqtt4j.hato.client.internal.common.concurrent.TimerService;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.log.Log;
