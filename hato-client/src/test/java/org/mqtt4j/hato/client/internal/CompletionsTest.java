@@ -12,10 +12,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.locks.LockSupport;
 import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.client.internal.common.concurrent.TimerService;
 
@@ -281,6 +285,44 @@ class CompletionsTest {
         assertThat(ran).containsExactlyElementsOf(expected);
     }
 
+    @ParameterizedTest
+    @EnumSource(PlatformThread.class)
+    void a_held_platform_thread_hands_completions_to_a_virtual_thread_until_it_returns(
+            PlatformThread kind
+    ) throws Exception {
+        // Arrange: the client takes its completions on a platform thread, which a continuation
+        // then holds. The continuation spins rather than waits, so that the thread waits only
+        // for completions, and only once the continuation has returned.
+        Completions sut = onPlatformThread(kind);
+        var released = new AtomicBoolean();
+        var threads = new LinkedBlockingQueue<Thread>();
+        sut.submit(() -> {
+            threads.add(Thread.currentThread());
+            while (!released.get()) {
+                Thread.onSpinWait();
+            }
+        });
+        Thread platform = requireNonNull(threads.poll(5, SECONDS));
+        try {
+            // Act: a completion waits behind the held thread past the takeover limit; then the
+            // continuation returns, and the platform thread waits for completions again.
+            sut.submit(() -> threads.add(Thread.currentThread()));
+            Thread replacing = requireNonNull(threads.poll(5, SECONDS));
+            released.set(true);
+            await().until(() -> LockSupport.getBlocker(platform) == sut);
+            sut.submit(() -> threads.add(Thread.currentThread()));
+
+            // Assert: a virtual thread took over rather than a second platform thread, and the
+            // platform thread then took the completions back, while the virtual thread ended.
+            assertThat(platform.isVirtual()).isFalse();
+            assertThat(replacing.isVirtual()).isTrue();
+            assertThat(threads.poll(5, SECONDS)).isSameAs(platform);
+            assertThat(replacing.join(Duration.ofSeconds(5))).isTrue();
+        } finally {
+            released.set(true);
+        }
+    }
+
     @Test
     void concurrent_submissions_complete_exactly_once() throws Exception {
         // Arrange
@@ -374,6 +416,16 @@ class CompletionsTest {
     // Completions of the client `clientId` with the given limits, which draw on the test's own
     // platform thread.
     private Completions completions(String clientId, Duration takeover, Duration idle) {
+        return completions(clientId, takeover, idle, CoreThreads.virtual());
+    }
+
+    // Completions like those above of a client whose core runs on the threads that `cores` gives.
+    private Completions completions(
+            String clientId,
+            Duration takeover,
+            Duration idle,
+            CoreThreads cores
+    ) {
         return new Completions(
                 URI.create("tcp://localhost:1883"),
                 clientId,
@@ -381,9 +433,32 @@ class CompletionsTest {
                 TimerService.instance,
                 takeover,
                 idle,
-                CoreThreads.virtual(),
+                cores,
                 platformThreads
         );
+    }
+
+    // Completions that run on a platform thread of the client, which they took as `kind` says.
+    // The takeover limit leaves the test the time to pile completions up behind a blocked one.
+    private Completions onPlatformThread(PlatformThread kind) throws InterruptedException {
+        return switch (kind) {
+            case CORE -> completions(
+                    "core-client",
+                    Duration.ofMillis(200),
+                    Duration.ofSeconds(5),
+                    new CoreThreads.Places(1).take()
+            );
+            case STREAMING -> {
+                Completions streaming = completions(
+                        "streaming-client",
+                        Duration.ofMillis(200),
+                        Duration.ofSeconds(5)
+                );
+                Thread platform = pileUp(streaming);
+                assertThat(platform.isVirtual()).isFalse();
+                yield streaming;
+            }
+        };
     }
 
     // Creates completions the way a client does, on the thread that creates the client, while
@@ -419,6 +494,16 @@ class CompletionsTest {
             last = requireNonNull(threads.poll(5, SECONDS));
         }
         return last;
+    }
+
+    // How a client comes to take its completions on a platform thread.
+    enum PlatformThread {
+
+        // Its core runs on platform threads.
+        CORE,
+
+        // Its completions piled up behind its virtual thread.
+        STREAMING
     }
 
     // Blocks until the test releases it, which each test does last, so that a completion that

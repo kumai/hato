@@ -5,9 +5,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.jspecify.annotations.Nullable;
 
-/// The kind of thread that runs the core of one client: its actor, its sender, the threads that
-/// complete its operations, and the thread that connects its TCP or TLS transport and then reads
-/// it. A core on platform threads keeps the client answering however the application uses
+/// The kind of thread that runs the core of one client: its actor, its sender, the thread that
+/// completes its operations, and the thread that connects its TCP or TLS transport and then
+/// reads it. A core on platform threads keeps the client answering however the application uses
 /// virtual threads, and the JVM spares places for a limited number of such clients at once.
 ///
 /// Virtual threads are not preempted: one that computes keeps its carrier until it blocks. An
@@ -21,13 +21,14 @@ import org.jspecify.annotations.Nullable;
 /// cost about the same per message, and with processors that other processes keep busy, a core
 /// on platform threads published QoS 1 messages five times as fast.
 ///
-/// A core on platform threads holds up to four threads of its own, whose stacks took about half a
-/// megabyte on Linux, which a thousand clients in one JVM, as a device simulator runs, would
-/// multiply. So the JVM spares [#PLATFORM_CORES] places. A client takes one, if one is free, as it
-/// is built, and gives it back as its actor ends, after it has closed its transports and stopped
-/// its sender; a thread that completes operations ends once it has been idle for a while. A
-/// client that finds no free place runs its core on virtual threads, which share their carriers
-/// as CarrierShare describes and read as TcpTransport describes.
+/// A core on platform threads holds up to four threads of its own; a continuation that holds the
+/// thread that completes operations hands them to a virtual thread, as Completions describes.
+/// Their stacks took about half a megabyte on Linux, which a thousand clients in one JVM, as a
+/// device simulator runs, would multiply. So the JVM spares [#PLATFORM_CORES] places. A client
+/// takes one, if one is free, as it is built, and gives it back as its actor ends, after it has
+/// closed its transports and stopped its sender; a thread that completes operations ends once it
+/// has been idle for a while. A client that finds no free place runs its core on virtual threads,
+/// which share their carriers as CarrierShare describes and read as TcpTransport describes.
 ///
 /// The build's single-carrier suite sets hato.client.platformCores to 0, so that it tests cores
 /// on virtual threads on one carrier; the property is not a supported setting.

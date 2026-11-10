@@ -17,7 +17,7 @@ import org.mqtt4j.hato.client.internal.common.log.Log;
 /// continuations leave behind never reaches another client's.
 ///
 /// A client whose core runs on platform threads, as CoreThreads describes, takes its completions
-/// on platform threads only, so that they never wait for a carrier. For the other clients, a
+/// on a platform thread, so that they do not wait for a carrier. For the other clients, a
 /// virtual thread of the client takes the completions while each returns promptly, and parks
 /// while there are none, so that a stream of them costs no thread start apiece; starting a
 /// virtual thread for each completion made small publications cost about twice the processor
@@ -31,8 +31,13 @@ import org.mqtt4j.hato.client.internal.common.log.Log;
 /// A completion whose synchronous continuations run past the takeover limit while others wait
 /// hands those others to a new thread, so that one blocked continuation delays the other
 /// completions by about that limit and never keeps them from completing. The thread that ran it
-/// ends once it returns. A thread that has parked for the idle limit ends too, and gives back
-/// the client's platform thread if it was one; the next completion starts a virtual thread.
+/// ends once it returns, except the client's platform thread. A client keeps one platform thread
+/// at most: the thread that takes over from it is a virtual one, and the platform thread takes
+/// the completions back once its continuation returns. A platform thread for each takeover
+/// would have the operating system hold a thread for each blocked continuation: ten seconds of
+/// 500 QoS 1 publications a second, whose continuations never returned, left a client 776
+/// platform threads. A thread that has parked for the idle limit ends too, and gives back the
+/// client's platform thread if it was one; the next completion starts another thread.
 ///
 /// Each thread runs with the context class loader of the thread that created the client, which
 /// the client's other threads inherit, and inherits no inheritable thread-local values.
@@ -79,7 +84,8 @@ final class Completions {
     // The platform threads that this client draws from: those of all clients, but in tests.
     private final Semaphore slots;
 
-    // Whether every thread is a platform thread, which the client's core holds a place for.
+    // Whether the client's completions run on its platform thread, which its core holds a place
+    // for.
     private final boolean platformCore;
 
     // The context class loader of the thread that created the client, which constructs this.
@@ -91,12 +97,17 @@ final class Completions {
     private final ArrayDeque<Runnable> waiting = new ArrayDeque<>();
 
     // The thread that takes waiting completions, or null when none runs. A thread that has been
-    // replaced finishes its running completion and takes no other.
+    // replaced finishes its running completion and takes no other, unless it is the client's
+    // platform thread.
     private @Nullable Taker active;
 
-    // Whether the client holds one of the platform threads, so that its threads are platform
-    // threads until the last of them ends for idleness.
+    // Whether the client holds one of the platform threads, so that its completions run on its
+    // platform thread until that thread ends for idleness.
     private boolean streaming;
+
+    // The client's platform thread, or null when it has none. While a continuation holds it, a
+    // virtual thread is active instead.
+    private @Nullable Taker platformTaker;
 
     private boolean checkScheduled;
 
@@ -154,7 +165,7 @@ final class Completions {
             waiting.addLast(completion);
             Taker taker = active;
             if (taker == null) {
-                start(streaming);
+                start(platformDue());
                 return null;
             }
             if (taker.parked) {
@@ -168,20 +179,35 @@ final class Completions {
         }
     }
 
-    // Caller holds the lock. Starts a thread of the client, a platform one if `platform` or if
-    // the client's core runs on platform threads, that takes the waiting completions from now on.
-    // A thread that the JVM cannot start leaves the current one in charge.
+    // Caller holds the lock. Starts a thread of the client, a platform one if `platform`, that
+    // takes the waiting completions from now on. A thread that the JVM cannot start leaves the
+    // current one in charge.
     private void start(boolean platform) {
-        boolean onPlatform = platform || platformCore;
-        var taker = new Taker(onPlatform);
-        Thread.Builder builder = onPlatform ? Thread.ofPlatform().daemon() : Thread.ofVirtual();
-        Thread thread = builder.name(threadName + started++)
-                .inheritInheritableThreadLocals(false)
-                .unstarted(() -> run(taker));
-        thread.setContextClassLoader(contextLoader);
+        var taker = new Taker(platform);
+        Thread thread = thread(platform, () -> run(taker));
         taker.thread = thread;
         thread.start();
         active = taker;
+        if (platform) {
+            platformTaker = taker;
+        }
+    }
+
+    // Caller holds the lock. Whether the next thread to take completions is to be a platform
+    // one: the client's completions belong on its platform thread, and that thread has ended.
+    private boolean platformDue() {
+        return (platformCore || streaming) && platformTaker == null;
+    }
+
+    // Caller holds the lock. A thread of the client, a platform one if `platform`, that runs
+    // `task`.
+    private Thread thread(boolean platform, Runnable task) {
+        Thread.Builder builder = platform ? Thread.ofPlatform().daemon() : Thread.ofVirtual();
+        Thread thread = builder.name(threadName + started++)
+                .inheritInheritableThreadLocals(false)
+                .unstarted(task);
+        thread.setContextClassLoader(contextLoader);
+        return thread;
     }
 
     // Caller holds the lock. While `taker` runs a completion that others wait behind,
@@ -206,7 +232,7 @@ final class Completions {
             }
             if (timer.nanoTime() - taker.since >= takeoverNanos) {
                 // The running completion holds up the waiting ones, so a new thread takes them.
-                start(streaming);
+                start(platformDue());
             } else {
                 // A later completion has started since the check was scheduled.
                 scheduleCheck(taker);
@@ -239,8 +265,11 @@ final class Completions {
                 scheduleIdleCheck(idleNanos - parkedFor);
                 return;
             }
-            // The thread ends once it wakes, and the next completion starts a virtual one.
+            // The thread ends once it wakes, and the next completion starts another.
             active = null;
+            if (taker == platformTaker) {
+                platformTaker = null;
+            }
             if (streaming) {
                 streaming = false;
                 slots.release();
@@ -258,14 +287,18 @@ final class Completions {
             if (completion == null) {
                 return;
             }
-            try {
-                completion.run();
-            } catch (Throwable t) {
-                log.warn("Completing an operation failed for {} at {}", clientId, endpoint, t);
-            } finally {
-                // Interrupt state left by a continuation must not reach the next completion.
-                boolean _ = Thread.interrupted();
-            }
+            complete(completion);
+        }
+    }
+
+    private void complete(Runnable completion) {
+        try {
+            completion.run();
+        } catch (Throwable t) {
+            log.warn("Completing an operation failed for {} at {}", clientId, endpoint, t);
+        } finally {
+            // Interrupt state left by a continuation must not reach the next completion.
+            boolean _ = Thread.interrupted();
         }
     }
 
@@ -275,9 +308,31 @@ final class Completions {
         lock.lock();
         try {
             self.running = false;
+            if (self == platformTaker && active != self) {
+                // A continuation held the client's platform thread past the takeover limit, and
+                // a virtual thread took the waiting completions over. The platform thread takes
+                // them back, and the virtual one ends once it has finished its own, if it has not
+                // ended for idleness already.
+                Taker replacing = active;
+                if (platformCore || streaming) {
+                    active = self;
+                    if (replacing != null && replacing.parked) {
+                        replacing.parked = false;
+                        LockSupport.unpark(replacing.thread);
+                    }
+                } else {
+                    // The virtual thread ended for idleness and gave back the client's hold of a
+                    // platform thread, so this one ends too.
+                    platformTaker = null;
+                }
+            }
             while (active == self) {
+                // A client whose completions belong on its platform thread already, which a
+                // continuation may hold meanwhile, starts no second one.
                 if (!self.platform
                         && !self.platformFailed
+                        && !platformCore
+                        && !streaming
                         && waiting.size() >= STREAMING
                         && slots.tryAcquire()) {
                     // The completions pile up, so a platform thread of the client takes them.
@@ -323,8 +378,8 @@ final class Completions {
     // One thread that takes completions, guarded by the lock of its Completions.
     private static final class Taker {
 
-        // Whether it is a platform thread, which only a client that holds one of the platform
-        // threads, or whose core runs on platform threads, has.
+        // Whether it is a platform thread, of which a client has one at most: while its core runs
+        // on platform threads, or while it holds one of the platform threads.
         private final boolean platform;
 
         // Set before the thread starts.
