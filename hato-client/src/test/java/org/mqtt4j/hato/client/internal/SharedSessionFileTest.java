@@ -201,6 +201,7 @@ class SharedSessionFileTest {
         Side(Path file) {
             keeper = new SessionKeeper(
                     "session-test",
+                    CoreThreads.virtual(),
                     "client",
                     new FileSessionStore(file),
                     codec,

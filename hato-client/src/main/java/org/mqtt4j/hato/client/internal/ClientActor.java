@@ -476,6 +476,7 @@ public final class ClientActor implements MqttClient {
         );
         sessionKeeper = sessionStore == null ? null : new SessionKeeper(
                 threadName("session"),
+                cores,
                 clientId,
                 sessionStore,
                 new SessionCodec(clientId, version),

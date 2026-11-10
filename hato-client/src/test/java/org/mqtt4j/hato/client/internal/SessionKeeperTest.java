@@ -379,6 +379,7 @@ class SessionKeeperTest {
     private SessionKeeper keeper(SessionStore store, BooleanSupplier transportsOpen) {
         var keeper = new SessionKeeper(
                 "session-test",
+                CoreThreads.virtual(),
                 "client",
                 store,
                 codec,

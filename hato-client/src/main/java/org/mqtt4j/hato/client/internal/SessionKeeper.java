@@ -81,6 +81,10 @@ final class SessionKeeper implements AutoCloseable {
 
     private final String threadName;
 
+    // The kind of the worker thread, that of the client's core: the claim before CONNECT then
+    // waits for no carrier while the core runs on platform threads.
+    private final CoreThreads cores;
+
     private final String clientId;
 
     private final SessionStore store;
@@ -116,6 +120,7 @@ final class SessionKeeper implements AutoCloseable {
 
     SessionKeeper(
             String threadName,
+            CoreThreads cores,
             String clientId,
             SessionStore store,
             SessionCodec codec,
@@ -124,6 +129,7 @@ final class SessionKeeper implements AutoCloseable {
             BooleanSupplier transportsOpen
     ) {
         this.threadName = threadName;
+        this.cores = cores;
         this.clientId = clientId;
         this.store = store;
         this.codec = codec;
@@ -178,7 +184,7 @@ final class SessionKeeper implements AutoCloseable {
         }
         requests.addLast(request);
         if (worker == null) {
-            worker = Thread.ofVirtual().name(threadName).start(this::run);
+            worker = cores.builder().name(threadName).start(this::run);
         }
     }
 
