@@ -125,9 +125,10 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     private final Connector connector;
     private final TimerScheduler timer;
     private final Semaphore platformReadingSlots;
-    // The kind of the thread that connects and then reads. A transport of a client whose core
-    // runs on platform threads connects and reads on a platform thread of its own, which leaves
-    // the platform readers to other connections; see CoreThreads.
+    // The kind of the thread that connects and then reads, and of the one that closes the
+    // connection gracefully. A transport of a client whose core runs on platform threads connects
+    // and reads on a platform thread of its own, which leaves the platform readers to other
+    // connections; see CoreThreads.
     private final CoreThreads cores;
     private final Object callbacks = new Object();
 
@@ -666,7 +667,7 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
                 if (graceful && connected && pending == null && !writing
                         && socket.closesGracefully()) {
                     ioWorkers++;
-                    Thread.ofVirtual().name(threadName + "-close").start(() -> {
+                    cores.builder().name(threadName + "-close").start(() -> {
                         try {
                             closeGracefully(socket, cause);
                         } finally {
