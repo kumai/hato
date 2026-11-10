@@ -751,9 +751,7 @@ class ClientActorTest {
             transport.receive(publication(new byte[] {1}));
             assertThat(entered.await(5, SECONDS)).isTrue();
             transport.completeSends = false;
-            CompletableFuture<PublishResult> stalled = sut.publish(MqttMessage.of(
-                    new Topic("a"), new byte[16 * 1024 * 1024 - 8], Qos.AT_MOST_ONCE, false
-            ));
+            CompletableFuture<PublishResult> stalled = publishFillingSendBudget(sut);
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
 
             // Act
@@ -960,9 +958,7 @@ class ClientActorTest {
                         Subscribe.of(new TopicFilter("slot/" + i), Qos.AT_MOST_ONCE)));
             }
             transport.completeSends = false;
-            CompletableFuture<PublishResult> stalled = sut.publish(MqttMessage.of(
-                    new Topic("a"), new byte[16 * 1024 * 1024 - 8], Qos.AT_MOST_ONCE, false
-            ));
+            CompletableFuture<PublishResult> stalled = publishFillingSendBudget(sut);
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
 
             // Act: all local lanes end, while broker removals wait for send capacity.
@@ -1053,9 +1049,7 @@ class ClientActorTest {
             ScriptTransport transport = connect(sut);
             PullSubscription subscription = subscribePull(sut, transport, request());
             transport.completeSends = false;
-            CompletableFuture<PublishResult> stalled = sut.publish(MqttMessage.of(
-                    new Topic("a"), new byte[16 * 1024 * 1024 - 8], Qos.AT_MOST_ONCE, false
-            ));
+            CompletableFuture<PublishResult> stalled = publishFillingSendBudget(sut);
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
             holdActor(transport, entered, release);
 
@@ -3989,13 +3983,7 @@ class ClientActorTest {
             ));
             subscribing.get(5, SECONDS);
             transport.completeSends = false;
-            // One-byte topic + length prefix + five-byte fixed header fills 16 MiB exactly.
-            CompletableFuture<PublishResult> publication = sut.publish(MqttMessage.of(
-                    new Topic("a"),
-                    new byte[16 * 1024 * 1024 - 8],
-                    Qos.AT_MOST_ONCE,
-                    false
-            ));
+            CompletableFuture<PublishResult> publication = publishFillingSendBudget(sut);
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
 
             // Act: both requests remain accepted while send capacity is exhausted.
@@ -8977,6 +8965,22 @@ class ClientActorTest {
 
     private static MqttMessage message(byte[] bytes) {
         return MqttMessage.of(new Topic("messages"), bytes, Qos.AT_MOST_ONCE, false);
+    }
+
+    /// Publishes a QoS 0 message whose packet fills the regular send budget exactly, once the
+    /// client has taken back the bytes of its earlier writes. The script transport shows a test
+    /// the packets of a write before the sender returns from it, and the sender gives their bytes
+    /// back only then, so a test that answers a SUBSCRIBE and publishes at once could find a few
+    /// bytes still taken, and the publication refused for capacity.
+    private static CompletableFuture<PublishResult> publishFillingSendBudget(MqttClient client) {
+        await().until(() -> client.stats().get(5, SECONDS).sending().queuedBytes().used() == 0);
+        // One-byte topic + length prefix + five-byte fixed header fills 16 MiB exactly.
+        return client.publish(MqttMessage.of(
+                new Topic("a"),
+                new byte[16 * 1024 * 1024 - 8],
+                Qos.AT_MOST_ONCE,
+                false
+        ));
     }
 
     private static Packet.Publish publication(byte[] bytes) {
