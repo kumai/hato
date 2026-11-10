@@ -70,6 +70,29 @@ class BusyCarriersTest {
         }
     }
 
+    @Test
+    @Timeout(30)
+    void a_client_completes_observations_while_virtual_threads_keep_every_carrier_busy()
+            throws Exception {
+        assumeTrue(platformCores());
+        try (
+                ServerSocket server = ScriptedBroker.listen();
+                MqttClient sut = ScriptedBroker.client(server);
+                ScriptedBroker peer = ScriptedBroker.connect(server, sut)
+        ) {
+            // Arrange
+            BusyCarriers busy = BusyCarriers.start();
+            try {
+                // Act & Assert: the SUBACK completes established() within five seconds, and the
+                // client's next snapshot completes stats() within five seconds too.
+                peer.subscribe(sut, "busy", AckMode.ON_RECEIVE, _ -> { });
+                assertThat(sut.stats()).succeedsWithin(Duration.ofSeconds(5));
+            } finally {
+                busy.stop();
+            }
+        }
+    }
+
     // Whether this JVM gives clients platform cores; the single-carrier suite gives none.
     private static boolean platformCores() {
         return Integer.getInteger("hato.client.platformCores", CoreThreads.PLATFORM_CORES) > 0;

@@ -374,8 +374,17 @@ public final class ClientActor implements MqttClient {
         commandLimit = commandLimit(limits);
         waiterLimit = CLIENT_WAITER_LIMIT + WAITERS_PER_SUBSCRIPTION * limits.subscriptions();
         waiterSlots = new Semaphore(waiterLimit);
+        completions = new Completions(
+                endpoint,
+                clientId,
+                threadName("complete-"),
+                TimerService.instance,
+                Completions.TAKEOVER,
+                Completions.IDLE,
+                cores
+        );
         termination = new ClientTermination(
-                threadName("terminated"),
+                completions,
                 inlineHandlers,
                 waiterSlots,
                 waiterLimit,
@@ -458,15 +467,6 @@ public final class ClientActor implements MqttClient {
                 termination::check
         );
         termination.watch(listenerLane, metricsLane, this.credentials);
-        completions = new Completions(
-                endpoint,
-                clientId,
-                threadName("complete-"),
-                TimerService.instance,
-                Completions.TAKEOVER,
-                Completions.IDLE,
-                cores
-        );
         cores.builder().name(threadName("actor")).start(this::run);
     }
 
@@ -2397,35 +2397,30 @@ public final class ClientActor implements MqttClient {
         return future;
     }
 
-    /// Caller holds lifecycleLock, but only for one thread start: a starter outside the lock gives
-    /// each observation its own thread, so a slow continuation delays no other observation.
+    /// Caller holds lifecycleLock, but only to queue the completions. They run on the client's
+    /// completion threads, which need no carrier while the client's core runs on platform
+    /// threads, and where, as Completions describes, a slow continuation holds up no other
+    /// observation for longer than the takeover limit.
     private <T> void completeWaiters(
             List<CompletableFuture<T>> observers,
             @Nullable T value,
             @Nullable Throwable failure
     ) {
-        if (observers.isEmpty()) {
-            return;
+        for (CompletableFuture<T> future : observers) {
+            completions.submitIndependent(() -> {
+                try {
+                    if (failure == null) {
+                        future.complete(value);
+                    } else {
+                        future.completeExceptionally(failure);
+                    }
+                } finally {
+                    waiterSlots.release();
+                    termination.check();
+                }
+            });
         }
-        List<CompletableFuture<T>> completing = List.copyOf(observers);
         observers.clear();
-        Thread.ofVirtual().name(threadName("observations")).start(() -> {
-            for (CompletableFuture<T> future : completing) {
-                Thread.ofVirtual().name(threadName("observation-" + sequence.incrementAndGet()))
-                        .start(() -> {
-                            try {
-                                if (failure == null) {
-                                    future.complete(value);
-                                } else {
-                                    future.completeExceptionally(failure);
-                                }
-                            } finally {
-                                waiterSlots.release();
-                                termination.check();
-                            }
-                        });
-            }
-        });
     }
 
     /// Creates the completion of a publication, which only the API package can do: the builder
