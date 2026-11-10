@@ -194,6 +194,7 @@ final class ClientIo {
             int regularSendLimit,
             int batchByteLimit,
             Transport.Factory factory,
+            CoreThreads cores,
             Events events,
             PacketCodec codec,
             Function<MqttMessage, byte[]> payloadOf
@@ -213,7 +214,7 @@ final class ClientIo {
                 RESERVED_SEND_LIMIT,
                 RESERVED_SEND_BYTE_LIMIT
         );
-        sender = Thread.ofVirtual().name("hato-" + clientId + "-sender").unstarted(this::run);
+        sender = cores.builder().name("hato-" + clientId + "-sender").unstarted(this::run);
         sender.start();
     }
 

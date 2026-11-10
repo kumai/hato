@@ -360,13 +360,16 @@ abstract class AcceptanceTest {
             publisher.connect().get(5, SECONDS);
             first.connect().get(5, SECONDS);
             second.connect().get(5, SECONDS);
-            publisher.publish(retained).get(5, SECONDS);
+            publishRetained(publisher, retained);
 
             // Act: take the retained message before removing it. A broker can look up what it
-            // retains for a new subscription after a later publication, here the removal.
+            // retains for a new subscription after a later publication, here the removal. As
+            // with the retained message, the first subscription shows when the broker has
+            // handled the removal.
             PullSubscription kept = subscribe(first, topic, Qos.AT_LEAST_ONCE);
             MqttMessage keptMessage = receive(kept);
             clearRetained(publisher, topic);
+            receive(kept);
             PullSubscription removed = subscribe(second, topic, Qos.AT_LEAST_ONCE);
 
             // Assert: for the same reason, the subscription after the removal waits a while
@@ -389,7 +392,7 @@ abstract class AcceptanceTest {
             // Arrange
             publisher.connect().get(5, SECONDS);
             sut.connect().get(5, SECONDS);
-            publisher.publish(retained).get(5, SECONDS);
+            publishRetained(publisher, retained);
 
             // Act
             PullSubscription subscription = subscribe(
@@ -608,6 +611,20 @@ abstract class AcceptanceTest {
                 subscription.receive(Duration.ofSeconds(5))
         );
         return received.delivery().message();
+    }
+
+    /// Publishes `retained`, and returns once a subscriber has received it: NanoMQ can handle a
+    /// publication after its PUBACK, so a subscription made right after the PUBACK could receive
+    /// the publication itself, without RETAIN, or miss the retained message. The subscriber takes
+    /// QoS 0, because RabbitMQ can hold back the PUBACK of a publication that meets the end of a
+    /// subscriber at QoS 1.
+    private void publishRetained(MqttClient publisher, MqttMessage retained) throws Exception {
+        try (MqttClient witness = client()) {
+            witness.connect().get(5, SECONDS);
+            PullSubscription handled = subscribe(witness, retained.topic(), Qos.AT_MOST_ONCE);
+            publisher.publish(retained).get(5, SECONDS);
+            receive(handled);
+        }
     }
 
     /// Removes the retained message of `topic`, so that later runs against the same container

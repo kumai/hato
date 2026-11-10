@@ -18,6 +18,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.client.internal.ClientActor;
 import org.mqtt4j.hato.client.internal.ClientLimits;
+import org.mqtt4j.hato.client.internal.CoreThreads;
 import org.mqtt4j.hato.client.internal.DefaultTimerScheduler;
 import org.mqtt4j.hato.client.internal.MessageProperties;
 import org.mqtt4j.hato.client.internal.TcpTransport;
@@ -630,53 +631,62 @@ public final class MqttClientBuilder {
                     .substring(0, GENERATED_CLIENT_ID_LENGTH - CLIENT_ID_PREFIX.length());
         }
         TimerScheduler timer = scheduler;
-        if (factory == null) {
-            factory = switch (requireNonNull(endpoint.getScheme())) {
-                case "mqtts" -> {
-                    SSLContext context = tlsContext();
-                    SSLParameters parameters = tlsParameters(context);
-                    yield value -> new TcpTransport(value, context, parameters, timer);
-                }
-                case "ws" -> new WebSocketTransports(id, timer);
-                case "wss" -> {
-                    SSLContext context = tlsContext();
-                    SSLParameters parameters = tlsParameters(context);
-                    requireEffectiveOverWebSocket(
-                            parameters,
-                            defaultParameters(context),
-                            endpoint.getHost()
-                    );
-                    yield new WebSocketTransports(id, timer, context, parameters);
-                }
-                default -> value -> new TcpTransport(value, timer);
-            };
+        // The kind of thread that runs the client's core, chosen once for all its connections.
+        CoreThreads cores = CoreThreads.take();
+        try {
+            if (factory == null) {
+                factory = switch (requireNonNull(endpoint.getScheme())) {
+                    case "mqtts" -> {
+                        SSLContext context = tlsContext();
+                        SSLParameters parameters = tlsParameters(context);
+                        yield value -> new TcpTransport(value, context, parameters, timer, cores);
+                    }
+                    case "ws" -> new WebSocketTransports(id, timer);
+                    case "wss" -> {
+                        SSLContext context = tlsContext();
+                        SSLParameters parameters = tlsParameters(context);
+                        requireEffectiveOverWebSocket(
+                                parameters,
+                                defaultParameters(context),
+                                endpoint.getHost()
+                        );
+                        yield new WebSocketTransports(id, timer, context, parameters);
+                    }
+                    default -> value -> new TcpTransport(value, timer, cores);
+                };
+            }
+            return new ClientActor(
+                    endpoint,
+                    id,
+                    keepAlive,
+                    connectionTimeout,
+                    maxPacketSize,
+                    timer,
+                    listener,
+                    metrics,
+                    factory,
+                    cores,
+                    version,
+                    sessionExpiry,
+                    credentials,
+                    connectWill,
+                    reconnectPolicy.backoff(),
+                    reconnectPolicy.rules(),
+                    responseTimeout,
+                    DeliveryOptions::execution,
+                    MqttMessage::received,
+                    MqttMessage::payloadArray,
+                    ClientStats::of,
+                    MetricsListener.PublishCompletion::of,
+                    MetricsListener.DeliveryStart::of,
+                    Disconnection::of,
+                    new ClientLimits(maxInflightPublishes, maxSubscriptions)
+            );
+        } catch (RuntimeException | Error failure) {
+            // No client holds the place, so another one may take it.
+            cores.giveBack();
+            throw failure;
         }
-        return new ClientActor(
-                endpoint,
-                id,
-                keepAlive,
-                connectionTimeout,
-                maxPacketSize,
-                timer,
-                listener,
-                metrics,
-                factory,
-                version,
-                sessionExpiry,
-                credentials,
-                connectWill,
-                reconnectPolicy.backoff(),
-                reconnectPolicy.rules(),
-                responseTimeout,
-                DeliveryOptions::execution,
-                MqttMessage::received,
-                MqttMessage::payloadArray,
-                ClientStats::of,
-                MetricsListener.PublishCompletion::of,
-                MetricsListener.DeliveryStart::of,
-                Disconnection::of,
-                new ClientLimits(maxInflightPublishes, maxSubscriptions)
-        );
     }
 
     /// The Will in the form that CONNECT carries, checked against what the protocol version can

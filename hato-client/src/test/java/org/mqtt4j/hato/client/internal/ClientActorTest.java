@@ -6148,6 +6148,25 @@ class ClientActorTest {
 
     @Test
     @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
+    void a_terminated_client_has_given_back_its_place_for_a_core_on_platform_threads()
+            throws Exception {
+        // Arrange: a client that took the one place for a core on platform threads.
+        var places = new CoreThreads.Places(1);
+        try (MqttClient sut = client(places.take())) {
+            boolean freeWhileRunning = places.take().platform();
+
+            // Act
+            sut.close();
+            sut.terminated().get(5, SECONDS);
+
+            // Assert: no place was free while the client ran, and another client takes it now.
+            assertThat(freeWhileRunning).isFalse();
+            assertThat(places.take().platform()).isTrue();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // Explicit close is under test; the resource also closes on failure.
     void client_termination_waits_for_the_disconnection_notice_that_closing_produces()
             throws Exception {
         // Arrange: the listener blocks in the notice of the connection that closing ends.
@@ -9096,7 +9115,22 @@ class ClientActorTest {
                 codec,
                 true,
                 MqttVersion.V3_1_1,
-                limits
+                limits,
+                CoreThreads.virtual()
+        );
+    }
+
+    /// A client like [#client()] whose core runs as `cores` says.
+    private MqttClient client(CoreThreads cores) {
+        return client(
+                "actor-test",
+                ends::add,
+                16 * 1024 * 1024,
+                codec,
+                true,
+                MqttVersion.V3_1_1,
+                ClientLimits.DEFAULT,
+                cores
         );
     }
 
@@ -9115,7 +9149,8 @@ class ClientActorTest {
                 packetCodec,
                 cleanStart,
                 version,
-                ClientLimits.DEFAULT
+                ClientLimits.DEFAULT,
+                CoreThreads.virtual()
         );
     }
 
@@ -9126,7 +9161,8 @@ class ClientActorTest {
             PacketCodec packetCodec,
             boolean cleanStart,
             MqttVersion version,
-            ClientLimits limits
+            ClientLimits limits,
+            CoreThreads cores
     ) {
         var clock = new TimerScheduler() {
             private volatile @Nullable Thread actor;
@@ -9165,6 +9201,7 @@ class ClientActorTest {
                     transports.add(transport);
                     return transport;
                 },
+                cores,
                 packetCodec,
                 version,
                 cleanStart ? Duration.ZERO : Duration.ofHours(1),

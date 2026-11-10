@@ -147,6 +147,10 @@ public final class ClientActor implements MqttClient {
 
     private final ClientTermination termination;
 
+    // The kind of thread that runs the actor, the sender, the completions, and the TCP or TLS
+    // transport's connecting and reading; a place on platform threads goes back as the actor ends.
+    private final CoreThreads cores;
+
     private final Completions completions;
 
     private final ListenerLane listenerLane;
@@ -280,6 +284,7 @@ public final class ClientActor implements MqttClient {
             ConnectionListener listener,
             @Nullable MetricsListener metrics,
             Transport.Factory transportFactory,
+            CoreThreads cores,
             MqttVersion version,
             Duration sessionExpiry,
             @Nullable Supplier<MqttCredentials> credentials,
@@ -306,6 +311,7 @@ public final class ClientActor implements MqttClient {
                 listener,
                 metrics,
                 transportFactory,
+                cores,
                 PacketCodec.of(version),
                 version,
                 sessionExpiry,
@@ -335,6 +341,7 @@ public final class ClientActor implements MqttClient {
             ConnectionListener listener,
             @Nullable MetricsListener metrics,
             Transport.Factory transportFactory,
+            CoreThreads cores,
             PacketCodec codec,
             MqttVersion version,
             Duration sessionExpiry,
@@ -360,14 +367,24 @@ public final class ClientActor implements MqttClient {
         this.messageOf = messageOf;
         this.statsOf = statsOf;
         this.limits = limits;
+        this.cores = cores;
         cleanStart = sessionExpiry.isZero();
         reconnects = backoff.enabled();
         operationSlots = new Semaphore(limits.operations());
         commandLimit = commandLimit(limits);
         waiterLimit = CLIENT_WAITER_LIMIT + WAITERS_PER_SUBSCRIPTION * limits.subscriptions();
         waiterSlots = new Semaphore(waiterLimit);
+        completions = new Completions(
+                endpoint,
+                clientId,
+                threadName("complete-"),
+                TimerService.instance,
+                Completions.TAKEOVER,
+                Completions.IDLE,
+                cores
+        );
         termination = new ClientTermination(
-                threadName("terminated"),
+                completions,
                 inlineHandlers,
                 waiterSlots,
                 waiterLimit,
@@ -416,6 +433,7 @@ public final class ClientActor implements MqttClient {
                 limits.regularSends(),
                 ClientIo.BATCH_BYTE_LIMIT,
                 transportFactory,
+                cores,
                 new IoEvents(),
                 codec,
                 payloadOf
@@ -449,15 +467,7 @@ public final class ClientActor implements MqttClient {
                 termination::check
         );
         termination.watch(listenerLane, metricsLane, this.credentials);
-        completions = new Completions(
-                endpoint,
-                clientId,
-                threadName("complete-"),
-                TimerService.instance,
-                Completions.TAKEOVER,
-                Completions.IDLE
-        );
-        Thread.ofVirtual().name(threadName("actor")).start(this::run);
+        cores.builder().name(threadName("actor")).start(this::run);
     }
 
     @Override
@@ -750,7 +760,11 @@ public final class ClientActor implements MqttClient {
         try {
             Optional<Mailbox.Event> next;
             // The time spent on events since the actor last let others run. Waiting for an event
-            // frees the carrier, so only the handling counts.
+            // frees the carrier, so only the handling counts. An actor on a platform thread holds
+            // no carrier, but parks after its slice too: the moment that it parks lets the threads
+            // that take its deliveries catch up on a busy processor. Without it, a subscription
+            // that handled a QoS 0 flood at full speed handled a fifth as many of its messages on
+            // one processor, and three fifths as many on two, before its buffer overflowed.
             long worked = 0;
             while ((next = mailbox.take(stopping::get)).isPresent()) {
                 long started = System.nanoTime();
@@ -819,10 +833,17 @@ public final class ClientActor implements MqttClient {
                     try {
                         io.shutdown();
                     } finally {
-                        recordLastStats();
-                        synchronized (lifecycleLock) {
-                            cleanedUp = true;
-                            checkLanesEnded();
+                        try {
+                            recordLastStats();
+                            synchronized (lifecycleLock) {
+                                cleanedUp = true;
+                                checkLanesEnded();
+                            }
+                        } finally {
+                            // The actor has closed the transports and stopped the sender, whose
+                            // threads end with them, so another client may take the place, even
+                            // one that its application builds once this one has terminated.
+                            cores.giveBack();
                         }
                         // The actor calls no application code from here on.
                         termination.actorEnded();
@@ -2376,35 +2397,30 @@ public final class ClientActor implements MqttClient {
         return future;
     }
 
-    /// Caller holds lifecycleLock, but only for one thread start: a starter outside the lock gives
-    /// each observation its own thread, so a slow continuation delays no other observation.
+    /// Caller holds lifecycleLock, but only to queue the completions. They run on the client's
+    /// completion threads, which need no carrier while the client's core runs on platform
+    /// threads, and where, as Completions describes, a slow continuation holds up no other
+    /// observation for longer than the takeover limit.
     private <T> void completeWaiters(
             List<CompletableFuture<T>> observers,
             @Nullable T value,
             @Nullable Throwable failure
     ) {
-        if (observers.isEmpty()) {
-            return;
+        for (CompletableFuture<T> future : observers) {
+            completions.submitIndependent(() -> {
+                try {
+                    if (failure == null) {
+                        future.complete(value);
+                    } else {
+                        future.completeExceptionally(failure);
+                    }
+                } finally {
+                    waiterSlots.release();
+                    termination.check();
+                }
+            });
         }
-        List<CompletableFuture<T>> completing = List.copyOf(observers);
         observers.clear();
-        Thread.ofVirtual().name(threadName("observations")).start(() -> {
-            for (CompletableFuture<T> future : completing) {
-                Thread.ofVirtual().name(threadName("observation-" + sequence.incrementAndGet()))
-                        .start(() -> {
-                            try {
-                                if (failure == null) {
-                                    future.complete(value);
-                                } else {
-                                    future.completeExceptionally(failure);
-                                }
-                            } finally {
-                                waiterSlots.release();
-                                termination.check();
-                            }
-                        });
-            }
-        });
     }
 
     /// Creates the completion of a publication, which only the API package can do: the builder
