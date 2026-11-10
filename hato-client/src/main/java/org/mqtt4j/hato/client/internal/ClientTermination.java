@@ -45,7 +45,8 @@ final class ClientTermination {
         COMPLETIONS
     }
 
-    private final String threadName;
+    // Completes this client's own observations, as it does the client's other observations.
+    private final Completions completions;
 
     // Its futures refuse to be waited for inside the client's inline handlers.
     private final InlineHandlers inlineHandlers;
@@ -91,7 +92,7 @@ final class ClientTermination {
     private final Runnable observationRefused;
 
     ClientTermination(
-            String threadName,
+            Completions completions,
             InlineHandlers inlineHandlers,
             Semaphore waiterSlots,
             int waiterLimit,
@@ -99,7 +100,7 @@ final class ClientTermination {
             int operationLimit,
             Runnable observationRefused
     ) {
-        this.threadName = threadName;
+        this.completions = completions;
         this.inlineHandlers = inlineHandlers;
         this.waiterSlots = waiterSlots;
         this.waiterLimit = waiterLimit;
@@ -238,25 +239,19 @@ final class ClientTermination {
         return waiterLimit - waiterSlots.availablePermits();
     }
 
-    /// Caller holds this monitor, but only for one thread start: as for other observations, each
-    /// gets its own thread, so a slow continuation delays no other, and its slot returns once
-    /// its synchronous continuations have run.
+    /// Caller holds this monitor, but only to queue the completions: as for other observations,
+    /// a slow continuation holds up no other for longer than the takeover limit of Completions,
+    /// and its slot returns once its synchronous continuations have run.
     private void completeObservations() {
-        if (waiters.isEmpty()) {
-            return;
+        for (CompletableFuture<Void> future : waiters) {
+            completions.submitIndependent(() -> {
+                try {
+                    future.complete(null);
+                } finally {
+                    waiterSlots.release();
+                }
+            });
         }
-        List<CompletableFuture<Void>> completing = List.copyOf(waiters);
         waiters.clear();
-        Thread.ofVirtual().name(threadName).start(() -> {
-            for (CompletableFuture<Void> future : completing) {
-                Thread.ofVirtual().name(threadName).start(() -> {
-                    try {
-                        future.complete(null);
-                    } finally {
-                        waiterSlots.release();
-                    }
-                });
-            }
-        });
     }
 }

@@ -6,20 +6,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.jspecify.annotations.Nullable;
 
 /// The kind of thread that runs the core of one client: its actor, its sender, the thread that
-/// completes its operations, and the thread that connects its TCP or TLS transport and then
-/// reads it. A core on platform threads keeps the client answering however the application uses
-/// virtual threads, and the JVM spares places for a limited number of such clients at once.
+/// completes its operations and observations, and the thread that connects its TCP or TLS
+/// transport and then reads it. A core on platform threads keeps the client answering however
+/// the application uses virtual threads, and the JVM spares places for a limited number of such
+/// clients at once.
 ///
 /// Virtual threads are not preempted: one that computes keeps its carrier until it blocks. An
 /// application that computes on virtual threads of its own, as a server that serves each request
 /// on one does, can keep every carrier busy, and a core that waits for a carrier then stops. With
 /// two processors kept three quarters busy so, each publication waited about 130 ms for its
 /// result; with more such work than the processors could do, the client sent no PINGREQ and lost
-/// its connection. A core on platform threads, which the operating system runs beside the
-/// carriers, answered within a few milliseconds in both cases, and a handler that computed on the
-/// client's own virtual threads no longer held up its keep-alive. Without such work, both kinds
-/// cost about the same per message, and with processors that other processes keep busy, a core
-/// on platform threads published QoS 1 messages five times as fast.
+/// its connection, and the future of stats() waited until that work ended, as it did for good
+/// while class initializers that waited for it held every carrier. A core on platform threads,
+/// which the operating system runs beside the carriers, answered within a few milliseconds in
+/// these cases, and a handler that computed on the client's own virtual threads no longer held
+/// up its keep-alive. Without such work, both kinds cost about the same per message, and with
+/// processors that other processes keep busy, a core on platform threads published QoS 1
+/// messages five times as fast.
 ///
 /// A core on platform threads holds up to four threads of its own; a continuation that holds the
 /// thread that completes operations hands them to a virtual thread, as Completions describes.

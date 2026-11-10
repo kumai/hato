@@ -3,6 +3,7 @@ package org.mqtt4j.hato.client.internal;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Iterator;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
@@ -12,9 +13,10 @@ import org.jspecify.annotations.Nullable;
 import org.mqtt4j.hato.client.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.client.internal.common.log.Log;
 
-/// Runs a client's operation completions, independently of I/O, in the order they are submitted,
-/// on threads that run no other client's completions, so that thread state that one client's
-/// continuations leave behind never reaches another client's.
+/// Runs a client's completions, of its operations and of its observations such as
+/// Subscription.established(), independently of I/O, in the order they are submitted, on threads
+/// that run no other client's completions, so that thread state that one client's continuations
+/// leave behind never reaches another client's.
 ///
 /// A client whose core runs on platform threads, as CoreThreads describes, takes its completions
 /// on a platform thread, so that they do not wait for a carrier. For the other clients, a
@@ -38,6 +40,12 @@ import org.mqtt4j.hato.client.internal.common.log.Log;
 /// 500 QoS 1 publications a second, whose continuations never returned, left a client 776
 /// platform threads. A thread that has parked for the idle limit ends too, and gives back the
 /// client's platform thread if it was one; the next completion starts another thread.
+///
+/// The completion of an observation, submitted with [#submitIndependent(Runnable)], does not wait
+/// for a thread that takes over: once a completion holds up the waiting ones past the takeover
+/// limit, each waiting observation starts on a virtual thread of its own. So every observation
+/// starts within about that limit, however many of their continuations block, and observations
+/// whose continuations return promptly cost no thread start.
 ///
 /// Each thread runs with the context class loader of the thread that created the client, which
 /// the client's other threads inherit, and inherits no inheritable thread-local values.
@@ -157,6 +165,13 @@ final class Completions {
         }
     }
 
+    /// Queues `completion` like [#submit(Runnable)], except that once another completion holds up
+    /// the waiting ones past the takeover limit, it starts on a virtual thread of its own rather
+    /// than waiting for the thread that takes over.
+    void submitIndependent(Runnable completion) {
+        submit(new Independent(completion));
+    }
+
     // Queues `completion`, and returns the thread to wake if the one that takes completions
     // has parked.
     private @Nullable Thread queue(Runnable completion) {
@@ -231,14 +246,29 @@ final class Completions {
                 return;
             }
             if (timer.nanoTime() - taker.since >= takeoverNanos) {
-                // The running completion holds up the waiting ones, so a new thread takes them.
-                start(platformDue());
+                // The running completion holds up the waiting ones: each independent one starts
+                // on a thread of its own, and a new thread takes the others.
+                startIndependent();
+                if (!waiting.isEmpty()) {
+                    start(platformDue());
+                }
             } else {
                 // A later completion has started since the check was scheduled.
                 scheduleCheck(taker);
             }
         } finally {
             lock.unlock();
+        }
+    }
+
+    // Caller holds the lock. Takes each independent completion out of the waiting ones, and
+    // starts it on a virtual thread of its own.
+    private void startIndependent() {
+        for (Iterator<Runnable> waiters = waiting.iterator(); waiters.hasNext(); ) {
+            if (waiters.next() instanceof Independent independent) {
+                waiters.remove();
+                thread(false, () -> complete(independent)).start();
+            }
         }
     }
 
@@ -372,6 +402,15 @@ final class Completions {
             return null;
         } finally {
             lock.unlock();
+        }
+    }
+
+    // A completion that starts on a thread of its own once others hold up the waiting ones.
+    private record Independent(Runnable completion) implements Runnable {
+
+        @Override
+        public void run() {
+            completion.run();
         }
     }
 
