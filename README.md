@@ -32,7 +32,7 @@ Gradle:
 
 ```kotlin
 dependencies {
-    implementation("org.mqtt4j:hato-client:1.0.2")
+    implementation("org.mqtt4j:hato-client:1.0.3")
 }
 ```
 
@@ -42,7 +42,7 @@ Maven:
 <dependency>
     <groupId>org.mqtt4j</groupId>
     <artifactId>hato-client</artifactId>
-    <version>1.0.2</version>
+    <version>1.0.3</version>
 </dependency>
 ```
 
