@@ -11,7 +11,9 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // pool. The capabilities are what the broker announces to MQTT 5.0 clients until a test changes
 // them. The selector calls `beforeProcess` before handing a packet to its session and
 // `beforeDeliveryWrite` before marking the deliveries of a write as sent. The session's actor
-// calls `beforeHandle` when it starts handling a packet.
+// calls `beforeHandle` when it starts handling a packet. A selector calls `beforeSelect` each
+// time before it waits for its sockets, outside the work of any connection, so what a test
+// throws there fails the selector itself.
 record BrokerSettings(
         long connectTimeout,
         long sendBytes,
@@ -28,6 +30,7 @@ record BrokerSettings(
         Timer scheduler,
         Consumer<Packet> beforeProcess,
         Consumer<Packet> beforeHandle,
-        Runnable beforeDeliveryWrite
+        Runnable beforeDeliveryWrite,
+        Runnable beforeSelect
 ) {
 }

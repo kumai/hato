@@ -119,6 +119,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private Runnable beforeDeliveryWrite = () -> { };
 
+        private Runnable beforeSelect = () -> { };
+
         private Builder() {
         }
 
@@ -202,6 +204,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder beforeSelect(Runnable value) {
+            beforeSelect = requireNonNull(value, "beforeSelect must not be null");
+            return this;
+        }
+
         BrokerServer start(InetSocketAddress address) throws IOException {
             requireNonNull(address, "address must not be null");
             if (connectTimeout.isNegative()
@@ -239,7 +246,8 @@ public final class BrokerServer implements AutoCloseable {
                     scheduler,
                     beforeProcess,
                     beforeHandle,
-                    beforeDeliveryWrite
+                    beforeDeliveryWrite,
+                    beforeSelect
             );
             // The sockets that a channel's listener accepts have channels too, through which a
             // connection's writer sends several packets in one gathering write.

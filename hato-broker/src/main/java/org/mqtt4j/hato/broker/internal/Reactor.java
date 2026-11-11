@@ -10,7 +10,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 
-// Experimental single-selector I/O for comparison only. Actor work has a separate fixed pool.
+// One of the broker's selectors, which does the socket I/O of the connections assigned to it.
+// Actor work has a separate fixed pool.
 // A connection queues at most one readiness task; the number of connections bounds that queue.
 final class Reactor implements AutoCloseable {
 
@@ -97,13 +98,17 @@ final class Reactor implements AutoCloseable {
                     }
                     try {
                         task.action().run();
-                    } catch (RuntimeException failure) {
+                    } catch (Throwable failure) {
+                        // As on a session's actor, what fails in the work of one connection
+                        // ends that connection alone, an Error included. Only a failure outside
+                        // the tasks is the selector's own, which closes the broker below.
                         task.connection().failed("selector task", failure);
                     }
                 }
                 // Clearing before the queue check lets a later producer wake select; a task
                 // queued before the clear is found here, even if it shared the earlier wakeup.
                 waking.set(false);
+                routing.settings.beforeSelect().run();
                 if (tasks.isEmpty()) {
                     selector.select();
                 } else {

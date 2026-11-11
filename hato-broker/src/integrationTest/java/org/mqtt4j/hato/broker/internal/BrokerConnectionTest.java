@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Test;
@@ -360,11 +361,42 @@ class BrokerConnectionTest {
     }
 
     @Test
-    void a_failed_selector_closes_the_listener_and_its_peers() throws Exception {
-        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+    void an_error_in_the_work_of_one_connection_ends_that_connection_alone() throws Exception {
         try (
                 BrokerServer sut = BrokerServer.builder().beforeProcess(packet -> {
-                    if (packet instanceof Packet.PingReq) {
+                    if (packet instanceof Packet.Publish publish
+                            && publish.topic().name().equals("failing")) {
+                        throw new AssertionError("injected failure in one connection");
+                    }
+                }).start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession failing = connected(sut.port(), "failing");
+                RawSession other = connected(sut.port(), "other")
+        ) {
+            // Arrange
+            long selectors = selectors(sut.port());
+
+            // Act
+            failing.send(publication("failing", "", AT_MOST_ONCE, 0));
+
+            // Assert: new connections go to the selectors in turn, so each selector serves one.
+            failing.expectClosed();
+            other.ping();
+            for (long i = 0; i < selectors; i++) {
+                try (RawSession client = connected(sut.port(), "after-failure")) {
+                    client.ping();
+                }
+            }
+            assertThat(selectors(sut.port())).isEqualTo(selectors);
+        }
+    }
+
+    @Test
+    void a_failed_selector_closes_the_listener_and_its_peers() throws Exception {
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        var failing = new AtomicBoolean();
+        try (
+                BrokerServer sut = BrokerServer.builder().beforeSelect(() -> {
+                    if (failing.compareAndSet(true, false)) {
                         throw new AssertionError("injected selector failure");
                     }
                 }).start(address);
@@ -372,7 +404,9 @@ class BrokerConnectionTest {
                 RawSession other = connected(sut.port(), "other")
         ) {
             int port = sut.port();
-            client.send(new Packet.PingReq());
+            failing.set(true);
+            // A publication without a response wakes a selector, which fails before it waits.
+            client.send(publication("unheard", "", AT_MOST_ONCE, 0));
 
             client.expectClosed();
             other.expectClosed();

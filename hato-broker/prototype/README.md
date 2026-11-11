@@ -14,7 +14,7 @@ processes at most 256 events before reserving another turn at the back of the ex
 |---|---|
 | [BrokerServer](../src/main/java/org/mqtt4j/hato/broker/internal/BrokerServer.java) | Platform-thread accept loop; closes the actor executor and selectors |
 | [Routing](../src/main/java/org/mqtt4j/hato/broker/internal/Routing.java) | Owns the selectors and actor executor; assigns connections round-robin |
-| [Reactor](../src/main/java/org/mqtt4j/hato/broker/internal/Reactor.java) | Owns key and channel cleanup, coalesces wakeups, and closes the broker on fatal failure |
+| [Reactor](../src/main/java/org/mqtt4j/hato/broker/internal/Reactor.java) | Owns key and channel cleanup, coalesces wakeups, ends a connection whose work fails, and closes the broker when the selector itself fails |
 | [Connection](../src/main/java/org/mqtt4j/hato/broker/internal/Connection.java) | Incremental framing, nonblocking reads and partial writes, pause/resume for bounded queues |
 | [Client](../src/main/java/org/mqtt4j/hato/broker/internal/Client.java) | Reports CONNECT acceptance through an internal callback instead of waiting on a future |
 | [Session](../src/main/java/org/mqtt4j/hato/broker/internal/Session.java) | Uses the actor executor for queued turns; wakes a reader when inbox space returns |
@@ -24,6 +24,10 @@ EOF and socket errors follow the packets already posted to the session. A queued
 can apply its session expiry and Will before the actor ends the connection. A peer that
 half-closes can still receive a final MQTT packet. The selector releases the send batch
 and the socket after the connection ends.
+
+A failure in the work of one connection, an `Error` included, ends that connection alone, as it
+does on a session's actor. Only a failure of the selector loop itself closes the broker. The
+application has no way yet to learn that the broker closed itself, other than the log.
 
 The original experiment applied `selector.patch`, `selector-bulk.patch`, `selector-ready.patch`,
 and `selector-fair.patch` and ran with `s0.inPlace=0`. The current experiment defaults to
