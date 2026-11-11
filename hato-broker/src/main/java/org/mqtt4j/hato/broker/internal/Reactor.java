@@ -64,7 +64,18 @@ final class Reactor implements AutoCloseable {
         return true;
     }
 
+    // Has the selector look at `connection`. A thread of the actor pool keeps the request until
+    // its task ends (see Worker).
     void wake(Connection connection) {
+        if (Thread.currentThread() instanceof Worker worker) {
+            worker.hold(connection);
+        } else {
+            schedule(connection);
+        }
+    }
+
+    // Queues the readiness task of `connection` now, unless one waits already.
+    void schedule(Connection connection) {
         if (connection.scheduled.compareAndSet(false, true)) {
             enqueue(connection.readiness);
         }

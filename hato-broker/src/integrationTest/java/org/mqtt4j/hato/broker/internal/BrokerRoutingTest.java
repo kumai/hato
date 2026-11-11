@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
@@ -203,6 +204,36 @@ class BrokerRoutingTest {
                 );
                 assertThat(first.expect(Packet.Publish.class)).isEqualTo(expected);
                 assertThat(second.expect(Packet.Publish.class)).isEqualTo(expected);
+            }
+        }
+    }
+
+    @Test
+    void a_publication_reaches_every_one_of_many_subscribers() throws Exception {
+        // More subscribers than a pool thread keeps for the end of its task, so that it hands
+        // some of them to their selectors while it still delivers to the others.
+        int count = 150;
+        var subscribers = new ArrayList<RawSession>();
+        try (MqttBroker sut = MqttBroker.start();
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange
+            for (int index = 0; index < count; index++) {
+                RawSession subscriber = connected(sut.port(), "subscriber-" + index);
+                subscribers.add(subscriber);
+                subscriber.subscribe("news", AT_MOST_ONCE);
+            }
+
+            // Act
+            publisher.publish("news", "for all", AT_LEAST_ONCE, 1);
+
+            // Assert
+            for (RawSession subscriber : subscribers) {
+                assertThat(subscriber.expect(Packet.Publish.class))
+                        .isEqualTo(publication("news", "for all", AT_MOST_ONCE, 0));
+            }
+        } finally {
+            for (RawSession subscriber : subscribers) {
+                subscriber.close();
             }
         }
     }

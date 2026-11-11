@@ -18,6 +18,7 @@ processes at most 256 events before reserving another turn at the back of the ex
 | [Connection](../src/main/java/org/mqtt4j/hato/broker/internal/Connection.java) | Incremental framing, nonblocking reads and partial writes, pause/resume for bounded queues |
 | [Client](../src/main/java/org/mqtt4j/hato/broker/internal/Client.java) | Reports CONNECT acceptance through an internal callback instead of waiting on a future |
 | [Session](../src/main/java/org/mqtt4j/hato/broker/internal/Session.java) | Uses the actor executor for queued turns; wakes a reader when inbox space returns |
+| [Worker](../src/main/java/org/mqtt4j/hato/broker/internal/Worker.java) | Actor pool thread; keeps the connections that a turn queued output for until the turn ends |
 
 The queue quotas, codec, delivery state, retained messages, and subscription matching are reused.
 EOF and socket errors follow the packets already posted to the session. A queued DISCONNECT
@@ -26,9 +27,13 @@ the selector first hands over the input that has already arrived, so a DISCONNEC
 before a reset still applies. A peer that half-closes can still receive a final MQTT packet.
 The selector releases the send batch and the socket after the connection ends.
 
-A session's inbox takes 128 received packets, so that a selector seldom stops within the packets
-of one read. A QoS 0 publication finds it full at 16: nothing else holds such publications back,
-and a publisher that gets far ahead of the actor overruns the queues of its subscribers.
+The selectors and the pool hand work to each other in batches. A session's inbox takes 128
+received packets, so that a selector seldom stops within the packets of one read. A QoS 0
+publication finds it full at 16: nothing else holds such publications back, and a publisher
+that gets far ahead of the actor overruns the queues of its subscribers. A worker keeps the
+connections that a turn queued output for, and has their selectors look at them when the turn
+ends, when it holds 64 of them, or at once when the turn fills a connection's send queue; a
+selector then writes a turn's output with one call.
 
 A failure in the work of one connection, an `Error` included, ends that connection alone, as it
 does on a session's actor. Only a failure of the selector loop itself closes the broker. The
@@ -53,8 +58,9 @@ Run from the repository root with the existing JDK 25 toolchain and Gradle cache
 The suite tests selector survival through repeated disconnects, that a connection ended by
 another thread stays open until its selector closes it, that an error in one connection leaves
 the others served, broker shutdown on an injected selector failure, the final response after a
-peer half-closes, a DISCONNECT that arrived before a write failed, and a burst that overfills a
-session's inbox.
+peer half-closes, a DISCONNECT that arrived before a write failed, a burst that overfills a
+session's inbox, and a publication to more subscribers than a worker keeps for the end of its
+turn.
 
 Fifteen cases fail in each configuration, and no others: one in `BrokerConcurrencyTest`, two in
 `BrokerDeadlineTest`, four in `BrokerQos2RaceTest`, seven in `BrokerSessionRaceTest`, and one in
@@ -103,13 +109,36 @@ candidate versus 1.87 million for base. With 10,000 idle connections, the candid
 each peaked at 14 Java platform threads, and cgroup memory was 275.0 versus 324.5 MiB before GC.
 Those are individual observations; 100,000 connections were not tested with this candidate.
 
+## Hand-off measurements
+
+On 2026-11-11 the two changes to the hand-off were compared with the prototype before them and
+with base `391973c`, in the environment of the earlier measurements. Each cell is the median of
+three rounds, and of five rounds for the fan-out loads.
+
+| Load | Base | Before | Larger inbox | And a turn's output together |
+|---|---|---|---|---|
+| QoS 1, 8 pairs, window 100 | 1,393,471 PUBACK/s | 811,153 | 1,210,555 | 1,382,437 |
+| QoS 1, 1 pair, window 100 | 431,467 PUBACK/s | 256,911 | 560,347 | 532,392 |
+| 4 full-speed publishers | 2,043,050 deliveries/s, 5.09 % lost | 1,249,354, 0.46 % | 1,193,738, 0.68 % | 1,304,641, 0.27 % |
+| 8 full-speed publishers | 2,373,201 deliveries/s, 4.78 % lost | 1,439,037, 2.04 % | 1,459,590, 1.02 % | 1,576,407, 0.96 % |
+| 10 subscribers, 100,000 publications/s | p99 0.885 ms | 2.621 ms | 1.311 ms | 0.983 ms |
+| 100 subscribers, 10,000 publications/s | p99 1.704 ms | 1.704 ms | 1.704 ms | 1.769 ms |
+| 1,000 subscribers, 500 publications/s | p99 4.063 ms | 4.719 ms | 4.719 ms | 4.456 ms |
+
+Before, a reader stopped after every 16 packets of a QoS 1 publisher, and each stop cost a wake
+of the selector and a turn of the actor. An inbox of 128 for every packet lets full-speed QoS 0
+publishers overrun their subscribers, which then lost a tenth of the deliveries or more, so
+QoS 0 publications keep the limit of 16. The variants and their measurements are in
+[`notes/bench/broker-threads.md`](../../notes/bench/broker-threads.md), chapter 7.
+
 ## Product work left for the next stage
 
 - Replace the queued-turn Thread sentinel with an explicit ownership state.
 - Share framing with the blocking reader and replace blocking race-test hooks with connection
   pause/resume operations. A blocking hook currently holds its entire selector or actor worker.
-- Meet the throughput targets and verify the remaining stop races. Subscription matching still
-  scans sessions.
+- Verify the remaining stop races. Subscription matching still scans sessions.
+- Keep the 99th percentile of a fan-out to 1,000 subscribers under its limit of 5 ms at busier
+  times too. It stays close to the limit, as before these changes.
 - Decide how to isolate the application's logging backend from the broker's execution threads.
   A selector still logs each disconnection, so a backend that blocks holds its connections.
 - Give the application a way to learn that the broker closed itself after a selector failed.
@@ -117,6 +146,10 @@ Those are individual observations; 100,000 connections were not tested with this
   input behind such a packet ends with the connection.
 - Count the received packets that wait in all inboxes against a budget for the whole broker.
   Each session's inbox takes 128 of them, eight times what it took.
+- Hand over the output that a worker holds when one of its events blocks. Today it waits for the
+  end of the turn, with the output of the events before.
+- Choose the numbers of selectors and workers from the processors at hand. Two workers are the
+  limit for eight QoS 1 pairs now.
 - Decide what `close()` has finished when it returns. It does not wait for the selectors, which
   close the sockets.
 - Remove the `hato.broker.*` experiment properties, and rename what still speaks of a writer

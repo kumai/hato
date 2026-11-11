@@ -322,6 +322,7 @@ final class Session {
     private void run(int budget) {
         for (int ran = 0; ran < budget || routing.closed; ran++) {
             Runnable next;
+            Connection reader = null;
             synchronized (this) {
                 next = events.pollFirst();
                 if (next == null) {
@@ -334,10 +335,14 @@ final class Session {
                     receivedCount--;
                     receivedBytes -= taken.bytes;
                     if (waitingReader != null) {
-                        waitingReader.wake();
+                        reader = waitingReader;
                         waitingReader = null;
                     }
                 }
+            }
+            if (reader != null) {
+                // The reader fills the inbox again while this turn goes on.
+                reader.wakeNow();
             }
             perform(next);
         }

@@ -9,7 +9,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -87,10 +89,28 @@ final class Routing {
         retained = new RetainedMessages(settings, port);
         capabilities = settings.capabilities();
         reactors = new Reactor[selectors];
-        actors = Executors.newFixedThreadPool(
-                Integer.getInteger("hato.broker.actors", 2),
-                Thread.ofPlatform().daemon().name("hato-broker-" + port + "-actor-", 0).factory()
-        );
+        int workers = Integer.getInteger("hato.broker.actors", 2);
+        var nextWorker = new AtomicInteger();
+        actors = new ThreadPoolExecutor(
+                workers,
+                workers,
+                0,
+                TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(),
+                loop -> new Worker(
+                        loop,
+                        "hato-broker-" + port + "-actor-" + nextWorker.getAndIncrement()
+                )
+        ) {
+
+            // Whatever a task did, the connections that it queued output for go to their
+            // selectors as it ends.
+            @Override
+            protected void afterExecute(Runnable task, @Nullable Throwable failure) {
+                var worker = (Worker) Thread.currentThread();
+                worker.handOver();
+            }
+        };
         try {
             for (int i = 0; i < reactors.length; i++) {
                 reactors[i] = new Reactor(this, i, stopBroker);

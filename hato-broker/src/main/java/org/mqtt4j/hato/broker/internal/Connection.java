@@ -207,6 +207,12 @@ final class Connection {
         reactor.wake(this);
     }
 
+    // Has the selector look at the connection without waiting for the end of a pool thread's
+    // task, as wake() does there.
+    void wakeNow() {
+        reactor.schedule(this);
+    }
+
     void ready() {
         scheduled.set(false);
         if (disposed) {
@@ -485,6 +491,13 @@ final class Connection {
             unparkWriter();
         } else {
             awaitingSpace = true;
+            // Only the writer makes room, and what a pool thread still queues waits or is
+            // dropped meanwhile. So a pool thread that has filled the queue hands the
+            // connection over now. One that found it full already has nothing to hand over:
+            // the selector knows, and a peer that does not read gains nothing from a wake.
+            if (Thread.currentThread() instanceof Worker worker) {
+                worker.handOver(this);
+            }
         }
         return result;
     }
