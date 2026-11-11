@@ -150,6 +150,10 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
   end of the turn, with the output of the events before.
 - Choose the numbers of selectors and workers from the processors at hand. Two workers are the
   limit for eight QoS 1 pairs now.
+- Accept through a selector. On macOS, closing the listener at the moment its thread enters
+  `accept` can leave `close()` waiting in the kernel until another file descriptor operation in
+  the process ends, which in a quiet process is never. It did not happen on Linux, nor with the
+  virtual thread that accepted before, in 20,000 starts each.
 - Decide what `close()` has finished when it returns. It does not wait for the selectors, which
   close the sockets.
 - Remove the `hato.broker.*` experiment properties, and rename what still speaks of a writer
