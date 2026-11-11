@@ -6,8 +6,11 @@ import java.net.BindException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -28,7 +31,9 @@ import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
+import static org.mqtt4j.hato.broker.internal.BrokerSessionRaceTest.awaitRelease;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
@@ -301,6 +306,56 @@ class BrokerConnectionTest {
             assertThat(client.getInputStream().readNBytes(disconnect.length))
                     .isEqualTo(disconnect);
             assertThat(client.getInputStream().read()).isEqualTo(-1);
+        }
+    }
+
+    @Test
+    void a_connection_that_another_thread_ends_stays_open_until_its_selector_closes_it()
+            throws Exception {
+        var selectorOf = new ConcurrentHashMap<String, Thread>();
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder().beforeProcess(packet -> {
+                    if (packet instanceof Packet.Connect connect) {
+                        selectorOf.put(connect.clientId(), Thread.currentThread());
+                    } else if (packet instanceof Packet.PingReq) {
+                        held.countDown();
+                        awaitRelease(release);
+                    }
+                }).start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession holder = connected(sut.port(), "holder")
+        ) {
+            // Arrange: connections go to the selectors in turn, so after one for each other
+            // selector the next shares the holder's, which the holder's PINGREQ then stops.
+            long selectors = selectors(sut.port());
+            for (long i = 1; i < selectors; i++) {
+                connected(sut.port(), "filler").close();
+            }
+            try (var victim = new Socket(InetAddress.getLoopbackAddress(), sut.port())) {
+                victim.setSoTimeout(5_000);
+                victim.getOutputStream().write(codec.encode(connect("victim", true, 0)));
+                byte[] connAck = codec.encode(new Packet.ConnAck(false, SUCCESS, EMPTY));
+                assertThat(victim.getInputStream().readNBytes(connAck.length)).isEqualTo(connAck);
+                assertThat(selectorOf.get("victim")).isSameAs(selectorOf.get("holder"));
+                holder.send(new Packet.PingReq());
+                awaitRelease(held);
+
+                // Act: the calling thread ends the connection, as a timer or an actor does.
+                sut.disconnect("victim");
+
+                // Assert: the peer sees the end only once the selector closes the channel.
+                assertThat(sut.connectedClients()).doesNotContain("victim");
+                victim.setSoTimeout(200);
+                assertThatThrownBy(() -> victim.getInputStream().read())
+                        .isInstanceOf(SocketTimeoutException.class);
+                release.countDown();
+                victim.setSoTimeout(5_000);
+                assertThat(victim.getInputStream().read()).isEqualTo(-1);
+                holder.expect(Packet.PingResp.class);
+            }
+        } finally {
+            release.countDown();
         }
     }
 
