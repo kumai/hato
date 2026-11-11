@@ -148,6 +148,8 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
 - Decide how to isolate the application's logging backend from the broker's execution threads.
   A selector still logs each disconnection, so a backend that blocks holds its connections.
 - Give the application a way to learn that the broker closed itself after a selector failed.
+- Decide what an interrupt does to a selector thread. Today its loop spins, because a selector
+  no longer waits once its thread is interrupted. The accepting thread ends the listener.
 - After a failed write, read on until the actor has taken a packet that waits for it. Today the
   input behind such a packet ends with the connection.
 - Count the received packets that wait in all inboxes against a budget for the whole broker.
