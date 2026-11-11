@@ -1,7 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
-import java.net.BindException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
@@ -19,7 +18,6 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
@@ -409,10 +407,8 @@ class BrokerSessionTest {
 
             sut.close();
 
-            // close() does not wait for a blocked accept to release the native listener.
-            try (var restarted = await().atMost(Duration.ofSeconds(5))
-                        .ignoreException(BindException.class)
-                        .until(() -> MqttBroker.start(address), value -> value != null);
+            // close() has released the listening port when it returns.
+            try (var restarted = MqttBroker.start(address);
                     RawSession replacement = connected(restarted.port(), "restart", false, false);
                     RawSession publisher = connected(restarted.port(), "publisher")) {
                 publisher.publish("restart", "discarded subscription", AT_LEAST_ONCE, 7);

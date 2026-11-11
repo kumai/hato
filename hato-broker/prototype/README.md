@@ -12,7 +12,7 @@ processes at most 256 events before reserving another turn at the back of the ex
 
 | Source | Change |
 |---|---|
-| [BrokerServer](../src/main/java/org/mqtt4j/hato/broker/internal/BrokerServer.java) | Platform-thread accept loop; closes the actor executor and selectors |
+| [BrokerServer](../src/main/java/org/mqtt4j/hato/broker/internal/BrokerServer.java) | Platform-thread accept loop that waits in a selector of its own; closes the actor executor and selectors |
 | [Routing](../src/main/java/org/mqtt4j/hato/broker/internal/Routing.java) | Owns the selectors and actor executor; assigns connections round-robin |
 | [Reactor](../src/main/java/org/mqtt4j/hato/broker/internal/Reactor.java) | Owns key and channel cleanup, coalesces wakeups, ends a connection whose work fails, and closes the broker when the selector itself fails |
 | [Connection](../src/main/java/org/mqtt4j/hato/broker/internal/Connection.java) | Incremental framing, nonblocking reads and partial writes, pause/resume for bounded queues |
@@ -26,6 +26,12 @@ can apply its session expiry and Will before the actor ends the connection. When
 the selector first hands over the input that has already arrived, so a DISCONNECT sent just
 before a reset still applies. A peer that half-closes can still receive a final MQTT packet.
 The selector releases the send batch and the socket after the connection ends.
+
+The accepting thread waits for connections in a selector and never inside `accept`. On macOS,
+closing a listener at the moment a thread enters a blocking `accept` can leave `close()` waiting
+in the kernel until another file descriptor operation in the process ends, which in a quiet
+process is never. `close()` closes that selector too, which frees the listening port before it
+returns.
 
 The selectors and the pool hand work to each other in batches. A session's inbox takes 128
 received packets, so that a selector seldom stops within the packets of one read. A QoS 0
@@ -150,10 +156,6 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
   end of the turn, with the output of the events before.
 - Choose the numbers of selectors and workers from the processors at hand. Two workers are the
   limit for eight QoS 1 pairs now.
-- Accept through a selector. On macOS, closing the listener at the moment its thread enters
-  `accept` can leave `close()` waiting in the kernel until another file descriptor operation in
-  the process ends, which in a quiet process is never. It did not happen on Linux, nor with the
-  virtual thread that accepted before, in 20,000 starts each.
 - Decide what `close()` has finished when it returns. It does not wait for the selectors, which
   close the sockets.
 - Remove the `hato.broker.*` experiment properties, and rename what still speaks of a writer

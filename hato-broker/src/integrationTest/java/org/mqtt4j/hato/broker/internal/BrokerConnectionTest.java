@@ -2,7 +2,6 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.net.BindException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -70,11 +69,11 @@ class BrokerConnectionTest {
             sut.close();
             client.expectClosed();
             var sameAddress = new InetSocketAddress(address.getAddress(), port);
-            // close() does not wait for a blocked accept to release the native listener.
-            MqttBroker restarted = await().atMost(Duration.ofSeconds(5))
-                    .ignoreException(BindException.class)
-                    .until(() -> MqttBroker.start(sameAddress), value -> value != null);
-            try (restarted; var next = connected(restarted.port(), "restarted")) {
+            // close() has released the listening port when it returns.
+            try (
+                    var restarted = MqttBroker.start(sameAddress);
+                    RawSession next = connected(restarted.port(), "restarted")
+            ) {
                 next.ping();
             }
         }

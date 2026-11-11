@@ -1,10 +1,13 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
@@ -54,13 +57,32 @@ public final class BrokerServer implements AutoCloseable {
     // Keep selector I/O separate from actor execution by default; the property is for trials.
     private static final int IN_PLACE = Integer.getInteger("hato.broker.inPlace", 0);
 
-    private final ServerSocket listener;
+    private final ServerSocketChannel listener;
+
+    // Tells the accepting thread that a connection waits at the listener, which is all that it
+    // watches. The thread waits here and never inside accept: when a listener is closed just as
+    // a thread enters a blocking accept, the closing thread can wait in the kernel until
+    // something else in the process uses a file descriptor (seen on macOS), which a quiet
+    // process never does.
+    private final Selector acceptor;
 
     private final Routing routing;
 
-    private BrokerServer(ServerSocket listener, BrokerSettings settings) throws IOException {
+    private BrokerServer(ServerSocketChannel listener, BrokerSettings settings) throws IOException {
         this.listener = listener;
-        routing = new Routing(settings, listener.getLocalPort(), this::close);
+        acceptor = Selector.open();
+        try {
+            listener.configureBlocking(false);
+            listener.register(acceptor, SelectionKey.OP_ACCEPT);
+            routing = new Routing(settings, listener.socket().getLocalPort(), this::close);
+        } catch (IOException | RuntimeException | Error failure) {
+            try {
+                acceptor.close();
+            } catch (IOException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
     }
 
     public static BrokerServer start(InetSocketAddress address) throws IOException {
@@ -249,9 +271,7 @@ public final class BrokerServer implements AutoCloseable {
                     beforeDeliveryWrite,
                     beforeSelect
             );
-            // The sockets that a channel's listener accepts have channels too, through which a
-            // connection's writer sends several packets in one gathering write.
-            ServerSocket listener = ServerSocketChannel.open().socket();
+            ServerSocketChannel listener = ServerSocketChannel.open();
             try {
                 listener.bind(address);
                 var server = new BrokerServer(listener, settings);
@@ -279,13 +299,13 @@ public final class BrokerServer implements AutoCloseable {
     }
 
     public int port() {
-        return listener.getLocalPort();
+        return routing.port;
     }
 
     private void accept() {
         try {
             while (true) {
-                Socket socket = listener.accept();
+                Socket socket = accepted();
                 Connection connection = null;
                 try {
                     connection = new Connection(socket, routing);
@@ -325,6 +345,24 @@ public final class BrokerServer implements AutoCloseable {
         }
     }
 
+    // The next connection that waits at the listener, once there is one. close() ends the wait
+    // with an exception, by closing the listener and the selector.
+    private Socket accepted() throws IOException {
+        while (true) {
+            SocketChannel channel = listener.accept();
+            if (channel != null) {
+                return channel.socket();
+            }
+            // The key tells nothing more than the return does: the loop asks the listener.
+            acceptor.select(_ -> { });
+            if (Thread.interrupted()) {
+                // An interrupted thread no longer waits in a selector. It ends the listener, as
+                // an interrupt of a blocking accept does.
+                throw new InterruptedIOException("Interrupted while waiting for a connection");
+            }
+        }
+    }
+
     @Override
     public void close() {
         synchronized (this) {
@@ -337,6 +375,15 @@ public final class BrokerServer implements AutoCloseable {
             listener.close();
         } catch (IOException failure) {
             log.warn("Closing broker listener on port {} failed", port(), failure);
+        }
+        // A channel that a selector watches keeps its socket until the selector lets go of it.
+        // Closing the selector does that here, so the port is free when close() returns, and
+        // it wakes the accepting thread.
+        try {
+            acceptor.close();
+        } catch (IOException failure) {
+            log.warn("Closing the accept selector of the broker on port {} failed",
+                    port(), failure);
         }
         try {
             routing.clear();
