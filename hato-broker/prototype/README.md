@@ -21,9 +21,10 @@ processes at most 256 events before reserving another turn at the back of the ex
 
 The queue quotas, codec, delivery state, retained messages, and subscription matching are reused.
 EOF and socket errors follow the packets already posted to the session. A queued DISCONNECT
-can apply its session expiry and Will before the actor ends the connection. A peer that
-half-closes can still receive a final MQTT packet. The selector releases the send batch
-and the socket after the connection ends.
+can apply its session expiry and Will before the actor ends the connection. When a write fails,
+the selector first hands over the input that has already arrived, so a DISCONNECT sent just
+before a reset still applies. A peer that half-closes can still receive a final MQTT packet.
+The selector releases the send batch and the socket after the connection ends.
 
 A failure in the work of one connection, an `Error` included, ends that connection alone, as it
 does on a session's actor. Only a failure of the selector loop itself closes the broker. The
@@ -45,9 +46,15 @@ Run from the repository root with the existing JDK 25 toolchain and Gradle cache
   --offline -Phato.interop=none --continue
 ```
 
-The suite now tests selector survival through repeated disconnects, broker shutdown on an
-injected selector failure, and the final response after a peer half-closes. The full suite
-also exercises race tests whose blocking hooks need per-connection pause and resume.
+The suite tests selector survival through repeated disconnects, that a connection ended by
+another thread stays open until its selector closes it, that an error in one connection leaves
+the others served, broker shutdown on an injected selector failure, the final response after a
+peer half-closes, and a DISCONNECT that arrived before a write failed.
+
+Fifteen cases fail in each configuration, and no others: one in `BrokerConcurrencyTest`, two in
+`BrokerDeadlineTest`, four in `BrokerQos2RaceTest`, seven in `BrokerSessionRaceTest`, and one in
+`BrokerWillDelayTest`. They are race tests whose blocking hooks now hold a whole selector or
+actor worker, and they need per-connection pause and resume.
 
 The review measurements and their commands are in
 [`notes/bench/broker-threads.md`](../../notes/bench/broker-threads.md) and
@@ -99,5 +106,13 @@ Those are individual observations; 100,000 connections were not tested with this
 - Meet the throughput targets and verify the remaining stop races. Subscription matching still
   scans sessions.
 - Decide how to isolate the application's logging backend from the broker's execution threads.
+  A selector still logs each disconnection, so a backend that blocks holds its connections.
+- Give the application a way to learn that the broker closed itself after a selector failed.
+- After a failed write, read on until the actor has taken a packet that waits for it. Today the
+  input behind such a packet ends with the connection.
+- Decide what `close()` has finished when it returns. It does not wait for the selectors, which
+  close the sockets.
+- Remove the `hato.broker.*` experiment properties, and rename what still speaks of a writer
+  thread, such as `unparkWriter`.
 - Run the full broker/client/testkit, distribution, and native-image checks. TLS and application
   authentication are not implemented by this prototype.

@@ -2,8 +2,11 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -11,6 +14,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.broker.MqttBroker;
+import org.mqtt4j.hato.broker.internal.common.io.FrameReader;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
 import org.mqtt4j.hato.broker.internal.common.protocol.Property;
@@ -22,10 +26,14 @@ import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+import static org.mqtt4j.hato.broker.internal.BrokerSessionRaceTest.awaitRelease;
 import static org.mqtt4j.hato.broker.internal.RawSession.acceptedV5;
+import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
+import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_MOST_ONCE;
@@ -170,6 +178,58 @@ class BrokerWillTest {
 
             // Assert: the broker discarded the Will before it closed the connection.
             subscriber.ping();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // The client resets its connection itself, before the cleanup.
+    void a_disconnect_that_arrived_before_a_write_failed_discards_the_will() throws Exception {
+        var armed = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .beforeDeliveryWrite(() -> {
+                            if (armed.compareAndSet(true, false)) {
+                                held.countDown();
+                                awaitRelease(release);
+                            }
+                        })
+                        .start(loopback());
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                var leaving = new Socket(InetAddress.getLoopbackAddress(), sut.port());
+                RawSession publisher = connected(sut.port(), "publisher")
+        ) {
+            // Arrange: the broker is about to write a delivery to the client that leaves.
+            subscriber.subscribe(WILL_TOPIC, EXACTLY_ONCE);
+            leaving.setSoTimeout(5_000);
+            var reader = new FrameReader(leaving.getInputStream(), 1024);
+            leaving.getOutputStream().write(codec.encode(
+                    connect(MqttVersion.V3_1_1, "leaving", 0, will("left", AT_LEAST_ONCE))
+            ));
+            assertThat(codec.decode(reader.read().orElseThrow()))
+                    .isInstanceOf(Packet.ConnAck.class);
+            leaving.getOutputStream().write(codec.encode(
+                    new Packet.Subscribe(1, List.of(subscription("feed", AT_MOST_ONCE)), EMPTY)
+            ));
+            assertThat(codec.decode(reader.read().orElseThrow())).isInstanceOf(Packet.SubAck.class);
+            armed.set(true);
+            publisher.publish("feed", "held", AT_MOST_ONCE, 0);
+            awaitRelease(held);
+
+            // Act: DISCONNECT and then a reset reach the broker, whose write now fails. The
+            // round trip of another client gives the reset the time to arrive.
+            leaving.getOutputStream().write(codec.encode(new Packet.Disconnect(SUCCESS, EMPTY)));
+            leaving.setSoLinger(true, 0);
+            leaving.close();
+            publisher.ping();
+            release.countDown();
+
+            // Assert: the broker discarded the Will before the connection ended.
+            await().until(() -> !sut.connectedClients().contains("leaving"));
+            subscriber.ping();
+        } finally {
+            release.countDown();
         }
     }
 

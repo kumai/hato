@@ -216,13 +216,17 @@ final class Connection {
             dispose();
             return;
         }
-        try {
-            if (!ioFailed) {
+        if (!ioFailed) {
+            try {
                 writeReady();
-                if (!isEnded() && !connecting && !readClosed && resumePending()
-                        && (readable || input.position() > 0)) {
-                    readReady();
-                }
+            } catch (IOException failure) {
+                writeFailed(failure);
+            }
+        }
+        try {
+            if (!ioFailed && !isEnded() && !connecting && !readClosed && resumePending()
+                    && (readable || input.position() > 0)) {
+                readReady();
             }
         } catch (IOException failure) {
             endRead(failureReason("I/O", failure), true);
@@ -289,6 +293,29 @@ final class Connection {
         input.flip();
         consume();
         input.compact();
+    }
+
+    // A peer that goes away can leave packets behind, such as the DISCONNECT that discards its
+    // Will, and a write can meet the failure before a read finds them. Hands the input that has
+    // arrived to the session, then ends the connection after it.
+    // Ceiling: a packet that waits for its actor or for response room stays where it is, and
+    // the input behind it ends with the connection. Reading on until the actor takes that
+    // packet would lift this.
+    private void writeFailed(IOException failure) {
+        String reason = failureReason("I/O", failure);
+        try {
+            while (!isEnded() && !connecting && !readClosed && resumePending()) {
+                input.flip();
+                boolean waiting = consume();
+                input.compact();
+                if (waiting || socket.getChannel().read(input) <= 0) {
+                    break;
+                }
+            }
+        } catch (IOException | PacketDecodeException _) {
+            // Whatever the input holds, the connection ends for the failure of the write.
+        }
+        endRead(reason, true);
     }
 
     // End the session's connection after the packets it has already received. A FIN still
@@ -385,8 +412,8 @@ final class Connection {
                 }
                 pending = PacketCodec.of(version).decode(bytes);
                 settings.beforeProcess().accept(pending);
-                log.debug("Broker received {} from {}", pending.getClass().getSimpleName(),
-                        socket.getRemoteSocketAddress());
+                log.debug("Broker received {} from {}",
+                        pending.getClass().getSimpleName(), socket.getRemoteSocketAddress());
                 pendingBytes = bytes.length;
                 pendingAnswered = answered(pending);
                 if (!resumePending() || isEnded()) {
