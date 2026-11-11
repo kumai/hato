@@ -16,11 +16,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
+import java.util.function.IntFunction;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
@@ -294,6 +300,55 @@ class BrokerConcurrencyTest {
             assertThat(handled).containsExactlyElementsOf(
                     IntStream.rangeClosed(1, count).mapToObj(Integer::toString).toList()
             );
+        }
+    }
+
+    /// The packets whose numbers wait in a session's inbox up to limits of their own: QoS 0
+    /// publications, which nothing else holds back, and the others, here acknowledgements of
+    /// deliveries that the broker never made, which it ignores.
+    static Stream<Arguments> bursts() {
+        IntFunction<Packet> publications = number -> publication(
+                "sequence",
+                Integer.toString(number),
+                AT_MOST_ONCE,
+                0
+        );
+        IntFunction<Packet> acknowledgements = number -> new Packet.PubAck(number, SUCCESS, EMPTY);
+        return Stream.of(
+                Arguments.of(Named.of("QoS 0 publications", publications)),
+                Arguments.of(Named.of("acknowledgements", acknowledgements))
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("bursts")
+    void a_burst_that_overfills_a_sessions_inbox_is_handled_whole_and_in_order(
+            IntFunction<Packet> packets
+    ) throws Exception {
+        List<Packet> burst = IntStream.rangeClosed(1, 400).mapToObj(packets).toList();
+        var handled = new ConcurrentLinkedQueue<Packet>();
+        try (BrokerServer sut = BrokerServer.builder()
+                .beforeHandle(packet -> {
+                    if (packet.getClass() == burst.getFirst().getClass()) {
+                        handled.add(packet);
+                        // Slower than the reader, which fills the inbox and waits for room.
+                        LockSupport.parkNanos(100_000);
+                    }
+                })
+                .start(loopback());
+                RawSession client = connected(sut.port(), "client")) {
+            // Arrange
+            var bytes = new ByteArrayOutputStream();
+            for (Packet packet : burst) {
+                bytes.writeBytes(codec.encode(packet));
+            }
+
+            // Act
+            client.sendRaw(bytes.toByteArray());
+            client.ping();
+
+            // Assert
+            assertThat(handled).containsExactlyElementsOf(burst);
         }
     }
 

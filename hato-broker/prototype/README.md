@@ -26,6 +26,10 @@ the selector first hands over the input that has already arrived, so a DISCONNEC
 before a reset still applies. A peer that half-closes can still receive a final MQTT packet.
 The selector releases the send batch and the socket after the connection ends.
 
+A session's inbox takes 128 received packets, so that a selector seldom stops within the packets
+of one read. A QoS 0 publication finds it full at 16: nothing else holds such publications back,
+and a publisher that gets far ahead of the actor overruns the queues of its subscribers.
+
 A failure in the work of one connection, an `Error` included, ends that connection alone, as it
 does on a session's actor. Only a failure of the selector loop itself closes the broker. The
 application has no way yet to learn that the broker closed itself, other than the log.
@@ -49,7 +53,8 @@ Run from the repository root with the existing JDK 25 toolchain and Gradle cache
 The suite tests selector survival through repeated disconnects, that a connection ended by
 another thread stays open until its selector closes it, that an error in one connection leaves
 the others served, broker shutdown on an injected selector failure, the final response after a
-peer half-closes, and a DISCONNECT that arrived before a write failed.
+peer half-closes, a DISCONNECT that arrived before a write failed, and a burst that overfills a
+session's inbox.
 
 Fifteen cases fail in each configuration, and no others: one in `BrokerConcurrencyTest`, two in
 `BrokerDeadlineTest`, four in `BrokerQos2RaceTest`, seven in `BrokerSessionRaceTest`, and one in
@@ -110,6 +115,8 @@ Those are individual observations; 100,000 connections were not tested with this
 - Give the application a way to learn that the broker closed itself after a selector failed.
 - After a failed write, read on until the actor has taken a packet that waits for it. Today the
   input behind such a packet ends with the connection.
+- Count the received packets that wait in all inboxes against a budget for the whole broker.
+  Each session's inbox takes 128 of them, eight times what it took.
 - Decide what `close()` has finished when it returns. It does not wait for the selectors, which
   close the sockets.
 - Remove the `hato.broker.*` experiment properties, and rename what still speaks of a writer

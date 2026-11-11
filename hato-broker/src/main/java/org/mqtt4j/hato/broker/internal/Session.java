@@ -53,7 +53,18 @@ final class Session {
     // The received packets that may wait in the inbox. A reader that finds no room waits until
     // the actor takes one, which holds its client back through TCP; one packet always fits,
     // whatever its size.
-    private static final int RECEIVED_COUNT = 16;
+    //
+    // A selector hands over the packets of a whole read, and each wait costs it a wake and the
+    // actor a turn of its own. So the limit is as large as a connection's other queues, which a
+    // read seldom exceeds.
+    private static final int RECEIVED_COUNT = 128;
+
+    // The limit that a QoS 0 publication finds instead. A client's other packets are bounded
+    // elsewhere: the broker answers them within the room that it keeps for its responses, or
+    // they acknowledge deliveries that its window let out. Only this limit and TCP hold back
+    // QoS 0 publications, and a publisher that gets far ahead of the actor overruns the queues
+    // of its subscribers, which drop what they cannot take.
+    private static final int UNACKNOWLEDGED_COUNT = 16;
 
     private static final long RECEIVED_BYTES = 1024 * 1024;
 
@@ -225,9 +236,12 @@ final class Session {
     // while received packets fill their limits.
     boolean receive(Connection from, Packet packet, boolean answered, int bytes) {
         var event = new Received(from, packet, answered, bytes);
+        boolean unacknowledged = !answered
+                && (packet instanceof Packet.Publish || packet instanceof Packet.AliasPublish);
+        int limit = unacknowledged ? UNACKNOWLEDGED_COUNT : RECEIVED_COUNT;
         Thread claimed;
         synchronized (this) {
-            if (receivedCount >= RECEIVED_COUNT
+            if (receivedCount >= limit
                     || (receivedCount > 0 && bytes > RECEIVED_BYTES - receivedBytes)) {
                 waitingReader = from;
                 return false;
