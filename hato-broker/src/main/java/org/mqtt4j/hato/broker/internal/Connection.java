@@ -1,24 +1,21 @@
 package org.mqtt4j.hato.broker.internal;
 
-import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.jspecify.annotations.Nullable;
 
-import org.mqtt4j.hato.broker.internal.common.concurrent.CarrierShare;
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
-import org.mqtt4j.hato.broker.internal.common.io.FrameReader;
-import org.mqtt4j.hato.broker.internal.common.io.FrameWriter;
 import org.mqtt4j.hato.broker.internal.common.io.SendQueue;
 import org.mqtt4j.hato.broker.internal.common.io.WriteParts;
 import org.mqtt4j.hato.broker.internal.common.log.Log;
@@ -26,6 +23,7 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
+import org.mqtt4j.hato.broker.internal.common.protocol.RemainingLength;
 import org.mqtt4j.hato.broker.internal.common.protocol.UnsupportedProtocolVersionException;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
@@ -33,7 +31,7 @@ import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 
 import static java.util.Objects.requireNonNull;
 
-// One network connection of the broker, with its own reader and writer. The reader hands the
+// One network connection, driven by its assigned selector. The reader hands the
 // packets that it decodes to the session that the CONNECT attached, whose actor handles them.
 final class Connection {
 
@@ -70,33 +68,62 @@ final class Connection {
 
     private final Socket socket;
 
-    private final FrameReader reader;
+    private final ByteBuffer input = ByteBuffer.allocate(8192);
 
-    private final FrameWriter writer;
+    final Reactor reactor;
 
     private final SendQueue<Outbound> outgoing;
 
     final Client client;
 
-    private final Thread readerThread;
-
-    // The thread that writes to the socket. It parks while it has nothing to write, rather than
-    // waiting on this connection's monitor: the JDK resumes a virtual thread that a monitor wakes
-    // through a platform thread of its own, which leaves it behind the work that the carriers
-    // queue for themselves. While readers kept the carriers busy, writers then fell behind what
-    // the readers took in, and subscribers lost messages to their queue limits. A virtual thread
-    // that unparks the writer queues it on its own carrier.
-    private final Thread writerThread;
-
     // The identifier is assigned once on acceptance, before the session attaches the connection,
     // and read by timers, logs, and the test controls.
     volatile String clientId = "";
 
-    // Remaining state is guarded by this connection's monitor.
+    final AtomicBoolean scheduled = new AtomicBoolean();
 
-    // Set by the writer when it finds nothing to write, before it parks; cleared by the thread
-    // that unparks it.
-    private boolean writerIdle;
+    final Reactor.Task readiness = new Reactor.Task(this, this::ready);
+
+    // I/O state belongs to the selector. Actor callbacks publish acceptance through its queue.
+
+    private byte[] frame = new byte[5];
+
+    private int frameReceived;
+
+    private int frameSize;
+
+    private int maxPacketSize = MAX_PACKET_SIZE;
+
+    private boolean connecting;
+
+    private boolean connected;
+
+    private boolean readClosed;
+
+    private boolean ioFailed;
+
+    private boolean disposed;
+
+    private @Nullable Packet pending;
+
+    private boolean pendingAnswered;
+
+    private int pendingBytes;
+
+    private boolean pendingReserved;
+
+    private List<SendQueue.Send<Outbound>> writing = List.of();
+
+    private ByteBuffer[] writingParts = new ByteBuffer[0];
+
+    private boolean writingLast;
+
+    // Only the selector sets this, after OP_READ, and clears it after a zero-byte read.
+    boolean readable;
+
+    @Nullable SelectionKey key;
+
+    // Remaining state is guarded by this connection's monitor.
 
     // Responses that a test released, waiting for room in the reserved quota in order. Later
     // responses queue behind them, so that none overtakes a released one.
@@ -150,15 +177,12 @@ final class Connection {
         receiveTimeout = settings.connectTimeout();
         this.socket = socket;
         socket.setTcpNoDelay(true);
-        // The frame reader takes a packet's fixed header a byte at a time, and every read of the
-        // socket is a call into the operating system. Packets still in this buffer when the
-        // connection ends can reach the session, which handles none from an ended connection.
-        reader = new FrameReader(new BufferedInputStream(socket.getInputStream()), MAX_PACKET_SIZE);
-        writer = new FrameWriter(socket.getOutputStream(), socket.getChannel());
         client = new Client(this, routing);
-        String name = "hato-broker-" + routing.port + "-" + socket.getRemoteSocketAddress();
-        readerThread = Thread.ofVirtual().name(name + "-reader").unstarted(this::readLoop);
-        writerThread = Thread.ofVirtual().name(name + "-writer").unstarted(this::writeLoop);
+        reactor = routing.reactors[Math.floorMod(
+                routing.nextReactor.getAndIncrement(),
+                routing.reactors.length
+        )];
+        socket.getChannel().configureBlocking(false);
     }
 
     SocketAddress remoteAddress() {
@@ -166,87 +190,211 @@ final class Connection {
     }
 
     // Refuses the packets after this point that are larger than `maximumPacketSize`, which
-    // CONNACK announced. Called by the reader, which alone uses it.
+    // CONNACK announced. Acceptance sets it before the selector resumes reads.
     void limitPacketSize(int maximumPacketSize) {
-        reader.limit(maximumPacketSize);
+        maxPacketSize = maximumPacketSize;
     }
 
-    synchronized void start() {
+    synchronized boolean start() {
+        if (!reactor.register(this, socket.getChannel())) {
+            return false;
+        }
         armTimer(receiveTimeout - (scheduler.nanoTime() - lastReceived));
-        writerThread.start();
-        readerThread.start();
+        return true;
     }
 
-    private void readLoop() {
-        String reason = "connection closed by the peer";
+    void wake() {
+        reactor.wake(this);
+    }
+
+    void ready() {
+        scheduled.set(false);
+        if (disposed) {
+            return;
+        }
+        if (terminated()) {
+            dispose();
+            return;
+        }
         try {
-            Optional<byte[]> first = reader.read();
-            if (first.isEmpty()) {
-                return;
-            }
-            received();
-            Packet.Connect request;
-            try {
-                request = PacketCodec.decodeConnect(first.get(), SUPPORTED_VERSIONS);
-            } catch (UnsupportedProtocolVersionException unsupported) {
-                refuse(
-                        ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,
-                        "protocol level " + unsupported.protocolLevel()
-                );
-                return;
-            }
-            synchronized (this) {
-                version = request.version();
-            }
-            settings.beforeProcess().accept(request);
-            if (!client.connect(request)) {
-                return;
-            }
-            Session owner = requireNonNull(client.session);
-            PacketCodec codec = PacketCodec.of(request.version());
-            // The time spent on packets since the reader last let others run. A read that waits
-            // frees the carrier anyway, so only what follows a read counts.
-            long worked = 0;
-            while (true) {
-                Optional<byte[]> bytes = reader.read();
-                if (bytes.isEmpty()) {
-                    return;
-                }
-                long started = System.nanoTime();
-                received();
-                Packet packet = codec.decode(bytes.get());
-                settings.beforeProcess().accept(packet);
-                log.debug("Broker received {} from {}", packet.getClass().getSimpleName(),
-                        socket.getRemoteSocketAddress());
-                // Packets without a response, such as QoS 0 publications, never wait here.
-                boolean answered = answered(packet);
-                if (answered && !reserveResponse()) {
-                    return;
-                }
-                owner.receive(this, packet, answered, bytes.get().length);
-                worked += System.nanoTime() - started;
-                // A publisher that never pauses keeps every read from blocking, and this reader
-                // from freeing its carrier for the writers that send what it takes in, so the
-                // reader parks once its work fills a slice.
-                if (CarrierShare.spent(worked)) {
-                    CarrierShare.share();
-                    worked = 0;
+            if (!ioFailed) {
+                writeReady();
+                if (!isEnded() && !connecting && !readClosed && resumePending()
+                        && (readable || input.position() > 0)) {
+                    readReady();
                 }
             }
-        } catch (Throwable failure) {
-            reason = failureReason("reader", failure);
-            // A CONNECT that fails to decode leaves the version at MQTT 3.1.1, so DISCONNECT
-            // only follows an accepted CONNECT.
-            if (failure instanceof PacketDecodeException violation) {
-                disconnect(violation.reasonCode(), reason);
+        } catch (IOException failure) {
+            endRead(failureReason("I/O", failure), true);
+        } catch (PacketDecodeException failure) {
+            failed("decoding", failure);
+        }
+        if (key != null && key.isValid()) {
+            int interests = !isEnded() && !connecting && !readClosed && pending == null
+                    ? SelectionKey.OP_READ : 0;
+            if (!ioFailed && writingParts.length > 0) {
+                interests |= SelectionKey.OP_WRITE;
             }
-        } finally {
-            // The writer closes a connection that ends with a last packet; closing here could
-            // drop that packet.
-            if (!endsWithLastPacket()) {
-                close(reason);
+            key.interestOps(interests);
+        }
+    }
+
+    private synchronized boolean terminated() {
+        return ended;
+    }
+
+    private boolean resumePending() {
+        if (pending == null) {
+            return true;
+        }
+        synchronized (this) {
+            if (pendingAnswered && !pendingReserved) {
+                if (responseRoomTaken()) {
+                    return false;
+                }
+                owed++;
+                pendingReserved = true;
             }
         }
+        if (!requireNonNull(client.session).receive(
+                this,
+                pending,
+                pendingAnswered,
+                pendingBytes
+        )) {
+            return false;
+        }
+        pending = null;
+        pendingReserved = false;
+        return true;
+    }
+
+    private void readReady() throws IOException {
+        // A hot publisher gets at most one buffer of socket input per turn. Buffered frames
+        // resume first after backpressure, without waiting for another socket readiness edge.
+        input.flip();
+        if (consume()) {
+            input.compact();
+            return;
+        }
+        input.compact();
+        int count = socket.getChannel().read(input);
+        if (count == 0) {
+            readable = false;
+        }
+        if (count < 0) {
+            endRead("connection closed by the peer", false);
+            return;
+        }
+        input.flip();
+        consume();
+        input.compact();
+    }
+
+    // End the session's connection after the packets it has already received. A FIN still
+    // allows a final response to be written; an I/O error stops both directions.
+    private void endRead(String reason, boolean failed) {
+        boolean alreadyPosted = readClosed;
+        readClosed = true;
+        ioFailed = failed;
+        Session owner = client.session;
+        if (owner == null) {
+            close(reason);
+        } else if (failed || !alreadyPosted) {
+            owner.post(() -> {
+                if (failed || !endsWithLastPacket()) {
+                    close(reason);
+                }
+            }, settings.inPlace());
+        }
+    }
+
+    // Returns true while a CONNECT or one complete packet waits for its actor or response room.
+    private boolean consume() {
+        while (input.hasRemaining()) {
+            if (frameSize > 0) {
+                int count = Math.min(input.remaining(), frameSize - frameReceived);
+                if (frameReceived + count > frame.length) {
+                    frame = Arrays.copyOf(
+                            frame,
+                            Math.min(frameSize, Math.max(frame.length * 2, frameReceived + count))
+                    );
+                }
+                input.get(frame, frameReceived, count);
+                frameReceived += count;
+            } else {
+                byte next = input.get();
+                frame[frameReceived++] = next;
+                if (frameReceived >= 2) {
+                    if ((next & 0x80) != 0) {
+                        if (frameReceived == 5) {
+                            throw new PacketDecodeException(
+                                    ReasonCode.MALFORMED_PACKET,
+                                    "Remaining Length exceeds four bytes"
+                            );
+                        }
+                    } else {
+                        int remaining = RemainingLength.read(
+                                ByteBuffer.wrap(frame, 1, frameReceived - 1)
+                        );
+                        frameSize = frameReceived + remaining;
+                        if (frameSize > maxPacketSize) {
+                            throw new PacketDecodeException(
+                                    ReasonCode.PACKET_TOO_LARGE,
+                                    "MQTT packet exceeds maximum " + maxPacketSize
+                            );
+                        }
+                    }
+                }
+            }
+            if (frameSize != 0 && frameReceived == frameSize) {
+                byte[] bytes = Arrays.copyOf(frame, frameSize);
+                frameReceived = 0;
+                frameSize = 0;
+                frame = new byte[5];
+                received();
+                if (!connected) {
+                    Packet.Connect request;
+                    try {
+                        request = PacketCodec.decodeConnect(bytes, SUPPORTED_VERSIONS);
+                    } catch (UnsupportedProtocolVersionException failure) {
+                        refuse(
+                                ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,
+                                "unsupported version " + failure.protocolLevel()
+                        );
+                        return true;
+                    }
+                    synchronized (this) {
+                        version = request.version();
+                    }
+                    settings.beforeProcess().accept(request);
+                    connecting = true;
+                    client.connect(request, accepted -> {
+                        // The callback can be on an actor worker; only the selector resumes I/O.
+                        reactor.execute(this, () -> {
+                            connecting = false;
+                            connected = accepted;
+                            if (!accepted && !endsWithLastPacket()) {
+                                close("CONNECT refused");
+                            } else {
+                                wake();
+                            }
+                        });
+                    });
+                    return true;
+                }
+                pending = PacketCodec.of(version).decode(bytes);
+                settings.beforeProcess().accept(pending);
+                log.debug("Broker received {} from {}", pending.getClass().getSimpleName(),
+                        socket.getRemoteSocketAddress());
+                pendingBytes = bytes.length;
+                pendingAnswered = answered(pending);
+                if (!resumePending() || isEnded()) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     void refuse(ReasonCode reason, String request) {
@@ -336,26 +484,6 @@ final class Connection {
         };
     }
 
-    /// Holds the reader until the reserved quota has room for one more response besides those
-    /// that the session still owes, and reserves it, so that answering the next request never
-    /// finds the quota full. Only responses to this reader's requests take the reserved quota,
-    /// so the room stays until the response takes it. A deliberate simplification: the wait
-    /// counts responses, not their bytes. Only a backlog of SUBACKs for SUBSCRIBE packets with
-    /// many thousands of filters reaches the byte limit, which still closes the connection;
-    /// waiting for the size of each response would remove that limit. Returns false once the
-    /// connection has ended. A connection that is to end with a last packet drops responses, so
-    /// its reader does not wait.
-    private synchronized boolean reserveResponse() throws InterruptedException {
-        while (lastPacket == null && responseRoomTaken()) {
-            wait();
-        }
-        if (ended) {
-            return false;
-        }
-        owed++;
-        return true;
-    }
-
     // Whether a response now would find no room: the reserved quota is full with the responses
     // owed, or responses that a test released wait for it first. Called under the connection
     // monitor.
@@ -368,7 +496,7 @@ final class Connection {
     // session has answered or passed over.
     synchronized void responseSettled() {
         owed--;
-        notifyAll();
+        unparkWriter();
     }
 
     // Queues a response to the client's request in the reserved quota, behind the responses
@@ -424,8 +552,6 @@ final class Connection {
             }
             released.removeFirst();
             unparkWriter();
-            // The reader may wait for the released responses to go first.
-            notifyAll();
         }
     }
 
@@ -448,101 +574,104 @@ final class Connection {
         return true;
     }
 
-    // Unparks the writer if it has gone idle. Called under the connection monitor.
+    // Reserves a connection task, unless one waits already. Called under the connection monitor.
     private void unparkWriter() {
-        if (writerIdle) {
-            writerIdle = false;
-            LockSupport.unpark(writerThread);
-        }
+        wake();
     }
 
-    private void writeLoop() {
-        // Unless a write fails, the writer ends an open connection only after its last
-        // packet, and the connection already holds the reason for that end.
-        String reason = "last packet written";
-        try {
-            while (true) {
-                List<SendQueue.Send<Outbound>> sends;
-                byte[] last;
-                while (true) {
-                    synchronized (this) {
-                        sends = outgoing.pollBatch(BATCH_BYTES);
-                        if (ended) {
-                            return;
-                        }
-                        last = lastPacket;
-                        if (!sends.isEmpty() || last != null) {
-                            break;
-                        }
-                        writerIdle = true;
-                    }
-                    // Parks outside the monitor, so that the threads that give the writer work can
-                    // take it. An unpark in between leaves a permit, and a spurious return only
-                    // makes the writer look again.
-                    LockSupport.park(this);
-                    if (Thread.interrupted()) {
-                        throw new InterruptedException();
-                    }
-                }
-                if (sends.isEmpty()) {
-                    writer.write(requireNonNull(last));
+    private void writeReady() throws IOException {
+        // One batch per turn bounds the time a writable peer keeps the selector. Completed
+        // batches requeue the connection; zero-byte writes wait only for OP_WRITE.
+        if (writingParts.length == 0) {
+            byte[] last;
+            synchronized (this) {
+                writing = outgoing.pollBatch(BATCH_BYTES);
+                if (ended) {
                     return;
                 }
-                boolean delivers = false;
-                for (SendQueue.Send<Outbound> send : sends) {
-                    delivers |= send.value() instanceof Outbound.Publish;
+                last = lastPacket;
+            }
+            if (writing.isEmpty()) {
+                if (last == null) {
+                    return;
                 }
+                writingParts = new ByteBuffer[] {ByteBuffer.wrap(last)};
+                writingLast = true;
+            } else {
+                boolean delivers = writing.stream()
+                        .anyMatch(send -> send.value() instanceof Outbound.Publish);
                 boolean skip = false;
                 if (delivers) {
                     settings.beforeDeliveryWrite().run();
-                    // This monitor decides. A session ends the connection that it leaves, under
-                    // this monitor, before it resends the connection's deliveries elsewhere, so
-                    // a delivery is marked as sent before the resend reads the mark, or is never
-                    // written here.
                     synchronized (this) {
-                        if (!ended && lastPacket == null) {
-                            for (SendQueue.Send<Outbound> send : sends) {
+                        if (ended) {
+                            return;
+                        }
+                        skip = lastPacket != null;
+                        if (!skip) {
+                            for (SendQueue.Send<Outbound> send : writing) {
                                 if (send.value() instanceof Outbound.Publish publish) {
                                     publish.delivery().sent = true;
                                 }
                             }
-                        } else if (lastPacket != null) {
-                            // The deliveries stay unsent for the session's next connection;
-                            // the last packet still follows.
-                            skip = true;
-                        } else {
-                            return;
                         }
                     }
                 }
-                ByteBuffer[] parts = parts(sends, skip);
-                if (parts.length > 0) {
-                    writer.writeParts(parts);
-                }
-                boolean resume;
-                Session owner;
-                synchronized (this) {
-                    outgoing.completed(sends.getLast().ticket());
-                    sendReleased();
-                    // Refusal and completion share this monitor, so no wakeup is lost.
-                    resume = awaitingSpace;
-                    awaitingSpace = false;
-                    owner = client.session;
-                    // The reader may wait for room for its next response.
-                    notifyAll();
-                }
-                if (resume && owner != null) {
-                    owner.requestDrain(settings.inPlace());
+                writingParts = parts(writing, skip);
+            }
+        }
+        if (writingParts.length > 0) {
+            writeParts();
+            for (ByteBuffer part : writingParts) {
+                if (part.hasRemaining()) {
+                    return;
                 }
             }
-        } catch (Throwable failure) {
-            reason = failureReason("writer", failure);
-        } finally {
-            close(reason);
-            outgoing.ended();
-            // Each started connection has one writer, so every end is logged exactly once.
-            logEnd();
         }
+        writingParts = new ByteBuffer[0];
+        if (writingLast) {
+            close("last packet written");
+            return;
+        }
+        boolean resume;
+        boolean more;
+        Session owner;
+        synchronized (this) {
+            outgoing.completed(writing.getLast().ticket());
+            writing = List.of();
+            sendReleased();
+            resume = awaitingSpace;
+            awaitingSpace = false;
+            owner = client.session;
+            more = outgoing.hasReady() || lastPacket != null;
+        }
+        if (resume && owner != null) {
+            owner.requestDrain(settings.inPlace());
+        }
+        if (more) {
+            wake();
+        }
+    }
+
+    // A gathering write copies heap buffers into temporary direct buffers. Cap the part of
+    // a large payload passed to each call, so a partial write does not copy its whole tail.
+    private void writeParts() throws IOException {
+        for (int i = 0; i < writingParts.length; i++) {
+            ByteBuffer part = writingParts[i];
+            if (part.remaining() > BATCH_BYTES) {
+                int limit = part.limit();
+                part.limit(part.position() + BATCH_BYTES);
+                try {
+                    if (socket.getChannel().write(writingParts, 0, i + 1) > 0) {
+                        wake();
+                    }
+                } finally {
+                    part.limit(limit);
+                }
+                return;
+            }
+        }
+        socket.getChannel().write(writingParts);
     }
 
     // The parts of the one write that carries `sends`: the bytes of each packet that was queued
@@ -637,8 +766,6 @@ final class Connection {
         lastPacket = bytes;
         endReason = reason;
         unparkWriter();
-        // The reader may wait for room for a response, which is dropped from now on.
-        notifyAll();
     }
 
     private synchronized void received() {
@@ -719,11 +846,11 @@ final class Connection {
                 terminate("timer failure");
             }
         }
-        // Ending the connection releases reader/writer, which hand its end to the session. The
-        // shared timer waits for no session before checking another peer.
+        // Ending reserves selector work to hand the end to the session. The shared timer waits
+        // for no actor before checking another peer.
     }
 
-    // Stops I/O; the exiting reader and writer hand the connection's end to the session.
+    // Stops I/O and reserves selector work for any remaining session cleanup.
     private void terminate(String reason) {
         if (ended) {
             return;
@@ -736,13 +863,6 @@ final class Connection {
         cancelTimer();
         outgoing.close();
         unparkWriter();
-        // The reader may wait for room for a response.
-        notifyAll();
-        try {
-            socket.close();
-        } catch (IOException failure) {
-            log.warn("Closing broker peer {} failed", socket.getRemoteSocketAddress(), failure);
-        }
     }
 
     // Ends the connection and hands its end, once, to the session that it is attached to.
@@ -756,10 +876,30 @@ final class Connection {
             endHandled = true;
             owner = client.session;
         }
-        routing.connections.remove(this);
-        if (owner != null) {
+        if (owner != null && !routing.closed) {
             owner.post(client::connectionEnded, settings.inPlace());
         }
+    }
+
+    // Only the selector cancels the key, closes the channel and releases its write batch.
+    void dispose() {
+        if (disposed) {
+            return;
+        }
+        disposed = true;
+        close("broker closed");
+        try {
+            if (key != null) {
+                key.cancel();
+            }
+            socket.close();
+        } catch (IOException failure) {
+            log.warn("Closing broker peer {} failed", socket.getRemoteSocketAddress(), failure);
+        } finally {
+            outgoing.ended();
+            routing.connections.remove(this);
+        }
+        logEnd();
     }
 
     // Has the connection's client belong to `session`, whose actor accepted the CONNECT, and
@@ -774,8 +914,8 @@ final class Connection {
     // Ends the connection for a failure in handling one of its packets, as the reader ends it for
     // one in reading: a packet that breaks the protocol with DISCONNECT, after which the writer
     // closes it.
-    void failed(Throwable failure) {
-        String reason = failureReason("reader", failure);
+    void failed(String operation, Throwable failure) {
+        String reason = failureReason(operation, failure);
         if (failure instanceof PacketDecodeException violation) {
             disconnect(violation.reasonCode(), reason);
         }

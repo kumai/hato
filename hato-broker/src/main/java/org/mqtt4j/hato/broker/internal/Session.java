@@ -8,6 +8,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.RejectedExecutionException;
 
 import org.jspecify.annotations.Nullable;
 
@@ -31,14 +32,10 @@ import static java.util.Objects.requireNonNull;
 // the attached connection, and the subscriptions, so that publishers can queue deliveries for
 // the session without its turn.
 //
-// A thread that posts an event while no thread holds the turn takes it and runs the events
-// itself, which spares waking another thread. A connection's reader and writer run a few so,
-// then hand the rest over to a new virtual thread and get back to their socket. A thread that
-// already holds another session's turn, such as a publisher that drains a subscriber, runs only
-// the event that it came for, so that no thread holds more than a few turns at once. Timers only
-// post. A thread takes a turn only while no other holds it, and one that holds a turn never
-// waits for another, so the actors cannot deadlock; a reader waits, for room in the inbox or for
-// its CONNECT, only while it holds none. Lock order is topic lock -> inbox -> Connection.
+// The selector and timers normally post work for the actor pool. A publisher can take a
+// subscriber's idle turn to drain it in place. A thread holding a turn never waits for another,
+// and the selector pauses reads when the inbox has no room. Lock order is
+// topic lock -> inbox -> Connection.
 //
 // One actor serves a client identifier while the session table holds it: a CONNECT that starts
 // a new session resets the state in place. The actor leaves the table only as its session ends,
@@ -47,9 +44,8 @@ final class Session {
 
     private static final Log log = Log.of(Session.class);
 
-    // How many events a thread that takes the turn runs in place, besides a connection's reader
-    // and writer, which run as many as the settings say: a thread that holds another session's
-    // turn, or closes the broker, only the one that it came for, and a timer none.
+    // A publisher that takes a subscriber's idle turn runs only the drain that it came for.
+    // Timers post work to the pool.
     static final int ALONE = 1;
 
     static final int ELSEWHERE = 0;
@@ -148,6 +144,14 @@ final class Session {
     // Whether the session has logged a dropped delivery at warning level yet.
     private boolean dropLogged;
 
+    // The selector paused on a full packet inbox and needs a wake when it has room.
+    private @Nullable Connection waitingReader;
+
+    // At most one report per session waits for the pool, even if many deliveries are dropped.
+    private @Nullable String dropCause;
+
+    private long droppedCount;
+
     // The connection attached to the session, which publishers and the test controls read.
     volatile @Nullable Connection connection;
 
@@ -165,8 +169,11 @@ final class Session {
 
     private final Runnable drainEvent = this::drain;
 
-    // The thread that holds the turn, or null while none does, and then no event waits.
+    // The thread holding the turn, QUEUED while a pool task waits, or null when idle.
     private @Nullable Thread runner;
+
+    // A queued turn owns the actor until a pool thread takes it.
+    private static final Thread QUEUED = Thread.ofPlatform().unstarted(() -> { });
 
     // Set once the session has ended and left the session table: deliveries pass it by, and a
     // CONNECT that comes to it goes to the table again.
@@ -201,7 +208,7 @@ final class Session {
     }
 
     // Posts `event`, which the actor runs after those posted before. If no thread holds the
-    // turn, the calling thread takes it and runs up to `inPlace` events here, and a new virtual
+    // turn, the calling thread takes it and runs up to `inPlace` events here, and a pool
     // thread runs the rest, or all of them for 0. A thread that holds this session's turn
     // already only queues the event.
     void post(Runnable event, int inPlace) {
@@ -214,16 +221,16 @@ final class Session {
     }
 
     // Posts a packet that `from` received, as post() does for a connection's reader, which
-    // reserved room for its response if `answered`. The reader waits while the received packets
-    // that wait already fill their limits.
-    void receive(Connection from, Packet packet, boolean answered, int bytes)
-            throws InterruptedException {
+    // reserved room for its response if `answered`. The selector pauses reads
+    // while received packets fill their limits.
+    boolean receive(Connection from, Packet packet, boolean answered, int bytes) {
         var event = new Received(from, packet, answered, bytes);
         Thread claimed;
         synchronized (this) {
-            while (receivedCount >= RECEIVED_COUNT
+            if (receivedCount >= RECEIVED_COUNT
                     || (receivedCount > 0 && bytes > RECEIVED_BYTES - receivedBytes)) {
-                wait();
+                waitingReader = from;
+                return false;
             }
             events.addLast(event);
             receivedCount++;
@@ -231,6 +238,7 @@ final class Session {
             claimed = claimTurn(settings.inPlace());
         }
         start(claimed, settings.inPlace());
+        return true;
     }
 
     // Asks the actor to send what waits, as post() does with a drain.
@@ -253,36 +261,52 @@ final class Session {
     }
 
     // Gives the turn, if no thread holds it, to the calling thread when it runs events in place,
-    // and else to a new virtual thread, and returns the thread that took it; null when another
+    // and else to the pool, and returns the thread that took it; null when another
     // thread holds it. Called under the inbox.
     private @Nullable Thread claimTurn(int inPlace) {
         if (runner != null) {
             return null;
         }
-        runner = (inPlace > 0) ? Thread.currentThread() : newRunner();
+        runner = (inPlace > 0) ? Thread.currentThread() : QUEUED;
         return runner;
     }
 
-    // Runs the events on the thread that has just taken the turn.
+    // Runs the turn here or submits its reservation to the pool.
     private void start(@Nullable Thread claimed, int inPlace) {
         if (claimed == Thread.currentThread()) {
             run(inPlace);
         } else if (claimed != null) {
-            claimed.start();
+            submitTurn();
         }
     }
 
-    private Thread newRunner() {
-        return Thread.ofVirtual()
-                .name(routing.runnerName)
-                .unstarted(() -> run(Integer.MAX_VALUE));
+    private void submitTurn() {
+        try {
+            routing.actors.execute(this::runQueued);
+        } catch (RejectedExecutionException failure) {
+            if (!routing.closed) {
+                throw failure;
+            }
+            // A reserved turn can reach the executor after shutdown. Drain its queued
+            // cleanup on the submitting thread.
+            runQueued();
+        }
+    }
+
+    private void runQueued() {
+        synchronized (this) {
+            runner = Thread.currentThread();
+        }
+        // Yield after 256 events so a hot actor cannot keep a pool worker forever.
+        // A time budget would also bound turns with expensive routing.
+        run(256);
     }
 
     // Runs the events while the calling thread holds the turn: at most `budget` of them, after
-    // which it hands the rest over to a new virtual thread, and lets go of the turn once none is
+    // which it hands the rest over to the pool, and lets go of the turn once none is
     // left.
     private void run(int budget) {
-        for (int ran = 0; ran < budget; ran++) {
+        for (int ran = 0; ran < budget || routing.closed; ran++) {
             Runnable next;
             synchronized (this) {
                 next = events.pollFirst();
@@ -295,22 +319,22 @@ final class Session {
                 } else if (next instanceof Received taken) {
                     receivedCount--;
                     receivedBytes -= taken.bytes;
-                    // A reader may wait for room.
-                    notifyAll();
+                    if (waitingReader != null) {
+                        waitingReader.wake();
+                        waitingReader = null;
+                    }
                 }
             }
             perform(next);
         }
-        Thread successor;
         synchronized (this) {
             if (events.isEmpty()) {
                 runner = null;
                 return;
             }
-            successor = newRunner();
-            runner = successor;
+            runner = QUEUED;
         }
-        successor.start();
+        submitTurn();
     }
 
     private void perform(Runnable event) {
@@ -334,7 +358,7 @@ final class Session {
                 from.client.process(this, received.packet);
             }
         } catch (Throwable failure) {
-            from.failed(failure);
+            from.failed("packet handling", failure);
         } finally {
             if (received.answered) {
                 from.responseSettled();
@@ -750,16 +774,41 @@ final class Session {
         return room.count > settings.maxQueued() || room.bytes > settings.maxQueuedBytes();
     }
 
-    // Logs a delivery that the session goes without: the first at warning level, so that the
-    // client that falls behind shows, and later ones at debug level. Called under the inbox.
+    // Records a drop under the inbox. The report runs without the inbox or topic lock,
+    // since the application's logging backend can block.
     private void dropped(String cause) {
-        if (!dropLogged) {
+        droppedCount++;
+        if (dropCause == null && !routing.closed) {
+            dropCause = cause;
+            try {
+                routing.actors.execute(this::logDrops);
+            } catch (RejectedExecutionException failure) {
+                if (!routing.closed) {
+                    throw failure;
+                }
+            }
+        }
+    }
+
+    private void logDrops() {
+        String cause;
+        long count;
+        boolean first;
+        synchronized (this) {
+            cause = requireNonNull(dropCause);
+            dropCause = null;
+            count = droppedCount;
+            droppedCount = 0;
+            first = !dropLogged;
             dropLogged = true;
+        }
+        if (first) {
             log.warn("Broker on port {} dropped a delivery for client {}: {}; later ones are"
                     + " logged at debug level", routing.port, clientId, cause);
-        } else {
-            log.debug("Broker on port {} dropped a delivery for client {}: {}",
-                    routing.port, clientId, cause);
+        }
+        if (!first || count > 1) {
+            log.debug("Broker on port {} dropped {} deliveries for client {}; first cause: {}",
+                    routing.port, first ? count - 1 : count, clientId, cause);
         }
     }
 

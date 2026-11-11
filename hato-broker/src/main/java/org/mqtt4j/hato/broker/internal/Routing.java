@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -7,6 +8,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -31,11 +34,14 @@ final class Routing {
 
     final BrokerSettings settings;
 
+    final Reactor[] reactors;
+
+    final AtomicInteger nextReactor = new AtomicInteger();
+
+    final ExecutorService actors;
+
     // The port that the broker listens on, for thread names and logs.
     final int port;
-
-    // The name of the virtual threads that run the events of sessions.
-    final String runnerName;
 
     final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 
@@ -71,12 +77,33 @@ final class Routing {
 
     volatile boolean closed;
 
-    Routing(BrokerSettings settings, int port) {
+    Routing(BrokerSettings settings, int port, Runnable stopBroker) throws IOException {
         this.settings = settings;
         this.port = port;
-        runnerName = "hato-broker-" + port + "-session";
+        int selectors = Integer.getInteger("hato.broker.selectors", 4);
+        if (selectors <= 0) {
+            throw new IllegalArgumentException("Selector count must be positive");
+        }
         retained = new RetainedMessages(settings, port);
         capabilities = settings.capabilities();
+        reactors = new Reactor[selectors];
+        actors = Executors.newFixedThreadPool(
+                Integer.getInteger("hato.broker.actors", 2),
+                Thread.ofPlatform().daemon().name("hato-broker-" + port + "-actor-", 0).factory()
+        );
+        try {
+            for (int i = 0; i < reactors.length; i++) {
+                reactors[i] = new Reactor(this, i, stopBroker);
+            }
+        } catch (IOException | RuntimeException | Error failure) {
+            for (Reactor reactor : reactors) {
+                if (reactor != null) {
+                    reactor.close();
+                }
+            }
+            actors.shutdown();
+            throw failure;
+        }
     }
 
     void refuseSubscriptions(String filter, Reason reason) {

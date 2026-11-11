@@ -6,13 +6,12 @@ import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 
 // The internal limits and test hooks of one broker, which `BrokerServer.Builder` checks before
-// the broker starts. The connect timeout is in nanoseconds. `inPlace` is how many events of its
-// session a connection's reader or writer runs itself before it hands the rest over (see
-// Session). The capabilities are what the broker announces to MQTT 5.0 clients until a test
-// changes them. A connection's reader calls `beforeProcess` before it hands a packet to the
-// session, and the session's actor calls `beforeHandle` as it starts to handle one. A
-// connection's writer calls `beforeDeliveryWrite` before it marks the deliveries of a write as
-// sent.
+// the broker starts. The connect timeout is in nanoseconds. `inPlace` is the event budget for
+// selector threads that take an idle session's turn. A zero budget sends all actor work to the
+// pool. The capabilities are what the broker announces to MQTT 5.0 clients until a test changes
+// them. The selector calls `beforeProcess` before handing a packet to its session and
+// `beforeDeliveryWrite` before marking the deliveries of a write as sent. The session's actor
+// calls `beforeHandle` when it starts handling a packet.
 record BrokerSettings(
         long connectTimeout,
         long sendBytes,

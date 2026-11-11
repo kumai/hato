@@ -24,8 +24,7 @@ import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 
 import static java.util.Objects.requireNonNull;
 
-/// One listener whose connections, each with its own reader and writer, share the bounded,
-/// in-memory sessions of one broker.
+/// One listener whose connections share the bounded, in-memory sessions of one broker.
 public final class BrokerServer implements AutoCloseable {
 
     private static final Log log = Log.of(BrokerServer.class);
@@ -52,16 +51,16 @@ public final class BrokerServer implements AutoCloseable {
     // that follows the protocol never holds more.
     private static final int MAX_HELD = 65_535;
 
-    // A few, so that a reader or writer that runs its session's events gets back to its socket.
-    private static final int IN_PLACE = 16;
+    // Keep selector I/O separate from actor execution by default; the property is for trials.
+    private static final int IN_PLACE = Integer.getInteger("hato.broker.inPlace", 0);
 
     private final ServerSocket listener;
 
     private final Routing routing;
 
-    private BrokerServer(ServerSocket listener, BrokerSettings settings) {
+    private BrokerServer(ServerSocket listener, BrokerSettings settings) throws IOException {
         this.listener = listener;
-        routing = new Routing(settings, listener.getLocalPort());
+        routing = new Routing(settings, listener.getLocalPort(), this::close);
     }
 
     public static BrokerServer start(InetSocketAddress address) throws IOException {
@@ -248,9 +247,17 @@ public final class BrokerServer implements AutoCloseable {
             try {
                 listener.bind(address);
                 var server = new BrokerServer(listener, settings);
-                Thread.ofVirtual()
-                        .name("hato-broker-" + server.port() + "-accept")
-                        .start(server::accept);
+                try {
+                    for (Reactor reactor : server.routing.reactors) {
+                        reactor.start();
+                    }
+                    Thread.ofPlatform().daemon()
+                            .name("hato-broker-" + server.port() + "-accept")
+                            .start(server::accept);
+                } catch (RuntimeException | Error failure) {
+                    server.close();
+                    throw failure;
+                }
                 return server;
             } catch (IOException | RuntimeException | Error failure) {
                 try {
@@ -273,18 +280,11 @@ public final class BrokerServer implements AutoCloseable {
                 Socket socket = listener.accept();
                 Connection connection = null;
                 try {
-                    if (routing.closed) {
+                    connection = new Connection(socket, routing);
+                    if (!connection.start()) {
                         socket.close();
                         return;
                     }
-                    connection = new Connection(socket, routing);
-                    routing.connections.add(connection);
-                    // A close that began meanwhile may have missed the connection.
-                    if (routing.closed) {
-                        connection.close("broker closed");
-                        return;
-                    }
-                    connection.start();
                 } catch (Throwable failure) {
                     if (connection != null) {
                         connection.close("start failed");
@@ -330,7 +330,14 @@ public final class BrokerServer implements AutoCloseable {
         } catch (IOException failure) {
             log.warn("Closing broker listener on port {} failed", port(), failure);
         }
-        routing.clear();
+        try {
+            routing.clear();
+        } finally {
+            routing.actors.shutdown();
+            for (Reactor reactor : routing.reactors) {
+                reactor.close();
+            }
+        }
     }
 
     /// Refuses later subscriptions to exactly `filter`: SUBACK answers them with failure 0x80,

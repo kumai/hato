@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import org.jspecify.annotations.Nullable;
@@ -90,10 +91,10 @@ final class Client {
         settings = routing.settings;
     }
 
-    // Accepts the CONNECT that opens the connection, or refuses it, and returns whether it was
-    // accepted. Called by the reader, which checks the request alone and waits while the actor of
-    // the client identifier's session takes the connection over.
-    boolean connect(Packet.Connect request) {
+    // Checks CONNECT on the selector and reports through `done` whether the session attached.
+    // The connection pauses reads while its session actor takes the connection over.
+    // No selector thread waits for the acceptance to finish.
+    void connect(Packet.Connect request, Consumer<Boolean> done) {
         // MQTT 3.1.1 refuses an empty identifier for a persistent session [MQTT-3.1.3-8];
         // MQTT 5.0 assigns one below whatever the session.
         if (request.version() == MqttVersion.V3_1_1
@@ -103,17 +104,20 @@ final class Client {
                     ReasonCode.CLIENT_IDENTIFIER_NOT_VALID,
                     "an empty persistent identifier"
             );
-            return false;
+            done.accept(false);
+            return;
         }
         if (request.properties().find(PropertyId.AUTHENTICATION_METHOD).isPresent()) {
             connection.refuse(
                     ReasonCode.BAD_AUTHENTICATION_METHOD,
                     "authentication for client '" + request.clientId() + "'"
             );
-            return false;
+            done.accept(false);
+            return;
         }
         if (connection.isEnded()) {
-            return false;
+            done.accept(false);
+            return;
         }
         Packet.Will requestedWill = request.will();
         // MQTT 3.1.1 leaves the retention of a Clean Session 0 session to the broker, which
@@ -134,7 +138,8 @@ final class Client {
                 );
             };
             connection.refuse(answer, "client '" + request.clientId() + "' by a test rule");
-            return false;
+            done.accept(false);
+            return;
         }
         // The connection keeps what its CONNACK announces. MQTT 3.1.1 announces nothing.
         Capabilities offered = switch (request.version()) {
@@ -149,14 +154,16 @@ final class Client {
                     ReasonCode.QOS_NOT_SUPPORTED,
                     "a Will above the maximum QoS for client '" + request.clientId() + "'"
             );
-            return false;
+            done.accept(false);
+            return;
         }
         if (requestedWill != null && requestedWill.retain() && !offered.retainAvailable()) {
             connection.refuse(
                     ReasonCode.RETAIN_NOT_SUPPORTED,
                     "a retained Will for client '" + request.clientId() + "'"
             );
-            return false;
+            done.accept(false);
+            return;
         }
         // Inline expiry or a scheduling failure must happen before taking over a peer.
         // A Server Keep Alive replaces the client's own [MQTT-3.2.2-21] [MQTT-3.2.2-22].
@@ -165,7 +172,8 @@ final class Client {
                 (serverKeepAlive == null) ? request.keepAliveSeconds() : serverKeepAlive
         );
         if (connection.isEnded()) {
-            return false;
+            done.accept(false);
+            return;
         }
         String id = request.clientId();
         if (id.isEmpty()) {
@@ -175,16 +183,19 @@ final class Client {
         }
         var acceptance = new Acceptance(request, id, offered, expiry);
         acceptance.post(settings.inPlace());
-        if (!acceptance.accepted.join()) {
-            return false;
-        }
-        Integer maximumPacketSize = offered.maximumPacketSize();
-        if (maximumPacketSize != null) {
-            connection.limitPacketSize(maximumPacketSize);
-        }
-        log.info("Broker accepted client {} from {} on port {}",
-                id, connection.remoteAddress(), routing.port);
-        return true;
+        acceptance.accepted.thenAccept(accepted -> {
+            if (!accepted) {
+                done.accept(false);
+                return;
+            }
+            Integer maximumPacketSize = offered.maximumPacketSize();
+            if (maximumPacketSize != null) {
+                connection.limitPacketSize(maximumPacketSize);
+            }
+            log.info("Broker accepted client {} from {} on port {}",
+                    acceptance.id, connection.remoteAddress(), routing.port);
+            done.accept(true);
+        });
     }
 
     // Has the connection take over the session of `id` on `actor`, which continues the session or
@@ -834,8 +845,8 @@ final class Client {
         publishWill();
     }
 
-    // The acceptance of this connection's CONNECT, which the actor of its client identifier's
-    // session runs while the reader waits for it.
+    // The acceptance of CONNECT, which the session actor runs while the connection pauses
+    // reads; completing it reserves a task on the connection's selector.
     private final class Acceptance implements Runnable {
 
         private final Packet.Connect request;

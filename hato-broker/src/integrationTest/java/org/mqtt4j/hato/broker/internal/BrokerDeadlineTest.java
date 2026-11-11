@@ -1,8 +1,10 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -19,11 +21,14 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
+import org.mqtt4j.hato.broker.internal.common.io.FrameReader;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.protocol.Property;
 import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
+import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.testkit.ManualTimerScheduler;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -33,6 +38,7 @@ import static org.mqtt4j.hato.broker.internal.RawSession.connect;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
+import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.EXACTLY_ONCE;
@@ -146,44 +152,52 @@ class BrokerDeadlineTest {
     }
 
     @Test
-    void a_writer_that_its_peer_holds_up_cannot_keep_a_timed_out_connection_open()
+    void a_peer_that_stops_reading_cannot_keep_a_timed_out_connection_open()
             throws Exception {
         var timer = new ManualTimer();
-        var armed = new AtomicBoolean();
-        var held = new CountDownLatch(1);
-        var release = new CountDownLatch(1);
+        var codec = PacketCodec.of(MqttVersion.V5);
         try (
-                BrokerServer sut = BrokerServer.builder()
-                        .connectTimeout(CONNECT_TIMEOUT)
-                        .scheduler(timer)
-                        .beforeDeliveryWrite(() -> {
-                            if (armed.compareAndSet(true, false)) {
-                                held.countDown();
-                                awaitCountDown(release);
-                            }
-                        })
-                        .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
-                var subscriber = RawSession.open(sut.port(), MqttVersion.V5);
+                BrokerServer sut = start(timer);
+                var subscriber = new Socket();
                 var publisher = connected(sut.port(), "publisher")
         ) {
-            // Arrange: the subscriber's writer holds a delivery, as for a peer that stops reading.
-            subscriber.send(connectV5("held", true, 1, 0));
-            subscriber.expect(Packet.ConnAck.class);
-            subscriber.subscribe("held/#", AT_MOST_ONCE);
-            armed.set(true);
-            publisher.publish("held/topic", "held", AT_MOST_ONCE, 0);
-            awaitCountDown(held);
+            // Arrange: a small TCP receive window keeps the delivery in progress while this
+            // subscriber stops reading. Read its first byte to establish that sending began.
+            subscriber.setReceiveBufferSize(16 * 1024);
+            subscriber.setSoTimeout(5_000);
+            subscriber.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), sut.port()));
+            InputStream input = subscriber.getInputStream();
+            var reader = new FrameReader(input, 1024);
+            subscriber.getOutputStream().write(codec.encode(connectV5("held", true, 1, 0)));
+            assertThat(codec.decode(reader.read().orElseThrow()))
+                    .isInstanceOf(Packet.ConnAck.class);
+            var subscribe = new Packet.Subscribe(
+                    1,
+                    List.of(subscription("held/#", AT_MOST_ONCE)),
+                    EMPTY
+            );
+            subscriber.getOutputStream().write(codec.encode(subscribe));
+            assertThat(codec.decode(reader.read().orElseThrow())).isInstanceOf(Packet.SubAck.class);
+            var payload = new byte[8 * 1024 * 1024];
+            publisher.publish(new Packet.Publish(
+                    new Topic("held/topic"),
+                    payload,
+                    AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    EMPTY
+            ));
+            assertThat(input.read()).isEqualTo(0x30);
 
             // Act: the keep-alive expires, and then the time for writing DISCONNECT.
             timer.clock.advance(KEEP_ALIVE_TIMEOUT);
             timer.clock.advance(CONNECT_TIMEOUT);
 
-            // Assert
-            subscriber.expectClosed();
+            // Assert: the stream ends inside the delivery even as the peer starts reading again.
+            assertThat(input.readNBytes(payload.length).length).isLessThan(payload.length);
             assertThat(timer.clock.pendingTaskCount()).isZero();
             publisher.ping();
-        } finally {
-            release.countDown();
         }
     }
 

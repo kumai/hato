@@ -2,19 +2,15 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
 import java.net.BindException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.net.Socket;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.regex.Pattern;
 
-import com.sun.management.HotSpotDiagnosticMXBean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -265,35 +261,79 @@ class BrokerConnectionTest {
     }
 
     @Test
-    void the_threads_of_a_connection_end_with_the_connection() throws Exception {
+    void all_selectors_keep_serving_through_repeated_disconnects() throws Exception {
         try (var sut = MqttBroker.start()) {
-            try (RawSession client = connected(sut.port(), "threads")) {
-                client.ping();
-                assertThat(connectionThreads(sut.port())).isEqualTo(2);
+            long selectors = selectors(sut.port());
+            assertThat(selectors).isPositive();
+            for (int i = 0; i < 2_000; i++) {
+                try (RawSession client = connected(sut.port(), "churn")) {
+                    client.send(new Packet.Disconnect(SUCCESS, EMPTY));
+                }
             }
-            await().until(() -> connectionThreads(sut.port()) == 0);
+            for (long i = 0; i < selectors; i++) {
+                try (RawSession client = connected(sut.port(), "after-churn")) {
+                    client.ping();
+                }
+            }
+            assertThat(selectors(sut.port())).isEqualTo(selectors);
         }
     }
 
-    // How many threads read or write the connections of the broker on `port`. A thread dump counts
-    // them because Thread.getAllStackTraces() leaves virtual threads out.
-    private static long connectionThreads(int port) throws IOException {
-        HotSpotDiagnosticMXBean diagnostic =
-                ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
-        Path file = Files.createTempFile("hato-threads", ".json");
-        try {
-            Files.delete(file);
-            diagnostic.dumpThreads(
-                    file.toString(),
-                    HotSpotDiagnosticMXBean.ThreadDumpFormat.JSON
+    @Test
+    void a_client_that_half_closes_can_read_the_brokers_final_packet() throws Exception {
+        var v5 = PacketCodec.of(MqttVersion.V5);
+        try (
+                var sut = MqttBroker.start();
+                var client = new Socket(InetAddress.getLoopbackAddress(), sut.port())
+        ) {
+            client.setSoTimeout(5_000);
+            client.getOutputStream().write(
+                    v5.encode(RawSession.connectV5("half-close", true, 0, 0))
             );
-            Pattern threads = Pattern.compile(
-                    "\"name\": \"hato-broker-" + port + "-[^\"]*-(reader|writer)\""
-            );
-            return threads.matcher(Files.readString(file)).results().count();
-        } finally {
-            Files.deleteIfExists(file);
+            byte[] connAck = v5.encode(RawSession.acceptedV5(false));
+            assertThat(client.getInputStream().readNBytes(connAck.length)).isEqualTo(connAck);
+
+            // PINGRESP from the client is a protocol error detected on its actor.
+            client.getOutputStream().write(v5.encode(new Packet.PingResp()));
+            client.shutdownOutput();
+
+            byte[] disconnect = v5.encode(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
+            assertThat(client.getInputStream().readNBytes(disconnect.length))
+                    .isEqualTo(disconnect);
+            assertThat(client.getInputStream().read()).isEqualTo(-1);
         }
+    }
+
+    @Test
+    void a_failed_selector_closes_the_listener_and_its_peers() throws Exception {
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        try (
+                BrokerServer sut = BrokerServer.builder().beforeProcess(packet -> {
+                    if (packet instanceof Packet.PingReq) {
+                        throw new AssertionError("injected selector failure");
+                    }
+                }).start(address);
+                RawSession client = connected(sut.port(), "trigger");
+                RawSession other = connected(sut.port(), "other")
+        ) {
+            int port = sut.port();
+            client.send(new Packet.PingReq());
+
+            client.expectClosed();
+            other.expectClosed();
+            await().until(() -> selectors(port) == 0);
+            var sameAddress = new InetSocketAddress(address.getAddress(), port);
+            try (var listener = MqttBroker.start(sameAddress)) {
+                assertThat(listener.port()).isEqualTo(port);
+            }
+        }
+    }
+
+    private static long selectors(int port) {
+        String prefix = "hato-broker-" + port + "-selector-";
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(thread -> thread.getName().startsWith(prefix))
+                .count();
     }
 
     private static BrokerServer shortConnectDeadline() throws IOException {
