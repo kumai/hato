@@ -55,9 +55,6 @@ public final class BrokerServer implements AutoCloseable {
     // that follows the protocol never holds more.
     private static final int MAX_HELD = 65_535;
 
-    // Keep selector I/O separate from actor execution by default; the property is for trials.
-    private static final int IN_PLACE = Integer.getInteger("hato.broker.inPlace", 0);
-
     private final ServerSocketChannel listener;
 
     // Tells the accepting thread that a connection waits at the listener, which is all that it
@@ -130,8 +127,6 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxHeld = MAX_HELD;
 
-        private int inPlace = IN_PLACE;
-
         private Capabilities capabilities = Capabilities.DEFAULT;
 
         private Timer scheduler = TimerService.instance;
@@ -197,11 +192,6 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
-        Builder inPlace(int value) {
-            inPlace = value;
-            return this;
-        }
-
         Builder capabilities(Capabilities value) {
             capabilities = requireNonNull(value, "capabilities must not be null");
             return this;
@@ -260,7 +250,6 @@ public final class BrokerServer implements AutoCloseable {
                 || maxRetained <= 0
                 || maxRetainedBytes <= 0
                 || maxHeld <= 0
-                || inPlace < 0
             ) {
                 throw new IllegalArgumentException(
                         "Broker limits must be positive and window fit queue"
@@ -277,7 +266,6 @@ public final class BrokerServer implements AutoCloseable {
                     maxRetained,
                     maxRetainedBytes,
                     maxHeld,
-                    inPlace,
                     capabilities,
                     scheduler,
                     beforeProcess,

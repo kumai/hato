@@ -55,9 +55,9 @@ import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.SUCCESS;
 /// How the sessions of one broker run at once: each handles the packets of its connections in
 /// order, while the others go on.
 ///
-/// A session stalls on a hook that its actor calls as it starts to handle a packet. Unless a
-/// test says otherwise, a connection's reader handles its packets itself while no other thread
-/// runs its session, so a session stalls on a packet of its own client.
+/// A session stalls on a hook that its actor calls as it starts to handle a packet. The hook
+/// holds the thread of the actor pool that runs the session, so the other sessions go on only
+/// while the pool has another thread.
 class BrokerConcurrencyTest {
 
     @Test
@@ -266,8 +266,6 @@ class BrokerConcurrencyTest {
         var most = new AtomicInteger();
         var handled = new ConcurrentLinkedQueue<String>();
         try (BrokerServer sut = BrokerServer.builder()
-                // The session runs on threads of its own, which take turns.
-                .inPlace(0)
                 .beforeHandle(packet -> {
                     if (packet instanceof Packet.Publish publish
                             && publish.topic().name().equals("sequence")) {
@@ -360,8 +358,6 @@ class BrokerConcurrencyTest {
         var decoded = new AtomicInteger();
         var stall = new Stall(Packet.PingReq.class::isInstance);
         try (BrokerServer sut = BrokerServer.builder()
-                // The session runs on a thread of its own, so its reader goes on while it stalls.
-                .inPlace(0)
                 .holdDeliveryWrite(writer)
                 .beforeProcess(packet -> {
                     if (armed.get() && packet instanceof Packet.PingReq) {

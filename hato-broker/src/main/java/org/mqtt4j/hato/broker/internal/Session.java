@@ -44,8 +44,9 @@ final class Session {
 
     private static final Log log = Log.of(Session.class);
 
-    // A publisher that takes a subscriber's idle turn runs only the drain that it came for.
-    // Timers post work to the pool.
+    // How many events a thread that takes a free turn runs in place. A publisher that takes a
+    // subscriber's turn runs only the drain that it came for, and the broker's selectors and
+    // timers run none: they leave the turn to the pool.
     static final int ALONE = 1;
 
     static final int ELSEWHERE = 0;
@@ -249,20 +250,20 @@ final class Session {
             events.addLast(event);
             receivedCount++;
             receivedBytes += bytes;
-            claimed = claimTurn(settings.inPlace());
+            claimed = claimTurn(ELSEWHERE);
         }
-        start(claimed, settings.inPlace());
+        start(claimed, ELSEWHERE);
         return true;
     }
 
-    // Asks the actor to send what waits, as post() does with a drain.
-    void requestDrain(int inPlace) {
+    // Asks the actor to send what waits, as post() does with a drain for the pool.
+    void requestDrain() {
         Thread claimed;
         synchronized (this) {
             queueDrain();
-            claimed = claimTurn(inPlace);
+            claimed = claimTurn(ELSEWHERE);
         }
-        start(claimed, inPlace);
+        start(claimed, ELSEWHERE);
     }
 
     // Queues a drain behind the events posted so far, unless one waits already. Called under the

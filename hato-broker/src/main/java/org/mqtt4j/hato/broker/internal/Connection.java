@@ -338,7 +338,7 @@ final class Connection {
                 if (failed || !endsWithLastPacket()) {
                     close(reason);
                 }
-            }, settings.inPlace());
+            }, Session.ELSEWHERE);
         }
     }
 
@@ -693,7 +693,7 @@ final class Connection {
             more = outgoing.hasReady() || lastPacket != null;
         }
         if (resume && owner != null) {
-            owner.requestDrain(settings.inPlace());
+            owner.requestDrain();
         }
         if (more) {
             wake();
@@ -924,7 +924,7 @@ final class Connection {
             owner = client.session;
         }
         if (owner != null && !routing.closed) {
-            owner.post(client::connectionEnded, settings.inPlace());
+            owner.post(client::connectionEnded, Session.ELSEWHERE);
         }
     }
 

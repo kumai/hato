@@ -57,9 +57,9 @@ measurement is in [`notes/bench/broker-threads.md`](../../notes/bench/broker-thr
 chapter 9.
 
 The original experiment applied `selector.patch`, `selector-bulk.patch`, `selector-ready.patch`,
-and `selector-fair.patch` and ran with `s0.inPlace=0`. The current experiment defaults to
-`hato.broker.inPlace=0`. The internal `hato.broker.selectors`, `hato.broker.actors`,
-and `hato.broker.inPlace` properties are experiment controls.
+and `selector-fair.patch` and ran with `s0.inPlace=0`, which left every actor event to the pool.
+That is the only form now, and the setting is gone. The internal `hato.broker.selectors` and
+`hato.broker.actors` properties are experiment controls.
 The normal Gradle build also regenerates the broker class index and processes nullness metadata.
 
 ## Verification
@@ -168,7 +168,7 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
   limit for eight QoS 1 pairs now.
 - Decide what `close()` has finished when it returns. It does not wait for the selectors, which
   close the sockets.
-- Remove the `hato.broker.*` experiment properties, and rename what still speaks of a writer
-  thread, such as `unparkWriter`.
+- Remove the `hato.broker.selectors` and `hato.broker.actors` experiment properties, and rename
+  what still speaks of a writer thread, such as `unparkWriter`.
 - Run the full broker/client/testkit, distribution, and native-image checks. TLS and application
   authentication are not implemented by this prototype.

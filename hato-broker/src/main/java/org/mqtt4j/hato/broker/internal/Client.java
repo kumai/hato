@@ -182,7 +182,7 @@ final class Client {
             } while (routing.sessions.containsKey(id));
         }
         var acceptance = new Acceptance(request, id, offered, expiry);
-        acceptance.post(settings.inPlace());
+        acceptance.post(Session.ELSEWHERE);
         acceptance.accepted.thenAccept(accepted -> {
             if (!accepted) {
                 done.accept(false);
