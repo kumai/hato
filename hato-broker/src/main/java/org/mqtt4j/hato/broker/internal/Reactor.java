@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
@@ -124,6 +125,13 @@ final class Reactor implements AutoCloseable {
                     selector.select();
                 } else {
                     selector.selectNow();
+                }
+                if (Thread.interrupted()) {
+                    // An interrupted thread no longer waits in a selector, so the loop would
+                    // turn without rest. The thread ends instead, and the broker with it,
+                    // because no other thread serves the connections of this selector. The
+                    // accepting thread ends the broker for an interrupt too.
+                    throw new InterruptedIOException("Interrupted while serving connections");
                 }
                 Iterator<SelectionKey> selected = selector.selectedKeys().iterator();
                 while (selected.hasNext()) {

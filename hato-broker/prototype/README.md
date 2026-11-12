@@ -14,7 +14,7 @@ processes at most 256 events before reserving another turn at the back of the ex
 |---|---|
 | [BrokerServer](../src/main/java/org/mqtt4j/hato/broker/internal/BrokerServer.java) | Platform-thread accept loop that waits in a selector of its own; closes the actor executor and selectors |
 | [Routing](../src/main/java/org/mqtt4j/hato/broker/internal/Routing.java) | Owns the selectors and actor executor; assigns connections round-robin |
-| [Reactor](../src/main/java/org/mqtt4j/hato/broker/internal/Reactor.java) | Owns key and channel cleanup, coalesces wakeups, ends a connection whose work fails, and closes the broker when the selector itself fails |
+| [Reactor](../src/main/java/org/mqtt4j/hato/broker/internal/Reactor.java) | Owns key and channel cleanup, coalesces wakeups, ends a connection whose work fails, and closes the broker when the selector itself fails or its thread is interrupted |
 | [Connection](../src/main/java/org/mqtt4j/hato/broker/internal/Connection.java) | Incremental framing, nonblocking reads and partial writes, pause/resume for bounded queues |
 | [Client](../src/main/java/org/mqtt4j/hato/broker/internal/Client.java) | Reports CONNECT acceptance through an internal callback instead of waiting on a future |
 | [Session](../src/main/java/org/mqtt4j/hato/broker/internal/Session.java) | Uses the actor executor for queued turns; wakes a reader when inbox space returns |
@@ -32,6 +32,10 @@ closing a listener at the moment a thread enters a blocking `accept` can leave `
 in the kernel until another file descriptor operation in the process ends, which in a quiet
 process is never. `close()` closes that selector too, which frees the listening port before it
 returns.
+
+An interrupt ends the accepting thread or a selector thread, and the broker closes with it: an
+interrupted thread no longer waits in a selector, and no other thread serves its sockets. A
+thread of the actor pool takes no notice of an interrupt.
 
 The selectors and the pool hand work to each other in batches. A session's inbox takes 128
 received packets, so that a selector seldom stops within the packets of one read. A QoS 0
@@ -70,10 +74,10 @@ Run from the repository root with the existing JDK 25 toolchain and Gradle cache
 
 The suite tests selector survival through repeated disconnects, that a connection ended by
 another thread stays open until its selector closes it, that an error in one connection leaves
-the others served, broker shutdown on an injected selector failure, the final response after a
-peer half-closes, a DISCONNECT that arrived before a write failed, a burst that overfills a
-session's inbox, and a publication to more subscribers than a worker keeps for the end of its
-turn.
+the others served, broker shutdown on an injected selector failure and on an interrupt of a
+selector thread, the final response after a peer half-closes, a DISCONNECT that arrived before
+a write failed, a burst that overfills a session's inbox, and a publication to more subscribers
+than a worker keeps for the end of its turn.
 
 The race tests stop the broker at a chosen point in two ways. A hook that waits holds its whole
 selector or actor worker, which is what a thread that loses the processor there does; such a
@@ -154,8 +158,6 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
 - Keep the 99th percentile of a fan-out to 1,000 subscribers under its limit of 5 ms at busier
   times too. It stays close to the limit, as before these changes.
 - Give the application a way to learn that the broker closed itself after a selector failed.
-- Decide what an interrupt does to a selector thread. Today its loop spins, because a selector
-  no longer waits once its thread is interrupted. The accepting thread ends the listener.
 - After a failed write, read on until the actor has taken a packet that waits for it. Today the
   input behind such a packet ends with the connection.
 - Count the received packets that wait in all inboxes against a budget for the whole broker.

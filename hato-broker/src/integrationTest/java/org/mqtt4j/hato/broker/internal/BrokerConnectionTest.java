@@ -417,6 +417,34 @@ class BrokerConnectionTest {
         }
     }
 
+    @Test
+    void an_interrupted_selector_ends_and_closes_the_listener_and_its_peers() throws Exception {
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        try (
+                var sut = MqttBroker.start(address);
+                RawSession client = connected(sut.port(), "connected")
+        ) {
+            // Arrange
+            int port = sut.port();
+            String name = "hato-broker-" + port + "-selector-0";
+            Thread selector = Thread.getAllStackTraces().keySet().stream()
+                    .filter(thread -> thread.getName().equals(name))
+                    .findFirst()
+                    .orElseThrow();
+
+            // Act
+            selector.interrupt();
+
+            // Assert: no selector is left, which an interrupted one that went on would be.
+            client.expectClosed();
+            await().until(() -> selectors(port) == 0);
+            var sameAddress = new InetSocketAddress(address.getAddress(), port);
+            try (var listener = MqttBroker.start(sameAddress)) {
+                assertThat(listener.port()).isEqualTo(port);
+            }
+        }
+    }
+
     private static long selectors(int port) {
         String prefix = "hato-broker-" + port + "-selector-";
         return Thread.getAllStackTraces().keySet().stream()
