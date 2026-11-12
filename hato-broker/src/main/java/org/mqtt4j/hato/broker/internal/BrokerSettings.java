@@ -7,7 +7,8 @@ import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 
 // The internal limits and test hooks of one broker, which `BrokerServer.Builder` checks before
-// the broker starts. The connect timeout is in nanoseconds. The capabilities are what the
+// the broker starts. The connect timeout is in nanoseconds. `selectors` and `actors` are the
+// numbers of selector threads and of threads in the actor pool. The capabilities are what the
 // broker announces to MQTT 5.0 clients until a test changes them. The selector calls
 // `beforeProcess` before handing a packet to its session. It asks `deliveryWriteHeld` before
 // marking the deliveries of a write as sent: while the answer is true, the connection keeps
@@ -27,6 +28,8 @@ record BrokerSettings(
         int maxRetained,
         long maxRetainedBytes,
         int maxHeld,
+        int selectors,
+        int actors,
         Capabilities capabilities,
         Timer scheduler,
         Consumer<Packet> beforeProcess,

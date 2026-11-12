@@ -301,6 +301,69 @@ class BrokerConcurrencyTest {
         }
     }
 
+    @Test
+    void a_session_with_a_long_backlog_lets_a_waiting_session_take_its_turn() throws Exception {
+        int workers = 2;
+        int backlog = 2_000;
+        var busy = new CountDownLatch(workers);
+        var release = new CountDownLatch(1);
+        var queued = new CountDownLatch(1);
+        var handled = new AtomicInteger();
+        var handledBefore = new CompletableFuture<Integer>();
+        try (BrokerServer sut = BrokerServer.builder()
+                .actors(workers)
+                .beforeProcess(packet -> {
+                    if (packet instanceof Packet.Publish publish
+                            && publish.topic().name().equals("queued")) {
+                        queued.countDown();
+                    }
+                })
+                .beforeHandle(packet -> {
+                    if (!(packet instanceof Packet.Publish publish)) {
+                        return;
+                    }
+                    if (publish.topic().name().equals("backlog")) {
+                        if (handled.getAndIncrement() < workers) {
+                            busy.countDown();
+                            awaitRelease(release);
+                        }
+                        // Slower than the selector hands the next publications over, so that
+                        // the session never runs out of them.
+                        LockSupport.parkNanos(50_000);
+                    } else if (publish.topic().name().equals("waiting")) {
+                        handledBefore.complete(handled.get());
+                    }
+                })
+                .start(loopback());
+                RawSession first = connected(sut.port(), "first");
+                RawSession second = connected(sut.port(), "second");
+                RawSession waiting = connected(sut.port(), "waiting")) {
+            // Arrange: each thread of the pool stalls on the first publication of one of two
+            // sessions, which both have many more to handle. Their selectors hand the next ones
+            // over as the sessions take them, which a request that waits for room for its
+            // response would not do before the turn ends. The third session's publication
+            // waits for a thread: its selector has handed it over once it decodes the next one.
+            var publications = new ByteArrayOutputStream();
+            for (int number = 0; number < backlog; number++) {
+                publications.writeBytes(codec.encode(publication("backlog", "", AT_MOST_ONCE, 0)));
+            }
+            first.sendRaw(publications.toByteArray());
+            second.sendRaw(publications.toByteArray());
+            awaitRelease(busy);
+            waiting.send(publication("waiting", "", AT_MOST_ONCE, 0));
+            waiting.send(publication("queued", "", AT_MOST_ONCE, 0));
+            awaitRelease(queued);
+
+            // Act
+            release.countDown();
+
+            // Assert: the publication is handled long before either backlog is through.
+            assertThat(handledBefore.get(5, SECONDS)).isLessThan(backlog);
+        } finally {
+            release.countDown();
+        }
+    }
+
     /// The packets whose numbers wait in a session's inbox up to limits of their own: QoS 0
     /// publications, which nothing else holds back, and the others, here acknowledgements of
     /// deliveries that the broker never made, which it ignores.

@@ -76,8 +76,9 @@ The suite tests selector survival through repeated disconnects, that a connectio
 another thread stays open until its selector closes it, that an error in one connection leaves
 the others served, broker shutdown on an injected selector failure and on an interrupt of a
 selector thread, the final response after a peer half-closes, a DISCONNECT that arrived before
-a write failed, a burst that overfills a session's inbox, and a publication to more subscribers
-than a worker keeps for the end of its turn.
+a write failed, a burst that overfills a session's inbox, a publication to more subscribers
+than a worker keeps for the end of its turn, and a session with a long backlog, which lets a
+waiting session take its turn.
 
 The race tests stop the broker at a chosen point in two ways. A hook that waits holds its whole
 selector or actor worker, which is what a thread that loses the processor there does; such a

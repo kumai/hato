@@ -82,14 +82,10 @@ final class Routing {
     Routing(BrokerSettings settings, int port, Runnable stopBroker) throws IOException {
         this.settings = settings;
         this.port = port;
-        int selectors = Integer.getInteger("hato.broker.selectors", 4);
-        if (selectors <= 0) {
-            throw new IllegalArgumentException("Selector count must be positive");
-        }
         retained = new RetainedMessages(settings, port);
         capabilities = settings.capabilities();
-        reactors = new Reactor[selectors];
-        int workers = Integer.getInteger("hato.broker.actors", 2);
+        reactors = new Reactor[settings.selectors()];
+        int workers = settings.actors();
         var nextWorker = new AtomicInteger();
         actors = new ThreadPoolExecutor(
                 workers,

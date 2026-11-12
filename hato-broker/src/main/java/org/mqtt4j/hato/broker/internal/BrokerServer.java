@@ -55,6 +55,12 @@ public final class BrokerServer implements AutoCloseable {
     // that follows the protocol never holds more.
     private static final int MAX_HELD = 65_535;
 
+    // How many selector threads do the socket I/O, and how many threads the actor pool has. The
+    // properties are for trials, until the numbers follow from the processors at hand.
+    private static final int SELECTORS = Integer.getInteger("hato.broker.selectors", 4);
+
+    private static final int ACTORS = Integer.getInteger("hato.broker.actors", 2);
+
     private final ServerSocketChannel listener;
 
     // Tells the accepting thread that a connection waits at the listener, which is all that it
@@ -127,6 +133,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxHeld = MAX_HELD;
 
+        private int selectors = SELECTORS;
+
+        private int actors = ACTORS;
+
         private Capabilities capabilities = Capabilities.DEFAULT;
 
         private Timer scheduler = TimerService.instance;
@@ -192,6 +202,16 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder selectors(int value) {
+            selectors = value;
+            return this;
+        }
+
+        Builder actors(int value) {
+            actors = value;
+            return this;
+        }
+
         Builder capabilities(Capabilities value) {
             capabilities = requireNonNull(value, "capabilities must not be null");
             return this;
@@ -250,6 +270,8 @@ public final class BrokerServer implements AutoCloseable {
                 || maxRetained <= 0
                 || maxRetainedBytes <= 0
                 || maxHeld <= 0
+                || selectors <= 0
+                || actors <= 0
             ) {
                 throw new IllegalArgumentException(
                         "Broker limits must be positive and window fit queue"
@@ -266,6 +288,8 @@ public final class BrokerServer implements AutoCloseable {
                     maxRetained,
                     maxRetainedBytes,
                     maxHeld,
+                    selectors,
+                    actors,
                     capabilities,
                     scheduler,
                     beforeProcess,
