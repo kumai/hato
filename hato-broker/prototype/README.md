@@ -167,7 +167,6 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
   limit for eight QoS 1 pairs now.
 - Decide what `close()` has finished when it returns. It does not wait for the selectors, which
   close the sockets.
-- Remove the `hato.broker.selectors` and `hato.broker.actors` experiment properties, and rename
-  what still speaks of a writer thread, such as `unparkWriter`.
+- Remove the `hato.broker.selectors` and `hato.broker.actors` experiment properties.
 - Run the full broker/client/testkit, distribution, and native-image checks. TLS and application
   authentication are not implemented by this prototype.

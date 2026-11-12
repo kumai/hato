@@ -31,8 +31,10 @@ import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 
 import static java.util.Objects.requireNonNull;
 
-// One network connection, driven by its assigned selector. The reader hands the
-// packets that it decodes to the session that the CONNECT attached, whose actor handles them.
+// One network connection. The selector that it is assigned to reads and writes it; where a
+// comment speaks of the connection's reader or writer, it means that selector at the one work
+// or the other, and no thread of the connection's own. The reader hands the packets that it
+// decodes to the session that the CONNECT attached, whose actor handles them.
 final class Connection {
 
     private static final Log log = Log.of(Connection.class);
@@ -203,6 +205,9 @@ final class Connection {
         return true;
     }
 
+    // Has the selector look at the connection: at what waits to be written, and at the input
+    // that it can take again. A thread of the actor pool keeps the request until its task ends
+    // (see Worker).
     void wake() {
         reactor.wake(this);
     }
@@ -488,7 +493,7 @@ final class Connection {
             }
         };
         if (result == SendQueue.OfferResult.ACCEPTED) {
-            unparkWriter();
+            wake();
         } else {
             awaitingSpace = true;
             // Only the writer makes room, and what a pool thread still queues waits or is
@@ -536,7 +541,7 @@ final class Connection {
     // session has answered or passed over.
     synchronized void responseSettled() {
         owed--;
-        unparkWriter();
+        wake();
     }
 
     // Queues a response to the client's request in the reserved quota, behind the responses
@@ -591,7 +596,7 @@ final class Connection {
                 return;
             }
             released.removeFirst();
-            unparkWriter();
+            wake();
         }
     }
 
@@ -610,13 +615,8 @@ final class Connection {
         if (enqueueFailed) {
             return false;
         }
-        unparkWriter();
-        return true;
-    }
-
-    // Reserves a connection task, unless one waits already. Called under the connection monitor.
-    private void unparkWriter() {
         wake();
+        return true;
     }
 
     private void writeReady() throws IOException {
@@ -812,7 +812,7 @@ final class Connection {
         }
         lastPacket = bytes;
         endReason = reason;
-        unparkWriter();
+        wake();
     }
 
     private synchronized void received() {
@@ -909,7 +909,7 @@ final class Connection {
         }
         cancelTimer();
         outgoing.close();
-        unparkWriter();
+        wake();
     }
 
     // Ends the connection and hands its end, once, to the session that it is attached to.
