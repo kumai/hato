@@ -26,7 +26,9 @@ final class Reactor implements AutoCloseable {
 
     private final Routing routing;
 
-    private final Thread thread;
+    // The thread that runs the selector. It closes the sockets of the selector's connections
+    // before it ends.
+    final Thread thread;
 
     private final Runnable stopBroker;
 

@@ -72,6 +72,9 @@ public final class BrokerServer implements AutoCloseable {
 
     private final Routing routing;
 
+    // The thread that accepts the connections.
+    private final Thread accepting;
+
     private BrokerServer(ServerSocketChannel listener, BrokerSettings settings) throws IOException {
         this.listener = listener;
         acceptor = Selector.open();
@@ -79,6 +82,9 @@ public final class BrokerServer implements AutoCloseable {
             listener.configureBlocking(false);
             listener.register(acceptor, SelectionKey.OP_ACCEPT);
             routing = new Routing(settings, listener.socket().getLocalPort(), this::close);
+            accepting = Thread.ofPlatform().daemon()
+                    .name("hato-broker-" + routing.port + "-accept")
+                    .unstarted(this::accept);
         } catch (IOException | RuntimeException | Error failure) {
             try {
                 acceptor.close();
@@ -305,9 +311,7 @@ public final class BrokerServer implements AutoCloseable {
                     for (Reactor reactor : server.routing.reactors) {
                         reactor.start();
                     }
-                    Thread.ofPlatform().daemon()
-                            .name("hato-broker-" + server.port() + "-accept")
-                            .start(server::accept);
+                    server.accepting.start();
                 } catch (RuntimeException | Error failure) {
                     server.close();
                     throw failure;
@@ -389,35 +393,77 @@ public final class BrokerServer implements AutoCloseable {
         }
     }
 
+    // Closes the broker, and returns once the listening port is free and every connection is
+    // closed. The first call ends the listener, the connections, and the sessions. Each
+    // selector closes the sockets of its connections on its own thread, as it ends, and the
+    // accepting thread closes a socket that it took from the listener too late; every call
+    // waits for those threads, so that a caller that closes the broker again meanwhile finds
+    // the same. Only a thread of the broker itself does not wait: one that closes the broker
+    // after its failure goes on to close its own sockets.
     @Override
     public void close() {
+        boolean first;
         synchronized (this) {
-            if (routing.closed) {
-                return;
-            }
+            first = !routing.closed;
             routing.closed = true;
         }
-        try {
-            listener.close();
-        } catch (IOException failure) {
-            log.warn("Closing broker listener on port {} failed", port(), failure);
+        if (first) {
+            end();
         }
-        // A channel that a selector watches keeps its socket until the selector lets go of it.
-        // Closing the selector does that here, so the port is free when close() returns, and
-        // it wakes the accepting thread.
-        try {
-            acceptor.close();
-        } catch (IOException failure) {
-            log.warn("Closing the accept selector of the broker on port {} failed",
-                    port(), failure);
+        Thread current = Thread.currentThread();
+        boolean own = current == accepting;
+        for (Reactor reactor : routing.reactors) {
+            own |= current == reactor.thread;
         }
+        if (own) {
+            return;
+        }
+        awaitEnd(accepting);
+        for (Reactor reactor : routing.reactors) {
+            awaitEnd(reactor.thread);
+        }
+    }
+
+    // Ends the listener, the connections, and the sessions, and has the selectors end.
+    private void end() {
         try {
+            try {
+                listener.close();
+            } catch (IOException failure) {
+                log.warn("Closing broker listener on port {} failed", port(), failure);
+            }
+            // A channel that a selector watches keeps its socket until the selector lets go of
+            // it. Closing the selector does that here, so the port is free from now on, and it
+            // wakes the accepting thread.
+            try {
+                acceptor.close();
+            } catch (IOException failure) {
+                log.warn("Closing the accept selector of the broker on port {} failed",
+                        port(), failure);
+            }
             routing.clear();
         } finally {
             routing.actors.shutdown();
             for (Reactor reactor : routing.reactors) {
                 reactor.close();
             }
+        }
+    }
+
+    // Waits until `thread` has ended; one that never started has. An interrupt does not end
+    // the wait, and stays with the calling thread.
+    private static void awaitEnd(Thread thread) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                thread.join();
+                break;
+            } catch (InterruptedException _) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 

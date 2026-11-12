@@ -142,8 +142,9 @@ public final class MqttBroker implements AutoCloseable {
 
     /// Stops accepting connections, closes all peers, and discards their session state and the
     /// retained messages, without publishing Wills, those that wait for their delay included.
-    /// Repeated calls are harmless. Does not wait for peer I/O or send MQTT packets. Before it
-    /// returns, it gives the logging backend a moment to take what the broker has logged.
+    /// When it returns, the listening port is free and every connection is closed. Repeated
+    /// calls are harmless. Does not wait for peer I/O or send MQTT packets. Before it returns,
+    /// it gives the logging backend a moment to take what the broker has logged.
     @Override
     public void close() {
         server.close();

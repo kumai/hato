@@ -10,7 +10,10 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -30,6 +33,7 @@ import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
@@ -76,6 +80,40 @@ class BrokerConnectionTest {
             ) {
                 next.ping();
             }
+        }
+    }
+
+    @Test
+    void close_returns_once_every_selector_has_closed_its_connections() throws Exception {
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder().beforeProcess(packet -> {
+                    if (packet instanceof Packet.PingReq) {
+                        held.countDown();
+                        awaitRelease(release);
+                    }
+                }).start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession client = connected(sut.port(), "client");
+                ExecutorService closer = Executors.newSingleThreadExecutor()
+        ) {
+            // Arrange: the selector of the client's connection stops on its PINGREQ.
+            int port = sut.port();
+            client.send(new Packet.PingReq());
+            awaitRelease(held);
+
+            // Act
+            Future<?> closing = closer.submit(sut::close);
+
+            // Assert: close() waits for that selector, which has yet to close the connection.
+            assertThatThrownBy(() -> closing.get(200, MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+            release.countDown();
+            closing.get(5, SECONDS);
+            assertThat(selectors(port)).isZero();
+            client.expectClosed();
+        } finally {
+            release.countDown();
         }
     }
 

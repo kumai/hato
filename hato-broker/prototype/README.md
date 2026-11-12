@@ -31,7 +31,9 @@ The accepting thread waits for connections in a selector and never inside `accep
 closing a listener at the moment a thread enters a blocking `accept` can leave `close()` waiting
 in the kernel until another file descriptor operation in the process ends, which in a quiet
 process is never. `close()` closes that selector too, which frees the listening port before it
-returns.
+returns. It then waits for the selectors and the accepting thread, which close the sockets of
+the connections as they end, so every connection is closed when `close()` returns. A thread of
+the broker that closes it after a failure does not wait for the others.
 
 An interrupt ends the accepting thread or a selector thread, and the broker closes with it: an
 interrupted thread no longer waits in a selector, and no other thread serves its sockets. A
@@ -77,8 +79,9 @@ another thread stays open until its selector closes it, that an error in one con
 the others served, broker shutdown on an injected selector failure and on an interrupt of a
 selector thread, the final response after a peer half-closes, a DISCONNECT that arrived before
 a write failed, a burst that overfills a session's inbox, a publication to more subscribers
-than a worker keeps for the end of its turn, and a session with a long backlog, which lets a
-waiting session take its turn.
+than a worker keeps for the end of its turn, a session with a long backlog, which lets a
+waiting session take its turn, and that `close()` waits for a selector that still has a
+connection open.
 
 The race tests stop the broker at a chosen point in two ways. A hook that waits holds its whole
 selector or actor worker, which is what a thread that loses the processor there does; such a
@@ -166,8 +169,6 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
   end of the turn, with the output of the events before.
 - Choose the numbers of selectors and workers from the processors at hand. Two workers are the
   limit for eight QoS 1 pairs now.
-- Decide what `close()` has finished when it returns. It does not wait for the selectors, which
-  close the sockets.
 - Remove the `hato.broker.selectors` and `hato.broker.actors` experiment properties.
 - Run the full broker/client/testkit, distribution, and native-image checks. TLS and application
   authentication are not implemented by this prototype.
