@@ -7,6 +7,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -323,6 +324,35 @@ class BrokerConnectionTest {
     }
 
     @Test
+    void connections_take_no_threads_of_their_own() throws Exception {
+        try (var sut = MqttBroker.start()) {
+            // Arrange: two packets of one connection have had every thread of the broker start.
+            int port = sut.port();
+            try (RawSession first = connected(port, "first")) {
+                first.ping();
+            }
+            long before = threads(port);
+
+            // Act
+            var clients = new ArrayList<RawSession>();
+            try {
+                for (int number = 0; number < 50; number++) {
+                    RawSession client = connected(port, "client-" + number);
+                    clients.add(client);
+                    client.ping();
+                }
+
+                // Assert
+                assertThat(threads(port)).isEqualTo(before);
+            } finally {
+                for (RawSession client : clients) {
+                    client.close();
+                }
+            }
+        }
+    }
+
+    @Test
     void a_client_that_half_closes_can_read_the_brokers_final_packet() throws Exception {
         var v5 = PacketCodec.of(MqttVersion.V5);
         try (
@@ -485,6 +515,14 @@ class BrokerConnectionTest {
 
     private static long selectors(int port) {
         String prefix = "hato-broker-" + port + "-selector-";
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(thread -> thread.getName().startsWith(prefix))
+                .count();
+    }
+
+    // How many threads the broker on `port` has, whatever they do.
+    private static long threads(int port) {
+        String prefix = "hato-broker-" + port + "-";
         return Thread.getAllStackTraces().keySet().stream()
                 .filter(thread -> thread.getName().startsWith(prefix))
                 .count();

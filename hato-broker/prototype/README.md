@@ -85,7 +85,8 @@ session's inbox, a publication to more subscribers than a worker keeps for the e
 turn, a session with a long backlog, which lets a waiting session take its turn, and that
 `close()` waits for a selector that still has a connection open. It also tests that a broker
 answers, accepts, and delivers while the application's virtual threads keep every carrier
-busy, and while its logging backend is held up.
+busy, and while its logging backend is held up, and that its threads stay the same number
+however many connections it serves.
 
 The race tests stop the broker at a chosen point in two ways. A hook that waits holds its whole
 selector or actor worker, which is what a thread that loses the processor there does; such a
@@ -160,7 +161,7 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
 
 ## Product work left for the next stage
 
-- Verify the remaining stop races. Subscription matching still scans sessions.
+- Subscription matching still scans sessions.
 - Keep the 99th percentile of a fan-out to 1,000 subscribers under its limit of 5 ms at busier
   times too. It stays close to the limit, as before these changes.
 - Give the application a way to learn that the broker closed itself after a selector failed.
