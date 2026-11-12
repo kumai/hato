@@ -152,7 +152,6 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
 
 ## Product work left for the next stage
 
-- Replace the queued-turn Thread sentinel with an explicit ownership state.
 - Share framing with the blocking reader.
 - Verify the remaining stop races. Subscription matching still scans sessions.
 - Keep the 99th percentile of a fan-out to 1,000 subscribers under its limit of 5 ms at busier

@@ -51,6 +51,12 @@ final class Session {
 
     static final int ELSEWHERE = 0;
 
+    // How many events a pool thread runs before it lets the turns that wait in the pool go
+    // first, so that a session with events without end does not keep the thread.
+    // Ceiling: an event that routes a publication to many sessions counts as one, so the time
+    // of a turn has no bound. A limit on the time or on the deliveries would give it one.
+    private static final int TURN_EVENTS = 256;
+
     // The received packets that may wait in the inbox. A reader that finds no room waits until
     // the actor takes one, which holds its client back through TCP; one packet always fits,
     // whatever its size.
@@ -181,11 +187,16 @@ final class Session {
 
     private final Runnable drainEvent = this::drain;
 
-    // The thread holding the turn, QUEUED while a pool task waits, or null when idle.
+    // Who has the turn. It is free, held by the thread that runs the events, or promised to a
+    // task that waits for a thread of the pool: the two fields below say which, and are never
+    // both set.
+
+    // The thread that holds the turn, or null while none does.
     private @Nullable Thread runner;
 
-    // A queued turn owns the actor until a pool thread takes it.
-    private static final Thread QUEUED = Thread.ofPlatform().unstarted(() -> { });
+    // Whether a task that will run the events waits in the pool. No thread holds the turn then,
+    // and none can take it.
+    private boolean turnQueued;
 
     // Set once the session has ended and left the session table: deliveries pass it by, and a
     // CONNECT that comes to it goes to the table again.
@@ -219,17 +230,19 @@ final class Session {
         return ended;
     }
 
-    // Posts `event`, which the actor runs after those posted before. If no thread holds the
-    // turn, the calling thread takes it and runs up to `inPlace` events here, and a pool
-    // thread runs the rest, or all of them for 0. A thread that holds this session's turn
-    // already only queues the event.
+    // Posts `event`, which the actor runs after those posted before. If the turn is free, the
+    // calling thread takes it and runs up to `inPlace` events here, and a pool thread runs the
+    // rest, or all of them for ELSEWHERE. While the turn is taken, also by the calling thread,
+    // the event is only queued.
     void post(Runnable event, int inPlace) {
-        Thread claimed;
+        boolean claimed;
         synchronized (this) {
             events.addLast(event);
             claimed = claimTurn(inPlace);
         }
-        start(claimed, inPlace);
+        if (claimed) {
+            start(inPlace);
+        }
     }
 
     // Posts a packet that `from` received, as post() does for a connection's reader, which
@@ -240,7 +253,7 @@ final class Session {
         boolean unacknowledged = !answered
                 && (packet instanceof Packet.Publish || packet instanceof Packet.AliasPublish);
         int limit = unacknowledged ? UNACKNOWLEDGED_COUNT : RECEIVED_COUNT;
-        Thread claimed;
+        boolean claimed;
         synchronized (this) {
             if (receivedCount >= limit
                     || (receivedCount > 0 && bytes > RECEIVED_BYTES - receivedBytes)) {
@@ -252,18 +265,22 @@ final class Session {
             receivedBytes += bytes;
             claimed = claimTurn(ELSEWHERE);
         }
-        start(claimed, ELSEWHERE);
+        if (claimed) {
+            start(ELSEWHERE);
+        }
         return true;
     }
 
     // Asks the actor to send what waits, as post() does with a drain for the pool.
     void requestDrain() {
-        Thread claimed;
+        boolean claimed;
         synchronized (this) {
             queueDrain();
             claimed = claimTurn(ELSEWHERE);
         }
-        start(claimed, ELSEWHERE);
+        if (claimed) {
+            start(ELSEWHERE);
+        }
     }
 
     // Queues a drain behind the events posted so far, unless one waits already. Called under the
@@ -275,22 +292,32 @@ final class Session {
         }
     }
 
-    // Gives the turn, if no thread holds it, to the calling thread when it runs events in place,
-    // and else to the pool, and returns the thread that took it; null when another
-    // thread holds it. Called under the inbox.
-    private @Nullable Thread claimTurn(int inPlace) {
-        if (runner != null) {
-            return null;
-        }
-        runner = (inPlace > 0) ? Thread.currentThread() : QUEUED;
-        return runner;
+    // Whether the turn is free. Called under the inbox.
+    private boolean turnFree() {
+        return runner == null && !turnQueued;
     }
 
-    // Runs the turn here or submits its reservation to the pool.
-    private void start(@Nullable Thread claimed, int inPlace) {
-        if (claimed == Thread.currentThread()) {
+    // Takes the turn if it is free: for the calling thread when it runs events in place, and
+    // else for a task of the pool. Returns whether it took the turn, which the caller then
+    // starts outside the inbox. Called under the inbox.
+    private boolean claimTurn(int inPlace) {
+        if (!turnFree()) {
+            return false;
+        }
+        if (inPlace > 0) {
+            runner = Thread.currentThread();
+        } else {
+            turnQueued = true;
+        }
+        return true;
+    }
+
+    // Starts the turn that the calling thread has just claimed with the same `inPlace`: runs
+    // it here, or submits the task that runs it to the pool.
+    private void start(int inPlace) {
+        if (inPlace > 0) {
             run(inPlace);
-        } else if (claimed != null) {
+        } else {
             submitTurn();
         }
     }
@@ -308,13 +335,14 @@ final class Session {
         }
     }
 
+    // The task that waits in the pool for a queued turn: the thread that runs it holds the turn
+    // from here on.
     private void runQueued() {
         synchronized (this) {
+            turnQueued = false;
             runner = Thread.currentThread();
         }
-        // Yield after 256 events so a hot actor cannot keep a pool worker forever.
-        // A time budget would also bound turns with expensive routing.
-        run(256);
+        run(TURN_EVENTS);
     }
 
     // Runs the events while the calling thread holds the turn: at most `budget` of them, after
@@ -348,11 +376,11 @@ final class Session {
             perform(next);
         }
         synchronized (this) {
+            runner = null;
             if (events.isEmpty()) {
-                runner = null;
                 return;
             }
-            runner = QUEUED;
+            turnQueued = true;
         }
         submitTurn();
     }
@@ -561,7 +589,7 @@ final class Session {
             } else {
                 return;
             }
-            Thread claimed = null;
+            boolean claimed = false;
             synchronized (this) {
                 if (subscriptions != matchedOn || version != sized) {
                     continue;
@@ -569,7 +597,7 @@ final class Session {
                 if (ended) {
                     return;
                 }
-                boolean here = runner == null || runner == Thread.currentThread();
+                boolean here = turnFree() || runner == Thread.currentThread();
                 boolean waits = false;
                 for (Delivery delivery : deliveries) {
                     waits |= admit(delivery, received, here);
@@ -582,16 +610,16 @@ final class Session {
                     queueDrain();
                     return;
                 }
-                if (runner == null) {
+                if (turnFree()) {
                     queueDrain();
                     claimed = claimTurn(ALONE);
                 }
             }
-            if (claimed == null) {
+            if (claimed) {
+                run(ALONE);
+            } else {
                 // This thread holds the turn already, as for the publisher's own session.
                 drain();
-            } else {
-                run(ALONE);
             }
             return;
         }
