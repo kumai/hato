@@ -86,6 +86,7 @@ import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.UserProperty;
+import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketDecodeException;
@@ -1663,6 +1664,7 @@ class ClientActorTest {
             await().pollInterval(Duration.ofMillis(1))
                     .untilAsserted(() -> assertThat(sut.usage().notifications()).isZero());
             assertThat(scheduler.pendingTaskCount()).isZero();
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
             assertThat(logCalls.get()).isPositive();
         } finally {
             logger.removeHandler(handler);
@@ -1853,6 +1855,7 @@ class ClientActorTest {
             }
 
             // Assert: each client identifies itself once, however often the broker repeats.
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
             assertThat(warnings).containsExactly(
                     "Ignoring PINGRESP without an outstanding PINGREQ"
                             + " for first at mqtt://localhost:1883",
@@ -2488,6 +2491,7 @@ class ClientActorTest {
             assertThat(sender.get(5, SECONDS).join(Duration.ofSeconds(5))).isTrue();
             assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
                     .hasCauseInstanceOf(IllegalStateException.class);
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
             assertThat(logCalls.get()).isEqualTo(1);
             assertThat(ends).isEmpty();
         } finally {
@@ -2586,35 +2590,17 @@ class ClientActorTest {
 
     @Test
     void actor_failure_is_visible_to_subscription_calls_before_cleanup() throws Exception {
-        // Arrange: the diagnostic pauses shutdown after the actor has recorded its failure.
+        // Arrange: the actor has recorded its failure when it closes the transport, and the
+        // transport holds it there, before the cleanup ends the subscriptions.
         var failure = new AssertionError("Actor failed");
         var cleanupStarted = new CompletableFuture<Thread>();
         var releaseCleanup = new CountDownLatch(1);
-        var jul = Logger.getLogger(ClientActor.class.getName());
-        Level previousLevel = jul.getLevel();
-        boolean previousParents = jul.getUseParentHandlers();
-        var handler = new Handler() {
-            @Override
-            public void publish(LogRecord record) {
-                if (record.getThrown() == failure) {
-                    cleanupStarted.complete(Thread.currentThread());
-                    waitFor(releaseCleanup);
-                }
-            }
-
-            @Override
-            public void flush() {
-            }
-
-            @Override
-            public void close() {
-            }
-        };
-        jul.addHandler(handler);
-        jul.setLevel(Level.ALL);
-        jul.setUseParentHandlers(false);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
+            transport.beforeClose = () -> {
+                cleanupStarted.complete(Thread.currentThread());
+                waitFor(releaseCleanup);
+            };
             PullSubscription observed = sut.subscribe(request());
             PullSubscription closed = sut.subscribe(
                     Subscribe.of(new TopicFilter("closed"), Qos.AT_MOST_ONCE)
@@ -2628,7 +2614,8 @@ class ClientActorTest {
             transport.receiveForActor(new Packet.PingResp());
             Thread actor = cleanupStarted.get(5, SECONDS);
 
-            // Act & Assert: callers see the permanent cause before shutdown reaches the core.
+            // Act & Assert: callers see the permanent cause before the cleanup has ended the
+            // subscriptions.
             try {
                 assertThat(waiting).isNotDone();
                 assertInternalFailureBeforeCleanup(observed, closed, failure);
@@ -2639,9 +2626,6 @@ class ClientActorTest {
             assertInternalFailureAfterCleanup(observed, waiting, failure);
         } finally {
             releaseCleanup.countDown();
-            jul.removeHandler(handler);
-            jul.setLevel(previousLevel);
-            jul.setUseParentHandlers(previousParents);
         }
     }
 

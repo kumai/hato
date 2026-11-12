@@ -3,9 +3,11 @@ package org.mqtt4j.hato.broker;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.time.Duration;
 
 import org.mqtt4j.hato.broker.internal.BrokerServer;
 import org.mqtt4j.hato.broker.internal.common.concurrent.ClassPreload;
+import org.mqtt4j.hato.broker.internal.common.log.Log;
 
 /// An experimental, in-memory MQTT 3.1.1 and 5.0 broker for tests.
 ///
@@ -96,6 +98,10 @@ import org.mqtt4j.hato.broker.internal.common.concurrent.ClassPreload;
 /// promise.
 public final class MqttBroker implements AutoCloseable {
 
+    // How long close() gives the logging backend to take what was logged until then. A backend
+    // that needs longer is one that the application must not wait for.
+    private static final Duration LOG_WAIT_AT_CLOSE = Duration.ofSeconds(1);
+
     private final BrokerServer server;
 
     private MqttBroker(BrokerServer server) {
@@ -136,9 +142,14 @@ public final class MqttBroker implements AutoCloseable {
 
     /// Stops accepting connections, closes all peers, and discards their session state and the
     /// retained messages, without publishing Wills, those that wait for their delay included.
-    /// Repeated calls are harmless. Does not wait for peer I/O or send MQTT packets.
+    /// Repeated calls are harmless. Does not wait for peer I/O or send MQTT packets. Before it
+    /// returns, it gives the logging backend a moment to take what the broker has logged.
     @Override
     public void close() {
         server.close();
+        // An application may exit as soon as it has closed its broker. The statements made
+        // until now have reached the logging backend by then; if they have not within the
+        // limit, the application goes on without them.
+        boolean _ = Log.awaitWritten(LOG_WAIT_AT_CLOSE);
     }
 }

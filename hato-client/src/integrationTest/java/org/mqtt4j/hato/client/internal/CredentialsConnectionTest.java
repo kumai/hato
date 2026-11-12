@@ -22,6 +22,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.*;
 import org.mqtt4j.hato.broker.MqttBroker;
+import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -194,6 +195,11 @@ class CredentialsConnectionTest {
             sut.connect().get(5, SECONDS);
             sut.disconnect().get(5, SECONDS);
         } finally {
+            // The handler stays until it has what the client and the broker logged.
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
+            assertThat(org.mqtt4j.hato.broker.internal.common.log.Log.awaitWritten(
+                    Duration.ofSeconds(10)
+            )).isTrue();
             hato.removeHandler(handler);
             hato.setLevel(previousLevel);
             hato.setUseParentHandlers(previousParents);

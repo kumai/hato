@@ -1,10 +1,15 @@
 package org.mqtt4j.hato.common.log;
 
+import java.lang.System.Logger.Level;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.Optional;
 import java.util.ResourceBundle;
 import java.util.ServiceLoader;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 import org.jspecify.annotations.Nullable;
 
@@ -22,8 +27,22 @@ import static java.util.Objects.requireNonNull;
 /// hexadecimal, as in wire dumps.
 ///
 /// Each class owns a static log named after that class. Package names identify the distribution;
-/// individual class names are implementation details. Implementing `System.Logger` lets JUL infer
-/// the actual caller through this facade. Parameterized overloads all use `{}`, not MessageFormat.
+/// individual class names are implementation details.
+///
+/// A statement never waits for the logging backend. The calling thread checks the level and
+/// renders the text; a thread of its own then gives the statements of the whole distribution to
+/// `System.Logger`, in the order in which they were made. A backend can hold its caller for
+/// seconds, and not only when it writes to a slow device. Where the application logs from virtual
+/// threads, a platform thread that waits for the backend's lock behind one of them sleeps until
+/// that virtual thread has run, although the lock is free, and that takes as long as the
+/// application keeps every carrier busy (JDK 25). The threads that call this facade keep
+/// connections alive, so they must not be the ones that wait.
+///
+/// The price is this. The backend stamps a statement with the time at which it is written.
+/// Statements that find no room because the backend has fallen behind are dropped, and a warning
+/// in their place says how many. Statements that still wait when the JVM exits are lost, so an
+/// entry point of the distribution waits for them in [#awaitWritten(Duration)] when the
+/// application closes it.
 ///
 /// A failing backend never reaches the caller. Logging happens in cleanup, notification, and
 /// failure-reporting paths, so a throwing handler must not interrupt them or replace the
@@ -37,7 +56,7 @@ import static java.util.Objects.requireNonNull;
 /// can replace it without a public API that every application would have to call before any class
 /// of the distribution initializes. It hinders neither native images, which need no metadata for
 /// it, nor the AOT cache.
-public final class Log implements System.Logger {
+public final class Log {
 
     // Null when the JDK found a provider itself or none exists, where System.getLogger is right.
     private static final System.@Nullable LoggerFinder ownLoaderFinder =
@@ -73,6 +92,20 @@ public final class Log implements System.Logger {
         return new Log(requireNonNull(logger, "logger must not be null"));
     }
 
+    /// Waits until the backend has taken the statements that the logs of the distribution made
+    /// before this call, or until `limit` has passed. An interrupted thread does not wait, and
+    /// keeps its interrupt status. Like a statement, the wait never fails its caller.
+    ///
+    /// @return whether the backend has taken them
+    public static boolean awaitWritten(Duration limit) {
+        try {
+            return Writer.instance.awaitWritten(limit.toNanos());
+        } catch (Throwable _) {
+            // The thread that writes could not start, so nothing waits to be written.
+            return false;
+        }
+    }
+
     private static Optional<System.LoggerFinder> findOwnLoaderFinder() {
         try {
             // The JDK's own finders are boot classes. Any other finder is a provider that the JDK
@@ -89,38 +122,12 @@ public final class Log implements System.Logger {
     }
 
     /// The `System.Logger` name.
-    @Override
     public String getName() {
         return logger.getName();
     }
 
-    @Override
     public boolean isLoggable(Level level) {
         return logger.isLoggable(level);
-    }
-
-    @Override
-    public void log(
-            Level level,
-            @Nullable ResourceBundle bundle,
-            String message,
-            @Nullable Throwable thrown
-    ) {
-        try {
-            logger.log(level, bundle, message, thrown);
-        } catch (Throwable _) {
-            // The statement is lost; the caller continues.
-        }
-    }
-
-    @Override
-    public void log(
-            Level level,
-            @Nullable ResourceBundle bundle,
-            String message,
-            @Nullable Object @Nullable ... args
-    ) {
-        formatAndLog(level, bundle, message, args == null ? new Object[0] : args);
     }
 
     public void error(String message, @Nullable Object... args) {
@@ -143,17 +150,7 @@ public final class Log implements System.Logger {
         log(Level.TRACE, message, args);
     }
 
-    @Override
-    public void log(Level level, String message, @Nullable Object... args) {
-        formatAndLog(level, null, message, args);
-    }
-
-    private void formatAndLog(
-            Level level,
-            @Nullable ResourceBundle bundle,
-            String message,
-            @Nullable Object[] args
-    ) {
+    private void log(Level level, String message, @Nullable Object[] args) {
         try {
             if (!logger.isLoggable(level)) {
                 return;
@@ -166,7 +163,13 @@ public final class Log implements System.Logger {
                 used--;
             }
             String text = substitute(message, args, used);
-            logger.log(level, bundle, text, thrown);
+            Writer.instance.take(new Statement(
+                    logger,
+                    level,
+                    text,
+                    thrown,
+                    Thread.currentThread().getName()
+            ));
         } catch (Throwable _) {
             // The statement is lost; the caller continues.
         }
@@ -227,6 +230,207 @@ public final class Log implements System.Logger {
         } catch (RuntimeException e) {
             // A broken toString() must not take the log statement, or the caller, down with it.
             return "[toString failed: " + e + "]";
+        }
+    }
+
+    /// What one call leaves for the backend, with the name of the thread that made it.
+    private record Statement(
+            System.Logger logger,
+            Level level,
+            String text,
+            @Nullable Throwable thrown,
+            String thread
+    ) {
+    }
+
+    /// The thread that gives the statements of the distribution to the backend. Nothing ends it.
+    ///
+    /// While it writes a statement, its name ends with the name of the thread that made the
+    /// statement. A backend prints the name of the thread that calls it, and that name is how an
+    /// application tells the statements of its clients apart: each thread of a client carries
+    /// the client identifier in its name, and many statements name the client nowhere else. The
+    /// thread keeps its own name in front, so that no thread dump and no count of threads by name
+    /// shows a second selector or a second actor.
+    ///
+    /// It is a `System.Logger` in name only, for the sake of `java.util.logging`. Its default
+    /// format prints the caller that it infers for a statement: the nearest frame under the
+    /// backend that does not belong to a `System.Logger`. Every frame of this thread belongs to
+    /// this class, so `java.util.logging` finds no caller and prints the name of the log instead,
+    /// which is the class that made the statement. Otherwise it would print this class for
+    /// every statement.
+    private static final class Writer extends Thread implements System.Logger {
+
+        // Each distribution embeds a copy under org.mqtt4j.hato.<distribution>; naming the
+        // thread after it tells the copies apart in one JVM.
+        private static final String NAME =
+                "hato-" + Log.class.getPackageName().split("\\.")[3] + "-log";
+
+        // The room for waiting statements, in characters of their text, with STATEMENT_SIZE more
+        // for each. It bounds the memory that they hold while the backend stands still. Counting
+        // statements would not: a trace statement holds a whole packet as text.
+        private static final long ROOM = 4L << 20;
+
+        private static final long STATEMENT_SIZE = 64;
+
+        private static final long POLL_NANOS = 1_000_000;
+
+        // Starting it here starts it with the first statement, or with the distribution's class
+        // preload. If it cannot start, the statements of the distribution are lost.
+        static final Writer instance = new Writer();
+
+        static {
+            instance.start();
+        }
+
+        private final ConcurrentLinkedQueue<Statement> statements = new ConcurrentLinkedQueue<>();
+
+        // The room that the statements in the queue take, the one being written included.
+        private final AtomicLong waiting = new AtomicLong();
+
+        // How many statements the queue has taken, and how many of them the backend has had.
+        private final AtomicLong taken = new AtomicLong();
+
+        private volatile long written;
+
+        // Statements that found no room, until a warning in the queue tells their number.
+        private final AtomicLong dropped = new AtomicLong();
+
+        // Whether the thread may be parked, so that a new statement has to wake it.
+        private volatile boolean idle;
+
+        // The name of another thread that this thread's name ends with, or empty. Only this
+        // thread reads and writes it.
+        private String carried = "";
+
+        // Tells of dropped statements under the name of the facade.
+        private final System.Logger own = Log.of(Log.class).logger;
+
+        private Writer() {
+            // The values that the first thread to log happens to hold in inheritable
+            // thread-locals, such as a logging context, are not this thread's.
+            super(null, null, NAME, 0, false);
+            setDaemon(true);
+        }
+
+        /// Queues `statement`, or drops it when there is no room. Never waits and takes no lock:
+        /// a lock here could hold a platform thread behind a virtual thread just as the
+        /// backend's lock can.
+        void take(Statement statement) {
+            long size = STATEMENT_SIZE + statement.text().length();
+            long ahead = waiting.get();
+            // A statement of any size fits an empty queue, so a large one is lost only while
+            // the backend is behind. Callers that pass this check together overshoot the room
+            // by no more than their own statements.
+            if (ahead != 0 && ahead + size > ROOM) {
+                dropped.incrementAndGet();
+                return;
+            }
+            // The warning stands where the dropped statements would have stood.
+            long lost = dropped.get() == 0 ? 0 : dropped.getAndSet(0);
+            if (lost != 0) {
+                queue(new Statement(
+                        own,
+                        Level.WARNING,
+                        "Logging fell behind; dropped " + lost + " log statements",
+                        null,
+                        ""
+                ));
+            }
+            queue(statement);
+            // The thread looks at the queue once more after it has set the flag, so either it
+            // sees this statement or this caller sees the flag.
+            if (idle) {
+                LockSupport.unpark(this);
+            }
+        }
+
+        private void queue(Statement statement) {
+            waiting.addAndGet(STATEMENT_SIZE + statement.text().length());
+            taken.incrementAndGet();
+            statements.add(statement);
+        }
+
+        /// Waits until the backend has had every statement queued before this call, for at most
+        /// `nanos`.
+        boolean awaitWritten(long nanos) {
+            // A backend that closes a client or a broker while it writes would wait for itself.
+            if (Thread.currentThread() == this) {
+                return false;
+            }
+            long target = taken.get();
+            long deadline = System.nanoTime() + nanos;
+            while (written < target) {
+                long left = deadline - System.nanoTime();
+                if (left <= 0 || Thread.currentThread().isInterrupted()) {
+                    return false;
+                }
+                // Looks again every millisecond, which can return that much later than the
+                // backend allows. Closing is rare; have the thread wake those who wait if this
+                // wait ever shows.
+                LockSupport.parkNanos(this, Math.min(left, POLL_NANOS));
+            }
+            return true;
+        }
+
+        @Override
+        public void run() {
+            long count = 0;
+            while (true) {
+                Statement next = statements.poll();
+                if (next == null) {
+                    carry("");
+                    idle = true;
+                    if (statements.isEmpty()) {
+                        LockSupport.park(this);
+                    }
+                    idle = false;
+                    // An interrupted thread no longer parks, and this one has nothing to stop for.
+                    boolean _ = Thread.interrupted();
+                    continue;
+                }
+                carry(next.thread());
+                try {
+                    next.logger().log(next.level(), null, next.text(), next.thrown());
+                } catch (Throwable _) {
+                    // The statement is lost; the thread goes on with the next one.
+                }
+                waiting.addAndGet(-(STATEMENT_SIZE + next.text().length()));
+                written = ++count;
+            }
+        }
+
+        // Puts the name of the thread that made a statement behind this thread's own, or takes
+        // it off for an empty one. The name stays until the next statement of another thread, or
+        // until nothing waits.
+        private void carry(String thread) {
+            if (!thread.equals(carried)) {
+                carried = thread;
+                setName(thread.isEmpty() ? NAME : NAME + " for " + thread);
+            }
+        }
+
+        // Nothing logs through this thread.
+        @Override
+        public boolean isLoggable(Level level) {
+            return false;
+        }
+
+        @Override
+        public void log(
+                Level level,
+                @Nullable ResourceBundle bundle,
+                @Nullable String message,
+                @Nullable Throwable thrown
+        ) {
+        }
+
+        @Override
+        public void log(
+                Level level,
+                @Nullable ResourceBundle bundle,
+                @Nullable String format,
+                @Nullable Object @Nullable ... params
+        ) {
         }
     }
 }

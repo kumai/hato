@@ -207,6 +207,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// replaces it on connecting.
     /// A Will registered with the broker may be published. For a graceful disconnect,
     /// wait for [#disconnect()] to complete successfully before calling this method.
+    /// Before it returns, this method gives the logging backend a moment to take what the client
+    /// has logged, so that an application that exits next keeps those lines.
     @Override
     void close();
 
@@ -220,6 +222,8 @@ public interface MqttClient extends MqttPublisher, MqttSubscriber, AutoCloseable
     /// the client completes have returned, except those of this method. Afterwards the client calls
     /// no handler, executor chosen with [DeliveryOptions], listener, supplier, [TimerScheduler],
     /// [Transport], or continuation, and a reconnection timer that fires late does nothing.
+    /// Before the future completes, the client gives the logging backend a moment to take what it
+    /// has logged, as [#close()] does.
     ///
     /// It does not wait for work that application code started, such as tasks submitted to the
     /// application's own executors, nor for the application's own calls into the client, such as

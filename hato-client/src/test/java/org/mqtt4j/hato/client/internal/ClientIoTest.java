@@ -44,6 +44,7 @@ import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.Transport;
 import org.mqtt4j.hato.client.internal.common.io.SendQueue;
 import org.mqtt4j.hato.client.internal.common.io.WriteParts;
+import org.mqtt4j.hato.client.internal.common.log.Log;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
 import org.mqtt4j.hato.client.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.client.internal.common.protocol.Properties;
@@ -282,6 +283,7 @@ class ClientIoTest {
             sut.send(1, 1, packet, null);
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
             requireNonNull(transport.listener).onBytes(bytes);
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
 
             // Assert
             assertThat(records).extracting(LogRecord::getMessage).containsExactly(
@@ -300,6 +302,7 @@ class ClientIoTest {
             sut.send(1, 2, packet, null);
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L));
             requireNonNull(transport.listener).onBytes(bytes);
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
 
             // Assert
             assertThat(records.stream().filter(record -> record.getLevel() == Level.FINER))
@@ -323,6 +326,7 @@ class ClientIoTest {
             );
             sut.send(1, 3, connect, null);
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L, 3L));
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
             assertThat(records).isNotEmpty().allSatisfy(record -> assertThat(record.getMessage())
                     .doesNotContain(
                             "private-user",
@@ -337,6 +341,7 @@ class ClientIoTest {
             await().untilAsserted(() -> assertThat(events.tickets)
                     .containsExactly(1L, 2L, 3L, 4L));
             requireNonNull(transport.listener).onBytes(bytes);
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
             assertThat(records).isEmpty();
         } finally {
             jul.removeHandler(handler);

@@ -1,32 +1,112 @@
 package org.mqtt4j.hato.common.log;
 
 import java.lang.System.Logger.Level;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.ResourceBundle;
+import java.util.concurrent.CountDownLatch;
 import java.util.logging.Handler;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class LogTest {
 
     @Test
-    void jul_infers_the_class_and_method_calling_the_facade() {
+    void a_statement_does_not_wait_for_a_backend_that_holds_its_caller() throws Exception {
+        // Arrange
+        var logger = new HoldingLogger();
+        var sut = Log.of(logger);
+        try {
+            // Act: both calls return while the backend holds the first statement.
+            sut.info("first");
+            sut.info("second");
+
+            // Assert
+            assertThat(logger.entered.await(10, SECONDS)).isTrue();
+            assertThat(Log.awaitWritten(Duration.ofMillis(50))).isFalse();
+        } finally {
+            logger.released.countDown();
+        }
+
+        // Assert: both reach the backend once it lets go.
+        awaitWritten();
+        assertThat(logger.messages).containsExactly("first", "second");
+    }
+
+    @Test
+    void statements_that_find_no_room_are_dropped_and_later_ones_are_written() throws Exception {
+        // Arrange: the backend holds one statement while far more text arrives than may wait.
+        var logger = new HoldingLogger();
+        var sut = Log.of(logger);
+        String text = "x".repeat(1024);
+        int made = 20_000;
+        try {
+            sut.info("first");
+            assertThat(logger.entered.await(10, SECONDS)).isTrue();
+
+            // Act
+            for (int i = 0; i < made; i++) {
+                sut.info("{} {}", i, text);
+            }
+        } finally {
+            logger.released.countDown();
+        }
+        awaitWritten();
+        sut.info("last");
+        awaitWritten();
+
+        // Assert: what waited is the start of what was made, in its order, and logging goes on.
+        List<String> messages = logger.messages;
+        assertThat(messages).hasSizeBetween(3, made);
+        assertThat(messages.getFirst()).isEqualTo("first");
+        assertThat(messages.getLast()).isEqualTo("last");
+        for (int i = 1; i < messages.size() - 1; i++) {
+            assertThat(messages.get(i)).startsWith((i - 1) + " ");
+        }
+    }
+
+    @Test
+    void the_backend_sees_which_thread_made_a_statement() throws Exception {
+        // Arrange
+        var logger = new RecordingLogger(Level.TRACE);
+        var sut = Log.of(logger);
+
+        // Act
+        Thread.ofPlatform().name("hato-client-1-actor").start(() -> sut.info("named")).join();
+        Thread.ofVirtual().start(() -> sut.info("unnamed")).join();
+        awaitWritten();
+
+        // Assert: the name of the writing thread ends with the name of the thread that made
+        // the statement, without being a second thread of that name. A thread without a name
+        // adds nothing to it.
+        assertThat(logger.records).extracting(Record::thread).satisfiesExactly(
+                thread -> assertThat(thread)
+                        .endsWith(" hato-client-1-actor")
+                        .doesNotStartWith("hato-client-1-actor"),
+                thread -> assertThat(thread).isNotEmpty().doesNotContain("hato-client-1-actor")
+        );
+    }
+
+    @Test
+    void jul_prints_the_name_of_the_log_in_place_of_a_caller() {
         // Arrange
         var jul = Logger.getLogger(LogTest.class.getName());
         var sut = Log.of(LogTest.class);
-        var records = new ArrayList<LogRecord>();
+        var lines = new ArrayList<String>();
         var handler = new Handler() {
             @Override
             public void publish(LogRecord record) {
-                // Resolve lazily inferred caller information while the caller is on the stack.
-                record.getSourceClassName();
-                records.add(record);
+                // Formats as the console handler does, on the thread that the caller is
+                // inferred from.
+                lines.add(new SimpleFormatter().format(record));
             }
 
             @Override
@@ -41,31 +121,14 @@ class LogTest {
         try {
             // Act
             sut.info("caller {}", "test");
+            awaitWritten();
 
-            // Assert
-            assertThat(records).singleElement().satisfies(record -> {
-                assertThat(record.getSourceClassName()).isEqualTo(LogTest.class.getName());
-                assertThat(record.getSourceMethodName())
-                        .isEqualTo("jul_infers_the_class_and_method_calling_the_facade");
-            });
+            // Assert: the first line ends with the source, which is the name of the log alone.
+            assertThat(lines).singleElement().asString()
+                    .contains(" " + LogTest.class.getName() + System.lineSeparator());
         } finally {
             jul.removeHandler(handler);
         }
-    }
-
-    @Test
-    void system_logger_parameter_overloads_use_the_same_placeholder_syntax() {
-        // Arrange
-        var recording = new RecordingLogger(Level.TRACE);
-        System.Logger sut = Log.of(recording);
-
-        // Act
-        sut.log(Level.INFO, "value {}", "one");
-        sut.log(Level.INFO, (ResourceBundle) null, "value {}", "two");
-
-        // Assert
-        assertThat(recording.records).extracting(Record::message)
-                .containsExactly("value one", "value two");
     }
 
     @Test
@@ -74,6 +137,7 @@ class LogTest {
         var sut = Log.of(logger);
 
         sut.info("connected to {} as {}", "broker:1883", "client-1");
+        awaitWritten();
 
         assertThat(logger.records).singleElement().satisfies(record -> {
             assertThat(record.level()).isEqualTo(Level.INFO);
@@ -89,6 +153,7 @@ class LogTest {
         var failure = new IllegalStateException("boom");
 
         sut.warn("write to {} failed", "broker:1883", failure);
+        awaitWritten();
 
         assertThat(logger.records).singleElement().satisfies(record -> {
             assertThat(record.message()).isEqualTo("write to broker:1883 failed");
@@ -102,6 +167,7 @@ class LogTest {
         var sut = Log.of(logger);
 
         sut.warn("rejected: {}", new IllegalStateException("boom"));
+        awaitWritten();
 
         assertThat(logger.records).singleElement().satisfies(record -> {
             assertThat(record.message())
@@ -116,6 +182,7 @@ class LogTest {
         var sut = Log.of(logger);
 
         sut.info("payload \\{} first {} then {}", "one");
+        awaitWritten();
 
         assertThat(logger.records.getFirst().message()).isEqualTo("payload {} first one then {}");
     }
@@ -131,6 +198,7 @@ class LogTest {
                 new String[] {"a"},
                 null
         );
+        awaitWritten();
 
         assertThat(logger.records.getFirst().message())
                 .isEqualTo("bytes 30ff names [a] nothing null");
@@ -143,6 +211,7 @@ class LogTest {
         var argument = new CountingArgument();
 
         sut.debug("state {}", argument);
+        awaitWritten();
 
         assertThat(argument.renderings).isZero();
         assertThat(logger.records).isEmpty();
@@ -160,6 +229,7 @@ class LogTest {
         };
 
         sut.info("value {}", broken);
+        awaitWritten();
 
         assertThat(logger.records.getFirst().message())
                 .startsWith("value [toString failed: java.lang.IllegalStateException: no text");
@@ -173,9 +243,10 @@ class LogTest {
 
         // Act
         sut.warn("value {}", 1);
-        sut.log(Level.ERROR, null, "text", new IllegalStateException("reported failure"));
+        sut.error("text", new IllegalStateException("reported failure"));
+        awaitWritten();
 
-        // Assert: both statements reached the backend and returned normally.
+        // Assert: both statements reached the backend, and the calls returned normally.
         assertThat(logger.calls).isEqualTo(2);
     }
 
@@ -185,7 +256,19 @@ class LogTest {
         assertThat(Log.of("org.mqtt4j.hato.test").getName()).isEqualTo("org.mqtt4j.hato.test");
     }
 
-    private record Record(Level level, String message, @Nullable Throwable thrown) {
+    /// Waits for the thread that writes. What the backend recorded until then is safe to read.
+    private static void awaitWritten() {
+        assertThat(Log.awaitWritten(Duration.ofSeconds(10)))
+                .as("the backend took the statements made so far")
+                .isTrue();
+    }
+
+    private record Record(
+            Level level,
+            String message,
+            @Nullable Throwable thrown,
+            String thread
+    ) {
     }
 
     private static final class CountingArgument {
@@ -221,15 +304,51 @@ class LogTest {
 
         @Override
         public void log(Level level, ResourceBundle bundle, String message, Throwable thrown) {
-            records.add(new Record(level, message, thrown));
+            records.add(new Record(level, message, thrown, Thread.currentThread().getName()));
         }
 
         @Override
         public void log(Level level, ResourceBundle bundle, String format, Object... params) {
-            assertThat(params)
-                    .as("the facade must not delegate formatting to System.Logger")
-                    .isNull();
-            records.add(new Record(level, format, null));
+            throw new AssertionError("the facade must not delegate formatting to System.Logger");
+        }
+    }
+
+    /// A backend that keeps its caller until the test lets it go. It gives up by itself, once
+    /// and for all its callers, so that a facade that waited for it would fail its test instead
+    /// of stopping the run.
+    private static final class HoldingLogger implements System.Logger {
+
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch released = new CountDownLatch(1);
+        final List<String> messages = new ArrayList<>();
+        private volatile boolean gaveUp;
+
+        @Override
+        public String getName() {
+            return "holding";
+        }
+
+        @Override
+        public boolean isLoggable(Level level) {
+            return true;
+        }
+
+        @Override
+        public void log(Level level, ResourceBundle bundle, String message, Throwable thrown) {
+            entered.countDown();
+            try {
+                if (!gaveUp && !released.await(10, SECONDS)) {
+                    gaveUp = true;
+                }
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+            }
+            messages.add(message);
+        }
+
+        @Override
+        public void log(Level level, ResourceBundle bundle, String format, Object... params) {
+            throw new AssertionError("the facade must not delegate formatting to System.Logger");
         }
     }
 

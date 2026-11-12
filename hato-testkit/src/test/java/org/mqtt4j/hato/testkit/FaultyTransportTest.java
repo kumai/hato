@@ -25,6 +25,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mqtt4j.hato.MqttCapacityException;
 import org.mqtt4j.hato.TimerScheduler;
 import org.mqtt4j.hato.Transport;
+import org.mqtt4j.hato.testkit.internal.common.log.Log;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -543,6 +544,7 @@ class FaultyTransportTest {
             assertThat(receiver.sent).isEmpty();
             assertThat(receiver.closures).isEqualTo(1);
             assertThat(clock.pendingTaskCount()).isZero();
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
             if (cancelFails) {
                 assertThat(logCalls.get()).isPositive();
             } else {

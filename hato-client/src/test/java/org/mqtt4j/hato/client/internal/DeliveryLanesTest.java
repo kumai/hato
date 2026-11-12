@@ -42,6 +42,7 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.DeliveryToken.Origin;
+import org.mqtt4j.hato.client.internal.common.log.Log;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -1628,6 +1629,7 @@ class DeliveryLanesTest {
             assertThat(failure.cause()).isSameAs(cause);
             assertThat(sut.retainedLanes()).isEqualTo(1);
             assertThat(failures).isEmpty();
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
             assertThat(logCalls.get()).isEqualTo(1);
             assertThat(sut.dropped(DropReason.FAILED)).isEqualTo(1);
         } finally {

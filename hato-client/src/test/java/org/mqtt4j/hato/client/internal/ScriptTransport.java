@@ -56,6 +56,9 @@ final class ScriptTransport implements Transport {
     Duration startTimeout = Duration.ZERO;
     // When set, close() leaves its report to finishClose(), as a transport still closing would.
     volatile boolean deferCloseReport;
+    // Runs on the thread that closes, before the transport is closed. A test holds that thread
+    // here without holding the transport.
+    volatile Runnable beforeClose = () -> { };
 
     /// A transport that speaks MQTT 3.1.1 and hands over copied bytes.
     ScriptTransport() {
@@ -220,14 +223,17 @@ final class ScriptTransport implements Transport {
     }
 
     @Override
-    public synchronized void close() {
-        if (closed) {
-            return;
-        }
-        closed = true;
-        Listener current = listener;
-        if (current != null && !deferCloseReport) {
-            current.onClosed(new IOException("Transport closed"));
+    public void close() {
+        beforeClose.run();
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            Listener current = listener;
+            if (current != null && !deferCloseReport) {
+                current.onClosed(new IOException("Transport closed"));
+            }
         }
     }
 }

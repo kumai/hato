@@ -109,6 +109,10 @@ public final class ClientActor implements MqttClient {
     // event waits behind them.
     private static final int RUN_LIMIT = 64;
 
+    // How long close() and the end of the actor give the logging backend to take what was logged
+    // until then. A backend that needs longer is one that the client must not wait for.
+    private static final Duration LOG_WAIT = Duration.ofSeconds(1);
+
     private final URI endpoint;
 
     private final String clientId;
@@ -766,6 +770,10 @@ public final class ClientActor implements MqttClient {
         }
         // No delivery is handed off after this returns, even while the actor is still busy.
         lanes.closeHandOffs();
+        // An application may exit as soon as it has closed its client. The statements made
+        // until now, such as why a connection ended, have reached the logging backend by then;
+        // if they have not within the limit, the application goes on without them.
+        boolean _ = Log.awaitWritten(LOG_WAIT);
     }
 
     @Override
@@ -870,6 +878,11 @@ public final class ClientActor implements MqttClient {
                             // one that its application builds once this one has terminated.
                             cores.giveBack();
                         }
+                        // An application may exit as soon as its client has terminated. What
+                        // the actor logged while it ended, such as the end of the connection,
+                        // has reached the logging backend by then, within the same limit as in
+                        // close(). The place is back first: this wait needs none.
+                        boolean _ = Log.awaitWritten(LOG_WAIT);
                         // The actor calls no application code from here on.
                         termination.actorEnded();
                     }

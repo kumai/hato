@@ -45,6 +45,13 @@ A failure in the work of one connection, an `Error` included, ends that connecti
 does on a session's actor. Only a failure of the selector loop itself closes the broker. The
 application has no way yet to learn that the broker closed itself, other than the log.
 
+No thread of the broker enters the application's logging backend. The shared `Log` facade queues
+each statement without a lock, and one platform thread gives the statements to the backend.
+Where the application logs from virtual threads, a selector or a worker that called the backend
+itself waited for its lock for seconds, behind a virtual thread that found no carrier. The
+measurement is in [`notes/bench/broker-threads.md`](../../notes/bench/broker-threads.md),
+chapter 9.
+
 The original experiment applied `selector.patch`, `selector-bulk.patch`, `selector-ready.patch`,
 and `selector-fair.patch` and ran with `s0.inPlace=0`. The current experiment defaults to
 `hato.broker.inPlace=0`. The internal `hato.broker.selectors`, `hato.broker.actors`,
@@ -146,8 +153,6 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
 - Verify the remaining stop races. Subscription matching still scans sessions.
 - Keep the 99th percentile of a fan-out to 1,000 subscribers under its limit of 5 ms at busier
   times too. It stays close to the limit, as before these changes.
-- Decide how to isolate the application's logging backend from the broker's execution threads.
-  A selector still logs each disconnection, so a backend that blocks holds its connections.
 - Give the application a way to learn that the broker closed itself after a selector failed.
 - Decide what an interrupt does to a selector thread. Today its loop spins, because a selector
   no longer waits once its thread is interrupted. The accepting thread ends the listener.

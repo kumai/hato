@@ -19,6 +19,7 @@ import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.ConnectionListener;
 import org.mqtt4j.hato.Disconnection;
 import org.mqtt4j.hato.DisconnectionAccess;
+import org.mqtt4j.hato.client.internal.common.log.Log;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -76,6 +77,7 @@ class ListenerLaneTest {
             assertThat(endings.poll(5, SECONDS)).isSameAs(ending);
             await().pollInterval(Duration.ofMillis(1))
                     .untilAsserted(() -> assertThat(sut.usage()).isZero());
+            assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
             assertThat(calls.get()).isEqualTo(1);
             assertThat(sut.dropped()).isZero();
         } finally {
