@@ -68,10 +68,12 @@ peer half-closes, a DISCONNECT that arrived before a write failed, a burst that 
 session's inbox, and a publication to more subscribers than a worker keeps for the end of its
 turn.
 
-Fifteen cases fail in each configuration, and no others: one in `BrokerConcurrencyTest`, two in
-`BrokerDeadlineTest`, four in `BrokerQos2RaceTest`, seven in `BrokerSessionRaceTest`, and one in
-`BrokerWillDelayTest`. They are race tests whose blocking hooks now hold a whole selector or
-actor worker, and they need per-connection pause and resume.
+The race tests stop the broker at a chosen point in two ways. A hook that waits holds its whole
+selector or actor worker, which is what a thread that loses the processor there does; such a
+test counts on its other connections having selectors of their own, which take connections in
+turn, and waits for nothing that the held thread does. A test that needs a connection to go on
+reading while its output waits, as with a peer that takes no more bytes, keeps the write of a
+delivery back on that connection alone, and no thread waits.
 
 The review measurements and their commands are in
 [`notes/bench/broker-threads.md`](../../notes/bench/broker-threads.md) and
@@ -140,8 +142,7 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
 ## Product work left for the next stage
 
 - Replace the queued-turn Thread sentinel with an explicit ownership state.
-- Share framing with the blocking reader and replace blocking race-test hooks with connection
-  pause/resume operations. A blocking hook currently holds its entire selector or actor worker.
+- Share framing with the blocking reader.
 - Verify the remaining stop races. Subscription matching still scans sessions.
 - Keep the 99th percentile of a fan-out to 1,000 subscribers under its limit of 5 ms at busier
   times too. It stays close to the limit, as before these changes.

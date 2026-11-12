@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import org.jspecify.annotations.Nullable;
 
@@ -139,7 +140,7 @@ public final class BrokerServer implements AutoCloseable {
 
         private Consumer<Packet> beforeHandle = _ -> { };
 
-        private Runnable beforeDeliveryWrite = () -> { };
+        private Predicate<Connection> deliveryWriteHeld = _ -> false;
 
         private Runnable beforeSelect = () -> { };
 
@@ -221,8 +222,21 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        // Runs `value` on the selector before each write that carries a delivery. A hook that
+        // waits holds the selector, and with it the input of the same connection.
         Builder beforeDeliveryWrite(Runnable value) {
-            beforeDeliveryWrite = requireNonNull(value, "beforeDeliveryWrite must not be null");
+            requireNonNull(value, "beforeDeliveryWrite must not be null");
+            deliveryWriteHeld = _ -> {
+                value.run();
+                return false;
+            };
+            return this;
+        }
+
+        // Keeps a write that carries a delivery back while `value` says so for its connection,
+        // without holding the selector. It replaces a hook set with beforeDeliveryWrite.
+        Builder holdDeliveryWrite(Predicate<Connection> value) {
+            deliveryWriteHeld = requireNonNull(value, "holdDeliveryWrite must not be null");
             return this;
         }
 
@@ -268,7 +282,7 @@ public final class BrokerServer implements AutoCloseable {
                     scheduler,
                     beforeProcess,
                     beforeHandle,
-                    beforeDeliveryWrite,
+                    deliveryWriteHeld,
                     beforeSelect
             );
             ServerSocketChannel listener = ServerSocketChannel.open();

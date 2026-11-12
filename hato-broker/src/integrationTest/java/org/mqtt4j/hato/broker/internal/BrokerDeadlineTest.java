@@ -204,37 +204,31 @@ class BrokerDeadlineTest {
     @Test
     void responses_that_wait_are_written_before_disconnect() throws Exception {
         var timer = new ManualTimer();
-        var armed = new AtomicBoolean();
-        var held = new CountDownLatch(1);
-        var release = new CountDownLatch(1);
+        var writer = new HeldWrite();
         try (
                 BrokerServer sut = BrokerServer.builder()
                         .connectTimeout(CONNECT_TIMEOUT)
                         .scheduler(timer)
-                        .beforeDeliveryWrite(() -> {
-                            if (armed.compareAndSet(true, false)) {
-                                held.countDown();
-                                awaitCountDown(release);
-                            }
-                        })
+                        .holdDeliveryWrite(writer)
                         .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
                 var client = RawSession.open(sut.port(), MqttVersion.V5);
                 var publisher = connected(sut.port(), "publisher")
         ) {
-            // Arrange: the client's writer holds a delivery, and no connection has a deadline.
+            // Arrange: the write of a delivery to the client is kept back, and no connection has
+            // a deadline.
             client.send(connectV5("violating", true, 0, 0));
             client.expect(Packet.ConnAck.class);
             client.subscribe("held/#", AT_MOST_ONCE);
-            armed.set(true);
+            writer.hold();
             publisher.publish("held/topic", "held", AT_MOST_ONCE, 0);
-            awaitCountDown(held);
+            writer.awaitHeld();
 
             // Act: PINGRESP waits behind the delivery when AUTH ends the connection, which
             // arms the deadline for its DISCONNECT.
             client.send(new Packet.PingReq());
             client.send(new Packet.Auth(ReasonCode.SUCCESS, EMPTY));
             timer.awaitPendingTasks(1);
-            release.countDown();
+            writer.release();
 
             // Assert: the held delivery is not written, and the waiting response comes first.
             client.expect(Packet.PingResp.class);
@@ -242,7 +236,7 @@ class BrokerDeadlineTest {
                     .isEqualTo(new Packet.Disconnect(ReasonCode.PROTOCOL_ERROR, EMPTY));
             client.expectClosed();
         } finally {
-            release.countDown();
+            writer.release();
         }
     }
 
@@ -358,11 +352,12 @@ class BrokerDeadlineTest {
             armed.set(true);
             try (var expired = RawSession.open(sut.port())) {
                 expired.send(connect("same-id", false, 0));
-                Thread reader = heldReader.get(5, SECONDS);
+                heldReader.get(5, SECONDS);
                 timer.clock.advance(CONNECT_TIMEOUT);
-                expired.expectClosed();
                 release.countDown();
-                assertThat(reader.join(Duration.ofSeconds(5))).isTrue();
+                // The held selector closes the connection only once it has gone through the
+                // CONNECT, and what that hands to the session comes before the ping below.
+                expired.expectClosed();
 
                 existing.ping();
                 existing.publish("kept/topic", "still attached", AT_MOST_ONCE, 0);
@@ -502,15 +497,6 @@ class BrokerDeadlineTest {
             }
         }
         assertThat(timer.clock.pendingTaskCount()).isZero();
-    }
-
-    private static void awaitCountDown(CountDownLatch latch) {
-        try {
-            assertThat(latch.await(5, SECONDS)).isTrue();
-        } catch (InterruptedException failure) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError(failure);
-        }
     }
 
     private static BrokerServer start(Timer timer) throws IOException {

@@ -6,9 +6,6 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -16,12 +13,10 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 
-import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.acknowledge;
 import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.receive;
 import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.withDup;
-import static org.mqtt4j.hato.broker.internal.BrokerSessionRaceTest.awaitRelease;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
@@ -32,8 +27,8 @@ import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.EXACTLY_ONCE;
 import static org.mqtt4j.hato.broker.internal.common.value.ReasonCode.SUCCESS;
 
-/// PUBREL that waits for space in a connection's send queue. The broker's writer is held on a
-/// delivery so that the queue stays full while the client's packets are processed.
+/// PUBREL that waits for space in a connection's send queue. A write of the connection is kept
+/// back on a delivery so that the queue stays full while the client's packets are processed.
 class BrokerQos2RaceTest {
 
     // A connection's regular send queue holds 128 sends, as many as the default inflight window.
@@ -55,7 +50,7 @@ class BrokerQos2RaceTest {
     void deferred_pubrels_keep_the_order_of_first_receipts_and_merge_duplicates(int receipts)
             throws Exception {
         // Arrange: two QoS 2 deliveries reach the subscriber, then its send queue fills up.
-        var writer = new HeldWriter();
+        var writer = new HeldWrite();
         try (
                 BrokerServer sut = broker(writer);
                 RawSession subscriber = connected(sut.port(), "subscriber");
@@ -109,7 +104,7 @@ class BrokerQos2RaceTest {
     @Test
     void pubcomp_drops_a_repeated_pubrel_still_waiting_for_space() throws Exception {
         // Arrange: the subscriber has received PUBREL, then its send queue fills up.
-        var writer = new HeldWriter();
+        var writer = new HeldWrite();
         try (
                 BrokerServer sut = broker(writer);
                 RawSession subscriber = connected(sut.port(), "subscriber");
@@ -145,7 +140,7 @@ class BrokerQos2RaceTest {
     @Test
     void requests_sent_while_a_resumed_pubrel_window_waits_are_answered() throws Exception {
         // Arrange: a persistent subscriber leaves one PUBLISH and 127 PUBRELs unacknowledged.
-        var writer = new HeldWriter();
+        var writer = new HeldWrite();
         try (
                 BrokerServer sut = broker(writer);
                 RawSession publisher = connected(sut.port(), "publisher");
@@ -166,9 +161,9 @@ class BrokerQos2RaceTest {
             }
 
             try (RawSession resumed = RawSession.open(sut.port())) {
-                // The writer is held on the write that carries the replayed PUBLISH. That write
-                // can carry CONNACK too, which keeps its place among the responses until the
-                // write is over, so the requests leave one place for it.
+                // The write that carries the replayed PUBLISH is kept back. That write can
+                // carry CONNACK too, which keeps its place among the responses until the write
+                // is over, so the requests leave one place for it.
                 writer.hold();
                 resumed.send(connect("subscriber", false, 0));
                 writer.awaitHeld();
@@ -207,15 +202,15 @@ class BrokerQos2RaceTest {
         }
     }
 
-    private static BrokerServer broker(HeldWriter writer) throws IOException {
+    private static BrokerServer broker(HeldWrite writer) throws IOException {
         return BrokerServer.builder()
-                .beforeDeliveryWrite(writer)
+                .holdDeliveryWrite(writer)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
     }
 
-    /// Holds the subscriber's writer on a QoS 0 delivery to `held`, then fills the rest of its
-    /// regular send queue with more of them.
-    private static void fillSendQueue(HeldWriter writer, RawSession publisher) throws Exception {
+    /// Keeps the subscriber's write back on a QoS 0 delivery to `held`, then fills the rest of
+    /// its regular send queue with more of them.
+    private static void fillSendQueue(HeldWrite writer, RawSession publisher) throws Exception {
         writer.hold();
         publisher.publish("held", "writer paused", AT_MOST_ONCE, 0);
         writer.awaitHeld();
@@ -237,34 +232,5 @@ class BrokerQos2RaceTest {
 
     private static void write(ByteArrayOutputStream burst, Packet packet) {
         burst.writeBytes(codec.encode(packet));
-    }
-
-    /// Holds the first broker writer that writes a delivery after [#hold()], until released.
-    private static final class HeldWriter implements Runnable {
-
-        private final AtomicBoolean holding = new AtomicBoolean();
-
-        private final CompletableFuture<Thread> held = new CompletableFuture<>();
-
-        private final CountDownLatch released = new CountDownLatch(1);
-
-        @Override
-        public void run() {
-            if (holding.get() && held.complete(Thread.currentThread())) {
-                awaitRelease(released);
-            }
-        }
-
-        void hold() {
-            holding.set(true);
-        }
-
-        void awaitHeld() throws Exception {
-            held.get(5, SECONDS);
-        }
-
-        void release() {
-            released.countDown();
-        }
     }
 }

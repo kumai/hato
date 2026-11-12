@@ -47,15 +47,10 @@ class BrokerSessionRaceTest {
             int deliveries,
             int acknowledgements
     ) throws Exception {
-        // Arrange: one active delivery holds the writer and the remaining deliveries queue.
-        var heldWriter = new CompletableFuture<Thread>();
-        var release = new CountDownLatch(1);
+        // Arrange: the write of one delivery is kept back and the remaining deliveries queue.
+        var writer = new HeldWrite();
         try (BrokerServer sut = builder(new BrokerDeadlineTest.ManualTimer())
-                .beforeDeliveryWrite(() -> {
-                    if (heldWriter.complete(Thread.currentThread())) {
-                        awaitRelease(release);
-                    }
-                })
+                .holdDeliveryWrite(writer)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
                 var reads = Executors.newVirtualThreadPerTaskExecutor();
                 var subscriber = connected(sut.port(), "subscriber");
@@ -63,10 +58,11 @@ class BrokerSessionRaceTest {
                 var observer = connected(sut.port(), "observer")) {
             subscriber.subscribe("deliveries", AT_MOST_ONCE);
             observer.subscribe("processed", AT_MOST_ONCE);
+            writer.hold();
             for (int i = 0; i < deliveries; i++) {
                 publisher.publish("deliveries", "queued-" + i, AT_MOST_ONCE, 0);
             }
-            heldWriter.get(5, SECONDS);
+            writer.awaitHeld();
             publisher.ping();
             var firstDelivery = reads.submit(() -> subscriber.expect(Packet.Publish.class));
             var markerReceived = reads.submit(() -> observer.expect(Packet.Publish.class));
@@ -94,9 +90,9 @@ class BrokerSessionRaceTest {
             // Assert: the marker follows response admission; an early EOF also ends this wait.
             await().atMost(Duration.ofSeconds(5))
                     .until(() -> firstDelivery.isDone() || markerReceived.isDone());
-            assertThat(firstDelivery).as("writer remains held before the marker").isNotDone();
+            assertThat(firstDelivery).as("write remains held before the marker").isNotDone();
             assertThat(markerReceived.get(5, SECONDS)).isEqualTo(marker);
-            release.countDown();
+            writer.release();
             for (int i = 0; i < deliveries; i++) {
                 Packet.Publish delivery = i == 0
                         ? firstDelivery.get(5, SECONDS)
@@ -115,27 +111,23 @@ class BrokerSessionRaceTest {
             subscriber.expect(Packet.PingResp.class);
             subscriber.ping();
         } finally {
-            release.countDown();
+            writer.release();
         }
     }
 
     @Test
     void a_delivery_taken_over_before_the_writer_starts_keeps_dup_clear() throws Exception {
-        var heldWriter = new CompletableFuture<Thread>();
-        var release = new CountDownLatch(1);
+        var writer = new HeldWrite();
         var timer = new BrokerDeadlineTest.ManualTimer();
         try (BrokerServer sut = builder(timer)
-                .beforeDeliveryWrite(() -> {
-                    if (heldWriter.complete(Thread.currentThread())) {
-                        awaitRelease(release);
-                    }
-                })
+                .holdDeliveryWrite(writer)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
                 var first = connected(sut.port(), "subscriber", false, false);
                 var publisher = connected(sut.port(), "publisher")) {
             first.subscribe("kept/#", AT_LEAST_ONCE);
+            writer.hold();
             publisher.publish("kept/topic", "not written", AT_LEAST_ONCE, 7);
-            Thread writer = heldWriter.get(5, SECONDS);
+            writer.awaitHeld();
 
             try (var replacement = connected(sut.port(), "subscriber", false, true)) {
                 first.expectClosed();
@@ -144,8 +136,7 @@ class BrokerSessionRaceTest {
                 assertThat(resumed).isEqualTo(publication(
                         "kept/topic", "not written", AT_LEAST_ONCE, resumed.packetId()
                 ));
-                release.countDown();
-                assertThat(writer.join(Duration.ofSeconds(5))).isTrue();
+                writer.release();
 
                 replacement.send(new Packet.PubAck(resumed.packetId(), SUCCESS, EMPTY));
                 replacement.ping();
@@ -160,7 +151,7 @@ class BrokerSessionRaceTest {
                 assertThat(timer.clock.pendingTaskCount()).isZero();
             }
         } finally {
-            release.countDown();
+            writer.release();
         }
     }
 
@@ -329,6 +320,9 @@ class BrokerSessionRaceTest {
     @EnumSource(OldPacket.class)
     void a_packet_decoded_before_takeover_cannot_change_the_replacement_session(OldPacket kind)
             throws Exception {
+        // The hook stops the selector of the first connection between decoding the packet and
+        // handing it to the session. The other connections have selectors of their own, which
+        // take connections in turn.
         var heldReader = new CompletableFuture<Thread>();
         var release = new CountDownLatch(1);
         var timer = new BrokerDeadlineTest.ManualTimer();
@@ -342,17 +336,19 @@ class BrokerSessionRaceTest {
             publisher.publish("kept/topic", "unacknowledged", AT_LEAST_ONCE, 7);
             Packet.Publish original = first.expect(Packet.Publish.class);
             first.send(kind.packet(original.packetId()));
-            Thread reader = heldReader.get(5, SECONDS);
+            heldReader.get(5, SECONDS);
 
             try (var replacement = connected(sut.port(), "subscriber", false, true)) {
-                first.expectClosed();
                 Packet.Publish replay = replacement.expect(Packet.Publish.class);
                 assertThat(replay).isEqualTo(new Packet.Publish(
                         original.topic(), original.payload(), AT_LEAST_ONCE,
                         false, true, original.packetId(), EMPTY
                 ));
                 release.countDown();
-                assertThat(reader.join(Duration.ofSeconds(5))).isTrue();
+                // The selector closes the old connection only after it has handed the packet
+                // over, and the session handles the packet before what the replacement sends
+                // from here on.
+                first.expectClosed();
 
                 publisher.publish("kept/topic", "after takeover", AT_LEAST_ONCE, 8);
                 // The old PUBACK must not release the one-message window.

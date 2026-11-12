@@ -625,7 +625,10 @@ final class Connection {
         if (writingParts.length == 0) {
             byte[] last;
             synchronized (this) {
-                writing = outgoing.pollBatch(BATCH_BYTES);
+                // A write that a test keeps back still has the sends that it took.
+                if (writing.isEmpty()) {
+                    writing = outgoing.pollBatch(BATCH_BYTES);
+                }
                 if (ended) {
                     return;
                 }
@@ -642,7 +645,11 @@ final class Connection {
                         .anyMatch(send -> send.value() instanceof Outbound.Publish);
                 boolean skip = false;
                 if (delivers) {
-                    settings.beforeDeliveryWrite().run();
+                    // While a test keeps the write back, the connection goes on with its
+                    // input. The test has the selector come back here.
+                    if (settings.deliveryWriteHeld().test(this)) {
+                        return;
+                    }
                     synchronized (this) {
                         if (ended) {
                             return;

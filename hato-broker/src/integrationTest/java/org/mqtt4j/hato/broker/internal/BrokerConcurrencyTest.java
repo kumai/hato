@@ -355,19 +355,14 @@ class BrokerConcurrencyTest {
     @Test
     void requests_that_wait_for_a_stalled_session_keep_room_for_their_responses()
             throws Exception {
-        var heldWriter = new CompletableFuture<Thread>();
-        var releaseWriter = new CountDownLatch(1);
+        var writer = new HeldWrite();
         var armed = new AtomicBoolean();
         var decoded = new AtomicInteger();
         var stall = new Stall(Packet.PingReq.class::isInstance);
         try (BrokerServer sut = BrokerServer.builder()
                 // The session runs on a thread of its own, so its reader goes on while it stalls.
                 .inPlace(0)
-                .beforeDeliveryWrite(() -> {
-                    if (heldWriter.complete(Thread.currentThread())) {
-                        awaitRelease(releaseWriter);
-                    }
-                })
+                .holdDeliveryWrite(writer)
                 .beforeProcess(packet -> {
                     if (armed.get() && packet instanceof Packet.PingReq) {
                         decoded.incrementAndGet();
@@ -382,12 +377,13 @@ class BrokerConcurrencyTest {
                 RawSession client = connected(sut.port(), "client");
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession observer = connected(sut.port(), "observer")) {
-            // Arrange: a held delivery keeps the writer, so that 120 PINGRESPs wait in the send
-            // queue, 8 short of the 128 responses that it keeps room for.
+            // Arrange: the write of a delivery is kept back, so that 120 PINGRESPs wait in the
+            // send queue, 8 short of the 128 responses that it keeps room for.
             client.subscribe("deliveries", AT_MOST_ONCE);
             observer.subscribe("processed", AT_MOST_ONCE);
+            writer.hold();
             publisher.publish("deliveries", "held", AT_MOST_ONCE, 0);
-            heldWriter.get(5, SECONDS);
+            writer.awaitHeld();
             var answered = new ByteArrayOutputStream();
             for (int request = 0; request < 120; request++) {
                 answered.writeBytes(codec.encode(new Packet.PingReq()));
@@ -409,7 +405,7 @@ class BrokerConcurrencyTest {
             await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                     assertThat(decoded).hasValueGreaterThanOrEqualTo(9));
             stall.release.countDown();
-            releaseWriter.countDown();
+            writer.release();
 
             // Assert: no response finds the room full, which would end the connection.
             assertThat(client.expect(Packet.Publish.class))
@@ -420,7 +416,7 @@ class BrokerConcurrencyTest {
             client.ping();
         } finally {
             stall.release.countDown();
-            releaseWriter.countDown();
+            writer.release();
         }
     }
 

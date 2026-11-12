@@ -5,9 +5,6 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -21,7 +18,6 @@ import org.mqtt4j.hato.broker.internal.common.value.ReasonCode;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.broker.internal.RawSession.acceptedV5;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
@@ -138,18 +134,12 @@ class BrokerWillDelayTest {
     @Test
     void an_old_connection_that_ends_after_its_session_was_continued_publishes_no_delayed_will()
             throws Exception {
-        // The old connection's writer, which ends the connection, stops at the hook.
-        var holding = new AtomicBoolean();
-        var heldWriter = new CompletableFuture<Thread>();
-        var release = new CountDownLatch(1);
+        // The old connection ends once its writes are over, and one of them is kept back.
+        var writer = new HeldWrite();
         try (BrokerServer sut = BrokerServer.builder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .scheduler(timer)
-                .beforeDeliveryWrite(() -> {
-                    if (holding.get() && heldWriter.complete(Thread.currentThread())) {
-                        BrokerSessionRaceTest.awaitRelease(release);
-                    }
-                })
+                .holdDeliveryWrite(writer)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
                 RawSession watcher = watching(sut);
                 RawSession publisher = RawSession.connectedV5(sut.port(), "publisher");
@@ -158,12 +148,12 @@ class BrokerWillDelayTest {
                         connect("racing", true, 60, delayed("racing", 10)),
                         false
                 )) {
-            // Arrange: the broker ends the old connection, whose writer is held, and a delivery
+            // Arrange: the broker ends the old connection, whose write is held, and a delivery
             // finds it ended and detaches the session before the connection's end comes.
             previous.subscribe("race/#", AT_LEAST_ONCE);
-            holding.set(true);
+            writer.hold();
             publisher.publish("race/held", "held", AT_MOST_ONCE, 0);
-            Thread writer = heldWriter.get(5, SECONDS);
+            writer.awaitHeld();
             sut.disconnect("racing");
             publisher.publish("race/queued", "queued", AT_LEAST_ONCE, 1);
 
@@ -171,15 +161,20 @@ class BrokerWillDelayTest {
             try (RawSession resumed = accepted(sut, connect("racing", false, 60, null), true)) {
                 assertThat(resumed.expect(Packet.Publish.class).topic())
                         .isEqualTo(new Topic("race/queued"));
-                release.countDown();
-                assertThat(writer.join(Duration.ofSeconds(5))).isTrue();
+                writer.release();
+                // The old connection closes after its end has gone to the session, which
+                // handles it before this ping.
+                assertThat(previous.expect(Packet.Disconnect.class).reasonCode())
+                        .isEqualTo(ReasonCode.ADMINISTRATIVE_ACTION);
+                previous.expectClosed();
+                resumed.ping();
 
                 // Assert: nothing even once the delay has long passed.
                 timer.clock.advance(Duration.ofSeconds(30));
                 expectNothing(watcher);
             }
         } finally {
-            release.countDown();
+            writer.release();
         }
     }
 
