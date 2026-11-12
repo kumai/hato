@@ -104,6 +104,10 @@ final class Connection {
 
     private boolean ioFailed;
 
+    // Why a write failed, while the connection still hands the input that had arrived by then
+    // to its session, and null otherwise.
+    private @Nullable String writeFailure;
+
     private boolean disposed;
 
     private @Nullable Packet pending;
@@ -156,6 +160,11 @@ final class Connection {
 
     // A delivery or PUBREL found its queue full; the writer's next completion resumes it.
     private boolean awaitingSpace;
+
+    // Set once a write has failed. Nothing goes out any more, so the connection takes no
+    // deliveries, drops the responses that its session still makes, and reserves no room for
+    // them.
+    private boolean outputFailed;
 
     private long lastReceived;
 
@@ -227,7 +236,9 @@ final class Connection {
             dispose();
             return;
         }
-        if (!ioFailed) {
+        if (writeFailure != null) {
+            handOverLastInput();
+        } else if (!ioFailed) {
             try {
                 writeReady();
             } catch (IOException failure) {
@@ -264,7 +275,7 @@ final class Connection {
         }
         synchronized (this) {
             if (pendingAnswered && !pendingReserved) {
-                if (responseRoomTaken()) {
+                if (!outputFailed && responseRoomTaken()) {
                     return false;
                 }
                 owed++;
@@ -307,25 +318,39 @@ final class Connection {
     }
 
     // A peer that goes away can leave packets behind, such as the DISCONNECT that discards its
-    // Will, and a write can meet the failure before a read finds them. Hands the input that has
-    // arrived to the session, then ends the connection after it.
-    // Ceiling: a packet that waits for its actor or for response room stays where it is, and
-    // the input behind it ends with the connection. Reading on until the actor takes that
-    // packet would lift this.
+    // Will, and a write can meet the failure before a read finds them. So a failed write ends
+    // the output at once, and the connection itself only after the input that has arrived.
     private void writeFailed(IOException failure) {
-        String reason = failureReason("I/O", failure);
+        writeFailure = failureReason("I/O", failure);
+        ioFailed = true;
+        synchronized (this) {
+            outputFailed = true;
+        }
+        handOverLastInput();
+    }
+
+    // Hands the input that has arrived to the session, then ends the connection after it, for
+    // the write that failed. A CONNECT that its actor has yet to answer, or a packet that waits
+    // for room in the session's inbox, keeps the connection until then: this returns, and the
+    // selector comes back here as the actor goes on. A response needs no room any more.
+    private void handOverLastInput() {
+        String reason = requireNonNull(writeFailure);
         try {
-            while (!isEnded() && !connecting && !readClosed && resumePending()) {
+            while (!isEnded() && !readClosed) {
+                if (connecting || !resumePending()) {
+                    return;
+                }
                 input.flip();
                 boolean waiting = consume();
                 input.compact();
-                if (waiting || socket.getChannel().read(input) <= 0) {
+                if (!waiting && socket.getChannel().read(input) <= 0) {
                     break;
                 }
             }
         } catch (IOException | PacketDecodeException _) {
             // Whatever the input holds, the connection ends for the failure of the write.
         }
+        writeFailure = null;
         endRead(reason, true);
     }
 
@@ -467,7 +492,7 @@ final class Connection {
     }
 
     synchronized SendQueue.OfferResult enqueue(Outgoing message) {
-        if (lastPacket != null) {
+        if (lastPacket != null || outputFailed) {
             return SendQueue.OfferResult.CLOSED;
         }
         // PUBLISH and PUBREL share the regular queue, whose window always fits a resumed
@@ -550,8 +575,9 @@ final class Connection {
     void respond(Packet packet) {
         boolean accepted;
         synchronized (this) {
-            // A connection that ends with a last packet drops later responses.
-            if (lastPacket != null) {
+            // A connection that ends with a last packet drops later responses, and so does one
+            // whose write has failed.
+            if (lastPacket != null || outputFailed) {
                 return;
             }
             if (!released.isEmpty()) {

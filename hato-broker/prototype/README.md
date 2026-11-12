@@ -24,8 +24,10 @@ The queue quotas, codec, delivery state, retained messages, and subscription mat
 EOF and socket errors follow the packets already posted to the session. A queued DISCONNECT
 can apply its session expiry and Will before the actor ends the connection. When a write fails,
 the selector first hands over the input that has already arrived, so a DISCONNECT sent just
-before a reset still applies. A peer that half-closes can still receive a final MQTT packet.
-The selector releases the send batch and the socket after the connection ends.
+before a reset still applies. Where a packet of that input has to wait for the session, the
+connection stays until the actor has taken it and what lies behind it; meanwhile it takes no
+deliveries and drops the session's responses. A peer that half-closes can still receive a final
+MQTT packet. The selector releases the send batch and the socket after the connection ends.
 
 The accepting thread waits for connections in a selector and never inside `accept`. On macOS,
 closing a listener at the moment a thread enters a blocking `accept` can leave `close()` waiting
@@ -78,11 +80,12 @@ The suite tests selector survival through repeated disconnects, that a connectio
 another thread stays open until its selector closes it, that an error in one connection leaves
 the others served, broker shutdown on an injected selector failure and on an interrupt of a
 selector thread, the final response after a peer half-closes, a DISCONNECT that arrived before
-a write failed, a burst that overfills a session's inbox, a publication to more subscribers
-than a worker keeps for the end of its turn, a session with a long backlog, which lets a
-waiting session take its turn, and that `close()` waits for a selector that still has a
-connection open. It also tests that a broker answers, accepts, and delivers while the
-application's virtual threads keep every carrier busy, and while its logging backend is held up.
+a write failed, also behind packets that waited for the session, a burst that overfills a
+session's inbox, a publication to more subscribers than a worker keeps for the end of its
+turn, a session with a long backlog, which lets a waiting session take its turn, and that
+`close()` waits for a selector that still has a connection open. It also tests that a broker
+answers, accepts, and delivers while the application's virtual threads keep every carrier
+busy, and while its logging backend is held up.
 
 The race tests stop the broker at a chosen point in two ways. A hook that waits holds its whole
 selector or actor worker, which is what a thread that loses the processor there does; such a
@@ -162,8 +165,6 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
 - Keep the 99th percentile of a fan-out to 1,000 subscribers under its limit of 5 ms at busier
   times too. It stays close to the limit, as before these changes.
 - Give the application a way to learn that the broker closed itself after a selector failed.
-- After a failed write, read on until the actor has taken a packet that waits for it. Today the
-  input behind such a packet ends with the connection.
 - Count the received packets that wait in all inboxes against a budget for the whole broker.
   Each session's inbox takes 128 of them, eight times what it took.
 - Hand over the output that a worker holds when one of its events blocks. Today it waits for the

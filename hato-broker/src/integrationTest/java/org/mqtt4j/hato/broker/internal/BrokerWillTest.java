@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -7,6 +8,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -233,6 +235,94 @@ class BrokerWillTest {
         }
     }
 
+    @Test
+    @SuppressWarnings("try") // The client resets its connection itself, before the cleanup.
+    void a_disconnect_behind_packets_that_waited_when_a_write_failed_discards_the_will()
+            throws Exception {
+        int count = 20;
+        var armed = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var stalling = new AtomicBoolean(true);
+        var stalled = new CountDownLatch(1);
+        var resume = new CountDownLatch(1);
+        var decoded = new AtomicInteger();
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .beforeDeliveryWrite(() -> {
+                            if (armed.compareAndSet(true, false)) {
+                                held.countDown();
+                                awaitRelease(release);
+                            }
+                        })
+                        .beforeProcess(packet -> {
+                            if (isBurst(packet)) {
+                                decoded.incrementAndGet();
+                            }
+                        })
+                        .beforeHandle(packet -> {
+                            if (isBurst(packet) && stalling.compareAndSet(true, false)) {
+                                stalled.countDown();
+                                awaitRelease(resume);
+                            }
+                        })
+                        .start(loopback());
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                var leaving = new Socket(InetAddress.getLoopbackAddress(), sut.port());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession observer = connected(sut.port(), "observer")
+        ) {
+            // Arrange: the broker is about to write a delivery to the client that leaves.
+            subscriber.subscribe(WILL_TOPIC, EXACTLY_ONCE);
+            observer.subscribe("burst", AT_MOST_ONCE);
+            leaving.setSoTimeout(5_000);
+            var reader = new FrameReader(leaving.getInputStream(), 1024);
+            leaving.getOutputStream().write(codec.encode(
+                    connect(MqttVersion.V3_1_1, "leaving", 0, will("left", AT_LEAST_ONCE))
+            ));
+            assertThat(codec.decode(reader.read().orElseThrow()))
+                    .isInstanceOf(Packet.ConnAck.class);
+            leaving.getOutputStream().write(codec.encode(
+                    new Packet.Subscribe(1, List.of(subscription("feed", AT_MOST_ONCE)), EMPTY)
+            ));
+            assertThat(codec.decode(reader.read().orElseThrow())).isInstanceOf(Packet.SubAck.class);
+            armed.set(true);
+            publisher.publish("feed", "held", AT_MOST_ONCE, 0);
+            awaitRelease(held);
+
+            // Act: more publications than a session lets wait, DISCONNECT, and then a reset
+            // reach the broker, whose write now fails. The session stalls on the first
+            // publication, so one of the others waits for it, with DISCONNECT behind.
+            var burst = new ByteArrayOutputStream();
+            for (int number = 1; number <= count; number++) {
+                burst.writeBytes(codec.encode(
+                        publication("burst", Integer.toString(number), AT_MOST_ONCE, 0)
+                ));
+            }
+            burst.writeBytes(codec.encode(new Packet.Disconnect(SUCCESS, EMPTY)));
+            leaving.getOutputStream().write(burst.toByteArray());
+            leaving.setSoLinger(true, 0);
+            leaving.close();
+            publisher.ping();
+            release.countDown();
+            awaitRelease(stalled);
+            await().until(() -> decoded.get() >= 17);
+            resume.countDown();
+
+            // Assert: every publication went on, and the broker discarded the Will.
+            for (int number = 1; number <= count; number++) {
+                Packet.Publish delivery = observer.expect(Packet.Publish.class);
+                assertThat(new String(delivery.payload(), UTF_8))
+                        .isEqualTo(Integer.toString(number));
+            }
+            await().until(() -> !sut.connectedClients().contains("leaving"));
+            subscriber.ping();
+        } finally {
+            release.countDown();
+            resume.countDown();
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(
             value = ReasonCode.class,
@@ -408,6 +498,11 @@ class BrokerWillTest {
                 (qos == AT_MOST_ONCE) ? 0 : 1,
                 EMPTY
         );
+    }
+
+    private static boolean isBurst(Packet packet) {
+        return packet instanceof Packet.Publish publish
+                && publish.topic().name().equals("burst");
     }
 
     private static InetSocketAddress loopback() {
