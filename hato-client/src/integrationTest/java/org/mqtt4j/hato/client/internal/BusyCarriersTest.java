@@ -3,10 +3,6 @@ package org.mqtt4j.hato.client.internal;
 import java.net.ServerSocket;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -14,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import org.mqtt4j.hato.*;
 import org.mqtt4j.hato.client.internal.common.protocol.Packet;
+import org.mqtt4j.hato.testsupport.BusyCarriers;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -161,41 +158,5 @@ class BusyCarriersTest {
     // Whether this JVM gives clients platform cores; the single-carrier suite gives none.
     private static boolean platformCores() {
         return Integer.getInteger("hato.client.platformCores", CoreThreads.PLATFORM_CORES) > 0;
-    }
-
-    /// As many virtual threads as the scheduler has carriers, each computing without blocking
-    /// until stopped, which keeps every carrier busy meanwhile.
-    private static final class BusyCarriers {
-
-        private final AtomicBoolean stopped = new AtomicBoolean();
-
-        private final List<Thread> threads = new ArrayList<>();
-
-        static BusyCarriers start() throws InterruptedException {
-            int carriers = Integer.getInteger(
-                    "jdk.virtualThreadScheduler.parallelism",
-                    Runtime.getRuntime().availableProcessors()
-            );
-            var busy = new BusyCarriers();
-            var running = new CountDownLatch(carriers);
-            for (int i = 0; i < carriers; i++) {
-                busy.threads.add(Thread.ofVirtual().start(() -> {
-                    running.countDown();
-                    while (!busy.stopped.get()) {
-                        Thread.onSpinWait();
-                    }
-                }));
-            }
-            // Each thread counts down on a carrier that it then keeps.
-            running.await();
-            return busy;
-        }
-
-        void stop() throws InterruptedException {
-            stopped.set(true);
-            for (Thread thread : threads) {
-                thread.join();
-            }
-        }
     }
 }

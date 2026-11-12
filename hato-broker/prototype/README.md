@@ -81,7 +81,8 @@ selector thread, the final response after a peer half-closes, a DISCONNECT that 
 a write failed, a burst that overfills a session's inbox, a publication to more subscribers
 than a worker keeps for the end of its turn, a session with a long backlog, which lets a
 waiting session take its turn, and that `close()` waits for a selector that still has a
-connection open.
+connection open. It also tests that a broker answers, accepts, and delivers while the
+application's virtual threads keep every carrier busy, and while its logging backend is held up.
 
 The race tests stop the broker at a chosen point in two ways. A hook that waits holds its whole
 selector or actor worker, which is what a thread that loses the processor there does; such a
