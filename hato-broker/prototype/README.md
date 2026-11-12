@@ -15,7 +15,7 @@ processes at most 256 events before reserving another turn at the back of the ex
 | [BrokerServer](../src/main/java/org/mqtt4j/hato/broker/internal/BrokerServer.java) | Platform-thread accept loop that waits in a selector of its own; closes the actor executor and selectors |
 | [Routing](../src/main/java/org/mqtt4j/hato/broker/internal/Routing.java) | Owns the selectors and actor executor; assigns connections round-robin |
 | [Reactor](../src/main/java/org/mqtt4j/hato/broker/internal/Reactor.java) | Owns key and channel cleanup, coalesces wakeups, ends a connection whose work fails, and closes the broker when the selector itself fails or its thread is interrupted |
-| [Connection](../src/main/java/org/mqtt4j/hato/broker/internal/Connection.java) | Incremental framing, nonblocking reads and partial writes, pause/resume for bounded queues |
+| [Connection](../src/main/java/org/mqtt4j/hato/broker/internal/Connection.java) | Nonblocking reads and partial writes, pause/resume for bounded queues; the shared `FrameAssembler` puts the received packets together |
 | [Client](../src/main/java/org/mqtt4j/hato/broker/internal/Client.java) | Reports CONNECT acceptance through an internal callback instead of waiting on a future |
 | [Session](../src/main/java/org/mqtt4j/hato/broker/internal/Session.java) | Uses the actor executor for queued turns; wakes a reader when inbox space returns |
 | [Worker](../src/main/java/org/mqtt4j/hato/broker/internal/Worker.java) | Actor pool thread; keeps the connections that a turn queued output for until the turn ends |
@@ -160,7 +160,6 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
 
 ## Product work left for the next stage
 
-- Share framing with the blocking reader.
 - Verify the remaining stop races. Subscription matching still scans sessions.
 - Keep the 99th percentile of a fan-out to 1,000 subscribers under its limit of 5 ms at busier
   times too. It stays close to the limit, as before these changes.

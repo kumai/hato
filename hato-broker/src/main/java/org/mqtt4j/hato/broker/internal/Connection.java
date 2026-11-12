@@ -7,7 +7,6 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.time.Duration;
 import java.util.ArrayDeque;
-import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
@@ -16,6 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
+import org.mqtt4j.hato.broker.internal.common.io.FrameAssembler;
 import org.mqtt4j.hato.broker.internal.common.io.SendQueue;
 import org.mqtt4j.hato.broker.internal.common.io.WriteParts;
 import org.mqtt4j.hato.broker.internal.common.log.Log;
@@ -23,7 +23,6 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.protocol.PacketDecodeException;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
-import org.mqtt4j.hato.broker.internal.common.protocol.RemainingLength;
 import org.mqtt4j.hato.broker.internal.common.protocol.UnsupportedProtocolVersionException;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
@@ -88,13 +87,9 @@ final class Connection {
 
     // I/O state belongs to the selector. Actor callbacks publish acceptance through its queue.
 
-    private byte[] frame = new byte[5];
-
-    private int frameReceived;
-
-    private int frameSize;
-
-    private int maxPacketSize = MAX_PACKET_SIZE;
+    // Puts the packets together from the input. Its size limit is that of the framing format,
+    // until the Maximum Packet Size that a CONNACK announces lowers it.
+    private final FrameAssembler frames = new FrameAssembler(MAX_PACKET_SIZE);
 
     private boolean connecting;
 
@@ -203,7 +198,7 @@ final class Connection {
     // Refuses the packets after this point that are larger than `maximumPacketSize`, which
     // CONNACK announced. Acceptance sets it before the selector resumes reads.
     void limitPacketSize(int maximumPacketSize) {
-        maxPacketSize = maximumPacketSize;
+        frames.limit(maximumPacketSize);
     }
 
     synchronized boolean start() {
@@ -375,46 +370,8 @@ final class Connection {
     // Returns true while a CONNECT or one complete packet waits for its actor or response room.
     private boolean consume() {
         while (input.hasRemaining()) {
-            if (frameSize > 0) {
-                int count = Math.min(input.remaining(), frameSize - frameReceived);
-                if (frameReceived + count > frame.length) {
-                    frame = Arrays.copyOf(
-                            frame,
-                            Math.min(frameSize, Math.max(frame.length * 2, frameReceived + count))
-                    );
-                }
-                input.get(frame, frameReceived, count);
-                frameReceived += count;
-            } else {
-                byte next = input.get();
-                frame[frameReceived++] = next;
-                if (frameReceived >= 2) {
-                    if ((next & 0x80) != 0) {
-                        if (frameReceived == 5) {
-                            throw new PacketDecodeException(
-                                    ReasonCode.MALFORMED_PACKET,
-                                    "Remaining Length exceeds four bytes"
-                            );
-                        }
-                    } else {
-                        int remaining = RemainingLength.read(
-                                ByteBuffer.wrap(frame, 1, frameReceived - 1)
-                        );
-                        frameSize = frameReceived + remaining;
-                        if (frameSize > maxPacketSize) {
-                            throw new PacketDecodeException(
-                                    ReasonCode.PACKET_TOO_LARGE,
-                                    "MQTT packet exceeds maximum " + maxPacketSize
-                            );
-                        }
-                    }
-                }
-            }
-            if (frameSize != 0 && frameReceived == frameSize) {
-                byte[] bytes = Arrays.copyOf(frame, frameSize);
-                frameReceived = 0;
-                frameSize = 0;
-                frame = new byte[5];
+            byte[] bytes = frames.next(input);
+            if (bytes != null) {
                 received();
                 if (!connected) {
                     Packet.Connect request;
