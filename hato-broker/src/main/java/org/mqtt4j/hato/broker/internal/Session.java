@@ -117,6 +117,13 @@ final class Session {
     // once set.
     private volatile Map<TopicFilter, Subscribed> subscriptions = Map.of();
 
+    // The characters of the filters of all the subscriptions, which the subscription limits
+    // bound with their number.
+    private long subscriptionLength;
+
+    // Whether the session has logged a refused subscription at warning level yet.
+    private boolean refusalLogged;
+
     private PacketIds packetIds = new PacketIds();
 
     private final LinkedHashMap<Integer, Outgoing> inflight = new LinkedHashMap<>();
@@ -688,14 +695,26 @@ final class Session {
         dropOldest(room);
     }
 
-    // Makes or replaces the subscription to its filter. Retain Handling 0 queues the retained
-    // messages that it matches for every SUBSCRIBE, 1 only for a new subscription, and 2, the
-    // only other value, never [MQTT-3.3.1-9] [MQTT-3.3.1-10] [MQTT-3.3.1-11]; MQTT 3.1.1 uses 0.
-    // They wait for the next drain, which follows SUBACK. Under the topic lock, a retained
-    // publication either is among them or is delivered to the subscription, and the deliveries
-    // after the subscription queue behind them. Runs on the actor.
-    void subscribe(Subscribed subscribed) {
+    // Makes or replaces the subscription to its filter, and returns false if the subscription
+    // limits leave no room for a new one, which then subscribes to nothing; replacing a
+    // subscription takes no room. Retain Handling 0 queues the retained messages that it
+    // matches for every SUBSCRIBE, 1 only for a new subscription, and 2, the only other value,
+    // never [MQTT-3.3.1-9] [MQTT-3.3.1-10] [MQTT-3.3.1-11]; MQTT 3.1.1 uses 0. They wait for the
+    // next drain, which follows SUBACK. Under the topic lock, a retained publication either is
+    // among them or is delivered to the subscription, and the deliveries after the subscription
+    // queue behind them. Runs on the actor.
+    boolean subscribe(Subscribed subscribed) {
         Packet.Subscription subscription = subscribed.subscription();
+        int length = subscription.filter().pattern().length();
+        boolean added = !subscriptions.containsKey(subscription.filter());
+        if (added && (subscriptions.size() >= settings.maxSubscriptions()
+                || length > settings.maxSubscriptionLength() - subscriptionLength)) {
+            logRefusal(subscription.filter());
+            return false;
+        }
+        if (added) {
+            subscriptionLength += length;
+        }
         synchronized (routing.retained) {
             Map<TopicFilter, Subscribed> current = subscriptions;
             boolean sendsRetained = switch (subscription.retainHandling()) {
@@ -713,6 +732,21 @@ final class Session {
                 subscriptions = changed;
             }
         }
+        return true;
+    }
+
+    // Logs that the subscription limits refused `filter`: the first time for the session as a
+    // warning, because the client now misses what it asked for.
+    private void logRefusal(TopicFilter filter) {
+        if (!refusalLogged) {
+            refusalLogged = true;
+            log.warn("Broker on port {} refused the subscription of client {} to {}: its"
+                    + " subscription limits are reached; later ones are logged at debug level",
+                    routing.port, clientId, filter.pattern());
+        } else {
+            log.debug("Broker on port {} refused the subscription of client {} to {}: its"
+                    + " subscription limits are reached", routing.port, clientId, filter.pattern());
+        }
     }
 
     // Ends the subscription to `filter`, and returns whether there was one. The retained
@@ -728,6 +762,7 @@ final class Session {
             var changed = new LinkedHashMap<>(current);
             changed.remove(filter);
             subscriptions = changed;
+            subscriptionLength -= filter.pattern().length();
             return true;
         }
     }
@@ -1165,6 +1200,7 @@ final class Session {
             retainedRoom.clear();
             connection = null;
         }
+        subscriptionLength = 0;
         expiry = 0;
         received.clear();
         inflight.clear();
@@ -1184,6 +1220,7 @@ final class Session {
             version = newVersion;
             dropLogged = false;
         }
+        refusalLogged = false;
         expiry = newExpiry;
         packetIds = new PacketIds();
     }

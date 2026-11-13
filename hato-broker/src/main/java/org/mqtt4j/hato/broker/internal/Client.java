@@ -506,7 +506,16 @@ final class Client {
                                     requested.retainHandling()
                             )
                             : requested;
-                    owner.subscribe(new Session.Subscribed(subscription, identifier));
+                    // The broker bounds the subscriptions of a session. One beyond its limits
+                    // subscribes to nothing, as a refused one, and the others of the request go
+                    // on.
+                    if (!owner.subscribe(new Session.Subscribed(subscription, identifier))) {
+                        grants.add(switch (owner.version) {
+                            case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
+                            case V5 -> ReasonCode.QUOTA_EXCEEDED;
+                        });
+                        continue;
+                    }
                     ReasonCode granted = switch (subscription.qos()) {
                         case AT_MOST_ONCE -> ReasonCode.SUCCESS;
                         case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;

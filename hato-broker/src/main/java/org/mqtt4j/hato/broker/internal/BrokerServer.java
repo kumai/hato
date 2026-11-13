@@ -53,6 +53,13 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int MAX_SESSIONS = 1024;
 
+    // One session's subscriptions are bounded by number, because every publication is matched
+    // against each of them, and by the length of their filters in all, because a single filter
+    // can have 65,535 bytes.
+    private static final int MAX_SUBSCRIPTIONS = 10_000;
+
+    private static final long MAX_SUBSCRIPTION_LENGTH = 1024 * 1024;
+
     // Retained messages are bounded like the other state that the broker keeps: by count, as
     // sessions are, and by size, as each session's waiting deliveries are.
     private static final int MAX_RETAINED = 1024;
@@ -168,6 +175,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxSessions = MAX_SESSIONS;
 
+        private int maxSubscriptions = MAX_SUBSCRIPTIONS;
+
+        private long maxSubscriptionLength = MAX_SUBSCRIPTION_LENGTH;
+
         private int maxRetained = MAX_RETAINED;
 
         private long maxRetainedBytes = SEND_BYTES;
@@ -235,6 +246,16 @@ public final class BrokerServer implements AutoCloseable {
 
         Builder maxSessions(int value) {
             maxSessions = value;
+            return this;
+        }
+
+        Builder maxSubscriptions(int value) {
+            maxSubscriptions = value;
+            return this;
+        }
+
+        Builder maxSubscriptionLength(long value) {
+            maxSubscriptionLength = value;
             return this;
         }
 
@@ -321,6 +342,8 @@ public final class BrokerServer implements AutoCloseable {
                 || maxQueued <= 0
                 || maxQueuedBytes <= 0
                 || maxSessions <= 0
+                || maxSubscriptions <= 0
+                || maxSubscriptionLength <= 0
                 || maxRetained <= 0
                 || maxRetainedBytes <= 0
                 || maxHeld <= 0
@@ -341,6 +364,8 @@ public final class BrokerServer implements AutoCloseable {
                     maxQueued,
                     maxQueuedBytes,
                     maxSessions,
+                    maxSubscriptions,
+                    maxSubscriptionLength,
                     maxRetained,
                     maxRetainedBytes,
                     maxHeld,

@@ -10,9 +10,11 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // the broker starts. The connect timeout is in nanoseconds. `maxPacketSize` is the largest
 // packet in bytes that the broker takes from a client, whatever its protocol version, and
 // `maxConnectSize` the largest that it takes as a CONNECT, from a peer that it knows nothing of
-// yet; the smaller of the two bounds a CONNECT. `selectors` and `actors` are the numbers of
-// selector threads and of threads in the actor pool. The capabilities are what the broker
-// announces to MQTT 5.0 clients until a test changes them, within its own limits.
+// yet; the smaller of the two bounds a CONNECT. `maxSubscriptions` and
+// `maxSubscriptionLength` bound the subscriptions of one session: their number, and the
+// characters of their filters in all. `selectors` and `actors` are the numbers of selector
+// threads and of threads in the actor pool. The capabilities are what the broker announces to
+// MQTT 5.0 clients until a test changes them, within its own limits.
 //
 // The selector calls `beforeProcess` before handing a packet to its session. It asks
 // `deliveryWriteHeld` before marking the deliveries of a write as sent: while the answer is
@@ -31,6 +33,8 @@ record BrokerSettings(
         int maxQueued,
         long maxQueuedBytes,
         int maxSessions,
+        int maxSubscriptions,
+        long maxSubscriptionLength,
         int maxRetained,
         long maxRetainedBytes,
         int maxHeld,
