@@ -170,7 +170,7 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
   Each session's inbox takes 128 of them, eight times what it took.
 - Hand over the output that a worker holds when one of its events blocks. Today it waits for the
   end of the turn, with the output of the events before.
-- Measure the numbers of selectors and workers on more than four processors. Two workers are
-  the limit for eight QoS 1 pairs on four.
+- Measure the numbers of selectors and workers on more than four processors. On four, a third
+  or a fourth worker moved less, not more.
 - Run the full broker/client/testkit, distribution, and native-image checks. TLS and application
   authentication are not implemented by this prototype.

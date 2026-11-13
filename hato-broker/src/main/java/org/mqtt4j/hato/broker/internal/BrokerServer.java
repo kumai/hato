@@ -59,9 +59,9 @@ public final class BrokerServer implements AutoCloseable {
     // two processors these numbers made a publication to many subscribers wait the shortest;
     // fewer selectors moved more QoS 0 publications at full speed, but such a publication and
     // QoS 1 exchanges waited longer. On four processors the numbers met the targets that the
-    // broker has at that size.
-    // Ceiling: more than four processors are unmeasured. Two pool threads were the limit for
-    // eight pairs of QoS 1 clients on four, so a larger machine may want more of both.
+    // broker has at that size, and a third or a fourth pool thread moved less, not more.
+    // Ceiling: more than four processors are unmeasured, and so are other numbers of
+    // selectors on four.
     private static final int SELECTORS = 4;
 
     private static final int ACTORS = 2;
