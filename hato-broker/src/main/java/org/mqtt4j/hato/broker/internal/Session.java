@@ -154,19 +154,19 @@ final class Session {
 
     // What waits for the window or for room in the connection's send queue, in the order it came:
     // deliveries, and the cursors of the retained messages that new subscriptions matched. QoS 0
-    // deliveries and acknowledged ones count against rooms of their own, each as large as the
-    // queue limits, so that QoS 0 deliveries that a client falls behind on cannot push out
+    // deliveries and acknowledged ones count against rooms of their own, each with its own
+    // limits, so that QoS 0 deliveries that a client falls behind on cannot push out
     // acknowledged ones.
     private final ArrayDeque<Pending> pending = new ArrayDeque<>();
 
-    private final Room atMostOnceRoom = new Room();
+    private final Room atMostOnceRoom;
 
-    private final Room acknowledgedRoom = new Room();
+    private final Room acknowledgedRoom;
 
     // The retained messages that the cursors still hold. Their room is as large as the retained
     // limits, so that one subscription can take everything that the broker retains, while the
     // cursors of a client that subscribes again and again without taking them never hold more.
-    private final Room retainedRoom = new Room();
+    private final Room retainedRoom;
 
     // Whether the session has logged a dropped delivery at warning level yet.
     private boolean dropLogged;
@@ -222,6 +222,12 @@ final class Session {
         settings = routing.settings;
         this.clientId = clientId;
         this.version = version;
+        atMostOnceRoom = new Room(
+                settings.maxQueuedAtMostOnce(),
+                settings.maxQueuedAtMostOnceBytes()
+        );
+        acknowledgedRoom = new Room(settings.maxQueued(), settings.maxQueuedBytes());
+        retainedRoom = new Room(settings.maxRetained(), settings.maxRetainedBytes());
     }
 
     // Whether the session outlives its connection: Clean Session 0 in MQTT 3.1.1, or a
@@ -687,14 +693,14 @@ final class Session {
     // than with the older ones; then the oldest go until the room holds its limits again. Called
     // under the inbox.
     private void trim(Room room) {
-        if (!overflows(room)) {
+        if (!room.overflows()) {
             return;
         }
         Iterator<Pending> queued = pending.iterator();
         while (queued.hasNext()) {
             if (queued.next() instanceof Delivery waiting
                     && roomOf(waiting) == room
-                    && waiting.byteCount > settings.maxQueuedBytes()) {
+                    && waiting.byteCount > room.maxBytes) {
                 queued.remove();
                 room.remove(waiting.byteCount);
                 dropped(waiting.qos, "it is larger than the delivery queue");
@@ -809,7 +815,7 @@ final class Session {
     private void dropOldestRetained() {
         for (Pending queued : pending) {
             if (queued instanceof RetainedCursor cursor) {
-                while (retainedOverflows() && cursor.hasNext()) {
+                while (retainedRoom.overflows() && cursor.hasNext()) {
                     Qos qos = cursor.nextQos();
                     retainedRoom.remove(cursor.advance());
                     dropped(qos, "its retained messages wait beyond what the broker retains");
@@ -829,11 +835,6 @@ final class Session {
         }
     }
 
-    private boolean retainedOverflows() {
-        return retainedRoom.count > settings.maxRetained()
-                || retainedRoom.bytes > settings.maxRetainedBytes();
-    }
-
     // Drops the oldest queued deliveries of the kind that `room` counts until it holds its
     // limits again, so that a client that falls behind gets the newest ones. Deliveries in the
     // connection's send queue or in flight are on their way and stay. A deliberate
@@ -842,7 +843,7 @@ final class Session {
     // would make it constant if the limits grow. Called under the inbox.
     private void dropOldest(Room room) {
         Iterator<Pending> queued = pending.iterator();
-        while (overflows(room) && queued.hasNext()) {
+        while (room.overflows() && queued.hasNext()) {
             if (queued.next() instanceof Delivery oldest && roomOf(oldest) == room) {
                 queued.remove();
                 room.remove(oldest.byteCount);
@@ -860,10 +861,6 @@ final class Session {
 
     private Room roomOf(Delivery delivery) {
         return (delivery.qos == Qos.AT_MOST_ONCE) ? atMostOnceRoom : acknowledgedRoom;
-    }
-
-    private boolean overflows(Room room) {
-        return room.count > settings.maxQueued() || room.bytes > settings.maxQueuedBytes();
     }
 
     // Records under the inbox that the broker's limits kept a delivery at `qos` from the
@@ -1310,13 +1307,27 @@ final class Session {
     record Subscribed(Packet.Subscription subscription, int identifier) {
     }
 
-    // The number and bytes of what waits of one kind: queued deliveries, or the retained messages
-    // that cursors hold.
+    // The number and bytes of what waits of one kind, and the limits on them: queued deliveries,
+    // or the retained messages that cursors hold.
     private static final class Room {
+
+        final int maxCount;
+
+        final long maxBytes;
 
         int count;
 
         long bytes;
+
+        Room(int maxCount, long maxBytes) {
+            this.maxCount = maxCount;
+            this.maxBytes = maxBytes;
+        }
+
+        // Whether more waits than the limits allow.
+        boolean overflows() {
+            return count > maxCount || bytes > maxBytes;
+        }
 
         void add(long size) {
             count++;

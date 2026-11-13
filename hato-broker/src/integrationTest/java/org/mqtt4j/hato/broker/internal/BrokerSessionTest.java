@@ -437,6 +437,41 @@ class BrokerSessionTest {
         }
     }
 
+    @Test
+    void qos_zero_deliveries_wait_within_limits_of_their_own() throws Exception {
+        BrokerServer.Builder limited = BrokerServer.builder()
+                .maxInflight(1)
+                .maxQueued(3)
+                .maxQueuedAtMostOnce(1);
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        try (BrokerServer sut = limited.start(address);
+                RawSession subscriber = connected(sut.port(), "mixed-client");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: an acknowledged delivery holds the window.
+            subscriber.subscribe("mixed", AT_LEAST_ONCE);
+            publisher.publish("mixed", "held", AT_LEAST_ONCE, 7);
+            Packet.Publish held = expectDelivery(subscriber, "mixed", "held");
+
+            // Act: three acknowledged deliveries and two QoS 0 ones come to wait behind it.
+            List<String> acknowledged = List.of("1-a", "1-b", "1-c");
+            for (String payload : acknowledged) {
+                publisher.publish("mixed", payload, AT_LEAST_ONCE, 7);
+            }
+            publisher.publish("mixed", "0-a", AT_MOST_ONCE, 0);
+            publisher.publish("mixed", "0-b", AT_MOST_ONCE, 0);
+            publisher.ping();
+
+            // Assert: every acknowledged one waited, and of the QoS 0 ones only the newer.
+            acknowledge(subscriber, held);
+            for (String payload : acknowledged) {
+                acknowledge(subscriber, expectDelivery(subscriber, "mixed", payload));
+            }
+            assertThat(subscriber.expect(Packet.Publish.class))
+                    .isEqualTo(publication("mixed", "0-b", AT_MOST_ONCE, 0));
+            subscriber.ping();
+        }
+    }
+
     private static BrokerServer broker(int maxInflight) throws IOException {
         return broker(maxInflight, 64 * 1024, 16, 64 * 1024, 16);
     }
@@ -464,6 +499,8 @@ class BrokerSessionTest {
                 .maxInflightBytes(maxInflightBytes)
                 .maxQueued(maxQueued)
                 .maxQueuedBytes(maxQueuedBytes)
+                .maxQueuedAtMostOnce(maxQueued)
+                .maxQueuedAtMostOnceBytes(maxQueuedBytes)
                 .maxSessions(maxSessions)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
     }

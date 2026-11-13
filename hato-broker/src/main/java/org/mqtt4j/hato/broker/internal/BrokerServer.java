@@ -58,6 +58,11 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int MAX_QUEUED = 128;
 
+    // The QoS 0 deliveries that may wait for a session have a number of their own, which stays
+    // small whatever the other is: a deeper queue would only have a client that falls behind
+    // get older ones, and none of them waits for a client that is away.
+    private static final int MAX_QUEUED_AT_MOST_ONCE = 128;
+
     private static final int MAX_SESSIONS = 1024;
 
     // How long a session may outlive its connection: as long as its client asks for.
@@ -199,6 +204,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private long maxQueuedBytes = SEND_BYTES;
 
+        private int maxQueuedAtMostOnce = MAX_QUEUED_AT_MOST_ONCE;
+
+        private long maxQueuedAtMostOnceBytes = SEND_BYTES;
+
         private int maxSessions = MAX_SESSIONS;
 
         private Duration maxSessionExpiry = MAX_SESSION_EXPIRY;
@@ -283,6 +292,16 @@ public final class BrokerServer implements AutoCloseable {
 
         Builder maxQueuedBytes(long value) {
             maxQueuedBytes = value;
+            return this;
+        }
+
+        Builder maxQueuedAtMostOnce(int value) {
+            maxQueuedAtMostOnce = value;
+            return this;
+        }
+
+        Builder maxQueuedAtMostOnceBytes(long value) {
+            maxQueuedAtMostOnceBytes = value;
             return this;
         }
 
@@ -400,6 +419,8 @@ public final class BrokerServer implements AutoCloseable {
                 || maxInflightBytes > sendBytes
                 || maxQueued <= 0
                 || maxQueuedBytes <= 0
+                || maxQueuedAtMostOnce <= 0
+                || maxQueuedAtMostOnceBytes <= 0
                 || maxSessions <= 0
                 || maxSessionExpiry.toSeconds() <= 0
                 || maxSubscriptions <= 0
@@ -425,6 +446,8 @@ public final class BrokerServer implements AutoCloseable {
                     maxInflightBytes,
                     maxQueued,
                     maxQueuedBytes,
+                    maxQueuedAtMostOnce,
+                    maxQueuedAtMostOnceBytes,
                     maxSessions,
                     // No session lasts longer than the longest interval that a client can ask
                     // for, which keeps it without end.

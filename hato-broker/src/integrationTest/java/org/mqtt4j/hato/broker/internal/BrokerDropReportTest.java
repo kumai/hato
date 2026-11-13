@@ -307,6 +307,8 @@ class BrokerDropReportTest {
                 .maxInflightBytes(1024)
                 .maxQueued(2)
                 .maxQueuedBytes(1024)
+                .maxQueuedAtMostOnce(2)
+                .maxQueuedAtMostOnceBytes(1024)
                 .dropListener(listener)
                 .start(loopback());
     }
