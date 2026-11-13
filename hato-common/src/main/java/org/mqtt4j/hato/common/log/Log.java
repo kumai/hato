@@ -302,7 +302,10 @@ public final class Log {
 
         // A statement takes its text and the messages of its exception, the causes and the
         // suppressed exceptions included, in characters, and STATEMENT_SIZE and THROWABLE_SIZE
-        // more for itself and for each exception.
+        // more for itself and for each exception. A statement whose exceptions cannot all be
+        // counted, because there are more than MAX_EXCEPTIONS or one of them fails to tell,
+        // keeps what it cannot count all the same. It takes the whole room, so it waits only
+        // when nothing else does, as a statement of any size may.
         // Ceiling: an exception's stack trace, and the fields of an exception class of the
         // application, count as THROWABLE_SIZE whatever they hold. Rendering the exception here
         // would count them, at the price of its whole text for every statement with one.
@@ -318,12 +321,11 @@ public final class Log {
             if (thrown != null) {
                 exceptions.add(thrown);
             }
-            // A cause chain can come back to itself; the count bounds the walk.
-            for (int counted = 0; counted < Writer.MAX_EXCEPTIONS; counted++) {
-                Throwable exception = exceptions.poll();
-                if (exception == null) {
-                    break;
-                }
+            // The exceptions found so far, counted or not yet. A cause chain can come back to
+            // itself, so the count also bounds the walk.
+            int found = exceptions.size();
+            Throwable exception;
+            while ((exception = exceptions.poll()) != null) {
                 size += Writer.THROWABLE_SIZE;
                 try {
                     String message = exception.getMessage();
@@ -331,12 +333,17 @@ public final class Log {
                         size += message.length();
                     }
                     Throwable cause = exception.getCause();
+                    Throwable[] suppressed = exception.getSuppressed();
+                    found += (cause == null ? 0 : 1) + suppressed.length;
+                    if (found > Writer.MAX_EXCEPTIONS) {
+                        return new Statement(logger, level, text, thrown, thread, Writer.ROOM);
+                    }
                     if (cause != null) {
                         exceptions.add(cause);
                     }
-                    exceptions.addAll(Arrays.asList(exception.getSuppressed()));
+                    exceptions.addAll(Arrays.asList(suppressed));
                 } catch (RuntimeException _) {
-                    // An exception whose own methods fail counts as THROWABLE_SIZE alone.
+                    return new Statement(logger, level, text, thrown, thread, Writer.ROOM);
                 }
             }
             return new Statement(logger, level, text, thrown, thread, size);
@@ -382,7 +389,8 @@ public final class Log {
         // backend prints it.
         private static final long THROWABLE_SIZE = 1024;
 
-        // The exceptions of one statement that count, beyond which the walk stops.
+        // The exceptions of one statement that the walk counts. A statement with more takes the
+        // whole room (see Statement.of).
         private static final int MAX_EXCEPTIONS = 64;
 
         private static final long POLL_NANOS = 1_000_000;

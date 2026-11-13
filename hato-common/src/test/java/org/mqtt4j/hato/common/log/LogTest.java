@@ -16,6 +16,8 @@ import java.util.logging.SimpleFormatter;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -163,6 +165,36 @@ class LogTest {
         // Assert: no more of them waited than the room of four mebi characters holds.
         assertThat(logger.messages).hasSizeBetween(2, 5);
         assertThat(logger.messages.getFirst()).isEqualTo("first");
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "64, 'first,chain,alone'",
+            "65, 'first,alone'"
+    })
+    void a_chain_of_more_exceptions_than_are_counted_waits_only_alone(int length, String written)
+            throws Exception {
+        // Arrange: the backend holds one statement. The deepest exception of the chain has a
+        // message of one mebi of characters.
+        var logger = new HoldingLogger();
+        var sut = Log.of(logger);
+        Throwable chain = chain(length, "x".repeat(1 << 20));
+        try {
+            sut.info("first");
+            assertThat(logger.entered.await(10, SECONDS)).isTrue();
+
+            // Act: the chain behind the statement that the backend holds, and then alone.
+            sut.error("chain", chain);
+        } finally {
+            logger.released.countDown();
+        }
+        awaitWritten();
+        sut.error("alone", chain);
+        awaitWritten();
+
+        // Assert: a chain that is counted whole waits as usual. A longer one finds no room
+        // while anything else waits.
+        assertThat(logger.messages).containsExactly(written.split(","));
     }
 
     @Test
@@ -346,6 +378,16 @@ class LogTest {
     void class_based_logs_are_named_after_the_class() {
         assertThat(Log.of(LogTest.class).getName()).isEqualTo(LogTest.class.getName());
         assertThat(Log.of("org.mqtt4j.hato.test").getName()).isEqualTo("org.mqtt4j.hato.test");
+    }
+
+    /// A chain of `length` exceptions, each the cause of the one before; the deepest has
+    /// `message`.
+    private static Throwable chain(int length, String message) {
+        Throwable chain = new IllegalStateException(message);
+        for (int depth = 1; depth < length; depth++) {
+            chain = new IllegalStateException("cause " + depth, chain);
+        }
+        return chain;
     }
 
     /// Waits for the thread that writes. What the backend recorded until then is safe to read.
