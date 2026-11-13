@@ -57,8 +57,8 @@ final class Connection {
 
     private static final long RESERVED_BYTES = 1024 * 1024;
 
-    // The framing format bounds packet size, until a connection's announced Maximum Packet Size
-    // lowers the bound.
+    // The largest packet that the framing format allows. The broker's own limits are at most
+    // this.
     static final int MAX_PACKET_SIZE = 268_435_460;
 
     private final Routing routing;
@@ -87,9 +87,9 @@ final class Connection {
 
     // I/O state belongs to the selector. Actor callbacks publish acceptance through its queue.
 
-    // Puts the packets together from the input. Its size limit is that of the framing format,
-    // until the Maximum Packet Size that a CONNACK announces lowers it.
-    private final FrameAssembler frames = new FrameAssembler(MAX_PACKET_SIZE);
+    // Puts the packets together from the input. Its size limit is the one for a CONNECT until
+    // the broker accepts the client, and from then on the one for the client's packets.
+    private final FrameAssembler frames;
 
     private boolean connecting;
 
@@ -179,6 +179,9 @@ final class Connection {
                 RESERVED_COUNT,
                 RESERVED_BYTES
         );
+        frames = new FrameAssembler(
+                Math.min(settings.maxPacketSize(), settings.maxConnectSize())
+        );
         lastReceived = scheduler.nanoTime();
         receiveTimeout = settings.connectTimeout();
         this.socket = socket;
@@ -195,8 +198,9 @@ final class Connection {
         return socket.getRemoteSocketAddress();
     }
 
-    // Refuses the packets after this point that are larger than `maximumPacketSize`, which
-    // CONNACK announced. Acceptance sets it before the selector resumes reads.
+    // Refuses the packets after this point that are larger than `maximumPacketSize`: the
+    // broker's limit for an accepted client, which an MQTT 5.0 CONNACK announced. Acceptance
+    // sets it before the selector resumes reads.
     void limitPacketSize(int maximumPacketSize) {
         frames.limit(maximumPacketSize);
     }

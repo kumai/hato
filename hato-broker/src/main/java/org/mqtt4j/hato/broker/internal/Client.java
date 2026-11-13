@@ -188,10 +188,13 @@ final class Client {
                 done.accept(false);
                 return;
             }
-            Integer maximumPacketSize = offered.maximumPacketSize();
-            if (maximumPacketSize != null) {
-                connection.limitPacketSize(maximumPacketSize);
-            }
+            // The CONNECT had a limit of its own. An MQTT 5.0 client has learned of its limit
+            // from CONNACK; MQTT 3.1.1 cannot tell a client, and the broker's limit holds for
+            // it all the same.
+            Integer announced = offered.maximumPacketSize();
+            connection.limitPacketSize(
+                    (announced == null) ? settings.maxPacketSize() : announced
+            );
             log.info("Broker accepted client {} from {} on port {}",
                     acceptance.id, connection.remoteAddress(), routing.port);
             done.accept(true);

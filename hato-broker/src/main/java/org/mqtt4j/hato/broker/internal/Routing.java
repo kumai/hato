@@ -73,7 +73,9 @@ final class Routing {
     // The kinds of response that the connections of these clients hold back.
     private final Set<Hold> holds = ConcurrentHashMap.newKeySet();
 
-    // What the broker announces to the MQTT 5.0 connections that it accepts from now on.
+    // What the broker announces to the MQTT 5.0 connections that it accepts from now on. Its
+    // Maximum Packet Size is never above the broker's own limit, which holds whatever a test
+    // announces.
     volatile Capabilities capabilities;
 
     volatile boolean closed;
@@ -82,7 +84,7 @@ final class Routing {
         this.settings = settings;
         this.port = port;
         retained = new RetainedMessages(settings, port);
-        capabilities = settings.capabilities();
+        capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
         int workers = settings.actors();
         var nextWorker = new AtomicInteger();
@@ -213,7 +215,7 @@ final class Routing {
     // A connection copies the capabilities as it accepts the CONNECT, so each one works by those
     // before or those after this replacement, never by a mix.
     void announce(Capabilities value) {
-        capabilities = value;
+        capabilities = value.withPacketSizeWithin(settings.maxPacketSize());
     }
 
     // The test rule for subscriptions to exactly `filter`, or null without one.

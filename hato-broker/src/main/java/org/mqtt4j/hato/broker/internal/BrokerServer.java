@@ -39,6 +39,12 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
 
+    // The largest packet that the broker takes from a client, and the largest that it takes as
+    // a CONNECT, before it knows the client. Each is the most that the framing format allows.
+    private static final int MAX_PACKET_SIZE = Connection.MAX_PACKET_SIZE;
+
+    private static final int MAX_CONNECT_SIZE = Connection.MAX_PACKET_SIZE;
+
     private static final long SEND_BYTES = 16L * 1024 * 1024;
 
     private static final int MAX_INFLIGHT = 128;
@@ -146,6 +152,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private Duration connectTimeout = CONNECT_TIMEOUT;
 
+        private int maxPacketSize = MAX_PACKET_SIZE;
+
+        private int maxConnectSize = MAX_CONNECT_SIZE;
+
         private long sendBytes = SEND_BYTES;
 
         private int maxInflight = MAX_INFLIGHT;
@@ -185,6 +195,16 @@ public final class BrokerServer implements AutoCloseable {
 
         Builder connectTimeout(Duration value) {
             connectTimeout = requireNonNull(value, "connectTimeout must not be null");
+            return this;
+        }
+
+        Builder maxPacketSize(int value) {
+            maxPacketSize = value;
+            return this;
+        }
+
+        Builder maxConnectSize(int value) {
+            maxConnectSize = value;
             return this;
         }
 
@@ -290,6 +310,9 @@ public final class BrokerServer implements AutoCloseable {
             requireNonNull(address, "address must not be null");
             if (connectTimeout.isNegative()
                 || connectTimeout.isZero()
+                || maxPacketSize <= 0
+                || maxPacketSize > Connection.MAX_PACKET_SIZE
+                || maxConnectSize <= 0
                 || sendBytes <= 0
                 || maxInflight <= 0
                 || maxInflight > Connection.SEND_COUNT
@@ -310,6 +333,8 @@ public final class BrokerServer implements AutoCloseable {
             }
             var settings = new BrokerSettings(
                     connectTimeout.toNanos(),
+                    maxPacketSize,
+                    maxConnectSize,
                     sendBytes,
                     maxInflight,
                     maxInflightBytes,
