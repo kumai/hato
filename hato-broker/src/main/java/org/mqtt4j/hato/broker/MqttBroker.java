@@ -42,9 +42,11 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 ///
 /// MQTT 5.0 support covers what client tests need. A positive Session Expiry Interval makes a
 /// session persistent, as Clean Session false does, and Clean Start false resumes it. The session
-/// ends once that many seconds have passed since its last connection ended, unless the interval is
-/// 0xFFFFFFFF; the client's DISCONNECT can change the interval, though not from 0. A Clean Session
-/// false session of MQTT 3.1.1 does not expire. A session resumes only with the protocol version
+/// ends once that many seconds have passed since its last connection ended; the client's
+/// DISCONNECT can change the interval, though not from 0. The broker bounds how long a session
+/// outlives its connection: a client that asks for longer, as with 0xFFFFFFFF, gets that bound and
+/// learns it from the Session Expiry Interval in CONNACK, and a Clean Session false session of MQTT
+/// 3.1.1 ends when the bound has passed. A session resumes only with the protocol version
 /// that created it. An empty client identifier is assigned and returned in CONNACK. Publication
 /// properties reach MQTT 5.0 subscribers unchanged and are dropped for MQTT 3.1.1 subscribers,
 /// except that a Message Expiry Interval arrives less the whole seconds that the message waited in
@@ -90,6 +92,12 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 /// every retained message that it matches. Those still waiting go when the client unsubscribes,
 /// and a client that keeps subscribing faster than it takes them misses the oldest. A delivery
 /// too large for the broker's internal size limits does not reach its subscriber either.
+/// The clients that the broker serves at once are bounded: a CONNECT beyond the limit is refused,
+/// in MQTT 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable, unless it comes for
+/// the session of a client that is connected, whose connection it takes over. Connections that
+/// have had no CONNECT accepted yet are bounded apart from the clients, and one beyond their
+/// limit is closed at once. A CONNECT larger than the broker takes from an unknown peer closes its
+/// connection without a CONNACK.
 /// A new persistent session is refused when the persistent-session limit is reached, in MQTT
 /// 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable. The number and total size
 /// of retained messages are bounded too: a retained publication beyond either limit is

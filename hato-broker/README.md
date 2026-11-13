@@ -76,13 +76,16 @@ and connections, or end connections, with reason codes of their choice. In turn,
 keeps to the Receive Maximum and Maximum Packet Size that MQTT 5.0 clients announce,
 and drops a message too large for a client instead of sending it. An MQTT 5.0
 persistent session ends once its Session Expiry Interval has passed after its
-connection; MQTT 3.1.1 persistent sessions do not expire.
+connection. The broker bounds how long any session outlives its connection, which
+also ends MQTT 3.1.1 persistent sessions, and tells an MQTT 5.0 client that asks
+for longer.
 
 With Clean Session false, or a positive session expiry in MQTT 5.0, subscriptions
 and QoS 1/2 deliveries survive a disconnect, and reconnecting with the same client
 identifier resumes them. Delivery storage is bounded, so a subscriber that falls too
 far behind misses messages, whatever their QoS, while its connection and session go
-on.
+on. The clients that the broker serves at once are bounded too, and it refuses one
+beyond the limit as it connects.
 
 State lives in memory and is lost when the broker stops; use test fixtures or your
 application to recreate it. MQTT delivery acknowledgements do not mean that data
