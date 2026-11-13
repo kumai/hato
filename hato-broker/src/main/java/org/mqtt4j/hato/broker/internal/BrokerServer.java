@@ -333,6 +333,9 @@ public final class BrokerServer implements AutoCloseable {
                 listener.bind(address);
                 var server = new BrokerServer(listener, settings);
                 try {
+                    // The pool would start a thread for each of its first tasks. Starting them
+                    // now gives the broker all its threads from the start, whatever comes.
+                    server.routing.actors.prestartAllCoreThreads();
                     for (Reactor reactor : server.routing.reactors) {
                         reactor.start();
                     }

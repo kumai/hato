@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -40,7 +39,7 @@ final class Routing {
 
     final AtomicInteger nextReactor = new AtomicInteger();
 
-    final ExecutorService actors;
+    final ThreadPoolExecutor actors;
 
     // The port that the broker listens on, for thread names and logs.
     final int port;

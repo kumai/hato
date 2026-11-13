@@ -350,11 +350,8 @@ class BrokerConnectionTest {
     @Test
     void connections_take_no_threads_of_their_own() throws Exception {
         try (var sut = MqttBroker.start()) {
-            // Arrange: two packets of one connection have had every thread of the broker start.
+            // Arrange: the broker's threads have all started with it.
             int port = sut.port();
-            try (RawSession first = connected(port, "first")) {
-                first.ping();
-            }
             long before = threads(port);
 
             // Act
