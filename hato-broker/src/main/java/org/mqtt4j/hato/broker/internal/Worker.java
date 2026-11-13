@@ -20,6 +20,10 @@ final class Worker extends Thread {
     // Touched by this thread alone.
     private final HashSet<Connection> held = new HashSet<>();
 
+    // The room in the broker's memory for deliveries that this thread keeps to take from and
+    // give back to (see MemoryBudget). This thread alone uses it while it runs tasks.
+    long memory;
+
     Worker(Runnable loop, String name) {
         super(loop, name);
         setDaemon(true);

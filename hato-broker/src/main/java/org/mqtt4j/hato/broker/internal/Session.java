@@ -79,6 +79,9 @@ final class Session {
     // A Session Expiry Interval of 0xFFFFFFFF, which keeps a session without end.
     static final long NEVER = 0xFFFF_FFFFL;
 
+    // Why a delivery is dropped that the broker's memory for deliveries has no room for.
+    private static final String MEMORY_USED_UP = "the broker's memory for deliveries is used up";
+
     private final Routing routing;
 
     private final BrokerSettings settings;
@@ -169,6 +172,13 @@ final class Session {
 
     // The number that the next delivery or cursor to wait gets.
     private long nextOrder;
+
+    // How many of the session's deliveries have room in the broker's memory for deliveries:
+    // those that have waited in its queues, and those that were unanswered in its window when
+    // it lost a connection. Each gives its room back as it leaves the session, so the number
+    // is zero once the session is cleared; if not, a delivery left without giving its room
+    // back.
+    private int withRoom;
 
     // The retained messages that the cursors still hold. Their room is as large as the retained
     // limits, so that one subscription can take everything that the broker retains, while the
@@ -431,7 +441,7 @@ final class Session {
         try {
             if (connection == from && !from.isEnded()) {
                 settings.beforeHandle().accept(received.packet);
-                from.client.process(this, received.packet);
+                from.client.process(this, received.packet, received.bytes);
             }
         } catch (Throwable failure) {
             from.failed("packet handling", failure);
@@ -558,7 +568,12 @@ final class Session {
     // a subscription once the client has learned that it ended [MQTT-3.10.4-2]. Called by the
     // publisher's actor, which drains the session here if it can take its turn, or holds it as
     // the publisher's own; otherwise the actor that holds the turn drains it.
-    void deliverMatching(Packet.Publish publication, Session publisher, long received) {
+    void deliverMatching(
+            Packet.Publish publication,
+            PublicationMemory room,
+            Session publisher,
+            long received
+    ) {
         while (true) {
             Map<TopicFilter, Subscribed> matchedOn = subscriptions;
             MqttVersion sized = version;
@@ -591,6 +606,7 @@ final class Session {
                 deliveries = List.of(
                         new Delivery(
                                 publication,
+                                room,
                                 received,
                                 Qos.of(Math.min(asPublished, published)),
                                 true,
@@ -599,6 +615,7 @@ final class Session {
                         ),
                         new Delivery(
                                 publication,
+                                room,
                                 received,
                                 Qos.of(Math.min(cleared, published)),
                                 false,
@@ -612,7 +629,15 @@ final class Session {
                 identifiers.addAll(clearedIdentifiers);
                 boolean retain = publication.retain() && asPublished >= 0;
                 deliveries = List.of(
-                        new Delivery(publication, received, qos, retain, identifiers, sized)
+                        new Delivery(
+                                publication,
+                                room,
+                                received,
+                                qos,
+                                retain,
+                                identifiers,
+                                sized
+                        )
                 );
             } else {
                 return;
@@ -689,19 +714,79 @@ final class Session {
         DeliveryQueue queue = queueOf(delivery);
         delivery.order = nextOrder++;
         queue.add(delivery);
-        if (!online || !drainsNext) {
+        if (!online) {
+            // Nothing sends for a session without a connection, so the delivery waits from
+            // now on.
             trim(queue);
+        } else if (!drainsNext) {
+            // The thread that has the session's turn sends what it can soon, and what waits
+            // then takes its room. Until then the queue keeps to its own limits.
+            applyLimits(queue);
         }
         return online;
     }
 
+    // Takes room in the broker's memory for `delivery`: for itself, and for its publication
+    // unless another delivery of it has that already. Returns false when the memory has none.
+    // Called under the inbox.
+    private boolean takeRoom(Delivery delivery) {
+        MemoryBudget memory = routing.memory;
+        if (!memory.take(MemoryBudget.DELIVERY_BYTES)) {
+            return false;
+        }
+        if (!delivery.memory.hold(memory)) {
+            memory.give(MemoryBudget.DELIVERY_BYTES);
+            return false;
+        }
+        delivery.hasRoom = true;
+        withRoom++;
+        return true;
+    }
+
+    // Takes room in the broker's memory for `delivery` whatever the memory has left. Called
+    // under the inbox.
+    private void takeRoomAnyway(Delivery delivery) {
+        MemoryBudget memory = routing.memory;
+        memory.takeAnyway(MemoryBudget.DELIVERY_BYTES);
+        delivery.memory.holdAnyway(memory);
+        delivery.hasRoom = true;
+        withRoom++;
+    }
+
+    // Gives the room of `delivery` in the broker's memory back. Called under the inbox.
+    private void giveRoom(Delivery delivery) {
+        MemoryBudget memory = routing.memory;
+        delivery.hasRoom = false;
+        withRoom--;
+        delivery.memory.release(memory);
+        memory.give(MemoryBudget.DELIVERY_BYTES);
+    }
+
+    // Drops `delivery`, which has just left its queue, for `cause`. Called under the inbox.
+    private void drop(Delivery delivery, String cause) {
+        if (delivery.hasRoom) {
+            giveRoom(delivery);
+        }
+        dropped(delivery.qos, cause);
+    }
+
     // Applies the limits of `queue` to its deliveries, which wait once what could go out has
-    // gone. One larger than the whole queue would never fit, so it goes alone rather than with
-    // the older ones; then the oldest go until the queue holds its limits again, so that a
-    // client that falls behind gets the newest ones. Deliveries in the connection's send queue
-    // or in flight are on their way and stay. Called under the inbox.
+    // gone, and takes room in the broker's memory for those that have come to wait since the
+    // last time. Called under the inbox.
     private void trim(DeliveryQueue queue) {
-        if (!queue.overflows()) {
+        applyLimits(queue);
+        takeRoomForWaiting(queue);
+    }
+
+    // Applies the limits of `queue` to its deliveries. One larger than the whole queue would
+    // never fit, so it goes alone rather than with the older ones; then the oldest go until
+    // the queue holds its limits again, so that a client that falls behind gets the newest
+    // ones. Deliveries in the connection's send queue or in flight are on their way and stay.
+    // Called under the inbox.
+    private void applyLimits(DeliveryQueue queue) {
+        // Only deliveries that came since the limits and the memory were last seen to can
+        // have the queue overflow, and they are the ones that are still without room.
+        if (queue.deliveries.size() == queue.withRoom) {
             return;
         }
         // The last time left none that large in the queue, so each of them has come since, and
@@ -712,12 +797,53 @@ final class Session {
             if (waiting.byteCount > queue.maxBytes) {
                 newest.remove();
                 queue.left(waiting);
-                dropped(waiting.qos, "it is larger than the delivery queue");
+                drop(waiting, "it is larger than the delivery queue");
             }
         }
         while (queue.overflows()) {
-            dropped(queue.removeOldest().qos, "its delivery queue is full");
+            drop(queue.removeOldest(), "its delivery queue is full");
         }
+    }
+
+    // Takes room in the broker's memory for the deliveries of `queue` that have none yet:
+    // those that came since the last time, which stand at its end in the order they came.
+    // Without room, the session's oldest deliveries of the kind make room for a new one, as
+    // they do for the queue's own limits. They stay if even all of them could not make enough:
+    // then the session goes without the new one alone, as it does when none waits. Called
+    // under the inbox.
+    private void takeRoomForWaiting(DeliveryQueue queue) {
+        int arrived = queue.deliveries.size() - queue.withRoom;
+        if (arrived == 0) {
+            return;
+        }
+        // They leave the queue for the moment, so that what the queue holds is what has room,
+        // oldest first, and come back in their order as they get theirs.
+        var waiting = new Delivery[arrived];
+        for (int index = arrived - 1; index >= 0; index--) {
+            waiting[index] = queue.deliveries.removeLast();
+            queue.left(waiting[index]);
+        }
+        for (Delivery delivery : waiting) {
+            if (makeRoom(queue, delivery)) {
+                queue.add(delivery);
+            }
+        }
+    }
+
+    // Takes room for `delivery`, which is to wait in `queue`, at the cost of the queue's
+    // oldest deliveries if need be. Returns false if the session goes without `delivery`.
+    private boolean makeRoom(DeliveryQueue queue, Delivery delivery) {
+        while (!takeRoom(delivery)) {
+            long held = queue.bytes
+                    + (long) MemoryBudget.DELIVERY_BYTES * queue.deliveries.size();
+            long needed = MemoryBudget.DELIVERY_BYTES + delivery.byteCount;
+            if (queue.deliveries.isEmpty() || !routing.memory.mightFit(needed, held)) {
+                dropped(delivery.qos, MEMORY_USED_UP);
+                return false;
+            }
+            drop(queue.removeOldest(), MEMORY_USED_UP);
+        }
+        return true;
     }
 
     // Makes or replaces the subscription to its filter, and returns false if the subscription
@@ -1055,22 +1181,36 @@ final class Session {
                     // An ACK can free the logical window before the writer frees physical space.
                     return;
                 }
-                consume(head);
-                if (acknowledged) {
-                    inflight.put(delivery.packetId, delivery);
-                    inflightBytes += delivery.byteCount;
-                    countOutstanding(delivery.packetId);
+                if (!acknowledged) {
+                    consume(head);
+                    continue;
                 }
+                // A delivery that had waited keeps its room in the broker's memory as it moves
+                // from the queue into the window.
+                switch (head) {
+                    case Delivery queued -> queueOf(queued).removeOldest();
+                    case RetainedCursor cursor -> retainedRoom.remove(cursor.advance());
+                }
+                inflight.put(delivery.packetId, delivery);
+                inflightBytes += delivery.byteCount;
+                countOutstanding(delivery.packetId);
             }
         }
     }
 
-    // Moves past the delivery at `head`, which is what goes out next: a queued delivery, the
-    // oldest of its kind, leaves its queue, and a cursor moves on to its next retained message,
-    // which leaves the retained room. Called under the inbox.
+    // Moves past the delivery at `head`, which leaves the session here: it went to the
+    // connection's send queue as a QoS 0 delivery, or goes without being sent. A queued
+    // delivery, the oldest of its kind, leaves its queue and gives back the room that it had
+    // in the broker's memory if it had waited, and a cursor moves on to its next retained
+    // message, which leaves the retained room. Called under the inbox.
     private void consume(Pending head) {
         switch (head) {
-            case Delivery queued -> queueOf(queued).removeOldest();
+            case Delivery queued -> {
+                queueOf(queued).removeOldest();
+                if (queued.hasRoom) {
+                    giveRoom(queued);
+                }
+            }
             case RetainedCursor cursor -> retainedRoom.remove(cursor.advance());
         }
     }
@@ -1137,6 +1277,7 @@ final class Session {
                     end(id, delivery);
                 } else {
                     inflightBytes -= delivery.byteCount;
+                    leaveWindow(delivery);
                     var release = new Release(id);
                     inflight.putLast(id, release);
                     deferred.putLast(id, release);
@@ -1156,11 +1297,34 @@ final class Session {
         packetIds.release(id);
         if (outgoing instanceof Delivery delivery) {
             inflightBytes -= delivery.byteCount;
+            leaveWindow(delivery);
         }
         if (outstanding.get(id)) {
             outstanding.clear(id);
             outstandingCount--;
         }
+    }
+
+    // Gives back the room that `delivery` has in the broker's memory, if any, as the window
+    // lets go of it: its exchange ended, or went on to the PUBREL, which needs the delivery no
+    // more. Runs on the actor, which alone sees the deliveries in the window.
+    private void leaveWindow(Delivery delivery) {
+        if (delivery.hasRoom) {
+            synchronized (this) {
+                giveRoom(delivery);
+            }
+        }
+    }
+
+    // Empties `queue`, whose deliveries give back the room that they have in the broker's
+    // memory. Called under the inbox.
+    private void empty(DeliveryQueue queue) {
+        for (Delivery delivery : queue.deliveries) {
+            if (delivery.hasRoom) {
+                giveRoom(delivery);
+            }
+        }
+        queue.clear();
     }
 
     // Detaches `peer` if it is the session's connection. A session that does not outlive the
@@ -1174,10 +1338,19 @@ final class Session {
             if (kept()) {
                 detachedAt = settings.scheduler().nanoTime();
                 // QoS 0 belongs to the connection; only acknowledged deliveries survive it.
-                atMostOnceQueue.clear();
+                empty(atMostOnceQueue);
                 for (RetainedCursor cursor : cursors) {
                     cursor.keepAcknowledgedOnly();
                 }
+                // From here on the session waits for a connection with everything that it
+                // holds, so all of it takes room in the broker's memory: the unanswered
+                // deliveries too, which the session cannot go without, whatever room is left.
+                for (Outgoing outgoing : inflight.values()) {
+                    if (outgoing instanceof Delivery delivery && !delivery.hasRoom) {
+                        takeRoomAnyway(delivery);
+                    }
+                }
+                trim(acknowledgedQueue);
             }
         }
         deferred.clear();
@@ -1209,13 +1382,26 @@ final class Session {
     // Drops the session state, the Will that waits with it and the timer included, which leaves
     // the actor without a session.
     void clear() {
+        int unaccounted;
         synchronized (this) {
             subscriptions = Map.of();
-            atMostOnceQueue.clear();
-            acknowledgedQueue.clear();
+            empty(atMostOnceQueue);
+            empty(acknowledgedQueue);
             cursors.clear();
             retainedRoom.clear();
             connection = null;
+            for (Outgoing outgoing : inflight.values()) {
+                if (outgoing instanceof Delivery delivery && delivery.hasRoom) {
+                    giveRoom(delivery);
+                }
+            }
+            // Every delivery that the session held has given its room back by now. A number
+            // that is left tells of deliveries that left the session without doing so.
+            unaccounted = withRoom;
+            withRoom = 0;
+        }
+        if (unaccounted != 0) {
+            routing.memory.lost(unaccounted);
         }
         subscriptionLength = 0;
         expiry = 0;
@@ -1269,9 +1455,14 @@ final class Session {
     // Ends the session as the broker closes. Its state goes, the Will that waits with it
     // included, which a closing broker does not publish.
     void close() {
+        routing.sessionClearing();
         post(() -> {
-            leave();
-            clear();
+            try {
+                leave();
+                clear();
+            } finally {
+                routing.sessionCleared();
+            }
         }, ALONE);
     }
 
@@ -1322,6 +1513,10 @@ final class Session {
         // the limits.
         int oversized;
 
+        // How many of the deliveries have room in the broker's memory for deliveries. They
+        // are the oldest: those that came later have none until the limits are applied again.
+        int withRoom;
+
         DeliveryQueue(int maxCount, long maxBytes) {
             this.maxCount = maxCount;
             this.maxBytes = maxBytes;
@@ -1338,6 +1533,9 @@ final class Session {
             if (delivery.byteCount > maxBytes) {
                 oversized++;
             }
+            if (delivery.hasRoom) {
+                withRoom++;
+            }
         }
 
         // Takes the oldest delivery out, and returns it.
@@ -1347,11 +1545,15 @@ final class Session {
             return oldest;
         }
 
-        // Takes account of `delivery` having left the deliveries.
+        // Takes account of `delivery` having left the deliveries, before it gives any room in
+        // the broker's memory back.
         void left(Delivery delivery) {
             bytes -= delivery.byteCount;
             if (delivery.byteCount > maxBytes) {
                 oversized--;
+            }
+            if (delivery.hasRoom) {
+                withRoom--;
             }
         }
 
@@ -1359,6 +1561,7 @@ final class Session {
             deliveries.clear();
             bytes = 0;
             oversized = 0;
+            withRoom = 0;
         }
     }
 

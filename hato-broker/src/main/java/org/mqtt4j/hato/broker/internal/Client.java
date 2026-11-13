@@ -474,9 +474,9 @@ final class Client {
         }
     }
 
-    // Handles one packet that the client sent on its accepted connection. Runs on the actor of
-    // `owner`.
-    void process(Session owner, Packet packet) {
+    // Handles one packet of `bytes` bytes that the client sent on its accepted connection. Runs
+    // on the actor of `owner`.
+    void process(Session owner, Packet packet, int bytes) {
         switch (packet) {
             case Packet.Subscribe request -> {
                 int identifier = identifierOf(request);
@@ -595,8 +595,8 @@ final class Client {
                 };
                 send(new Packet.UnsubAck(request.packetId(), reasonCodes, Properties.EMPTY));
             }
-            case Packet.Publish publish -> receive(owner, resolved(publish));
-            case Packet.AliasPublish publish -> receive(owner, resolved(publish));
+            case Packet.Publish publish -> receive(owner, resolved(publish), bytes);
+            case Packet.AliasPublish publish -> receive(owner, resolved(publish), bytes);
             case Packet.PubAck ack -> owner.acknowledge(ack.packetId(), false);
             case Packet.PubRec ack -> owner.release(ack.packetId(), ack.reasonCode());
             case Packet.PubRel ack -> {
@@ -680,9 +680,10 @@ final class Client {
         );
     }
 
-    // Forwards a publication from the client and acknowledges it. Only a server sets
-    // Subscription Identifiers. MQTT 3.1.1 has no properties.
-    private void receive(Session owner, Packet.Publish publish) {
+    // Forwards a publication from the client, which came in a packet of `bytes` bytes, and
+    // acknowledges it. Only a server sets Subscription Identifiers. MQTT 3.1.1 has no
+    // properties.
+    private void receive(Session owner, Packet.Publish publish, int bytes) {
         if (publish.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
             throw new PacketDecodeException(
                     ReasonCode.PROTOCOL_ERROR,
@@ -745,7 +746,7 @@ final class Client {
             unreleased.set(publish.packetId());
             owner.received.set(publish.packetId());
         }
-        routing.route(publish, owner);
+        routing.route(publish, owner, bytes);
         // Acknowledge only after every delivery was enqueued or its target closed.
         if (publish.qos() == Qos.AT_LEAST_ONCE) {
             send(new Packet.PubAck(

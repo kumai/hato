@@ -20,6 +20,10 @@ final class Delivery implements Outgoing, Pending {
 
     private final Packet.Publish publication;
 
+    // The room that the publication takes in the broker's memory for deliveries, which its
+    // deliveries to all sessions share.
+    final PublicationMemory memory;
+
     private final PacketCodec codec;
 
     final Qos qos;
@@ -47,12 +51,18 @@ final class Delivery implements Outgoing, Pending {
     // it, set under the session's inbox as the delivery comes to wait.
     long order;
 
+    // Whether the delivery has room in the broker's memory for deliveries, which its session
+    // takes for it once it waits and gives back as it leaves the session. The session's, under
+    // its inbox.
+    boolean hasRoom;
+
     int packetId;
 
     volatile boolean sent;
 
     Delivery(
             Packet.Publish publication,
+            PublicationMemory memory,
             long received,
             Qos qos,
             boolean retain,
@@ -60,6 +70,7 @@ final class Delivery implements Outgoing, Pending {
             MqttVersion version
     ) {
         this.publication = publication;
+        this.memory = memory;
         this.received = received;
         lifetime = lifetimeOf(publication);
         this.qos = qos;

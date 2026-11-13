@@ -67,6 +67,7 @@ final class RetainedCursor implements Pending {
             RetainedMessages.Message entry = matched.get(next);
             current = new Delivery(
                     entry.publication(),
+                    entry.memory(),
                     entry.received(),
                     nextQos(),
                     true,

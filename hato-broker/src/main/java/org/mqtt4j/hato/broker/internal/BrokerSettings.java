@@ -19,11 +19,13 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // for one session, and `maxQueuedAtMostOnce` and `maxQueuedAtMostOnceBytes` its QoS 0
 // deliveries. `maxSessionExpiry` is the longest that a session outlives its connection,
 // in seconds. `maxSubscriptions` and `maxSubscriptionLength` bound the subscriptions of
-// one session: their number, and the characters of their filters in all. `selectors` and
-// `actors` are the numbers of selector threads and of threads in the actor pool. The
-// capabilities are what the broker announces to MQTT 5.0 clients until a test changes them,
-// within its own limits. The drop listener, if there is one, hears of the QoS 1 and 2
-// deliveries that the limits keep from a session.
+// one session: their number, and the characters of their filters in all. `maxDeliveryMemory`
+// is the memory in bytes that the deliveries that wait for all the sessions may take
+// together, and `deliveryMemoryUnit` how much of it a thread of the actor pool fetches for
+// itself at a time (see MemoryBudget). `selectors` and `actors` are the numbers of selector
+// threads and of threads in the actor pool. The capabilities are what the broker announces
+// to MQTT 5.0 clients until a test changes them, within its own limits. The drop listener,
+// if there is one, hears of the QoS 1 and 2 deliveries that the limits keep from a session.
 //
 // The selector calls `beforeProcess` before handing a packet to its session. It asks
 // `deliveryWriteHeld` before marking the deliveries of a write as sent: while the answer is
@@ -54,6 +56,8 @@ record BrokerSettings(
         int maxRetained,
         long maxRetainedBytes,
         int maxHeld,
+        long maxDeliveryMemory,
+        long deliveryMemoryUnit,
         int selectors,
         int actors,
         Capabilities capabilities,

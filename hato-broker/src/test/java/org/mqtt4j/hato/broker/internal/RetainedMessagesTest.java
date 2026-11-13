@@ -26,12 +26,12 @@ class RetainedMessagesTest {
     void a_message_that_expired_while_a_publication_waited_for_the_store_makes_room_for_it() {
         // Arrange: a store for one message keeps one whose lifetime of a second began at 0.
         var sut = new RetainedMessages(1, 1024, clock, 0);
-        sut.store(retained("old", 1), 0);
+        store(sut, retained("old", 1), 0);
 
         // Act: the next publication arrives after 0.9 s and reaches the store after 1.1 s, as
         // one that waited for the topic lock does.
         clock.now = 1_100_000_000L;
-        sut.store(retained("new", 60), 900_000_000L);
+        store(sut, retained("new", 60), 900_000_000L);
 
         // Assert
         assertThat(kept(sut)).containsExactly("new");
@@ -41,14 +41,14 @@ class RetainedMessagesTest {
     void messages_make_room_one_after_the_other_as_their_lifetimes_pass() {
         // Arrange: a store for two messages keeps one that lives for 5 s and one for 10 s.
         var sut = new RetainedMessages(2, 1024, clock, 0);
-        sut.store(retained("short", 5), 0);
-        sut.store(retained("long", 10), 0);
+        store(sut, retained("short", 5), 0);
+        store(sut, retained("long", 10), 0);
 
         // Act: a further message comes just before each lifetime has passed, and as it has.
         var keptAfterEach = new ArrayList<List<String>>();
         for (long seconds : new long[] {4, 5, 9, 10}) {
             clock.now = seconds * 1_000_000_000L;
-            sut.store(retained("at-" + seconds, 60), clock.now);
+            store(sut, retained("at-" + seconds, 60), clock.now);
             keptAfterEach.add(kept(sut));
         }
 
@@ -59,6 +59,12 @@ class RetainedMessagesTest {
                 List.of("long", "at-5"),
                 List.of("at-5", "at-10")
         );
+    }
+
+    /// Hands `publication`, which arrived at `received`, to `store`. Its room in the broker's
+    /// memory for deliveries plays no part in what the store keeps.
+    private static void store(RetainedMessages store, Packet.Publish publication, long received) {
+        store.store(publication, received, new PublicationMemory(1));
     }
 
     /// The topics of the retained messages that `store` keeps now, in the order stored.

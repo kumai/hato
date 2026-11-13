@@ -65,8 +65,10 @@ final class RetainedMessages {
     // topic in place of the previous one [MQTT-3.3.1-5]. An empty payload only removes the
     // previous one [MQTT-3.3.1-6] [MQTT-3.3.1-7]. A message beyond the retained limits is not
     // kept either, which leaves its topic without a retained message rather than with an
-    // outdated one. The messages whose lifetime has passed make room first.
-    void store(Packet.Publish publication, long received) {
+    // outdated one. The messages whose lifetime has passed make room first. `memory` is the
+    // publication's room in the broker's memory for deliveries, which the deliveries of the
+    // retained message share with those of the publication itself.
+    void store(Packet.Publish publication, long received, PublicationMemory memory) {
         Message previous = messages.remove(publication.topic());
         if (previous != null) {
             bytes -= previous.byteCount();
@@ -85,7 +87,8 @@ final class RetainedMessages {
                 publication,
                 byteCount,
                 received,
-                Delivery.lifetimeOf(publication)
+                Delivery.lifetimeOf(publication),
+                memory
         );
         if (!fits(message)) {
             // The lifetimes are judged by the time now, not by `received`: the publication may
@@ -182,11 +185,18 @@ final class RetainedMessages {
         expiring = false;
     }
 
-    // A retained message, its share of the retained size limit, when the broker received it, and
-    // its Message Expiry Interval in seconds, which counts from then, or -1 without one. The
-    // interval is read from the publication once, because a look at the lifetimes goes through
-    // every message.
-    record Message(Packet.Publish publication, long byteCount, long received, long lifetime) {
+    // A retained message, its share of the retained size limit, when the broker received it,
+    // its Message Expiry Interval in seconds, which counts from then, or -1 without one, and
+    // the room that its deliveries share in the broker's memory for deliveries. The interval is
+    // read from the publication once, because a look at the lifetimes goes through every
+    // message.
+    record Message(
+            Packet.Publish publication,
+            long byteCount,
+            long received,
+            long lifetime,
+            PublicationMemory memory
+    ) {
 
         boolean expired(long now) {
             return Delivery.expired(lifetime, received, now);

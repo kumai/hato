@@ -95,6 +95,14 @@ public final class BrokerServer implements AutoCloseable {
     // that follows the protocol never holds more.
     private static final int MAX_HELD = 65_535;
 
+    // The share of the largest heap that the deliveries that wait for all the sessions may take
+    // together, whatever the limits of each session allow in sum: a quarter. The broker shares
+    // the heap with the application that embeds it.
+    private static final int DELIVERY_MEMORY_SHARE = 4;
+
+    // How much of that memory a thread of the actor pool fetches for itself at a time.
+    private static final long DELIVERY_MEMORY_UNIT = 256 * 1024;
+
     // How many selector threads do the socket I/O, and how many threads the actor pool has. On
     // two processors these numbers made a publication to many subscribers wait the shortest;
     // fewer selectors moved more QoS 0 publications at full speed, but such a publication and
@@ -234,6 +242,11 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxHeld = MAX_HELD;
 
+        private long maxDeliveryMemory =
+                Runtime.getRuntime().maxMemory() / DELIVERY_MEMORY_SHARE;
+
+        private long deliveryMemoryUnit = DELIVERY_MEMORY_UNIT;
+
         private int selectors = SELECTORS;
 
         private int actors = ACTORS;
@@ -352,6 +365,16 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder maxDeliveryMemory(long value) {
+            maxDeliveryMemory = value;
+            return this;
+        }
+
+        Builder deliveryMemoryUnit(long value) {
+            deliveryMemoryUnit = value;
+            return this;
+        }
+
         Builder selectors(int value) {
             selectors = value;
             return this;
@@ -440,6 +463,8 @@ public final class BrokerServer implements AutoCloseable {
                 || maxRetained <= 0
                 || maxRetainedBytes <= 0
                 || maxHeld <= 0
+                || maxDeliveryMemory <= 0
+                || deliveryMemoryUnit < 0
                 || selectors <= 0
                 || actors <= 0
             ) {
@@ -469,6 +494,8 @@ public final class BrokerServer implements AutoCloseable {
                     maxRetained,
                     maxRetainedBytes,
                     maxHeld,
+                    maxDeliveryMemory,
+                    deliveryMemoryUnit,
                     selectors,
                     actors,
                     capabilities,
@@ -671,6 +698,8 @@ public final class BrokerServer implements AutoCloseable {
         for (Reactor reactor : routing.reactors) {
             awaitEnd(reactor.thread);
         }
+        // Only a broker that runs with assertions, as in tests, looks and waits here.
+        assert routing.deliveryMemoryAddsUp();
     }
 
     // Ends the listener, the connections, and the sessions, and has the selectors end.

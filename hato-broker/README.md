@@ -84,10 +84,11 @@ for longer.
 
 With Clean Session false, or a positive session expiry in MQTT 5.0, subscriptions
 and QoS 1/2 deliveries survive a disconnect, and reconnecting with the same client
-identifier resumes them. Delivery storage is bounded, so a subscriber that falls too
-far behind misses messages, whatever their QoS, while its connection and session go
-on. The clients that the broker serves at once are bounded too, and it refuses one
-beyond the limit as it connects.
+identifier resumes them. Delivery storage is bounded, for each session and for all
+sessions together, so a subscriber that falls too far behind misses messages,
+whatever their QoS, while its connection and session go on. The clients that the
+broker serves at once are bounded too, and it refuses one beyond the limit as it
+connects.
 
 State lives in memory and is lost when the broker stops; use test fixtures or your
 application to recreate it. MQTT delivery acknowledgements do not mean that data

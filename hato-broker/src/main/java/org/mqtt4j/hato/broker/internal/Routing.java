@@ -8,19 +8,23 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
 import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
+import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
@@ -36,6 +40,10 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 final class Routing {
 
     private static final Log log = Log.of(Routing.class);
+
+    // How long a closing broker that checks its memory for deliveries waits for the sessions
+    // and the pool to end before it gives the check up.
+    private static final long MEMORY_CHECK_NANOS = 1_000_000_000L;
 
     final BrokerSettings settings;
 
@@ -73,6 +81,15 @@ final class Routing {
 
     final RetainedMessages retained;
 
+    // The memory that the deliveries of all the sessions may take together.
+    final MemoryBudget memory;
+
+    // The threads of the actor pool, each of which keeps some of that memory to itself.
+    private final List<Worker> actorThreads = new CopyOnWriteArrayList<>();
+
+    // How many sessions the closing broker has yet to clear, on whatever thread has their turn.
+    private final AtomicInteger clearing = new AtomicInteger();
+
     // Tells the application of dropped QoS 1 and 2 deliveries, if it asked to hear of them.
     final @Nullable DropReports dropReports;
 
@@ -109,6 +126,11 @@ final class Routing {
                 settings.scheduler(),
                 port
         );
+        memory = new MemoryBudget(
+                settings.maxDeliveryMemory(),
+                settings.deliveryMemoryUnit(),
+                port
+        );
         BrokerSettings.DropListener dropListener = settings.dropListener();
         dropReports = (dropListener == null) ? null : new DropReports(dropListener, port);
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
@@ -121,10 +143,14 @@ final class Routing {
                 0,
                 TimeUnit.MILLISECONDS,
                 new LinkedBlockingQueue<>(),
-                loop -> new Worker(
-                        loop,
-                        "hato-broker-" + port + "-actor-" + nextWorker.getAndIncrement()
-                )
+                loop -> {
+                    var worker = new Worker(
+                            loop,
+                            "hato-broker-" + port + "-actor-" + nextWorker.getAndIncrement()
+                    );
+                    actorThreads.add(worker);
+                    return worker;
+                }
         ) {
 
             // Whatever a task did, the connections that it queued output for go to their
@@ -328,31 +354,93 @@ final class Routing {
                 (will.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
                 properties
         );
-        route(publication, publisher);
+        // A Will takes the room of the PUBLISH that would have carried it.
+        int bytes = PacketCodec.of(MqttVersion.V5).publishSize(
+                publication.topic(),
+                publication.qos(),
+                properties,
+                publication.payload().length
+        );
+        route(publication, publisher, bytes);
     }
 
     // Delivers `publication` from `publisher`'s client to every matching subscription, after
-    // making it the retained message of its topic if its RETAIN flag asks for that. Called on the
-    // actor of `publisher`, which drains the sessions that it delivers to, here where no thread
+    // making it the retained message of its topic if its RETAIN flag asks for that. `bytes` is
+    // the size of the packet that brought it, which is the room that it takes in the broker's
+    // memory for deliveries while a session holds one of its deliveries. Called on the actor
+    // of `publisher`, which drains the sessions that it delivers to, here where no thread
     // holds their turn: under the topic lock for a retained publication.
-    void route(Packet.Publish publication, Session publisher) {
+    void route(Packet.Publish publication, Session publisher, int bytes) {
         // A Message Expiry Interval counts from here.
         long received = settings.scheduler().nanoTime();
+        var room = new PublicationMemory(bytes);
         if (!publication.retain()) {
-            deliver(publication, publisher, received);
+            deliver(publication, room, publisher, received);
             return;
         }
         synchronized (retained) {
-            retained.store(publication, received);
-            deliver(publication, publisher, received);
+            retained.store(publication, received, room);
+            deliver(publication, room, publisher, received);
         }
     }
 
-    private void deliver(Packet.Publish publication, Session publisher, long received) {
+    private void deliver(
+            Packet.Publish publication,
+            PublicationMemory room,
+            Session publisher,
+            long received
+    ) {
         // The table lets a target leave it during delivery, as one whose connection ended does.
         for (Session target : sessions.values()) {
-            target.deliverMatching(publication, publisher, received);
+            target.deliverMatching(publication, room, publisher, received);
         }
+    }
+
+    // Counts a session that the closing broker has asked to clear itself, and one that has.
+    void sessionClearing() {
+        clearing.incrementAndGet();
+    }
+
+    void sessionCleared() {
+        clearing.decrementAndGet();
+    }
+
+    // Checks that the memory for deliveries adds up once the broker has closed: no delivery
+    // left its session without giving its room back, and nothing is handed out any more but
+    // the room that the pool's threads keep. What does not add up fails as an assertion with
+    // the numbers; otherwise the answer is true, so that the call stands in an `assert`. A
+    // broker that runs with assertions, as in tests, checks so as it closes, which makes every
+    // test of the broker a test of the counting too. The check waits a moment for the sessions
+    // that other threads still clear and for the pool to end, and takes what it cannot judge
+    // in that time to be in order.
+    boolean deliveryMemoryAddsUp() {
+        long deadline = System.nanoTime() + MEMORY_CHECK_NANOS;
+        while ((clearing.get() > 0 || !actors.isTerminated())
+                && System.nanoTime() - deadline < 0) {
+            LockSupport.parkNanos(1_000_000);
+        }
+        long lost = memory.lostDeliveries();
+        if (lost != 0) {
+            throw new AssertionError(
+                    lost + " deliveries left their sessions without giving their room in the"
+                            + " broker's memory for deliveries back"
+            );
+        }
+        if (clearing.get() > 0 || !actors.isTerminated()) {
+            return true;
+        }
+        long kept = 0;
+        for (Worker worker : actorThreads) {
+            kept += worker.memory;
+        }
+        long lent = memory.lent();
+        if (lent != kept) {
+            throw new AssertionError(
+                    "The broker's memory for deliveries has " + lent + " bytes handed out after"
+                            + " every session has ended, of which its threads keep " + kept
+            );
+        }
+        return true;
     }
 
     // Ends every connection and session and forgets every retained message, as the broker
