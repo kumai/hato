@@ -40,6 +40,12 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
 
+    // The connections that may wait for the broker to accept a CONNECT on them, and the clients
+    // that it serves at once. Neither is bounded yet.
+    private static final int MAX_AWAITING_CONNECT = Integer.MAX_VALUE;
+
+    private static final int MAX_CLIENTS = Integer.MAX_VALUE;
+
     // The largest packet that the broker takes from a client, and the largest that it takes as
     // a CONNECT, before it knows the client. Each is the most that the framing format allows.
     private static final int MAX_PACKET_SIZE = Connection.MAX_PACKET_SIZE;
@@ -57,12 +63,6 @@ public final class BrokerServer implements AutoCloseable {
     // One session's subscriptions are bounded by number, because every publication is matched
     // against each of them, and by the length of their filters in all, because a single filter
     // can have 65,535 bytes.
-    // The connections that may wait for the broker to accept a CONNECT on them, and the clients
-    // that it serves at once. Neither is bounded yet.
-    private static final int MAX_AWAITING_CONNECT = Integer.MAX_VALUE;
-
-    private static final int MAX_CLIENTS = Integer.MAX_VALUE;
-
     private static final int MAX_SUBSCRIPTIONS = 10_000;
 
     private static final long MAX_SUBSCRIPTION_LENGTH = 1024 * 1024;
