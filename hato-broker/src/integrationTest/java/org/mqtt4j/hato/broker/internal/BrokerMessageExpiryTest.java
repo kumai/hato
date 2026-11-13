@@ -197,6 +197,25 @@ class BrokerMessageExpiryTest {
     }
 
     @Test
+    void an_expired_retained_message_makes_room_for_a_new_one_at_the_limit() throws Exception {
+        // Arrange: a broker that keeps a single retained message, whose lifetime passes.
+        try (BrokerServer sut = broker(128, 1);
+                RawSession publisher = connectedV5(sut.port(), "publisher");
+                RawSession subscriber = connectedV5(sut.port(), "subscriber")) {
+            publisher.publish(retained("kept/expiring", 1, 5));
+            timer.clock.advance(Duration.ofSeconds(5));
+
+            // Act: no subscription has looked at the retained messages meanwhile.
+            publisher.publish(retained("kept/lasting", 2, 60));
+
+            // Assert
+            subscriber.subscribe("kept/#", AT_MOST_ONCE);
+            assertThat(subscriber.expect(Packet.Publish.class).topic())
+                    .isEqualTo(new Topic("kept/lasting"));
+        }
+    }
+
+    @Test
     void an_mqtt_3_1_1_subscriber_does_not_receive_an_expired_message() throws Exception {
         // Arrange: a window of one unanswered delivery holds the second one back.
         try (BrokerServer sut = broker(1);

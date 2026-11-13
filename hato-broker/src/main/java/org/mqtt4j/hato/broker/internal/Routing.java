@@ -83,7 +83,12 @@ final class Routing {
     Routing(BrokerSettings settings, int port, Runnable stopBroker) throws IOException {
         this.settings = settings;
         this.port = port;
-        retained = new RetainedMessages(settings, port);
+        retained = new RetainedMessages(
+                settings.maxRetained(),
+                settings.maxRetainedBytes(),
+                settings.scheduler(),
+                port
+        );
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
         int workers = settings.actors();
