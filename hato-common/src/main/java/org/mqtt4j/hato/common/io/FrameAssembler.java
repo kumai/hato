@@ -111,14 +111,20 @@ public final class FrameAssembler {
             }
             // The copy can carry bytes of an earlier, longer header behind this one; the body
             // overwrites them before the packet is complete.
-            storage = Arrays.copyOf(header, capacity(size, headerLength, input.remaining()));
+            storage = Arrays.copyOf(
+                    header,
+                    capacity(size, 0, (long) headerLength + input.remaining())
+            );
             packet = storage;
             packetSize = size;
             received = headerLength;
         }
         int count = Math.min(input.remaining(), packetSize - received);
         if (received + count > storage.length) {
-            storage = Arrays.copyOf(storage, capacity(packetSize, received, count));
+            storage = Arrays.copyOf(
+                    storage,
+                    capacity(packetSize, storage.length, (long) received + count)
+            );
             packet = storage;
         }
         input.get(storage, received, count);
@@ -130,12 +136,13 @@ public final class FrameAssembler {
         return storage;
     }
 
-    // How large the storage of a packet of `size` bytes becomes when `arriving` bytes follow
-    // the `kept` ones that it holds: room for those, and at least the initial capacity or
-    // twice the bytes kept, so that growing copies each byte a bounded number of times, but
-    // never more than the packet takes.
-    private static int capacity(int size, int kept, int arriving) {
-        long wanted = Math.max((long) kept + arriving, Math.max(INITIAL_CAPACITY, 2L * kept));
+    // How large the storage of a packet of `size` bytes becomes when it must hold `needed` bytes
+    // and is `current` bytes long now: room for those, and at least the initial capacity or
+    // twice its present length, so that growing copies each byte a bounded number of times, but
+    // never more than the packet takes. Storage grows only when the bytes received outgrow it,
+    // so it stays within twice those bytes, or the initial capacity.
+    private static int capacity(int size, int current, long needed) {
+        long wanted = Math.max(needed, Math.max(INITIAL_CAPACITY, 2L * current));
         return (int) Math.min(size, wanted);
     }
 }

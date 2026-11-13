@@ -77,19 +77,23 @@ class FrameAssemblerTest {
         assertThat(sut.next(input)).isNull();
     }
 
-    @Test
-    void a_packet_that_arrives_in_many_parts_fills_an_array_of_its_size() {
-        // Arrange: larger than what a packet gets as its fixed header completes.
+    @ParameterizedTest
+    @ValueSource(ints = {8192, 1, 5, 8200})
+    void a_packet_that_arrives_in_many_parts_fills_an_array_of_its_size(int first) {
+        // Arrange: larger than what a packet gets as its fixed header completes, in parts of
+        // 8 KiB after a first part that need not line up with them.
         byte[] packet = packet("30a08d06", 100_000);
         var input = ByteBuffer.wrap(packet);
         var sut = new FrameAssembler(packet.length);
 
         // Act
         byte[] result = null;
+        int part = first;
         while (result == null) {
-            int part = Math.min(8192, input.remaining());
+            part = Math.min(part, input.remaining());
             result = sut.next(input.slice(input.position(), part));
             input.position(input.position() + part);
+            part = 8192;
         }
 
         // Assert
