@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -320,6 +321,44 @@ class BrokerWillTest {
         } finally {
             release.countDown();
             resume.countDown();
+        }
+    }
+
+    @Test
+    void a_disconnect_before_a_packet_that_breaks_the_protocol_discards_the_will()
+            throws Exception {
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .beforeHandle(packet -> {
+                            if (packet instanceof Packet.Publish publish
+                                    && publish.topic().name().equals("ahead")) {
+                                // The selector reads on while the session handles what came
+                                // before DISCONNECT.
+                                LockSupport.parkNanos(Duration.ofMillis(100).toNanos());
+                            }
+                        })
+                        .start(loopback());
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                RawSession client = connectedWithWill(
+                        sut.port(),
+                        "leaving",
+                        will("left", AT_LEAST_ONCE, false)
+                )
+        ) {
+            // Arrange
+            subscriber.subscribe(WILL_TOPIC, EXACTLY_ONCE);
+
+            // Act: a publication, DISCONNECT, and a packet of a reserved type, in one write.
+            var bytes = new ByteArrayOutputStream();
+            bytes.writeBytes(codec.encode(publication("ahead", "first", AT_MOST_ONCE, 0)));
+            bytes.writeBytes(codec.encode(new Packet.Disconnect(SUCCESS, EMPTY)));
+            bytes.writeBytes(new byte[] {0, 0});
+            client.sendRaw(bytes.toByteArray());
+
+            // Assert: the connection ends, and the broker discarded the Will.
+            client.expectClosed();
+            await().until(() -> !sut.connectedClients().contains("leaving"));
+            subscriber.ping();
         }
     }
 

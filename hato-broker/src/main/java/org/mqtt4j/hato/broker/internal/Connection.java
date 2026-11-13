@@ -248,7 +248,7 @@ final class Connection {
         } catch (IOException failure) {
             endRead(failureReason("I/O", failure), true);
         } catch (PacketDecodeException failure) {
-            failed("decoding", failure);
+            decodeFailed(failure);
         }
         if (key != null && key.isValid()) {
             int interests = !isEnded() && !connecting && !readClosed && pending == null
@@ -347,6 +347,20 @@ final class Connection {
         }
         writeFailure = null;
         endRead(reason, true);
+    }
+
+    // Ends the connection for a packet that cannot be read, after the packets before it, which
+    // the session has already: a DISCONNECT among them discards the Will, as it would without
+    // the bytes behind it. The reader reads no more, because what follows a broken packet has no
+    // packet boundary. Before a session, nothing waits ahead of the failure.
+    private void decodeFailed(PacketDecodeException failure) {
+        readClosed = true;
+        Session owner = client.session;
+        if (owner == null) {
+            failed("decoding", failure);
+        } else {
+            owner.post(() -> failed("decoding", failure), Session.ELSEWHERE);
+        }
     }
 
     // End the session's connection after the packets it has already received. A FIN still
