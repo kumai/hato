@@ -156,13 +156,20 @@ class BrokerDeadlineTest {
             throws Exception {
         var timer = new ManualTimer();
         var codec = PacketCodec.of(MqttVersion.V5);
+        BrokerServer.Builder takingLargePackets = BrokerServer.builder()
+                .connectTimeout(CONNECT_TIMEOUT)
+                .maxPacketSize(16 * 1024 * 1024)
+                .scheduler(timer);
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
         try (
-                BrokerServer sut = start(timer);
+                BrokerServer sut = takingLargePackets.start(address);
                 var subscriber = new Socket();
                 var publisher = connected(sut.port(), "publisher")
         ) {
             // Arrange: a small TCP receive window keeps the delivery in progress while this
             // subscriber stops reading. Read its first byte to establish that sending began.
+            // The delivery is larger than any socket buffer, and so than the broker's default
+            // limit on packets.
             subscriber.setReceiveBufferSize(16 * 1024);
             subscriber.setSoTimeout(5_000);
             subscriber.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), sut.port()));

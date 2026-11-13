@@ -67,8 +67,9 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 /// the session within the delay, also by taking over, cancels the Will. The properties of a
 /// Will, except the delay, reach MQTT 5.0 subscribers as publication properties, and its Message
 /// Expiry Interval counts from its publication. By default, CONNACK
-/// announces only that shared subscriptions are not supported, and a Topic Alias Maximum of 16: the
-/// aliases that a client sets last for its connection. A test can make the broker announce smaller
+/// announces only that shared subscriptions are not supported, the largest packet that the broker
+/// takes, and a Topic Alias Maximum of 16: the aliases that a client sets last for its
+/// connection. A test can make the broker announce smaller
 /// limits with the test kit's `BrokerControls`, and the broker then holds clients to them; the test
 /// kit can also make it refuse publications, subscriptions, and connections, or end a connection,
 /// with a reason code of the test's choice. In turn, the broker keeps to the client's Receive
@@ -97,7 +98,9 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 /// the session of a client that is connected, whose connection it takes over. Connections that
 /// have had no CONNECT accepted yet are bounded apart from the clients, and one beyond their
 /// limit is closed at once. A CONNECT larger than the broker takes from an unknown peer closes its
-/// connection without a CONNACK.
+/// connection without a CONNACK. A later packet larger than the broker takes ends the connection
+/// too: an MQTT 5.0 client, which learned the limit from CONNACK, receives DISCONNECT with Packet
+/// too large, and an MQTT 3.1.1 client, which cannot learn it, receives nothing.
 /// A new persistent session is refused when the persistent-session limit is reached, in MQTT
 /// 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable. The number and total size
 /// of retained messages are bounded too: a retained publication beyond either limit is

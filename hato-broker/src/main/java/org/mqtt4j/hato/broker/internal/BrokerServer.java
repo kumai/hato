@@ -50,9 +50,9 @@ public final class BrokerServer implements AutoCloseable {
     // slowly. A longer backlog lets more wait here at once, and needs the measurement again.
     private static final int MAX_AWAITING_CONNECT = 1024;
 
-    // The largest packet that the broker takes from a client: the most that the framing format
-    // allows.
-    private static final int MAX_PACKET_SIZE = Connection.MAX_PACKET_SIZE;
+    // The largest packet that the broker takes from a client. A smaller one than the framing
+    // format allows keeps what one client can have the broker hold at a time small.
+    private static final int MAX_PACKET_SIZE = 1024 * 1024;
 
     // The largest CONNECT that the broker takes, from a peer that it knows nothing of yet. A
     // CONNECT whose strings all have their greatest length is about a third of this, so only

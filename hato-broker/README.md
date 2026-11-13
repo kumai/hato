@@ -70,7 +70,9 @@ drops it, retained messages included, once its lifetime has passed. MQTT 5.0
 subscriptions honor No Local, Retain As Published, Retain Handling, and Subscription
 Identifiers, and MQTT 5.0 clients may set up to 16 Topic Aliases. The broker does
 not support shared subscriptions, and tells MQTT 5.0 clients so when they connect;
-it refuses `$share/` filters in MQTT 3.1.1 too. With the test kit, tests can make it
+it refuses `$share/` filters in MQTT 3.1.1 too. It also tells them the largest packet
+that it takes, and ends the connection of a client that sends a larger one. With the
+test kit, tests can make it
 announce smaller limits to MQTT 5.0 clients, and refuse publications, subscriptions,
 and connections, or end connections, with reason codes of their choice. In turn, it
 keeps to the Receive Maximum and Maximum Packet Size that MQTT 5.0 clients announce,
