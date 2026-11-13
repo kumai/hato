@@ -28,6 +28,9 @@ final class RetainedCursor implements Pending {
 
     private final MqttVersion version;
 
+    // Where the cursor stands among what its session has queued: the session's number for it.
+    final long order;
+
     // The position in `matched` of the next retained message to go out.
     private int next;
 
@@ -42,13 +45,15 @@ final class RetainedCursor implements Pending {
             Packet.Subscription subscription,
             List<Integer> identifiers,
             List<RetainedMessages.Message> matched,
-            MqttVersion version
+            MqttVersion version,
+            long order
     ) {
         filter = subscription.filter();
         granted = subscription.qos();
         this.identifiers = identifiers;
         this.matched = matched;
         this.version = version;
+        this.order = order;
     }
 
     // Whether a retained message is left.

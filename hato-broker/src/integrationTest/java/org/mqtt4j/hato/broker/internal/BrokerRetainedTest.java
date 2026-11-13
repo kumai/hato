@@ -246,6 +246,37 @@ class BrokerRetainedTest {
     }
 
     @Test
+    void retained_messages_for_a_new_subscription_wait_behind_earlier_deliveries()
+            throws Exception {
+        try (BrokerServer sut = BrokerServer.builder().maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            // Arrange: a retained message, and two deliveries, of which the first takes the
+            // window and the second waits.
+            publisher.publish(retained("kept/a", "a", AT_LEAST_ONCE));
+            subscriber.subscribe("live", AT_LEAST_ONCE);
+            publisher.publish("live", "first", AT_LEAST_ONCE, 7);
+            Packet.Publish first = subscriber.expect(Packet.Publish.class);
+            publisher.publish("live", "second", AT_LEAST_ONCE, 7);
+
+            // Act
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+
+            // Assert: the delivery that waited before the subscription goes out ahead of the
+            // retained message.
+            subscriber.send(new Packet.PubAck(first.packetId(), SUCCESS, EMPTY));
+            Packet.Publish second = subscriber.expect(Packet.Publish.class);
+            assertThat(second.topic().name()).isEqualTo("live");
+            subscriber.send(new Packet.PubAck(second.packetId(), SUCCESS, EMPTY));
+            Packet.Publish kept = subscriber.expect(Packet.Publish.class);
+            assertThat(kept.topic().name()).isEqualTo("kept/a");
+            assertThat(kept.retain()).isTrue();
+            subscriber.send(new Packet.PubAck(kept.packetId(), SUCCESS, EMPTY));
+            subscriber.ping();
+        }
+    }
+
+    @Test
     void retained_messages_that_wait_go_on_when_the_session_resumes() throws Exception {
         try (BrokerServer sut = BrokerServer.builder().maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher")) {

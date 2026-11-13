@@ -43,6 +43,10 @@ final class Delivery implements Outgoing, Pending {
 
     final int byteCount;
 
+    // Where the delivery stands among what its session has queued: the session's number for
+    // it, set under the session's inbox as the delivery comes to wait.
+    long order;
+
     int packetId;
 
     volatile boolean sent;

@@ -152,16 +152,23 @@ final class Session {
 
     // What the inbox guards from here on, besides the subscriptions.
 
-    // What waits for the window or for room in the connection's send queue, in the order it came:
-    // deliveries, and the cursors of the retained messages that new subscriptions matched. QoS 0
-    // deliveries and acknowledged ones count against rooms of their own, each with its own
-    // limits, so that QoS 0 deliveries that a client falls behind on cannot push out
-    // acknowledged ones.
-    private final ArrayDeque<Pending> pending = new ArrayDeque<>();
+    // What waits for the window or for room in the connection's send queue: deliveries, and the
+    // cursors of the retained messages that new subscriptions matched. It goes out in the order
+    // it came, but each kind waits in a queue of its own: QoS 0 deliveries, acknowledged ones,
+    // and the cursors. The session numbers what it queues, and what goes out next is the
+    // earliest among the heads of the three queues. So the oldest delivery of a kind is at the
+    // head of its queue, and dropping it takes no longer when more waits. The two kinds of
+    // delivery have limits of their own, so that QoS 0 deliveries that a client falls behind on
+    // cannot push out acknowledged ones.
+    private final DeliveryQueue atMostOnceQueue;
 
-    private final Room atMostOnceRoom;
+    private final DeliveryQueue acknowledgedQueue;
 
-    private final Room acknowledgedRoom;
+    // Few sessions ever have a cursor, so the queue starts small.
+    private final ArrayDeque<RetainedCursor> cursors = new ArrayDeque<>(1);
+
+    // The number that the next delivery or cursor to wait gets.
+    private long nextOrder;
 
     // The retained messages that the cursors still hold. Their room is as large as the retained
     // limits, so that one subscription can take everything that the broker retains, while the
@@ -222,11 +229,11 @@ final class Session {
         settings = routing.settings;
         this.clientId = clientId;
         this.version = version;
-        atMostOnceRoom = new Room(
+        atMostOnceQueue = new DeliveryQueue(
                 settings.maxQueuedAtMostOnce(),
                 settings.maxQueuedAtMostOnceBytes()
         );
-        acknowledgedRoom = new Room(settings.maxQueued(), settings.maxQueuedBytes());
+        acknowledgedQueue = new DeliveryQueue(settings.maxQueued(), settings.maxQueuedBytes());
         retainedRoom = new Room(settings.maxRetained(), settings.maxRetainedBytes());
     }
 
@@ -679,34 +686,38 @@ final class Session {
             dropped(delivery.qos, "it is larger than the send window");
             return false;
         }
-        pending.addLast(delivery);
-        Room room = roomOf(delivery);
-        room.add(delivery.byteCount);
+        DeliveryQueue queue = queueOf(delivery);
+        delivery.order = nextOrder++;
+        queue.add(delivery);
         if (!online || !drainsNext) {
-            trim(room);
+            trim(queue);
         }
         return online;
     }
 
-    // Applies the queue limits to the deliveries that `room` counts, which wait once what could
-    // go out has gone. One larger than the whole queue would never fit, so it goes alone rather
-    // than with the older ones; then the oldest go until the room holds its limits again. Called
-    // under the inbox.
-    private void trim(Room room) {
-        if (!room.overflows()) {
+    // Applies the limits of `queue` to its deliveries, which wait once what could go out has
+    // gone. One larger than the whole queue would never fit, so it goes alone rather than with
+    // the older ones; then the oldest go until the queue holds its limits again, so that a
+    // client that falls behind gets the newest ones. Deliveries in the connection's send queue
+    // or in flight are on their way and stay. Called under the inbox.
+    private void trim(DeliveryQueue queue) {
+        if (!queue.overflows()) {
             return;
         }
-        Iterator<Pending> queued = pending.iterator();
-        while (queued.hasNext()) {
-            if (queued.next() instanceof Delivery waiting
-                    && roomOf(waiting) == room
-                    && waiting.byteCount > room.maxBytes) {
-                queued.remove();
-                room.remove(waiting.byteCount);
+        // The last time left none that large in the queue, so each of them has come since, and
+        // they stand at its end: finding them does not go through what waited before.
+        Iterator<Delivery> newest = queue.deliveries.descendingIterator();
+        while (queue.oversized > 0) {
+            Delivery waiting = newest.next();
+            if (waiting.byteCount > queue.maxBytes) {
+                newest.remove();
+                queue.left(waiting);
                 dropped(waiting.qos, "it is larger than the delivery queue");
             }
         }
-        dropOldest(room);
+        while (queue.overflows()) {
+            dropped(queue.removeOldest().qos, "its delivery queue is full");
+        }
     }
 
     // Makes or replaces the subscription to its filter, and returns false if the subscription
@@ -804,7 +815,9 @@ final class Session {
         List<Integer> identifiers = subscribed.identifier() == 0
                 ? List.of()
                 : List.of(subscribed.identifier());
-        pending.addLast(new RetainedCursor(subscription, identifiers, matched, version));
+        cursors.addLast(
+                new RetainedCursor(subscription, identifiers, matched, version, nextOrder++)
+        );
         dropOldestRetained();
     }
 
@@ -813,41 +826,23 @@ final class Session {
     // only older cursors lose any, which takes SUBSCRIBEs faster than the client takes their
     // retained messages. Called under the inbox.
     private void dropOldestRetained() {
-        for (Pending queued : pending) {
-            if (queued instanceof RetainedCursor cursor) {
-                while (retainedRoom.overflows() && cursor.hasNext()) {
-                    Qos qos = cursor.nextQos();
-                    retainedRoom.remove(cursor.advance());
-                    dropped(qos, "its retained messages wait beyond what the broker retains");
-                }
+        for (RetainedCursor cursor : cursors) {
+            while (retainedRoom.overflows() && cursor.hasNext()) {
+                Qos qos = cursor.nextQos();
+                retainedRoom.remove(cursor.advance());
+                dropped(qos, "its retained messages wait beyond what the broker retains");
             }
         }
     }
 
     // Drops the retained messages that still wait for `filter`. Called under the inbox.
     private void dropRetained(TopicFilter filter) {
-        Iterator<Pending> queued = pending.iterator();
+        Iterator<RetainedCursor> queued = cursors.iterator();
         while (queued.hasNext()) {
-            if (queued.next() instanceof RetainedCursor cursor && cursor.filter.equals(filter)) {
+            RetainedCursor cursor = queued.next();
+            if (cursor.filter.equals(filter)) {
                 queued.remove();
                 retainedRoom.remove(cursor.remainingCount(), cursor.remainingBytes());
-            }
-        }
-    }
-
-    // Drops the oldest queued deliveries of the kind that `room` counts until it holds its
-    // limits again, so that a client that falls behind gets the newest ones. Deliveries in the
-    // connection's send queue or in flight are on their way and stay. A deliberate
-    // simplification: finding and removing them takes time in proportion to the queue's length,
-    // which its limits keep short; a queue for each kind, merged by arrival as they are sent,
-    // would make it constant if the limits grow. Called under the inbox.
-    private void dropOldest(Room room) {
-        Iterator<Pending> queued = pending.iterator();
-        while (room.overflows() && queued.hasNext()) {
-            if (queued.next() instanceof Delivery oldest && roomOf(oldest) == room) {
-                queued.remove();
-                room.remove(oldest.byteCount);
-                dropped(oldest.qos, "its delivery queue is full");
             }
         }
     }
@@ -859,8 +854,23 @@ final class Session {
                         && delivery.byteCount > settings.maxInflightBytes());
     }
 
-    private Room roomOf(Delivery delivery) {
-        return (delivery.qos == Qos.AT_MOST_ONCE) ? atMostOnceRoom : acknowledgedRoom;
+    private DeliveryQueue queueOf(Delivery delivery) {
+        return (delivery.qos == Qos.AT_MOST_ONCE) ? atMostOnceQueue : acknowledgedQueue;
+    }
+
+    // What goes out next: the delivery or cursor that came first among those that wait, or null
+    // if nothing waits. Called under the inbox.
+    private @Nullable Pending head() {
+        Delivery delivery = atMostOnceQueue.deliveries.peekFirst();
+        Delivery other = acknowledgedQueue.deliveries.peekFirst();
+        if (delivery == null || (other != null && other.order < delivery.order)) {
+            delivery = other;
+        }
+        RetainedCursor cursor = cursors.peekFirst();
+        if (cursor == null || (delivery != null && delivery.order < cursor.order)) {
+            return delivery;
+        }
+        return cursor;
     }
 
     // Records under the inbox that the broker's limits kept a delivery at `qos` from the
@@ -950,8 +960,8 @@ final class Session {
     void drain() {
         sendWaiting();
         synchronized (this) {
-            trim(atMostOnceRoom);
-            trim(acknowledgedRoom);
+            trim(atMostOnceQueue);
+            trim(acknowledgedQueue);
         }
     }
 
@@ -993,14 +1003,14 @@ final class Session {
         // the deliveries over as they are: the connection's writer prepares their packets.
         synchronized (this) {
             Pending head;
-            while ((head = pending.peekFirst()) != null) {
+            while ((head = head()) != null) {
                 Delivery delivery = switch (head) {
                     case Delivery queued -> queued;
                     case RetainedCursor cursor -> cursor.current();
                 };
                 // The cursor has sent all of its retained messages.
                 if (delivery == null) {
-                    pending.removeFirst();
+                    cursors.removeFirst();
                     continue;
                 }
                 // A retained QoS 0 message whose connection ended goes, like a queued QoS 0
@@ -1055,15 +1065,12 @@ final class Session {
         }
     }
 
-    // Moves the queue past the delivery at `head`: a queued delivery leaves the queue and its
-    // room, and a cursor moves on to its next retained message, which leaves the retained room.
-    // Called under the inbox.
+    // Moves past the delivery at `head`, which is what goes out next: a queued delivery, the
+    // oldest of its kind, leaves its queue, and a cursor moves on to its next retained message,
+    // which leaves the retained room. Called under the inbox.
     private void consume(Pending head) {
         switch (head) {
-            case Delivery queued -> {
-                pending.removeFirst();
-                roomOf(queued).remove(queued.byteCount);
-            }
+            case Delivery queued -> queueOf(queued).removeOldest();
             case RetainedCursor cursor -> retainedRoom.remove(cursor.advance());
         }
     }
@@ -1167,18 +1174,10 @@ final class Session {
             if (kept()) {
                 detachedAt = settings.scheduler().nanoTime();
                 // QoS 0 belongs to the connection; only acknowledged deliveries survive it.
-                Iterator<Pending> queued = pending.iterator();
-                while (queued.hasNext()) {
-                    switch (queued.next()) {
-                        case Delivery delivery -> {
-                            if (delivery.qos == Qos.AT_MOST_ONCE) {
-                                queued.remove();
-                            }
-                        }
-                        case RetainedCursor cursor -> cursor.keepAcknowledgedOnly();
-                    }
+                atMostOnceQueue.clear();
+                for (RetainedCursor cursor : cursors) {
+                    cursor.keepAcknowledgedOnly();
                 }
-                atMostOnceRoom.clear();
             }
         }
         deferred.clear();
@@ -1212,9 +1211,9 @@ final class Session {
     void clear() {
         synchronized (this) {
             subscriptions = Map.of();
-            pending.clear();
-            atMostOnceRoom.clear();
-            acknowledgedRoom.clear();
+            atMostOnceQueue.clear();
+            acknowledgedQueue.clear();
+            cursors.clear();
             retainedRoom.clear();
             connection = null;
         }
@@ -1307,8 +1306,63 @@ final class Session {
     record Subscribed(Packet.Subscription subscription, int identifier) {
     }
 
-    // The number and bytes of what waits of one kind, and the limits on them: queued deliveries,
-    // or the retained messages that cursors hold.
+    // The deliveries of one kind that wait, oldest first, with their bytes and the limits on
+    // their number and bytes.
+    private static final class DeliveryQueue {
+
+        final ArrayDeque<Delivery> deliveries = new ArrayDeque<>();
+
+        final int maxCount;
+
+        final long maxBytes;
+
+        long bytes;
+
+        // How many of the deliveries are larger than `maxBytes`, and so can never wait within
+        // the limits.
+        int oversized;
+
+        DeliveryQueue(int maxCount, long maxBytes) {
+            this.maxCount = maxCount;
+            this.maxBytes = maxBytes;
+        }
+
+        // Whether more waits than the limits allow.
+        boolean overflows() {
+            return deliveries.size() > maxCount || bytes > maxBytes;
+        }
+
+        void add(Delivery delivery) {
+            deliveries.addLast(delivery);
+            bytes += delivery.byteCount;
+            if (delivery.byteCount > maxBytes) {
+                oversized++;
+            }
+        }
+
+        // Takes the oldest delivery out, and returns it.
+        Delivery removeOldest() {
+            Delivery oldest = deliveries.removeFirst();
+            left(oldest);
+            return oldest;
+        }
+
+        // Takes account of `delivery` having left the deliveries.
+        void left(Delivery delivery) {
+            bytes -= delivery.byteCount;
+            if (delivery.byteCount > maxBytes) {
+                oversized--;
+            }
+        }
+
+        void clear() {
+            deliveries.clear();
+            bytes = 0;
+            oversized = 0;
+        }
+    }
+
+    // The number and bytes of the retained messages that cursors hold, and the limits on them.
     private static final class Room {
 
         final int maxCount;

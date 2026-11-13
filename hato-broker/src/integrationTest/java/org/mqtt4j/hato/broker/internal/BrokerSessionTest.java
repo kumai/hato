@@ -438,6 +438,66 @@ class BrokerSessionTest {
     }
 
     @Test
+    void a_delivery_larger_than_the_whole_queue_is_dropped_without_the_older_ones()
+            throws Exception {
+        BrokerServer.Builder limited = BrokerServer.builder()
+                .maxInflight(1)
+                .maxQueuedBytes(1024);
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        try (BrokerServer sut = limited.start(address);
+                RawSession subscriber = connected(sut.port(), "bounded-client");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: one delivery holds the window, and two wait behind it.
+            subscriber.subscribe("bounded", AT_LEAST_ONCE);
+            publisher.publish("bounded", "held", AT_LEAST_ONCE, 7);
+            Packet.Publish held = expectDelivery(subscriber, "bounded", "held");
+            publisher.publish("bounded", "0001", AT_LEAST_ONCE, 7);
+            publisher.publish("bounded", "0002", AT_LEAST_ONCE, 7);
+
+            // Act: one that the window would take, but that is larger than the queue.
+            publisher.publish("bounded", "x".repeat(2048), AT_LEAST_ONCE, 7);
+            publisher.ping();
+
+            // Assert: the two that waited arrive, and nothing after them.
+            acknowledge(subscriber, held);
+            acknowledge(subscriber, expectDelivery(subscriber, "bounded", "0001"));
+            acknowledge(subscriber, expectDelivery(subscriber, "bounded", "0002"));
+            subscriber.ping();
+        }
+    }
+
+    @Test
+    void waiting_deliveries_of_both_kinds_go_out_in_the_order_they_came() throws Exception {
+        try (BrokerServer sut = broker(1);
+                RawSession subscriber = connected(sut.port(), "mixed-client");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: an acknowledged delivery holds the window.
+            subscriber.subscribe("mixed", AT_LEAST_ONCE);
+            publisher.publish("mixed", "held", AT_LEAST_ONCE, 7);
+            Packet.Publish held = expectDelivery(subscriber, "mixed", "held");
+
+            // Act: deliveries of both kinds come to wait behind it, in turn.
+            publisher.publish("mixed", "1-a", AT_LEAST_ONCE, 7);
+            publisher.publish("mixed", "0-a", AT_MOST_ONCE, 0);
+            publisher.publish("mixed", "1-b", AT_LEAST_ONCE, 7);
+            publisher.publish("mixed", "0-b", AT_MOST_ONCE, 0);
+            publisher.ping();
+
+            // Assert: each goes out behind the one that came before it, whatever its kind, so
+            // a QoS 0 delivery waits for the window with the acknowledged one ahead of it.
+            acknowledge(subscriber, held);
+            Packet.Publish first = expectDelivery(subscriber, "mixed", "1-a");
+            assertThat(subscriber.expect(Packet.Publish.class))
+                    .isEqualTo(publication("mixed", "0-a", AT_MOST_ONCE, 0));
+            acknowledge(subscriber, first);
+            acknowledge(subscriber, expectDelivery(subscriber, "mixed", "1-b"));
+            assertThat(subscriber.expect(Packet.Publish.class))
+                    .isEqualTo(publication("mixed", "0-b", AT_MOST_ONCE, 0));
+            subscriber.ping();
+        }
+    }
+
+    @Test
     void qos_zero_deliveries_wait_within_limits_of_their_own() throws Exception {
         BrokerServer.Builder limited = BrokerServer.builder()
                 .maxInflight(1)
