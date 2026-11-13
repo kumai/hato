@@ -60,17 +60,21 @@ final class RetainedCursor implements Pending {
     @Nullable Delivery current() {
         if (current == null && hasNext()) {
             RetainedMessages.Message entry = matched.get(next);
-            Packet.Publish publication = entry.publication();
             current = new Delivery(
-                    publication,
+                    entry.publication(),
                     entry.received(),
-                    Qos.of(Math.min(granted.level(), publication.qos().level())),
+                    nextQos(),
                     true,
                     identifiers,
                     version
             );
         }
         return current;
+    }
+
+    // The QoS at which the next retained message goes out. Called only while one is left.
+    Qos nextQos() {
+        return Qos.of(Math.min(granted.level(), matched.get(next).publication().qos().level()));
     }
 
     // Moves past the next retained message, which went out or was dropped, and returns its size

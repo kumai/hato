@@ -200,6 +200,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private Capabilities capabilities = Capabilities.DEFAULT;
 
+        private BrokerSettings.@Nullable DropListener dropListener;
+
         private Timer scheduler = TimerService.instance;
 
         private Consumer<Packet> beforeProcess = _ -> { };
@@ -300,6 +302,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder dropListener(BrokerSettings.DropListener value) {
+            dropListener = requireNonNull(value, "dropListener must not be null");
+            return this;
+        }
+
         Builder scheduler(Timer value) {
             scheduler = requireNonNull(value, "scheduler must not be null");
             return this;
@@ -388,6 +395,7 @@ public final class BrokerServer implements AutoCloseable {
                     selectors,
                     actors,
                     capabilities,
+                    dropListener,
                     scheduler,
                     beforeProcess,
                     beforeHandle,
@@ -403,6 +411,10 @@ public final class BrokerServer implements AutoCloseable {
                     // The pool would start a thread for each of its first tasks. Starting them
                     // now gives the broker all its threads from the start, whatever comes.
                     server.routing.actors.prestartAllCoreThreads();
+                    DropReports reports = server.routing.dropReports;
+                    if (reports != null) {
+                        reports.start();
+                    }
                     for (Reactor reactor : server.routing.reactors) {
                         reactor.start();
                     }
@@ -572,6 +584,10 @@ public final class BrokerServer implements AutoCloseable {
             routing.clear();
         } finally {
             routing.actors.shutdown();
+            DropReports reports = routing.dropReports;
+            if (reports != null) {
+                reports.close();
+            }
             for (Reactor reactor : routing.reactors) {
                 reactor.close();
             }

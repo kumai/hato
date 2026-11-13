@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.jspecify.annotations.Nullable;
 
@@ -172,10 +173,16 @@ final class Session {
     // The selector paused on a full packet inbox and needs a wake when it has room.
     private @Nullable Connection waitingReader;
 
-    // At most one report per session waits for the pool, even if many deliveries are dropped.
+    // At most one log statement per session waits for the pool, even if many deliveries are
+    // dropped.
     private @Nullable String dropCause;
 
     private long droppedCount;
+
+    // The QoS 1 and 2 deliveries that the limits kept from the session and that the application
+    // has not heard of. The session waits for its report from the first of them until the
+    // listener's thread takes the count.
+    private final AtomicLong unreportedDrops = new AtomicLong();
 
     // The connection attached to the session, which publishers and the test controls read.
     volatile @Nullable Connection connection;
@@ -662,7 +669,7 @@ final class Session {
         }
         // A frame that can never fit must not block the head indefinitely, so it goes alone.
         if (neverFits(delivery)) {
-            dropped("it is larger than the send window");
+            dropped(delivery.qos, "it is larger than the send window");
             return false;
         }
         pending.addLast(delivery);
@@ -689,7 +696,7 @@ final class Session {
                     && waiting.byteCount > settings.maxQueuedBytes()) {
                 queued.remove();
                 room.remove(waiting.byteCount);
-                dropped("it is larger than the delivery queue");
+                dropped(waiting.qos, "it is larger than the delivery queue");
             }
         }
         dropOldest(room);
@@ -802,8 +809,9 @@ final class Session {
         for (Pending queued : pending) {
             if (queued instanceof RetainedCursor cursor) {
                 while (retainedOverflows() && cursor.hasNext()) {
+                    Qos qos = cursor.nextQos();
                     retainedRoom.remove(cursor.advance());
-                    dropped("its retained messages wait beyond what the broker retains");
+                    dropped(qos, "its retained messages wait beyond what the broker retains");
                 }
             }
         }
@@ -837,7 +845,7 @@ final class Session {
             if (queued.next() instanceof Delivery oldest && roomOf(oldest) == room) {
                 queued.remove();
                 room.remove(oldest.byteCount);
-                dropped("its delivery queue is full");
+                dropped(oldest.qos, "its delivery queue is full");
             }
         }
     }
@@ -857,9 +865,16 @@ final class Session {
         return room.count > settings.maxQueued() || room.bytes > settings.maxQueuedBytes();
     }
 
-    // Records a drop under the inbox. The report runs without the inbox or topic lock,
-    // since the application's logging backend can block.
-    private void dropped(String cause) {
+    // Records under the inbox that the broker's limits kept a delivery at `qos` from the
+    // session. The log statement runs without the inbox or topic lock. A QoS 1 or 2 delivery is
+    // also counted for the application, whose listener hears of the session's count on a thread
+    // of its own.
+    private void dropped(Qos qos, String cause) {
+        DropReports reports = routing.dropReports;
+        if (qos != Qos.AT_MOST_ONCE && reports != null
+                && unreportedDrops.getAndIncrement() == 0) {
+            reports.add(this);
+        }
         droppedCount++;
         if (dropCause == null && !routing.closed) {
             dropCause = cause;
@@ -893,6 +908,11 @@ final class Session {
             log.debug("Broker on port {} dropped {} deliveries for client {}; first cause: {}",
                     routing.port, first ? count - 1 : count, clientId, cause);
         }
+    }
+
+    // Takes the QoS 1 and 2 deliveries that the application has not heard of, to report them.
+    long takeUnreportedDrops() {
+        return unreportedDrops.getAndSet(0);
     }
 
     // Attaches `peer`, which a CONNECT accepted, and queues its CONNACK, so that publishers find
@@ -1006,7 +1026,7 @@ final class Session {
                 // delivery cannot, as it was dropped before it was queued.
                 if (neverFits(delivery)) {
                     consume(head);
-                    dropped("it is larger than the send window");
+                    dropped(delivery.qos, "it is larger than the send window");
                     continue;
                 }
                 boolean acknowledged = delivery.qos != Qos.AT_MOST_ONCE;

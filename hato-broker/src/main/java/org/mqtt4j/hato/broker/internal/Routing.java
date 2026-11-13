@@ -56,6 +56,9 @@ final class Routing {
 
     final RetainedMessages retained;
 
+    // Tells the application of dropped QoS 1 and 2 deliveries, if it asked to hear of them.
+    final @Nullable DropReports dropReports;
+
     // The test controls. Until a test sets them, they change nothing.
 
     // Rules for later subscriptions to exactly these filters.
@@ -89,6 +92,8 @@ final class Routing {
                 settings.scheduler(),
                 port
         );
+        BrokerSettings.DropListener dropListener = settings.dropListener();
+        dropReports = (dropListener == null) ? null : new DropReports(dropListener, port);
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
         int workers = settings.actors();

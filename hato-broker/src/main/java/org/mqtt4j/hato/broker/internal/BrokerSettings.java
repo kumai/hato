@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 
@@ -15,7 +17,8 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // `maxSubscriptionLength` bound the subscriptions of one session: their number, and the
 // characters of their filters in all. `selectors` and `actors` are the numbers of selector
 // threads and of threads in the actor pool. The capabilities are what the broker announces to
-// MQTT 5.0 clients until a test changes them, within its own limits.
+// MQTT 5.0 clients until a test changes them, within its own limits. The drop listener, if
+// there is one, hears of the QoS 1 and 2 deliveries that the limits keep from a session.
 //
 // The selector calls `beforeProcess` before handing a packet to its session. It asks
 // `deliveryWriteHeld` before marking the deliveries of a write as sent: while the answer is
@@ -44,6 +47,7 @@ record BrokerSettings(
         int selectors,
         int actors,
         Capabilities capabilities,
+        @Nullable DropListener dropListener,
         Timer scheduler,
         Consumer<Packet> beforeProcess,
         Consumer<Packet> beforeHandle,
@@ -51,6 +55,16 @@ record BrokerSettings(
         Runnable beforeSelect,
         AcceptHook beforeAccept
 ) {
+
+    // What the application runs to learn that the broker's limits have kept QoS 1 or 2
+    // deliveries from a session, which goes on without them: the client identifier, and how
+    // many deliveries since the last call for that session. The calls come one at a time, on a
+    // thread that the broker keeps for them, and may take their time.
+    @FunctionalInterface
+    interface DropListener {
+
+        void dropped(String clientId, long count);
+    }
 
     // What a test runs before each attempt to accept a connection.
     @FunctionalInterface
