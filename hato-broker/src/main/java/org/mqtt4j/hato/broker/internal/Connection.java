@@ -95,6 +95,10 @@ final class Connection {
 
     private boolean connected;
 
+    // Whether the connection counts among those that wait for the broker to accept a CONNECT on
+    // them, as every connection does from its registration.
+    private boolean awaitingConnect = true;
+
     private boolean readClosed;
 
     private boolean ioFailed;
@@ -412,6 +416,9 @@ final class Connection {
                         reactor.execute(this, () -> {
                             connecting = false;
                             connected = accepted;
+                            if (accepted) {
+                                leaveAwaitingConnect();
+                            }
                             if (!accepted && !endsWithLastPacket()) {
                                 close("CONNECT refused");
                             } else {
@@ -936,6 +943,8 @@ final class Connection {
         }
         disposed = true;
         close("broker closed");
+        // Before the socket closes, so that a peer that sees the close finds the place free.
+        leaveAwaitingConnect();
         try {
             if (key != null) {
                 key.cancel();
@@ -948,6 +957,15 @@ final class Connection {
             routing.connections.remove(this);
         }
         logEnd();
+    }
+
+    // Takes the connection out of those that wait for their CONNECT, once: as the broker
+    // accepts its client, or as it ends without that. Runs on the selector.
+    private void leaveAwaitingConnect() {
+        if (awaitingConnect) {
+            awaitingConnect = false;
+            routing.awaitingConnect.decrementAndGet();
+        }
     }
 
     // Has the connection's client belong to `session`, whose actor accepted the CONNECT, and

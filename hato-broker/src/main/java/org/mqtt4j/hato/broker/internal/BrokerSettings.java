@@ -10,15 +10,17 @@ import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 
 // The internal limits and test hooks of one broker, which `BrokerServer.Builder` checks before
-// the broker starts. The connect timeout is in nanoseconds. `maxPacketSize` is the largest
-// packet in bytes that the broker takes from a client, whatever its protocol version, and
-// `maxConnectSize` the largest that it takes as a CONNECT, from a peer that it knows nothing of
-// yet; the smaller of the two bounds a CONNECT. `maxSubscriptions` and
-// `maxSubscriptionLength` bound the subscriptions of one session: their number, and the
-// characters of their filters in all. `selectors` and `actors` are the numbers of selector
-// threads and of threads in the actor pool. The capabilities are what the broker announces to
-// MQTT 5.0 clients until a test changes them, within its own limits. The drop listener, if
-// there is one, hears of the QoS 1 and 2 deliveries that the limits keep from a session.
+// the broker starts. The connect timeout is in nanoseconds. `maxAwaitingConnect` bounds the
+// connections that the broker has accepted no CONNECT on yet, and `maxClients` those that it
+// has accepted one on: its clients. `maxPacketSize` is the largest packet in bytes that the
+// broker takes from a client, whatever its protocol version, and `maxConnectSize` the largest
+// that it takes as a CONNECT, from a peer that it knows nothing of yet; the smaller of the two
+// bounds a CONNECT. `maxSubscriptions` and `maxSubscriptionLength` bound the subscriptions of
+// one session: their number, and the characters of their filters in all. `selectors` and
+// `actors` are the numbers of selector threads and of threads in the actor pool. The
+// capabilities are what the broker announces to MQTT 5.0 clients until a test changes them,
+// within its own limits. The drop listener, if there is one, hears of the QoS 1 and 2
+// deliveries that the limits keep from a session.
 //
 // The selector calls `beforeProcess` before handing a packet to its session. It asks
 // `deliveryWriteHeld` before marking the deliveries of a write as sent: while the answer is
@@ -31,6 +33,8 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // failure of that attempt.
 record BrokerSettings(
         long connectTimeout,
+        int maxAwaitingConnect,
+        int maxClients,
         int maxPacketSize,
         int maxConnectSize,
         long sendBytes,

@@ -55,6 +55,7 @@ final class Reactor implements AutoCloseable {
             return false;
         }
         routing.connections.add(connection);
+        routing.awaitingConnect.incrementAndGet();
         execute(connection, () -> {
             try {
                 if (connection.key == null && !connection.isEnded()) {

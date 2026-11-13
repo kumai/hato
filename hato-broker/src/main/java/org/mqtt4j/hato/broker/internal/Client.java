@@ -85,6 +85,11 @@ final class Client {
 
     int sendLimit = Connection.MAX_PACKET_SIZE;
 
+    // Whether the connection has a place among the broker's clients: from its acceptance until
+    // its end comes to the session, or until another connection takes the session over and the
+    // place with it. Only the session's actor uses it.
+    private boolean holdsPlace;
+
     Client(Connection connection, Routing routing) {
         this.connection = connection;
         this.routing = routing;
@@ -224,6 +229,19 @@ final class Client {
                 routing.publishWill(expiredWill, actor);
             }
         }
+        // The connection that has the session now, whose end may not have come to the session
+        // yet. This one takes its place among the clients over with the session, and so needs
+        // no room of its own: a client can always come back for its session, even if the
+        // connection that it lost still counts.
+        Connection previous = actor.connection;
+        if (previous == null && !routing.takeClientPlace()) {
+            connection.refuse(
+                    noRoom(request.version()),
+                    "client '" + id + "' beyond the client limit"
+            );
+            actor.leaveIfUnused();
+            return false;
+        }
         boolean keep = expiry > 0;
         boolean present = !request.cleanStart()
                 && actor.kept()
@@ -232,6 +250,9 @@ final class Client {
         // frees it if it is not kept itself.
         boolean placed = actor.kept();
         if (keep && !placed && !routing.takePersistentPlace()) {
+            if (previous == null) {
+                routing.freeClientPlace();
+            }
             connection.refuse(
                     ReasonCode.SERVER_UNAVAILABLE,
                     "persistent session capacity for client '" + id + "'"
@@ -242,7 +263,10 @@ final class Client {
         if (placed && !keep) {
             routing.freePersistentPlace();
         }
-        Connection previous = actor.connection;
+        if (previous != null) {
+            previous.client.holdsPlace = false;
+        }
+        holdsPlace = true;
         // The Will that waits with the session goes out after CONNACK when this CONNECT ends
         // the session, or when it continues the session after the Will's delay has passed; a
         // connection within the delay cancels it [MQTT-3.1.3-9].
@@ -351,6 +375,16 @@ final class Client {
             entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
         }
         return new Properties(entries);
+    }
+
+    // Why the broker refuses a CONNECT that one of its limits leaves no room for. MQTT 3.1.1
+    // has no return code for a limit, and its "Server unavailable" has a client try again
+    // later, as it should.
+    private static ReasonCode noRoom(MqttVersion version) {
+        return switch (version) {
+            case V3_1_1 -> ReasonCode.SERVER_UNAVAILABLE;
+            case V5 -> ReasonCode.QUOTA_EXCEEDED;
+        };
     }
 
     // The Subscription Identifier that a SUBSCRIBE gives every subscription that it makes or
@@ -839,6 +873,10 @@ final class Client {
         Session owner = session;
         if (owner == null) {
             return;
+        }
+        if (holdsPlace) {
+            holdsPlace = false;
+            routing.freeClientPlace();
         }
         owner.detach(connection);
         Packet.Will last = will;

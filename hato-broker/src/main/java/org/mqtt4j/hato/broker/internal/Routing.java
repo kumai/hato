@@ -11,11 +11,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
 import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
@@ -33,6 +35,8 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 // measurements justify productization. Lock order is topic lock -> session inbox -> Connection.
 final class Routing {
 
+    private static final Log log = Log.of(Routing.class);
+
     final BrokerSettings settings;
 
     final Reactor[] reactors;
@@ -45,6 +49,19 @@ final class Routing {
     final int port;
 
     final Set<Connection> connections = ConcurrentHashMap.newKeySet();
+
+    // How many of the connections wait for the broker to accept a CONNECT on them, which their
+    // limit bounds. A connection counts from its registration with its selector, which the
+    // accepting thread makes, until the broker accepts its client or the connection ends.
+    final AtomicInteger awaitingConnect = new AtomicInteger();
+
+    // How many clients the broker serves, which the client limit bounds: the connections that
+    // it has accepted a CONNECT on and whose end has not come to their session yet. A
+    // connection that takes a session over from another takes over its place too.
+    private final AtomicInteger clients = new AtomicInteger();
+
+    // Whether the broker has warned yet that the client limit refused a CONNECT.
+    private final AtomicBoolean clientLimitReached = new AtomicBoolean();
 
     final Map<String, Session> sessions = new ConcurrentHashMap<>();
 
@@ -253,6 +270,26 @@ final class Routing {
     // Whether a test holds back the responses of `type` to `clientId`.
     boolean holdsBack(Class<? extends Packet> type, String clientId) {
         return holds.contains(new Hold(type, clientId));
+    }
+
+    // Takes a place among the clients for a connection whose CONNECT the broker accepts, and
+    // returns false when the client limit leaves none.
+    boolean takeClientPlace() {
+        int limit = settings.maxClients();
+        int before = clients.getAndUpdate(count -> (count < limit) ? count + 1 : count);
+        if (before < limit) {
+            return true;
+        }
+        if (clientLimitReached.compareAndSet(false, true)) {
+            log.warn("Broker on port {} serves {} clients, its limit, and refuses further ones;"
+                    + " later refusals are logged at info level", port, limit);
+        }
+        return false;
+    }
+
+    // Frees the place of a client whose connection has ended.
+    void freeClientPlace() {
+        clients.decrementAndGet();
     }
 
     // Takes a place among the persistent sessions for a session that a CONNECT makes, and returns

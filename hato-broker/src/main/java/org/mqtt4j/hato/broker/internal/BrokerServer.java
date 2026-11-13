@@ -57,6 +57,12 @@ public final class BrokerServer implements AutoCloseable {
     // One session's subscriptions are bounded by number, because every publication is matched
     // against each of them, and by the length of their filters in all, because a single filter
     // can have 65,535 bytes.
+    // The connections that may wait for the broker to accept a CONNECT on them, and the clients
+    // that it serves at once. Neither is bounded yet.
+    private static final int MAX_AWAITING_CONNECT = Integer.MAX_VALUE;
+
+    private static final int MAX_CLIENTS = Integer.MAX_VALUE;
+
     private static final int MAX_SUBSCRIPTIONS = 10_000;
 
     private static final long MAX_SUBSCRIPTION_LENGTH = 1024 * 1024;
@@ -109,6 +115,10 @@ public final class BrokerServer implements AutoCloseable {
 
     // The thread that accepts the connections.
     private final Thread accepting;
+
+    // Whether the accepting thread has warned yet that it closed a connection at once, for the
+    // limit on those that wait for their CONNECT. Only that thread uses it.
+    private boolean turnedAway;
 
     private BrokerServer(ServerSocketChannel listener, BrokerSettings settings) throws IOException {
         this.listener = listener;
@@ -168,6 +178,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private Duration connectTimeout = CONNECT_TIMEOUT;
 
+        private int maxAwaitingConnect = MAX_AWAITING_CONNECT;
+
+        private int maxClients = MAX_CLIENTS;
+
         private int maxPacketSize = MAX_PACKET_SIZE;
 
         private int maxConnectSize = MAX_CONNECT_SIZE;
@@ -219,6 +233,16 @@ public final class BrokerServer implements AutoCloseable {
 
         Builder connectTimeout(Duration value) {
             connectTimeout = requireNonNull(value, "connectTimeout must not be null");
+            return this;
+        }
+
+        Builder maxAwaitingConnect(int value) {
+            maxAwaitingConnect = value;
+            return this;
+        }
+
+        Builder maxClients(int value) {
+            maxClients = value;
             return this;
         }
 
@@ -354,6 +378,8 @@ public final class BrokerServer implements AutoCloseable {
             requireNonNull(address, "address must not be null");
             if (connectTimeout.isNegative()
                 || connectTimeout.isZero()
+                || maxAwaitingConnect <= 0
+                || maxClients <= 0
                 || maxPacketSize <= 0
                 || maxPacketSize > Connection.MAX_PACKET_SIZE
                 || maxConnectSize <= 0
@@ -379,6 +405,8 @@ public final class BrokerServer implements AutoCloseable {
             }
             var settings = new BrokerSettings(
                     connectTimeout.toNanos(),
+                    maxAwaitingConnect,
+                    maxClients,
                     maxPacketSize,
                     maxConnectSize,
                     sendBytes,
@@ -443,6 +471,12 @@ public final class BrokerServer implements AutoCloseable {
         try {
             while (true) {
                 Socket socket = accepted();
+                // Only this thread adds to the connections that wait for their CONNECT, so the
+                // limit holds exactly.
+                if (routing.awaitingConnect.get() >= routing.settings.maxAwaitingConnect()) {
+                    turnAway(socket);
+                    continue;
+                }
                 Connection connection = null;
                 try {
                     connection = new Connection(socket, routing);
@@ -479,6 +513,32 @@ public final class BrokerServer implements AutoCloseable {
                 log.error("Broker listener on port {} failed", port(), failure);
             }
             close();
+        }
+    }
+
+    // Closes a connection that came while as many as the broker allows waited for their
+    // CONNECT. It has sent nothing that the broker has read, and learns nothing but the close:
+    // the broker does not know which protocol version it speaks.
+    private void turnAway(Socket socket) {
+        if (turnedAway) {
+            log.debug("Broker on port {} closed the connection from {} at once",
+                    port(), socket.getRemoteSocketAddress());
+        } else {
+            turnedAway = true;
+            log.warn(
+                    "Broker on port {} closed the connection from {} at once, because {}"
+                            + " connections wait for their CONNECT, its limit; later ones are"
+                            + " logged at debug level",
+                    port(),
+                    socket.getRemoteSocketAddress(),
+                    routing.settings.maxAwaitingConnect()
+            );
+        }
+        try {
+            socket.close();
+        } catch (IOException failure) {
+            log.debug("Closing the connection from {} failed",
+                    socket.getRemoteSocketAddress(), failure);
         }
     }
 
