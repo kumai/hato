@@ -74,6 +74,31 @@ class LogTest {
     }
 
     @Test
+    void the_messages_of_waiting_exceptions_count_against_the_room() throws Exception {
+        // Arrange: the backend holds one statement while statements with short text arrive,
+        // each with an exception whose message is one mebi of characters.
+        var logger = new HoldingLogger();
+        var sut = Log.of(logger);
+        String message = "x".repeat(1 << 20);
+        try {
+            sut.info("first");
+            assertThat(logger.entered.await(10, SECONDS)).isTrue();
+
+            // Act
+            for (int i = 0; i < 40; i++) {
+                sut.error("failure {}", i, new IllegalStateException(message));
+            }
+        } finally {
+            logger.released.countDown();
+        }
+        awaitWritten();
+
+        // Assert: no more of them waited than the room of four mebi characters holds.
+        assertThat(logger.messages).hasSizeBetween(2, 5);
+        assertThat(logger.messages.getFirst()).isEqualTo("first");
+    }
+
+    @Test
     void the_backend_sees_which_thread_made_a_statement() throws Exception {
         // Arrange
         var logger = new RecordingLogger(Level.TRACE);

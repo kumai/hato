@@ -2,6 +2,7 @@ package org.mqtt4j.hato.common.log;
 
 import java.lang.System.Logger.Level;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.Optional;
@@ -163,7 +164,7 @@ public final class Log {
                 used--;
             }
             String text = substitute(message, args, used);
-            Writer.instance.take(new Statement(
+            Writer.instance.take(Statement.of(
                     logger,
                     level,
                     text,
@@ -233,14 +234,58 @@ public final class Log {
         }
     }
 
-    /// What one call leaves for the backend, with the name of the thread that made it.
+    /// What one call leaves for the backend, with the name of the thread that made it and the
+    /// room that it takes while it waits.
     private record Statement(
             System.Logger logger,
             Level level,
             String text,
             @Nullable Throwable thrown,
-            String thread
+            String thread,
+            long size
     ) {
+
+        // A statement takes its text and the messages of its exception, the causes and the
+        // suppressed exceptions included, in characters, and STATEMENT_SIZE and THROWABLE_SIZE
+        // more for itself and for each exception.
+        // Ceiling: an exception's stack trace, and the fields of an exception class of the
+        // application, count as THROWABLE_SIZE whatever they hold. Rendering the exception here
+        // would count them, at the price of its whole text for every statement with one.
+        static Statement of(
+                System.Logger logger,
+                Level level,
+                String text,
+                @Nullable Throwable thrown,
+                String thread
+        ) {
+            long size = Writer.STATEMENT_SIZE + text.length();
+            var exceptions = new ArrayDeque<Throwable>();
+            if (thrown != null) {
+                exceptions.add(thrown);
+            }
+            // A cause chain can come back to itself; the count bounds the walk.
+            for (int counted = 0; counted < Writer.MAX_EXCEPTIONS; counted++) {
+                Throwable exception = exceptions.poll();
+                if (exception == null) {
+                    break;
+                }
+                size += Writer.THROWABLE_SIZE;
+                try {
+                    String message = exception.getMessage();
+                    if (message != null) {
+                        size += message.length();
+                    }
+                    Throwable cause = exception.getCause();
+                    if (cause != null) {
+                        exceptions.add(cause);
+                    }
+                    exceptions.addAll(Arrays.asList(exception.getSuppressed()));
+                } catch (RuntimeException _) {
+                    // An exception whose own methods fail counts as THROWABLE_SIZE alone.
+                }
+            }
+            return new Statement(logger, level, text, thrown, thread, size);
+        }
     }
 
     /// The thread that gives the statements of the distribution to the backend. Nothing ends it.
@@ -265,12 +310,21 @@ public final class Log {
         private static final String NAME =
                 "hato-" + Log.class.getPackageName().split("\\.")[3] + "-log";
 
-        // The room for waiting statements, in characters of their text, with STATEMENT_SIZE more
-        // for each. It bounds the memory that they hold while the backend stands still. Counting
-        // statements would not: a trace statement holds a whole packet as text.
+        // The room for waiting statements, in characters of their text and of the messages of
+        // their exceptions, with STATEMENT_SIZE more for each statement and THROWABLE_SIZE for
+        // each exception (see Statement.of). It bounds the memory that they hold while the
+        // backend stands still. Counting statements would not: a trace statement holds a whole
+        // packet as text, and an exception can carry a message of any length.
         private static final long ROOM = 4L << 20;
 
         private static final long STATEMENT_SIZE = 64;
+
+        // What an exception holds beside its message: about what its stack trace takes before a
+        // backend prints it.
+        private static final long THROWABLE_SIZE = 1024;
+
+        // The exceptions of one statement that count, beyond which the walk stops.
+        private static final int MAX_EXCEPTIONS = 64;
 
         private static final long POLL_NANOS = 1_000_000;
 
@@ -316,7 +370,7 @@ public final class Log {
         /// a lock here could hold a platform thread behind a virtual thread just as the
         /// backend's lock can.
         void take(Statement statement) {
-            long size = STATEMENT_SIZE + statement.text().length();
+            long size = statement.size();
             long ahead = waiting.get();
             // A statement of any size fits an empty queue, so a large one is lost only while
             // the backend is behind. Callers that pass this check together overshoot the room
@@ -328,7 +382,7 @@ public final class Log {
             // The warning stands where the dropped statements would have stood.
             long lost = dropped.get() == 0 ? 0 : dropped.getAndSet(0);
             if (lost != 0) {
-                queue(new Statement(
+                queue(Statement.of(
                         own,
                         Level.WARNING,
                         "Logging fell behind; dropped " + lost + " log statements",
@@ -345,7 +399,7 @@ public final class Log {
         }
 
         private void queue(Statement statement) {
-            waiting.addAndGet(STATEMENT_SIZE + statement.text().length());
+            waiting.addAndGet(statement.size());
             taken.incrementAndGet();
             statements.add(statement);
         }
@@ -394,7 +448,7 @@ public final class Log {
                 } catch (Throwable _) {
                     // The statement is lost; the thread goes on with the next one.
                 }
-                waiting.addAndGet(-(STATEMENT_SIZE + next.text().length()));
+                waiting.addAndGet(-next.size());
                 written = ++count;
             }
         }
