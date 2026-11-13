@@ -90,14 +90,14 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 /// every retained message that it matches. Those still waiting go when the client unsubscribes,
 /// and a client that keeps subscribing faster than it takes them misses the oldest. A delivery
 /// too large for the broker's internal size limits does not reach its subscriber either.
-/// A new persistent session is refused with Server unavailable when the
-/// persistent-session limit is reached. The number and total size of retained messages are
-/// bounded too: a retained publication beyond either limit is delivered but not kept, which
-/// leaves its topic without a retained message. So are the subscriptions of a session: one
-/// beyond their limit fails in SUBACK, in MQTT 5.0 with Quota exceeded, and subscribes to
-/// nothing, while subscribing again to a filter needs no room. These limits are provisional
-/// and may change. All state is lost when the broker stops. This experimental API is outside
-/// the compatibility promise.
+/// A new persistent session is refused when the persistent-session limit is reached, in MQTT
+/// 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable. The number and total size
+/// of retained messages are bounded too: a retained publication beyond either limit is
+/// delivered but not kept, which leaves its topic without a retained message. So are the
+/// subscriptions of a session: one beyond their limit fails in SUBACK, in MQTT 5.0 with Quota
+/// exceeded, and subscribes to nothing, while subscribing again to a filter needs no room.
+/// These limits are provisional and may change. All state is lost when the broker stops. This
+/// experimental API is outside the compatibility promise.
 public final class MqttBroker implements AutoCloseable {
 
     // How long close() gives the logging backend to take what was logged until then. A backend

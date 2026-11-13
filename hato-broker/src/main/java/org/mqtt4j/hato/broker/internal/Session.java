@@ -90,9 +90,10 @@ final class Session {
     // subscriptions, which publishers check under the inbox.
     volatile MqttVersion version;
 
-    // How long the session outlives a connection, in seconds: 0 ends it with its connection,
-    // and NEVER keeps it, as MQTT 3.1.1 Clean Session 0 does, which leaves retention to the
-    // broker. A connection that resumes the session sets it again from its own CONNECT, and
+    // How long the session outlives a connection, in seconds, which is never longer than the
+    // broker keeps a session: 0 ends it with its connection, and NEVER keeps it. MQTT 3.1.1
+    // Clean Session 0 leaves retention to the broker, and so gets the longest that the broker
+    // gives. A connection that resumes the session sets it again from its own CONNECT, and
     // the client's DISCONNECT can change it (MQTT 5.0 section 3.14.2.2.2). An actor without a
     // session has 0.
     volatile long expiry;

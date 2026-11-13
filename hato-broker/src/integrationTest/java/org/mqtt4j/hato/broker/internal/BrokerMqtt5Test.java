@@ -316,7 +316,7 @@ class BrokerMqtt5Test {
 
             // Assert
             assertThat(refused.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(false, ReasonCode.SERVER_UNAVAILABLE, EMPTY));
+                    .isEqualTo(new Packet.ConnAck(false, ReasonCode.QUOTA_EXCEEDED, EMPTY));
             refused.expectClosed();
             ending.ping();
             kept.ping();

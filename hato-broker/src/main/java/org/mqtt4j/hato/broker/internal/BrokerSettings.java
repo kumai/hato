@@ -15,7 +15,8 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // has accepted one on: its clients. `maxPacketSize` is the largest packet in bytes that the
 // broker takes from a client, whatever its protocol version, and `maxConnectSize` the largest
 // that it takes as a CONNECT, from a peer that it knows nothing of yet; the smaller of the two
-// bounds a CONNECT. `maxSubscriptions` and `maxSubscriptionLength` bound the subscriptions of
+// bounds a CONNECT. `maxSessionExpiry` is the longest that a session outlives its connection,
+// in seconds. `maxSubscriptions` and `maxSubscriptionLength` bound the subscriptions of
 // one session: their number, and the characters of their filters in all. `selectors` and
 // `actors` are the numbers of selector threads and of threads in the actor pool. The
 // capabilities are what the broker announces to MQTT 5.0 clients until a test changes them,
@@ -43,6 +44,7 @@ record BrokerSettings(
         int maxQueued,
         long maxQueuedBytes,
         int maxSessions,
+        long maxSessionExpiry,
         int maxSubscriptions,
         long maxSubscriptionLength,
         int maxRetained,

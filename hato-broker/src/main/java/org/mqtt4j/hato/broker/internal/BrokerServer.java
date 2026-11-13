@@ -60,6 +60,9 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int MAX_SESSIONS = 1024;
 
+    // How long a session may outlive its connection: as long as its client asks for.
+    private static final Duration MAX_SESSION_EXPIRY = Duration.ofSeconds(Session.NEVER);
+
     // One session's subscriptions are bounded by number, because every publication is matched
     // against each of them, and by the length of their filters in all, because a single filter
     // can have 65,535 bytes.
@@ -198,6 +201,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxSessions = MAX_SESSIONS;
 
+        private Duration maxSessionExpiry = MAX_SESSION_EXPIRY;
+
         private int maxSubscriptions = MAX_SUBSCRIPTIONS;
 
         private long maxSubscriptionLength = MAX_SUBSCRIPTION_LENGTH;
@@ -283,6 +288,11 @@ public final class BrokerServer implements AutoCloseable {
 
         Builder maxSessions(int value) {
             maxSessions = value;
+            return this;
+        }
+
+        Builder maxSessionExpiry(Duration value) {
+            maxSessionExpiry = requireNonNull(value, "maxSessionExpiry must not be null");
             return this;
         }
 
@@ -391,6 +401,7 @@ public final class BrokerServer implements AutoCloseable {
                 || maxQueued <= 0
                 || maxQueuedBytes <= 0
                 || maxSessions <= 0
+                || maxSessionExpiry.toSeconds() <= 0
                 || maxSubscriptions <= 0
                 || maxSubscriptionLength <= 0
                 || maxRetained <= 0
@@ -415,6 +426,9 @@ public final class BrokerServer implements AutoCloseable {
                     maxQueued,
                     maxQueuedBytes,
                     maxSessions,
+                    // No session lasts longer than the longest interval that a client can ask
+                    // for, which keeps it without end.
+                    Math.min(maxSessionExpiry.toSeconds(), Session.NEVER),
                     maxSubscriptions,
                     maxSubscriptionLength,
                     maxRetained,
