@@ -55,11 +55,24 @@ public final class BrokerServer implements AutoCloseable {
     // that follows the protocol never holds more.
     private static final int MAX_HELD = 65_535;
 
-    // How many selector threads do the socket I/O, and how many threads the actor pool has. The
-    // properties are for trials, until the numbers follow from the processors at hand.
-    private static final int SELECTORS = Integer.getInteger("hato.broker.selectors", 4);
+    // How many selector threads do the socket I/O, and how many threads the actor pool has. On
+    // two processors these numbers made a publication to many subscribers wait the shortest;
+    // fewer selectors moved more QoS 0 publications at full speed, but such a publication and
+    // QoS 1 exchanges waited longer. On four processors the numbers met the targets that the
+    // broker has at that size.
+    // Ceiling: more than four processors are unmeasured. Two pool threads were the limit for
+    // eight pairs of QoS 1 clients on four, so a larger machine may want more of both.
+    private static final int SELECTORS = 4;
 
-    private static final int ACTORS = Integer.getInteger("hato.broker.actors", 2);
+    private static final int ACTORS = 2;
+
+    // The numbers for a broker with one processor, where more threads only take the processor
+    // from each other. With these, QoS 1 exchanges went a tenth faster there, and the slowest
+    // of them, and of the deliveries to a thousand subscribers, waited a quarter to two fifths
+    // less.
+    private static final int SELECTORS_ON_ONE_PROCESSOR = 2;
+
+    private static final int ACTORS_ON_ONE_PROCESSOR = 1;
 
     private final ServerSocketChannel listener;
 
@@ -96,7 +109,16 @@ public final class BrokerServer implements AutoCloseable {
     }
 
     public static BrokerServer start(InetSocketAddress address) throws IOException {
-        return builder().start(address);
+        return start(address, Runtime.getRuntime().availableProcessors());
+    }
+
+    // Starts a broker with the threads that suit a machine of `processors` processors.
+    static BrokerServer start(InetSocketAddress address, int processors) throws IOException {
+        Builder builder = builder();
+        if (processors == 1) {
+            builder.selectors(SELECTORS_ON_ONE_PROCESSOR).actors(ACTORS_ON_ONE_PROCESSOR);
+        }
+        return builder.start(address);
     }
 
     /// Lets [#of(MqttBroker)] find the server of each broker. MqttBroker calls this as it starts
@@ -117,6 +139,9 @@ public final class BrokerServer implements AutoCloseable {
 
     /// Internal limits and test hooks, copied when the broker starts. Not thread safe.
     /// Values are checked together at [#start(InetSocketAddress)], so they can be set in any order.
+    ///
+    /// A builder starts with the numbers of threads for two processors or more, whatever the
+    /// machine has: a test that stops one thread of the broker counts on the others.
     static final class Builder {
 
         private Duration connectTimeout = CONNECT_TIMEOUT;

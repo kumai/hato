@@ -6,7 +6,8 @@ prototype, with product work still outstanding. The public broker API is unchang
 
 ## Configuration and source map
 
-The default is four platform-thread selectors and two platform-thread actor workers.
+The default is four platform-thread selectors and two platform-thread actor workers. A broker
+that finds a single processor takes two selectors and one worker.
 Socket I/O posts work to the session actors rather than running them inline. Each worker turn
 processes at most 256 events before reserving another turn at the back of the executor queue.
 
@@ -62,8 +63,8 @@ chapter 9.
 
 The original experiment applied `selector.patch`, `selector-bulk.patch`, `selector-ready.patch`,
 and `selector-fair.patch` and ran with `s0.inPlace=0`, which left every actor event to the pool.
-That is the only form now, and the setting is gone. The internal `hato.broker.selectors` and
-`hato.broker.actors` properties are experiment controls.
+That is the only form now, and the setting is gone. So are the properties that set the numbers
+of selectors and workers for trials; a measurement sets them through the internal builder.
 The normal Gradle build also regenerates the broker class index and processes nullness metadata.
 
 ## Verification
@@ -169,8 +170,7 @@ QoS 0 publications keep the limit of 16. The variants and their measurements are
   Each session's inbox takes 128 of them, eight times what it took.
 - Hand over the output that a worker holds when one of its events blocks. Today it waits for the
   end of the turn, with the output of the events before.
-- Choose the numbers of selectors and workers from the processors at hand. Two workers are the
-  limit for eight QoS 1 pairs now.
-- Remove the `hato.broker.selectors` and `hato.broker.actors` experiment properties.
+- Measure the numbers of selectors and workers on more than four processors. Two workers are
+  the limit for eight QoS 1 pairs on four.
 - Run the full broker/client/testkit, distribution, and native-image checks. TLS and application
   authentication are not implemented by this prototype.

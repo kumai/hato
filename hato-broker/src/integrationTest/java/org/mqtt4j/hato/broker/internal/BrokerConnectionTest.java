@@ -324,6 +324,30 @@ class BrokerConnectionTest {
     }
 
     @Test
+    void a_broker_with_one_processor_serves_with_fewer_threads() throws Exception {
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        try (
+                BrokerServer sut = BrokerServer.start(address, 1);
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession other = connected(sut.port(), "other")
+        ) {
+            // Act: three connections share the selectors, and their sessions the pool.
+            subscriber.subscribe("news", AT_LEAST_ONCE);
+            publisher.publish("news", "first", AT_LEAST_ONCE, 1);
+            Packet.Publish delivery = subscriber.expect(Packet.Publish.class);
+            subscriber.send(new Packet.PubAck(delivery.packetId(), SUCCESS, EMPTY));
+            other.ping();
+            subscriber.ping();
+
+            // Assert
+            assertThat(delivery.topic().name()).isEqualTo("news");
+            assertThat(threads(sut.port(), "selector-")).isEqualTo(2);
+            assertThat(threads(sut.port(), "actor-")).isEqualTo(1);
+        }
+    }
+
+    @Test
     void connections_take_no_threads_of_their_own() throws Exception {
         try (var sut = MqttBroker.start()) {
             // Arrange: two packets of one connection have had every thread of the broker start.
@@ -514,15 +538,17 @@ class BrokerConnectionTest {
     }
 
     private static long selectors(int port) {
-        String prefix = "hato-broker-" + port + "-selector-";
-        return Thread.getAllStackTraces().keySet().stream()
-                .filter(thread -> thread.getName().startsWith(prefix))
-                .count();
+        return threads(port, "selector-");
     }
 
     // How many threads the broker on `port` has, whatever they do.
     private static long threads(int port) {
-        String prefix = "hato-broker-" + port + "-";
+        return threads(port, "");
+    }
+
+    // How many threads of the broker on `port` have names that go on with `kind`.
+    private static long threads(int port, String kind) {
+        String prefix = "hato-broker-" + port + "-" + kind;
         return Thread.getAllStackTraces().keySet().stream()
                 .filter(thread -> thread.getName().startsWith(prefix))
                 .count();
