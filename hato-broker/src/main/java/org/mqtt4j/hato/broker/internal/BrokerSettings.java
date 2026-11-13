@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.IOException;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
@@ -22,7 +23,9 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // time its selector looks at it, which `Connection.wakeNow()` brings about. The session's actor
 // calls `beforeHandle` when it starts handling a packet. A selector calls `beforeSelect` each
 // time before it waits for its sockets, outside the work of any connection, so what a test
-// throws there fails the selector itself.
+// throws there fails the selector itself. The accepting thread calls `beforeAccept` each time
+// before it asks the listener for a connection, and takes what a test throws there as the
+// failure of that attempt.
 record BrokerSettings(
         long connectTimeout,
         int maxPacketSize,
@@ -45,6 +48,14 @@ record BrokerSettings(
         Consumer<Packet> beforeProcess,
         Consumer<Packet> beforeHandle,
         Predicate<Connection> deliveryWriteHeld,
-        Runnable beforeSelect
+        Runnable beforeSelect,
+        AcceptHook beforeAccept
 ) {
+
+    // What a test runs before each attempt to accept a connection.
+    @FunctionalInterface
+    interface AcceptHook {
+
+        void run() throws IOException;
+    }
 }

@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
@@ -87,6 +88,11 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int ACTORS_ON_ONE_PROCESSOR = 1;
 
+    // How long the accepting thread waits before it tries again after a connection could not
+    // be accepted. The cause, such as a process without a free file descriptor, lasts until
+    // something else in the process gives way, so trying at once would only spin.
+    private static final long ACCEPT_RETRY_MILLIS = 100;
+
     private final ServerSocketChannel listener;
 
     // Tells the accepting thread that a connection waits at the listener, which is all that it
@@ -95,6 +101,9 @@ public final class BrokerServer implements AutoCloseable {
     // something else in the process uses a file descriptor (seen on macOS), which a quiet
     // process never does.
     private final Selector acceptor;
+
+    // The listener's registration with that selector.
+    private final SelectionKey acceptKey;
 
     private final Routing routing;
 
@@ -106,7 +115,7 @@ public final class BrokerServer implements AutoCloseable {
         acceptor = Selector.open();
         try {
             listener.configureBlocking(false);
-            listener.register(acceptor, SelectionKey.OP_ACCEPT);
+            acceptKey = listener.register(acceptor, SelectionKey.OP_ACCEPT);
             routing = new Routing(settings, listener.socket().getLocalPort(), this::close);
             accepting = Thread.ofPlatform().daemon()
                     .name("hato-broker-" + routing.port + "-accept")
@@ -200,6 +209,8 @@ public final class BrokerServer implements AutoCloseable {
         private Predicate<Connection> deliveryWriteHeld = _ -> false;
 
         private Runnable beforeSelect = () -> { };
+
+        private BrokerSettings.AcceptHook beforeAccept = () -> { };
 
         private Builder() {
         }
@@ -327,6 +338,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder beforeAccept(BrokerSettings.AcceptHook value) {
+            beforeAccept = requireNonNull(value, "beforeAccept must not be null");
+            return this;
+        }
+
         BrokerServer start(InetSocketAddress address) throws IOException {
             requireNonNull(address, "address must not be null");
             if (connectTimeout.isNegative()
@@ -376,7 +392,8 @@ public final class BrokerServer implements AutoCloseable {
                     beforeProcess,
                     beforeHandle,
                     deliveryWriteHeld,
-                    beforeSelect
+                    beforeSelect,
+                    beforeAccept
             );
             ServerSocketChannel listener = ServerSocketChannel.open();
             try {
@@ -455,19 +472,52 @@ public final class BrokerServer implements AutoCloseable {
 
     // The next connection that waits at the listener, once there is one. close() ends the wait
     // with an exception, by closing the listener and the selector.
+    //
+    // An attempt can fail while the listener is sound: the process may lack what a connection
+    // takes, as when it has no file descriptor left. That passes, and the connection waits at
+    // the listener meanwhile. So the thread tries again after a pause, rather than end the
+    // listener and with it the broker and the connections that it serves.
     private Socket accepted() throws IOException {
+        boolean failing = false;
         while (true) {
-            SocketChannel channel = listener.accept();
-            if (channel != null) {
-                return channel.socket();
+            try {
+                routing.settings.beforeAccept().run();
+                SocketChannel channel = listener.accept();
+                if (channel != null) {
+                    if (failing) {
+                        log.info("Broker on port {} accepts connections again", port());
+                    }
+                    return channel.socket();
+                }
+            } catch (ClosedChannelException closed) {
+                throw closed;
+            } catch (IOException failure) {
+                if (failing) {
+                    log.debug("Broker on port {} cannot accept a connection", port(), failure);
+                } else {
+                    failing = true;
+                    log.warn("Broker on port {} cannot accept a connection and keeps trying;"
+                            + " later failures are logged at debug level", port(), failure);
+                }
+                // The connection that could not be accepted keeps the key ready, so the pause
+                // looks away from it. Closing the selector still ends the wait.
+                acceptKey.interestOps(0);
+                acceptor.select(_ -> { }, ACCEPT_RETRY_MILLIS);
+                acceptKey.interestOps(SelectionKey.OP_ACCEPT);
+                endIfInterrupted();
+                continue;
             }
             // The key tells nothing more than the return does: the loop asks the listener.
             acceptor.select(_ -> { });
-            if (Thread.interrupted()) {
-                // An interrupted thread no longer waits in a selector. It ends the listener, as
-                // an interrupt of a blocking accept does.
-                throw new InterruptedIOException("Interrupted while waiting for a connection");
-            }
+            endIfInterrupted();
+        }
+    }
+
+    // An interrupted thread no longer waits in a selector. It ends the listener, as an interrupt
+    // of a blocking accept does.
+    private static void endIfInterrupted() throws InterruptedIOException {
+        if (Thread.interrupted()) {
+            throw new InterruptedIOException("Interrupted while waiting for a connection");
         }
     }
 
