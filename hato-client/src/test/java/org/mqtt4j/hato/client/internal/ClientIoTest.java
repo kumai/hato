@@ -280,6 +280,7 @@ class ClientIoTest {
 
             // Act: DEBUG describes admission, write completion, and decoded input.
             jul.setLevel(Level.FINE);
+            assertThat(Log.awaitLevels(Duration.ofSeconds(10))).isTrue();
             sut.send(1, 1, packet, null);
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L));
             requireNonNull(transport.listener).onBytes(bytes);
@@ -299,6 +300,7 @@ class ClientIoTest {
             // Act: TRACE additionally records attempted writes and incoming byte chunks.
             records.clear();
             jul.setLevel(Level.FINER);
+            assertThat(Log.awaitLevels(Duration.ofSeconds(10))).isTrue();
             sut.send(1, 2, packet, null);
             await().untilAsserted(() -> assertThat(events.tickets).containsExactly(1L, 2L));
             requireNonNull(transport.listener).onBytes(bytes);
@@ -337,6 +339,7 @@ class ClientIoTest {
             // Act & Assert: disabled levels emit neither packet summaries nor bytes.
             records.clear();
             jul.setLevel(Level.OFF);
+            assertThat(Log.awaitLevels(Duration.ofSeconds(10))).isTrue();
             sut.send(1, 4, packet, null);
             await().untilAsserted(() -> assertThat(events.tickets)
                     .containsExactly(1L, 2L, 3L, 4L));

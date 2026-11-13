@@ -945,7 +945,7 @@ Payloads appear only at `TRACE`, and credentials never appear.
 
 The client does not wait for the logging backend, so a backend that is slow or blocked does not
 hold the client up. Its lines keep their order and reach the backend a moment after the client
-made them. When the backend falls far behind, the client drops lines, and a `WARNING` in their
+made them, and a level that you change in the backend applies a moment later. When the backend falls far behind, the client drops lines, and a `WARNING` in their
 place says how many. `close()` and `terminated()` each give the backend a moment to take the
 lines made until then, so close the client before the application exits.
 

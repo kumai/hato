@@ -526,6 +526,7 @@ class FaultyTransportTest {
         }
         jul.addHandler(handler);
         jul.setLevel(Level.ALL);
+        assertThat(Log.awaitLevels(Duration.ofSeconds(10))).isTrue();
         jul.setUseParentHandlers(false);
         try (var sut = new FaultyTransport(delegate, dispatched)) {
             var receiver = new Receiver();

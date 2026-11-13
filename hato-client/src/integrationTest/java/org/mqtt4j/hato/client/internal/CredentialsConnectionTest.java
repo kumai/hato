@@ -184,6 +184,10 @@ class CredentialsConnectionTest {
         hato.addHandler(handler);
         hato.setUseParentHandlers(false);
         hato.setLevel(Level.ALL);
+        assertThat(Log.awaitLevels(Duration.ofSeconds(10))).isTrue();
+        assertThat(org.mqtt4j.hato.broker.internal.common.log.Log.awaitLevels(
+                Duration.ofSeconds(10)
+        )).isTrue();
         try (MqttBroker broker = MqttBroker.start();
                 MqttClient sut = MqttClient.builder()
                         .server(URI.create("mqtt://localhost:" + broker.port()))

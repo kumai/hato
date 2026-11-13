@@ -30,12 +30,15 @@ import static java.util.Objects.requireNonNull;
 /// Each class owns a static log named after that class. Package names identify the distribution;
 /// individual class names are implementation details.
 ///
-/// A statement never waits for the logging backend. The calling thread checks the level and
-/// renders the text; a thread of its own then gives the statements of the whole distribution to
-/// `System.Logger`, in the order in which they were made. A backend can hold its caller for
-/// seconds, and not only when it writes to a slow device. Where the application logs from virtual
-/// threads, a platform thread that waits for the backend's lock behind one of them sleeps until
-/// that virtual thread has run, although the lock is free, and that takes as long as the
+/// A statement never waits for the logging backend. The calling thread renders the text when the
+/// level is enabled; a thread of its own then gives the statements of the whole distribution to
+/// `System.Logger`, in the order in which they were made. Nor does the calling thread ask the
+/// backend whether a level is enabled: a log keeps the backend's answer, which it gets as it is
+/// made and which that thread asks for again every second. A backend can hold its caller for
+/// seconds, in a level check as well as in a write, and not only when it writes to a slow device:
+/// an application's filter can wait as long as its handler can. Where the application logs from
+/// virtual threads, a platform thread that waits for the backend's lock behind one of them sleeps
+/// until that virtual thread has run, although the lock is free, and that takes as long as the
 /// application keeps every carrier busy (JDK 25). The threads that call this facade keep
 /// connections alive, so they must not be the ones that wait.
 ///
@@ -43,7 +46,9 @@ import static java.util.Objects.requireNonNull;
 /// Statements that find no room because the backend has fallen behind are dropped, and a warning
 /// in their place says how many. Statements that still wait when the JVM exits are lost, so an
 /// entry point of the distribution waits for them in [#awaitWritten(Duration)] when the
-/// application closes it.
+/// application closes it. A level that the application changes in the backend applies to the
+/// statements within a second. A filter of the backend that decides by the thread that calls it,
+/// such as by that thread's diagnostic context, sees the thread that writes.
 ///
 /// A failing backend never reaches the caller. Logging happens in cleanup, notification, and
 /// failure-reporting paths, so a throwing handler must not interrupt them or replace the
@@ -63,23 +68,41 @@ public final class Log {
     private static final System.@Nullable LoggerFinder ownLoaderFinder =
             findOwnLoaderFinder().orElse(null);
 
+    private static final Level[] LEVELS = Level.values();
+
     private final System.Logger logger;
+
+    // The levels that the backend enables, one bit for each by ordinal, as it last answered: as
+    // the log was made, and since then each time the thread that writes asks again. Statements
+    // read these instead of asking the backend.
+    private volatile int enabled;
 
     private Log(System.Logger logger) {
         this.logger = logger;
+        enabled = enabledLevels(logger);
+        try {
+            Writer.instance.watch(this);
+        } catch (Throwable _) {
+            // The thread that writes could not start, so statements are lost anyway; the levels
+            // stay as the backend first answered.
+        }
     }
 
     /// Returns the log with the given `System.Logger` name.
     public static Log of(String name) {
         requireNonNull(name, "name must not be null");
+        return of(systemLogger(name));
+    }
+
+    private static System.Logger systemLogger(String name) {
         if (ownLoaderFinder != null) {
             try {
-                return of(ownLoaderFinder.getLogger(name, Log.class.getModule()));
+                return ownLoaderFinder.getLogger(name, Log.class.getModule());
             } catch (Throwable _) {
                 // A broken bridge must not keep the class asking for its log from initializing.
             }
         }
-        return of(System.getLogger(name));
+        return System.getLogger(name);
     }
 
     /// Returns the log named after `type`. After embedding, the name carries the distribution's
@@ -107,6 +130,22 @@ public final class Log {
         }
     }
 
+    /// Has every log of the distribution ask the backend again which levels it enables, and waits
+    /// until they all have, or until `limit` has passed. Otherwise a level that the application
+    /// changes in the backend applies within a second; a test that changes one waits here. An
+    /// interrupted thread does not wait, and keeps its interrupt status. Like a statement, the
+    /// wait never fails its caller.
+    ///
+    /// @return whether the logs have asked
+    public static boolean awaitLevels(Duration limit) {
+        try {
+            return Writer.instance.awaitLevels(limit.toNanos());
+        } catch (Throwable _) {
+            // The thread that writes could not start, so no statement is written anyway.
+            return false;
+        }
+    }
+
     private static Optional<System.LoggerFinder> findOwnLoaderFinder() {
         try {
             // The JDK's own finders are boot classes. Any other finder is a provider that the JDK
@@ -128,7 +167,23 @@ public final class Log {
     }
 
     public boolean isLoggable(Level level) {
-        return logger.isLoggable(level);
+        return (enabled & (1 << level.ordinal())) != 0;
+    }
+
+    // Asks the backend which levels it enables. A level whose check fails counts as disabled,
+    // as its statements would be lost.
+    private static int enabledLevels(System.Logger logger) {
+        int bits = 0;
+        for (Level level : LEVELS) {
+            try {
+                if (logger.isLoggable(level)) {
+                    bits |= 1 << level.ordinal();
+                }
+            } catch (Throwable _) {
+                // The backend failed to answer for this level.
+            }
+        }
+        return bits;
     }
 
     public void error(String message, @Nullable Object... args) {
@@ -153,7 +208,7 @@ public final class Log {
 
     private void log(Level level, String message, @Nullable Object[] args) {
         try {
-            if (!logger.isLoggable(level)) {
+            if (!isLoggable(level)) {
                 return;
             }
             // As in SLF4J, a trailing Throwable that no placeholder consumes is the cause.
@@ -303,6 +358,10 @@ public final class Log {
     /// this class, so `java.util.logging` finds no caller and prints the name of the log instead,
     /// which is the class that made the statement. Otherwise it would print this class for
     /// every statement.
+    ///
+    /// It also asks the backend which levels the logs enable, every second, so that a level that
+    /// the application changes reaches the statements, while the threads that make them never
+    /// ask.
     private static final class Writer extends Thread implements System.Logger {
 
         // Each distribution embeds a copy under org.mqtt4j.hato.<distribution>; naming the
@@ -327,6 +386,12 @@ public final class Log {
         private static final int MAX_EXCEPTIONS = 64;
 
         private static final long POLL_NANOS = 1_000_000;
+
+        // How often the thread asks the backend about the levels again, unless awaitLevels asks
+        // it to now.
+        // Ceiling: a statement made within a second of a change in the backend follows the old
+        // level. A backend that told of its changes would lift this; System.Logger has no way to.
+        private static final long LEVELS_NANOS = 1_000_000_000;
 
         // Starting it here starts it with the first statement, or with the distribution's class
         // preload. If it cannot start, the statements of the distribution are lost.
@@ -356,8 +421,19 @@ public final class Log {
         // thread reads and writes it.
         private String carried = "";
 
-        // Tells of dropped statements under the name of the facade.
-        private final System.Logger own = Log.of(Log.class).logger;
+        // Tells of dropped statements under the name of the facade. It is no log: a log would
+        // ask this thread, which is still being made, to keep its levels.
+        private final System.Logger own = systemLogger(Log.class.getName());
+
+        // Every log of the distribution, whose levels this thread asks the backend about. There
+        // are as many as classes that log, each held by a static field for good.
+        private final ConcurrentLinkedQueue<Log> logs = new ConcurrentLinkedQueue<>();
+
+        // How many times callers have asked for the levels now, and how many of those requests
+        // the thread had seen when it last began to ask the backend.
+        private final AtomicLong levelRequests = new AtomicLong();
+
+        private volatile long levelRequestsServed;
 
         private Writer() {
             // The values that the first thread to log happens to hold in inheritable
@@ -404,6 +480,30 @@ public final class Log {
             statements.add(statement);
         }
 
+        // Has this thread keep the levels of `log` up to date from now on.
+        void watch(Log log) {
+            logs.add(log);
+        }
+
+        /// Has the thread ask the backend about the levels of every log now, and waits until it
+        /// has done so from start to end, for at most `nanos`.
+        boolean awaitLevels(long nanos) {
+            if (Thread.currentThread() == this) {
+                return false;
+            }
+            long request = levelRequests.incrementAndGet();
+            LockSupport.unpark(this);
+            long deadline = System.nanoTime() + nanos;
+            while (levelRequestsServed < request) {
+                long left = deadline - System.nanoTime();
+                if (left <= 0 || Thread.currentThread().isInterrupted()) {
+                    return false;
+                }
+                LockSupport.parkNanos(this, Math.min(left, POLL_NANOS));
+            }
+            return true;
+        }
+
         /// Waits until the backend has had every statement queued before this call, for at most
         /// `nanos`.
         boolean awaitWritten(long nanos) {
@@ -429,13 +529,27 @@ public final class Log {
         @Override
         public void run() {
             long count = 0;
+            long levelsAsked = System.nanoTime();
             while (true) {
+                // A request seen here is served by asking every log after it was made.
+                long requested = levelRequests.get();
+                if (requested != levelRequestsServed
+                        || System.nanoTime() - levelsAsked >= LEVELS_NANOS) {
+                    levelsAsked = System.nanoTime();
+                    for (Log log : logs) {
+                        log.enabled = enabledLevels(log.logger);
+                    }
+                    levelRequestsServed = requested;
+                }
                 Statement next = statements.poll();
                 if (next == null) {
                     carry("");
                     idle = true;
                     if (statements.isEmpty()) {
-                        LockSupport.park(this);
+                        LockSupport.parkNanos(
+                                this,
+                                LEVELS_NANOS - (System.nanoTime() - levelsAsked)
+                        );
                     }
                     idle = false;
                     // An interrupted thread no longer parks, and this one has nothing to stop for.

@@ -1602,6 +1602,7 @@ class ClientActorTest {
         Level previousLevel = logger.getLevel();
         boolean previousParents = logger.getUseParentHandlers();
         logger.setLevel(Level.ALL);
+        assertThat(Log.awaitLevels(Duration.ofSeconds(10))).isTrue();
         logger.setUseParentHandlers(false);
         logger.addHandler(handler);
         try (MqttClient client = MqttClient.builder()
@@ -2465,6 +2466,7 @@ class ClientActorTest {
         };
         jul.addHandler(handler);
         jul.setLevel(Level.ALL);
+        assertThat(Log.awaitLevels(Duration.ofSeconds(10))).isTrue();
         jul.setUseParentHandlers(false);
         var sender = new CompletableFuture<Thread>();
         var encoder = new ScriptCodec();

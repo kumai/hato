@@ -63,6 +63,7 @@ class ListenerLaneTest {
         Level previousLevel = logger.getLevel();
         boolean previousParents = logger.getUseParentHandlers();
         logger.setLevel(Level.ALL);
+        assertThat(Log.awaitLevels(Duration.ofSeconds(10))).isTrue();
         logger.setUseParentHandlers(false);
         logger.addHandler(handler);
         try {

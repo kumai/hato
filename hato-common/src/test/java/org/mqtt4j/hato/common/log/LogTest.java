@@ -5,7 +5,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.ResourceBundle;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.locks.LockSupport;
 import java.util.logging.Handler;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
@@ -71,6 +74,70 @@ class LogTest {
         for (int i = 1; i < messages.size() - 1; i++) {
             assertThat(messages.get(i)).startsWith((i - 1) + " ");
         }
+    }
+
+    @Test
+    void a_statement_does_not_ask_a_backend_whose_level_checks_hold_their_caller() {
+        // Arrange: from now on, the backend's level checks keep their caller.
+        var logger = new HoldingLevelsLogger();
+        var sut = Log.of(logger);
+        logger.holding = true;
+        try {
+            // Act
+            sut.info("made");
+            sut.debug("not made");
+        } finally {
+            logger.holding = false;
+        }
+        awaitWritten();
+
+        // Assert: the calls asked the backend nothing, and the enabled statement reached it.
+        assertThat(logger.heldCallers).doesNotContain(Thread.currentThread().getName());
+        assertThat(logger.messages).containsExactly("made");
+    }
+
+    @Test
+    void a_level_that_the_backend_changes_applies_to_later_statements() throws Exception {
+        // Arrange
+        var logger = new RecordingLogger(Level.INFO);
+        var sut = Log.of(logger);
+
+        // Act: the application lowers the level in the backend.
+        logger.minimum = Level.DEBUG;
+
+        // Assert: debug statements reach the backend within a few seconds.
+        long deadline = System.nanoTime() + SECONDS.toNanos(5);
+        while (logger.records.isEmpty() && System.nanoTime() < deadline) {
+            sut.debug("lowered");
+            awaitWritten();
+            Thread.sleep(10);
+        }
+        assertThat(logger.records).extracting(Record::message).first().isEqualTo("lowered");
+    }
+
+    @Test
+    void a_level_that_the_backend_changes_applies_once_the_logs_have_asked_again() {
+        // Arrange: a log made before the one under test answers slowly, so that asking every
+        // log takes a while.
+        var slow = new SlowLevelsLogger();
+        Log _ = Log.of(slow);
+        var logger = new RecordingLogger(Level.INFO);
+        var sut = Log.of(logger);
+        logger.minimum = Level.DEBUG;
+        slow.slow = true;
+        boolean asked;
+        try {
+            // Act
+            asked = Log.awaitLevels(Duration.ofSeconds(10));
+            sut.debug("lowered");
+        } finally {
+            slow.slow = false;
+        }
+        awaitWritten();
+
+        // Assert
+        assertThat(asked).isTrue();
+        assertThat(logger.records).extracting(Record::message).containsExactly("lowered");
     }
 
     @Test
@@ -311,7 +378,7 @@ class LogTest {
     private static final class RecordingLogger implements System.Logger {
 
         final List<Record> records = new ArrayList<>();
-        private final Level minimum;
+        volatile Level minimum;
 
         RecordingLogger(Level minimum) {
             this.minimum = minimum;
@@ -374,6 +441,74 @@ class LogTest {
         @Override
         public void log(Level level, ResourceBundle bundle, String format, Object... params) {
             throw new AssertionError("the facade must not delegate formatting to System.Logger");
+        }
+    }
+
+    /// A backend whose level checks keep their caller while `holding` is set, for at most a
+    /// second each, as an application's filter that waits would. It notes the threads that it
+    /// kept. INFO and above are enabled.
+    private static final class HoldingLevelsLogger implements System.Logger {
+
+        volatile boolean holding;
+        final Set<String> heldCallers = ConcurrentHashMap.newKeySet();
+        final List<String> messages = new ArrayList<>();
+
+        @Override
+        public String getName() {
+            return "holding levels";
+        }
+
+        @Override
+        public boolean isLoggable(Level level) {
+            if (holding) {
+                heldCallers.add(Thread.currentThread().getName());
+                long end = System.nanoTime() + SECONDS.toNanos(1);
+                while (holding && System.nanoTime() < end) {
+                    LockSupport.parkNanos(1_000_000);
+                }
+            }
+            return level.getSeverity() >= Level.INFO.getSeverity();
+        }
+
+        @Override
+        public void log(Level level, ResourceBundle bundle, String message, Throwable thrown) {
+            messages.add(message);
+        }
+
+        @Override
+        public void log(Level level, ResourceBundle bundle, String format, Object... params) {
+            throw new AssertionError("the facade must not delegate formatting to System.Logger");
+        }
+    }
+
+    /// A backend whose level checks take 20 ms each while `slow` is set. It enables nothing.
+    private static final class SlowLevelsLogger implements System.Logger {
+
+        volatile boolean slow;
+
+        @Override
+        public String getName() {
+            return "slow levels";
+        }
+
+        @Override
+        public boolean isLoggable(Level level) {
+            if (slow) {
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public void log(Level level, ResourceBundle bundle, String message, Throwable thrown) {
+        }
+
+        @Override
+        public void log(Level level, ResourceBundle bundle, String format, Object... params) {
         }
     }
 

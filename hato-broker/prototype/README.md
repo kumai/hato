@@ -55,7 +55,8 @@ does on a session's actor. Only a failure of the selector loop itself closes the
 application has no way yet to learn that the broker closed itself, other than the log.
 
 No thread of the broker enters the application's logging backend. The shared `Log` facade queues
-each statement without a lock, and one platform thread gives the statements to the backend.
+each statement without a lock, and one platform thread gives the statements to the backend and
+asks it which levels are enabled.
 Where the application logs from virtual threads, a selector or a worker that called the backend
 itself waited for its lock for seconds, behind a virtual thread that found no carrier. The
 measurement is in [`notes/bench/broker-threads.md`](../../notes/bench/broker-threads.md),
