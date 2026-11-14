@@ -2477,7 +2477,9 @@ class ClientActorTest {
             transport.completeSends = false;
             CompletableFuture<PublishResult> pending = sut.publish(message(new byte[] {1}));
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Publish.class);
+            var actor = new CompletableFuture<Thread>();
             beforeActorTime = () -> {
+                actor.complete(Thread.currentThread());
                 throw failure;
             };
 
@@ -2491,6 +2493,10 @@ class ClientActorTest {
             assertThat(ends.poll(5, SECONDS)).isEqualTo(DisconnectionAccess.of(failure, false, 1));
             assertThat(transport.closed).isTrue();
             assertThat(sender.get(5, SECONDS).join(Duration.ofSeconds(5))).isTrue();
+            // The failing clock also ends the actor thread with an uncaught error, possibly after
+            // the test has seen the cleanup. Waiting for the thread keeps that error out of the
+            // waits of the next test.
+            assertThat(actor.get(5, SECONDS).join(Duration.ofSeconds(5))).isTrue();
             assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
                     .hasCauseInstanceOf(IllegalStateException.class);
             assertThat(Log.awaitWritten(Duration.ofSeconds(10))).isTrue();
@@ -5743,19 +5749,19 @@ class ClientActorTest {
     void unsubscribing_during_shutdown_fixes_the_ending_before_a_later_internal_failure()
             throws Exception {
         // Arrange: hold the actor in an event that fails once released, then close.
-        var entered = new CountDownLatch(1);
+        var entered = new CompletableFuture<Thread>();
         var release = new CountDownLatch(1);
         try (MqttClient sut = client()) {
             ScriptTransport transport = connect(sut);
             PullSubscription subscription = sut.subscribe(request());
             assertThat(transport.sent.poll(5, SECONDS)).isInstanceOf(Packet.Subscribe.class);
             beforeActorTime = () -> {
-                entered.countDown();
+                entered.complete(Thread.currentThread());
                 waitFor(release);
                 throw new AssertionError("Actor failed");
             };
             transport.receiveForActor(new Packet.PingResp());
-            assertThat(entered.await(5, SECONDS)).isTrue();
+            Thread actor = entered.get(5, SECONDS);
             sut.close();
 
             // Act
@@ -5767,6 +5773,10 @@ class ClientActorTest {
                     .isEqualTo(new ReceiveResult.Ended());
             assertThatThrownBy(() -> subscription.established().get(5, SECONDS))
                     .hasCauseInstanceOf(IllegalStateException.class);
+            // The failing clock also ends the actor thread with an uncaught error, possibly after
+            // the test has seen the cleanup. Waiting for the thread keeps that error out of the
+            // waits of the next test.
+            assertThat(actor.join(Duration.ofSeconds(5))).isTrue();
         } finally {
             release.countDown();
         }

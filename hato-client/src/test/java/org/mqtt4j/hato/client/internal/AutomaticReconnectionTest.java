@@ -606,10 +606,12 @@ class AutomaticReconnectionTest {
         // Arrange: the actor reads a clock that fails with an error, an internal failure.
         var failure = new AssertionError("clock broken");
         var broken = new AtomicBoolean();
+        var actor = new CompletableFuture<Thread>();
         var clock = new TimerScheduler() {
             @Override
             public long nanoTime() {
                 if (broken.get()) {
+                    actor.complete(Thread.currentThread());
                     throw failure;
                 }
                 return scheduler.nanoTime();
@@ -644,6 +646,10 @@ class AutomaticReconnectionTest {
             assertThat(ending.cause()).get()
                     .isInstanceOfSatisfying(MqttConnectException.class, cause ->
                             assertThat(cause).hasCause(failure));
+            // The failing clock also ends the actor thread with an uncaught error, possibly after
+            // the test has seen the cleanup. Waiting for the thread keeps that error out of the
+            // waits of the next test.
+            assertThat(actor.get(5, SECONDS).join(Duration.ofSeconds(5))).isTrue();
         }
     }
 
