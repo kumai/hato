@@ -1096,6 +1096,45 @@ class BrokerDeliveryMemoryTest {
     }
 
     @Test
+    void a_subscription_made_again_with_the_memory_full_takes_the_place_of_the_first_one()
+            throws Exception {
+        // Arrange: a client whose window of one holds a delivery that it does not answer. Six
+        // retained messages wait for it with the cursor of their subscription, and behind
+        // them a publication to another topic, which fills the memory.
+        long room = cursorSize("k/#", 6)
+                + 6 * PublicationMemory.sizeOf(retained("k/1", "0001"))
+                + roomOf("live", "0007");
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            subscriber.subscribe("held", AT_LEAST_ONCE);
+            publisher.publish("held", "held", AT_LEAST_ONCE, 7);
+            Packet.Publish held = subscriber.expect(Packet.Publish.class);
+            for (int number = 1; number <= 6; number++) {
+                publisher.publish(retained("k/" + number, "000" + number));
+            }
+            subscriber.subscribe("k/#", AT_LEAST_ONCE);
+            subscriber.subscribe("live", AT_LEAST_ONCE);
+            publisher.publish("live", "0007", AT_LEAST_ONCE, 7);
+
+            // Act: the same subscription again. Its cursor needs room, which the copies that
+            // wait for the first subscription make: all but the copy of the message that the
+            // new cursor comes to hold first, whose room stays with that message.
+            subscriber.subscribe("k/#", AT_LEAST_ONCE);
+
+            // Assert: the first subscription's copies went, one after the other, for those
+            // of the second, so the client gets every message once, behind the publication
+            // that came between the two subscriptions.
+            await().untilAsserted(() -> assertThat(reported).hasSize(6));
+            subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
+            assertThat(received(subscriber, 7))
+                    .containsExactly("0007", "0001", "0002", "0003", "0004", "0005", "0006");
+            subscriber.ping();
+            assertThat(reported).containsOnly("subscriber").hasSize(6);
+        }
+    }
+
+    @Test
     void a_session_keeps_its_oldest_retained_message_when_another_session_takes_the_room_first()
             throws Exception {
         // Arrange: a client whose window of one holds a delivery that it does not answer, and

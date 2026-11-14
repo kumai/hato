@@ -1220,6 +1220,7 @@ final class Session {
         PublicationMemory memory = message.memory();
         long own = cursor.hasRoom ? 0 : cursor.ownBytes;
         int oldest = oldestRetainedThatMakeRoom(
+                memory,
                 own + (memory.held() ? 0 : memory.bytes()),
                 own + memory.bytes()
         );
@@ -1312,13 +1313,15 @@ final class Session {
     // A message gives its room back only if nothing else holds it: the room of one that
     // another cursor or a delivery holds as well, of this session or of another, stays taken
     // until the last holder lets go. So a message that several of these cursors hold counts
-    // for none of them, which errs towards keeping what waits. A cursor gives back its own
-    // room with its last message. And as with deliveries, no further message goes once those
-    // before it count for as much as the new one does.
+    // for none of them, which errs towards keeping what waits. Nor does the new message
+    // itself give anything back where it waits for an earlier subscription too: `arriving` is
+    // its room, which the new holder keeps. A cursor gives back its own room with its last
+    // message. And as with deliveries, no further message goes once those before it count for
+    // as much as the new one does.
     //
     // The answer is of this moment, and nothing goes on the strength of it alone: handOver()
     // makes sure of the room first. Called under the inbox.
-    private int oldestRetainedThatMakeRoom(long needed, long counted) {
+    private int oldestRetainedThatMakeRoom(PublicationMemory arriving, long needed, long counted) {
         long missing = routing.memory.shortOf(needed);
         // What the cursors count is the most that they and their messages could give back.
         if (missing > retainedWithRoom) {
@@ -1337,7 +1340,7 @@ final class Session {
                     return -1;
                 }
                 PublicationMemory memory = cursor.at(position).memory();
-                if (memory.heldOnce()) {
+                if (memory != arriving && memory.heldOnce()) {
                     missing -= memory.bytes();
                 }
                 given += memory.bytes();
