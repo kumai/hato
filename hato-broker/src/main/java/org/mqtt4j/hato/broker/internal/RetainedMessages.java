@@ -9,8 +9,6 @@ import java.util.Map;
 import org.mqtt4j.hato.broker.internal.common.concurrent.Timer;
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
-import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
-import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
@@ -27,7 +25,8 @@ final class RetainedMessages {
 
     private static final Log log = Log.of(RetainedMessages.class);
 
-    // The retained limits: how many messages the broker keeps, and their bytes in all.
+    // The retained limits: how many messages the broker keeps, and what they hold on the heap
+    // in all (see PublicationMemory).
     private final int maxCount;
 
     private final long maxBytes;
@@ -65,27 +64,20 @@ final class RetainedMessages {
     // topic in place of the previous one [MQTT-3.3.1-5]. An empty payload only removes the
     // previous one [MQTT-3.3.1-6] [MQTT-3.3.1-7]. A message beyond the retained limits is not
     // kept either, which leaves its topic without a retained message rather than with an
-    // outdated one. The messages whose lifetime has passed make room first. `memory` is the
-    // publication's room in the broker's memory for deliveries, which the deliveries of the
-    // retained message share with those of the publication itself.
+    // outdated one. The messages whose lifetime has passed make room first. `memory` says what
+    // the publication holds on the heap, which is what the message counts for here, and is the
+    // room in the broker's memory for deliveries that the deliveries of the retained message
+    // share with those of the publication itself.
     void store(Packet.Publish publication, long received, PublicationMemory memory) {
         Message previous = messages.remove(publication.topic());
         if (previous != null) {
-            bytes -= previous.byteCount();
+            bytes -= previous.memory().bytes();
         }
         if (publication.payload().length == 0) {
             return;
         }
-        // A retained message counts as the MQTT 5.0 PUBLISH that carries it with its properties.
-        int byteCount = PacketCodec.of(MqttVersion.V5).publishSize(
-                publication.topic(),
-                publication.qos(),
-                publication.properties(),
-                publication.payload().length
-        );
         var message = new Message(
                 publication,
-                byteCount,
                 received,
                 Delivery.lifetimeOf(publication),
                 memory
@@ -115,13 +107,13 @@ final class RetainedMessages {
             return;
         }
         messages.put(publication.topic(), message);
-        bytes += message.byteCount();
+        bytes += message.memory().bytes();
         noteExpiry(message);
     }
 
     // Whether the retained limits have room for `message`.
     private boolean fits(Message message) {
-        return messages.size() < maxCount && message.byteCount() <= maxBytes - bytes;
+        return messages.size() < maxCount && message.memory().bytes() <= maxBytes - bytes;
     }
 
     // Takes account of the lifetime of `message`, which the store keeps: the earliest end is
@@ -158,7 +150,7 @@ final class RetainedMessages {
             Message message = kept.next();
             if (message.expired(now)) {
                 kept.remove();
-                bytes -= message.byteCount();
+                bytes -= message.memory().bytes();
             } else {
                 noteExpiry(message);
             }
@@ -185,14 +177,13 @@ final class RetainedMessages {
         expiring = false;
     }
 
-    // A retained message, its share of the retained size limit, when the broker received it,
-    // its Message Expiry Interval in seconds, which counts from then, or -1 without one, and
-    // the room that its deliveries share in the broker's memory for deliveries. The interval is
-    // read from the publication once, because a look at the lifetimes goes through every
-    // message.
+    // A retained message, when the broker received it, its Message Expiry Interval in seconds,
+    // which counts from then, or -1 without one, and what it holds on the heap: its share of
+    // the retained size limit, and the room that its deliveries share in the broker's memory
+    // for deliveries. The interval is read from the publication once, because a look at the
+    // lifetimes goes through every message.
     record Message(
             Packet.Publish publication,
-            long byteCount,
             long received,
             long lifetime,
             PublicationMemory memory

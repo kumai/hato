@@ -119,6 +119,9 @@ final class Connection {
 
     private List<SendQueue.Send<Outbound>> writing = List.of();
 
+    // What the deliveries of the write in progress hold on the heap.
+    private long writingMemory;
+
     private ByteBuffer[] writingParts = new ByteBuffer[0];
 
     private boolean writingLast;
@@ -151,6 +154,12 @@ final class Connection {
     private String endReason = "";
 
     private long ticket;
+
+    // What the deliveries in the send queue hold on the heap, those of the write in progress
+    // included. The queue bounds the bytes of the packets that wait in it, but a delivery of
+    // many small properties holds many times its packet's bytes, and the queue holds the
+    // delivery until it is written. So what the deliveries hold stays within the same limit.
+    private long queuedMemory;
 
     // Set once the connection is to end with these bytes, such as a refusal CONNACK or a
     // DISCONNECT. The queue then admits nothing more; the writer writes what waits, except
@@ -483,12 +492,23 @@ final class Connection {
             // The writer prepares a delivery as it writes it. A session queues a delivery here
             // only once the connection that had it before has ended, so whether that connection
             // started to send it no longer changes.
-            case Delivery delivery -> outgoing.offer(
-                    ++ticket,
-                    new Outbound.Publish(delivery, delivery.sent),
-                    delivery.byteCount,
-                    false
-            );
+            case Delivery delivery -> {
+                // The queue holds the delivery until it is written, so it is full for one
+                // whose memory does not fit, as for one whose packet does not.
+                if (delivery.memoryBytes > settings.sendBytes() - queuedMemory) {
+                    yield SendQueue.OfferResult.FULL;
+                }
+                SendQueue.OfferResult offered = outgoing.offer(
+                        ++ticket,
+                        new Outbound.Publish(delivery, delivery.sent),
+                        delivery.byteCount,
+                        false
+                );
+                if (offered == SendQueue.OfferResult.ACCEPTED) {
+                    queuedMemory += delivery.memoryBytes;
+                }
+                yield offered;
+            }
             case Release release -> {
                 byte[] bytes = PacketCodec.of(version).encode(release.packet());
                 yield outgoing.offer(
@@ -636,6 +656,12 @@ final class Connection {
                 // A write that a test keeps back still has the sends that it took.
                 if (writing.isEmpty()) {
                     writing = outgoing.pollBatch(BATCH_BYTES);
+                    writingMemory = 0;
+                    for (SendQueue.Send<Outbound> send : writing) {
+                        if (send.value() instanceof Outbound.Publish publish) {
+                            writingMemory += publish.delivery().memoryBytes;
+                        }
+                    }
                 }
                 if (ended) {
                     return;
@@ -649,8 +675,8 @@ final class Connection {
                 writingParts = new ByteBuffer[] {ByteBuffer.wrap(last)};
                 writingLast = true;
             } else {
-                boolean delivers = writing.stream()
-                        .anyMatch(send -> send.value() instanceof Outbound.Publish);
+                // Every delivery holds something.
+                boolean delivers = writingMemory > 0;
                 boolean skip = false;
                 if (delivers) {
                     // While a test keeps the write back, the connection goes on with its
@@ -694,6 +720,8 @@ final class Connection {
         synchronized (this) {
             outgoing.completed(writing.getLast().ticket());
             writing = List.of();
+            queuedMemory -= writingMemory;
+            writingMemory = 0;
             sendReleased();
             resume = awaitingSpace;
             awaitingSpace = false;

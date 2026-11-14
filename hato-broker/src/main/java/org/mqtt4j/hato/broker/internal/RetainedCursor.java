@@ -83,10 +83,10 @@ final class RetainedCursor implements Pending {
         return Qos.of(Math.min(granted.level(), matched.get(next).publication().qos().level()));
     }
 
-    // Moves past the next retained message, which went out or was dropped, and returns its size
-    // as the broker counts it for retaining (an MQTT 5.0 PUBLISH). Called only while one is left.
+    // Moves past the next retained message, which went out or was dropped, and returns what it
+    // holds on the heap, as the retained limits count it. Called only while one is left.
     long advance() {
-        long bytes = matched.get(next).byteCount();
+        long bytes = matched.get(next).memory().bytes();
         current = null;
         next++;
         return bytes;
@@ -97,11 +97,11 @@ final class RetainedCursor implements Pending {
         return matched.size() - next;
     }
 
-    // The size of the retained messages left, as `advance()` counts it.
+    // What the retained messages left hold on the heap, as `advance()` counts it.
     long remainingBytes() {
         long bytes = 0;
         for (int position = next; position < matched.size(); position++) {
-            bytes += matched.get(position).byteCount();
+            bytes += matched.get(position).memory().bytes();
         }
         return bytes;
     }

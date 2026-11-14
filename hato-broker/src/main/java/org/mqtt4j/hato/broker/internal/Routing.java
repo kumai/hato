@@ -21,10 +21,8 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.broker.internal.common.log.Log;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
-import org.mqtt4j.hato.broker.internal.common.protocol.PacketCodec;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
 import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
-import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
@@ -354,26 +352,19 @@ final class Routing {
                 (will.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
                 properties
         );
-        // A Will takes the room of the PUBLISH that would have carried it.
-        int bytes = PacketCodec.of(MqttVersion.V5).publishSize(
-                publication.topic(),
-                publication.qos(),
-                properties,
-                publication.payload().length
-        );
-        route(publication, publisher, bytes);
+        route(publication, publisher);
     }
 
     // Delivers `publication` from `publisher`'s client to every matching subscription, after
-    // making it the retained message of its topic if its RETAIN flag asks for that. `bytes` is
-    // the size of the packet that brought it, which is the room that it takes in the broker's
-    // memory for deliveries while a session holds one of its deliveries. Called on the actor
-    // of `publisher`, which drains the sessions that it delivers to, here where no thread
-    // holds their turn: under the topic lock for a retained publication.
-    void route(Packet.Publish publication, Session publisher, int bytes) {
+    // making it the retained message of its topic if its RETAIN flag asks for that. Called on
+    // the actor of `publisher`, which drains the sessions that it delivers to, here where no
+    // thread holds their turn: under the topic lock for a retained publication.
+    void route(Packet.Publish publication, Session publisher) {
         // A Message Expiry Interval counts from here.
         long received = settings.scheduler().nanoTime();
-        var room = new PublicationMemory(bytes);
+        // What the publication holds on the heap, which its deliveries and its retained message
+        // share.
+        var room = new PublicationMemory(publication);
         if (!publication.retain()) {
             deliver(publication, room, publisher, received);
             return;

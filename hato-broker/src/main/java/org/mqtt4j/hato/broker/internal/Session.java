@@ -133,6 +133,8 @@ final class Session {
 
     private final LinkedHashMap<Integer, Outgoing> inflight = new LinkedHashMap<>();
 
+    // What the deliveries in the window hold on the heap, which the window's byte limit
+    // bounds.
     private long inflightBytes;
 
     // Replays and PUBRELs waiting for space in the current connection's send queue, at most
@@ -441,7 +443,7 @@ final class Session {
         try {
             if (connection == from && !from.isEnded()) {
                 settings.beforeHandle().accept(received.packet);
-                from.client.process(this, received.packet, received.bytes);
+                from.client.process(this, received.packet);
             }
         } catch (Throwable failure) {
             from.failed("packet handling", failure);
@@ -731,11 +733,11 @@ final class Session {
     // Called under the inbox.
     private boolean takeRoom(Delivery delivery) {
         MemoryBudget memory = routing.memory;
-        if (!memory.take(MemoryBudget.DELIVERY_BYTES)) {
+        if (!memory.take(delivery.ownBytes)) {
             return false;
         }
         if (!delivery.memory.hold(memory)) {
-            memory.give(MemoryBudget.DELIVERY_BYTES);
+            memory.give(delivery.ownBytes);
             return false;
         }
         delivery.hasRoom = true;
@@ -747,7 +749,7 @@ final class Session {
     // under the inbox.
     private void takeRoomAnyway(Delivery delivery) {
         MemoryBudget memory = routing.memory;
-        memory.takeAnyway(MemoryBudget.DELIVERY_BYTES);
+        memory.takeAnyway(delivery.ownBytes);
         delivery.memory.holdAnyway(memory);
         delivery.hasRoom = true;
         withRoom++;
@@ -759,7 +761,7 @@ final class Session {
         delivery.hasRoom = false;
         withRoom--;
         delivery.memory.release(memory);
-        memory.give(MemoryBudget.DELIVERY_BYTES);
+        memory.give(delivery.ownBytes);
     }
 
     // Drops `delivery`, which has just left its queue, for `cause`. Called under the inbox.
@@ -794,7 +796,7 @@ final class Session {
         Iterator<Delivery> newest = queue.deliveries.descendingIterator();
         while (queue.oversized > 0) {
             Delivery waiting = newest.next();
-            if (waiting.byteCount > queue.maxBytes) {
+            if (waiting.memoryBytes > queue.maxBytes) {
                 newest.remove();
                 queue.left(waiting);
                 drop(waiting, "it is larger than the delivery queue");
@@ -834,9 +836,9 @@ final class Session {
     // oldest deliveries if need be. Returns false if the session goes without `delivery`.
     private boolean makeRoom(DeliveryQueue queue, Delivery delivery) {
         while (!takeRoom(delivery)) {
-            long held = queue.bytes
-                    + (long) MemoryBudget.DELIVERY_BYTES * queue.deliveries.size();
-            long needed = MemoryBudget.DELIVERY_BYTES + delivery.byteCount;
+            // What the queue holds now is what has room.
+            long held = queue.bytes;
+            long needed = delivery.memoryBytes;
             if (queue.deliveries.isEmpty() || !routing.memory.mightFit(needed, held)) {
                 dropped(delivery.qos, MEMORY_USED_UP);
                 return false;
@@ -934,7 +936,7 @@ final class Session {
             return;
         }
         for (RetainedMessages.Message message : matched) {
-            retainedRoom.add(message.byteCount());
+            retainedRoom.add(message.memory().bytes());
         }
         Packet.Subscription subscription = subscribed.subscription();
         // They result from this subscription alone, and carry its identifier [MQTT-3.3.4-3].
@@ -973,11 +975,13 @@ final class Session {
         }
     }
 
-    // Whether `delivery` is larger than the send queue or, if acknowledged, the window ever takes.
+    // Whether `delivery` is larger than the send queue or, if acknowledged, the window ever
+    // takes: as a packet for the send queue, and by what it holds on the heap for both.
     private boolean neverFits(Delivery delivery) {
         return delivery.byteCount > settings.sendBytes()
+                || delivery.memoryBytes > settings.sendBytes()
                 || (delivery.qos != Qos.AT_MOST_ONCE
-                        && delivery.byteCount > settings.maxInflightBytes());
+                        && delivery.memoryBytes > settings.maxInflightBytes());
     }
 
     private DeliveryQueue queueOf(Delivery delivery) {
@@ -1165,7 +1169,7 @@ final class Session {
                 }
                 boolean acknowledged = delivery.qos != Qos.AT_MOST_ONCE;
                 if (acknowledged && (inflight.size() == settings.maxInflight()
-                        || delivery.byteCount > settings.maxInflightBytes() - inflightBytes
+                        || delivery.memoryBytes > settings.maxInflightBytes() - inflightBytes
                         || outstandingCount >= peer.client.sendQuota)) {
                     return;
                 }
@@ -1192,7 +1196,7 @@ final class Session {
                     case RetainedCursor cursor -> retainedRoom.remove(cursor.advance());
                 }
                 inflight.put(delivery.packetId, delivery);
-                inflightBytes += delivery.byteCount;
+                inflightBytes += delivery.memoryBytes;
                 countOutstanding(delivery.packetId);
             }
         }
@@ -1276,7 +1280,7 @@ final class Session {
                     // only a successful PUBREC leads to PUBREL.
                     end(id, delivery);
                 } else {
-                    inflightBytes -= delivery.byteCount;
+                    inflightBytes -= delivery.memoryBytes;
                     leaveWindow(delivery);
                     var release = new Release(id);
                     inflight.putLast(id, release);
@@ -1296,7 +1300,7 @@ final class Session {
         deferred.remove(id);
         packetIds.release(id);
         if (outgoing instanceof Delivery delivery) {
-            inflightBytes -= delivery.byteCount;
+            inflightBytes -= delivery.memoryBytes;
             leaveWindow(delivery);
         }
         if (outstanding.get(id)) {
@@ -1497,8 +1501,8 @@ final class Session {
     record Subscribed(Packet.Subscription subscription, int identifier) {
     }
 
-    // The deliveries of one kind that wait, oldest first, with their bytes and the limits on
-    // their number and bytes.
+    // The deliveries of one kind that wait, oldest first, with what they hold on the heap in
+    // bytes and the limits on their number and on those bytes.
     private static final class DeliveryQueue {
 
         final ArrayDeque<Delivery> deliveries = new ArrayDeque<>();
@@ -1529,8 +1533,8 @@ final class Session {
 
         void add(Delivery delivery) {
             deliveries.addLast(delivery);
-            bytes += delivery.byteCount;
-            if (delivery.byteCount > maxBytes) {
+            bytes += delivery.memoryBytes;
+            if (delivery.memoryBytes > maxBytes) {
                 oversized++;
             }
             if (delivery.hasRoom) {
@@ -1548,8 +1552,8 @@ final class Session {
         // Takes account of `delivery` having left the deliveries, before it gives any room in
         // the broker's memory back.
         void left(Delivery delivery) {
-            bytes -= delivery.byteCount;
-            if (delivery.byteCount > maxBytes) {
+            bytes -= delivery.memoryBytes;
+            if (delivery.memoryBytes > maxBytes) {
                 oversized--;
             }
             if (delivery.hasRoom) {

@@ -18,9 +18,9 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
+import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_LEAST_ONCE;
@@ -134,7 +134,9 @@ class BrokerSessionTest {
     @Test
     void acknowledgement_releases_the_byte_window_before_the_count_window_is_full()
             throws Exception {
-        long bytes = codec.encode(publication("bytes", "payload", AT_LEAST_ONCE, 1)).length;
+        // Arrange: a window of two deliveries by count, whose bytes hold one of them and half of
+        // another by what they hold on the heap, which is far more than their packets.
+        long bytes = deliverySize(publication("bytes", "payload", AT_LEAST_ONCE, 1)) * 3 / 2;
         try (BrokerServer sut = broker(2, bytes, 2, 1024, 8);
                 RawSession subscriber = connected(sut.port(), "subscriber", false, false);
                 RawSession publisher = connected(sut.port(), "publisher")) {
@@ -265,10 +267,11 @@ class BrokerSessionTest {
     void a_delivery_that_can_never_fit_the_window_is_dropped_and_the_session_goes_on(
             boolean offline
     ) throws Exception {
-        try (BrokerServer sut = broker(2, 32, 4, 1024, 8);
+        // Arrange: a window whose bytes hold the small delivery exactly.
+        long window = deliverySize(publication("oversized", "small", AT_LEAST_ONCE, 1));
+        try (BrokerServer sut = broker(2, window, 4, 1024, 8);
                 RawSession previous = connected(sut.port(), "oversized", false, false);
                 RawSession publisher = connected(sut.port(), "publisher")) {
-            // Arrange
             previous.subscribe("oversized", AT_LEAST_ONCE);
             if (offline) {
                 previous.disconnect();
@@ -539,7 +542,7 @@ class BrokerSessionTest {
     // A broker whose queue holds two of the equally sized deliveries in these tests, by count or
     // by bytes, behind a window of one.
     private static BrokerServer boundedBroker(boolean byteLimit) throws IOException {
-        long bytes = codec.encode(publication("bounded", "0001", AT_LEAST_ONCE, 1)).length;
+        long bytes = deliverySize(publication("bounded", "0001", AT_LEAST_ONCE, 1));
         return byteLimit
                 ? broker(1, 1024, 16, 2 * bytes, 8)
                 : broker(1, 1024, 2, 1024, 8);

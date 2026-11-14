@@ -22,10 +22,13 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 // one session: their number, and the characters of their filters in all. `maxDeliveryMemory`
 // is the memory in bytes that the deliveries that wait for all the sessions may take
 // together, and `deliveryMemoryUnit` how much of it a thread of the actor pool fetches for
-// itself at a time (see MemoryBudget). `selectors` and `actors` are the numbers of selector
-// threads and of threads in the actor pool. The capabilities are what the broker announces
-// to MQTT 5.0 clients until a test changes them, within its own limits. The drop listener,
-// if there is one, hears of the QoS 1 and 2 deliveries that the limits keep from a session.
+// itself at a time (see MemoryBudget). The byte limits on deliveries and on retained messages
+// count what these hold on the heap, which can be many times the bytes of their packets (see
+// PublicationMemory); `sendBytes` bounds both for what waits in a connection's send queue.
+// `selectors` and `actors` are the numbers of selector threads and of threads in the actor
+// pool. The capabilities are what the broker announces to MQTT 5.0 clients until a test
+// changes them, within its own limits. The drop listener, if there is one, hears of the
+// QoS 1 and 2 deliveries that the limits keep from a session.
 //
 // The selector calls `beforeProcess` before handing a packet to its session. It asks
 // `deliveryWriteHeld` before marking the deliveries of a write as sent: while the answer is

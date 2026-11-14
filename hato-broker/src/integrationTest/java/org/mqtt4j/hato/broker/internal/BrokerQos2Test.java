@@ -17,8 +17,8 @@ import org.mqtt4j.hato.broker.internal.common.protocol.PacketType;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
+import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_LEAST_ONCE;
@@ -277,7 +277,7 @@ class BrokerQos2Test {
     @Test
     void pubrec_releases_payload_bytes_before_pubcomp() throws Exception {
         // Arrange: two identifier slots, but payload space for only one publication.
-        long bytes = codec.encode(publication("bytes", "payload", EXACTLY_ONCE, 1)).length;
+        long bytes = deliverySize(publication("bytes", "payload", EXACTLY_ONCE, 1));
         try (BrokerServer sut = broker(2, bytes);
                 RawSession subscriber = connected(sut.port(), "subscriber");
                 RawSession publisher = connected(sut.port(), "publisher")) {

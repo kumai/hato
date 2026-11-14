@@ -10,6 +10,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
+import org.mqtt4j.hato.broker.internal.common.protocol.Property;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
@@ -17,8 +19,9 @@ import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
-import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
+import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
+import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_LEAST_ONCE;
@@ -149,7 +152,7 @@ class BrokerDeliveryMemoryTest {
         // of eight sessions, which is far less than eight times the publication.
         String payload = "x".repeat(4096);
         List<String> clients = List.of("a", "b", "c", "d", "e", "f", "g", "h");
-        long room = wireSize("shared", payload)
+        long room = PublicationMemory.sizeOf(publication("shared", payload, AT_LEAST_ONCE, 7))
                 + (long) clients.size() * MemoryBudget.DELIVERY_BYTES;
         try (BrokerServer sut = broker(room);
                 RawSession publisher = connected(sut.port(), "publisher")) {
@@ -294,6 +297,44 @@ class BrokerDeliveryMemoryTest {
         }
     }
 
+    @Test
+    void deliveries_take_room_for_the_properties_that_their_publications_hold() throws Exception {
+        // Arrange: memory that the packets of the ten publications below would fill by a fifth,
+        // and a session that waits for them while its client is away.
+        try (BrokerServer sut = broker(64 * 1024);
+                RawSession publisher = connectedV5(sut.port(), "publisher")) {
+            leaveSubscribed(sut, "away", "kept", AT_LEAST_ONCE);
+
+            // Act: each carries two hundred User Properties, which take 1.4 kilobytes in its
+            // packet and at least 24 on the heap.
+            for (int number = 0; number < 10; number++) {
+                publisher.publish(withUserProperties("kept", 200));
+            }
+
+            // Assert: the memory holds fewer than half of them, so the session lost the rest.
+            await().untilAsserted(() -> assertThat(reported).hasSizeGreaterThan(5));
+            assertThat(reported).containsOnly("away");
+        }
+    }
+
+    /// A QoS 1 publication to `topic` that carries `count` User Properties of two strings of
+    /// one character.
+    private static Packet.Publish withUserProperties(String topic, int count) {
+        var entries = new ArrayList<Property>();
+        for (int number = 0; number < count; number++) {
+            entries.add(new Property.UserProperty("a", "b"));
+        }
+        return new Packet.Publish(
+                new Topic(topic),
+                "0001".getBytes(UTF_8),
+                AT_LEAST_ONCE,
+                false,
+                false,
+                7,
+                new Properties(entries)
+        );
+    }
+
     /// The payloads of the next `count` deliveries to `receiver`, each of which it answers if
     /// it is a QoS 1 delivery.
     private static List<String> received(RawSession receiver, int count) throws Exception {
@@ -322,16 +363,10 @@ class BrokerDeliveryMemoryTest {
         }
     }
 
-    /// The room that a delivery of a QoS 1 or 2 publication to `topic` with `payload` takes
-    /// while no other delivery shares the publication.
+    /// The room that a delivery of a publication to `topic` with `payload` takes while no other
+    /// delivery shares the publication.
     private static long roomOf(String topic, String payload) {
-        return MemoryBudget.DELIVERY_BYTES + wireSize(topic, payload);
-    }
-
-    /// The size of the packet that brings a QoS 1 or 2 publication, which is the room that the
-    /// publication takes.
-    private static int wireSize(String topic, String payload) {
-        return codec.encode(publication(topic, payload, AT_LEAST_ONCE, 7)).length;
+        return deliverySize(publication(topic, payload, AT_LEAST_ONCE, 7));
     }
 
     /// A broker whose waiting deliveries may take `bytes` of memory together, and whose

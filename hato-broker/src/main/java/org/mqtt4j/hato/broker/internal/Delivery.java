@@ -45,7 +45,18 @@ final class Delivery implements Outgoing, Pending {
 
     private final long lifetime;
 
+    // The bytes of the PUBLISH that carries the delivery to its session's client, for what the
+    // protocol and the connection's send queue measure in packets.
     final int byteCount;
+
+    // What the delivery holds on the heap beside its publication: itself, its places in its
+    // session's queue and window, and a sequence of properties of its own if it adds
+    // Subscription Identifiers to the publication's.
+    final long ownBytes;
+
+    // What the limits that bound memory count for the delivery: its publication, which it
+    // shares with the publication's other deliveries, and what it holds beside.
+    final long memoryBytes;
 
     // Where the delivery stands among what its session has queued: the session's number for
     // it, set under the session's inbox as the delivery comes to wait.
@@ -86,6 +97,14 @@ final class Delivery implements Outgoing, Pending {
                 properties,
                 publication.payload().length
         );
+        long own = MemoryBudget.DELIVERY_BYTES;
+        if (properties != publication.properties() && !properties.isEmpty()) {
+            // The sequence is the delivery's own: the publication's properties, which it
+            // shares, and the identifiers, which are its own too.
+            own += PublicationMemory.sequenceSize(properties.entries().size(), identifiers.size());
+        }
+        ownBytes = own;
+        memoryBytes = memory.bytes() + ownBytes;
     }
 
     private static Properties withIdentifiers(Properties properties, List<Integer> identifiers) {
