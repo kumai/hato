@@ -406,13 +406,13 @@ public final class Log {
 
         // Starting it here starts it with the first statement, or with the distribution's class
         // preload. If it cannot start, the statements of the distribution are lost.
-        static final Writer instance = new Writer();
+        static final Writer instance = new Writer(new ConcurrentLinkedQueue<>());
 
         static {
             instance.start();
         }
 
-        private final ConcurrentLinkedQueue<Statement> statements = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<Statement> statements;
 
         // The room that the statements in the queue take, the one being written included.
         private final AtomicLong waiting = new AtomicLong();
@@ -452,11 +452,14 @@ public final class Log {
 
         private volatile long levelRequestsServed;
 
-        private Writer() {
+        // Besides the one instance, the test makes one that it does not start, with a queue that
+        // fails to take a statement.
+        Writer(ConcurrentLinkedQueue<Statement> statements) {
             // The values that the first thread to log happens to hold in inheritable
             // thread-locals, such as a logging context, are not this thread's.
             super(null, null, NAME, 0, false);
             setDaemon(true);
+            this.statements = statements;
         }
 
         /// Queues `statement`, or drops it when there is no room. Never waits and takes no lock:
@@ -508,10 +511,24 @@ public final class Log {
             }
         }
 
+        // A statement is counted before the queue takes it, so that none is in the queue
+        // uncounted. Then once the thread has written as many statements as a wait read from the
+        // count, it has written every statement that the queue had taken by that read, since it
+        // writes them in their order.
+        // The queue first makes the node that is to hold the statement, and memory can run out
+        // there; after that, it needs none. A statement that the queue failed to take is not in
+        // it, and gives its room and its count back. Otherwise later statements would find less
+        // room, and no wait would see the count reached, both for good.
         private void queue(Statement statement) {
             waiting.addAndGet(statement.size());
             taken.incrementAndGet();
-            statements.add(statement);
+            try {
+                statements.add(statement);
+            } catch (Throwable e) {
+                taken.decrementAndGet();
+                waiting.addAndGet(-statement.size());
+                throw e;
+            }
         }
 
         // Has this thread keep the levels of `log` up to date from now on.
@@ -547,7 +564,11 @@ public final class Log {
             }
             long target = taken.get();
             long deadline = System.nanoTime() + nanos;
-            while (written < target) {
+            // The count falls back when the queue fails to take a statement (see queue), and a
+            // wait that read it before then would wait for a statement that never comes. The
+            // count never falls below the statements that the queue has taken, so the smaller of
+            // the two still covers every statement queued before this call.
+            while (written < Math.min(target, taken.get())) {
                 long left = deadline - System.nanoTime();
                 if (left <= 0 || Thread.currentThread().isInterrupted()) {
                     return false;

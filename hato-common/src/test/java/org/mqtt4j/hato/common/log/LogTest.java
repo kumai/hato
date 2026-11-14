@@ -6,7 +6,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.ResourceBundle;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.locks.LockSupport;
 import java.util.logging.Handler;
@@ -21,6 +23,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 class LogTest {
 
@@ -406,6 +409,46 @@ class LogTest {
     }
 
     @Test
+    void a_statement_that_the_queue_cannot_take_is_not_waited_for_and_gives_back_its_room()
+            throws Exception {
+        // Arrange: a thread that writes nothing, so that what is queued stays queued. Its queue
+        // runs out of memory for the first statement, as the queue can for the node that is to
+        // hold one, but keeps the caller until the test lets go. With more exceptions than are
+        // counted, that statement takes the whole room.
+        var queue = new FailingQueue();
+        var sut = new Log.Writer(queue);
+        var logger = new RecordingLogger(Level.INFO);
+        var lost = Log.Statement.of(
+                logger,
+                Level.ERROR,
+                "lost",
+                chain(65, "cause"),
+                "test"
+        );
+        var failure = new CompletableFuture<Throwable>();
+        Thread.ofPlatform().start(() -> failure.complete(catchThrowable(() -> sut.take(lost))));
+        assertThat(queue.entered.await(10, SECONDS)).isTrue();
+        // A wait for what has been queued, the lost statement included, has begun.
+        var waited = new CompletableFuture<Boolean>();
+        Thread waiter = Thread.ofPlatform().start(
+                () -> waited.complete(sut.awaitWritten(SECONDS.toNanos(10)))
+        );
+        awaitParked(waiter);
+
+        // Act: the queue fails to take the statement. Once the wait has returned, a later
+        // statement follows, which the wait would otherwise wait for in its place.
+        queue.released.countDown();
+        boolean allWritten = waited.get(5, SECONDS);
+        sut.take(Log.Statement.of(logger, Level.INFO, "later", null, "test"));
+
+        // Assert: the error reached the caller, and the statement was lost. The wait returned
+        // well before its limit, and the later statement found the room.
+        assertThat(failure.get(5, SECONDS)).isInstanceOf(OutOfMemoryError.class);
+        assertThat(allWritten).isTrue();
+        assertThat(queue).extracting(Log.Statement::text).containsExactly("later");
+    }
+
+    @Test
     void class_based_logs_are_named_after_the_class() {
         assertThat(Log.of(LogTest.class).getName()).isEqualTo(LogTest.class.getName());
         assertThat(Log.of("org.mqtt4j.hato.test").getName()).isEqualTo("org.mqtt4j.hato.test");
@@ -426,6 +469,16 @@ class LogTest {
         assertThat(Log.awaitWritten(Duration.ofSeconds(10)))
                 .as("the backend took the statements made so far")
                 .isTrue();
+    }
+
+    /// Waits until `thread` parks for a limited time, as a wait does once it has read what it
+    /// waits for.
+    private static void awaitParked(Thread thread) {
+        long end = System.nanoTime() + SECONDS.toNanos(10);
+        while (thread.getState() != Thread.State.TIMED_WAITING) {
+            assertThat(System.nanoTime() - end).as("the thread parked in time").isNegative();
+            LockSupport.parkNanos(1_000_000);
+        }
     }
 
     private record Record(
@@ -610,6 +663,30 @@ class LogTest {
         public void log(Level level, ResourceBundle bundle, String format, Object... params) {
             calls++;
             throw new AssertionError("Logging backend failed");
+        }
+    }
+
+    /// A queue that runs out of memory for the first statement, as the queue of the thread that
+    /// writes can for the node that is to hold one. It keeps that caller until the test lets go,
+    /// for at most ten seconds, and takes later statements.
+    @SuppressWarnings("serial") // Never serialized.
+    private static final class FailingQueue extends ConcurrentLinkedQueue<Log.Statement> {
+
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch released = new CountDownLatch(1);
+
+        @Override
+        public boolean offer(Log.Statement statement) {
+            if (entered.getCount() == 0) {
+                return super.offer(statement);
+            }
+            entered.countDown();
+            try {
+                boolean _ = released.await(10, SECONDS);
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+            }
+            throw new OutOfMemoryError("Java heap space");
         }
     }
 }
