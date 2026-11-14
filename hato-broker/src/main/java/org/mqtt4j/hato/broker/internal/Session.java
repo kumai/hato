@@ -701,9 +701,10 @@ final class Session {
     }
 
     // Queues `delivery` behind what waits, unless the session goes without it, and returns
-    // whether it waits for a connection that can take it now. The queue limits apply to what
-    // still waits once the drain that `drainsNext` promises has sent what it can, and otherwise
-    // at once. Called under the inbox.
+    // whether it waits for a connection that can take it now. The queue's limits and the
+    // memory's apply to what still waits once the drain that `drainsNext` promises has sent
+    // what it can; without that promise they apply at once if the session has no connection
+    // or the queue is full. Called under the inbox.
     private boolean admit(Delivery delivery, long received, boolean drainsNext) {
         Connection peer = connection;
         boolean online = peer != null && !peer.isEnded();
@@ -729,10 +730,12 @@ final class Session {
             // Nothing sends for a session without a connection, so the delivery waits from
             // now on.
             trim(queue);
-        } else if (!drainsNext) {
+        } else if (!drainsNext && queue.overflows()) {
             // The thread that has the session's turn sends what it can soon, and what waits
-            // then takes its room. Until then the queue keeps to its own limits.
-            applyLimits(queue);
+            // then takes its room. A queue that is full cannot leave it at that: its limits
+            // have something go now, and which one depends on whether the memory has room
+            // for what came, so what came waits from now on.
+            trim(queue);
         }
         return online;
     }
@@ -781,48 +784,19 @@ final class Session {
         dropped(delivery.qos, cause);
     }
 
-    // Applies the limits of `queue` to its deliveries, which wait once what could go out has
-    // gone, and takes room in the broker's memory for those that have come to wait since the
-    // last time. Called under the inbox.
-    private void trim(DeliveryQueue queue) {
-        applyLimits(queue);
-        takeRoomForWaiting(queue);
-    }
-
-    // Applies the limits of `queue` to its deliveries. One larger than the whole queue would
-    // never fit, so it goes alone rather than with the older ones; then the oldest go until
-    // the queue holds its limits again, so that a client that falls behind gets the newest
-    // ones. Deliveries in the connection's send queue or in flight are on their way and stay.
+    // Sees to the deliveries of `queue` that have come to wait since the last time: those
+    // that are still there once what could go out has gone, which stand at its end in the
+    // order they came and are the ones without room in the broker's memory. Each takes its
+    // room there first. Without room, the session's oldest deliveries of the kind make room
+    // for the new one; they stay if they could not make enough, and the session then goes
+    // without the new one alone, as it does when none waits. Only then do the queue's own
+    // limits apply to a delivery that has its room: the oldest go until the queue holds its
+    // limits again, so that a client that falls behind gets the newest ones. In this order
+    // the queue gives up nothing for a delivery that the memory then refuses. One larger
+    // than the whole queue would never fit, so it goes alone rather than with the older ones.
+    // Deliveries in the connection's send queue or in flight are on their way and stay.
     // Called under the inbox.
-    private void applyLimits(DeliveryQueue queue) {
-        // Only deliveries that came since the limits and the memory were last seen to can
-        // have the queue overflow, and they are the ones that are still without room.
-        if (queue.deliveries.size() == queue.withRoom) {
-            return;
-        }
-        // The last time left none that large in the queue, so each of them has come since, and
-        // they stand at its end: finding them does not go through what waited before.
-        Iterator<Delivery> newest = queue.deliveries.descendingIterator();
-        while (queue.oversized > 0) {
-            Delivery waiting = newest.next();
-            if (waiting.memoryBytes > queue.maxBytes) {
-                newest.remove();
-                queue.left(waiting);
-                drop(waiting, "it is larger than the delivery queue");
-            }
-        }
-        while (queue.overflows()) {
-            drop(queue.removeOldest(), "its delivery queue is full");
-        }
-    }
-
-    // Takes room in the broker's memory for the deliveries of `queue` that have none yet:
-    // those that came since the last time, which stand at its end in the order they came.
-    // Without room, the session's oldest deliveries of the kind make room for a new one, as
-    // they do for the queue's own limits. They stay if even all of them could not make enough:
-    // then the session goes without the new one alone, as it does when none waits. Called
-    // under the inbox.
-    private void takeRoomForWaiting(DeliveryQueue queue) {
+    private void trim(DeliveryQueue queue) {
         int arrived = queue.deliveries.size() - queue.withRoom;
         if (arrived == 0) {
             return;
@@ -835,8 +809,16 @@ final class Session {
             queue.left(waiting[index]);
         }
         for (Delivery delivery : waiting) {
-            if (makeRoom(queue, delivery)) {
-                queue.add(delivery);
+            if (delivery.memoryBytes > queue.maxBytes) {
+                dropped(delivery.qos, "it is larger than the delivery queue");
+                continue;
+            }
+            if (!makeRoom(queue, delivery)) {
+                continue;
+            }
+            queue.add(delivery);
+            while (queue.overflows()) {
+                drop(queue.removeOldest(), "its delivery queue is full");
             }
         }
     }
@@ -1775,10 +1757,6 @@ final class Session {
 
         long bytes;
 
-        // How many of the deliveries are larger than `maxBytes`, and so can never wait within
-        // the limits.
-        int oversized;
-
         // How many of the deliveries have room in the broker's memory for deliveries. They
         // are the oldest: those that came later have none until the limits are applied again.
         int withRoom;
@@ -1796,9 +1774,6 @@ final class Session {
         void add(Delivery delivery) {
             deliveries.addLast(delivery);
             bytes += delivery.memoryBytes;
-            if (delivery.memoryBytes > maxBytes) {
-                oversized++;
-            }
             if (delivery.hasRoom) {
                 withRoom++;
             }
@@ -1815,9 +1790,6 @@ final class Session {
         // the broker's memory back.
         void left(Delivery delivery) {
             bytes -= delivery.memoryBytes;
-            if (delivery.memoryBytes > maxBytes) {
-                oversized--;
-            }
             if (delivery.hasRoom) {
                 withRoom--;
             }
@@ -1826,7 +1798,6 @@ final class Session {
         void clear() {
             deliveries.clear();
             bytes = 0;
-            oversized = 0;
             withRoom = 0;
         }
     }

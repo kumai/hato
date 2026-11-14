@@ -7,14 +7,14 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 // The memory that the deliveries that wait for the sessions of one broker may take together.
 // The limits of a session bound what waits for that session alone, and many sessions that are
 // away or behind would still fill the heap. So a delivery takes room here once it waits: when
-// it is still in its session's queue after the session has sent what it could, and when its
-// session loses its connection while the delivery is unanswered in the window. It keeps the
-// room until it leaves the session: what it holds on the heap itself, and what its publication
-// holds, once for all the deliveries of that publication that have room (see
-// PublicationMemory). The retained messages that wait for a new subscription take room in the
-// same way, for as long as their cursor holds them, and so does the cursor for what it holds
-// itself. A session that finds no room drops what waits for it as it does for its own limits,
-// but only what gives enough room back as it goes.
+// it is still in its session's queue after the session has sent what it could, when it comes
+// to a queue that is full already, and when its session loses its connection while the
+// delivery is unanswered in the window. It keeps the room until it leaves the session: what it
+// holds on the heap itself, and what its publication holds, once for all the deliveries of
+// that publication that have room (see PublicationMemory). The retained messages that wait
+// for a new subscription take room in the same way, for as long as their cursor holds them,
+// and so does the cursor for what it holds itself. A session that finds no room drops what
+// waits for it as it does for its own limits, but only what gives enough room back as it goes.
 //
 // A delivery that goes straight out takes no room and costs nothing here. That is what keeps
 // the count off the path of a client that keeps up: counting every delivery from the moment

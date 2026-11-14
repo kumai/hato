@@ -191,6 +191,32 @@ class BrokerDeliveryMemoryTest {
     }
 
     @Test
+    void a_full_queue_keeps_its_oldest_delivery_when_the_memory_has_no_room_for_a_new_one()
+            throws Exception {
+        // Arrange: a session that is away, for which two deliveries may wait at the most. Two
+        // small ones wait for it and fill the memory.
+        BrokerServer.Builder limited = settings(2 * roomOf("kept", "0001")).maxQueued(2);
+        try (BrokerServer sut = limited.start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            leaveSubscribed(sut, "away", "kept", AT_LEAST_ONCE);
+            publisher.publish("kept", "0001", AT_LEAST_ONCE, 7);
+            publisher.publish("kept", "0002", AT_LEAST_ONCE, 7);
+
+            // Act: a publication larger than the two together, for which the memory has no
+            // room whatever the session drops.
+            publisher.publish("kept", "x".repeat(4096), AT_LEAST_ONCE, 7);
+
+            // Assert: the session goes without it alone. Its queue, which the new delivery
+            // would have overflowed, gave up nothing for it.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("away"));
+            try (RawSession back = connected(sut.port(), "away", false, true)) {
+                assertThat(received(back, 2)).containsExactly("0001", "0002");
+                back.ping();
+            }
+        }
+    }
+
+    @Test
     void a_delivery_without_room_in_the_memory_does_not_wait_for_its_session() throws Exception {
         // Arrange: memory for less than one delivery.
         try (BrokerServer sut = broker(MemoryBudget.DELIVERY_BYTES);
