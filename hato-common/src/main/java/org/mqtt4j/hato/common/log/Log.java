@@ -351,7 +351,9 @@ public final class Log {
         }
     }
 
-    /// The thread that gives the statements of the distribution to the backend. Nothing ends it.
+    /// The thread that gives the statements of the distribution to the backend. Nothing ends it:
+    /// a pass of its loop that fails costs at most the statement at hand, and unless the backend
+    /// failed it, a warning tells of it.
     ///
     /// While it writes a statement, its name ends with the name of the thread that made the
     /// statement. A backend prints the name of the thread that calls it, and that name is how an
@@ -423,6 +425,12 @@ public final class Log {
         // Statements that found no room, until a warning in the queue tells their number.
         private final AtomicLong dropped = new AtomicLong();
 
+        // Passes of the thread that failed, though not by the backend's doing, until a warning
+        // in the queue tells their number, and what failed the first of them.
+        private final AtomicLong failed = new AtomicLong();
+
+        private volatile @Nullable Throwable failure;
+
         // Whether the thread may be parked, so that a new statement has to wake it.
         private volatile boolean idle;
 
@@ -474,6 +482,23 @@ public final class Log {
                         null,
                         ""
                 ));
+            }
+            // A warning of failed passes comes with the first statement made after them. Their
+            // number is taken only once the warning is made: where memory failed the thread, it
+            // can fail this caller too, and then a later statement tells of them.
+            long failures = failed.get();
+            if (failures != 0) {
+                Statement warning = Statement.of(
+                        own,
+                        Level.WARNING,
+                        "Logging failed " + failures
+                                + " times; lost at most one log statement each time",
+                        failure,
+                        ""
+                );
+                if (failed.compareAndSet(failures, 0)) {
+                    queue(warning);
+                }
             }
             queue(statement);
             // The thread looks at the queue once more after it has set the flag, so either it
@@ -575,20 +600,29 @@ public final class Log {
                     }
                     try {
                         carry(next.thread());
-                        next.logger().log(next.level(), null, next.text(), next.thrown());
+                        try {
+                            next.logger().log(next.level(), null, next.text(), next.thrown());
+                        } catch (Throwable _) {
+                            // The statement is lost. A backend that fails is not this thread's
+                            // failure, and no warning tells of it.
+                        }
                     } finally {
                         // Written or lost, the statement no longer waits.
                         waiting.addAndGet(-next.size());
                         written = ++count;
                     }
-                } catch (Throwable _) {
+                } catch (Throwable e) {
                     // Nothing ends the thread: whatever fails a pass, it goes on with the next
-                    // one. A pass can fail outside the backend too. Memory can run out wherever
-                    // this thread asks for some, as it does to walk through the logs and to make
-                    // a name. A failed pass loses the statement that it had taken, if it had
-                    // one, and nothing else. Logs that it had not asked yet keep their levels,
-                    // and a request for the levels stays unserved, until a later pass asks every
-                    // log.
+                    // one. Memory can run out wherever this thread asks for some, as it does to
+                    // walk through the logs and to make a name. A failed pass loses the
+                    // statement that it had taken, if it had one, and nothing else. Logs that it
+                    // had not asked yet keep their levels, and a request for the levels stays
+                    // unserved, until a later pass asks every log. The next statement that is
+                    // made brings a warning of the failed passes with it.
+                    if (failed.get() == 0) {
+                        failure = e;
+                    }
+                    failed.incrementAndGet();
                 }
             }
         }
