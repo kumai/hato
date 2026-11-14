@@ -86,10 +86,16 @@ public final class BrokerServer implements AutoCloseable {
     private static final long MAX_SUBSCRIPTION_LENGTH = 1024 * 1024;
 
     // Retained messages are bounded like the other state that the broker keeps: by count, as
-    // sessions are, and by size, as each session's waiting deliveries are.
+    // sessions are, and by size, as each session's waiting deliveries are. The size is what
+    // they hold on the heap.
     private static final int MAX_RETAINED = 10_000;
 
     private static final long MAX_RETAINED_BYTES = 64L * 1024 * 1024;
+
+    // The share of the largest heap that the retained messages hold at most unless a setting
+    // says otherwise: an eighth, so that a small heap does not fill with what a large one may
+    // retain.
+    private static final int RETAINED_MEMORY_SHARE = 8;
 
     // Every response that a test holds takes one of the client's packet identifiers, so a client
     // that follows the protocol never holds more.
@@ -238,7 +244,10 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxRetained = MAX_RETAINED;
 
-        private long maxRetainedBytes = MAX_RETAINED_BYTES;
+        private long maxRetainedBytes = Math.min(
+                MAX_RETAINED_BYTES,
+                Runtime.getRuntime().maxMemory() / RETAINED_MEMORY_SHARE
+        );
 
         private int maxHeld = MAX_HELD;
 
