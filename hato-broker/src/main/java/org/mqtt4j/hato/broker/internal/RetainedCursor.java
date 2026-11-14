@@ -23,8 +23,14 @@ import static java.util.Objects.requireNonNull;
 // The cursor holds the messages themselves, which the store may replace or drop meanwhile, so
 // what waits here is memory of its own. It lets go of each message as that goes out or is
 // dropped, and the session takes room in the broker's memory for those that still wait once it
-// has sent what it could: for the first ones, in the order they go out.
+// has sent what it could: for the first ones, in the order they go out. Before that, the session
+// takes room for what the cursor holds besides the messages, which stays as large as it was
+// made until the cursor leaves the session: a message that has gone leaves its place in the
+// array behind.
 final class RetainedCursor implements Pending {
+
+    // A cursor itself, and its place among its session's cursors.
+    private static final int CURSOR_BYTES = 104;
 
     final TopicFilter filter;
 
@@ -55,8 +61,13 @@ final class RetainedCursor implements Pending {
     // Whether QoS 0 deliveries are left out, because the connection they belong to has ended.
     private boolean acknowledgedOnly;
 
-    // Whether the session has taken room in the broker's memory for the messages that are
-    // left, which it does once the cursor waits. The session's, under its inbox.
+    // What the cursor holds on the heap besides the retained messages, as the broker's memory
+    // for deliveries counts it while the cursor waits (see sizeOf).
+    final long ownBytes;
+
+    // Whether the cursor has room in the broker's memory for what it holds itself, which the
+    // session takes for it once it waits, before it takes room for the messages that are
+    // left, and gives back as the cursor leaves the session. The session's, under its inbox.
     boolean hasRoom;
 
     // The delivery of the retained message at `next`, made when the session first looks at it
@@ -77,6 +88,36 @@ final class RetainedCursor implements Pending {
         this.version = version;
         this.order = order;
         remaining = this.matched.length;
+        long delivery = MemoryBudget.DELIVERY_BYTES;
+        for (RetainedMessages.Message message : matched) {
+            delivery = Math.max(
+                    delivery,
+                    Delivery.ownSize(message.publication(), identifiers, version)
+            );
+        }
+        ownBytes = sizeOf(filter, identifiers.size(), this.matched.length, delivery);
+    }
+
+    // What a cursor for `messages` retained messages holds on the heap besides those messages:
+    // itself; its array, by the length that it was made with; the filter of its SUBSCRIBE,
+    // which no later subscription to the same filter shares; its `identifiers` Subscription
+    // Identifiers; and the delivery of its next message, which it makes when the session first
+    // looks at that message and keeps until the message goes. `delivery` is what the largest
+    // delivery of one of its messages holds beside its publication, so the count is not below
+    // what the cursor holds whichever message is next. Like the size of a publication, it errs
+    // towards counting more than is held.
+    static long sizeOf(TopicFilter filter, int identifiers, int messages, long delivery) {
+        long size = CURSOR_BYTES
+                + PublicationMemory.ARRAY_BYTES
+                + (long) PublicationMemory.REFERENCE_BYTES * messages
+                + PublicationMemory.OBJECT_BYTES
+                + PublicationMemory.sizeOf(filter.pattern())
+                + delivery;
+        if (identifiers > 0) {
+            // The list, and a number for each identifier.
+            size += PublicationMemory.OBJECT_BYTES * (1L + identifiers);
+        }
+        return size;
     }
 
     // Whether a retained message is left.

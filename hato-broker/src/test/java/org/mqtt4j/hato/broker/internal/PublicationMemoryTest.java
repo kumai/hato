@@ -13,11 +13,13 @@ import org.mqtt4j.hato.broker.internal.common.protocol.PropertyId;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
+import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/// What the broker counts a publication and a delivery of it for where it bounds memory: what
-/// they hold on the heap, which the bytes of the packet do not tell.
+/// What the broker counts a publication, a delivery of it, and the cursor of a subscription's
+/// retained messages for where it bounds memory: what they hold on the heap, which the bytes
+/// of the packet do not tell.
 class PublicationMemoryTest {
 
     @Test
@@ -124,6 +126,94 @@ class PublicationMemoryTest {
         assertThat(shared.ownBytes).isEqualTo(MemoryBudget.DELIVERY_BYTES);
         assertThat(identified.ownBytes - shared.ownBytes).isGreaterThanOrEqualTo(1001 * 4);
         assertThat(identified.memoryBytes).isEqualTo(memory.bytes() + identified.ownBytes);
+    }
+
+    @Test
+    void a_cursor_counts_for_its_array_by_the_messages_that_it_was_made_for() {
+        // Arrange
+        var filter = new TopicFilter("kept/#");
+
+        // Act
+        long none = RetainedCursor.sizeOf(filter, 0, 0, MemoryBudget.DELIVERY_BYTES);
+        long many = RetainedCursor.sizeOf(filter, 0, 1000, MemoryBudget.DELIVERY_BYTES);
+
+        // Assert: a reference to each message, which takes eight bytes on a JVM that does not
+        // compress references. The array stays as long as it was made, so the count does not
+        // look at how many messages are left.
+        assertThat(many - none).isEqualTo(1000 * 8);
+    }
+
+    @Test
+    void a_cursor_counts_for_what_it_holds_besides_its_array() {
+        // Arrange
+        var filter = new TopicFilter("f");
+        long delivery = MemoryBudget.DELIVERY_BYTES;
+
+        // Act
+        long plain = RetainedCursor.sizeOf(filter, 0, 1, delivery);
+        long lengthy = RetainedCursor.sizeOf(new TopicFilter("f".repeat(1001)), 0, 1, delivery);
+        long identified = RetainedCursor.sizeOf(filter, 1, 1, delivery);
+        long heavier = RetainedCursor.sizeOf(filter, 0, 1, delivery + 1000);
+
+        // Assert: itself, which is 96 bytes without compressed references, and the delivery
+        // that it makes for its next message; the characters of its filter, a byte each at
+        // the least; a list and a number for its identifier, 16 bytes each at the least; and
+        // whatever the largest delivery of one of its messages holds.
+        assertThat(plain).isGreaterThanOrEqualTo(96 + delivery);
+        assertThat(lengthy - plain).isGreaterThanOrEqualTo(1000);
+        assertThat(identified - plain).isGreaterThanOrEqualTo(32);
+        assertThat(heavier - plain).isEqualTo(1000);
+    }
+
+    @Test
+    void a_cursor_counts_for_the_largest_delivery_that_it_makes() {
+        // Arrange: two retained messages, of which the second has a thousand properties. A
+        // delivery that adds a Subscription Identifier holds a sequence of its own with a
+        // reference to each of them.
+        var entries = new ArrayList<Property>();
+        for (int i = 0; i < 1000; i++) {
+            entries.add(new Property.UserProperty("a", "b"));
+        }
+        Packet.Publish plain = publication("kept/1", 8, Properties.EMPTY);
+        Packet.Publish heavy = publication("kept/2", 8, new Properties(entries));
+        List<RetainedMessages.Message> matched = List.of(retained(plain), retained(heavy));
+        var subscription = new Packet.Subscription(
+                new TopicFilter("kept/#"),
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                0
+        );
+
+        // Act: cursors of an MQTT 5.0 subscription without and with an identifier.
+        var shared = new RetainedCursor(subscription, List.of(), matched, MqttVersion.V5, 0);
+        var identified = new RetainedCursor(subscription, List.of(7), matched, MqttVersion.V5, 0);
+
+        // Assert: the second counts for the delivery of the message with the properties,
+        // whichever of the two is next.
+        long delivery = Delivery.ownSize(heavy, List.of(7), MqttVersion.V5);
+        assertThat(delivery - MemoryBudget.DELIVERY_BYTES).isGreaterThanOrEqualTo(1001 * 4);
+        assertThat(shared.ownBytes).isEqualTo(RetainedCursor.sizeOf(
+                subscription.filter(),
+                0,
+                2,
+                MemoryBudget.DELIVERY_BYTES
+        ));
+        assertThat(identified.ownBytes).isEqualTo(RetainedCursor.sizeOf(
+                subscription.filter(),
+                1,
+                2,
+                delivery
+        ));
+    }
+
+    private static RetainedMessages.Message retained(Packet.Publish publication) {
+        return new RetainedMessages.Message(
+                publication,
+                0,
+                Delivery.lifetimeOf(publication),
+                new PublicationMemory(publication)
+        );
     }
 
     private static Packet.Publish publication(String topic, int payload, Properties properties) {

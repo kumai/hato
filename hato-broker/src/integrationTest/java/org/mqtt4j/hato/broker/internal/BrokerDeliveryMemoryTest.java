@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
+import static org.mqtt4j.hato.broker.internal.RawSession.cursorSize;
 import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
@@ -118,29 +119,25 @@ class BrokerDeliveryMemoryTest {
     @Test
     void a_delivery_of_a_publication_that_has_its_room_needs_room_for_itself_alone()
             throws Exception {
-        // Arrange: two sessions that wait while their clients are away, each with three small
-        // deliveries that it shares with nobody. The memory has room for them, for a large
+        // Arrange: two sessions that wait while their clients are away, with deliveries of
+        // three small publications each. The memory has room for them, for a large
         // publication with one delivery, and for a little less than a second delivery of it.
         String large = "x".repeat(4096);
-        long room = 6 * roomOf("own/a", "0001")
-                + roomOf("both", large)
+        long room = 3 * (roomOf("kept", "0001") + MemoryBudget.DELIVERY_BYTES)
+                + roomOf("kept", large)
                 + MemoryBudget.DELIVERY_BYTES - 1;
         try (BrokerServer sut = broker(room);
                 RawSession publisher = connected(sut.port(), "publisher")) {
-            for (String client : List.of("a", "b")) {
-                try (RawSession away = connected(sut.port(), client, false, false)) {
-                    away.subscribe("own/" + client, AT_LEAST_ONCE);
-                    away.subscribe("both", AT_LEAST_ONCE);
-                    away.disconnect();
-                }
-                for (String payload : List.of("0001", "0002", "0003")) {
-                    publisher.publish("own/" + client, payload, AT_LEAST_ONCE, 7);
-                }
+            leaveSubscribed(sut, "a", "kept", AT_LEAST_ONCE);
+            leaveSubscribed(sut, "b", "kept", AT_LEAST_ONCE);
+            for (String payload : List.of("0001", "0002", "0003")) {
+                publisher.publish("kept", payload, AT_LEAST_ONCE, 7);
             }
 
             // Act: the session that the large publication reaches first takes its room. The
-            // other one needs room for its delivery alone, which its oldest delivery makes.
-            publisher.publish("both", large, AT_LEAST_ONCE, 7);
+            // other one needs room for its delivery alone. Its oldest delivery gives that
+            // much back, though the publication that it shares with the first session stays.
+            publisher.publish("kept", large, AT_LEAST_ONCE, 7);
 
             // Assert: both sessions keep the large one, and one of them lost its oldest.
             await().untilAsserted(() -> assertThat(reported).hasSize(1));
@@ -152,6 +149,43 @@ class BrokerDeliveryMemoryTest {
                     assertThat(received(back, kept.size())).isEqualTo(kept);
                     back.ping();
                 }
+            }
+        }
+    }
+
+    @Test
+    void a_new_delivery_does_not_push_out_older_ones_that_count_for_more_than_it_does()
+            throws Exception {
+        // Arrange: two sessions that wait while their clients are away. Both hold two large
+        // publications, and the second one a third of its own behind them, which fills the
+        // memory.
+        long shared = roomOf("shared", "1" + "x".repeat(4095)) + MemoryBudget.DELIVERY_BYTES;
+        long room = 2 * shared + roomOf("own", "3" + "x".repeat(4095));
+        try (BrokerServer sut = broker(room);
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            leaveSubscribed(sut, "a", "shared", AT_LEAST_ONCE);
+            try (RawSession away = connected(sut.port(), "b", false, false)) {
+                away.subscribe("shared", AT_LEAST_ONCE);
+                away.subscribe("own", AT_LEAST_ONCE);
+                away.disconnect();
+            }
+            publisher.publish("shared", "1" + "x".repeat(4095), AT_LEAST_ONCE, 7);
+            publisher.publish("shared", "2" + "x".repeat(4095), AT_LEAST_ONCE, 7);
+            publisher.publish("own", "3" + "x".repeat(4095), AT_LEAST_ONCE, 7);
+
+            // Act: one more for the second session alone. Its two oldest deliveries would give
+            // little back, because the first session holds their publications too, and only
+            // the third would make the room.
+            publisher.publish("own", "4" + "x".repeat(4095), AT_LEAST_ONCE, 7);
+
+            // Assert: the session does not give up all three for one. It goes without the
+            // new one, and keeps what waited.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("b"));
+            try (RawSession back = connected(sut.port(), "b", false, true)) {
+                assertThat(received(back, 3))
+                        .extracting(payload -> payload.substring(0, 1))
+                        .containsExactly("1", "2", "3");
+                back.ping();
             }
         }
     }
@@ -392,8 +426,9 @@ class BrokerDeliveryMemoryTest {
 
     @Test
     void retained_messages_that_wait_for_a_session_take_room() throws Exception {
-        // Arrange: three retained messages, memory for one of them, and a window of one.
-        long room = PublicationMemory.sizeOf(retained("kept/1", "0001"));
+        // Arrange: three retained messages, memory for one of them with the cursor of their
+        // subscription, and a window of one.
+        long room = cursorSize("kept/#", 3) + PublicationMemory.sizeOf(retained("kept/1", "0001"));
         try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "subscriber")) {
@@ -416,9 +451,11 @@ class BrokerDeliveryMemoryTest {
     @Test
     void a_retained_message_that_the_waiting_ones_could_not_make_room_for_leaves_them_alone()
             throws Exception {
-        // Arrange: memory for two small retained messages, a window of one, and a fourth
-        // retained message that is larger than the two together.
-        long room = 2 * PublicationMemory.sizeOf(retained("kept/1", "0001"));
+        // Arrange: memory for two small retained messages with the cursor of their
+        // subscription, a window of one, and a fourth retained message that is larger than
+        // all of that together.
+        long room = cursorSize("kept/#", 4)
+                + 2 * PublicationMemory.sizeOf(retained("kept/1", "0001"));
         try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "subscriber")) {
@@ -441,8 +478,11 @@ class BrokerDeliveryMemoryTest {
     void retained_messages_that_wait_more_than_once_stay_when_dropping_them_makes_no_room()
             throws Exception {
         // Arrange: a client whose window of one holds a delivery that it does not answer, and
-        // two retained messages, of which the memory has room for the smaller one alone.
-        long room = PublicationMemory.sizeOf(retained("kept/1", "x".repeat(4096))) + 100;
+        // two retained messages. The memory has room for the smaller one and for the cursors
+        // of three subscriptions to both, but not for the larger one.
+        long room = PublicationMemory.sizeOf(retained("kept/1", "x".repeat(4096)))
+                + 3 * cursorSize("kept/#", 2)
+                + 100;
         try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "subscriber")) {
@@ -469,10 +509,111 @@ class BrokerDeliveryMemoryTest {
     }
 
     @Test
+    void a_new_retained_message_does_not_push_out_waiting_ones_that_count_for_more_than_it_does()
+            throws Exception {
+        // Arrange: two large retained messages wait for a client whose window of one holds a
+        // delivery that it does not answer. A session that is away holds a delivery of the
+        // first of them, so that one would give no room back. The memory has room for all of
+        // that and for the cursor of one more subscription, and no more.
+        String large = "x".repeat(4096);
+        long room = roomOf("kept/x", "1" + large)
+                + cursorSize("kept/#", 2)
+                + PublicationMemory.sizeOf(retained("kept/y", "2" + large))
+                + cursorSize("more/#", 1);
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            publisher.publish(retained("held/1", "held"));
+            subscriber.subscribe("held/#", AT_LEAST_ONCE);
+            Packet.Publish held = subscriber.expect(Packet.Publish.class);
+            leaveSubscribed(sut, "away", "kept/x", AT_LEAST_ONCE);
+            publisher.publish(retained("kept/x", "1" + large));
+            publisher.publish(retained("kept/y", "2" + large));
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+            publisher.publish(retained("more/z", "3" + large));
+
+            // Act: a subscription to a third message of the same size, which finds no room.
+            // Only the second of the two that wait would make it.
+            subscriber.subscribe("more/#", AT_LEAST_ONCE);
+
+            // Assert: the client does not lose both for it. It goes without the new one, and
+            // gets what waited.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
+            subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
+            assertThat(received(subscriber, 2))
+                    .extracting(payload -> payload.substring(0, 1))
+                    .containsExactly("1", "2");
+            subscriber.ping();
+        }
+    }
+
+    @Test
+    void a_later_subscription_makes_room_at_the_cost_of_the_retained_message_of_an_earlier_one()
+            throws Exception {
+        // Arrange: a client whose window of one holds a delivery that it does not answer, and
+        // one retained message that waits for it. The memory has room for that message and
+        // the cursor of its subscription, and no more.
+        long room = cursorSize("a/#", 1) + PublicationMemory.sizeOf(retained("a/1", "0001"));
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            publisher.publish(retained("held/1", "held"));
+            subscriber.subscribe("held/#", AT_LEAST_ONCE);
+            Packet.Publish held = subscriber.expect(Packet.Publish.class);
+            publisher.publish(retained("a/1", "0001"));
+            publisher.publish(retained("b/1", "0002"));
+            subscriber.subscribe("a/#", AT_LEAST_ONCE);
+
+            // Act: a second subscription with a retained message of the same size. Its cursor
+            // finds no room for itself, and the message that waits gives too little back
+            // alone: its cursor, which then holds nothing, gives the rest.
+            subscriber.subscribe("b/#", AT_LEAST_ONCE);
+
+            // Assert: the client lost the older message and gets the newer one.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
+            subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
+            assertThat(received(subscriber, 1)).containsExactly("0002");
+            subscriber.ping();
+        }
+    }
+
+    @Test
+    void a_subscription_whose_retained_messages_found_no_room_leaves_no_room_taken()
+            throws Exception {
+        // Arrange: a client whose window of one holds a delivery that it does not answer, and
+        // a large retained message. The memory has room for the cursor of a subscription to
+        // it and a little more, but not for the message.
+        long room = cursorSize("big/#", 1) + 100;
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            publisher.publish(retained("held/1", "held"));
+            subscriber.subscribe("held/#", AT_LEAST_ONCE);
+            subscriber.expect(Packet.Publish.class);
+            publisher.publish(retained("big/1", "x".repeat(4096)));
+            leaveSubscribed(sut, "second", "next/1", AT_LEAST_ONCE);
+
+            // Act: the subscription's only retained message cannot wait, which leaves its
+            // cursor with nothing to hold.
+            subscriber.subscribe("big/#", AT_LEAST_ONCE);
+
+            // Assert: a delivery that waits for another session finds all of the room.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
+            String filling = fillingPayload("next/1", room);
+            publisher.publish("next/1", filling, AT_LEAST_ONCE, 7);
+            try (RawSession back = connected(sut.port(), "second", false, true)) {
+                assertThat(received(back, 1)).containsExactly(filling);
+            }
+            assertThat(reported).containsExactly("subscriber");
+        }
+    }
+
+    @Test
     void retained_messages_give_their_room_back_as_their_subscription_ends() throws Exception {
-        // Arrange: memory for one delivery, and a retained message that waits with room for a
-        // client behind another that holds its window.
-        try (BrokerServer sut = settings(roomOf("kept/1", "0001")).maxInflight(1).start(loopback());
+        // Arrange: memory for no more than a retained message that waits with room for a
+        // client behind another that holds its window, and the cursor of its subscription.
+        long room = waitingRetainedRoom();
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "subscriber")) {
             leaveRetainedWaiting(publisher, subscriber);
@@ -482,10 +623,11 @@ class BrokerDeliveryMemoryTest {
             subscriber.send(new Packet.Unsubscribe(2, List.of(new TopicFilter("kept/#")), EMPTY));
             subscriber.expect(Packet.UnsubAck.class);
 
-            // Assert: a delivery that waits for another session finds the room.
-            publisher.publish("next/1", "0003", AT_LEAST_ONCE, 7);
+            // Assert: a delivery that waits for another session finds all of the room.
+            String filling = fillingPayload("next/1", room);
+            publisher.publish("next/1", filling, AT_LEAST_ONCE, 7);
             try (RawSession back = connected(sut.port(), "second", false, true)) {
-                assertThat(received(back, 1)).containsExactly("0003");
+                assertThat(received(back, 1)).containsExactly(filling);
             }
             assertThat(reported).isEmpty();
         }
@@ -493,9 +635,10 @@ class BrokerDeliveryMemoryTest {
 
     @Test
     void retained_messages_give_their_room_back_as_their_session_ends() throws Exception {
-        // Arrange: memory for one delivery, and a retained message that waits with room for a
-        // client behind another that holds its window.
-        try (BrokerServer sut = settings(roomOf("kept/1", "0001")).maxInflight(1).start(loopback());
+        // Arrange: memory for no more than a retained message that waits with room for a
+        // client behind another that holds its window, and the cursor of its subscription.
+        long room = waitingRetainedRoom();
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher")) {
             try (RawSession subscriber = connected(sut.port(), "subscriber")) {
                 leaveRetainedWaiting(publisher, subscriber);
@@ -505,12 +648,76 @@ class BrokerDeliveryMemoryTest {
                 subscriber.disconnect();
             }
 
-            // Assert: a delivery that waits for another session finds the room.
-            publisher.publish("next/1", "0003", AT_LEAST_ONCE, 7);
+            // Assert: a delivery that waits for another session finds all of the room.
+            String filling = fillingPayload("next/1", room);
+            publisher.publish("next/1", filling, AT_LEAST_ONCE, 7);
             try (RawSession back = connected(sut.port(), "second", false, true)) {
-                assertThat(received(back, 1)).containsExactly("0003");
+                assertThat(received(back, 1)).containsExactly(filling);
             }
             assertThat(reported).isEmpty();
+        }
+    }
+
+    @Test
+    void a_subscription_goes_on_without_the_retained_messages_that_found_no_room_to_wait()
+            throws Exception {
+        // Arrange: three retained messages and a window of one. The memory has room for the
+        // two that come to wait, but is a byte short of what the cursor that holds them
+        // needs for itself.
+        long room = cursorSize("kept/#", 3) - 1;
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            for (int number = 1; number <= 3; number++) {
+                publisher.publish(retained("kept/" + number, "000" + number));
+            }
+
+            // Act
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+
+            // Assert: the client gets the one that its window took and goes without the two
+            // others, and its subscription goes on.
+            await().untilAsserted(
+                    () -> assertThat(reported).containsExactly("subscriber", "subscriber")
+            );
+            assertThat(received(subscriber, 1)).containsExactly("0001");
+            publisher.publish("kept/1", "live", AT_LEAST_ONCE, 7);
+            assertThat(received(subscriber, 1)).containsExactly("live");
+            subscriber.ping();
+        }
+    }
+
+    @Test
+    void a_subscription_made_again_takes_the_room_of_the_retained_messages_that_it_pushes_out()
+            throws Exception {
+        // Arrange: a broker that retains one message, which is as many as may wait for a
+        // session, and a client whose window of one holds a delivery that it does not answer
+        // while a second one waits. The memory has room for that delivery and for one
+        // waiting retained message with its cursor.
+        long room = roomOf("live", "0002")
+                + cursorSize("kept/#", 1)
+                + PublicationMemory.sizeOf(retained("kept/1", "kept"));
+        BrokerServer.Builder limited = settings(room).maxInflight(1).maxRetained(1);
+        try (BrokerServer sut = limited.start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            subscriber.subscribe("live", AT_LEAST_ONCE);
+            publisher.publish("live", "0001", AT_LEAST_ONCE, 7);
+            Packet.Publish held = subscriber.expect(Packet.Publish.class);
+            publisher.publish("live", "0002", AT_LEAST_ONCE, 7);
+            publisher.publish(retained("kept/1", "kept"));
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+
+            // Act: the same subscription again. Its retained message pushes out the one that
+            // waited for the first, whose cursor then holds nothing.
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+
+            // Assert: the client lost the copy that was pushed out and no other, so the second
+            // cursor found the room that the first one had, and its message arrives.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
+            subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
+            assertThat(received(subscriber, 2)).containsExactly("0002", "kept");
+            subscriber.ping();
         }
     }
 
@@ -523,6 +730,17 @@ class BrokerDeliveryMemoryTest {
         publisher.publish(retained("kept/2", "0002"));
         subscriber.subscribe("kept/#", AT_LEAST_ONCE);
         subscriber.expect(Packet.Publish.class);
+    }
+
+    /// The room that leaveRetainedWaiting() leaves taken: that of the retained message that
+    /// waits, and that of the cursor of the subscription to the two.
+    private static long waitingRetainedRoom() {
+        return cursorSize("kept/#", 2) + PublicationMemory.sizeOf(retained("kept/2", "0002"));
+    }
+
+    /// A payload with which one delivery of a publication to `topic` takes exactly `room`.
+    private static String fillingPayload(String topic, long room) {
+        return "x".repeat((int) (room - roomOf(topic, "")));
     }
 
     /// A retained QoS 1 publication to `topic` with `payload`.

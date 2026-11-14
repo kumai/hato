@@ -97,14 +97,27 @@ final class Delivery implements Outgoing, Pending {
                 properties,
                 publication.payload().length
         );
-        long own = MemoryBudget.DELIVERY_BYTES;
-        if (properties != publication.properties() && !properties.isEmpty()) {
-            // The sequence is the delivery's own: the publication's properties, which it
-            // shares, and the identifiers, which are its own too.
-            own += PublicationMemory.sequenceSize(properties.entries().size(), identifiers.size());
-        }
-        ownBytes = own;
+        ownBytes = ownSize(publication, identifiers, version);
         memoryBytes = memory.bytes() + ownBytes;
+    }
+
+    // What a delivery of `publication` to a receiver of `version` that carries `identifiers`
+    // holds on the heap beside the publication. Only an MQTT 5.0 delivery with Subscription
+    // Identifiers has a sequence of properties of its own: the publication's properties, which
+    // it shares, and the identifiers, which are its own too.
+    static long ownSize(
+            Packet.Publish publication,
+            List<Integer> identifiers,
+            MqttVersion version
+    ) {
+        long own = MemoryBudget.DELIVERY_BYTES;
+        if (version == MqttVersion.V5 && !identifiers.isEmpty()) {
+            own += PublicationMemory.sequenceSize(
+                    publication.properties().entries().size() + identifiers.size(),
+                    identifiers.size()
+            );
+        }
+        return own;
     }
 
     private static Properties withIdentifiers(Properties properties, List<Integer> identifiers) {

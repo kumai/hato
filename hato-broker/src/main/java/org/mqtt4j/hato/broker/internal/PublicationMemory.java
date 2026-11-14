@@ -22,13 +22,13 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Property;
 // towards counting more than is held.
 final class PublicationMemory {
 
-    private static final int REFERENCE_BYTES = 8;
+    static final int REFERENCE_BYTES = 8;
 
     // A small object: its header and up to two references, or a number.
-    private static final int OBJECT_BYTES = 32;
+    static final int OBJECT_BYTES = 32;
 
     // An array, before its elements.
-    private static final int ARRAY_BYTES = 24;
+    static final int ARRAY_BYTES = 24;
 
     // A string and its array, before its characters.
     private static final int STRING_BYTES = OBJECT_BYTES + ARRAY_BYTES;
@@ -85,7 +85,8 @@ final class PublicationMemory {
         };
     }
 
-    private static long sizeOf(String text) {
+    // What a string holds on the heap, with two bytes for each of its characters.
+    static long sizeOf(String text) {
         return STRING_BYTES + 2L * text.length();
     }
 
