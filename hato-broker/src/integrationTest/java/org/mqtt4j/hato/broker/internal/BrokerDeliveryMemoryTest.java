@@ -10,6 +10,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
 import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
@@ -1092,6 +1094,44 @@ class BrokerDeliveryMemoryTest {
             subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
             assertThat(received(subscriber, 1)).containsExactly(large);
             subscriber.ping();
+        }
+    }
+
+    @ParameterizedTest(name = "with a limit on their {0}")
+    @ValueSource(strings = {"number", "bytes"})
+    void a_subscription_without_room_leaves_an_earlier_one_when_no_more_may_wait(String limit)
+            throws Exception {
+        // Arrange: a client whose window of one holds a delivery that it does not answer, and
+        // a retained message that waits for it with the cursor of a subscription to every
+        // topic, which fills the memory. No second retained message may wait for the
+        // session: the limit on their number, or the one on what they hold, allows one.
+        long message = PublicationMemory.sizeOf(retained("a/1", "0001"));
+        BrokerServer.Builder roomy = settings(cursorSize("#", 1) + message).maxInflight(1);
+        BrokerServer.Builder limited = limit.equals("number")
+                ? roomy.maxRetained(1)
+                : roomy.maxRetainedBytes(message + 1);
+        try (BrokerServer sut = limited.start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            subscriber.subscribe("held", AT_LEAST_ONCE);
+            publisher.publish("held", "held", AT_LEAST_ONCE, 7);
+            Packet.Publish held = subscriber.expect(Packet.Publish.class);
+            publisher.publish(retained("a/1", "0001"));
+            subscriber.subscribe("#", AT_LEAST_ONCE);
+            subscriber.ping();
+
+            // Act: a second subscription to the same message. Its copy is one more than may
+            // wait, and its cursor needs a little more room than the first one would give
+            // back, so the memory has none for it.
+            subscriber.subscribe("a/#", AT_LEAST_ONCE);
+
+            // Assert: the client goes without the second copy alone. The first one did not
+            // go for a copy that then found no room.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
+            subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
+            assertThat(received(subscriber, 1)).containsExactly("0001");
+            subscriber.ping();
+            assertThat(reported).containsExactly("subscriber");
         }
     }
 

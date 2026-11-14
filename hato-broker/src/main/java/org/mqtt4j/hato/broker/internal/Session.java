@@ -989,6 +989,11 @@ final class Session {
                 subscriptions = changed;
             }
         }
+        // Outside the topic lock, which the retained messages and subscriptions of every
+        // client wait for.
+        synchronized (this) {
+            limitRetained();
+        }
         return true;
     }
 
@@ -1034,7 +1039,9 @@ final class Session {
     // which no delivery queue limit drops, so the subscription receives all of them, however
     // many it matches. A cursor that still waits for the same filter stays: replacing the
     // subscription must lose none of its messages, while Retain Handling 0 sends the retained
-    // ones again [MQTT-3.8.4-3]. Called under the topic lock and the inbox.
+    // ones again [MQTT-3.8.4-3]. The session's limits on what its cursors hold apply right
+    // after, once the topic lock is free (see limitRetained). Called under the topic lock and
+    // the inbox.
     private void queueRetained(Subscribed subscribed, List<RetainedMessages.Message> matched) {
         if (matched.isEmpty()) {
             return;
@@ -1050,7 +1057,20 @@ final class Session {
         cursors.addLast(
                 new RetainedCursor(subscription, identifiers, matched, version, nextOrder++)
         );
-        dropOldestRetained();
+    }
+
+    // Sees to it that the session's cursors hold no more retained messages than may wait for
+    // it, once a subscription has queued its own. If they do, some go now, and which ones
+    // depends on whether the broker's memory has room for those that came. So the cursors
+    // that came take their room first, as they do when they still wait after the session has
+    // sent what it could (see takeRoomForRetained): a message that finds none goes alone. Only
+    // then do the oldest go until the room holds its limits again. In this order the session
+    // gives up no older message for one that the memory then refuses. Called under the inbox.
+    private void limitRetained() {
+        if (retainedRoom.overflows()) {
+            takeRoomForRetained();
+            dropOldestRetained();
+        }
     }
 
     // Drops the oldest retained messages that the cursors hold until their room holds its limits
