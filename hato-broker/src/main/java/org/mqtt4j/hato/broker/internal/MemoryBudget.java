@@ -11,8 +11,9 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 // session loses its connection while the delivery is unanswered in the window. It keeps the
 // room until it leaves the session: what it holds on the heap itself, and what its publication
 // holds, once for all the deliveries of that publication that have room (see
-// PublicationMemory). A session that finds no room drops deliveries as it does for its own
-// limits.
+// PublicationMemory). The retained messages that wait for a new subscription take room in the
+// same way, for as long as their cursor holds them. A session that finds no room drops what
+// waits for it as it does for its own limits.
 //
 // A delivery that goes straight out takes no room and costs nothing here. That is what keeps
 // the count off the path of a client that keeps up: counting every delivery from the moment
@@ -30,8 +31,7 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 // queue. Their own limits bound what they hold on the heap for each connection, so a client
 // that stays connected and neither answers nor reads holds up to those limits outside this
 // budget, and all the clients together as many times as much. Having a connection that falls
-// behind take room for them would close that. The retained messages that wait for a new
-// subscription take no room either, within the limits on retained messages for each session.
+// behind take room for them would close that.
 final class MemoryBudget {
 
     // What a delivery holds on the heap besides its publication and a sequence of properties

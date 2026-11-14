@@ -176,16 +176,20 @@ final class Session {
     private long nextOrder;
 
     // How many of the session's deliveries have room in the broker's memory for deliveries:
-    // those that have waited in its queues, and those that were unanswered in its window when
-    // it lost a connection. Each gives its room back as it leaves the session, so the number
-    // is zero once the session is cleared; if not, a delivery left without giving its room
-    // back.
+    // those that have waited in its queues, those that were unanswered in its window when it
+    // lost a connection, and the retained messages that have waited in its cursors. Each gives
+    // its room back as it leaves the session, so the number is zero once the session is
+    // cleared; if not, one of them left without giving its room back.
     private int withRoom;
 
     // The retained messages that the cursors still hold. Their room is as large as the retained
     // limits, so that one subscription can take everything that the broker retains, while the
     // cursors of a client that subscribes again and again without taking them never hold more.
     private final Room retainedRoom;
+
+    // What the retained messages in the cursors that have room in the broker's memory hold on
+    // the heap: what they could give back at most.
+    private long retainedWithRoom;
 
     // Whether the session has logged a dropped delivery at warning level yet.
     private boolean dropLogged;
@@ -957,7 +961,7 @@ final class Session {
         for (RetainedCursor cursor : cursors) {
             while (retainedRoom.overflows() && cursor.hasNext()) {
                 Qos qos = cursor.nextQos();
-                retainedRoom.remove(cursor.advance());
+                pass(cursor);
                 dropped(qos, "its retained messages wait beyond what the broker retains");
             }
         }
@@ -971,6 +975,84 @@ final class Session {
             if (cursor.filter.equals(filter)) {
                 queued.remove();
                 retainedRoom.remove(cursor.remainingCount(), cursor.remainingBytes());
+                cursor.eachWithRoom(this::giveRoom);
+            }
+        }
+    }
+
+    // Moves `cursor` past its next retained message, which goes out or is dropped: the message
+    // leaves the retained room, and gives back the room that it had in the broker's memory if
+    // it had waited. Called under the inbox, only while the cursor has a message left.
+    private void pass(RetainedCursor cursor) {
+        boolean hadRoom = cursor.nextHasRoom();
+        RetainedMessages.Message message = cursor.advance();
+        retainedRoom.remove(message.memory().bytes());
+        if (hadRoom) {
+            giveRoom(message);
+        }
+    }
+
+    // Gives the room of `message`, which a cursor held, in the broker's memory back. Called
+    // under the inbox.
+    private void giveRoom(RetainedMessages.Message message) {
+        withRoom--;
+        retainedWithRoom -= message.memory().bytes();
+        message.memory().release(routing.memory);
+    }
+
+    // Takes room in the broker's memory for the retained messages in the cursors that have
+    // none yet: those that still wait once the session has sent what it could. A cursor holds
+    // its messages whatever becomes of them in the store, so they are memory that waits for
+    // the session like its deliveries. Without room, the session's oldest waiting retained
+    // messages make room for a later one, as its deliveries do for one another; they stay if
+    // even all of them could not make enough, and the session then goes without that one
+    // alone. Called under the inbox.
+    private void takeRoomForRetained() {
+        // Few sessions ever have a cursor, and every drain comes by here.
+        if (cursors.isEmpty()) {
+            return;
+        }
+        for (RetainedCursor cursor : cursors) {
+            RetainedMessages.Message message;
+            while ((message = cursor.withoutRoom()) != null) {
+                if (makeRoom(message)) {
+                    cursor.roomTaken();
+                } else {
+                    Qos qos = cursor.qosOf(message);
+                    cursor.dropWithoutRoom();
+                    retainedRoom.remove(message.memory().bytes());
+                    dropped(qos, MEMORY_USED_UP);
+                }
+            }
+        }
+    }
+
+    // Takes room for `message`, which waits in a cursor, at the cost of the oldest retained
+    // messages that wait with room if need be. Returns false if the session goes without
+    // `message`.
+    private boolean makeRoom(RetainedMessages.Message message) {
+        long needed = message.memory().bytes();
+        while (!message.memory().hold(routing.memory)) {
+            if (retainedWithRoom == 0 || !routing.memory.mightFit(needed, retainedWithRoom)) {
+                return false;
+            }
+            dropOldestRetainedWithRoom();
+        }
+        withRoom++;
+        retainedWithRoom += needed;
+        return true;
+    }
+
+    // Drops the oldest retained message that waits with room in the broker's memory: the next
+    // one of the first cursor that has such a one, because the cursors take their room in the
+    // order in which their messages go out. Called only while one has room.
+    private void dropOldestRetainedWithRoom() {
+        for (RetainedCursor cursor : cursors) {
+            if (cursor.hasNext() && cursor.nextHasRoom()) {
+                Qos qos = cursor.nextQos();
+                pass(cursor);
+                dropped(qos, MEMORY_USED_UP);
+                return;
             }
         }
     }
@@ -1092,6 +1174,7 @@ final class Session {
         synchronized (this) {
             trim(atMostOnceQueue);
             trim(acknowledgedQueue);
+            takeRoomForRetained();
         }
     }
 
@@ -1190,10 +1273,11 @@ final class Session {
                     continue;
                 }
                 // A delivery that had waited keeps its room in the broker's memory as it moves
-                // from the queue into the window.
+                // from the queue into the window. A retained message gives the room that it
+                // had in its cursor back: its delivery is new to the window.
                 switch (head) {
                     case Delivery queued -> queueOf(queued).removeOldest();
-                    case RetainedCursor cursor -> retainedRoom.remove(cursor.advance());
+                    case RetainedCursor cursor -> pass(cursor);
                 }
                 inflight.put(delivery.packetId, delivery);
                 inflightBytes += delivery.memoryBytes;
@@ -1215,7 +1299,7 @@ final class Session {
                     giveRoom(queued);
                 }
             }
-            case RetainedCursor cursor -> retainedRoom.remove(cursor.advance());
+            case RetainedCursor cursor -> pass(cursor);
         }
     }
 
@@ -1355,6 +1439,7 @@ final class Session {
                     }
                 }
                 trim(acknowledgedQueue);
+                takeRoomForRetained();
             }
         }
         deferred.clear();
@@ -1391,6 +1476,9 @@ final class Session {
             subscriptions = Map.of();
             empty(atMostOnceQueue);
             empty(acknowledgedQueue);
+            for (RetainedCursor cursor : cursors) {
+                cursor.eachWithRoom(this::giveRoom);
+            }
             cursors.clear();
             retainedRoom.clear();
             connection = null;

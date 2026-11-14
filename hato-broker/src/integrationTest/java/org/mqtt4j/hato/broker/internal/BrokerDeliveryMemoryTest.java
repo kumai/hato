@@ -15,6 +15,7 @@ import org.mqtt4j.hato.broker.internal.common.protocol.Property;
 import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
+import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -315,6 +316,123 @@ class BrokerDeliveryMemoryTest {
             await().untilAsserted(() -> assertThat(reported).hasSizeGreaterThan(5));
             assertThat(reported).containsOnly("away");
         }
+    }
+
+    @Test
+    void retained_messages_that_wait_for_a_session_take_room() throws Exception {
+        // Arrange: three retained messages, memory for one of them, and a window of one.
+        long room = PublicationMemory.sizeOf(retained("kept/1", "0001"));
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            for (int number = 1; number <= 3; number++) {
+                publisher.publish(retained("kept/" + number, "000" + number));
+            }
+
+            // Act: the subscription matches all three. The first takes the window, which needs
+            // no room while the client is connected. The second waits and takes the room, and
+            // then makes room for the third.
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+
+            // Assert: the client gets the first and the newest, and nothing else.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
+            assertThat(received(subscriber, 2)).containsExactly("0001", "0003");
+            subscriber.ping();
+        }
+    }
+
+    @Test
+    void a_retained_message_that_the_waiting_ones_could_not_make_room_for_leaves_them_alone()
+            throws Exception {
+        // Arrange: memory for two small retained messages, a window of one, and a fourth
+        // retained message that is larger than the two together.
+        long room = 2 * PublicationMemory.sizeOf(retained("kept/1", "0001"));
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            for (int number = 1; number <= 3; number++) {
+                publisher.publish(retained("kept/" + number, "000" + number));
+            }
+            publisher.publish(retained("kept/4", "x".repeat(4096)));
+
+            // Act: the first takes the window, and the second and the third wait with room.
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+
+            // Assert: the session goes without the large one, and keeps what waited.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
+            assertThat(received(subscriber, 3)).containsExactly("0001", "0002", "0003");
+            subscriber.ping();
+        }
+    }
+
+    @Test
+    void retained_messages_give_their_room_back_as_their_subscription_ends() throws Exception {
+        // Arrange: memory for one delivery, and a retained message that waits with room for a
+        // client behind another that holds its window.
+        try (BrokerServer sut = settings(roomOf("kept/1", "0001")).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            leaveRetainedWaiting(publisher, subscriber);
+            leaveSubscribed(sut, "second", "next/1", AT_LEAST_ONCE);
+
+            // Act
+            subscriber.send(new Packet.Unsubscribe(2, List.of(new TopicFilter("kept/#")), EMPTY));
+            subscriber.expect(Packet.UnsubAck.class);
+
+            // Assert: a delivery that waits for another session finds the room.
+            publisher.publish("next/1", "0003", AT_LEAST_ONCE, 7);
+            try (RawSession back = connected(sut.port(), "second", false, true)) {
+                assertThat(received(back, 1)).containsExactly("0003");
+            }
+            assertThat(reported).isEmpty();
+        }
+    }
+
+    @Test
+    void retained_messages_give_their_room_back_as_their_session_ends() throws Exception {
+        // Arrange: memory for one delivery, and a retained message that waits with room for a
+        // client behind another that holds its window.
+        try (BrokerServer sut = settings(roomOf("kept/1", "0001")).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            try (RawSession subscriber = connected(sut.port(), "subscriber")) {
+                leaveRetainedWaiting(publisher, subscriber);
+                leaveSubscribed(sut, "second", "next/1", AT_LEAST_ONCE);
+
+                // Act: the client's session ends with its connection.
+                subscriber.disconnect();
+            }
+
+            // Assert: a delivery that waits for another session finds the room.
+            publisher.publish("next/1", "0003", AT_LEAST_ONCE, 7);
+            try (RawSession back = connected(sut.port(), "second", false, true)) {
+                assertThat(received(back, 1)).containsExactly("0003");
+            }
+            assertThat(reported).isEmpty();
+        }
+    }
+
+    /// Has `publisher` retain two messages and `subscriber` subscribe to them: the first takes
+    /// the subscriber's window of one and stays unanswered, and the second waits behind it,
+    /// which it does by the time the broker handles the subscriber's next packet.
+    private static void leaveRetainedWaiting(RawSession publisher, RawSession subscriber)
+            throws Exception {
+        publisher.publish(retained("kept/1", "0001"));
+        publisher.publish(retained("kept/2", "0002"));
+        subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+        subscriber.expect(Packet.Publish.class);
+    }
+
+    /// A retained QoS 1 publication to `topic` with `payload`.
+    private static Packet.Publish retained(String topic, String payload) {
+        return new Packet.Publish(
+                new Topic(topic),
+                payload.getBytes(UTF_8),
+                AT_LEAST_ONCE,
+                true,
+                false,
+                7,
+                EMPTY
+        );
     }
 
     /// A QoS 1 publication to `topic` that carries `count` User Properties of two strings of
