@@ -290,8 +290,9 @@ public final class Log {
     }
 
     /// What one call leaves for the backend, with the name of the thread that made it and the
-    /// room that it takes while it waits.
-    private record Statement(
+    /// room that it takes while it waits. Like the thread that takes it, it is open to the
+    /// package for the test that queues a statement which no call makes.
+    record Statement(
             System.Logger logger,
             Level level,
             String text,
@@ -369,7 +370,7 @@ public final class Log {
     /// It also asks the backend which levels the logs enable, every second, so that a level that
     /// the application changes reaches the statements, while the threads that make them never
     /// ask.
-    private static final class Writer extends Thread implements System.Logger {
+    static final class Writer extends Thread implements System.Logger {
 
         // Each distribution embeds a copy under org.mqtt4j.hato.<distribution>; naming the
         // thread after it tells the copies apart in one JVM.
@@ -538,40 +539,57 @@ public final class Log {
         public void run() {
             long count = 0;
             long levelsAsked = System.nanoTime();
+            // The requests for the levels that the thread has begun to serve. A pass that fails
+            // while it asks leaves them unserved, and they wait for the next time that the
+            // levels are due: asking again at once would fail pass after pass, ahead of the
+            // statements, for as long as the cause lasts.
+            long levelRequestsTried = 0;
             while (true) {
-                // A request seen here is served by asking every log after it was made.
-                long requested = levelRequests.get();
-                if (requested != levelRequestsServed
-                        || System.nanoTime() - levelsAsked >= LEVELS_NANOS) {
-                    levelsAsked = System.nanoTime();
-                    for (Log log : logs) {
-                        log.enabled = enabledLevels(log.logger);
-                    }
-                    levelRequestsServed = requested;
-                }
-                Statement next = statements.poll();
-                if (next == null) {
-                    carry("");
-                    idle = true;
-                    if (statements.isEmpty()) {
-                        LockSupport.parkNanos(
-                                this,
-                                LEVELS_NANOS - (System.nanoTime() - levelsAsked)
-                        );
-                    }
-                    idle = false;
-                    // An interrupted thread no longer parks, and this one has nothing to stop for.
-                    boolean _ = Thread.interrupted();
-                    continue;
-                }
-                carry(next.thread());
                 try {
-                    next.logger().log(next.level(), null, next.text(), next.thrown());
+                    // A request seen here is served by asking every log after it was made.
+                    long requested = levelRequests.get();
+                    if (requested != levelRequestsTried
+                            || System.nanoTime() - levelsAsked >= LEVELS_NANOS) {
+                        levelsAsked = System.nanoTime();
+                        levelRequestsTried = requested;
+                        for (Log log : logs) {
+                            log.enabled = enabledLevels(log.logger);
+                        }
+                        levelRequestsServed = requested;
+                    }
+                    Statement next = statements.poll();
+                    if (next == null) {
+                        carry("");
+                        idle = true;
+                        if (statements.isEmpty()) {
+                            LockSupport.parkNanos(
+                                    this,
+                                    LEVELS_NANOS - (System.nanoTime() - levelsAsked)
+                            );
+                        }
+                        idle = false;
+                        // An interrupted thread no longer parks, and this one has nothing to stop
+                        // for.
+                        boolean _ = Thread.interrupted();
+                        continue;
+                    }
+                    try {
+                        carry(next.thread());
+                        next.logger().log(next.level(), null, next.text(), next.thrown());
+                    } finally {
+                        // Written or lost, the statement no longer waits.
+                        waiting.addAndGet(-next.size());
+                        written = ++count;
+                    }
                 } catch (Throwable _) {
-                    // The statement is lost; the thread goes on with the next one.
+                    // Nothing ends the thread: whatever fails a pass, it goes on with the next
+                    // one. A pass can fail outside the backend too. Memory can run out wherever
+                    // this thread asks for some, as it does to walk through the logs and to make
+                    // a name. A failed pass loses the statement that it had taken, if it had
+                    // one, and nothing else. Logs that it had not asked yet keep their levels,
+                    // and a request for the levels stays unserved, until a later pass asks every
+                    // log.
                 }
-                waiting.addAndGet(-next.size());
-                written = ++count;
             }
         }
 
@@ -580,8 +598,10 @@ public final class Log {
         // until nothing waits.
         private void carry(String thread) {
             if (!thread.equals(carried)) {
-                carried = thread;
                 setName(thread.isEmpty() ? NAME : NAME + " for " + thread);
+                // Noted once the thread has the name: a name that could not be made is made
+                // again for the next statement, which would otherwise go out under the old one.
+                carried = thread;
             }
         }
 

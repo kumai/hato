@@ -375,6 +375,37 @@ class LogTest {
     }
 
     @Test
+    @SuppressWarnings("NullAway") // The statement that fails the thread names no thread.
+    void a_statement_that_fails_the_writing_thread_is_lost_and_later_ones_are_written() {
+        // Arrange: nothing waits, and the backend now enables a level that it did not.
+        var logger = new RecordingLogger(Level.INFO);
+        var sut = Log.of(logger);
+        logger.minimum = Level.DEBUG;
+        awaitWritten();
+
+        // Act: a statement that names no thread, which no call makes, fails the thread that
+        // writes as it puts that name behind its own. That is no failure of the backend; memory
+        // that runs out there fails the thread the same way. With more exceptions than are
+        // counted, the statement takes the whole room.
+        Log.Writer.instance.take(Log.Statement.of(
+                logger,
+                Level.ERROR,
+                "lost",
+                chain(65, "cause"),
+                null
+        ));
+        awaitWritten();
+        boolean asked = Log.awaitLevels(Duration.ofSeconds(10));
+        sut.debug("later");
+        awaitWritten();
+
+        // Assert: the thread went on. It asked for the levels again, and the later statement
+        // found the room that the lost one gave back.
+        assertThat(asked).isTrue();
+        assertThat(logger.records).extracting(Record::message).containsExactly("later");
+    }
+
+    @Test
     void class_based_logs_are_named_after_the_class() {
         assertThat(Log.of(LogTest.class).getName()).isEqualTo(LogTest.class.getName());
         assertThat(Log.of("org.mqtt4j.hato.test").getName()).isEqualTo("org.mqtt4j.hato.test");
