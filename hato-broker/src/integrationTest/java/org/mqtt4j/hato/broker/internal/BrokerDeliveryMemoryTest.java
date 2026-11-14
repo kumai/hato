@@ -511,14 +511,15 @@ class BrokerDeliveryMemoryTest {
     @Test
     void a_new_retained_message_does_not_push_out_waiting_ones_that_count_for_more_than_it_does()
             throws Exception {
-        // Arrange: two large retained messages wait for a client whose window of one holds a
-        // delivery that it does not answer. A session that is away holds a delivery of the
-        // first of them, so that one would give no room back. The memory has room for all of
+        // Arrange: three large retained messages wait for a client whose window of one holds a
+        // delivery that it does not answer. A session that is away holds deliveries of the
+        // first two of them, so those would give no room back. The memory has room for all of
         // that and for the cursor of one more subscription, and no more.
         String large = "x".repeat(4096);
-        long room = roomOf("kept/x", "1" + large)
-                + cursorSize("kept/#", 2)
-                + PublicationMemory.sizeOf(retained("kept/y", "2" + large))
+        long room = roomOf("kept/a/1", "1" + large)
+                + roomOf("kept/a/2", "2" + large)
+                + cursorSize("kept/#", 3)
+                + PublicationMemory.sizeOf(retained("kept/b", "3" + large))
                 + cursorSize("more/#", 1);
         try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
@@ -526,23 +527,25 @@ class BrokerDeliveryMemoryTest {
             publisher.publish(retained("held/1", "held"));
             subscriber.subscribe("held/#", AT_LEAST_ONCE);
             Packet.Publish held = subscriber.expect(Packet.Publish.class);
-            leaveSubscribed(sut, "away", "kept/x", AT_LEAST_ONCE);
-            publisher.publish(retained("kept/x", "1" + large));
-            publisher.publish(retained("kept/y", "2" + large));
+            leaveSubscribed(sut, "away", "kept/a/#", AT_LEAST_ONCE);
+            publisher.publish(retained("kept/a/1", "1" + large));
+            publisher.publish(retained("kept/a/2", "2" + large));
+            publisher.publish(retained("kept/b", "3" + large));
             subscriber.subscribe("kept/#", AT_LEAST_ONCE);
-            publisher.publish(retained("more/z", "3" + large));
+            publisher.publish(retained("more/z", "4" + large));
 
-            // Act: a subscription to a third message of the same size, which finds no room.
-            // Only the second of the two that wait would make it.
+            // Act: a subscription to a fourth message of the same size, which finds no room
+            // with its cursor. Only the third of those that wait would make it, and the two
+            // before it count for more than the new one and its cursor.
             subscriber.subscribe("more/#", AT_LEAST_ONCE);
 
-            // Assert: the client does not lose both for it. It goes without the new one, and
-            // gets what waited.
+            // Assert: the client does not lose all three for it. It goes without the new one,
+            // and gets what waited.
             await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
             subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
-            assertThat(received(subscriber, 2))
+            assertThat(received(subscriber, 3))
                     .extracting(payload -> payload.substring(0, 1))
-                    .containsExactly("1", "2");
+                    .containsExactly("1", "2", "3");
             subscriber.ping();
         }
     }
@@ -564,8 +567,8 @@ class BrokerDeliveryMemoryTest {
             publisher.publish(retained("b/1", "0002"));
             subscriber.subscribe("a/#", AT_LEAST_ONCE);
 
-            // Act: a second subscription with a retained message of the same size. Its cursor
-            // finds no room for itself, and the message that waits gives too little back
+            // Act: a second subscription with a retained message of the same size. The message
+            // and its cursor find no room, and the message that waits gives too little back
             // alone: its cursor, which then holds nothing, gives the rest.
             subscriber.subscribe("b/#", AT_LEAST_ONCE);
 
@@ -573,6 +576,36 @@ class BrokerDeliveryMemoryTest {
             await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
             subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
             assertThat(received(subscriber, 1)).containsExactly("0002");
+            subscriber.ping();
+        }
+    }
+
+    @Test
+    void a_later_subscription_whose_retained_message_finds_no_room_leaves_the_earlier_one_waiting()
+            throws Exception {
+        // Arrange: a client whose window of one holds a delivery that it does not answer, and
+        // one retained message that waits for it. The memory has room for that message and
+        // the cursor of its subscription, and no more.
+        long room = cursorSize("a/#", 1) + PublicationMemory.sizeOf(retained("a/1", "0001"));
+        try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            publisher.publish(retained("held/1", "held"));
+            subscriber.subscribe("held/#", AT_LEAST_ONCE);
+            Packet.Publish held = subscriber.expect(Packet.Publish.class);
+            publisher.publish(retained("a/1", "0001"));
+            publisher.publish(retained("b/1", "x".repeat(4096)));
+            subscriber.subscribe("a/#", AT_LEAST_ONCE);
+
+            // Act: a second subscription with a retained message that is larger than the
+            // memory. What waits would give back enough for the cursor of the subscription,
+            // but not for its message.
+            subscriber.subscribe("b/#", AT_LEAST_ONCE);
+
+            // Assert: the client goes without the large one alone, and gets what waited.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("subscriber"));
+            subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
+            assertThat(received(subscriber, 1)).containsExactly("0001");
             subscriber.ping();
         }
     }

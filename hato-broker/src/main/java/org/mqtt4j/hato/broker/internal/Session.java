@@ -1075,8 +1075,10 @@ final class Session {
     // memory that waits for the session like its deliveries, and so is the cursor itself.
     // Without room, the session's oldest waiting retained messages make room for a later one,
     // as its deliveries do for one another; they stay if they could not make enough, and the
-    // session then goes without that one alone. A cursor that finds no room for itself goes
-    // with all its messages, while its subscription stays. Called under the inbox.
+    // session then goes without that one alone. A cursor takes its own room with the first
+    // of its messages that finds room, so nothing older goes for a cursor whose messages then
+    // find none: such a cursor leaves without having taken anything, while its subscription
+    // stays. Called under the inbox.
     private void takeRoomForRetained() {
         int arrived = cursors.size() - cursorsWithRoom;
         if (arrived == 0) {
@@ -1091,18 +1093,9 @@ final class Session {
         }
         for (RetainedCursor cursor : waiting) {
             cursors.addLast(cursor);
-            if (!takeRoom(cursor)) {
-                cursors.removeLast();
-                while (cursor.hasNext()) {
-                    Qos qos = cursor.nextQos();
-                    pass(cursor);
-                    dropped(qos, MEMORY_USED_UP);
-                }
-                continue;
-            }
             RetainedMessages.Message message;
             while ((message = cursor.withoutRoom()) != null) {
-                if (makeRoom(message)) {
+                if (makeRoom(cursor, message)) {
                     cursor.roomTaken();
                 } else {
                     Qos qos = cursor.qosOf(message);
@@ -1119,36 +1112,45 @@ final class Session {
         }
     }
 
-    // Takes room for what `cursor`, the queue's last one, holds itself, at the cost of the
-    // oldest retained messages that wait with room if need be. Returns false if the session
-    // goes without the cursor.
-    private boolean takeRoom(RetainedCursor cursor) {
-        // What the cursor counts for with all that it holds, which is as much as older ones
-        // may count for that go for it.
-        long counted = cursor.ownBytes + cursor.remainingBytes();
-        while (!routing.memory.take(cursor.ownBytes)) {
-            int oldest = oldestRetainedThatMakeRoom(cursor.ownBytes, counted);
-            if (oldest < 0) {
-                return false;
-            }
-            for (int number = 0; number < oldest; number++) {
-                dropOldestRetainedWithRoom();
-            }
+    // Takes room in the broker's memory for `message`, which waits in `cursor`, and for what
+    // the cursor holds itself if it has none yet: both or neither. Returns false when the
+    // memory has none. Called under the inbox.
+    private boolean takeRoom(RetainedCursor cursor, RetainedMessages.Message message) {
+        MemoryBudget memory = routing.memory;
+        long own = cursor.hasRoom ? 0 : cursor.ownBytes;
+        if (own > 0 && !memory.take(own)) {
+            return false;
         }
-        cursor.hasRoom = true;
-        cursorsWithRoom++;
+        if (!message.memory().hold(memory)) {
+            if (own > 0) {
+                memory.give(own);
+            }
+            return false;
+        }
+        if (own > 0) {
+            cursor.hasRoom = true;
+            cursorsWithRoom++;
+            withRoom++;
+            retainedWithRoom += own;
+        }
         withRoom++;
-        retainedWithRoom += cursor.ownBytes;
+        retainedWithRoom += message.memory().bytes();
         return true;
     }
 
-    // Takes room for `message`, which waits in the queue's last cursor, at the cost of the
-    // oldest retained messages that wait with room if need be. Returns false if the session
-    // goes without `message`.
-    private boolean makeRoom(RetainedMessages.Message message) {
+    // Takes room for `message`, which waits in `cursor`, the queue's last one, and with it
+    // for the cursor itself if that has none yet, at the cost of the oldest retained messages
+    // that wait with room if need be. The two count as one, so that no older message goes for
+    // a cursor whose message then finds no room. Returns false if the session goes without
+    // `message`.
+    private boolean makeRoom(RetainedCursor cursor, RetainedMessages.Message message) {
         PublicationMemory memory = message.memory();
-        while (!memory.hold(routing.memory)) {
-            int oldest = oldestRetainedThatMakeRoom(memory.bytes(), memory.bytes());
+        while (!takeRoom(cursor, message)) {
+            long own = cursor.hasRoom ? 0 : cursor.ownBytes;
+            int oldest = oldestRetainedThatMakeRoom(
+                    own + (memory.held() ? 0 : memory.bytes()),
+                    own + memory.bytes()
+            );
             if (oldest < 0) {
                 return false;
             }
@@ -1156,15 +1158,13 @@ final class Session {
                 dropOldestRetainedWithRoom();
             }
         }
-        withRoom++;
-        retainedWithRoom += memory.bytes();
         return true;
     }
 
     // How many of the oldest retained messages that wait with room must go for `needed` bytes
-    // to find room in the broker's memory, for a new message or cursor that counts for
-    // `counted` bytes: none if they find room as things are now, and -1 if the oldest ones do
-    // not make it, so that none of them goes in vain.
+    // to find room in the broker's memory, for a new message that counts for `counted` bytes
+    // together with its cursor if that has no room yet: none if they find room as things are
+    // now, and -1 if the oldest ones do not make it, so that none of them goes in vain.
     //
     // A message gives its room back only if nothing else holds it: the room of one that
     // another cursor or a delivery holds as well, of this session or of another, stays taken

@@ -23,10 +23,10 @@ import static java.util.Objects.requireNonNull;
 // The cursor holds the messages themselves, which the store may replace or drop meanwhile, so
 // what waits here is memory of its own. It lets go of each message as that goes out or is
 // dropped, and the session takes room in the broker's memory for those that still wait once it
-// has sent what it could: for the first ones, in the order they go out. Before that, the session
-// takes room for what the cursor holds besides the messages, which stays as large as it was
-// made until the cursor leaves the session: a message that has gone leaves its place in the
-// array behind.
+// has sent what it could: for the first ones, in the order they go out. With the first of them
+// that finds room, the session takes room for what the cursor holds besides the messages, which
+// stays as large as it was made until the cursor leaves the session: a message that has gone
+// leaves its place in the array behind.
 final class RetainedCursor implements Pending {
 
     // A cursor itself, and its place among its session's cursors.
@@ -66,8 +66,8 @@ final class RetainedCursor implements Pending {
     final long ownBytes;
 
     // Whether the cursor has room in the broker's memory for what it holds itself, which the
-    // session takes for it once it waits, before it takes room for the messages that are
-    // left, and gives back as the cursor leaves the session. The session's, under its inbox.
+    // session takes for it with the first of its messages that finds room to wait, and gives
+    // back as the cursor leaves the session. The session's, under its inbox.
     boolean hasRoom;
 
     // The delivery of the retained message at `next`, made when the session first looks at it
