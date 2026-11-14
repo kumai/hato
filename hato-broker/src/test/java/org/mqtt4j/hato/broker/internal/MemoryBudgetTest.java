@@ -123,6 +123,64 @@ class MemoryBudgetTest {
     }
 
     @Test
+    void what_is_missing_for_room_is_what_has_to_come_back_first() {
+        // Arrange: 40 of 100 bytes are left.
+        var sut = new MemoryBudget(100, 0, 0);
+        sut.take(60);
+
+        // Act
+        long fits = sut.shortOf(40);
+        long tooMuch = sut.shortOf(55);
+
+        // Assert: nothing is missing for the first, and 15 bytes for the second.
+        assertThat(fits).isNotPositive();
+        assertThat(tooMuch).isEqualTo(15);
+    }
+
+    @Test
+    void what_a_pool_thread_keeps_is_not_missing_for_it() throws Exception {
+        // Arrange: a thread that keeps 90 bytes of the unit that it fetched, which leaves the
+        // other threads 50.
+        var sut = new MemoryBudget(150, 100, 0);
+        var missing = new ArrayList<Long>();
+
+        // Act
+        onPoolThread(() -> {
+            sut.take(10);
+            missing.add(sut.shortOf(140));
+            missing.add(sut.shortOf(150));
+        });
+
+        // Assert: the thread counts what it keeps, and another thread only what is left.
+        assertThat(missing).containsExactly(0L, 10L);
+        assertThat(sut.shortOf(60)).isEqualTo(10);
+    }
+
+    @Test
+    void a_publication_tells_whether_a_holder_would_take_or_give_back_its_room() {
+        // Arrange
+        var budget = new MemoryBudget(100, 0, 0);
+        var sut = new PublicationMemory(60);
+
+        // Act: no holder, one, two, and one again. Each time: whether the publication has its
+        // room, and whether a holder that let go would give it back.
+        List<Boolean> without = List.of(sut.held(), sut.heldOnce());
+        boolean first = sut.hold(budget);
+        List<Boolean> withOne = List.of(sut.held(), sut.heldOnce());
+        boolean second = sut.hold(budget);
+        List<Boolean> withTwo = List.of(sut.held(), sut.heldOnce());
+        sut.release(budget);
+        List<Boolean> withOneAgain = List.of(sut.held(), sut.heldOnce());
+
+        // Assert: the first holder takes the room, and only the last one gives it back.
+        assertThat(List.of(first, second)).containsOnly(true);
+        assertThat(without).containsExactly(false, false);
+        assertThat(withOne).containsExactly(true, true);
+        assertThat(withTwo).containsExactly(true, false);
+        assertThat(withOneAgain).containsExactly(true, true);
+    }
+
+    @Test
     void a_publication_takes_its_room_once_for_all_its_holders() {
         // Arrange
         var budget = new MemoryBudget(100, 0, 0);

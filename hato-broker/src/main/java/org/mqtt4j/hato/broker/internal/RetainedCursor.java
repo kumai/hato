@@ -147,6 +147,28 @@ final class RetainedCursor implements Pending {
         remove(roomEnd);
     }
 
+    // The position of the oldest retained message that is left and has room in the broker's
+    // memory, or -1 if none has.
+    int firstWithRoom() {
+        return nextWithRoom(next - 1);
+    }
+
+    // The position of the next retained message after `position` that is left and has room,
+    // or -1 if none has.
+    int nextWithRoom(int position) {
+        for (int following = position + 1; following < roomEnd; following++) {
+            if (matched[following] != null) {
+                return following;
+            }
+        }
+        return -1;
+    }
+
+    // The retained message at `position`, which firstWithRoom() or nextWithRoom() returned.
+    RetainedMessages.Message at(int position) {
+        return requireNonNull(matched[position]);
+    }
+
     // Has `action` take each retained message that is left and has room in the broker's
     // memory, oldest first.
     void eachWithRoom(Consumer<RetainedMessages.Message> action) {

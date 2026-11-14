@@ -104,12 +104,13 @@ final class MemoryBudget {
         worker.memory = kept;
     }
 
-    // Whether `bytes` might find room once `freed` bytes more have come back: a session asks
-    // before it drops what waits for it to make room. The answer looks at the shared count as
-    // it is, so it can be wrong by what the pool's threads keep and by what other threads do
-    // meanwhile.
-    boolean mightFit(long bytes, long freed) {
-        return bytes - freed <= limit - lent.get();
+    // How many bytes more would have to come back before `bytes` found room, which is none if
+    // the number is not positive: a session asks before it drops what waits for it to make
+    // room. The answer looks at the shared count as it is and at what the calling thread
+    // keeps, so it can be wrong by what other threads do meanwhile.
+    long shortOf(long bytes) {
+        long kept = (Thread.currentThread() instanceof Worker worker) ? worker.memory : 0;
+        return bytes - kept - (limit - lent.get());
     }
 
     private boolean borrow(long bytes) {

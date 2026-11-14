@@ -141,4 +141,17 @@ final class PublicationMemory {
             budget.give(bytes);
         }
     }
+
+    // Whether the publication has its room, so that another holder would take none for it.
+    // Other threads add and remove holders meanwhile, so the answer is of this moment.
+    boolean held() {
+        return holders.get() > 0;
+    }
+
+    // Whether the publication has one holder, which then gives its room back as it lets go:
+    // with more holders, the room stays taken until the last of them has. The answer is of
+    // this moment as well.
+    boolean heldOnce() {
+        return holders.get() == 1;
+    }
 }
