@@ -136,11 +136,52 @@ final class PublicationMemory {
         }
     }
 
+    // Adds a holder if the publication has one already, which takes no room. Returns false,
+    // without adding it, if nothing holds the publication.
+    boolean holdIfHeld() {
+        while (true) {
+            int held = holders.get();
+            if (held == 0) {
+                return false;
+            }
+            if (holders.compareAndSet(held, held + 1)) {
+                return true;
+            }
+        }
+    }
+
+    // Adds a holder that brings the publication's room with it: room that it took from `budget`
+    // for the publication, or kept as it let go of the publication in letGoAsLast(). If the
+    // publication has its room already, because another holder came meanwhile, the room that
+    // came with this one goes back to `budget`.
+    void holdWithRoom(MemoryBudget budget) {
+        while (true) {
+            int held = holders.get();
+            if (held == 0) {
+                if (holders.compareAndSet(0, 1)) {
+                    return;
+                }
+            } else if (holders.compareAndSet(held, held + 1)) {
+                budget.give(bytes);
+                return;
+            }
+        }
+    }
+
     // Removes a holder, which gives the publication's room back to `budget` if it was the last.
     void release(MemoryBudget budget) {
         if (holders.decrementAndGet() == 0) {
             budget.give(bytes);
         }
+    }
+
+    // Removes a holder if it is the only one, and leaves the publication's room with the
+    // caller instead of giving it back: the caller hands the room on to something else, or
+    // comes back with it in holdWithRoom(). Meanwhile the publication is without room, and
+    // another holder takes room of its own for it. Returns false, without removing the holder,
+    // if others hold the publication as well.
+    boolean letGoAsLast() {
+        return holders.compareAndSet(1, 0);
     }
 
     // Whether the publication has its room, so that another holder would take none for it.

@@ -276,6 +276,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private BrokerSettings.AcceptHook beforeAccept = () -> { };
 
+        private Consumer<String> beforeHandOver = _ -> { };
+
         private Builder() {
         }
 
@@ -447,6 +449,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder beforeHandOver(Consumer<String> value) {
+            beforeHandOver = requireNonNull(value, "beforeHandOver must not be null");
+            return this;
+        }
+
         BrokerServer start(InetSocketAddress address) throws IOException {
             requireNonNull(address, "address must not be null");
             if (connectTimeout.isNegative()
@@ -514,7 +521,8 @@ public final class BrokerServer implements AutoCloseable {
                     beforeHandle,
                     deliveryWriteHeld,
                     beforeSelect,
-                    beforeAccept
+                    beforeAccept,
+                    beforeHandOver
             );
             ServerSocketChannel listener = ServerSocketChannel.open();
             try {

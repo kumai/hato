@@ -214,6 +214,110 @@ class MemoryBudgetTest {
         assertThat(sut.hold(new MemoryBudget(60, 0, 0))).isTrue();
     }
 
+    @Test
+    void a_holder_joins_a_publication_that_has_its_room_and_takes_none() {
+        // Arrange: a publication whose one holder took all the room that there is.
+        var budget = new MemoryBudget(60, 0, 0);
+        var sut = new PublicationMemory(60);
+        boolean first = sut.hold(budget);
+
+        // Act
+        boolean joined = sut.holdIfHeld();
+        sut.release(budget);
+        long heldByOne = budget.lent();
+        sut.release(budget);
+
+        // Assert: the room stays until both have let go.
+        assertThat(List.of(first, joined)).containsExactly(true, true);
+        assertThat(List.of(heldByOne, budget.lent())).containsExactly(60L, 0L);
+    }
+
+    @Test
+    void nothing_joins_a_publication_that_has_no_holder() {
+        // Arrange
+        var sut = new PublicationMemory(60);
+
+        // Act
+        boolean joined = sut.holdIfHeld();
+
+        // Assert
+        assertThat(joined).isFalse();
+        assertThat(sut.held()).isFalse();
+    }
+
+    @Test
+    void the_last_holder_of_a_publication_lets_go_and_keeps_the_room() {
+        // Arrange
+        var budget = new MemoryBudget(100, 0, 0);
+        var sut = new PublicationMemory(60);
+        boolean held = sut.hold(budget);
+
+        // Act
+        boolean letGo = sut.letGoAsLast();
+
+        // Assert: the publication has no holder, and its room has not gone back.
+        assertThat(List.of(held, letGo)).containsExactly(true, true);
+        assertThat(sut.held()).isFalse();
+        assertThat(budget.lent()).isEqualTo(60);
+    }
+
+    @Test
+    void a_holder_among_others_does_not_let_go_as_the_last() {
+        // Arrange
+        var budget = new MemoryBudget(100, 0, 0);
+        var sut = new PublicationMemory(60);
+        boolean first = sut.hold(budget);
+        boolean second = sut.hold(budget);
+
+        // Act
+        boolean letGo = sut.letGoAsLast();
+
+        // Assert: both still hold it, so that one of them is the last once the other goes.
+        assertThat(List.of(first, second, letGo)).containsExactly(true, true, false);
+        assertThat(sut.heldOnce()).isFalse();
+        sut.release(budget);
+        assertThat(sut.heldOnce()).isTrue();
+    }
+
+    @Test
+    void a_holder_that_comes_back_with_the_room_leaves_it_with_its_publication() {
+        // Arrange: a holder that let go as the last one and kept the room.
+        var budget = new MemoryBudget(60, 0, 0);
+        var sut = new PublicationMemory(60);
+        boolean held = sut.hold(budget);
+        boolean letGo = sut.letGoAsLast();
+
+        // Act
+        sut.holdWithRoom(budget);
+
+        // Assert: the publication has its room again, and gives it back with its holder.
+        assertThat(List.of(held, letGo)).containsExactly(true, true);
+        assertThat(sut.heldOnce()).isTrue();
+        assertThat(budget.lent()).isEqualTo(60);
+        sut.release(budget);
+        assertThat(budget.lent()).isZero();
+    }
+
+    @Test
+    void a_holder_that_comes_back_with_the_room_gives_it_up_if_another_holder_came() {
+        // Arrange: a holder that let go as the last one and kept the room, and another that
+        // then took room of its own for the publication.
+        var budget = new MemoryBudget(120, 0, 0);
+        var sut = new PublicationMemory(60);
+        boolean held = sut.hold(budget);
+        boolean letGo = sut.letGoAsLast();
+        boolean other = sut.hold(budget);
+        long withBoth = budget.lent();
+
+        // Act
+        sut.holdWithRoom(budget);
+
+        // Assert: the publication counts once again, for its two holders.
+        assertThat(List.of(held, letGo, other)).containsExactly(true, true, true);
+        assertThat(List.of(withBoth, budget.lent())).containsExactly(120L, 60L);
+        assertThat(sut.heldOnce()).isFalse();
+    }
+
     /// Runs `body` on a thread of the kind that the actor pool has, and waits for it.
     private static void onPoolThread(Runnable body) throws InterruptedException {
         var failure = new ArrayList<Throwable>();
