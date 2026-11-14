@@ -1065,10 +1065,13 @@ final class Session {
     // that came take their room first, as they do when they still wait after the session has
     // sent what it could (see takeRoomForRetained): a message that finds none goes alone. Only
     // then do the oldest go until the room holds its limits again. In this order the session
-    // gives up no older message for one that the memory then refuses. Called under the inbox.
+    // gives up no older message for one that the memory then refuses. A cursor for whose
+    // next message the memory has no room tries to take room for all that it has left at
+    // once, because the oldest go for them here anyway (see takeRoomAtOnce). Called under the
+    // inbox.
     private void limitRetained() {
         if (retainedRoom.overflows()) {
-            takeRoomForRetained();
+            takeRoomForRetained(true);
             dropOldestRetained();
         }
     }
@@ -1161,8 +1164,10 @@ final class Session {
     // session then goes without that one alone. A cursor takes its own room with the first
     // of its messages that finds room, so nothing older goes for a cursor whose messages then
     // find none: such a cursor leaves without having taken anything, while its subscription
-    // stays. Called under the inbox.
-    private void takeRoomForRetained() {
+    // stays. With `atOnce`, a cursor whose next message finds no room as things are first
+    // tries to take room for all that it has left together (see takeRoomAtOnce). Called under
+    // the inbox.
+    private void takeRoomForRetained(boolean atOnce) {
         int arrived = cursors.size() - cursorsWithRoom;
         if (arrived == 0) {
             return;
@@ -1176,8 +1181,20 @@ final class Session {
         }
         for (RetainedCursor cursor : waiting) {
             cursors.addLast(cursor);
+            // Whether the cursor may still try to take room for all that it has left at once.
+            boolean together = atOnce;
             RetainedMessages.Message message;
             while ((message = cursor.withoutRoom()) != null) {
+                if (takeRoom(cursor, message)) {
+                    cursor.roomTaken();
+                    continue;
+                }
+                if (together) {
+                    together = false;
+                    if (takeRoomAtOnce(cursor)) {
+                        continue;
+                    }
+                }
                 if (makeRoom(cursor, message)) {
                     cursor.roomTaken();
                 } else {
@@ -1230,13 +1247,11 @@ final class Session {
 
     // Takes room for `message`, which waits in `cursor`, the queue's last one, and with it
     // for the cursor itself if that has none yet, at the cost of the oldest retained messages
-    // that wait with room if need be. The two count as one, so that no older message goes for
-    // a cursor whose message then finds no room. Returns false if the session goes without
-    // `message`, and then nothing older has gone for it.
+    // that wait with room: the memory had none for them as things were (see takeRoom). The
+    // two count as one, so that no older message goes for a cursor whose message then finds
+    // no room. Returns false if the session goes without `message`, and then nothing older
+    // has gone for it.
     private boolean makeRoom(RetainedCursor cursor, RetainedMessages.Message message) {
-        if (takeRoom(cursor, message)) {
-            return true;
-        }
         PublicationMemory memory = message.memory();
         long own = cursor.hasRoom ? 0 : cursor.ownBytes;
         int oldest = oldestRetainedThatMakeRoom(
@@ -1249,17 +1264,103 @@ final class Session {
 
     // Has the `oldest` oldest retained messages that wait with room hand their room in the
     // broker's memory over to `message`, which waits in `cursor`, and to the cursor itself if
-    // it has none yet, and drops them. It makes sure of the room before any of them goes, as
-    // handOver() does for deliveries, so that none goes unless `message` stays. A cursor that
-    // loses its last message this way brings the room that it had for itself as well. Returns
-    // false if the room is not to be had now, and then nothing has changed. Called under the
-    // inbox.
+    // it has none yet, and drops them: none of them goes unless `message` stays. The message
+    // joins the holders of its publication if there are any, and then needs no room for it.
+    // Returns false if the room is not to be had now, and then nothing has changed. Called
+    // under the inbox.
     private boolean handOver(int oldest, RetainedCursor cursor, RetainedMessages.Message message) {
-        settings.beforeHandOver().accept(clientId);
-        MemoryBudget memory = routing.memory;
         PublicationMemory publication = message.memory();
         boolean joined = publication.holdIfHeld();
         long needed = (cursor.hasRoom ? 0 : cursor.ownBytes) + (joined ? 0 : publication.bytes());
+        if (!handOverRetained(oldest, needed)) {
+            if (joined) {
+                publication.release(routing.memory);
+            }
+            return false;
+        }
+        if (!joined) {
+            publication.holdWithRoom(routing.memory);
+        }
+        roomTaken(cursor, message);
+        return true;
+    }
+
+    // Takes room for every retained message of `cursor`, the queue's last one, that has none
+    // yet, and for the cursor itself if it has none, all at once, at the cost of the oldest
+    // retained messages that wait with room if need be. Returns false, having changed
+    // nothing, if that does not work out: the messages then take their room one at a time
+    // (see makeRoom).
+    //
+    // This is for a session that holds more retained messages than may wait for it, where the
+    // oldest are about to go for those that came, as far as those find room. One at a time,
+    // every new message would trade its room with one of the oldest in a count and a
+    // hand-over of its own, which takes a subscription to as many messages as the limits
+    // allow longer than all the rest of it. Here every new message first joins the holders
+    // that its publication has, which a subscription made again finds in the copies that wait
+    // for the earlier one, and one count and one hand-over see to what is still needed then.
+    // The cursor and its messages count for the sum of what each counts for, so that is how
+    // much of the older ones may go for them.
+    private boolean takeRoomAtOnce(RetainedCursor cursor) {
+        MemoryBudget memory = routing.memory;
+        // Which of the messages joined the holders of their publications, in their order.
+        var joined = new boolean[cursor.remainingCount()];
+        long needed = cursor.hasRoom ? 0 : cursor.ownBytes;
+        long counted = needed;
+        int index = 0;
+        int position = cursor.firstWithoutRoom();
+        while (position >= 0) {
+            PublicationMemory publication = cursor.at(position).memory();
+            joined[index] = publication.holdIfHeld();
+            if (!joined[index]) {
+                needed += publication.bytes();
+            }
+            counted += publication.bytes();
+            index++;
+            position = cursor.nextWithoutRoom(position);
+        }
+        // A copy that a new message has joined has two holders now, so the count takes it to
+        // give nothing back.
+        int oldest = oldestRetainedThatMakeRoom(null, needed, counted);
+        boolean taken = oldest >= 0 && handOverRetained(oldest, needed);
+        index = 0;
+        position = cursor.firstWithoutRoom();
+        while (position >= 0) {
+            PublicationMemory publication = cursor.at(position).memory();
+            if (taken) {
+                if (!joined[index]) {
+                    publication.holdWithRoom(memory);
+                }
+                withRoom++;
+                retainedWithRoom += publication.bytes();
+            } else if (joined[index]) {
+                publication.release(memory);
+            }
+            index++;
+            position = cursor.nextWithoutRoom(position);
+        }
+        if (taken) {
+            if (!cursor.hasRoom) {
+                cursor.hasRoom = true;
+                cursorsWithRoom++;
+                withRoom++;
+                retainedWithRoom += cursor.ownBytes;
+            }
+            cursor.allRoomTaken();
+        }
+        return taken;
+    }
+
+    // Has the `oldest` oldest retained messages that wait with room hand `needed` bytes of
+    // room in the broker's memory over to what is taking its room, and drops them. It makes
+    // sure of the room before any of them goes, as handOver() does for deliveries: each lets
+    // go of its publication if its cursor is the last holder, with the room kept in hand, a
+    // cursor that loses its last message this way brings the room that it had for itself as
+    // well, and the memory gives what is still missing in one piece. What they bring beyond
+    // `needed` goes back to the memory. Returns false if the room is not to be had now, and
+    // then nothing has changed. Called under the inbox.
+    private boolean handOverRetained(int oldest, long needed) {
+        settings.beforeHandOver().accept(clientId);
+        MemoryBudget memory = routing.memory;
         // The publications that the oldest messages' cursors let go of as their last holders,
         // each at the place of its message among them.
         var released = new @Nullable PublicationMemory[oldest];
@@ -1290,9 +1391,6 @@ final class Session {
         long missing = needed - inHand;
         if (missing > 0 && !memory.take(missing)) {
             holdAgain(released);
-            if (joined) {
-                publication.release(memory);
-            }
             return false;
         }
         for (index = 0; index < oldest; index++) {
@@ -1315,13 +1413,9 @@ final class Session {
                 long _ = letGoOfOwnRoom(first);
             }
         }
-        if (!joined) {
-            publication.holdWithRoom(memory);
-        }
         if (missing < 0) {
             memory.give(-missing);
         }
-        roomTaken(cursor, message);
         return true;
     }
 
@@ -1335,13 +1429,18 @@ final class Session {
     // until the last holder lets go. So a message that several of these cursors hold counts
     // for none of them, which errs towards keeping what waits. Nor does the new message
     // itself give anything back where it waits for an earlier subscription too: `arriving` is
-    // its room, which the new holder keeps. A cursor gives back its own room with its last
-    // message. And as with deliveries, no further message goes once those before it count for
-    // as much as the new one does.
+    // its room, which the new holder keeps, or null if what is new holds its publications
+    // already. A cursor gives back its own room with its last message. And as with
+    // deliveries, no further message goes once those before it count for as much as the new
+    // one does.
     //
     // The answer is of this moment, and nothing goes on the strength of it alone: handOver()
     // makes sure of the room first. Called under the inbox.
-    private int oldestRetainedThatMakeRoom(PublicationMemory arriving, long needed, long counted) {
+    private int oldestRetainedThatMakeRoom(
+            @Nullable PublicationMemory arriving,
+            long needed,
+            long counted
+    ) {
         long missing = routing.memory.shortOf(needed);
         // What the cursors count is the most that they and their messages could give back.
         if (missing > retainedWithRoom) {
@@ -1493,7 +1592,7 @@ final class Session {
         synchronized (this) {
             trim(atMostOnceQueue);
             trim(acknowledgedQueue);
-            takeRoomForRetained();
+            takeRoomForRetained(false);
         }
     }
 
@@ -1763,7 +1862,7 @@ final class Session {
                     }
                 }
                 trim(acknowledgedQueue);
-                takeRoomForRetained();
+                takeRoomForRetained(false);
             }
         }
         deferred.clear();
