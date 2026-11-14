@@ -55,6 +55,10 @@ final class RetainedCursor implements Pending {
     // Whether QoS 0 deliveries are left out, because the connection they belong to has ended.
     private boolean acknowledgedOnly;
 
+    // Whether the session has taken room in the broker's memory for the messages that are
+    // left, which it does once the cursor waits. The session's, under its inbox.
+    boolean hasRoom;
+
     // The delivery of the retained message at `next`, made when the session first looks at it
     // and kept until it goes out.
     private @Nullable Delivery current;
@@ -80,11 +84,12 @@ final class RetainedCursor implements Pending {
         return remaining > 0;
     }
 
-    // The delivery of the next retained message, or null once none is left.
-    @Nullable Delivery current() {
-        if (current == null && hasNext()) {
+    // The delivery of the next retained message. Called only while one is left.
+    Delivery current() {
+        Delivery delivery = current;
+        if (delivery == null) {
             RetainedMessages.Message entry = requireNonNull(matched[next]);
-            current = new Delivery(
+            delivery = new Delivery(
                     entry.publication(),
                     entry.memory(),
                     entry.received(),
@@ -93,8 +98,9 @@ final class RetainedCursor implements Pending {
                     identifiers,
                     version
             );
+            current = delivery;
         }
-        return current;
+        return delivery;
     }
 
     // The QoS at which the next retained message goes out. Called only while one is left.
