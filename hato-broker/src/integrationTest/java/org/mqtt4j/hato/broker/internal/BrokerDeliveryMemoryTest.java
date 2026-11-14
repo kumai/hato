@@ -498,9 +498,19 @@ class BrokerDeliveryMemoryTest {
         return BrokerServer.builder()
                 .maxDeliveryMemory(bytes)
                 .deliveryMemoryUnit(0)
-                .dropListener((clientId, count) -> {
-                    for (long each = 0; each < count; each++) {
-                        reported.add(clientId);
+                .dropListener(new BrokerSettings.DropListener() {
+                    @Override
+                    public void dropped(String clientId, long count) {
+                        for (long each = 0; each < count; each++) {
+                            reported.add(clientId);
+                        }
+                    }
+
+                    @Override
+                    public void droppedUnattributed(long count) {
+                        // No test here has more clients than the broker reports by identifier,
+                        // so a delivery reported without one shows as an unexpected client.
+                        dropped("no client", count);
                     }
                 });
     }

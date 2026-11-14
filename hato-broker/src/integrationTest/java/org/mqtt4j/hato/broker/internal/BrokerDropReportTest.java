@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
@@ -32,7 +33,7 @@ class BrokerDropReportTest {
     @Test
     void the_application_hears_how_many_deliveries_a_session_lost_to_its_queue_limit()
             throws Exception {
-        try (BrokerServer sut = broker(this::record);
+        try (BrokerServer sut = broker(recording());
                 RawSession subscriber = connected(sut.port(), "behind");
                 RawSession publisher = connected(sut.port(), "publisher")) {
             // Arrange: one delivery takes the window, and two more fill the queue.
@@ -80,7 +81,7 @@ class BrokerDropReportTest {
 
     @Test
     void the_application_hears_of_what_a_session_loses_while_it_is_away() throws Exception {
-        try (BrokerServer sut = broker(this::record);
+        try (BrokerServer sut = broker(recording());
                 RawSession publisher = connected(sut.port(), "publisher")) {
             // Arrange: a session that outlives its connection.
             try (RawSession previous = connected(sut.port(), "away", false, false)) {
@@ -100,7 +101,7 @@ class BrokerDropReportTest {
 
     @Test
     void the_application_hears_of_a_delivery_too_large_for_the_brokers_limits() throws Exception {
-        try (BrokerServer sut = broker(this::record);
+        try (BrokerServer sut = broker(recording());
                 RawSession subscriber = connected(sut.port(), "behind");
                 RawSession publisher = connected(sut.port(), "publisher")) {
             // Arrange
@@ -120,7 +121,7 @@ class BrokerDropReportTest {
         BrokerServer.Builder limited = BrokerServer.builder()
                 .maxInflight(1)
                 .maxQueuedBytes(1024)
-                .dropListener(this::record);
+                .dropListener(recording());
         try (BrokerServer sut = limited.start(loopback());
                 RawSession subscriber = connected(sut.port(), "behind");
                 RawSession publisher = connected(sut.port(), "publisher")) {
@@ -143,7 +144,7 @@ class BrokerDropReportTest {
         BrokerServer.Builder limited = BrokerServer.builder()
                 .maxInflight(1)
                 .maxRetained(2)
-                .dropListener(this::record);
+                .dropListener(recording());
         try (BrokerServer sut = limited.start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "behind")) {
@@ -189,15 +190,67 @@ class BrokerDropReportTest {
     }
 
     @Test
+    void a_client_that_returns_with_new_sessions_while_the_listener_is_busy_gets_one_report()
+            throws Exception {
+        // Arrange: the listener is busy with the first drop of a client whose session has ended.
+        var release = new CountDownLatch(1);
+        try (BrokerServer sut = broker(busyWithFirstCall(release))) {
+            loseOne(sut.port(), "returning");
+            await().untilAsserted(() -> assertThat(reports).hasSize(1));
+
+            // Act: the client comes back three times, each time with a new session that loses a
+            // delivery and ends.
+            for (int visit = 0; visit < 3; visit++) {
+                loseOne(sut.port(), "returning");
+            }
+            release.countDown();
+
+            // Assert: the three sessions are one client to the listener.
+            await().untilAsserted(() -> assertThat(reports).containsExactly(
+                    new Report("returning", 1),
+                    new Report("returning", 3)
+            ));
+        }
+    }
+
+    @Test
+    void drops_of_more_clients_than_the_broker_can_have_sessions_arrive_without_their_clients()
+            throws Exception {
+        // Arrange: a broker that can have two clients and one persistent session, so three
+        // sessions at once, and a listener that is busy with a first drop.
+        var release = new CountDownLatch(1);
+        BrokerServer.Builder limited = settings(busyWithFirstCall(release))
+                .maxClients(2)
+                .maxSessions(1);
+        try (BrokerServer sut = limited.start(loopback())) {
+            loseOne(sut.port(), "first");
+            await().untilAsserted(() -> assertThat(reports).hasSize(1));
+
+            // Act: five more clients lose a delivery each, and then one of the first three of
+            // them another.
+            for (String clientId : List.of("a", "b", "c", "d", "e", "a")) {
+                loseOne(sut.port(), clientId);
+            }
+            release.countDown();
+
+            // Assert: three clients waited with their identifiers, and the listener hears of the
+            // other two in one count.
+            await().untilAsserted(() -> assertThat(reports).containsExactlyInAnyOrder(
+                    new Report("first", 1),
+                    new Report("a", 2),
+                    new Report("b", 1),
+                    new Report("c", 1),
+                    new Report(null, 2)
+            ));
+        }
+    }
+
+    @Test
     void a_listener_that_fails_still_hears_of_later_drops() throws Exception {
         // Arrange: a listener whose first call fails.
-        BrokerSettings.DropListener failing = (clientId, count) -> {
-            boolean first = reports.isEmpty();
-            record(clientId, count);
-            if (first) {
-                throw new IllegalStateException("injected listener failure");
-            }
-        };
+        BrokerSettings.DropListener failing = recording(() -> {
+            throw new IllegalStateException("injected listener failure");
+        });
         try (BrokerServer sut = broker(failing);
                 RawSession subscriber = connected(sut.port(), "behind");
                 RawSession publisher = connected(sut.port(), "publisher")) {
@@ -242,7 +295,7 @@ class BrokerDropReportTest {
     void a_closed_broker_keeps_no_thread_for_reports_that_never_came() throws Exception {
         // Arrange
         Thread reporting;
-        try (BrokerServer sut = broker(this::record)) {
+        try (BrokerServer sut = broker(recording())) {
             reporting = reportingThread(sut.port());
 
             // Act: the broker closes as it leaves the block.
@@ -252,18 +305,37 @@ class BrokerDropReportTest {
         await().until(() -> !reporting.isAlive());
     }
 
-    private void record(String clientId, long count) {
-        reports.add(new Report(clientId, count));
+    /// A listener that records its calls.
+    private BrokerSettings.DropListener recording() {
+        return recording(() -> { });
     }
 
     /// A listener that records its calls and does not return from the first one before
     /// `release` opens.
     private BrokerSettings.DropListener busyWithFirstCall(CountDownLatch release) {
-        return (clientId, count) -> {
-            boolean first = reports.isEmpty();
-            record(clientId, count);
-            if (first) {
-                awaitUninterruptibly(release);
+        return recording(() -> awaitUninterruptibly(release));
+    }
+
+    /// A listener that records its calls, and runs `firstCall` in the first of them once it has
+    /// recorded it.
+    private BrokerSettings.DropListener recording(Runnable firstCall) {
+        return new BrokerSettings.DropListener() {
+            @Override
+            public void dropped(String clientId, long count) {
+                record(new Report(clientId, count));
+            }
+
+            @Override
+            public void droppedUnattributed(long count) {
+                record(new Report(null, count));
+            }
+
+            private void record(Report report) {
+                boolean first = reports.isEmpty();
+                reports.add(report);
+                if (first) {
+                    firstCall.run();
+                }
             }
         };
     }
@@ -280,9 +352,19 @@ class BrokerDropReportTest {
     /// How many deliveries the listener has heard of for `clientId` so far.
     private long reported(String clientId) {
         return reports.stream()
-                .filter(report -> report.clientId().equals(clientId))
+                .filter(report -> clientId.equals(report.clientId()))
                 .mapToLong(Report::count)
                 .sum();
+    }
+
+    /// Connects `clientId` with a new session, which loses one delivery of its own publication,
+    /// larger than its window ever takes, and ends with its connection.
+    private static void loseOne(int port, String clientId) throws Exception {
+        try (RawSession client = connected(port, clientId)) {
+            client.subscribe("reported", AT_LEAST_ONCE);
+            client.publish("reported", "x".repeat(2048), AT_LEAST_ONCE, 7);
+            client.disconnect();
+        }
     }
 
     /// Subscribes `subscriber` to `reported` at QoS 1 and has `publisher` fill its window with
@@ -300,6 +382,11 @@ class BrokerDropReportTest {
     /// A broker whose sessions take one unanswered delivery at a time and have two more wait
     /// for it, of each kind.
     private static BrokerServer broker(BrokerSettings.DropListener listener) throws IOException {
+        return settings(listener).start(loopback());
+    }
+
+    /// The settings of such a broker, for a test that adds its own.
+    private static BrokerServer.Builder settings(BrokerSettings.DropListener listener) {
         return BrokerServer.builder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .sendBytes(64 * 1024)
@@ -309,8 +396,7 @@ class BrokerDropReportTest {
                 .maxQueuedBytes(1024)
                 .maxQueuedAtMostOnce(2)
                 .maxQueuedAtMostOnceBytes(1024)
-                .dropListener(listener)
-                .start(loopback());
+                .dropListener(listener);
     }
 
     private static InetSocketAddress loopback() {
@@ -345,6 +431,7 @@ class BrokerDropReportTest {
         }
     }
 
-    private record Report(String clientId, long count) {
+    /// One call of the listener; `clientId` is null in a call without a client.
+    private record Report(@Nullable String clientId, long count) {
     }
 }

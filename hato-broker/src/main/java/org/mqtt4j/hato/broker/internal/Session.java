@@ -9,7 +9,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.atomic.AtomicLong;
 
 import org.jspecify.annotations.Nullable;
 
@@ -203,10 +202,10 @@ final class Session {
 
     private long droppedCount;
 
-    // The QoS 1 and 2 deliveries that the limits kept from the session and that the application
-    // has not heard of. The session waits for its report from the first of them until the
-    // listener's thread takes the count.
-    private final AtomicLong unreportedDrops = new AtomicLong();
+    // Where the session counts the QoS 1 and 2 deliveries that the limits keep from it, for the
+    // application to hear of: the count that it got for the first of them since its client's
+    // last report. Null before any, and while the reports have no place for the client.
+    private DropReports.@Nullable Count unreported;
 
     // The connection attached to the session, which publishers and the test controls read.
     volatile @Nullable Connection connection;
@@ -1090,13 +1089,16 @@ final class Session {
 
     // Records under the inbox that the broker's limits kept a delivery at `qos` from the
     // session. The log statement runs without the inbox or topic lock. A QoS 1 or 2 delivery is
-    // also counted for the application, whose listener hears of the session's count on a thread
-    // of its own.
+    // also counted for the application, whose listener hears of the client's count on a thread
+    // of its own. The session adds to the count that it has; once the report has taken that
+    // one, or if it has none, it gets the next from the reports.
     private void dropped(Qos qos, String cause) {
         DropReports reports = routing.dropReports;
-        if (qos != Qos.AT_MOST_ONCE && reports != null
-                && unreportedDrops.getAndIncrement() == 0) {
-            reports.add(this);
+        if (qos != Qos.AT_MOST_ONCE && reports != null) {
+            DropReports.Count count = unreported;
+            if (count == null || !count.add()) {
+                unreported = reports.add(clientId);
+            }
         }
         droppedCount++;
         if (dropCause == null && !routing.closed) {
@@ -1131,11 +1133,6 @@ final class Session {
             log.debug("Broker on port {} dropped {} deliveries for client {}; first cause: {}",
                     routing.port, first ? count - 1 : count, clientId, cause);
         }
-    }
-
-    // Takes the QoS 1 and 2 deliveries that the application has not heard of, to report them.
-    long takeUnreportedDrops() {
-        return unreportedDrops.getAndSet(0);
     }
 
     // Attaches `peer`, which a CONNECT accepted, and queues its CONNACK, so that publishers find

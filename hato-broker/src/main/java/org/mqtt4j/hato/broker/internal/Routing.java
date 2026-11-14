@@ -130,7 +130,15 @@ final class Routing {
                 port
         );
         BrokerSettings.DropListener dropListener = settings.dropListener();
-        dropReports = (dropListener == null) ? null : new DropReports(dropListener, port);
+        // The clients that wait for a report of their own are bounded by the sessions that the
+        // broker can have at once. So a client with a session finds a place among them unless
+        // clients that have gone still hold some.
+        long sessions = (long) settings.maxClients() + settings.maxSessions();
+        dropReports = (dropListener == null) ? null : new DropReports(
+                dropListener,
+                port,
+                (int) Math.min(sessions, Integer.MAX_VALUE)
+        );
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
         int workers = settings.actors();

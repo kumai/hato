@@ -74,13 +74,19 @@ record BrokerSettings(
 ) {
 
     // What the application runs to learn that the broker's limits have kept QoS 1 or 2
-    // deliveries from a session, which goes on without them: the client identifier, and how
-    // many deliveries since the last call for that session. The calls come one at a time, on a
-    // thread that the broker keeps for them, and may take their time.
-    @FunctionalInterface
+    // deliveries from a client, whose session goes on without them. The calls come one at a
+    // time, on a thread that the broker keeps for them, and may take their time. Meanwhile the
+    // broker counts on, for each client by its identifier; once it counts for as many clients
+    // as it may have clients and persistent sessions together, it counts for further ones
+    // without their identifiers.
     interface DropListener {
 
+        // The client `clientId` has lost `count` deliveries since the last call for it.
         void dropped(String clientId, long count);
+
+        // Clients that the broker does not name have lost `count` deliveries since the last
+        // such call: those whose identifiers it could not keep while the listener was behind.
+        void droppedUnattributed(long count);
     }
 
     // What a test runs before each attempt to accept a connection.
