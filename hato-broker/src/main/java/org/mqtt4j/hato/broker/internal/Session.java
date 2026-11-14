@@ -1033,10 +1033,12 @@ final class Session {
     private boolean makeRoom(RetainedMessages.Message message) {
         long needed = message.memory().bytes();
         while (!message.memory().hold(routing.memory)) {
-            if (retainedWithRoom == 0 || !routing.memory.mightFit(needed, retainedWithRoom)) {
+            // Each turn drops one that waits with room, so the search ends with them at the
+            // latest, whatever the counts say.
+            if (!routing.memory.mightFit(needed, retainedWithRoom)
+                    || !dropOldestRetainedWithRoom()) {
                 return false;
             }
-            dropOldestRetainedWithRoom();
         }
         withRoom++;
         retainedWithRoom += needed;
@@ -1045,16 +1047,17 @@ final class Session {
 
     // Drops the oldest retained message that waits with room in the broker's memory: the next
     // one of the first cursor that has such a one, because the cursors take their room in the
-    // order in which their messages go out. Called only while one has room.
-    private void dropOldestRetainedWithRoom() {
+    // order in which their messages go out. Returns false if none waits with room.
+    private boolean dropOldestRetainedWithRoom() {
         for (RetainedCursor cursor : cursors) {
             if (cursor.hasNext() && cursor.nextHasRoom()) {
                 Qos qos = cursor.nextQos();
                 pass(cursor);
                 dropped(qos, MEMORY_USED_UP);
-                return;
+                return true;
             }
         }
+        return false;
     }
 
     // Whether `delivery` is larger than the send queue or, if acknowledged, the window ever
