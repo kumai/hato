@@ -128,7 +128,7 @@ class ReleaseBundleTest {
 
     private static Map<String, byte[]> completeBundle() {
         var files = new LinkedHashMap<String, byte[]>();
-        for (String module : List.of("hato-client", "hato-broker", "hato-testkit")) {
+        for (String module : List.of("hato", "hato-client", "hato-testkit")) {
             for (String suffix : ARTIFACT_SUFFIXES) {
                 String name = "org/mqtt4j/%s/0.3.0/%s-0.3.0%s".formatted(module, module, suffix);
                 byte[] content = name.getBytes(UTF_8);

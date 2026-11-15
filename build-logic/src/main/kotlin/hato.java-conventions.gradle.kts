@@ -102,6 +102,11 @@ testing {
             dependencies {
                 implementation(project())
             }
+        }
+
+        // Every suite but the unit tests is of that kind: integrationTest, and the suites that a
+        // project adds for such tests that need settings of their own.
+        matching { it.name != "test" }.withType<JvmTestSuite>().configureEach {
             targets.configureEach {
                 testTask.configure {
                     shouldRunAfter(tasks.named("test"))
@@ -114,6 +119,13 @@ testing {
                         "hato.docker.required",
                         providers.gradleProperty("hato.docker.required").orElse("true").get()
                     )
+                }
+            }
+        }
+
+        named<JvmTestSuite>("integrationTest") {
+            targets.configureEach {
+                testTask.configure {
                     filter {
                         when (interop) {
                             null -> {}
@@ -134,7 +146,7 @@ testing {
 }
 
 tasks.named("check") {
-    dependsOn(testing.suites.named("integrationTest"))
+    dependsOn(testing.suites.matching { it.name != "test" })
 }
 
 // Tests run on the toolchain's JDK unless -Phato.testJava=<release> names another one. CI uses it

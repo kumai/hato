@@ -1,15 +1,6 @@
-/// The Hato client. Applications see only the exported packages; everything else is internal
-/// and may change without notice.
+/// The client's module name of Hato 1.0, kept for applications that require it. It holds no
+/// classes: the client lives in the module `org.mqtt4j.hato`, which this module requires
+/// transitively.
 module org.mqtt4j.hato.client {
-    // Nullness annotations are compile-time only. Never 'transitive': that would force module-path
-    // consumers to have org.jspecify at compile time.
-    requires static org.jspecify;
-
-    // WebSocket transports use the JDK's HTTP client.
-    requires java.net.http;
-
-    // The embedded log looks for a logging bridge that the JDK's own search cannot reach.
-    uses java.lang.System.LoggerFinder;
-
-    exports org.mqtt4j.hato;
+    requires transitive org.mqtt4j.hato;
 }

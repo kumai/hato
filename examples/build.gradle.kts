@@ -8,8 +8,7 @@ plugins {
 description = "Usage examples. Not published."
 
 dependencies {
-    implementation(project(":hato-client"))
-    implementation(project(":hato-broker"))
+    implementation(project(":hato"))
     implementation(libs.micrometer.core)
 }
 

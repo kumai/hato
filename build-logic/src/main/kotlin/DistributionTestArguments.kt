@@ -8,11 +8,11 @@ abstract class DistributionTestArguments : CommandLineArgumentProvider {
     // Byte-for-byte jar contents matter here, including metadata, sources, and entry names.
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.NONE)
-    abstract val clientJar: ConfigurableFileCollection
+    abstract val hatoJar: ConfigurableFileCollection
 
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.NONE)
-    abstract val brokerJar: ConfigurableFileCollection
+    abstract val clientAliasJar: ConfigurableFileCollection
 
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.NONE)
@@ -35,8 +35,8 @@ abstract class DistributionTestArguments : CommandLineArgumentProvider {
     abstract val publicationMetadata: ConfigurableFileCollection
 
     override fun asArguments(): Iterable<String> = listOf(
-        "-Dclient.jar=${clientJar.singleFile.absolutePath}",
-        "-Dbroker.jar=${brokerJar.singleFile.absolutePath}",
+        "-Dhato.jar=${hatoJar.singleFile.absolutePath}",
+        "-Dclient.alias.jar=${clientAliasJar.singleFile.absolutePath}",
         "-Dtestkit.jars=${testkitJars.asPath}",
         "-Dsource.jars=${sourceJars.asPath}",
         "-Djavadoc.jars=${javadocJars.asPath}",

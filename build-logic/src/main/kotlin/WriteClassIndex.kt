@@ -1,6 +1,7 @@
 import org.gradle.api.DefaultTask
 import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.provider.MapProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.CacheableTask
 import org.gradle.api.tasks.Input
@@ -11,8 +12,9 @@ import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
 
 /**
- * Writes the binary name of every class in the compiled classes, one per line in sorted order, as
- * a resource that the library reads at run time. Module and package descriptors are left out.
+ * Writes indexes of the compiled classes as resources that the library reads at run time. Each
+ * index holds the binary name of every class outside its excluded packages, one per line in sorted
+ * order. Module and package descriptors are left out.
  */
 @CacheableTask
 abstract class WriteClassIndex : DefaultTask() {
@@ -20,9 +22,16 @@ abstract class WriteClassIndex : DefaultTask() {
     @get:PathSensitive(PathSensitivity.RELATIVE)
     abstract val classDirectories: ConfigurableFileCollection
 
-    /** The index's resource path, for example `org/mqtt4j/hato/client/internal/classes.txt`. */
+    /** The resource directory of the indexes, for example `org/mqtt4j/hato/internal/concurrent`. */
     @get:Input
-    abstract val resourcePath: Property<String>
+    abstract val resourceDirectory: Property<String>
+
+    /**
+     * The file name of each index, and the package prefixes whose classes it leaves out, for
+     * example `org.mqtt4j.hato.broker.`.
+     */
+    @get:Input
+    abstract val indexes: MapProperty<String, List<String>>
 
     @get:OutputDirectory
     abstract val outputDirectory: DirectoryProperty
@@ -39,8 +48,11 @@ abstract class WriteClassIndex : DefaultTask() {
         }
         val root = outputDirectory.get().asFile
         root.deleteRecursively()
-        val index = root.resolve(resourcePath.get())
-        index.parentFile.mkdirs()
-        index.writeText(names.joinToString("") { "$it\n" })
+        val directory = root.resolve(resourceDirectory.get())
+        directory.mkdirs()
+        for ((file, excluded) in indexes.get()) {
+            val included = names.filter { name -> excluded.none { name.startsWith(it) } }
+            directory.resolve(file).writeText(included.joinToString("") { "$it\n" })
+        }
     }
 }

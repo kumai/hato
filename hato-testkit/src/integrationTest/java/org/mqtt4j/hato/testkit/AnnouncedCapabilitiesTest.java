@@ -8,16 +8,16 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.broker.MqttBroker;
-import org.mqtt4j.hato.testkit.internal.common.io.FrameReader;
-import org.mqtt4j.hato.testkit.internal.common.io.FrameWriter;
-import org.mqtt4j.hato.testkit.internal.common.protocol.Packet;
-import org.mqtt4j.hato.testkit.internal.common.protocol.PacketCodec;
-import org.mqtt4j.hato.testkit.internal.common.protocol.Properties;
-import org.mqtt4j.hato.testkit.internal.common.protocol.Property;
-import org.mqtt4j.hato.testkit.internal.common.protocol.PropertyId;
-import org.mqtt4j.hato.testkit.internal.common.value.MqttVersion;
+import org.mqtt4j.hato.internal.io.FrameReader;
+import org.mqtt4j.hato.internal.io.FrameWriter;
+import org.mqtt4j.hato.internal.protocol.Packet;
+import org.mqtt4j.hato.internal.protocol.PacketCodec;
+import org.mqtt4j.hato.internal.protocol.Properties;
+import org.mqtt4j.hato.internal.protocol.Property;
+import org.mqtt4j.hato.internal.protocol.PropertyId;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;

@@ -1,4 +1,4 @@
-// Conventions for the published library modules: hato-client, hato-broker, and hato-testkit.
+// Conventions for the published library modules: hato, hato-client, and hato-testkit.
 
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.language.base.plugins.LifecycleBasePlugin

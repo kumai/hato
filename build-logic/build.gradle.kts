@@ -8,11 +8,4 @@ fun plugin(plugin: Provider<PluginDependency>) =
 
 dependencies {
     implementation(plugin(libs.plugins.errorprone))
-
-    testImplementation(libs.junit.jupiter)
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-}
-
-tasks.test {
-    useJUnitPlatform()
 }

@@ -40,8 +40,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class DistributionTest {
 
-    private static final Path CLIENT = Path.of(System.getProperty("client.jar"));
-    private static final Path BROKER = Path.of(System.getProperty("broker.jar"));
+    private static final Path HATO = Path.of(System.getProperty("hato.jar"));
+    // The module name of the client of Hato 1.0, which holds no class and requires Hato.
+    private static final Path CLIENT_ALIAS = Path.of(System.getProperty("client.alias.jar"));
     private static final String TESTKIT_JARS = System.getProperty("testkit.jars");
     private static final String CLIENT_PROBE = """
             if (org.mqtt4j.hato.MqttVersion.V3_1_1.protocolLevel() != 4
@@ -329,57 +330,67 @@ class DistributionTest {
     Path temporaryDirectory;
 
     @Test
-    void client_runs_with_only_its_distributed_jar() throws Exception {
-        runClasspathProbe("client", CLIENT.toString(), CLIENT_PROBE);
-    }
-
-    @Test
-    void broker_runs_with_only_its_distributed_jar() throws Exception {
-        runClasspathProbe("broker", BROKER.toString(), BROKER_PROBE);
-    }
-
-    @Test
-    void client_and_broker_can_share_a_classpath() throws Exception {
+    void client_and_broker_run_with_only_the_hato_jar() throws Exception {
         runClasspathProbe(
-                "both",
-                CLIENT + File.pathSeparator + BROKER,
+                "classpath",
+                HATO.toString(),
                 CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE
         );
     }
 
     @Test
-    void client_runs_as_a_standalone_named_module() throws Exception {
+    void client_and_broker_run_as_one_named_module() throws Exception {
+        runModuleProbe(
+                "module",
+                HATO.toString(),
+                List.of("org.mqtt4j.hato"),
+                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE
+        );
+    }
+
+    @Test
+    void an_application_that_uses_only_the_client_loads_no_broker_class() throws Exception {
+        // Arrange
+        Path root = temporaryDirectory.resolve("clientOnly");
+        Path source = write(root.resolve("src/probe/Probe.java"), probeSource(CLIENT_PROBE));
+        Path classes = Files.createDirectories(root.resolve("classes"));
+        succeed(root, "javac", "-cp", HATO.toString(), "-d", classes.toString(), source.toString());
+        // Act
+        ProcessResult result = execute(
+                root,
+                "java",
+                "-Xlog:class+load=info",
+                "-cp",
+                classes + File.pathSeparator + HATO,
+                "probe.Probe"
+        );
+        // Assert: the client loaded its classes ahead of use, its actor among them, and none of
+        // the broker's.
+        assertThat(result.exitCode()).as(result.output()).isZero();
+        assertThat(result.output())
+                .contains("OK")
+                .contains("org.mqtt4j.hato.client.internal.ClientActor ")
+                .doesNotContain("org.mqtt4j.hato.broker.");
+    }
+
+    @Test
+    void applications_that_require_the_client_module_run_on_the_hato_jar() throws Exception {
         runModuleProbe(
                 "clientModule",
-                CLIENT.toString(),
+                CLIENT_ALIAS + File.pathSeparator + HATO,
                 List.of("org.mqtt4j.hato.client"),
+                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE
+        );
+        runClasspathProbe(
+                "clientClasspath",
+                CLIENT_ALIAS + File.pathSeparator + HATO,
                 CLIENT_PROBE
         );
     }
 
     @Test
-    void broker_runs_as_a_standalone_named_module() throws Exception {
-        runModuleProbe(
-                "brokerModule",
-                BROKER.toString(),
-                List.of("org.mqtt4j.hato.broker"),
-                BROKER_PROBE
-        );
-    }
-
-    @Test
-    void client_and_broker_connect_as_independent_named_modules() throws Exception {
-        runModuleProbe(
-                "bothModules",
-                CLIENT + File.pathSeparator + BROKER,
-                List.of("org.mqtt4j.hato.client", "org.mqtt4j.hato.broker"),
-                CONNECTION_PROBE
-        );
-    }
-
-    @Test
-    void testkit_resolves_both_independent_modules_transitively() throws Exception {
-        assertThat(paths(TESTKIT_JARS)).hasSize(3);
+    void testkit_resolves_hato_transitively() throws Exception {
+        assertThat(paths(TESTKIT_JARS)).hasSize(2);
         runModuleProbe("testkitModule", TESTKIT_JARS, List.of("org.mqtt4j.hato.testkit"),
                 CLIENT_PROBE + CONNECTION_PROBE + """
                 var scheduler = new org.mqtt4j.hato.testkit.ManualTimerScheduler();
@@ -389,11 +400,27 @@ class DistributionTest {
                 if (!ran.get()) {
                     throw new AssertionError("Public timer SPI is not usable");
                 }
-                if (ModuleLayer.boot().findModule("org.mqtt4j.hato.client").isEmpty()
-                        || ModuleLayer.boot().findModule("org.mqtt4j.hato.broker").isEmpty()) {
-                    throw new AssertionError("Testkit did not resolve both libraries");
+                if (ModuleLayer.boot().findModule("org.mqtt4j.hato").isEmpty()) {
+                    throw new AssertionError("Testkit did not resolve Hato");
                 }
                 """);
+    }
+
+    @Test
+    void testkit_works_for_applications_that_require_the_client_module() throws Exception {
+        runModuleProbe(
+                "testkitClientModule",
+                CLIENT_ALIAS + File.pathSeparator + TESTKIT_JARS,
+                List.of("org.mqtt4j.hato.client", "org.mqtt4j.hato.testkit"),
+                CONNECTION_PROBE + """
+                try (var broker = org.mqtt4j.hato.broker.MqttBroker.start()) {
+                    var controls = org.mqtt4j.hato.testkit.BrokerControls.of(broker);
+                    if (!controls.connectedClients().isEmpty()) {
+                        throw new AssertionError("A new broker has connected clients");
+                    }
+                }
+                """
+        );
     }
 
     @Test
@@ -436,78 +463,76 @@ class DistributionTest {
     }
 
     @Test
-    void named_modules_may_look_for_a_logging_bridge() throws Exception {
-        for (Path jar : List.of(CLIENT, BROKER, testkitJar())) {
-            ModuleDescriptor descriptor = ModuleFinder.of(jar).findAll().iterator().next()
-                    .descriptor();
-            assertThat(descriptor.uses())
-                    .as("Services of %s", jar)
-                    .containsExactly("java.lang.System$LoggerFinder");
-        }
+    void the_hato_module_may_look_for_a_logging_bridge() throws Exception {
+        assertThat(descriptor(HATO).uses()).containsExactly("java.lang.System$LoggerFinder");
     }
 
     @Test
-    void embedded_packages_are_disjoint_and_unexported() throws Exception {
+    void hato_holds_the_shared_code_once_and_exports_no_internal_package() throws Exception {
         Path testkit = testkitJar();
-        Set<String> clientClasses = classEntries(CLIENT);
-        Set<String> brokerClasses = classEntries(BROKER);
-        Set<String> testkitClasses = classEntries(testkit);
+        Set<String> hatoClasses = classEntries(HATO);
         for (String type : List.of("MqttVersion", "Qos", "ReasonCode", "Topic", "TopicFilter")) {
-            assertThat(clientClasses).contains("org/mqtt4j/hato/" + type + ".class");
-            assertThat(clientClasses)
+            assertThat(hatoClasses)
+                    .contains("org/mqtt4j/hato/" + type + ".class")
                     .noneMatch(name -> name.endsWith("/value/" + type + ".class"));
-            assertThat(brokerClasses)
-                    .contains("org/mqtt4j/hato/broker/internal/common/value/" + type + ".class");
-            assertThat(testkitClasses)
-                    .contains("org/mqtt4j/hato/testkit/internal/common/value/" + type + ".class");
         }
-        for (Path jar : List.of(CLIENT, BROKER, testkit)) {
-            assertThat(classEntries(jar))
-                    .contains("org/mqtt4j/hato/" + ownerOf(jar) + "/internal/common/log/Log.class")
-                    .noneMatch(name -> name.endsWith("/ProtocolVersion.class"));
-        }
-        assertThat(clientClasses).doesNotContainAnyElementsOf(brokerClasses);
-        assertThat(clientClasses).doesNotContainAnyElementsOf(testkitClasses);
-        assertThat(brokerClasses).doesNotContainAnyElementsOf(testkitClasses);
+        assertThat(hatoClasses)
+                .contains("org/mqtt4j/hato/internal/log/Log.class")
+                .noneMatch(name -> name.contains("/common/")
+                        || name.endsWith("/ProtocolVersion.class"));
+        // The test kit holds only its own classes, and the client's module name holds none.
+        assertThat(classEntries(testkit))
+                .isNotEmpty()
+                .allMatch(name -> name.startsWith("org/mqtt4j/hato/testkit/"));
+        assertThat(classEntries(CLIENT_ALIAS)).isEmpty();
 
-        for (Path jar : List.of(CLIENT, BROKER, testkit)) {
-            ModuleDescriptor descriptor = ModuleFinder.of(jar).findAll().iterator().next()
-                    .descriptor();
+        for (Path jar : List.of(HATO, CLIENT_ALIAS, testkit)) {
+            ModuleDescriptor descriptor = descriptor(jar);
             assertThat(descriptor.isAutomatic()).isFalse();
             assertThat(descriptor.isOpen()).isFalse();
             assertThat(descriptor.opens()).isEmpty();
-            assertThat(descriptor.requires()).allMatch(r -> r.name().startsWith("java.")
-                    || (jar.equals(testkit) && r.name().startsWith("org.mqtt4j.hato."))
-                    || isCompileTimeOnlyAnnotations(r));
-            assertThat(descriptor.requires())
-                    .anyMatch(DistributionTest::isCompileTimeOnlyAnnotations);
             assertThat(descriptor.exports())
                     .filteredOn(e -> !e.isQualified())
                     .noneMatch(e -> List.of(e.source().split("\\.")).contains("internal"));
-            // The one export to a single module: the broker's test controls, for the testkit.
-            assertThat(descriptor.exports())
-                    .filteredOn(ModuleDescriptor.Exports::isQualified)
-                    .extracting(e -> e.source() + " to " + e.targets())
-                    .containsExactlyElementsOf(jar.equals(BROKER)
-                            ? List.of("org.mqtt4j.hato.broker.internal.control"
-                                    + " to [org.mqtt4j.hato.testkit]")
-                            : List.of());
-            assertThat(descriptor.packages())
-                    .noneMatch(p -> p.startsWith("org.mqtt4j.hato.common"));
         }
+        assertThat(descriptor(HATO).requires())
+                .allMatch(r -> r.name().startsWith("java.") || isCompileTimeOnlyAnnotations(r))
+                .anyMatch(DistributionTest::isCompileTimeOnlyAnnotations);
+        assertThat(descriptor(testkit).requires())
+                .allMatch(r -> r.name().startsWith("java.")
+                        || isCompileTimeOnlyAnnotations(r)
+                        || requiresHatoTransitively(r))
+                .anyMatch(DistributionTest::isCompileTimeOnlyAnnotations)
+                .anyMatch(DistributionTest::requiresHatoTransitively);
+        assertThat(descriptor(CLIENT_ALIAS).requires())
+                .allMatch(r -> r.name().startsWith("java.") || requiresHatoTransitively(r))
+                .anyMatch(DistributionTest::requiresHatoTransitively);
+        // The exports to a single module: the broker's test controls and the log, for the testkit.
+        assertThat(descriptor(HATO).exports())
+                .filteredOn(ModuleDescriptor.Exports::isQualified)
+                .extracting(e -> e.source() + " to " + e.targets())
+                .containsExactlyInAnyOrder(
+                        "org.mqtt4j.hato.broker.internal.control to [org.mqtt4j.hato.testkit]",
+                        "org.mqtt4j.hato.internal.log to [org.mqtt4j.hato.testkit]"
+                );
+        assertThat(descriptor(testkit).exports()).noneMatch(ModuleDescriptor.Exports::isQualified);
 
         Path root = temporaryDirectory.resolve("privateApi");
         Path descriptor = write(
                 root.resolve("src/module-info.java"),
-                "module probe { requires org.mqtt4j.hato.client; requires org.mqtt4j.hato.broker; "
-                        + "requires org.mqtt4j.hato.testkit; }"
+                "module probe { requires org.mqtt4j.hato; requires org.mqtt4j.hato.testkit; }"
         );
-        for (String owner : List.of("client", "broker", "testkit")) {
+        for (String type : List.of(
+                "org.mqtt4j.hato.internal.log.Log",
+                "org.mqtt4j.hato.client.internal.ClientActor",
+                "org.mqtt4j.hato.broker.internal.BrokerServer",
+                "org.mqtt4j.hato.broker.internal.control.ControlPort"
+        )) {
             Path source = write(root.resolve("src/probe/Probe.java"), """
                     package probe;
-                    import org.mqtt4j.hato.%s.internal.common.log.Log;
-                    public class Probe { Log value; }
-                    """.formatted(owner));
+                    import %s;
+                    public class Probe { %s value; }
+                    """.formatted(type, type.substring(type.lastIndexOf('.') + 1)));
             ProcessResult result = execute(
                     root,
                     "javac",
@@ -519,33 +544,15 @@ class DistributionTest {
                     descriptor.toString(),
                     source.toString()
             );
-            assertThat(result.exitCode()).isNotZero();
-            assertThat(result.output()).contains("compiler.err.package.not.visible");
+            assertThat(result.exitCode()).as(type).isNotZero();
+            assertThat(result.output()).as(type).contains("compiler.err.package.not.visible");
         }
-        Path controls = write(root.resolve("src/probe/Probe.java"), """
-                package probe;
-                import org.mqtt4j.hato.broker.internal.control.ControlPort;
-                public class Probe { ControlPort value; }
-                """);
-        ProcessResult result = execute(
-                root,
-                "javac",
-                "-XDrawDiagnostics",
-                "--module-path",
-                TESTKIT_JARS,
-                "-d",
-                root.resolve("classes").toString(),
-                descriptor.toString(),
-                controls.toString()
-        );
-        assertThat(result.exitCode()).isNotZero();
-        assertThat(result.output()).contains("compiler.err.package.not.visible");
     }
 
     @Test
     void each_jar_exports_exactly_the_types_of_its_public_api() throws Exception {
         // A change here is a change to the public API; update the list only on purpose.
-        assertThat(publicTypes(CLIENT)).containsExactlyInAnyOrder(
+        assertThat(publicTypes(HATO)).containsExactlyInAnyOrder(
                 "org.mqtt4j.hato.AckMode",
                 "org.mqtt4j.hato.CapacityLimit",
                 "org.mqtt4j.hato.ClientStats",
@@ -603,9 +610,10 @@ class DistributionTest {
                 "org.mqtt4j.hato.Transport$Factory",
                 "org.mqtt4j.hato.Transport$Listener",
                 "org.mqtt4j.hato.Transport$SendResult",
-                "org.mqtt4j.hato.UserProperty"
+                "org.mqtt4j.hato.UserProperty",
+                "org.mqtt4j.hato.broker.MqttBroker"
         );
-        assertThat(publicTypes(BROKER)).containsExactly("org.mqtt4j.hato.broker.MqttBroker");
+        assertThat(publicTypes(CLIENT_ALIAS)).isEmpty();
         assertThat(publicTypes(testkitJar())).containsExactlyInAnyOrder(
                 "org.mqtt4j.hato.testkit.BrokerCapabilities",
                 "org.mqtt4j.hato.testkit.BrokerControls",
@@ -667,7 +675,7 @@ class DistributionTest {
     })
     void evolving_value_types_are_final_classes_with_private_constructors(String type)
             throws Exception {
-        try (var archive = new JarFile(CLIENT.toFile())) {
+        try (var archive = new JarFile(HATO.toFile())) {
             JarEntry entry = archive.getJarEntry("org/mqtt4j/hato/" + type + ".class");
             assertThat(entry).as(type).isNotNull();
             ClassModel model = ClassFile.of().parse(archive.getInputStream(entry).readAllBytes());
@@ -682,28 +690,20 @@ class DistributionTest {
     }
 
     @Test
-    void source_jars_match_the_embedded_packages() throws Exception {
+    void source_jars_hold_the_source_of_every_class() throws Exception {
         for (Path path : paths(System.getProperty("source.jars"))) {
-            String owner = ownerOf(path);
+            // A class file of a top-level type, module and package descriptors included, comes
+            // from the source file of the same name.
+            Set<String> expected = classEntries(libraryOf(path)).stream()
+                    .filter(name -> !name.contains("$"))
+                    .map(name -> name.substring(0, name.length() - ".class".length()) + ".java")
+                    .collect(Collectors.toCollection(HashSet::new));
+            expected.add("module-info.java");
             try (var archive = new ZipFile(path.toFile())) {
-                String valuePackage = owner.equals("client") ? "org.mqtt4j.hato"
-                        : "org.mqtt4j.hato." + owner + ".internal.common.value";
-                for (String type : List.of(
-                        "MqttVersion",
-                        "Qos",
-                        "ReasonCode",
-                        "Topic",
-                        "TopicFilter"
-                )) {
-                    String name = valuePackage.replace('.', '/') + "/" + type + ".java";
-                    ZipEntry entry = archive.getEntry(name);
-                    assertThat(entry).as("%s in %s", name, path).isNotNull();
-                    var source = new String(archive.getInputStream(entry).readAllBytes(), UTF_8);
-                    assertThat(source).contains("package " + valuePackage + ";");
-                    assertThat(source).doesNotContain("org.mqtt4j.hato.common");
-                }
-                assertThat(archive.stream().map(e -> e.getName()))
-                        .noneMatch(name -> name.startsWith("org/mqtt4j/hato/common/"));
+                assertThat(archive.stream().map(ZipEntry::getName))
+                        .as("Sources in %s", path)
+                        .filteredOn(name -> name.endsWith(".java"))
+                        .containsExactlyInAnyOrderElementsOf(expected);
             }
         }
     }
@@ -733,10 +733,10 @@ class DistributionTest {
                             .item(0).getTextContent());
                 }
                 if (document.getDocumentElement().getElementsByTagName("artifactId")
-                        .item(0).getTextContent().equals("hato-testkit")) {
-                    assertThat(artifacts).containsExactlyInAnyOrder("hato-client", "hato-broker");
-                } else {
+                        .item(0).getTextContent().equals("hato")) {
                     assertThat(artifacts).isEmpty();
+                } else {
+                    assertThat(artifacts).containsExactly("hato");
                 }
             } else {
                 List<String> groups = Pattern.compile("\"group\"\\s*:\\s*\"([^\"]+)\"")
@@ -751,15 +751,12 @@ class DistributionTest {
                         .map(m -> m.group(1))
                         .toList();
                 assertThat(modules).isNotEmpty();
-                if (modules.getFirst().equals("hato-testkit")) {
-                    assertThat(new HashSet<>(modules)).containsExactlyInAnyOrder(
-                            "hato-testkit",
-                            "hato-client",
-                            "hato-broker"
-                    );
-                } else {
+                if (modules.getFirst().equals("hato")) {
                     // No published variant may acquire a dependency, including an internal one.
                     assertThat(contents).doesNotContain("\"dependencies\"");
+                } else {
+                    assertThat(new HashSet<>(modules))
+                            .containsExactlyInAnyOrder(modules.getFirst(), "hato");
                 }
             }
         }
@@ -795,22 +792,17 @@ class DistributionTest {
                         .isNotBlank();
             }
         }
-        assertThat(artifacts)
-                .containsExactlyInAnyOrder("hato-client", "hato-broker", "hato-testkit");
+        assertThat(artifacts).containsExactlyInAnyOrder("hato", "hato-client", "hato-testkit");
     }
 
     @Test
     void javadoc_jars_document_only_the_public_api_in_english() throws Exception {
         List<Path> javadocs = paths(System.getProperty("javadoc.jars"));
         assertThat(javadocs).extracting(DistributionTest::ownerOf)
-                .containsExactlyInAnyOrder("client", "broker", "testkit");
+                .containsExactlyInAnyOrder("hato", "client", "testkit");
         for (Path javadoc : javadocs) {
-            Path library = List.of(CLIENT, BROKER, testkitJar()).stream()
-                    .filter(path -> ownerOf(path).equals(ownerOf(javadoc)))
-                    .findFirst()
-                    .orElseThrow();
-            ModuleDescriptor descriptor = ModuleFinder.of(library).findAll().iterator().next()
-                    .descriptor();
+            Path library = libraryOf(javadoc);
+            ModuleDescriptor descriptor = descriptor(library);
             String modulePrefix = descriptor.name() + "/";
             Set<String> packages = descriptor.exports().stream()
                     .filter(export -> !export.isQualified())
@@ -857,8 +849,8 @@ class DistributionTest {
         byte[] license = Files.readAllBytes(Path.of(System.getProperty("repository.license")));
         List<Path> sources = paths(System.getProperty("source.jars"));
         assertThat(sources).extracting(DistributionTest::ownerOf)
-                .containsExactlyInAnyOrder("client", "broker", "testkit");
-        var archives = new ArrayList<>(List.of(CLIENT, BROKER, testkitJar()));
+                .containsExactlyInAnyOrder("hato", "client", "testkit");
+        var archives = new ArrayList<>(List.of(HATO, CLIENT_ALIAS, testkitJar()));
         archives.addAll(sources);
         for (Path path : archives) {
             try (var archive = new ZipFile(path.toFile())) {
@@ -973,8 +965,7 @@ class DistributionTest {
     private static List<String> applicationPaths(Path root) {
         return List.of(
                 root.resolve("application").toString(),
-                CLIENT.toString(),
-                BROKER.toString(),
+                HATO.toString(),
                 root.resolve("bridge").toString()
         );
     }
@@ -1074,6 +1065,18 @@ class DistributionTest {
                 && !requires.modifiers().contains(ModuleDescriptor.Requires.Modifier.TRANSITIVE);
     }
 
+    /// The test kit and the client's module name hand Hato on to the modules that require them.
+    private static boolean requiresHatoTransitively(ModuleDescriptor.Requires requires) {
+        return requires.name().equals("org.mqtt4j.hato")
+                && requires.modifiers().equals(
+                        Set.of(ModuleDescriptor.Requires.Modifier.TRANSITIVE)
+                );
+    }
+
+    private static ModuleDescriptor descriptor(Path jar) {
+        return ModuleFinder.of(jar).findAll().iterator().next().descriptor();
+    }
+
     private static Path testkitJar() {
         return paths(TESTKIT_JARS).stream()
                 .filter(path -> path.getFileName().toString().startsWith("hato-testkit"))
@@ -1081,12 +1084,27 @@ class DistributionTest {
                 .orElseThrow();
     }
 
+    /// The runtime jar that a sources or javadoc jar belongs to.
+    private static Path libraryOf(Path jar) {
+        return switch (ownerOf(jar)) {
+            case "hato" -> HATO;
+            case "client" -> CLIENT_ALIAS;
+            case "testkit" -> testkitJar();
+            default -> throw new AssertionError("Unexpected jar: " + jar);
+        };
+    }
+
+    /// `hato` for the jar of the client and the broker, `client` for the client's module name,
+    /// and `testkit` for the test kit, by the file name of the jar or of its sources or javadoc.
     private static String ownerOf(Path jar) {
         String name = jar.getFileName().toString();
-        for (String owner : List.of("client", "broker", "testkit")) {
-            if (name.startsWith("hato-" + owner)) {
+        for (String owner : List.of("client", "testkit")) {
+            if (name.startsWith("hato-" + owner + "-")) {
                 return owner;
             }
+        }
+        if (name.matches("hato-\\d.*")) {
+            return "hato";
         }
         throw new AssertionError("Unexpected jar: " + jar);
     }

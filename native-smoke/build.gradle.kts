@@ -7,8 +7,7 @@ plugins {
 description = "GraalVM native-image smoke test: exercises the packaged client and broker. Not published."
 
 dependencies {
-    implementation(project(":hato-client"))
-    implementation(project(":hato-broker"))
+    implementation(project(":hato"))
 }
 
 application {

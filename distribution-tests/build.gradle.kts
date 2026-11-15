@@ -4,13 +4,15 @@ plugins {
 
 description = "Tests the final library jars and their publication metadata. Not published."
 
-val clientJarDependencies = configurations.dependencyScope("clientJarDependencies")
-val clientJar = configurations.resolvable("clientJar") {
-    extendsFrom(clientJarDependencies.get())
+val hatoJarDependencies = configurations.dependencyScope("hatoJarDependencies")
+val hatoJar = configurations.resolvable("hatoJar") {
+    extendsFrom(hatoJarDependencies.get())
 }
-val brokerJarDependencies = configurations.dependencyScope("brokerJarDependencies")
-val brokerJar = configurations.resolvable("brokerJar") {
-    extendsFrom(brokerJarDependencies.get())
+// The client's module name alone, without the hato jar that it depends on.
+val clientAliasJarDependencies = configurations.dependencyScope("clientAliasJarDependencies")
+val clientAliasJar = configurations.resolvable("clientAliasJar") {
+    extendsFrom(clientAliasJarDependencies.get())
+    isTransitive = false
 }
 val testkitJarsDependencies = configurations.dependencyScope("testkitJarsDependencies")
 val testkitJars = configurations.resolvable("testkitJars") {
@@ -38,10 +40,13 @@ val releaseTools = configurations.resolvable("releaseTools") {
 }
 
 dependencies {
-    add(clientJarDependencies.name, project(path = ":hato-client", configuration = "runtimeElements"))
-    add(brokerJarDependencies.name, project(path = ":hato-broker", configuration = "runtimeElements"))
+    add(hatoJarDependencies.name, project(path = ":hato", configuration = "runtimeElements"))
+    add(
+        clientAliasJarDependencies.name,
+        project(path = ":hato-client", configuration = "runtimeElements")
+    )
     add(testkitJarsDependencies.name, project(path = ":hato-testkit", configuration = "runtimeElements"))
-    for (module in listOf("hato-client", "hato-broker", "hato-testkit")) {
+    for (module in listOf("hato", "hato-client", "hato-testkit")) {
         add(sourceJarsDependencies.name, project(path = ":$module", configuration = "sourcesElements"))
         add(javadocJarsDependencies.name, project(path = ":$module", configuration = "javadocElements"))
         add(
@@ -58,8 +63,8 @@ dependencies {
 }
 
 val distributionArguments = objects.newInstance<DistributionTestArguments>().apply {
-    clientJar.from(configurations["clientJar"])
-    brokerJar.from(configurations["brokerJar"])
+    hatoJar.from(configurations["hatoJar"])
+    clientAliasJar.from(configurations["clientAliasJar"])
     testkitJars.from(configurations["testkitJars"])
     sourceJars.from(configurations["sourceJars"])
     javadocJars.from(configurations["javadocJars"])

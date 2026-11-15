@@ -1,0 +1,107 @@
+package org.mqtt4j.hato.client.internal;
+
+import java.time.Duration;
+import java.util.ArrayList;
+
+import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.UserProperty;
+import org.mqtt4j.hato.internal.protocol.MqttString;
+import org.mqtt4j.hato.internal.protocol.Properties;
+import org.mqtt4j.hato.internal.protocol.Property;
+import org.mqtt4j.hato.internal.protocol.PropertyId;
+
+/// Maps the properties of an application message to MQTT 5.0 PUBLISH properties. Topic Alias and
+/// Subscription Identifier steer how the client handles a connection, so a message never carries
+/// them. [MqttMessage] itself maps them back for a received PUBLISH.
+public final class MessageProperties {
+
+    private MessageProperties() {}
+
+    /// Whether `message` has a property that only MQTT 5.0 can carry.
+    public static boolean present(MqttMessage message) {
+        return message.payloadUtf8()
+                || message.messageExpiry().isPresent()
+                || message.contentType().isPresent()
+                || message.responseTopic().isPresent()
+                || !message.userProperties().isEmpty()
+                // Last, because the accessor copies the bytes.
+                || message.correlationData().isPresent();
+    }
+
+    /// The PUBLISH properties of `message`, or [Properties#EMPTY] when it has none.
+    static Properties of(MqttMessage message) {
+        var entries = new ArrayList<Property>();
+        if (message.payloadUtf8()) {
+            entries.add(new Property.ByteValue(PropertyId.PAYLOAD_FORMAT_INDICATOR, 1));
+        }
+        message.messageExpiry().ifPresent(expiry -> entries.add(new Property.FourByteValue(
+                PropertyId.MESSAGE_EXPIRY_INTERVAL,
+                seconds(expiry)
+        )));
+        message.contentType().ifPresent(type -> entries.add(new Property.StringValue(
+                PropertyId.CONTENT_TYPE,
+                type
+        )));
+        message.responseTopic().ifPresent(topic -> entries.add(new Property.StringValue(
+                PropertyId.RESPONSE_TOPIC,
+                topic.name()
+        )));
+        message.correlationData().ifPresent(data -> entries.add(new Property.BinaryValue(
+                PropertyId.CORRELATION_DATA,
+                data
+        )));
+        for (UserProperty property : message.userProperties()) {
+            entries.add(new Property.UserProperty(property.name(), property.value()));
+        }
+        return entries.isEmpty() ? Properties.EMPTY : new Properties(entries);
+    }
+
+    /// The Will Properties of the Will message `will`: its message properties and, unless `delay`
+    /// is zero, a Will Delay Interval rounded up to whole seconds.
+    public static Properties will(MqttMessage will, Duration delay) {
+        Properties properties = of(will);
+        if (delay.isZero()) {
+            return properties;
+        }
+        var entries = new ArrayList<>(properties.entries());
+        entries.add(new Property.FourByteValue(PropertyId.WILL_DELAY_INTERVAL, seconds(delay)));
+        return new Properties(entries);
+    }
+
+    /// The bytes that the payload and the properties of `message` take in a PUBLISH, which bound
+    /// the memory that a waiting publication holds. Saturates at [Integer#MAX_VALUE], which no
+    /// limit admits.
+    static int bodySize(MqttMessage message) {
+        return (int) Math.min((long) message.payloadSize() + size(message), Integer.MAX_VALUE);
+    }
+
+    /// The bytes that the properties of `message` take in a PUBLISH or a Will, without their
+    /// length prefix. Saturates at [Integer#MAX_VALUE], which no limit admits.
+    public static int size(MqttMessage message) {
+        long bytes = 0;
+        // Each property is a one-byte identifier and its value; strings and binary data have
+        // a two-byte length. The strings are counted as the codec counts them, without encoding
+        // them; a message has checked its strings, so counting them does not fail.
+        if (message.payloadUtf8()) {
+            bytes += 2;
+        }
+        if (message.messageExpiry().isPresent()) {
+            bytes += 5;
+        }
+        bytes += message.contentType().map(type -> 1L + MqttString.encodedSize(type)).orElse(0L);
+        bytes += message.responseTopic()
+                .map(topic -> 1L + MqttString.encodedSize(topic.name()))
+                .orElse(0L);
+        bytes += message.correlationData().map(data -> 3L + data.length).orElse(0L);
+        for (UserProperty property : message.userProperties()) {
+            bytes += 1L + MqttString.encodedSize(property.name())
+                    + MqttString.encodedSize(property.value());
+        }
+        return (int) Math.min(bytes, Integer.MAX_VALUE);
+    }
+
+    // Rounding up never shortens the lifetime or the delay that the application asked for.
+    private static long seconds(Duration duration) {
+        return Math.ceilDiv(duration.toNanos(), 1_000_000_000L);
+    }
+}

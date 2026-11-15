@@ -6,10 +6,12 @@ plugins {
     base
 }
 
-val apiDocumentation = listOf("client", "testkit", "broker").associateWith { module ->
+// The directory under api/ for each published module that has classes.
+val apiDocumentation = mapOf("hato" to ":hato", "testkit" to ":hato-testkit").mapValues {
+    (module, path) ->
     val declared = configurations.dependencyScope("${module}ApiDocumentation")
     dependencies {
-        add(declared.name, project(path = ":hato-$module", configuration = "pagesJavadocElements"))
+        add(declared.name, project(path = path, configuration = "pagesJavadocElements"))
     }
     configurations.resolvable("${module}ApiDocumentationFiles") {
         extendsFrom(declared.get())

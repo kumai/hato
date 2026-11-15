@@ -1,0 +1,2655 @@
+package org.mqtt4j.hato.client.internal;
+
+import java.net.URI;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.LongFunction;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+import org.jspecify.annotations.Nullable;
+
+import org.mqtt4j.hato.AckMode;
+import org.mqtt4j.hato.CapacityLimit;
+import org.mqtt4j.hato.ClientStats;
+import org.mqtt4j.hato.ClientStats.ConnectionState;
+import org.mqtt4j.hato.ClientStats.OverloadCause;
+import org.mqtt4j.hato.ConnAck;
+import org.mqtt4j.hato.ConnectionListener;
+import org.mqtt4j.hato.DeliveryOptions;
+import org.mqtt4j.hato.Disconnection;
+import org.mqtt4j.hato.FailurePolicy;
+import org.mqtt4j.hato.MetricsListener;
+import org.mqtt4j.hato.MqttCapacityException;
+import org.mqtt4j.hato.MqttClient;
+import org.mqtt4j.hato.MqttConnectException;
+import org.mqtt4j.hato.MqttConnectionLostException;
+import org.mqtt4j.hato.MqttCredentials;
+import org.mqtt4j.hato.MqttDelivery;
+import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttNotConnectedException;
+import org.mqtt4j.hato.MqttSubscriptionRefusedException;
+import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.PublishResult;
+import org.mqtt4j.hato.PullSubscription;
+import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.ReceiveResult;
+import org.mqtt4j.hato.RetainHandling;
+import org.mqtt4j.hato.Subscribe;
+import org.mqtt4j.hato.Subscription;
+import org.mqtt4j.hato.TimerScheduler;
+import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.Transport;
+import org.mqtt4j.hato.internal.concurrent.CarrierShare;
+import org.mqtt4j.hato.internal.concurrent.TimerService;
+import org.mqtt4j.hato.internal.io.SendQueue;
+import org.mqtt4j.hato.internal.log.Log;
+import org.mqtt4j.hato.internal.protocol.Packet;
+import org.mqtt4j.hato.internal.protocol.PacketCodec;
+
+import static java.util.Objects.requireNonNull;
+
+/// Serializes protocol decisions, isolating application continuations and listeners from I/O.
+/// API methods run on their callers; the core runs on the actor. A separate sender prepares
+/// publication payloads and starts writes without blocking protocol decisions.
+///
+/// The actor is whichever thread runs the mailbox's events, one at a time: the actor thread, or
+/// the thread that reads the connection, the sender, or a thread of the delivery lanes' own when
+/// it brings events while no other thread runs them; see [Mailbox]. A thread that publishes
+/// while the client has nothing else to do runs its own publication alone. What only the actor
+/// touches is therefore touched by one thread at a time.
+public final class ClientActor implements MqttClient {
+
+    private static final Log log = Log.of(ClientActor.class);
+
+    // Pending observations beyond those that the subscriptions have room for.
+    private static final int CLIENT_WAITER_LIMIT = 1024;
+
+    // Each subscription has room to observe its establishment, its removal, and its termination
+    // at once, so waiting for every subscription never meets the limit.
+    private static final int WAITERS_PER_SUBSCRIPTION = 3;
+
+    // Connection notifications waiting for the listener, excluding the one running. Attempt
+    // numbers reveal what a listener that fell this far behind has lost.
+    private static final int LISTENER_QUEUE_LIMIT = 64;
+
+    // Timings waiting for the metrics listener, excluding the one running. They come as often as
+    // publications and deliveries, so more of them wait than connection notifications.
+    private static final int METRICS_QUEUE_LIMIT = 1024;
+
+    // A burst, such as retained messages on subscribe, can arrive faster than the actor routes
+    // it, so most of it may wait here. This count bounds per-packet overhead (about 190 bytes
+    // each when measured); the byte limit bounds the packets themselves, with the allowance for
+    // their properties (ClientIo.PROPERTY_COST). QoS 0 publications have a second allowance of
+    // both sizes, and what does not fit it is dropped rather than ending the connection.
+    private static final int MAILBOX_INCOMING_LIMIT = 65_536;
+
+    private static final int MAILBOX_COMMAND_BYTE_LIMIT = 32 * 1024 * 1024;
+
+    private static final int RECEIVE_BYTE_LIMIT = 32 * 1024 * 1024;
+
+    // The QoS 0 publications in one run at most. The limit bounds how long the first of them
+    // waits for its lanes, how long the lanes' lock is held for them, and how long a keep-alive
+    // event waits behind them.
+    private static final int RUN_LIMIT = 64;
+
+    // How long close() and the end of the actor give the logging backend to take what was logged
+    // until then. A backend that needs longer is one that the client must not wait for.
+    private static final Duration LOG_WAIT = Duration.ofSeconds(1);
+
+    private final URI endpoint;
+
+    private final String clientId;
+
+    private final ConnectionListener listener;
+
+    // Both null when no listener times publications and deliveries; the client then reads no
+    // time for them.
+    private final @Nullable MetricsListener metrics;
+
+    private final @Nullable ListenerLane metricsLane;
+
+    // Only the API package creates metrics events; the builder passes their package-private
+    // factories.
+    private final PublishCompletionOf publishCompletionOf;
+
+    private final BiFunction<Subscription, Duration, MetricsListener.DeliveryStart> deliveryStartOf;
+
+    // MQTT 3.1.1 cannot carry message properties, so publish() refuses them before admission.
+    private final MqttVersion version;
+
+    // A nonpersistent session ends with the client, which confirms its pending removals.
+    private final boolean cleanStart;
+
+    // Whether the policy reconnects at all; the log then says when an ending gives up.
+    private final boolean reconnects;
+
+    private final TimerScheduler scheduler;
+
+    // Delivery options keep their choice out of the public API; the builder passes their
+    // package-private accessor.
+    private final Function<DeliveryOptions, HandlerExecution> executionOf;
+
+    // A received message takes over the arrays that decoding made for it and skips the check of
+    // the strings that the codec validated; only the builder can pass the package-private
+    // factory that does so.
+    private final Function<Packet.Publish, MqttMessage> messageOf;
+
+    private final ClientTermination termination;
+
+    // The kind of thread that runs the actor, the sender, the completions, and the TCP or TLS
+    // transport's connecting and reading; a place on platform threads goes back as the actor ends.
+    private final CoreThreads cores;
+
+    private final Completions completions;
+
+    private final ListenerLane listenerLane;
+
+    private final SessionCore core;
+
+    private final ClientIo io;
+
+    // The HttpClient that the client's WebSocket transports share, which ends after them.
+    private final @Nullable WebSocketTransports webSockets;
+
+    private final @Nullable CredentialsEvaluator credentials;
+
+    private final @Nullable SessionKeeper sessionKeeper;
+
+    private final Mailbox mailbox;
+
+    // The wake that tells the core of ready deliveries. The mailbox queues it at most once, so
+    // one event serves every post.
+    private final Mailbox.Event deliveriesReady;
+
+    private final DeliveryLanes lanes;
+
+    // The QoS 0 publications that the actor has routed in its current run and not yet handed to
+    // their lanes; only the actor touches them. The run hands them over at its end. Before then,
+    // ending a connection or a subscription through the core's port hands them over first, so
+    // that the ending finds them queued as though each had been handed over at once.
+    private final ArrayList<DeliveryLanes.Arrival> arrivals = new ArrayList<>();
+
+    // The QoS 0 publications that continueRun() took from the mailbox after the first of its run;
+    // only the actor touches them, and it empties the list at the end of each run.
+    private final ArrayList<Mailbox.Event> following = new ArrayList<>(RUN_LIMIT - 1);
+
+    // Published under lifecycleLock before admitting commands for an established connection.
+    private long connectedGeneration;
+
+    // Guarded by lifecycleLock. The established connection's CONNACK, published once continued
+    // subscriptions are reconciled, and null after the connection ends.
+    private @Nullable ConnAck connectedAck;
+
+    // Guarded by lifecycleLock. whenConnected() observations waiting for a connection.
+    private final List<CompletableFuture<ConnAck>> connectionWaiters = new ArrayList<>();
+
+    // Guarded by lifecycleLock. stats() observations waiting for the actor's next snapshot.
+    private final List<CompletableFuture<ClientStats>> statsWaiters = new ArrayList<>();
+
+    // Guarded by lifecycleLock. Set once the actor has ended: the statistics that stats() returns
+    // from then on, or the failure that it returns instead.
+    private @Nullable ClientStats lastStats;
+
+    private @Nullable RuntimeException lastStatsFailure;
+
+    // Lifetime counts of operations refused for capacity on the callers' threads, by limit; the
+    // core counts its own refusals.
+    private final AtomicLongArray refusals = new AtomicLongArray(CapacityLimit.values().length);
+
+    // A lifetime count of QoS 0 publications that the transport's thread dropped because they did
+    // not fit the mailbox, and whether the first of them has been logged at warning level.
+    private final AtomicLong unrouted = new AtomicLong();
+
+    private final AtomicBoolean unroutedLogged = new AtomicBoolean();
+
+    private final Function<ClientSnapshot, ClientStats> statsOf;
+
+    private final ClientLimits limits;
+
+    // Guarded by lifecycleLock. Set when the core accepts a requested disconnect and cleared when
+    // the connection ends or a new attempt begins; meanwhile, establishment observations wait
+    // for a later connection.
+    private boolean disconnecting;
+
+    private long openedGeneration;
+
+    // The attempt being connected or established, and null once its connection ends. Only its
+    // credentials results are applied.
+    private @Nullable ConnectionAttempt activeAttempt;
+
+    // Admission and stopping share this lock so shutdown cannot miss a registered operation.
+    private final Object lifecycleLock = new Object();
+
+    // One durable removal per registration, guarded by lifecycleLock. Observations have their
+    // own budget; neither local close nor public unsubscribe needs an operation slot.
+    private final Map<Long, UnsubscribeAttempt> closingAttempts = new LinkedHashMap<>();
+
+    private final Semaphore operationSlots;
+
+    private final int commandLimit;
+
+    // connect() and disconnect() keep one slot each, so publications holding every operation
+    // slot while they wait for a reconnection cannot refuse the call that hastens or ends it.
+    private final Semaphore connectSlot = new Semaphore(1);
+
+    private final Semaphore disconnectSlot = new Semaphore(1);
+
+    private final int waiterLimit;
+
+    private final Semaphore waiterSlots;
+
+    // Marks the threads that run this client's inline handlers, inside which the futures that the
+    // client returns and the receive of its pull subscriptions refuse to wait.
+    private final InlineHandlers inlineHandlers = new InlineHandlers();
+
+    // Handles include registrations still queued for the actor. The core decides admission; the
+    // mailbox refuses only registrations beyond its queue bound.
+    private final Map<Long, ClientSubscription> subscriptions = new ConcurrentHashMap<>();
+
+    // Handles whose lane may still run, changed under lifecycleLock. A lane's termination finds
+    // its handle here after retirement has removed it from subscriptions, and so does the timing
+    // of a delivery, which reads it from the lane's thread without the lock.
+    private final Map<Long, ClientSubscription> unterminated = new ConcurrentHashMap<>();
+
+    // Guarded by lifecycleLock. Set once the actor's cleanup has retired every subscription.
+    private boolean cleanedUp;
+
+    private final Map<Long, Operation<?>> operations = new ConcurrentHashMap<>();
+
+    private final AtomicLong sequence = new AtomicLong();
+
+    private final AtomicBoolean stopping = new AtomicBoolean();
+
+    // Guarded by lifecycleLock and published with stopping. A fatal I/O failure or the actor's
+    // own failure; it bypasses mailbox capacity, survives connection generation changes, and
+    // decides whether permanent endings report an internal failure.
+    private @Nullable Throwable fatalFailure;
+
+    public ClientActor(
+            URI endpoint,
+            String clientId,
+            Duration keepAlive,
+            Duration timeout,
+            int maxPacketSize,
+            TimerScheduler scheduler,
+            ConnectionListener listener,
+            @Nullable MetricsListener metrics,
+            Transport.Factory transportFactory,
+            CoreThreads cores,
+            MqttVersion version,
+            Duration sessionExpiry,
+            @Nullable Path sessionFile,
+            @Nullable Supplier<MqttCredentials> credentials,
+            Packet.@Nullable Will will,
+            ReconnectBackoff backoff,
+            RetryRules rules,
+            Duration responseTimeout,
+            Function<DeliveryOptions, HandlerExecution> executionOf,
+            Function<Packet.Publish, MqttMessage> messageOf,
+            Function<MqttMessage, byte[]> payloadOf,
+            Function<ClientSnapshot, ClientStats> statsOf,
+            PublishCompletionOf publishCompletionOf,
+            BiFunction<Subscription, Duration, MetricsListener.DeliveryStart> deliveryStartOf,
+            DisconnectionOf disconnectionOf,
+            ClientLimits limits
+    ) {
+        this(
+                endpoint,
+                clientId,
+                keepAlive,
+                timeout,
+                maxPacketSize,
+                scheduler,
+                listener,
+                metrics,
+                transportFactory,
+                cores,
+                PacketCodec.of(version),
+                version,
+                sessionExpiry,
+                sessionFile == null ? null : new FileSessionStore(sessionFile),
+                credentials,
+                will,
+                backoff,
+                rules,
+                responseTimeout,
+                executionOf,
+                messageOf,
+                payloadOf,
+                statsOf,
+                publishCompletionOf,
+                deliveryStartOf,
+                disconnectionOf,
+                limits
+        );
+    }
+
+    ClientActor(
+            URI endpoint,
+            String clientId,
+            Duration keepAlive,
+            Duration timeout,
+            int maxPacketSize,
+            TimerScheduler scheduler,
+            ConnectionListener listener,
+            @Nullable MetricsListener metrics,
+            Transport.Factory transportFactory,
+            CoreThreads cores,
+            PacketCodec codec,
+            MqttVersion version,
+            Duration sessionExpiry,
+            @Nullable SessionStore sessionStore,
+            @Nullable Supplier<MqttCredentials> credentials,
+            Packet.@Nullable Will will,
+            ReconnectBackoff backoff,
+            RetryRules rules,
+            Duration responseTimeout,
+            Function<DeliveryOptions, HandlerExecution> executionOf,
+            Function<Packet.Publish, MqttMessage> messageOf,
+            Function<MqttMessage, byte[]> payloadOf,
+            Function<ClientSnapshot, ClientStats> statsOf,
+            PublishCompletionOf publishCompletionOf,
+            BiFunction<Subscription, Duration, MetricsListener.DeliveryStart> deliveryStartOf,
+            DisconnectionOf disconnectionOf,
+            ClientLimits limits
+    ) {
+        this.endpoint = endpoint;
+        this.clientId = clientId;
+        this.version = version;
+        this.scheduler = scheduler;
+        this.executionOf = executionOf;
+        this.messageOf = messageOf;
+        this.statsOf = statsOf;
+        this.limits = limits;
+        this.cores = cores;
+        cleanStart = sessionExpiry.isZero();
+        reconnects = backoff.enabled();
+        operationSlots = new Semaphore(limits.operations());
+        commandLimit = commandLimit(limits);
+        waiterLimit = CLIENT_WAITER_LIMIT + WAITERS_PER_SUBSCRIPTION * limits.subscriptions();
+        waiterSlots = new Semaphore(waiterLimit);
+        completions = new Completions(
+                endpoint,
+                clientId,
+                threadName("complete-"),
+                TimerService.client,
+                Completions.TAKEOVER,
+                Completions.IDLE,
+                cores
+        );
+        termination = new ClientTermination(
+                completions,
+                inlineHandlers,
+                waiterSlots,
+                waiterLimit,
+                List.of(operationSlots, connectSlot, disconnectSlot),
+                commandLimit,
+                () -> refused(CapacityLimit.OBSERVATIONS)
+        );
+        this.listener = listener;
+        listenerLane = new ListenerLane(
+                endpoint,
+                clientId,
+                "Connection listener",
+                "listener",
+                LISTENER_QUEUE_LIMIT,
+                termination::check
+        );
+        this.metrics = metrics;
+        this.publishCompletionOf = publishCompletionOf;
+        this.deliveryStartOf = deliveryStartOf;
+        metricsLane = metrics == null ? null : new ListenerLane(
+                endpoint,
+                clientId,
+                "Metrics listener",
+                "metrics",
+                METRICS_QUEUE_LIMIT,
+                termination::check
+        );
+        mailbox = createMailbox(maxPacketSize, limits);
+        lanes = new DeliveryLanes(
+                clientId,
+                receiveByteLimit(maxPacketSize),
+                limits.subscriptions(),
+                DeliveryLanes.CONDITION_LIMIT,
+                this::deliveryFailed,
+                this::handOffRefused,
+                this::deliveryReady,
+                this::laneTerminated,
+                metrics == null ? null : this::deliveryStarted,
+                inlineHandlers
+        );
+        webSockets = transportFactory instanceof WebSocketTransports owner ? owner : null;
+        io = new ClientIo(
+                endpoint,
+                clientId,
+                maxPacketSize,
+                limits.regularSends(),
+                ClientIo.BATCH_BYTE_LIMIT,
+                transportFactory,
+                cores,
+                new IoEvents(),
+                codec,
+                payloadOf
+        );
+        core = new SessionCore(
+                new CorePort(),
+                clientId,
+                timeout,
+                keepAlive,
+                version,
+                sessionExpiry,
+                maxPacketSize,
+                will,
+                credentials != null,
+                backoff,
+                rules,
+                responseTimeout,
+                disconnectionOf,
+                limits,
+                sessionStore != null
+        );
+        deliveriesReady = new Mailbox.Event(
+                0,
+                () -> core.deliveriesReady(lanes.takeReady()),
+                Mailbox.Kind.DELIVERY_READY,
+                0
+        );
+        this.credentials = credentials == null ? null : new CredentialsEvaluator(
+                threadName("credentials"),
+                credentials,
+                () -> post(0, this::applyCredentials, Mailbox.Kind.CREDENTIALS_READY, 0),
+                termination::check
+        );
+        sessionKeeper = sessionStore == null ? null : new SessionKeeper(
+                threadName("session"),
+                cores,
+                clientId,
+                sessionStore,
+                new SessionCodec(clientId, version),
+                () -> post(0, this::applySessionStore, Mailbox.Kind.SESSION_STORE_READY, 0),
+                termination::check,
+                io::transportsOpen
+        );
+        termination.watch(listenerLane, metricsLane, this.credentials, sessionKeeper);
+        cores.builder().name(threadName("actor")).start(this::run);
+    }
+
+    @Override
+    public CompletableFuture<ConnAck> connect() {
+        return submit(Command.CONNECT, 0, null, null);
+    }
+
+    @Override
+    public CompletableFuture<ConnAck> whenConnected() {
+        synchronized (lifecycleLock) {
+            if (stopping.get()) {
+                return ClientFuture.failed(inlineHandlers, closedFailure());
+            }
+            ConnAck current = connectedAck;
+            if (current != null && !disconnecting) {
+                return ClientFuture.completed(inlineHandlers, current);
+            }
+            return observeFuture(connectionWaiters);
+        }
+    }
+
+    @Override
+    public CompletableFuture<Void> disconnect() {
+        return submit(Command.DISCONNECT, 0, null, null);
+    }
+
+    @Override
+    public CompletableFuture<PublishResult> publish(MqttMessage message) {
+        requireNonNull(message, "message");
+        if (version == MqttVersion.V3_1_1 && MessageProperties.present(message)) {
+            return ClientFuture.failed(inlineHandlers, new IllegalArgumentException(
+                    "MQTT 3.1.1 cannot carry message properties"
+            ));
+        }
+        // The properties count with the payload: User Properties alone can be large.
+        return submit(
+                Command.PUBLISH,
+                MessageProperties.bodySize(message),
+                publishTiming(message.qos()),
+                message
+        );
+    }
+
+    @Override
+    public Subscription subscribe(
+            Subscribe request,
+            Consumer<MqttDelivery> handler
+    ) {
+        requireNonNull(request, "request");
+        requireNonNull(handler, "handler");
+        var execution = new HandlerExecution.Internal();
+        return subscribeInternal(
+                request,
+                id -> new ClientSubscription(id, request, execution, handler, null)
+        );
+    }
+
+    @Override
+    public Subscription subscribe(
+            Subscribe request,
+            DeliveryOptions options,
+            Consumer<MqttDelivery> handler
+    ) {
+        requireNonNull(request, "request");
+        requireNonNull(options, "options");
+        requireNonNull(handler, "handler");
+        HandlerExecution execution = executionOf.apply(options);
+        return subscribeInternal(
+                request,
+                id -> new ClientSubscription(id, request, execution, handler, null)
+        );
+    }
+
+    @Override
+    public PullSubscription subscribe(Subscribe request) {
+        requireNonNull(request, "request");
+        if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
+            throw new IllegalArgumentException(
+                    "A pull subscription has no handler to acknowledge"
+            );
+        }
+        if (request.failurePolicy() == FailurePolicy.SKIP) {
+            throw new IllegalArgumentException(
+                    "A pull subscription has no handler whose failures to skip"
+            );
+        }
+        // The creation below makes a pull subscription, so the result is one.
+        return (PullSubscription) subscribeInternal(
+                request,
+                id -> new PullClientSubscription(id, request)
+        );
+    }
+
+    @Override
+    public Subscription handOff(Subscribe request, Predicate<MqttDelivery> acceptor) {
+        requireNonNull(request, "request");
+        requireNonNull(acceptor, "acceptor");
+        if (request.ackMode().orElse(AckMode.ON_RECEIVE) == AckMode.AFTER_HANDLER) {
+            throw new IllegalArgumentException(
+                    "A hand-off subscription cannot see when its deliveries are processed"
+            );
+        }
+        var execution = new HandlerExecution.Internal();
+        return subscribeInternal(
+                request,
+                id -> new ClientSubscription(id, request, execution, null, acceptor)
+        );
+    }
+
+    /// Registers the subscription that `creation` makes from its id, of the kind that the caller
+    /// chose.
+    private ClientSubscription subscribeInternal(
+            Subscribe request,
+            LongFunction<ClientSubscription> creation
+    ) {
+        // MQTT 3.1.1 has no subscription options, so a request that sets one is an argument
+        // error, decided by the version of the client.
+        boolean setsOptions = request.noLocal()
+                || request.retainAsPublished()
+                || request.retainHandling() != RetainHandling.SEND;
+        if (version == MqttVersion.V3_1_1 && setsOptions) {
+            throw new IllegalArgumentException("MQTT 3.1.1 has no subscription options");
+        }
+        ClientSubscription subscription;
+        MqttCapacityException rejection = null;
+        synchronized (lifecycleLock) {
+            if (stopping.get()) {
+                throw new IllegalStateException("Client is closed");
+            }
+            long id = sequence.incrementAndGet();
+            subscription = creation.apply(id);
+            subscriptions.put(id, subscription);
+            unterminated.put(id, subscription);
+            Mailbox.OfferResult admitted = mailbox.offer(new Mailbox.Event(
+                    0,
+                    () -> register(subscription),
+                    Mailbox.Kind.REGISTRATION,
+                    0
+            ));
+            if (admitted == Mailbox.OfferResult.FULL) {
+                refused(CapacityLimit.REGISTRATION_QUEUE);
+                rejection = new MqttCapacityException(
+                        "Registration mailbox capacity",
+                        CapacityLimit.REGISTRATION_QUEUE
+                );
+                retire(subscription, rejection);
+            }
+        }
+        if (rejection != null) {
+            logEnding(subscription, rejection);
+        }
+        return subscription;
+    }
+
+    private void register(ClientSubscription subscription) {
+        synchronized (lifecycleLock) {
+            subscription.registrationStarted = true;
+            if (subscription.unsubscription != null) {
+                // Removal won before registration reached the broker, so no wire cleanup is due.
+                retire(subscription, null);
+                completeOperation(subscription.unsubscription.token, null, null);
+                return;
+            }
+        }
+        // A removal requested from here on posts its own wake, which starts it after this.
+        core.subscribe(subscription.id, subscription.request);
+    }
+
+    /// Operators see a registration that ends without the application asking, even when nothing
+    /// observes its establishment.
+    private void logEnding(ClientSubscription subscription, Throwable cause) {
+        log.warn("Subscription {} ended for {} at {}",
+                subscription.filter().pattern(), clientId, endpoint, cause);
+    }
+
+    private <T> CompletableFuture<T> submit(
+            Command kind,
+            int bytes,
+            @Nullable PublishTiming timing,
+            @Nullable MqttMessage message
+    ) {
+        boolean needsConnection = kind == Command.PUBLISH;
+        Mailbox.Event own;
+        CompletableFuture<T> future;
+        synchronized (lifecycleLock) {
+            Throwable refusal = null;
+            Semaphore slot = null;
+            if (stopping.get()) {
+                refusal = new IllegalStateException("Client is closed");
+            } else if (needsConnection && connectedGeneration == 0) {
+                refusal = new MqttNotConnectedException();
+            } else {
+                slot = acquireSlot(kind);
+                if (slot == null) {
+                    refused(CapacityLimit.OPERATIONS);
+                    refusal = new MqttCapacityException(
+                            "Operation capacity",
+                            CapacityLimit.OPERATIONS
+                    );
+                }
+            }
+            if (refusal != null) {
+                return ClientFuture.failed(inlineHandlers, refusal);
+            }
+
+            long token = sequence.incrementAndGet();
+            var operation = new Operation<T>(
+                    token,
+                    kind,
+                    requireNonNull(slot),
+                    connectedGeneration,
+                    message,
+                    timing,
+                    bytes
+            );
+            operations.put(token, operation);
+            // A publication may run on the calling thread; see runAlone.
+            Mailbox.OfferResult admitted = kind == Command.PUBLISH
+                    ? mailbox.offerAlone(operation)
+                    : mailbox.offer(operation);
+            if (admitted == Mailbox.OfferResult.FULL) {
+                // Refused at admission like the cases above, so the call has failed when it
+                // returns. The operation never started: no completion thread finishes it, and no
+                // metrics listener hears of it.
+                operations.remove(token);
+                operation.slot.release();
+                refused(CapacityLimit.OPERATION_QUEUE);
+                return ClientFuture.failed(inlineHandlers, new MqttCapacityException(
+                        "Command mailbox capacity",
+                        CapacityLimit.OPERATION_QUEUE
+                ));
+            }
+            own = mailbox.holds() ? operation : null;
+            future = operation.future;
+        }
+        if (own != null) {
+            runAlone(own);
+        }
+        return future;
+    }
+
+    /// Runs `own`, the publication that the calling thread posted while the client had nothing
+    /// else to do, in place, which spares waking the actor thread for it. The thread runs no other
+    /// event: one that goes ahead of it, or that another thread posts meanwhile, is left to the
+    /// actor thread, so that an application thread does not take over the client's other work.
+    private void runAlone(Mailbox.Event own) {
+        try {
+            if (mailbox.takeAlone(own)) {
+                handleRun(own);
+            }
+        } catch (Throwable failure) {
+            stopFor(failure);
+        } finally {
+            mailbox.letGo();
+        }
+    }
+
+    /// connect() and disconnect() first take their own slot; a concurrent second call shares the
+    /// operation slots.
+    private @Nullable Semaphore acquireSlot(Command kind) {
+        Semaphore reserved = switch (kind) {
+            case CONNECT -> connectSlot;
+            case DISCONNECT -> disconnectSlot;
+            case PUBLISH -> null;
+        };
+        if (reserved != null && reserved.tryAcquire()) {
+            return reserved;
+        }
+        return operationSlots.tryAcquire() ? operationSlots : null;
+    }
+
+    @Override
+    public void close() {
+        synchronized (lifecycleLock) {
+            stopping.set(true);
+            mailbox.connectionRequested(false);
+            mailbox.wake();
+        }
+        // No delivery is handed off after this returns, even while the actor is still busy.
+        lanes.closeHandOffs();
+        // An application may exit as soon as it has closed its client. The statements made
+        // until now, such as why a connection ended, have reached the logging backend by then;
+        // if they have not within the limit, the application goes on without them.
+        boolean _ = Log.awaitWritten(LOG_WAIT);
+    }
+
+    @Override
+    public CompletableFuture<Void> terminated() {
+        return termination.observe();
+    }
+
+    private void run() {
+        Throwable failure = null;
+        try {
+            Optional<Mailbox.Event> next;
+            // The time spent on events since the actor last let others run. Waiting for an event
+            // frees the carrier, so only the handling counts. An actor on a platform thread holds
+            // no carrier, but parks after its slice too: the moment that it parks lets the threads
+            // that take its deliveries catch up on a busy processor. Without it, a subscription
+            // that handled a QoS 0 flood at full speed handled a fifth as many of its messages on
+            // one processor, and three fifths as many on two, before its buffer overflowed.
+            long worked = 0;
+            while ((next = mailbox.take(stopping::get)).isPresent()) {
+                long started = System.nanoTime();
+                handleRun(next.orElseThrow());
+                worked += System.nanoTime() - started;
+                if (CarrierShare.spent(worked)) {
+                    // The actor blocks next when its mailbox is empty, which frees the carrier
+                    // without parking.
+                    if (mailbox.size() != 0) {
+                        CarrierShare.share();
+                    }
+                    worked = 0;
+                }
+            }
+        } catch (Throwable cause) {
+            failure = cause;
+        } finally {
+            synchronized (lifecycleLock) {
+                if (fatalFailure != null) {
+                    failure = fatalFailure;
+                } else {
+                    fatalFailure = failure;
+                }
+                stopping.set(true);
+                mailbox.connectionRequested(false);
+            }
+            // Another thread that runs events stops after its current one, now that the actor is
+            // stopping; the cleanup waits for it.
+            mailbox.holdForGood();
+            if (credentials != null) {
+                // Drops a waiting result before the remaining cleanup.
+                credentials.close();
+            }
+            if (sessionKeeper != null) {
+                // Drops waiting requests and results; a running store call finishes on its own.
+                // The keeper gives the store up once no transport is open.
+                sessionKeeper.close();
+            }
+            try {
+                try {
+                    if (failure != null) {
+                        log.error("Client failed for {} at {}", clientId, endpoint, failure);
+                    }
+                } finally {
+                    core.close(failure);
+                }
+            } catch (Throwable cleanupFailure) {
+                log.error("Shutdown failed for {} at {}", clientId, endpoint, cleanupFailure);
+            } finally {
+                try {
+                    synchronized (lifecycleLock) {
+                        Throwable ending = permanentFailure();
+                        for (ClientSubscription subscription : subscriptions.values()) {
+                            retire(subscription, ending);
+                        }
+                        finishClosures(ending);
+                        completeWaiters(connectionWaiters, null, closedFailure());
+                    }
+                    lanes.close(failure);
+                    mailbox.discard(0);
+                    Throwable cause = failure;
+                    // The core has completed started operations, apart from disconnections that
+                    // wait for the session store; those and the operations that never started
+                    // complete as closed.
+                    operations.keySet().forEach(token -> completeOperation(
+                            token,
+                            null,
+                            (cause == null)
+                                    ? new IllegalStateException("Client is closed")
+                                    : new IllegalStateException("Client is closed", cause)
+                    ));
+                } finally {
+                    try {
+                        io.shutdown();
+                    } finally {
+                        try {
+                            recordLastStats();
+                            synchronized (lifecycleLock) {
+                                cleanedUp = true;
+                                checkLanesEnded();
+                            }
+                        } finally {
+                            // The actor has closed the transports and stopped the sender, whose
+                            // threads end with them, so another client may take the place, even
+                            // one that its application builds once this one has terminated.
+                            cores.giveBack();
+                        }
+                        // An application may exit as soon as its client has terminated. What
+                        // the actor logged while it ended, such as the end of the connection,
+                        // has reached the logging backend by then, within the same limit as in
+                        // close(). The place is back first: this wait needs none.
+                        boolean _ = Log.awaitWritten(LOG_WAIT);
+                        // The actor calls no application code from here on.
+                        termination.actorEnded();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handles `event`, with the QoS 0 publications that follow it when it is one, and hands the
+    /// publications of the run to their lanes.
+    private void handleRun(Mailbox.Event event) {
+        handle(event);
+        if (event.kind() == Mailbox.Kind.AT_MOST_ONCE) {
+            continueRun();
+        }
+        deliverArrivals();
+    }
+
+    /// Runs the events that the calling thread took over by posting one while no thread ran them,
+    /// until none is left. A thread of the client does so in place, where it holds no lock and
+    /// waits for nothing, which costs less than waking the actor thread. It hands the events over
+    /// to the actor thread once it has worked for a slice, so that its own work does not wait
+    /// long, and when the actor stops; a failure stops the client, as one on the actor thread
+    /// does.
+    private void runHeld() {
+        if (!mailbox.holds()) {
+            return;
+        }
+        try {
+            long started = System.nanoTime();
+            while (!stopping.get()) {
+                Mailbox.Event event = mailbox.poll();
+                if (event == null) {
+                    return;
+                }
+                handleRun(event);
+                if (CarrierShare.spent(System.nanoTime() - started)) {
+                    break;
+                }
+            }
+        } catch (Throwable failure) {
+            stopFor(failure);
+        } finally {
+            // Nothing once the thread has let go of the events with none left.
+            mailbox.handOver();
+        }
+    }
+
+    /// Stops the client for a failure that it cannot recover from, as one of the actor's own
+    /// would: of the sender, or of a thread that ran the events in place. The actor reports it.
+    private void stopFor(Throwable failure) {
+        synchronized (lifecycleLock) {
+            if (fatalFailure == null) {
+                fatalFailure = failure;
+            }
+            stopping.set(true);
+            mailbox.connectionRequested(false);
+            mailbox.wake();
+        }
+    }
+
+    private void handle(Mailbox.Event event) {
+        if (event.kind().received() && mailbox.resumeDue()) {
+            io.resumeReading(event.generation());
+        }
+        try {
+            event.perform();
+        } catch (SpiException cause) {
+            if (cause.schedulerFailure()) {
+                core.schedulerFailed(cause.generation(), requireNonNull(cause.getCause()));
+            } else {
+                core.failed(cause.generation(), requireNonNull(cause.getCause()));
+            }
+        }
+    }
+
+    /// Handles the QoS 0 publications that wait next in the mailbox, without waiting for more, up
+    /// to [#RUN_LIMIT] with the one just handled. Their lanes take them together at the end of the
+    /// run, so that each lane's dispatcher wakes once for the run rather than once for each
+    /// publication.
+    private void continueRun() {
+        mailbox.takeAtMostOnce(stopping::get, RUN_LIMIT - 1, following);
+        try {
+            for (Mailbox.Event event : following) {
+                // Taking a publication one at a time saw stopping before each; one that the run
+                // took but has not handled when the actor stops is dropped, as the mailbox's
+                // queue is.
+                if (stopping.get()) {
+                    return;
+                }
+                handle(event);
+            }
+        } finally {
+            following.clear();
+        }
+    }
+
+    /// Hands the publications of the current run to their lanes; see [#arrivals].
+    private void deliverArrivals() {
+        if (!arrivals.isEmpty()) {
+            lanes.deliverAtMostOnce(arrivals);
+            arrivals.clear();
+        }
+    }
+
+    private void deliveryReady(boolean here, boolean last) {
+        post(deliveriesReady, here);
+        if (here && mailbox.holds()) {
+            // A thread of the lanes' own runs what it took over before its next delivery. After
+            // the last delivery that waits for it, it also writes what those events queued, such
+            // as a PUBACK, when the sender sleeps, which spares waking the sender for it. While
+            // more deliveries wait, the sender writes their acknowledgements together instead.
+            if (last) {
+                io.deferWrites();
+            }
+            try {
+                runHeld();
+            } finally {
+                if (last) {
+                    io.writeDeferred();
+                }
+            }
+        }
+    }
+
+    /// A lane runs and hands off nothing more. Called without the lanes' lock, from the lane's
+    /// exiting dispatcher or the thread that stopped a pull lane.
+    private void laneTerminated(long id) {
+        synchronized (lifecycleLock) {
+            ClientSubscription subscription = unterminated.get(id);
+            if (subscription != null) {
+                subscription.laneEnded = true;
+                subscription.checkTerminated();
+                checkLanesEnded();
+            }
+        }
+    }
+
+    /// Caller holds lifecycleLock. Once the cleanup has retired every subscription, the last one
+    /// to terminate ends the lanes for the client's termination.
+    private void checkLanesEnded() {
+        if (cleanedUp && unterminated.isEmpty()) {
+            termination.lanesEnded();
+        }
+    }
+
+    /// Caller holds lifecycleLock. Public removal and local close share one durable request.
+    private UnsubscribeAttempt requestRemoval(ClientSubscription subscription) {
+        UnsubscribeAttempt current = subscription.unsubscription;
+        if (current != null) {
+            return current;
+        }
+        long token = sequence.incrementAndGet();
+        var attempt = new UnsubscribeAttempt(token, subscription);
+        subscription.unsubscription = attempt;
+        closingAttempts.put(token, attempt);
+        subscription.endEstablishment(new IllegalStateException("Subscription is being removed"));
+        post(0, this::startClosures, Mailbox.Kind.SUBSCRIPTION_CLOSE, 0);
+        return attempt;
+    }
+
+    private void startClosures() {
+        var starting = new ArrayList<UnsubscribeAttempt>();
+        synchronized (lifecycleLock) {
+            if (stopping.get()) {
+                return;
+            }
+            for (UnsubscribeAttempt attempt : closingAttempts.values()) {
+                if (!attempt.started && attempt.subscription.registrationStarted) {
+                    attempt.started = true;
+                    starting.add(attempt);
+                }
+            }
+        }
+        for (UnsubscribeAttempt attempt : starting) {
+            core.unsubscribe(attempt.token, attempt.subscription.id);
+        }
+        core.sendCapacityAvailable(openedGeneration);
+    }
+
+    /// Caller holds lifecycleLock. Completes every removal still pending at shutdown, including
+    /// ones whose coalesced wake never reached the core. Closing a nonpersistent session confirms
+    /// them; after an ordinary close, a persistent broker may still hold the subscription.
+    private void finishClosures(@Nullable Throwable ending) {
+        Throwable failure = ending != null || cleanStart
+                ? ending
+                : new IllegalStateException("Client is closed");
+        for (long token : List.copyOf(closingAttempts.keySet())) {
+            completeOperation(token, null, failure);
+        }
+    }
+
+    /// Caller holds lifecycleLock. An internal failure that closes the client is reported with
+    /// its cause; an ordinary close reports no failure.
+    private @Nullable Throwable permanentFailure() {
+        return fatalFailure == null ? null : new MqttConnectionLostException(fatalFailure);
+    }
+
+    /// The failure of an observation after stopping: the permanent cause, or an ordinary close.
+    private Throwable closedFailure() {
+        Throwable ending = permanentFailure();
+        return ending != null ? ending : new IllegalStateException("Client is closed");
+    }
+
+    private void post(long generation, Runnable action, Mailbox.Kind kind, int bytes) {
+        post(generation, action, kind, bytes, false);
+    }
+
+    /// Posts an event. When `here`, a calling thread of the client that will call [#runHeld()]
+    /// next takes the events over if no thread runs them; see [Mailbox#offer(Mailbox.Event,
+    /// boolean)].
+    private void post(
+            long generation,
+            Runnable action,
+            Mailbox.Kind kind,
+            int bytes,
+            boolean here
+    ) {
+        if (stopping.get()) {
+            return;
+        }
+        post(new Mailbox.Event(generation, action, kind, bytes), here);
+    }
+
+    /// Posts `event`, with `here` as for [#post(long, Runnable, Mailbox.Kind, int, boolean)].
+    private void post(Mailbox.Event event, boolean here) {
+        if (stopping.get()) {
+            return;
+        }
+        Mailbox.OfferResult admitted = mailbox.offer(event, here);
+        Mailbox.Kind kind = event.kind();
+        if (admitted == Mailbox.OfferResult.FULL) {
+            if (kind == Mailbox.Kind.AT_MOST_ONCE) {
+                // Like a full subscription buffer, a full mailbox drops QoS 0 and goes on.
+                droppedUnrouted();
+                return;
+            }
+            String admission = switch (kind) {
+                case COMMAND -> "Command";
+                case REGISTRATION -> "Registration";
+                case INCOMING, AT_MOST_ONCE -> "Incoming";
+                case KEEP_ALIVE -> "Keep-alive";
+                case CONTROL, DELIVERY_READY, SEND_CAPACITY, SUBSCRIPTION_CLOSE,
+                        CREDENTIALS_READY, SESSION_STORE_READY, RECONNECT, STATS -> "Control";
+            };
+            signalOverload(
+                    event.generation(),
+                    OverloadCause.EVENTS,
+                    new MqttCapacityException(admission + " mailbox capacity")
+            );
+        }
+    }
+
+    /// Counts a QoS 0 publication that the mailbox had no room for, and logs the first one at
+    /// warning level. Called by the transport's thread.
+    private void droppedUnrouted() {
+        unrouted.incrementAndGet();
+        if (unroutedLogged.compareAndSet(false, true)) {
+            log.warn("Dropped a QoS 0 publication for {} at {}: it arrived faster than the client "
+                    + "routes publications; later ones are logged at debug level",
+                    clientId, endpoint);
+        } else {
+            log.debug("Dropped a QoS 0 publication for {} at {}: it arrived faster than the "
+                    + "client routes publications", clientId, endpoint);
+        }
+    }
+
+    private void signalFailure(long generation, Throwable failure) {
+        terminate(generation, () -> core.failed(generation, failure));
+    }
+
+    private void signalOverload(
+            long generation,
+            OverloadCause cause,
+            MqttCapacityException failure
+    ) {
+        terminate(generation, () -> core.overloaded(generation, cause, failure));
+    }
+
+    /// An acceptor refused a QoS 1 or 2 delivery, so the connection that delivered it ends as
+    /// overloaded, as with a full buffer. Called by the hand-off worker.
+    private void handOffRefused(DeliveryToken arrival) {
+        signalOverload(
+                arrival.connection(),
+                OverloadCause.HAND_OFF,
+                new MqttCapacityException("Hand-off capacity")
+        );
+    }
+
+    /// A result belongs to the attempt, which may span more than one connection. One for an
+    /// ended attempt is dropped before it can read the clock on behalf of a later attempt.
+    private void applyCredentials() {
+        CredentialsEvaluator.Result result = requireNonNull(credentials).take();
+        if (result != null && result.attempt() == activeAttempt) {
+            core.credentials(
+                    result.attempt(),
+                    result.value(),
+                    result.failure(),
+                    nanoTime(openedGeneration)
+            );
+        }
+    }
+
+    /// Hands the session store's results to the core in the order of their requests. A claim
+    /// belongs to the session rather than to a connection, so the core applies it even after the
+    /// connection that requested it has ended; a check answers its own connection only.
+    private void applySessionStore() {
+        for (SessionKeeper.Outcome outcome : requireNonNull(sessionKeeper).take()) {
+            switch (outcome) {
+                case SessionKeeper.Outcome.Claimed(var state, var ownSave, var failure) ->
+                        core.claimed(state, ownSave, failure, nanoTime(openedGeneration));
+                case SessionKeeper.Outcome.Refused _ ->
+                        core.claimRefused(nanoTime(openedGeneration));
+                case SessionKeeper.Outcome.Checked(var connection, var held, var failure) ->
+                        core.checked(connection, held, failure, nanoTime(openedGeneration));
+                case SessionKeeper.Outcome.Saved(var disconnections) ->
+                        core.saved(disconnections);
+            }
+        }
+    }
+
+    private boolean deliveryFailed(DeliveryToken token, Throwable failure) {
+        // Reject retired sessions before they can occupy the current request's stop slot.
+        // A closing client keeps the failed lane paused until shutdown removes it.
+        return mailbox.stopSession(token.session(), () -> core.deliveryFailed(token, failure))
+                || stopping.get();
+    }
+
+    private boolean terminate(long generation, Runnable action) {
+        if (!stopping.get()) {
+            return mailbox.terminate(new Mailbox.Event(
+                    generation,
+                    action,
+                    Mailbox.Kind.CONTROL,
+                    0
+            ));
+        }
+        return false;
+    }
+
+    /// Called by the actor; futures complete on the client's completion threads, where a blocked
+    /// continuation holds up no other completion for long; see [Completions].
+    private void completeOperation(
+            long token,
+            @Nullable Object result,
+            @Nullable Throwable failure
+    ) {
+        Operation<?> operation = operations.remove(token);
+        if (operation == null) {
+            ClientSubscription rejected = null;
+            synchronized (lifecycleLock) {
+                UnsubscribeAttempt closing = closingAttempts.remove(token);
+                if (closing != null) {
+                    closing.finish(failure);
+                } else if (failure != null) {
+                    // The core rejected a registration, whose id is the token.
+                    rejected = subscriptions.get(token);
+                    if (rejected != null) {
+                        retire(rejected, failure);
+                    }
+                }
+            }
+            if (rejected != null) {
+                logEnding(rejected, requireNonNull(failure));
+            }
+            return;
+        }
+        // The completions' lock hands the outcome to the thread that takes the operation.
+        operation.result = result;
+        operation.failure = failure;
+        completions.submit(operation);
+    }
+
+    /// The start of a publication's timing at `qos`, or null when publications are not timed or
+    /// the clock fails. A failing clock costs only this timing; the actor's own readings handle
+    /// the failure as the scheduler's contract describes.
+    private @Nullable PublishTiming publishTiming(Qos qos) {
+        if (metrics == null) {
+            return null;
+        }
+        try {
+            return new PublishTiming(qos, scheduler.nanoTime());
+        } catch (RuntimeException _) {
+            return null;
+        }
+    }
+
+    /// Reports the completion of a timed publication, failed with `failure` or successful when it
+    /// is null. Called on the thread that completes the publication's future, just before it
+    /// does.
+    private void reportPublication(@Nullable PublishTiming timing, @Nullable Throwable failure) {
+        ListenerLane lane = metricsLane;
+        MetricsListener metricsListener = metrics;
+        if (timing == null || lane == null || metricsListener == null) {
+            return;
+        }
+        long now;
+        try {
+            now = scheduler.nanoTime();
+        } catch (RuntimeException _) {
+            return;
+        }
+        Duration duration = Duration.ofNanos(Math.max(0, now - timing.admittedAt()));
+        MetricsListener.PublishCompletion completion = publishCompletionOf.of(
+                timing.qos(),
+                failure,
+                duration
+        );
+        lane.submit(() -> metricsListener.onPublishCompleted(completion));
+    }
+
+    /// Reports that application code receives a delivery of the subscription `id` that the
+    /// client received at `receivedAt`. Called by the delivery lanes on the thread that hands the
+    /// delivery over, before termination can complete: the subscription is then still listed.
+    private void deliveryStarted(long id, long receivedAt) {
+        ListenerLane lane = metricsLane;
+        MetricsListener metricsListener = metrics;
+        ClientSubscription subscription = unterminated.get(id);
+        if (receivedAt == DeliveryToken.UNTIMED || lane == null || metricsListener == null
+                || subscription == null) {
+            return;
+        }
+        long now;
+        try {
+            now = scheduler.nanoTime();
+        } catch (RuntimeException _) {
+            return;
+        }
+        MetricsListener.DeliveryStart start = deliveryStartOf.apply(
+                subscription,
+                Duration.ofNanos(Math.max(0, now - receivedAt))
+        );
+        lane.submit(() -> metricsListener.onDeliveryStarted(start));
+    }
+
+    /// When a timed PUBLISH reached the client, or [DeliveryToken#UNTIMED] when deliveries are
+    /// not timed or the clock fails.
+    private long receptionTime() {
+        if (metrics == null) {
+            return DeliveryToken.UNTIMED;
+        }
+        try {
+            return scheduler.nanoTime();
+        } catch (RuntimeException _) {
+            return DeliveryToken.UNTIMED;
+        }
+    }
+
+    private String threadName(String role) {
+        return "hato-" + clientId + "-" + role;
+    }
+
+    private long nanoTime(long generation) {
+        try {
+            return scheduler.nanoTime();
+        } catch (RuntimeException failure) {
+            throw SpiException.scheduler(generation, failure);
+        }
+    }
+
+    @Override
+    public CompletableFuture<ClientStats> stats() {
+        synchronized (lifecycleLock) {
+            if (lastStats != null) {
+                return ClientFuture.completed(inlineHandlers, lastStats);
+            }
+            if (lastStatsFailure != null) {
+                return ClientFuture.failed(inlineHandlers, lastStatsFailure);
+            }
+            CompletableFuture<ClientStats> observed = observeFuture(statsWaiters);
+            if (!observed.isDone()) {
+                // The request is a wake, which the mailbox queues once; every observation made
+                // before the actor answers it shares its snapshot.
+                post(0, this::takeStats, Mailbox.Kind.STATS, 0);
+            }
+            return observed;
+        }
+    }
+
+    /// Answers the waiting stats() observations with a snapshot taken now. A clock failure fails
+    /// them and then ends the connection as other clock failures do.
+    private void takeStats() {
+        long now;
+        try {
+            now = scheduler.nanoTime();
+        } catch (RuntimeException failure) {
+            answerStats(null, failure);
+            throw SpiException.scheduler(0, failure);
+        }
+        answerStats(statsOf.apply(snapshot(now)), null);
+    }
+
+    /// From close() on, the waiting observations get the snapshot collected when the actor ends
+    /// instead, so that no call made after close() sees an earlier one.
+    private void answerStats(@Nullable ClientStats stats, @Nullable Throwable failure) {
+        synchronized (lifecycleLock) {
+            if (!stopping.get()) {
+                completeWaiters(statsWaiters, stats, failure);
+            }
+        }
+    }
+
+    /// Runs on the actor at its end: keeps what the client counted for later stats() calls, and
+    /// answers those that waited, so that termination does not wait for them.
+    private void recordLastStats() {
+        try {
+            long now;
+            try {
+                now = scheduler.nanoTime();
+            } catch (RuntimeException _) {
+                // Durations then end at the latest event that brought a time.
+                now = core.eventTime();
+            }
+            ClientStats last = statsOf.apply(snapshot(now));
+            synchronized (lifecycleLock) {
+                lastStats = last;
+                completeWaiters(statsWaiters, last, null);
+            }
+        } catch (RuntimeException failure) {
+            log.error("Final statistics failed for {} at {}", clientId, endpoint, failure);
+            synchronized (lifecycleLock) {
+                lastStatsFailure = failure;
+                completeWaiters(statsWaiters, null, failure);
+            }
+        }
+    }
+
+    /// Called only on the actor. The core's values at one point, then the subscriptions that the
+    /// client holds, and the lanes' values read under their own lock.
+    private ClientSnapshot snapshot(long now) {
+        SessionCore.Values session = core.values(now);
+        List<ClientSubscription> listed;
+        synchronized (lifecycleLock) {
+            // A closed subscription leaves the list at once; its broker removal may continue.
+            listed = subscriptions.values().stream()
+                    .filter(subscription -> !subscription.ended)
+                    .toList();
+        }
+        DeliveryLanes.Values delivery = lanes.values();
+        var held = new ArrayList<ClientSnapshot.SubscriptionValues>();
+        for (ClientSubscription subscription : listed) {
+            DeliveryLanes.LaneValues lane = delivery.lanes().getOrDefault(
+                    subscription.id,
+                    DeliveryLanes.LaneValues.UNREGISTERED
+            );
+            held.add(new ClientSnapshot.SubscriptionValues(
+                    subscription,
+                    subscription.filter(),
+                    lane.waiting(),
+                    lane.running(),
+                    lane.awaitingAck(),
+                    subscription.request.bufferCapacity(),
+                    lane.dropped()
+            ));
+        }
+        var refused = new EnumMap<CapacityLimit, Long>(session.refusals());
+        for (CapacityLimit limit : CapacityLimit.values()) {
+            refused.merge(limit, refusals.get(limit.ordinal()), Long::sum);
+        }
+        Receptions.Values received = session.receiving();
+        Publications.Values published = session.sending();
+        Subscriptions.Values registered = session.subscribing();
+        // Publications that the mailbox dropped never reached the core, which counted the rest.
+        long dropped = unrouted.get();
+        var publishes = new EnumMap<Qos, Long>(received.publishes());
+        publishes.merge(Qos.AT_MOST_ONCE, dropped, Long::sum);
+        return new ClientSnapshot(
+                new ClientSnapshot.Connection(
+                        connectionState(session.state()),
+                        session.attempt(),
+                        session.establishedAttempt(),
+                        listenerLane.dropped()
+                ),
+                new ClientSnapshot.Receiving(
+                        publishes,
+                        received.unmatched(),
+                        dropped,
+                        delivery.admitted(),
+                        delivery.dropped(),
+                        delivery.deliveries(),
+                        delivery.bytes(),
+                        delivery.conditions(),
+                        received.awaitingConditions(),
+                        received.awaitingTurn(),
+                        received.awaitingAcknowledgementWrite(),
+                        received.awaitingRelease(),
+                        received.awaitingCompletionWrite(),
+                        received.receptions(),
+                        received.oldestAwaitingConditions(),
+                        received.oldestAwaitingRelease()
+                ),
+                new ClientSnapshot.Sending(
+                        new ClientStats.Usage(
+                                limits.operations() - operationSlots.availablePermits(),
+                                limits.operations()
+                        ),
+                        new ClientStats.Usage(io.sends(), io.sendLimit()),
+                        new ClientStats.Usage(io.sendBytes(), io.sendByteLimit()),
+                        published.awaitingPubAck(),
+                        published.awaitingPubRec(),
+                        published.awaitingPubComp(),
+                        published.publications(),
+                        published.keptBytes(),
+                        session.quota(),
+                        session.oldestResponseWait()
+                ),
+                new ClientSnapshot.Subscribing(
+                        registered.registrations(),
+                        registered.established(),
+                        registered.pending(),
+                        registered.removing(),
+                        delivery.retainedLanes()
+                ),
+                held,
+                refused,
+                session.overloads(),
+                metricsLane == null ? 0 : metricsLane.dropped()
+        );
+    }
+
+    private static ConnectionState connectionState(SessionCore.State state) {
+        return switch (state) {
+            case DISCONNECTED -> ConnectionState.DISCONNECTED;
+            case CONNECTING -> ConnectionState.CONNECTING;
+            case CONNECTED -> ConnectionState.CONNECTED;
+            case DISCONNECTING -> ConnectionState.DISCONNECTING;
+            case RECONNECT_WAIT -> ConnectionState.WAITING_TO_RECONNECT;
+            case CLOSED -> ConnectionState.CLOSED;
+        };
+    }
+
+    /// Counts an operation refused for capacity outside the core; any thread.
+    private void refused(CapacityLimit limit) {
+        refusals.incrementAndGet(limit.ordinal());
+    }
+
+    /// The most observations that can be pending at once, which [Usage#waiters()] counts against.
+    int waiterLimit() {
+        return waiterLimit;
+    }
+
+    /// What the client holds against its internal bounds. Tests compare this with the bounds.
+    /// The parts are read one after another, not atomically.
+    Usage usage() {
+        return new Usage(
+                commandLimit
+                        - operationSlots.availablePermits()
+                        - connectSlot.availablePermits()
+                        - disconnectSlot.availablePermits(),
+                listenerLane.usage(),
+                mailbox.size(),
+                mailbox.bytes(),
+                io.sends(),
+                io.sendBytes(),
+                lanes.retainedLanes(),
+                lanes.retainedDeliveries(),
+                lanes.retainedBytes(),
+                waiterLimit - waiterSlots.availablePermits()
+        );
+    }
+
+    /// Listener notifications dropped because the listener fell behind, for tests until
+    /// applications get statistics.
+    long droppedNotifications() {
+        return listenerLane.dropped();
+    }
+
+    /// Handler failures whose report has returned, to the client for a stop or to the log for a
+    /// skip, for tests that order later events after it until applications get statistics.
+    long reportedHandlerFailures() {
+        return lanes.reportedFailures();
+    }
+
+    /// Deliveries that dispatchers moved to an executor, for tests that order later events after
+    /// the move until applications get statistics.
+    long placedDeliveries() {
+        return lanes.placedDeliveries();
+    }
+
+    /// Connection ends that I/O has posted to the actor, for tests that order later events after
+    /// an end until applications get statistics.
+    long postedConnectionEnds() {
+        return io.postedEnds();
+    }
+
+    /// What the client's termination still waits for, for tests that hold one part until
+    /// applications get statistics.
+    Set<ClientTermination.Pending> terminationPending() {
+        return termination.pending();
+    }
+
+    static Mailbox createMailbox(int maxPacketSize, ClientLimits limits) {
+        // Registrations have their own admission class within the shared FIFO.
+        return new Mailbox(
+                commandLimit(limits),
+                MAILBOX_COMMAND_BYTE_LIMIT,
+                limits.subscriptions(),
+                MAILBOX_INCOMING_LIMIT,
+                receiveByteLimit(maxPacketSize),
+                limits.controlEvents()
+        );
+    }
+
+    // The shared operation slots plus the connect and disconnect slots. Every admitted operation
+    // holds one of them and posts one command, so the command count never refuses one.
+    private static int commandLimit(ClientLimits limits) {
+        return limits.operations() + 2;
+    }
+
+    /// An empty mailbox or set of lanes must admit one packet up to the configured maximum, with
+    /// as many properties as decoding admits.
+    private static long receiveByteLimit(int maxPacketSize) {
+        return Math.max(
+                RECEIVE_BYTE_LIMIT,
+                maxPacketSize + PacketCodec.MAX_PROPERTIES * ClientIo.PROPERTY_COST
+        );
+    }
+
+    /// Called only by the core on the actor thread. Owns the actor's timer registrations.
+    private final class CorePort implements SessionCore.Port {
+
+        private final Map<SessionCore.Timer, TimerEntry> timers = new EnumMap<>(
+                SessionCore.Timer.class
+        );
+
+        // Warn once per client: a broker that repeats this quirk must not flood the log.
+        private boolean unsolicitedPingResponseLogged;
+
+        @Override
+        public void beginAttempt(long generation, ConnectionAttempt attempt, long attemptNumber) {
+            synchronized (lifecycleLock) {
+                disconnecting = false;
+            }
+            activeAttempt = attempt;
+            openedGeneration = generation;
+            mailbox.activateSession(core.sessionNumber());
+            mailbox.activate(generation);
+        }
+
+        @Override
+        public void continueAttempt(long generation) {
+            // The previous connection wrote its DISCONNECT and ends without a notification.
+            mailbox.discard(openedGeneration);
+            io.close();
+            openedGeneration = generation;
+            mailbox.activate(generation);
+        }
+
+        @Override
+        public void finishConnection() {
+            io.finish();
+        }
+
+        @Override
+        public void connectionRequested(boolean requested) {
+            synchronized (lifecycleLock) {
+                mailbox.connectionRequested(requested && !stopping.get());
+            }
+        }
+
+        @Override
+        public void evaluateCredentials(ConnectionAttempt attempt) {
+            requireNonNull(credentials).evaluate(attempt);
+        }
+
+        @Override
+        public void cancelCredentials(ConnectionAttempt attempt) {
+            requireNonNull(credentials).cancel(attempt);
+        }
+
+        @Override
+        public void claimSession() {
+            requireNonNull(sessionKeeper).claim();
+        }
+
+        @Override
+        public void checkSession(long connection) {
+            requireNonNull(sessionKeeper).check(connection);
+        }
+
+        @Override
+        public void saveSession(SessionState state, List<SessionCore.Completion> disconnections) {
+            requireNonNull(sessionKeeper).save(state, disconnections);
+        }
+
+        @Override
+        public void openTransport(long generation, Duration timeout) {
+            io.open(generation, timeout);
+        }
+
+        @Override
+        public void admit(long generation) {
+            // Admission opens before onConnected is queued, so the callback can always use it.
+            synchronized (lifecycleLock) {
+                connectedGeneration = generation;
+            }
+        }
+
+        @Override
+        public void connected(long generation, ConnAck ack) {
+            synchronized (lifecycleLock) {
+                connectedAck = ack;
+                // A requested disconnect lets observers wait for a later connection.
+                if (!disconnecting) {
+                    completeWaiters(connectionWaiters, ack, null);
+                }
+            }
+            listenerLane.submit(() -> listener.onConnected(ack));
+            log.info("Connected {} to {}", clientId, endpoint);
+        }
+
+        @Override
+        public void disconnecting() {
+            synchronized (lifecycleLock) {
+                disconnecting = true;
+            }
+        }
+
+        @Override
+        public void stopDiscarded() {
+            lanes.stopDiscarded();
+        }
+
+        @Override
+        public void resubscribeFailed(
+                Subscription handle,
+                MqttSubscriptionRefusedException failure
+        ) {
+            // The subscription's end finds the current run queued; see arrivals.
+            deliverArrivals();
+            var subscription = (ClientSubscription) handle;
+            synchronized (lifecycleLock) {
+                if (subscription.retired || subscription.removalRequested()) {
+                    // The first ending decides; a requested removal only waited for this answer.
+                    retire(subscription, null, !subscription.locallyClosed);
+                    return;
+                }
+                retire(subscription, failure);
+            }
+            listenerLane.submit(() -> listener.onResubscribeFailed(subscription, failure));
+            // Operators see the refusal even when the listener does not override the callback.
+            log.warn("Re-creation of subscription {} for {} at {} was refused",
+                    subscription.filter().pattern(), clientId, endpoint, failure);
+        }
+
+        @Override
+        public SendQueue.OfferResult send(
+                long generation,
+                long ticket,
+                Packet packet,
+                @Nullable SendReceipt receipt
+        ) {
+            return io.send(generation, ticket, packet, receipt);
+        }
+
+        @Override
+        public SendQueue.OfferResult publish(
+                long generation,
+                long ticket,
+                MqttMessage message,
+                int bodySize,
+                int packetId,
+                @Nullable SendReceipt receipt,
+                TopicAlias alias
+        ) {
+            return io.publish(generation, ticket, message, bodySize, packetId, receipt, alias);
+        }
+
+        @Override
+        public void schedule(long generation, SessionCore.Timer timer, Duration delay) {
+            cancel(timer);
+            var entry = new TimerEntry();
+            timers.put(timer, entry);
+            Mailbox.Kind kind = switch (timer) {
+                case KEEP_ALIVE, PING -> Mailbox.Kind.KEEP_ALIVE;
+                case CONNECT, DISCONNECT, STABLE, RESPONSE -> Mailbox.Kind.CONTROL;
+                case RECONNECT -> Mailbox.Kind.RECONNECT;
+            };
+            Runnable fired = (timer == SessionCore.Timer.RECONNECT)
+                    ? () -> {
+                        // The only way back to a connection must survive a full control queue,
+                        // such as the one that just ended the connection when the delay is
+                        // zero and the scheduler runs the task at once. A wake is never refused.
+                        entry.due = true;
+                        post(0, this::reconnect, kind, 0);
+                    }
+                    : () -> post(
+                            generation,
+                            () -> {
+                                if (timers.get(timer) == entry) {
+                                    timers.remove(timer);
+                                    core.timer(generation, timer, nanoTime(generation));
+                                }
+                            },
+                            kind,
+                            0
+                    );
+            try {
+                entry.cancellation = scheduler.schedule(delay, fired);
+            } catch (RuntimeException failure) {
+                timers.remove(timer);
+                throw SpiException.scheduler(generation, failure);
+            }
+            // The PINGRESP that this deadline waits for overtakes the received packets only once
+            // it has been read, so the transport reads on until the deadline is cancelled.
+            if (timer == SessionCore.Timer.PING && mailbox.pingResponseDue(true)) {
+                io.resumeReading(generation);
+            }
+        }
+
+        // Wakes are coalesced, so the actor checks the current timer. A late callback of a
+        // timer that the actor has replaced marks only its own entry.
+        private void reconnect() {
+            TimerEntry entry = timers.get(SessionCore.Timer.RECONNECT);
+            if (entry != null && entry.due) {
+                timers.remove(SessionCore.Timer.RECONNECT);
+                core.timer(0, SessionCore.Timer.RECONNECT, nanoTime(0));
+            }
+        }
+
+        @Override
+        public void cancel(SessionCore.Timer timer) {
+            if (timer == SessionCore.Timer.PING) {
+                mailbox.pingResponseDue(false);
+            }
+            TimerEntry entry = timers.remove(timer);
+            if (entry != null && entry.cancellation != null) {
+                try {
+                    entry.cancellation.cancel();
+                } catch (Throwable t) {
+                    log.warn("Timer cancellation failed for {}", clientId, t);
+                }
+            }
+        }
+
+        @Override
+        public void complete(long token, @Nullable Object result, @Nullable Throwable failure) {
+            completeOperation(token, result, failure);
+        }
+
+        @Override
+        public Optional<Subscription> registerSubscription(long id) {
+            synchronized (lifecycleLock) {
+                ClientSubscription subscription = requireNonNull(subscriptions.get(id));
+                if (subscription.locallyClosed) {
+                    return Optional.of(subscription);
+                }
+                boolean admitted = subscription.admitLane();
+                if (admitted && subscription.receiver == null) {
+                    // Termination now waits for this push or hand-off lane to end.
+                    subscription.laneStarted = true;
+                }
+                if (subscription.unsubscription != null) {
+                    lanes.pause(id);
+                }
+                return admitted ? Optional.of(subscription) : Optional.empty();
+            }
+        }
+
+        @Override
+        public void subscribed(Subscription handle, Qos granted) {
+            var subscription = (ClientSubscription) handle;
+            synchronized (lifecycleLock) {
+                subscription.granted = granted;
+                subscription.establishedGeneration = connectedGeneration;
+                if (!disconnecting && subscription.establishmentFailure == null) {
+                    completeWaiters(subscription.establishmentWaiters, granted, null);
+                }
+            }
+        }
+
+        @Override
+        public boolean deliver(
+                DeliveryToken token,
+                List<Long> ids,
+                Packet.Publish publish,
+                int bytes
+        ) {
+            MqttMessage message = messageOf.apply(publish);
+            if (publish.qos() == Qos.AT_MOST_ONCE) {
+                // Its lanes take it at the end of the actor's run; see continueRun().
+                arrivals.add(new DeliveryLanes.Arrival(token, ids, message, publish.dup(), bytes));
+                return true;
+            }
+            return lanes.deliver(token, ids, message, publish.dup(), bytes);
+        }
+
+        @Override
+        public void releaseDelivery(long token) {
+            lanes.release(token);
+        }
+
+        @Override
+        public void forgetDelivery(long token) {
+            lanes.forget(token);
+        }
+
+        @Override
+        public Map<Long, Boolean> receiveState() {
+            return lanes.receiveState();
+        }
+
+        @Override
+        public boolean readyDelivery(long token) {
+            return lanes.isReady(token);
+        }
+
+        @Override
+        public void sessionChanged(long session) {
+            mailbox.activateSession(session);
+            lanes.sessionDiscarded();
+        }
+
+        @Override
+        public void removeSubscription(long id, Subscription handle, @Nullable Throwable cause) {
+            // The subscription's end finds the current run queued; see arrivals.
+            deliverArrivals();
+            var subscription = (ClientSubscription) handle;
+            boolean unrequested;
+            synchronized (lifecycleLock) {
+                boolean closed = core.state() == SessionCore.State.CLOSED;
+                Throwable ending;
+                if (closed) {
+                    // The core's cause cannot tell an ordinary close from an internal failure.
+                    ending = permanentFailure();
+                } else if (subscription.removalRequested()) {
+                    // A requested removal decides the ending; a refusal only confirms it.
+                    ending = null;
+                } else {
+                    ending = cause;
+                }
+                unrequested = !closed && ending != null && !subscription.retired;
+                // Confirming unsubscribe() lets the deliveries it accepted finish; local closure
+                // has already discarded them.
+                boolean drain = !closed && ending == null && !subscription.locallyClosed;
+                retire(subscription, ending, drain);
+            }
+            if (unrequested) {
+                logEnding(subscription, requireNonNull(cause));
+            }
+        }
+
+        @Override
+        public void ignoredPingResponse() {
+            if (!unsolicitedPingResponseLogged) {
+                unsolicitedPingResponseLogged = true;
+                log.warn("Ignoring PINGRESP without an outstanding PINGREQ for {} at {}",
+                        clientId, endpoint);
+            }
+        }
+
+        @Override
+        public Map<Long, Boolean> end(
+                long generation,
+                boolean established,
+                Disconnection disconnection,
+                boolean preserveSession,
+                boolean stopped
+        ) {
+            // The connection's end discards the current run with the deliveries that wait; see
+            // arrivals.
+            deliverArrivals();
+            Throwable cause = disconnection.cause().orElse(null);
+            synchronized (lifecycleLock) {
+                connectedGeneration = 0;
+                connectedAck = null;
+                disconnecting = false;
+            }
+            mailbox.discard(generation);
+            // Reject old failures before releasing their lane pause; otherwise a late failure
+            // can pause the lane again with a terminal notification that discard would erase.
+            Map<Long, Boolean> handed = lanes.connectionEnded(preserveSession, stopped);
+            io.close();
+            if (established) {
+                listenerLane.submit(() -> listener.onDisconnected(disconnection));
+                log.info("Disconnected {} from {}", clientId, endpoint, cause);
+            } else {
+                listenerLane.submit(() -> listener.onConnectFailed(disconnection));
+                if (activeAttempt != null) {
+                    log.info("Connection failed for {} at {}", clientId, endpoint, cause);
+                } else {
+                    // A handler, clock, or internal failure ends a wait that has no attempt.
+                    log.info("Stopped reconnecting {} to {}", clientId, endpoint, cause);
+                }
+            }
+            Duration delay = disconnection.reconnectDelay().orElse(null);
+            if (delay != null) {
+                log.info("Reconnecting {} to {} in {}", clientId, endpoint, delay);
+            } else if (reconnects && (established || activeAttempt != null)
+                    && !disconnection.userRequested()) {
+                // The policy reconnects, but this ending gives the connection request up.
+                log.info("Stopped reconnecting {} to {}", clientId, endpoint);
+            }
+            activeAttempt = null;
+            return handed;
+        }
+    }
+
+    /// I/O callbacks post events; fatal failures stop the actor independently of its mailbox.
+    /// A packet that the transport received. Every message posts one, so it runs itself rather
+    /// than an action.
+    private final class ReceivedEvent extends Mailbox.Event {
+
+        private final Packet packet;
+
+        private final long receivedAt;
+
+        ReceivedEvent(long generation, Packet packet, int size, long receivedAt) {
+            super(
+                    generation,
+                    packet instanceof Packet.Publish publish && publish.qos() == Qos.AT_MOST_ONCE
+                            ? Mailbox.Kind.AT_MOST_ONCE
+                            : Mailbox.Kind.INCOMING,
+                    size
+            );
+            this.packet = packet;
+            this.receivedAt = receivedAt;
+        }
+
+        @Override
+        void perform() {
+            core.received(generation(), packet, nanoTime(generation()), bytes(), receivedAt);
+        }
+    }
+
+    /// A completed write, which [ClientIo] runs, as the action that
+    /// [ClientIo.Events#prepareSent(long, long)] returned, once it may post. Running posts this
+    /// same object, which the actor then performs: every write makes one, so it is both.
+    private final class SentEvent extends Mailbox.Event implements Runnable {
+
+        private final long ticket;
+
+        private final long sentAt;
+
+        SentEvent(long generation, long ticket, long sentAt) {
+            super(generation, Mailbox.Kind.CONTROL, 0);
+            this.ticket = ticket;
+            this.sentAt = sentAt;
+        }
+
+        @Override
+        public void run() {
+            post(this, false);
+        }
+
+        @Override
+        void perform() {
+            core.sent(generation(), ticket, sentAt, nanoTime(generation()));
+        }
+    }
+
+    /// A completed write of a PUBACK, PUBREC, or PUBCOMP. Every acknowledgement posts one, so it
+    /// runs itself rather than an action.
+    private final class WrittenEvent extends Mailbox.Event {
+
+        private final long ticket;
+
+        WrittenEvent(long generation, long ticket) {
+            super(generation, Mailbox.Kind.CONTROL, 0);
+            this.ticket = ticket;
+        }
+
+        @Override
+        void perform() {
+            core.written(generation(), ticket, nanoTime(generation()));
+        }
+    }
+
+    private final class IoEvents implements ClientIo.Events {
+
+        // Made once, for the reads that run the events they took over.
+        private final Runnable runHeld = ClientActor.this::runHeld;
+
+        @Override
+        public void connected(long generation) {
+            post(generation, () -> core.opened(generation), Mailbox.Kind.CONTROL, 0);
+        }
+
+        @Override
+        public void pingResponse(long generation, Packet packet, int size, boolean here) {
+            post(
+                    generation,
+                    () -> core.received(generation, packet, nanoTime(generation), size),
+                    Mailbox.Kind.KEEP_ALIVE,
+                    0,
+                    here
+            );
+        }
+
+        @Override
+        public void received(long generation, Packet packet, int size, boolean here) {
+            // A PUBLISH's deliveries are timed from here, before it waits for the actor.
+            long receivedAt = packet instanceof Packet.Publish
+                    ? receptionTime()
+                    : DeliveryToken.UNTIMED;
+            post(new ReceivedEvent(generation, packet, size, receivedAt), here);
+            // A reader that runs the events itself reads no more before it has run them.
+            if (!mailbox.holds() && mailbox.pauseDue(generation)) {
+                io.pauseReading(generation);
+            }
+        }
+
+        @Override
+        public Runnable prepareSent(long generation, long ticket) {
+            long sentAt;
+            try {
+                sentAt = scheduler.nanoTime();
+            } catch (RuntimeException failure) {
+                return () -> terminate(generation, () -> core.schedulerFailed(generation, failure));
+            }
+            return new SentEvent(generation, ticket, sentAt);
+        }
+
+        @Override
+        public void written(long generation, long ticket) {
+            post(new WrittenEvent(generation, ticket), false);
+        }
+
+        @Override
+        public void sendCapacityAvailable(long generation) {
+            post(
+                    generation,
+                    () -> core.sendCapacityAvailable(generation),
+                    Mailbox.Kind.SEND_CAPACITY,
+                    0
+            );
+        }
+
+        @Override
+        public void hold() {
+            if (!stopping.get()) {
+                mailbox.hold();
+            }
+        }
+
+        @Override
+        public void runHeld() {
+            ClientActor.this.runHeld();
+        }
+
+        @Override
+        public void runAfterRead() {
+            // Only the thread that took the events over has deliveries of its own to run.
+            if (mailbox.holds()) {
+                lanes.runReading(runHeld);
+            }
+        }
+
+        @Override
+        public boolean runsHandlersAfterReads() {
+            return lanes.hasInlineLanes();
+        }
+
+        @Override
+        public void ended(long generation, Throwable cause) {
+            // FIFO termination keeps preceding input and write completions, such as a final
+            // CONNACK refusal that arrived just before EOF.
+            if (!stopping.get()) {
+                mailbox.offerTermination(new Mailbox.Event(
+                        generation,
+                        () -> core.failed(generation, cause),
+                        Mailbox.Kind.CONTROL,
+                        0
+                ));
+            }
+        }
+
+        @Override
+        public void failed(long generation, Throwable cause) {
+            signalFailure(generation, cause);
+        }
+
+        @Override
+        public void fatal(Throwable failure) {
+            stopFor(failure);
+        }
+
+        @Override
+        public void transportsClosed() {
+            if (sessionKeeper != null) {
+                // Nothing that this client object sends can follow the claim of another one now.
+                sessionKeeper.transportsClosed();
+            }
+        }
+
+        @Override
+        public void closed() {
+            // The HttpClient of WebSocket transports is released once none uses it, and
+            // termination waits for its threads too.
+            WebSocketTransports shared = webSockets;
+            if (shared == null) {
+                termination.transportsClosed();
+            } else {
+                shared.release(termination::transportsClosed);
+            }
+        }
+    }
+
+    /// Operation slots, including those of connect() and disconnect(), stay held until just before
+    /// their future completes, and notifications until the listener returns or the lane drops them;
+    /// lanes and deliveries until handlers return and acknowledgements are released.
+    record Usage(
+            int operations,
+            int notifications,
+            int mailboxEvents,
+            long mailboxBytes,
+            int sends,
+            long sendBytes,
+            int lanes,
+            int deliveries,
+            long deliveryBytes,
+            int waiters
+    ) {
+    }
+
+    private static final class TimerEntry {
+
+        TimerScheduler.@Nullable Cancellable cancellation;
+
+        // Set by the scheduler when a reconnect timer fires; the actor reads it.
+        volatile boolean due;
+    }
+
+    private void retire(ClientSubscription subscription, @Nullable Throwable cause) {
+        retire(subscription, cause, false);
+    }
+
+    /// With `drain`, deliveries the subscription had already accepted still run or can still be
+    /// received; otherwise they are discarded.
+    private void retire(ClientSubscription subscription, @Nullable Throwable cause, boolean drain) {
+        synchronized (lifecycleLock) {
+            if (subscription.retired) {
+                return;
+            }
+            subscription.retired = true;
+            subscriptions.remove(subscription.id);
+            subscription.endLocally(cause, drain);
+        }
+    }
+
+    private class ClientSubscription implements Subscription {
+
+        private final long id;
+
+        private final Subscribe request;
+
+        private final HandlerExecution execution;
+
+        // Exactly one of handler, acceptor, and receiver decides how deliveries reach the
+        // application: a push, hand-off, or pull subscription.
+        private final @Nullable Consumer<MqttDelivery> handler;
+
+        private final @Nullable Predicate<MqttDelivery> acceptor;
+
+        private final DeliveryLanes.@Nullable Receiver receiver;
+
+        private volatile @Nullable Qos granted;
+
+        private long establishedGeneration;
+
+        private final List<CompletableFuture<Qos>> establishmentWaiters = new ArrayList<>();
+
+        private @Nullable Throwable establishmentFailure;
+
+        private boolean registrationStarted;
+
+        // Attempt state belongs to the client, never to a caller-mutable future.
+        private @Nullable UnsubscribeAttempt unsubscription;
+
+        private boolean locallyClosed;
+
+        private boolean retired;
+
+        // Termination follows the local end once a started lane has ended: a push lane starts
+        // on admission, while a pull lane exists from creation.
+        private boolean ended;
+
+        private boolean laneStarted;
+
+        private boolean laneEnded;
+
+        private boolean terminated;
+
+        private final List<CompletableFuture<Void>> terminationWaiters = new ArrayList<>();
+
+        ClientSubscription(
+                long id,
+                Subscribe request,
+                HandlerExecution execution,
+                @Nullable Consumer<MqttDelivery> handler,
+                @Nullable Predicate<MqttDelivery> acceptor
+        ) {
+            this.id = id;
+            this.request = request;
+            this.execution = execution;
+            this.handler = handler;
+            this.acceptor = acceptor;
+            receiver = handler == null && acceptor == null ? lanes.receiver(id, request) : null;
+            laneStarted = receiver != null;
+        }
+
+        /// Caller holds lifecycleLock. Admits this subscription's routing lane, of the kind that
+        /// its registration chose. False when the lane limit is full.
+        private boolean admitLane() {
+            if (receiver != null) {
+                return lanes.register(receiver);
+            }
+            if (acceptor != null) {
+                return lanes.registerHandOff(id, request, acceptor);
+            }
+            return lanes.register(id, request, execution, requireNonNull(handler));
+        }
+
+        @Override
+        public TopicFilter filter() {
+            return request.filter();
+        }
+
+        @Override
+        public Optional<Qos> grantedQos() {
+            return Optional.ofNullable(granted);
+        }
+
+        @Override
+        public CompletableFuture<Qos> established() {
+            synchronized (lifecycleLock) {
+                if (establishmentFailure != null) {
+                    return ClientFuture.failed(inlineHandlers, establishmentFailure);
+                }
+                if (stopping.get()) {
+                    endEstablishment(closedFailure());
+                    return ClientFuture.failed(
+                            inlineHandlers,
+                            requireNonNull(establishmentFailure)
+                    );
+                }
+                if (!disconnecting && connectedGeneration != 0
+                        && establishedGeneration == connectedGeneration) {
+                    return ClientFuture.completed(inlineHandlers, requireNonNull(granted));
+                }
+                return observeFuture(establishmentWaiters);
+            }
+        }
+
+        private void endEstablishment(Throwable failure) {
+            if (establishmentFailure == null) {
+                establishmentFailure = failure;
+                completeWaiters(establishmentWaiters, null, failure);
+            }
+        }
+
+        /// Caller holds lifecycleLock. Ends local delivery before establishment, so a caller that
+        /// sees establishment fail finds no further delivery admitted. Without `drain`, receiving
+        /// also has ended; with it, the deliveries accepted before the end still run or can still
+        /// be received. Without a cause the ending is ordinary.
+        private void endLocally(@Nullable Throwable cause, boolean drain) {
+            ended = true;
+            if (receiver != null) {
+                if (drain) {
+                    receiver.finish();
+                } else {
+                    receiver.end(cause);
+                }
+            } else if (drain) {
+                lanes.finish(id);
+            } else {
+                lanes.remove(id, cause);
+            }
+            endEstablishment(
+                    cause != null ? cause : new IllegalStateException("Subscription is closed")
+            );
+            checkTerminated();
+        }
+
+        /// Caller holds lifecycleLock. Termination follows the local end once a started lane has
+        /// ended, so no handler of this subscription runs and no delivery remains for it.
+        private void checkTerminated() {
+            if (!terminated && ended && (!laneStarted || laneEnded)) {
+                terminated = true;
+                unterminated.remove(id);
+                completeWaiters(terminationWaiters, null, null);
+            }
+        }
+
+        @Override
+        public CompletableFuture<Void> terminated() {
+            synchronized (lifecycleLock) {
+                if (terminated) {
+                    return ClientFuture.completed(inlineHandlers, null);
+                }
+                return observeFuture(terminationWaiters);
+            }
+        }
+
+        /// Caller holds lifecycleLock. A requested removal decides how this subscription ends.
+        private boolean removalRequested() {
+            return locallyClosed || unsubscription != null;
+        }
+
+        /// The receiver of a pull subscription, which is the only kind that has one.
+        DeliveryLanes.Receiver pullReceiver() {
+            return requireNonNull(receiver);
+        }
+
+        @Override
+        public CompletableFuture<Void> unsubscribe() {
+            synchronized (lifecycleLock) {
+                if (stopping.get()) {
+                    // Discards deliveries still queued here; a running handler finishes.
+                    endLocally(permanentFailure(), false);
+                    return ClientFuture.completed(inlineHandlers, null);
+                }
+                if (retired) {
+                    // Deliveries an earlier confirmed removal accepted may still be finishing.
+                    return ClientFuture.completed(inlineHandlers, null);
+                }
+
+                lanes.pause(id);
+                return requestRemoval(this).observe();
+            }
+        }
+
+        @Override
+        public void close() {
+            synchronized (lifecycleLock) {
+                if (locallyClosed) {
+                    return;
+                }
+                locallyClosed = true;
+                // Stop locally before scheduling the independently bounded broker removal.
+                // A handed-off MANUAL delivery retains its own acknowledgement obligation.
+                endLocally(permanentFailure(), false);
+                if (!stopping.get() && !retired) {
+                    requestRemoval(this);
+                }
+            }
+        }
+    }
+
+    /// A pull subscription, which the application drains through its receiver.
+    private final class PullClientSubscription extends ClientSubscription
+            implements PullSubscription {
+
+        PullClientSubscription(long id, Subscribe request) {
+            super(id, request, new HandlerExecution.Internal(), null, null);
+        }
+
+        @Override
+        public ReceiveResult receive() throws InterruptedException {
+            inlineHandlers.refuseWait();
+            return pullReceiver().receive();
+        }
+
+        @Override
+        public ReceiveResult receive(Duration timeout) throws InterruptedException {
+            inlineHandlers.refuseWait();
+            return pullReceiver().receive(timeout);
+        }
+    }
+
+    /// One durable removal, with independently bounded observations. Guarded by lifecycleLock.
+    private final class UnsubscribeAttempt {
+
+        private final long token;
+        private final ClientSubscription subscription;
+        private final List<CompletableFuture<Void>> observers = new ArrayList<>();
+        private boolean started;
+
+        UnsubscribeAttempt(long token, ClientSubscription subscription) {
+            this.token = token;
+            this.subscription = subscription;
+        }
+
+        /// A finished attempt has no new observers: its handle is already retired, and later
+        /// calls complete locally.
+        CompletableFuture<Void> observe() {
+            return observeFuture(observers);
+        }
+
+        void finish(@Nullable Throwable cause) {
+            completeWaiters(observers, null, cause);
+        }
+    }
+
+    /// Caller holds lifecycleLock. The budget includes completion through synchronous callbacks.
+    private <T> CompletableFuture<T> observeFuture(List<CompletableFuture<T>> observers) {
+        if (!waiterSlots.tryAcquire()) {
+            refused(CapacityLimit.OBSERVATIONS);
+            return ClientFuture.failed(inlineHandlers, new MqttCapacityException(
+                    "Waiter capacity",
+                    CapacityLimit.OBSERVATIONS
+            ));
+        }
+        var future = new ClientFuture<T>(inlineHandlers);
+        observers.add(future);
+        return future;
+    }
+
+    /// Caller holds lifecycleLock, but only to queue the completions. They run on the client's
+    /// completion threads, which need no carrier while the client's core runs on platform
+    /// threads, and where, as Completions describes, a slow continuation holds up no other
+    /// observation for longer than the takeover limit.
+    private <T> void completeWaiters(
+            List<CompletableFuture<T>> observers,
+            @Nullable T value,
+            @Nullable Throwable failure
+    ) {
+        for (CompletableFuture<T> future : observers) {
+            completions.submitIndependent(() -> {
+                try {
+                    if (failure == null) {
+                        future.complete(value);
+                    } else {
+                        future.completeExceptionally(failure);
+                    }
+                } finally {
+                    waiterSlots.release();
+                    termination.check();
+                }
+            });
+        }
+        observers.clear();
+    }
+
+    /// Creates the completion of a publication, which only the API package can do: the builder
+    /// passes the package-private factory of [MetricsListener.PublishCompletion].
+    @FunctionalInterface
+    public interface PublishCompletionOf {
+
+        MetricsListener.PublishCompletion of(
+                Qos qos,
+                @Nullable Throwable failure,
+                Duration duration
+        );
+    }
+
+    /// Creates the ending of a connection or of an attempt, which only the API package can do:
+    /// the builder passes the package-private factory of [Disconnection].
+    @FunctionalInterface
+    public interface DisconnectionOf {
+
+        Disconnection of(
+                @Nullable Throwable cause,
+                boolean userRequested,
+                long connectionAttempt,
+                @Nullable Duration reconnectDelay
+        );
+    }
+
+    /// A timed publication's QoS and the time the client admitted it.
+    private record PublishTiming(Qos qos, long admittedAt) {}
+
+    private enum Command {
+        CONNECT,
+        DISCONNECT,
+        PUBLISH
+    }
+
+    /// An operation that the application started. It is also the event that starts the operation
+    /// on the actor, and the completion that finishes its future on a completion thread: every
+    /// publication makes one, so one object serves as all three.
+    private final class Operation<T> extends Mailbox.Event implements Runnable {
+
+        final CompletableFuture<T> future;
+
+        // Returned just before the future completes.
+        final Semaphore slot;
+
+        // Present for connect(). The core starts it unless the call joins the current attempt or
+        // completes at once.
+        final @Nullable ConnectionAttempt attempt;
+
+        // Present for a publication that a metrics listener times.
+        final @Nullable PublishTiming timing;
+
+        private final long token;
+
+        private final Command command;
+
+        // The connection that a publication was admitted on. If another one is current when the
+        // actor starts the publication, the publication has lost its connection.
+        private final long admittedGeneration;
+
+        // Present for a publication until the actor hands it to the core, which keeps it no
+        // longer than the session needs it.
+        private @Nullable MqttMessage message;
+
+        // The outcome, which completeOperation sets before it submits the completion.
+        @Nullable Object result;
+
+        @Nullable Throwable failure;
+
+        Operation(
+                long token,
+                Command command,
+                Semaphore slot,
+                long admittedGeneration,
+                @Nullable MqttMessage message,
+                @Nullable PublishTiming timing,
+                int bytes
+        ) {
+            super(0, Mailbox.Kind.COMMAND, bytes);
+            future = new ClientFuture<>(inlineHandlers);
+            this.slot = slot;
+            attempt = (command == Command.CONNECT) ? new ConnectionAttempt(token) : null;
+            this.timing = timing;
+            this.token = token;
+            this.command = command;
+            this.admittedGeneration = admittedGeneration;
+            this.message = message;
+        }
+
+        @Override
+        void perform() {
+            switch (command) {
+                case CONNECT -> {
+                    long now;
+                    try {
+                        now = scheduler.nanoTime();
+                    } catch (RuntimeException cause) {
+                        core.schedulerFailed(openedGeneration, cause);
+                        completeOperation(token, null, new MqttConnectException(
+                                "Cannot read connection start time", cause
+                        ));
+                        return;
+                    }
+                    core.connect(requireNonNull(attempt), now);
+                }
+                case DISCONNECT -> core.disconnect(token);
+                case PUBLISH -> {
+                    synchronized (lifecycleLock) {
+                        if (admittedGeneration != connectedGeneration) {
+                            completeOperation(token, null, new MqttConnectionLostException());
+                            return;
+                        }
+                    }
+                    MqttMessage published = requireNonNull(message);
+                    message = null;
+                    // The body size that publish() measured for the mailbox's byte bound.
+                    core.publish(token, published, bytes());
+                }
+            }
+        }
+
+        /// Finishes the future with the outcome, on a completion thread.
+        @Override
+        public void run() {
+            termination.completionStarted();
+            try {
+                // The slot returns before the future completes, so that its continuations can
+                // start an operation in its place. Termination waits for them through the count,
+                // and for a queued completion through its slot.
+                slot.release();
+                reportPublication(timing, failure);
+                finish();
+            } finally {
+                termination.completionFinished();
+            }
+        }
+
+        @SuppressWarnings("unchecked") // Tokens retain their operation's result type in the core.
+        private void finish() {
+            if (failure == null) {
+                future.complete((T) result);
+            } else {
+                future.completeExceptionally(failure);
+            }
+        }
+    }
+}

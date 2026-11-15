@@ -22,8 +22,8 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
 final class ReleaseBundle {
 
     private static final List<String> MODULES = List.of(
+            "hato",
             "hato-client",
-            "hato-broker",
             "hato-testkit"
     );
 

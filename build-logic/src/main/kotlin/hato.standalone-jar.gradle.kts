@@ -1,5 +1,5 @@
 // A standalone jar has no runtime dependencies at all: neither external libraries nor other Hato
-// jars. Applied to hato-client and hato-broker.
+// jars. Applied to hato.
 
 plugins {
     id("hato.java-library")

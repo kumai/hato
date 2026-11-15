@@ -13,13 +13,13 @@ processes at most 256 events before reserving another turn at the back of the ex
 
 | Source | Change |
 |---|---|
-| [BrokerServer](../src/main/java/org/mqtt4j/hato/broker/internal/BrokerServer.java) | Platform-thread accept loop that waits in a selector of its own; closes the actor executor and selectors |
-| [Routing](../src/main/java/org/mqtt4j/hato/broker/internal/Routing.java) | Owns the selectors and actor executor; assigns connections round-robin |
-| [Reactor](../src/main/java/org/mqtt4j/hato/broker/internal/Reactor.java) | Owns key and channel cleanup, coalesces wakeups, ends a connection whose work fails, and closes the broker when the selector itself fails or its thread is interrupted |
-| [Connection](../src/main/java/org/mqtt4j/hato/broker/internal/Connection.java) | Nonblocking reads and partial writes, pause/resume for bounded queues; the shared `FrameAssembler` puts the received packets together |
-| [Client](../src/main/java/org/mqtt4j/hato/broker/internal/Client.java) | Reports CONNECT acceptance through an internal callback instead of waiting on a future |
-| [Session](../src/main/java/org/mqtt4j/hato/broker/internal/Session.java) | Uses the actor executor for queued turns; wakes a reader when inbox space returns |
-| [Worker](../src/main/java/org/mqtt4j/hato/broker/internal/Worker.java) | Actor pool thread; keeps the connections that a turn queued output for until the turn ends |
+| [BrokerServer](../../hato/src/main/java/org/mqtt4j/hato/broker/internal/BrokerServer.java) | Platform-thread accept loop that waits in a selector of its own; closes the actor executor and selectors |
+| [Routing](../../hato/src/main/java/org/mqtt4j/hato/broker/internal/Routing.java) | Owns the selectors and actor executor; assigns connections round-robin |
+| [Reactor](../../hato/src/main/java/org/mqtt4j/hato/broker/internal/Reactor.java) | Owns key and channel cleanup, coalesces wakeups, ends a connection whose work fails, and closes the broker when the selector itself fails or its thread is interrupted |
+| [Connection](../../hato/src/main/java/org/mqtt4j/hato/broker/internal/Connection.java) | Nonblocking reads and partial writes, pause/resume for bounded queues; the shared `FrameAssembler` puts the received packets together |
+| [Client](../../hato/src/main/java/org/mqtt4j/hato/broker/internal/Client.java) | Reports CONNECT acceptance through an internal callback instead of waiting on a future |
+| [Session](../../hato/src/main/java/org/mqtt4j/hato/broker/internal/Session.java) | Uses the actor executor for queued turns; wakes a reader when inbox space returns |
+| [Worker](../../hato/src/main/java/org/mqtt4j/hato/broker/internal/Worker.java) | Actor pool thread; keeps the connections that a turn queued output for until the turn ends |
 
 The queue quotas, codec, delivery state, retained messages, and subscription matching are reused.
 EOF and socket errors follow the packets already posted to the session. A queued DISCONNECT
@@ -73,9 +73,9 @@ The normal Gradle build also regenerates the broker class index and processes nu
 Run from the repository root with the existing JDK 25 toolchain and Gradle cache:
 
 ```sh
-./gradlew :hato-broker:jar :hato-broker:checkstyleMain :hato-broker:checkstyleIntegrationTest --offline
-./gradlew :hato-broker:integrationTest :hato-broker:integrationTestSingleCarrier \
-  --offline -Phato.interop=none --continue
+./gradlew :hato:jar :hato:checkstyleMain :hato:checkstyleBrokerIntegrationTest --offline
+./gradlew :hato:brokerIntegrationTest :hato:brokerIntegrationTestSingleCarrier \
+  --offline --continue
 ```
 
 The suite tests selector survival through repeated disconnects, that a connection ended by

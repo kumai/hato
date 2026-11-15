@@ -21,9 +21,8 @@ dependencyResolutionManagement {
 
 rootProject.name = "hato"
 
-include("hato-common")
+include("hato")
 include("hato-client")
-include("hato-broker")
 include("hato-testkit")
 include("examples")
 include("native-smoke")

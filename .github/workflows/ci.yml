@@ -27,7 +27,7 @@ jobs:
       # stays short.
       - run: >-
           ./gradlew build :build-logic:check -Phato.interop=none
-          -x :hato-client:integrationTestSingleCarrier
+          -x :hato:integrationTestSingleCarrier
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
@@ -48,7 +48,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
         with:
           validate-wrappers: true
-      - run: ./gradlew :hato-client:integrationTestSingleCarrier -Phato.interop=none
+      - run: ./gradlew :hato:integrationTestSingleCarrier -Phato.interop=none
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
@@ -71,7 +71,7 @@ jobs:
           validate-wrappers: true
       # The classes still target Java 25; only the tests run on the newest JDK release, which
       # Gradle provisions. Raise the release here when a new one comes out.
-      - run: ./gradlew test integrationTest -Phato.testJava=27 -Phato.interop=none
+      - run: ./gradlew test integrationTest brokerIntegrationTest -Phato.testJava=27 -Phato.interop=none
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
@@ -97,8 +97,8 @@ jobs:
         with:
           validate-wrappers: true
       - run: >-
-          ./gradlew :hato-common:integrationTest :hato-client:integrationTest
-          :hato-client:integrationTestSingleCarrier -Phato.interop=${{ matrix.broker }}
+          ./gradlew :hato:integrationTest
+          :hato:integrationTestSingleCarrier -Phato.interop=${{ matrix.broker }}
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
