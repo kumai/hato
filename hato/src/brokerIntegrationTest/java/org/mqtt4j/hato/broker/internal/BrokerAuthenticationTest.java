@@ -289,6 +289,47 @@ class BrokerAuthenticationTest {
         }
     }
 
+    @Test
+    void a_failure_after_the_decision_ends_the_connection_and_frees_its_place() throws Exception {
+        // Arrange: room for one connection that waits for its CONNECT, and a first decision that
+        // has the timer fail the next task asked of it: the keep-alive deadline of the client
+        // that the decision accepts.
+        var timer = new BrokerDeadlineTest.ManualTimer();
+        var first = new AtomicBoolean(true);
+        Authenticator sut = _ -> {
+            if (first.getAndSet(false)) {
+                timer.failNextSchedule.set(true);
+            }
+            return Authenticator.Decision.accept(Authenticator.Scope.all());
+        };
+        try (BrokerServer broker = BrokerServer.builder()
+                .authenticator(sut)
+                .maxAwaitingConnect(1)
+                .scheduler(timer)
+                .start(loopback())) {
+            try (RawSession failing = RawSession.open(broker.port(), MqttVersion.V5)) {
+                // Act
+                failing.send(new Packet.Connect(
+                        "failing",
+                        MqttVersion.V5,
+                        true,
+                        30,
+                        null,
+                        null,
+                        null,
+                        EMPTY
+                ));
+                // Assert: the connection ends, and its place waits for the next one.
+                failing.expectClosed();
+            }
+            try (RawSession next = RawSession.open(broker.port(), MqttVersion.V5)) {
+                next.send(connect("next", MqttVersion.V5, null, null));
+                assertThat(next.expect(Packet.ConnAck.class).reasonCode())
+                        .isEqualTo(ReasonCode.SUCCESS);
+            }
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(MqttVersion.class)
     void a_connect_beyond_the_decisions_that_may_run_is_refused_at_once(MqttVersion version)

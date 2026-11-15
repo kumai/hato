@@ -227,8 +227,9 @@ final class Client {
         }
     }
 
-    // Runs the authenticator on a thread of the authentication pool and acts on its decision,
-    // unless the connection has ended or been refused for its deadline meanwhile.
+    // Runs the authenticator on a thread of the authentication pool and acts on its decision.
+    // A failure in acting on it ends the connection, as a failure in handling a CONNECT on the
+    // selector does, which frees its place among the connections that wait for their CONNECT.
     private void decide(
             Authenticator authenticator,
             ConnectRequest asked,
@@ -249,11 +250,27 @@ final class Client {
             // Interrupt status that the decision leaves must not reach the next one.
             boolean _ = Thread.interrupted();
         }
+        try {
+            act(decision, asked.clientId(), request, offered, expiry, done);
+        } catch (Throwable failure) {
+            connection.failed("acceptance", failure);
+        }
+    }
+
+    // Acts on the authenticator's decision on the client `id`, null for none, unless the
+    // connection has ended or its deadline has passed meanwhile.
+    private void act(
+            Authenticator.@Nullable Decision decision,
+            String id,
+            Packet.Connect request,
+            Capabilities offered,
+            long expiry,
+            Consumer<Boolean> done
+    ) {
         if (!connection.decided()) {
             done.accept(false);
             return;
         }
-        String id = asked.clientId();
         switch (decision) {
             case Authenticator.Decision.Accepted accepted -> {
                 Packet.Will will = request.will();
