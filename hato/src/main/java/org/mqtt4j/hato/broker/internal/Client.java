@@ -243,9 +243,16 @@ final class Client {
             decision = authenticator.authenticate(asked);
         } catch (Throwable failure) {
             // The failure is the application's. The request leaves the credentials out of the
-            // log, though what the application put into its exception is beyond the broker.
-            log.warn("Broker on port {} could not decide on client {} from {}",
-                    routing.port, asked.clientId(), connection.remoteAddress(), failure);
+            // log, though what the application put into its exception is beyond the broker. A
+            // failure while the broker closes, as when closing interrupts the decision, is no
+            // cause for a warning: the client goes unanswered along with every other.
+            if (routing.closed) {
+                log.debug("Broker on port {} closed while it decided on client {}",
+                        routing.port, asked.clientId(), failure);
+            } else {
+                log.warn("Broker on port {} could not decide on client {} from {}",
+                        routing.port, asked.clientId(), connection.remoteAddress(), failure);
+            }
         } finally {
             // Interrupt status that the decision leaves must not reach the next one.
             boolean _ = Thread.interrupted();
