@@ -9,9 +9,11 @@ import java.util.function.Consumer;
 // and the threads that call the application's listener, if there is one. Each of these reports
 // its end here once, as the last thing that it does.
 //
-// A thread of its own completes the end once every part has ended. It runs from the start, so
-// that it is there even in a process that can start no more threads, and nothing of the broker
-// waits for it. The application observes the end through observations, each of which completes
+// A thread of its own completes the end once every part has ended. The broker starts it last,
+// once every part has started, so that it is there even if the process can start no more
+// threads later, and a start that fails part of the way leaves it unstarted. Nothing of the
+// broker waits for it. Parts that end before it starts are not missed: it counts before it
+// waits. The application observes the end through observations, each of which completes
 // on a thread of its own and runs its synchronous continuations there. So a continuation that
 // waits, even for another observation, holds up neither the other observations nor any part of
 // the broker, close() included, which waits for the accepting thread and the selectors to end.
@@ -44,7 +46,7 @@ final class Termination {
                 .unstarted(this::run);
     }
 
-    // Starts the end's thread, as the broker starts.
+    // Starts the end's thread, once every part of the broker has started.
     void start() {
         thread.start();
     }

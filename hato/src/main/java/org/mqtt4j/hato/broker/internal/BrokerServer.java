@@ -285,6 +285,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private Consumer<String> beforeHandOver = _ -> { };
 
+        private Runnable beforeAcceptingStarts = () -> { };
+
         private Builder() {
         }
 
@@ -461,6 +463,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder beforeAcceptingStarts(Runnable value) {
+            beforeAcceptingStarts = requireNonNull(value, "beforeAcceptingStarts must not be null");
+            return this;
+        }
+
         /// Starts a broker at `address` with the numbers of threads that suit a machine of
         /// `processors` processors, in place of those that the builder holds.
         public BrokerServer start(InetSocketAddress address, int processors) throws IOException {
@@ -540,7 +547,8 @@ public final class BrokerServer implements AutoCloseable {
                     deliveryWriteHeld,
                     beforeSelect,
                     beforeAccept,
-                    beforeHandOver
+                    beforeHandOver,
+                    beforeAcceptingStarts
             );
             ServerSocketChannel listener = ServerSocketChannel.open();
             try {
@@ -550,7 +558,6 @@ public final class BrokerServer implements AutoCloseable {
                     // The pool would start a thread for each of its first tasks. Starting them
                     // now gives the broker all its threads from the start, whatever comes.
                     server.routing.actors.prestartAllCoreThreads();
-                    server.routing.termination.start();
                     DropReports reports = server.routing.dropReports;
                     if (reports != null) {
                         reports.start();
@@ -562,7 +569,11 @@ public final class BrokerServer implements AutoCloseable {
                     for (Reactor reactor : server.routing.reactors) {
                         reactor.start();
                     }
+                    settings.beforeAcceptingStarts().run();
                     server.accepting.start();
+                    // Last, once every part is there to end: a start that fails before this
+                    // leaves no thread that waits for parts that never started.
+                    server.routing.termination.start();
                 } catch (RuntimeException | Error failure) {
                     server.close();
                     throw failure;

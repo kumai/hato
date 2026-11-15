@@ -42,7 +42,9 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // failure of that attempt. A session calls `beforeHandOver` with its client identifier, under
 // its inbox, once it has counted which of its oldest waiting deliveries or retained messages
 // are to make room in the broker's memory for a new one and before they hand their room over,
-// so that a test can have other sessions take room or hold publications in between.
+// so that a test can have other sessions take room or hold publications in between. The
+// starting broker runs `beforeAcceptingStarts` just before it starts its accepting thread, so
+// that what a test throws there stands for a thread that could not start, after others did.
 record BrokerSettings(
         long connectTimeout,
         int maxAwaitingConnect,
@@ -75,7 +77,8 @@ record BrokerSettings(
         Predicate<Connection> deliveryWriteHeld,
         Runnable beforeSelect,
         AcceptHook beforeAccept,
-        Consumer<String> beforeHandOver
+        Consumer<String> beforeHandOver,
+        Runnable beforeAcceptingStarts
 ) {
 
     // What a test runs before each attempt to accept a connection.

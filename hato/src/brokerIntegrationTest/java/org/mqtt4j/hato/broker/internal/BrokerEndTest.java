@@ -3,6 +3,7 @@ package org.mqtt4j.hato.broker.internal;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
 import java.util.List;
@@ -18,6 +19,8 @@ import org.mqtt4j.hato.broker.MqttBroker;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
@@ -114,6 +117,30 @@ class BrokerEndTest {
             assertThat(sut.terminated()).succeedsWithin(WAIT);
             assertThat(failures).containsExactly(injected);
         }
+    }
+
+    @Test
+    void a_broker_that_fails_part_of_the_way_through_its_start_leaves_no_thread() throws Exception {
+        // Arrange: a free port, and a broker whose accepting thread cannot start after its other
+        // threads have.
+        int port;
+        try (var probe = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
+            port = probe.getLocalPort();
+        }
+        var failure = new OutOfMemoryError("unable to create native thread");
+        BrokerServer.Builder sut = BrokerServer.builder()
+                .listener(listener)
+                .beforeAcceptingStarts(() -> {
+                    throw failure;
+                });
+        // Act & Assert
+        assertThatThrownBy(() -> sut.start(new InetSocketAddress(
+                InetAddress.getLoopbackAddress(),
+                port
+        ))).isSameAs(failure);
+        String prefix = "hato-broker-" + port + "-";
+        await().atMost(WAIT).until(() -> Thread.getAllStackTraces().keySet().stream()
+                .noneMatch(thread -> thread.getName().startsWith(prefix)));
     }
 
     @Test
