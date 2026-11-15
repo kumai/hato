@@ -66,10 +66,12 @@ class BrokerMqtt5Test {
             client.send(connectV5("accepted", true, 0, 0));
 
             // Assert: only the MQTT 5.0 form, which has a reason code, decodes here. It announces
-            // only that shared subscriptions are not supported, and the Topic Alias Maximum.
+            // only that shared subscriptions are not supported, the Topic Alias Maximum, and
+            // the largest packet that the broker takes.
             var announcements = new Properties(List.of(
                     new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0),
-                    new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16)
+                    new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16),
+                    new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 1024 * 1024)
             ));
             assertThat(client.expect(Packet.ConnAck.class))
                     .isEqualTo(new Packet.ConnAck(false, SUCCESS, announcements));

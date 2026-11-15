@@ -29,11 +29,14 @@ class BrokerQos2OrderTest {
     void qos_two_stages_and_queued_order_survive_legal_event_orders(List<Event> events)
             throws Exception {
         // Arrange: repeated ACK events advance the original exchange in legal protocol order.
+        // The broker keeps a session without end, so a session without a connection has no
+        // timer, and the count of pending tasks tells of stray ones.
         var timer = new BrokerDeadlineTest.ManualTimer();
         RawSession subscriber = null;
         try (
                 BrokerServer sut = BrokerServer.builder()
                         .maxInflight(1)
+                        .maxSessionExpiry(Duration.ofSeconds(Session.NEVER))
                         .scheduler(timer)
                         .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
                 RawSession publisher = connected(sut.port(), "publisher")

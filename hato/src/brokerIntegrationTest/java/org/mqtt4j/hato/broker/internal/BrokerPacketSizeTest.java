@@ -117,8 +117,9 @@ class BrokerPacketSizeTest {
                 RawSession client = RawSession.open(sut.port(), MqttVersion.V5)) {
             client.send(connectV5("unbounded", true, 0, 0));
 
-            assertThat(client.expect(Packet.ConnAck.class))
-                    .isEqualTo(RawSession.acceptedV5(false));
+            Packet.ConnAck connAck = client.expect(Packet.ConnAck.class);
+            assertThat(connAck.reasonCode()).isEqualTo(SUCCESS);
+            assertThat(connAck.properties().find(PropertyId.MAXIMUM_PACKET_SIZE)).isEmpty();
         }
     }
 

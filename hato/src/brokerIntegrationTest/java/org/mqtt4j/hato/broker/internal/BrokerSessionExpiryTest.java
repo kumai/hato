@@ -323,11 +323,13 @@ class BrokerSessionExpiryTest {
         return builder(maxSessions).maxSessionExpiry(longest).start(loopback());
     }
 
+    /// A broker that gives each session the expiry that its client asks for, however long.
     private BrokerServer.Builder builder(int maxSessions) {
         return BrokerServer.builder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .scheduler(timer)
-                .maxSessions(maxSessions);
+                .maxSessions(maxSessions)
+                .maxSessionExpiry(Duration.ofSeconds(Session.NEVER));
     }
 
     private static InetSocketAddress loopback() {
