@@ -188,28 +188,6 @@ final class RetainedCursor implements Pending {
         remove(roomEnd);
     }
 
-    // The position of the first retained message that is left and has no room in the broker's
-    // memory yet, or -1 if all that are left have.
-    int firstWithoutRoom() {
-        return nextWithoutRoom(roomEnd - 1);
-    }
-
-    // The position of the next retained message after `position` that is left and has no room
-    // yet, or -1 if there is none.
-    int nextWithoutRoom(int position) {
-        for (int following = position + 1; following < matched.length; following++) {
-            if (matched[following] != null) {
-                return following;
-            }
-        }
-        return -1;
-    }
-
-    // Notes that every retained message that is left has taken its room.
-    void allRoomTaken() {
-        roomEnd = matched.length;
-    }
-
     // The position of the oldest retained message that is left and has room in the broker's
     // memory, or -1 if none has.
     int firstWithRoom() {
@@ -227,8 +205,7 @@ final class RetainedCursor implements Pending {
         return -1;
     }
 
-    // The retained message at `position`, which one of the methods that look for a message
-    // with or without room returned.
+    // The retained message at `position`, which firstWithRoom() or nextWithRoom() returned.
     RetainedMessages.Message at(int position) {
         return requireNonNull(matched[position]);
     }

@@ -1160,8 +1160,8 @@ class BrokerDeliveryMemoryTest {
 
             // Act: a subscription to every topic. Its three retained messages are more than
             // may wait beside the two, and the memory has no room for its cursor as things
-            // are. The first subscription makes it: the new one holds the same two messages,
-            // so their room stays, and the cursor of the first hands its own over.
+            // are. The first subscription makes it: its two copies go, and with them what
+            // its cursor holds, which leaves room for the new cursor and its messages.
             subscriber.subscribe("#", AT_LEAST_ONCE);
 
             // Assert: the client lost the two copies of the first subscription, and gets all
