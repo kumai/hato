@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
@@ -39,13 +40,40 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
 
+    // The connections that may wait for the broker to accept a CONNECT on them, and the clients
+    // that it serves at once. Neither is bounded yet.
+    private static final int MAX_AWAITING_CONNECT = Integer.MAX_VALUE;
+
+    private static final int MAX_CLIENTS = Integer.MAX_VALUE;
+
+    // The largest packet that the broker takes from a client, and the largest that it takes as
+    // a CONNECT, before it knows the client. Each is the most that the framing format allows.
+    private static final int MAX_PACKET_SIZE = Connection.MAX_PACKET_SIZE;
+
+    private static final int MAX_CONNECT_SIZE = Connection.MAX_PACKET_SIZE;
+
     private static final long SEND_BYTES = 16L * 1024 * 1024;
 
     private static final int MAX_INFLIGHT = 128;
 
     private static final int MAX_QUEUED = 128;
 
+    // The QoS 0 deliveries that may wait for a session have a number of their own, which stays
+    // small whatever the other is: a deeper queue would only have a client that falls behind
+    // get older ones, and none of them waits for a client that is away.
+    private static final int MAX_QUEUED_AT_MOST_ONCE = 128;
+
     private static final int MAX_SESSIONS = 1024;
+
+    // How long a session may outlive its connection: as long as its client asks for.
+    private static final Duration MAX_SESSION_EXPIRY = Duration.ofSeconds(Session.NEVER);
+
+    // One session's subscriptions are bounded by number, because every publication is matched
+    // against each of them, and by the length of their filters in all, because a single filter
+    // can have 65,535 bytes.
+    private static final int MAX_SUBSCRIPTIONS = 10_000;
+
+    private static final long MAX_SUBSCRIPTION_LENGTH = 1024 * 1024;
 
     // Retained messages are bounded like the other state that the broker keeps: by count, as
     // sessions are, and by size, as each session's waiting deliveries are.
@@ -54,6 +82,14 @@ public final class BrokerServer implements AutoCloseable {
     // Every response that a test holds takes one of the client's packet identifiers, so a client
     // that follows the protocol never holds more.
     private static final int MAX_HELD = 65_535;
+
+    // The share of the largest heap that the deliveries that wait for all the sessions may take
+    // together, whatever the limits of each session allow in sum: a quarter. The broker shares
+    // the heap with the application that embeds it.
+    private static final int DELIVERY_MEMORY_SHARE = 4;
+
+    // How much of that memory a thread of the actor pool fetches for itself at a time.
+    private static final long DELIVERY_MEMORY_UNIT = 256 * 1024;
 
     // How many selector threads do the socket I/O, and how many threads the actor pool has. On
     // two processors these numbers made a publication to many subscribers wait the shortest;
@@ -74,6 +110,11 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int ACTORS_ON_ONE_PROCESSOR = 1;
 
+    // How long the accepting thread waits before it tries again after a connection could not
+    // be accepted. The cause, such as a process without a free file descriptor, lasts until
+    // something else in the process gives way, so trying at once would only spin.
+    private static final long ACCEPT_RETRY_MILLIS = 100;
+
     private final ServerSocketChannel listener;
 
     // Tells the accepting thread that a connection waits at the listener, which is all that it
@@ -83,17 +124,24 @@ public final class BrokerServer implements AutoCloseable {
     // process never does.
     private final Selector acceptor;
 
+    // The listener's registration with that selector.
+    private final SelectionKey acceptKey;
+
     private final Routing routing;
 
     // The thread that accepts the connections.
     private final Thread accepting;
+
+    // Whether the accepting thread has warned yet that it closed a connection at once, for the
+    // limit on those that wait for their CONNECT. Only that thread uses it.
+    private boolean turnedAway;
 
     private BrokerServer(ServerSocketChannel listener, BrokerSettings settings) throws IOException {
         this.listener = listener;
         acceptor = Selector.open();
         try {
             listener.configureBlocking(false);
-            listener.register(acceptor, SelectionKey.OP_ACCEPT);
+            acceptKey = listener.register(acceptor, SelectionKey.OP_ACCEPT);
             routing = new Routing(settings, listener.socket().getLocalPort(), this::close);
             accepting = Thread.ofPlatform().daemon()
                     .name("hato-broker-" + routing.port + "-accept")
@@ -146,6 +194,14 @@ public final class BrokerServer implements AutoCloseable {
 
         private Duration connectTimeout = CONNECT_TIMEOUT;
 
+        private int maxAwaitingConnect = MAX_AWAITING_CONNECT;
+
+        private int maxClients = MAX_CLIENTS;
+
+        private int maxPacketSize = MAX_PACKET_SIZE;
+
+        private int maxConnectSize = MAX_CONNECT_SIZE;
+
         private long sendBytes = SEND_BYTES;
 
         private int maxInflight = MAX_INFLIGHT;
@@ -156,7 +212,17 @@ public final class BrokerServer implements AutoCloseable {
 
         private long maxQueuedBytes = SEND_BYTES;
 
+        private int maxQueuedAtMostOnce = MAX_QUEUED_AT_MOST_ONCE;
+
+        private long maxQueuedAtMostOnceBytes = SEND_BYTES;
+
         private int maxSessions = MAX_SESSIONS;
+
+        private Duration maxSessionExpiry = MAX_SESSION_EXPIRY;
+
+        private int maxSubscriptions = MAX_SUBSCRIPTIONS;
+
+        private long maxSubscriptionLength = MAX_SUBSCRIPTION_LENGTH;
 
         private int maxRetained = MAX_RETAINED;
 
@@ -164,11 +230,18 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxHeld = MAX_HELD;
 
+        private long maxDeliveryMemory =
+                Runtime.getRuntime().maxMemory() / DELIVERY_MEMORY_SHARE;
+
+        private long deliveryMemoryUnit = DELIVERY_MEMORY_UNIT;
+
         private int selectors = SELECTORS;
 
         private int actors = ACTORS;
 
         private Capabilities capabilities = Capabilities.DEFAULT;
+
+        private BrokerSettings.@Nullable DropListener dropListener;
 
         private Timer scheduler = TimerService.instance;
 
@@ -180,11 +253,35 @@ public final class BrokerServer implements AutoCloseable {
 
         private Runnable beforeSelect = () -> { };
 
+        private BrokerSettings.AcceptHook beforeAccept = () -> { };
+
+        private Consumer<String> beforeHandOver = _ -> { };
+
         private Builder() {
         }
 
         Builder connectTimeout(Duration value) {
             connectTimeout = requireNonNull(value, "connectTimeout must not be null");
+            return this;
+        }
+
+        Builder maxAwaitingConnect(int value) {
+            maxAwaitingConnect = value;
+            return this;
+        }
+
+        Builder maxClients(int value) {
+            maxClients = value;
+            return this;
+        }
+
+        Builder maxPacketSize(int value) {
+            maxPacketSize = value;
+            return this;
+        }
+
+        Builder maxConnectSize(int value) {
+            maxConnectSize = value;
             return this;
         }
 
@@ -213,8 +310,33 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder maxQueuedAtMostOnce(int value) {
+            maxQueuedAtMostOnce = value;
+            return this;
+        }
+
+        Builder maxQueuedAtMostOnceBytes(long value) {
+            maxQueuedAtMostOnceBytes = value;
+            return this;
+        }
+
         Builder maxSessions(int value) {
             maxSessions = value;
+            return this;
+        }
+
+        Builder maxSessionExpiry(Duration value) {
+            maxSessionExpiry = requireNonNull(value, "maxSessionExpiry must not be null");
+            return this;
+        }
+
+        Builder maxSubscriptions(int value) {
+            maxSubscriptions = value;
+            return this;
+        }
+
+        Builder maxSubscriptionLength(long value) {
+            maxSubscriptionLength = value;
             return this;
         }
 
@@ -233,6 +355,16 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder maxDeliveryMemory(long value) {
+            maxDeliveryMemory = value;
+            return this;
+        }
+
+        Builder deliveryMemoryUnit(long value) {
+            deliveryMemoryUnit = value;
+            return this;
+        }
+
         Builder selectors(int value) {
             selectors = value;
             return this;
@@ -245,6 +377,11 @@ public final class BrokerServer implements AutoCloseable {
 
         Builder capabilities(Capabilities value) {
             capabilities = requireNonNull(value, "capabilities must not be null");
+            return this;
+        }
+
+        Builder dropListener(BrokerSettings.DropListener value) {
+            dropListener = requireNonNull(value, "dropListener must not be null");
             return this;
         }
 
@@ -286,10 +423,25 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder beforeAccept(BrokerSettings.AcceptHook value) {
+            beforeAccept = requireNonNull(value, "beforeAccept must not be null");
+            return this;
+        }
+
+        Builder beforeHandOver(Consumer<String> value) {
+            beforeHandOver = requireNonNull(value, "beforeHandOver must not be null");
+            return this;
+        }
+
         BrokerServer start(InetSocketAddress address) throws IOException {
             requireNonNull(address, "address must not be null");
             if (connectTimeout.isNegative()
                 || connectTimeout.isZero()
+                || maxAwaitingConnect <= 0
+                || maxClients <= 0
+                || maxPacketSize <= 0
+                || maxPacketSize > Connection.MAX_PACKET_SIZE
+                || maxConnectSize <= 0
                 || sendBytes <= 0
                 || maxInflight <= 0
                 || maxInflight > Connection.SEND_COUNT
@@ -297,10 +449,17 @@ public final class BrokerServer implements AutoCloseable {
                 || maxInflightBytes > sendBytes
                 || maxQueued <= 0
                 || maxQueuedBytes <= 0
+                || maxQueuedAtMostOnce <= 0
+                || maxQueuedAtMostOnceBytes <= 0
                 || maxSessions <= 0
+                || maxSessionExpiry.toSeconds() <= 0
+                || maxSubscriptions <= 0
+                || maxSubscriptionLength <= 0
                 || maxRetained <= 0
                 || maxRetainedBytes <= 0
                 || maxHeld <= 0
+                || maxDeliveryMemory <= 0
+                || deliveryMemoryUnit < 0
                 || selectors <= 0
                 || actors <= 0
             ) {
@@ -310,23 +469,39 @@ public final class BrokerServer implements AutoCloseable {
             }
             var settings = new BrokerSettings(
                     connectTimeout.toNanos(),
+                    maxAwaitingConnect,
+                    maxClients,
+                    maxPacketSize,
+                    maxConnectSize,
                     sendBytes,
                     maxInflight,
                     maxInflightBytes,
                     maxQueued,
                     maxQueuedBytes,
+                    maxQueuedAtMostOnce,
+                    maxQueuedAtMostOnceBytes,
                     maxSessions,
+                    // No session lasts longer than the longest interval that a client can ask
+                    // for, which keeps it without end.
+                    Math.min(maxSessionExpiry.toSeconds(), Session.NEVER),
+                    maxSubscriptions,
+                    maxSubscriptionLength,
                     maxRetained,
                     maxRetainedBytes,
                     maxHeld,
+                    maxDeliveryMemory,
+                    deliveryMemoryUnit,
                     selectors,
                     actors,
                     capabilities,
+                    dropListener,
                     scheduler,
                     beforeProcess,
                     beforeHandle,
                     deliveryWriteHeld,
-                    beforeSelect
+                    beforeSelect,
+                    beforeAccept,
+                    beforeHandOver
             );
             ServerSocketChannel listener = ServerSocketChannel.open();
             try {
@@ -336,6 +511,10 @@ public final class BrokerServer implements AutoCloseable {
                     // The pool would start a thread for each of its first tasks. Starting them
                     // now gives the broker all its threads from the start, whatever comes.
                     server.routing.actors.prestartAllCoreThreads();
+                    DropReports reports = server.routing.dropReports;
+                    if (reports != null) {
+                        reports.start();
+                    }
                     for (Reactor reactor : server.routing.reactors) {
                         reactor.start();
                     }
@@ -364,6 +543,12 @@ public final class BrokerServer implements AutoCloseable {
         try {
             while (true) {
                 Socket socket = accepted();
+                // Only this thread adds to the connections that wait for their CONNECT, so the
+                // limit holds exactly.
+                if (routing.awaitingConnect.get() >= routing.settings.maxAwaitingConnect()) {
+                    turnAway(socket);
+                    continue;
+                }
                 Connection connection = null;
                 try {
                     connection = new Connection(socket, routing);
@@ -403,21 +588,80 @@ public final class BrokerServer implements AutoCloseable {
         }
     }
 
+    // Closes a connection that came while as many as the broker allows waited for their
+    // CONNECT. It has sent nothing that the broker has read, and learns nothing but the close:
+    // the broker does not know which protocol version it speaks.
+    private void turnAway(Socket socket) {
+        if (turnedAway) {
+            log.debug("Broker on port {} closed the connection from {} at once",
+                    port(), socket.getRemoteSocketAddress());
+        } else {
+            turnedAway = true;
+            log.warn(
+                    "Broker on port {} closed the connection from {} at once, because {}"
+                            + " connections wait for their CONNECT, its limit; later ones are"
+                            + " logged at debug level",
+                    port(),
+                    socket.getRemoteSocketAddress(),
+                    routing.settings.maxAwaitingConnect()
+            );
+        }
+        try {
+            socket.close();
+        } catch (IOException failure) {
+            log.debug("Closing the connection from {} failed",
+                    socket.getRemoteSocketAddress(), failure);
+        }
+    }
+
     // The next connection that waits at the listener, once there is one. close() ends the wait
     // with an exception, by closing the listener and the selector.
+    //
+    // An attempt can fail while the listener is sound: the process may lack what a connection
+    // takes, as when it has no file descriptor left. That passes, and the connection waits at
+    // the listener meanwhile. So the thread tries again after a pause, rather than end the
+    // listener and with it the broker and the connections that it serves.
     private Socket accepted() throws IOException {
+        boolean failing = false;
         while (true) {
-            SocketChannel channel = listener.accept();
-            if (channel != null) {
-                return channel.socket();
+            try {
+                routing.settings.beforeAccept().run();
+                SocketChannel channel = listener.accept();
+                if (channel != null) {
+                    if (failing) {
+                        log.info("Broker on port {} accepts connections again", port());
+                    }
+                    return channel.socket();
+                }
+            } catch (ClosedChannelException closed) {
+                throw closed;
+            } catch (IOException failure) {
+                if (failing) {
+                    log.debug("Broker on port {} cannot accept a connection", port(), failure);
+                } else {
+                    failing = true;
+                    log.warn("Broker on port {} cannot accept a connection and keeps trying;"
+                            + " later failures are logged at debug level", port(), failure);
+                }
+                // The connection that could not be accepted keeps the key ready, so the pause
+                // looks away from it. Closing the selector still ends the wait.
+                acceptKey.interestOps(0);
+                acceptor.select(_ -> { }, ACCEPT_RETRY_MILLIS);
+                acceptKey.interestOps(SelectionKey.OP_ACCEPT);
+                endIfInterrupted();
+                continue;
             }
             // The key tells nothing more than the return does: the loop asks the listener.
             acceptor.select(_ -> { });
-            if (Thread.interrupted()) {
-                // An interrupted thread no longer waits in a selector. It ends the listener, as
-                // an interrupt of a blocking accept does.
-                throw new InterruptedIOException("Interrupted while waiting for a connection");
-            }
+            endIfInterrupted();
+        }
+    }
+
+    // An interrupted thread no longer waits in a selector. It ends the listener, as an interrupt
+    // of a blocking accept does.
+    private static void endIfInterrupted() throws InterruptedIOException {
+        if (Thread.interrupted()) {
+            throw new InterruptedIOException("Interrupted while waiting for a connection");
         }
     }
 
@@ -450,6 +694,8 @@ public final class BrokerServer implements AutoCloseable {
         for (Reactor reactor : routing.reactors) {
             awaitEnd(reactor.thread);
         }
+        // Only a broker that runs with assertions, as in tests, looks and waits here.
+        assert routing.deliveryMemoryAddsUp();
     }
 
     // Ends the listener, the connections, and the sessions, and has the selectors end.
@@ -472,6 +718,10 @@ public final class BrokerServer implements AutoCloseable {
             routing.clear();
         } finally {
             routing.actors.shutdown();
+            DropReports reports = routing.dropReports;
+            if (reports != null) {
+                reports.close();
+            }
             for (Reactor reactor : routing.reactors) {
                 reactor.close();
             }

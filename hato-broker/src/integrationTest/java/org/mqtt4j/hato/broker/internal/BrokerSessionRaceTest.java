@@ -33,6 +33,7 @@ import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.withDup;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
+import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_LEAST_ONCE;
@@ -202,7 +203,7 @@ class BrokerSessionRaceTest {
 
     @Test
     void deliveries_waiting_for_send_space_resume_when_the_writer_frees_it() throws Exception {
-        // Arrange: the held writer keeps three deliveries in a 1 KiB queue; two more wait.
+        // Arrange: the held writer keeps what a 1 KiB queue takes; the other deliveries wait.
         var heldWriter = new CompletableFuture<Thread>();
         var release = new CountDownLatch(1);
         String payload = "x".repeat(300);
@@ -233,6 +234,50 @@ class BrokerSessionRaceTest {
                 assertThat(subscriber.expect(Packet.Publish.class))
                         .isEqualTo(publication("queued", payload + i, AT_MOST_ONCE, 0));
             }
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_send_queue_takes_deliveries_only_while_what_they_hold_on_the_heap_fits()
+            throws Exception {
+        // Arrange: a send queue whose bytes hold two of the deliveries below by what they hold
+        // on the heap, and three by their packets. The held writer keeps what the queue takes,
+        // and one QoS 0 delivery may wait behind it.
+        var heldWriter = new CompletableFuture<Thread>();
+        var release = new CountDownLatch(1);
+        String payload = "x".repeat(300);
+        long two = 2 * deliverySize(publication("queued", payload + 0, AT_MOST_ONCE, 0));
+        try (BrokerServer sut = builder(new BrokerDeadlineTest.ManualTimer())
+                .sendBytes(two)
+                .maxInflightBytes(two)
+                .maxQueuedAtMostOnce(1)
+                .beforeDeliveryWrite(() -> {
+                    if (heldWriter.complete(Thread.currentThread())) {
+                        awaitRelease(release);
+                    }
+                })
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            subscriber.subscribe("queued", AT_MOST_ONCE);
+
+            // Act
+            for (int i = 0; i < 5; i++) {
+                publisher.publish("queued", payload + i, AT_MOST_ONCE, 0);
+            }
+            heldWriter.get(5, SECONDS);
+            // The broker routes all five publications before answering this ping.
+            publisher.ping();
+            release.countDown();
+
+            // Assert: the queue took the first two, and of the others the newest waited.
+            for (int i : new int[] {0, 1, 4}) {
+                assertThat(subscriber.expect(Packet.Publish.class))
+                        .isEqualTo(publication("queued", payload + i, AT_MOST_ONCE, 0));
+            }
+            subscriber.ping();
         } finally {
             release.countDown();
         }

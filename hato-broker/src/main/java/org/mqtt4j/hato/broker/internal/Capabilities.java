@@ -56,6 +56,24 @@ record Capabilities(
         requireRange(serverKeepAlive, 0, 65_535, "serverKeepAlive");
     }
 
+    // These capabilities with a Maximum Packet Size of at most `limit`, the broker's own limit
+    // for the packets of its clients. A size that the framing format bounds anyway is not
+    // announced.
+    Capabilities withPacketSizeWithin(int limit) {
+        Integer own = maximumPacketSize;
+        int size = (own == null) ? limit : Math.min(own, limit);
+        return new Capabilities(
+                maximumQos,
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
+                receiveMaximum,
+                (size == Connection.MAX_PACKET_SIZE) ? null : size,
+                topicAliasMaximum,
+                serverKeepAlive
+        );
+    }
+
     private static void requireRange(
             @Nullable Integer value,
             int minimum,

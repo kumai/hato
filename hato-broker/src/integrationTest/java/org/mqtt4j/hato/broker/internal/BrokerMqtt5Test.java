@@ -30,10 +30,10 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.broker.internal.RawSession.acceptedV5;
-import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
+import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
@@ -316,7 +316,7 @@ class BrokerMqtt5Test {
 
             // Assert
             assertThat(refused.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(false, ReasonCode.SERVER_UNAVAILABLE, EMPTY));
+                    .isEqualTo(new Packet.ConnAck(false, ReasonCode.QUOTA_EXCEEDED, EMPTY));
             refused.expectClosed();
             ending.ping();
             kept.ping();
@@ -406,10 +406,11 @@ class BrokerMqtt5Test {
     }
 
     @Test
-    void a_delivery_is_sized_without_properties_that_its_mqtt_3_1_1_receiver_never_gets()
+    void a_delivery_counts_for_the_properties_that_its_mqtt_3_1_1_receiver_never_gets()
             throws Exception {
-        // Arrange: the window fits the MQTT 3.1.1 form of the delivery exactly.
-        long size = codec.encode(publication("sized/topic", "payload", AT_LEAST_ONCE, 1)).length;
+        // Arrange: a window whose bytes hold a delivery of the publication without properties,
+        // which is all that the MQTT 3.1.1 receiver gets of it.
+        long size = deliverySize(publication("sized/first", "payload", AT_LEAST_ONCE, 1));
         try (
                 BrokerServer sut = BrokerServer.builder().maxInflightBytes(size).start(loopback());
                 var subscriber = connected(sut.port(), "subscriber");
@@ -417,14 +418,17 @@ class BrokerMqtt5Test {
         ) {
             subscriber.subscribe("sized/#", AT_LEAST_ONCE);
 
-            // Act
-            publish(publisher, "sized/topic", PROPERTIES);
+            // Act: a publication with properties, and one of the same size without them.
+            publish(publisher, "sized/first", PROPERTIES);
+            publish(publisher, "sized/other", EMPTY);
 
-            // Assert
+            // Assert: the window never takes the first, because the broker holds its properties
+            // for as long as it holds the delivery, and takes the second.
             Packet.Publish delivery = subscriber.expect(Packet.Publish.class);
             assertThat(delivery).isEqualTo(
-                    publication("sized/topic", "payload", AT_LEAST_ONCE, delivery.packetId())
+                    publication("sized/other", "payload", AT_LEAST_ONCE, delivery.packetId())
             );
+            subscriber.ping();
         }
     }
 

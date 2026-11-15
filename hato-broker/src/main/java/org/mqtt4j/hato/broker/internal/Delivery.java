@@ -20,6 +20,10 @@ final class Delivery implements Outgoing, Pending {
 
     private final Packet.Publish publication;
 
+    // The room that the publication takes in the broker's memory for deliveries, which its
+    // deliveries to all sessions share.
+    final PublicationMemory memory;
+
     private final PacketCodec codec;
 
     final Qos qos;
@@ -41,7 +45,27 @@ final class Delivery implements Outgoing, Pending {
 
     private final long lifetime;
 
+    // The bytes of the PUBLISH that carries the delivery to its session's client, for what the
+    // protocol and the connection's send queue measure in packets.
     final int byteCount;
+
+    // What the delivery holds on the heap beside its publication: itself, its places in its
+    // session's queue and window, and a sequence of properties of its own if it adds
+    // Subscription Identifiers to the publication's.
+    final long ownBytes;
+
+    // What the limits that bound memory count for the delivery: its publication, which it
+    // shares with the publication's other deliveries, and what it holds beside.
+    final long memoryBytes;
+
+    // Where the delivery stands among what its session has queued: the session's number for
+    // it, set under the session's inbox as the delivery comes to wait.
+    long order;
+
+    // Whether the delivery has room in the broker's memory for deliveries, which its session
+    // takes for it once it waits and gives back as it leaves the session. The session's, under
+    // its inbox.
+    boolean hasRoom;
 
     int packetId;
 
@@ -49,6 +73,7 @@ final class Delivery implements Outgoing, Pending {
 
     Delivery(
             Packet.Publish publication,
+            PublicationMemory memory,
             long received,
             Qos qos,
             boolean retain,
@@ -56,6 +81,7 @@ final class Delivery implements Outgoing, Pending {
             MqttVersion version
     ) {
         this.publication = publication;
+        this.memory = memory;
         this.received = received;
         lifetime = lifetimeOf(publication);
         this.qos = qos;
@@ -71,6 +97,27 @@ final class Delivery implements Outgoing, Pending {
                 properties,
                 publication.payload().length
         );
+        ownBytes = ownSize(publication, identifiers, version);
+        memoryBytes = memory.bytes() + ownBytes;
+    }
+
+    // What a delivery of `publication` to a receiver of `version` that carries `identifiers`
+    // holds on the heap beside the publication. Only an MQTT 5.0 delivery with Subscription
+    // Identifiers has a sequence of properties of its own: the publication's properties, which
+    // it shares, and the identifiers, which are its own too.
+    static long ownSize(
+            Packet.Publish publication,
+            List<Integer> identifiers,
+            MqttVersion version
+    ) {
+        long own = MemoryBudget.DELIVERY_BYTES;
+        if (version == MqttVersion.V5 && !identifiers.isEmpty()) {
+            own += PublicationMemory.sequenceSize(
+                    publication.properties().entries().size() + identifiers.size(),
+                    identifiers.size()
+            );
+        }
+        return own;
     }
 
     private static Properties withIdentifiers(Properties properties, List<Integer> identifiers) {

@@ -26,6 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.acknowledge;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
+import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
@@ -365,10 +366,11 @@ class BrokerRoutingTest {
     @Test
     void a_delivery_larger_than_the_send_byte_budget_is_dropped_and_its_subscriber_stays()
             throws Exception {
-        try (var sut = limitedBroker(64, 128);
+        // Arrange: a budget that holds the small delivery exactly.
+        long budget = deliverySize(publication("bounded", "fits", AT_LEAST_ONCE, 7));
+        try (var sut = limitedBroker(budget, 128);
                 var subscriber = connected(sut.port(), "subscriber");
                 var publisher = connected(sut.port(), "publisher")) {
-            // Arrange
             subscriber.subscribe("bounded", AT_MOST_ONCE);
 
             // Act: a single oversized frame deterministically exceeds capacity without filling

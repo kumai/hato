@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.util.List;
+import java.util.function.Consumer;
 
 import org.jspecify.annotations.Nullable;
 
@@ -9,6 +10,8 @@ import org.mqtt4j.hato.broker.internal.common.value.MqttVersion;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 
+import static java.util.Objects.requireNonNull;
+
 // The retained messages that a subscription matched as the client made it, on their way to the
 // session. They wait at one place in the session's queue, behind the deliveries queued before the
 // subscription and ahead of those queued after it, and go out one at a time as the window and
@@ -16,7 +19,18 @@ import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
 // than the delivery queue's. Each arrives with RETAIN 1 at the lower of its QoS and the granted
 // one, and carries the subscription's identifier [MQTT-3.3.4-3]. It belongs to the session's
 // actor, and waits under the session's inbox.
+//
+// The cursor holds the messages themselves, which the store may replace or drop meanwhile, so
+// what waits here is memory of its own. It lets go of each message as that goes out or is
+// dropped, and the session takes room in the broker's memory for those that still wait once it
+// has sent what it could: for the first ones, in the order they go out. With the first of them
+// that finds room, the session takes room for what the cursor holds besides the messages, which
+// stays as large as it was made until the cursor leaves the session: a message that has gone
+// leaves its place in the array behind.
 final class RetainedCursor implements Pending {
+
+    // A cursor itself, and its place among its session's cursors.
+    private static final int CURSOR_BYTES = 104;
 
     final TopicFilter filter;
 
@@ -24,15 +38,37 @@ final class RetainedCursor implements Pending {
 
     private final List<Integer> identifiers;
 
-    private final List<RetainedMessages.Message> matched;
+    // The retained messages in the order they go out. One that went out or was dropped leaves
+    // null behind.
+    private final RetainedMessages.@Nullable Message[] matched;
 
     private final MqttVersion version;
 
-    // The position in `matched` of the next retained message to go out.
+    // Where the cursor stands among what its session has queued: the session's number for it.
+    final long order;
+
+    // The position in `matched` of the next retained message to go out, or its length once
+    // none is left.
     private int next;
+
+    // The position behind the messages that have room in the broker's memory: those that are
+    // left before it have room, and those from it on have none yet.
+    private int roomEnd;
+
+    // How many retained messages are left.
+    private int remaining;
 
     // Whether QoS 0 deliveries are left out, because the connection they belong to has ended.
     private boolean acknowledgedOnly;
+
+    // What the cursor holds on the heap besides the retained messages, as the broker's memory
+    // for deliveries counts it while the cursor waits (see sizeOf).
+    final long ownBytes;
+
+    // Whether the cursor has room in the broker's memory for what it holds itself, which the
+    // session takes for it with the first of its messages that finds room to wait, and gives
+    // back as the cursor leaves the session. The session's, under its inbox.
+    boolean hasRoom;
 
     // The delivery of the retained message at `next`, made when the session first looks at it
     // and kept until it goes out.
@@ -42,56 +78,177 @@ final class RetainedCursor implements Pending {
             Packet.Subscription subscription,
             List<Integer> identifiers,
             List<RetainedMessages.Message> matched,
-            MqttVersion version
+            MqttVersion version,
+            long order
     ) {
         filter = subscription.filter();
         granted = subscription.qos();
         this.identifiers = identifiers;
-        this.matched = matched;
+        this.matched = matched.toArray(new RetainedMessages.Message[0]);
         this.version = version;
+        this.order = order;
+        remaining = this.matched.length;
+        long delivery = MemoryBudget.DELIVERY_BYTES;
+        for (RetainedMessages.Message message : matched) {
+            delivery = Math.max(
+                    delivery,
+                    Delivery.ownSize(message.publication(), identifiers, version)
+            );
+        }
+        ownBytes = sizeOf(filter, identifiers.size(), this.matched.length, delivery);
+    }
+
+    // What a cursor for `messages` retained messages holds on the heap besides those messages:
+    // itself; its array, by the length that it was made with; the filter of its SUBSCRIBE,
+    // which no later subscription to the same filter shares; its `identifiers` Subscription
+    // Identifiers; and the delivery of its next message, which it makes when the session first
+    // looks at that message and keeps until the message goes. `delivery` is what the largest
+    // delivery of one of its messages holds beside its publication, so the count is not below
+    // what the cursor holds whichever message is next. Like the size of a publication, it errs
+    // towards counting more than is held.
+    static long sizeOf(TopicFilter filter, int identifiers, int messages, long delivery) {
+        long size = CURSOR_BYTES
+                + PublicationMemory.ARRAY_BYTES
+                + (long) PublicationMemory.REFERENCE_BYTES * messages
+                + PublicationMemory.OBJECT_BYTES
+                + PublicationMemory.sizeOf(filter.pattern())
+                + delivery;
+        if (identifiers > 0) {
+            // The list, and a number for each identifier.
+            size += PublicationMemory.OBJECT_BYTES * (1L + identifiers);
+        }
+        return size;
     }
 
     // Whether a retained message is left.
     boolean hasNext() {
-        return next < matched.size();
+        return remaining > 0;
     }
 
-    // The delivery of the next retained message, or null once none is left.
-    @Nullable Delivery current() {
-        if (current == null && hasNext()) {
-            RetainedMessages.Message entry = matched.get(next);
-            Packet.Publish publication = entry.publication();
-            current = new Delivery(
-                    publication,
+    // The delivery of the next retained message. Called only while one is left.
+    Delivery current() {
+        Delivery delivery = current;
+        if (delivery == null) {
+            RetainedMessages.Message entry = requireNonNull(matched[next]);
+            delivery = new Delivery(
+                    entry.publication(),
+                    entry.memory(),
                     entry.received(),
-                    Qos.of(Math.min(granted.level(), publication.qos().level())),
+                    qosOf(entry),
                     true,
                     identifiers,
                     version
             );
+            current = delivery;
         }
-        return current;
+        return delivery;
     }
 
-    // Moves past the next retained message, which went out or was dropped, and returns its size
-    // as the broker counts it for retaining (an MQTT 5.0 PUBLISH). Called only while one is left.
-    long advance() {
-        long bytes = matched.get(next).byteCount();
+    // The QoS at which the next retained message goes out. Called only while one is left.
+    Qos nextQos() {
+        return qosOf(requireNonNull(matched[next]));
+    }
+
+    // The QoS at which `message` goes out: the lower of its own and the granted one.
+    Qos qosOf(RetainedMessages.Message message) {
+        return Qos.of(Math.min(granted.level(), message.publication().qos().level()));
+    }
+
+    // Whether the next retained message has room in the broker's memory. Called only while one
+    // is left.
+    boolean nextHasRoom() {
+        return next < roomEnd;
+    }
+
+    // Moves past the next retained message, which went out or was dropped, lets go of it, and
+    // returns it. Called only while one is left.
+    RetainedMessages.Message advance() {
+        RetainedMessages.Message message = requireNonNull(matched[next]);
+        remove(next);
+        return message;
+    }
+
+    // The first retained message that has no room in the broker's memory yet, or null if all
+    // that are left have.
+    RetainedMessages.@Nullable Message withoutRoom() {
+        while (roomEnd < matched.length && matched[roomEnd] == null) {
+            roomEnd++;
+        }
+        return (roomEnd < matched.length) ? matched[roomEnd] : null;
+    }
+
+    // Notes that the retained message that withoutRoom() returned has taken its room.
+    void roomTaken() {
+        roomEnd++;
+    }
+
+    // Lets go of the retained message that withoutRoom() returned, which the session goes
+    // without.
+    void dropWithoutRoom() {
+        remove(roomEnd);
+    }
+
+    // The position of the oldest retained message that is left and has room in the broker's
+    // memory, or -1 if none has.
+    int firstWithRoom() {
+        return nextWithRoom(next - 1);
+    }
+
+    // The position of the next retained message after `position` that is left and has room,
+    // or -1 if none has.
+    int nextWithRoom(int position) {
+        for (int following = position + 1; following < roomEnd; following++) {
+            if (matched[following] != null) {
+                return following;
+            }
+        }
+        return -1;
+    }
+
+    // The retained message at `position`, which firstWithRoom() or nextWithRoom() returned.
+    RetainedMessages.Message at(int position) {
+        return requireNonNull(matched[position]);
+    }
+
+    // Has `action` take each retained message that is left and has room in the broker's
+    // memory, oldest first.
+    void eachWithRoom(Consumer<RetainedMessages.Message> action) {
+        for (int position = next; position < roomEnd; position++) {
+            RetainedMessages.Message message = matched[position];
+            if (message != null) {
+                action.accept(message);
+            }
+        }
+    }
+
+    // Lets go of the message at `position`, and moves on to the next one that is left if it
+    // was the next to go out.
+    private void remove(int position) {
+        matched[position] = null;
+        remaining--;
+        if (position != next) {
+            return;
+        }
         current = null;
-        next++;
-        return bytes;
+        while (next < matched.length && matched[next] == null) {
+            next++;
+        }
+        roomEnd = Math.max(roomEnd, next);
     }
 
     // The number of retained messages left.
     int remainingCount() {
-        return matched.size() - next;
+        return remaining;
     }
 
-    // The size of the retained messages left, as `advance()` counts it.
+    // What the retained messages left hold on the heap, as the retained limits count it.
     long remainingBytes() {
         long bytes = 0;
-        for (int position = next; position < matched.size(); position++) {
-            bytes += matched.get(position).byteCount();
+        for (int position = next; position < matched.length; position++) {
+            RetainedMessages.Message message = matched[position];
+            if (message != null) {
+                bytes += message.memory().bytes();
+            }
         }
         return bytes;
     }

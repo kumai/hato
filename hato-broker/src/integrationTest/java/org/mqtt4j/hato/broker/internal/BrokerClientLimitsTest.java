@@ -22,6 +22,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.broker.internal.RawSession.acceptedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
+import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.common.protocol.Properties.EMPTY;
 import static org.mqtt4j.hato.broker.internal.common.value.Qos.AT_LEAST_ONCE;
@@ -237,10 +238,11 @@ class BrokerClientLimitsTest {
     @Test
     void a_delivery_beyond_the_client_and_the_broker_limits_leaves_the_session_alone()
             throws Exception {
-        try (BrokerServer sut = brokerWithSendBudget(256);
+        // Arrange: a budget that holds the small delivery exactly.
+        long budget = deliverySize(publication("sized/small", "small", AT_LEAST_ONCE, 1));
+        try (BrokerServer sut = brokerWithSendBudget(budget);
                 var subscriber = RawSession.open(sut.port(), MqttVersion.V5);
                 RawSession publisher = connected(sut.port(), "publisher")) {
-            // Arrange
             accepted(subscriber, connect("subscriber", true, maximumPacketSize(64)), false);
             subscriber.subscribe("sized/#", AT_LEAST_ONCE);
 

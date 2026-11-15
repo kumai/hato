@@ -74,20 +74,7 @@ class BrokerSessionExpiryTest {
         try (BrokerServer sut = broker(); RawSession watcher = watching(sut)) {
             // Arrange: 0xFFFFFFFF in MQTT 5.0, and Clean Session 0 in MQTT 3.1.1.
             leave(open(sut, "lasting", true, 0xFFFF_FFFFL), watcher, "lasting");
-            var classic = RawSession.open(sut.port());
-            classic.send(new Packet.Connect(
-                    "classic",
-                    MqttVersion.V3_1_1,
-                    false,
-                    0,
-                    will("classic"),
-                    null,
-                    null,
-                    EMPTY
-            ));
-            assertThat(classic.expect(Packet.ConnAck.class))
-                    .isEqualTo(new Packet.ConnAck(false, SUCCESS, EMPTY));
-            leave(classic, watcher, "classic");
+            leave(classic(sut, "classic", false), watcher, "classic");
 
             // Act: longer than the longest expiry that a session can have.
             timer.clock.advance(Duration.ofSeconds(0xFFFF_FFFFL + 1));
@@ -157,11 +144,7 @@ class BrokerSessionExpiryTest {
         try (BrokerServer sut = broker(1); RawSession watcher = watching(sut)) {
             // Arrange: the only persistent session that the broker keeps.
             leave(open(sut, "first", true, 10), watcher, "first");
-            try (var refused = RawSession.open(sut.port(), MqttVersion.V5)) {
-                refused.send(connectV5("second", true, 0, 10));
-                assertThat(refused.expect(Packet.ConnAck.class).reasonCode())
-                        .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
-            }
+            assertNoPlace(sut, "second");
 
             // Act
             timer.clock.advance(Duration.ofSeconds(10));
@@ -250,11 +233,80 @@ class BrokerSessionExpiryTest {
             leave(open(sut, "first", true, 10), watcher, "first");
 
             // Assert: the new session holds the only place.
-            try (var refused = RawSession.open(sut.port(), MqttVersion.V5)) {
-                refused.send(connectV5("second", true, 0, 10));
-                assertThat(refused.expect(Packet.ConnAck.class).reasonCode())
-                        .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
-            }
+            assertNoPlace(sut, "second");
+        }
+    }
+
+    @Test
+    void an_mqtt_3_1_1_session_ends_once_the_longest_lifetime_has_passed() throws Exception {
+        try (BrokerServer sut = broker(1, Duration.ofSeconds(60));
+                RawSession watcher = watching(sut)) {
+            // Arrange: Clean Session 0, which asks for no end, in the only place.
+            leave(classic(sut, "classic", false), watcher, "classic");
+
+            // Act & Assert: the session holds the place that long, and no longer.
+            timer.clock.advance(Duration.ofSeconds(60).minusNanos(1));
+            assertNoPlace(sut, "second");
+            timer.clock.advance(Duration.ofNanos(1));
+            awaitPlace(sut, "second");
+        }
+    }
+
+    @Test
+    void an_mqtt_5_client_that_asks_for_longer_learns_the_longest_lifetime_from_connack()
+            throws Exception {
+        try (BrokerServer sut = broker(1, Duration.ofSeconds(60));
+                RawSession watcher = watching(sut)) {
+            // Act: the client asks for a session without end.
+            RawSession client = RawSession.open(sut.port(), MqttVersion.V5);
+            client.send(connect("lasting", true, 0xFFFF_FFFFL));
+            Packet.ConnAck connAck = client.expect(Packet.ConnAck.class);
+
+            // Assert: CONNACK tells the interval that the broker uses, and the session ends
+            // with it.
+            assertThat(connAck.reasonCode()).isEqualTo(SUCCESS);
+            assertThat(connAck.properties().find(PropertyId.SESSION_EXPIRY_INTERVAL))
+                    .contains(new Property.FourByteValue(PropertyId.SESSION_EXPIRY_INTERVAL, 60));
+            leave(client, watcher, "lasting");
+            timer.clock.advance(Duration.ofSeconds(60).minusNanos(1));
+            assertNoPlace(sut, "second");
+            timer.clock.advance(Duration.ofNanos(1));
+            awaitPlace(sut, "second");
+        }
+    }
+
+    @Test
+    void a_session_that_asks_for_less_than_the_longest_lifetime_keeps_its_own_expiry()
+            throws Exception {
+        try (BrokerServer sut = broker(1, Duration.ofSeconds(60));
+                RawSession watcher = watching(sut)) {
+            // Arrange: the CONNACK tells this client nothing about its expiry.
+            leave(open(sut, "short", true, 10), watcher, "short");
+
+            // Act & Assert
+            timer.clock.advance(Duration.ofSeconds(10).minusNanos(1));
+            assertNoPlace(sut, "second");
+            timer.clock.advance(Duration.ofNanos(1));
+            awaitPlace(sut, "second");
+        }
+    }
+
+    @Test
+    void a_disconnect_cannot_lengthen_the_expiry_beyond_the_longest_lifetime() throws Exception {
+        try (BrokerServer sut = broker(1, Duration.ofSeconds(60));
+                RawSession watcher = watching(sut)) {
+            // Arrange
+            RawSession client = open(sut, "lengthened", true, 10);
+
+            // Act: the client asks for longer as it leaves.
+            client.send(disconnectWithWill(1000));
+            leave(client, watcher, "lengthened");
+
+            // Assert: the session lasts longer than it first asked for, but not that long.
+            timer.clock.advance(Duration.ofSeconds(60).minusNanos(1));
+            assertNoPlace(sut, "second");
+            timer.clock.advance(Duration.ofNanos(1));
+            awaitPlace(sut, "second");
         }
     }
 
@@ -263,11 +315,23 @@ class BrokerSessionExpiryTest {
     }
 
     private BrokerServer broker(int maxSessions) throws IOException {
+        return builder(maxSessions).start(loopback());
+    }
+
+    /// A broker that keeps no session longer than `longest` after its connection.
+    private BrokerServer broker(int maxSessions, Duration longest) throws IOException {
+        return builder(maxSessions).maxSessionExpiry(longest).start(loopback());
+    }
+
+    private BrokerServer.Builder builder(int maxSessions) {
         return BrokerServer.builder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .scheduler(timer)
-                .maxSessions(maxSessions)
-                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                .maxSessions(maxSessions);
+    }
+
+    private static InetSocketAddress loopback() {
+        return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
     }
 
     /// A connection that receives the Wills of the clients that leave.
@@ -291,6 +355,26 @@ class BrokerSessionExpiryTest {
         return client;
     }
 
+    /// An MQTT 3.1.1 connection of `clientId` with a Will and Clean Session 0, which the broker
+    /// accepted with or without a session of that client.
+    private static RawSession classic(BrokerServer broker, String clientId, boolean present)
+            throws Exception {
+        RawSession client = RawSession.open(broker.port());
+        client.send(new Packet.Connect(
+                clientId,
+                MqttVersion.V3_1_1,
+                false,
+                0,
+                will(clientId),
+                null,
+                null,
+                EMPTY
+        ));
+        assertThat(client.expect(Packet.ConnAck.class))
+                .isEqualTo(new Packet.ConnAck(present, SUCCESS, EMPTY));
+        return client;
+    }
+
     /// Connects `clientId` again without Clean Start and checks whether its session was kept.
     private static RawSession resumed(
             BrokerServer broker,
@@ -311,6 +395,16 @@ class BrokerSessionExpiryTest {
         client.close();
         assertThat(watcher.expect(Packet.Publish.class).topic())
                 .isEqualTo(new Topic("left/" + clientId));
+    }
+
+    /// Checks that the broker has no place among the persistent sessions for `clientId`, whose
+    /// CONNECT it refuses and which leaves nothing behind.
+    private static void assertNoPlace(BrokerServer broker, String clientId) throws Exception {
+        try (var refused = RawSession.open(broker.port(), MqttVersion.V5)) {
+            refused.send(connectV5(clientId, true, 0, 10));
+            assertThat(refused.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.QUOTA_EXCEEDED);
+        }
     }
 
     /// Waits until a CONNECT of `clientId` takes a place among the persistent sessions.

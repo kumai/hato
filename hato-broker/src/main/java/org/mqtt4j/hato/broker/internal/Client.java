@@ -85,6 +85,11 @@ final class Client {
 
     int sendLimit = Connection.MAX_PACKET_SIZE;
 
+    // Whether the connection has a place among the broker's clients: from its acceptance until
+    // its end comes to the session, or until another connection takes the session over and the
+    // place with it. Only the session's actor uses it.
+    private boolean holdsPlace;
+
     Client(Connection connection, Routing routing) {
         this.connection = connection;
         this.routing = routing;
@@ -120,12 +125,7 @@ final class Client {
             return;
         }
         Packet.Will requestedWill = request.will();
-        // MQTT 3.1.1 leaves the retention of a Clean Session 0 session to the broker, which
-        // keeps it without end.
-        long expiry = switch (request.version()) {
-            case V3_1_1 -> request.cleanStart() ? 0 : Session.NEVER;
-            case V5 -> expiryOf(request.properties()).orElse(0);
-        };
+        long expiry = Math.min(requestedExpiry(request), settings.maxSessionExpiry());
         // A test rule can refuse the client before anything else, which leaves the session and
         // the Will of its identifier as they were.
         Reason refusal = routing.connectionRefusal(request.clientId());
@@ -188,10 +188,13 @@ final class Client {
                 done.accept(false);
                 return;
             }
-            Integer maximumPacketSize = offered.maximumPacketSize();
-            if (maximumPacketSize != null) {
-                connection.limitPacketSize(maximumPacketSize);
-            }
+            // The CONNECT had a limit of its own. An MQTT 5.0 client has learned of its limit
+            // from CONNACK; MQTT 3.1.1 cannot tell a client, and the broker's limit holds for
+            // it all the same.
+            Integer announced = offered.maximumPacketSize();
+            connection.limitPacketSize(
+                    (announced == null) ? settings.maxPacketSize() : announced
+            );
             log.info("Broker accepted client {} from {} on port {}",
                     acceptance.id, connection.remoteAddress(), routing.port);
             done.accept(true);
@@ -221,6 +224,19 @@ final class Client {
                 routing.publishWill(expiredWill, actor);
             }
         }
+        // The connection that has the session now, whose end may not have come to the session
+        // yet. This one takes its place among the clients over with the session, and so needs
+        // no room of its own: a client can always come back for its session, even if the
+        // connection that it lost still counts.
+        Connection previous = actor.connection;
+        if (previous == null && !routing.takeClientPlace()) {
+            connection.refuse(
+                    noRoom(request.version()),
+                    "client '" + id + "' beyond the client limit"
+            );
+            actor.leaveIfUnused();
+            return false;
+        }
         boolean keep = expiry > 0;
         boolean present = !request.cleanStart()
                 && actor.kept()
@@ -229,8 +245,11 @@ final class Client {
         // frees it if it is not kept itself.
         boolean placed = actor.kept();
         if (keep && !placed && !routing.takePersistentPlace()) {
+            if (previous == null) {
+                routing.freeClientPlace();
+            }
             connection.refuse(
-                    ReasonCode.SERVER_UNAVAILABLE,
+                    noRoom(request.version()),
                     "persistent session capacity for client '" + id + "'"
             );
             actor.leaveIfUnused();
@@ -239,7 +258,10 @@ final class Client {
         if (placed && !keep) {
             routing.freePersistentPlace();
         }
-        Connection previous = actor.connection;
+        if (previous != null) {
+            previous.client.holdsPlace = false;
+        }
+        holdsPlace = true;
         // The Will that waits with the session goes out after CONNACK when this CONNECT ends
         // the session, or when it continues the session after the Will's delay has passed; a
         // connection within the delay cancels it [MQTT-3.1.3-9].
@@ -274,7 +296,7 @@ final class Client {
         }
         Properties properties = switch (request.version()) {
             case V3_1_1 -> Properties.EMPTY;
-            case V5 -> acceptanceV5(id, request.clientId().isEmpty(), offered);
+            case V5 -> acceptanceV5(request, id, offered, expiry);
         };
         var connAck = new Packet.ConnAck(present, ReasonCode.SUCCESS, properties);
         if (!actor.attach(connection, connAck)) {
@@ -302,12 +324,22 @@ final class Client {
         return true;
     }
 
-    // The properties of an MQTT 5.0 CONNACK that accepts the connection. The broker has no shared
-    // subscriptions, so it tells clients to send none. It announces the capabilities that differ
-    // from what a client assumes without them, and only MQTT 5.0 can tell a client the identifier
-    // assigned to it.
-    private static Properties acceptanceV5(String id, boolean assigned, Capabilities offered) {
+    // The properties of an MQTT 5.0 CONNACK that accepts `request` for the client `id` with a
+    // session that outlives its connection by `expiry` seconds. A client that asked for longer
+    // learns the interval that the broker uses instead (MQTT 5.0 section 3.2.2.3.2). The broker
+    // has no shared subscriptions, so it tells clients to send none. It announces the
+    // capabilities that differ from what a client assumes without them, and only MQTT 5.0 can
+    // tell a client the identifier assigned to it.
+    private static Properties acceptanceV5(
+            Packet.Connect request,
+            String id,
+            Capabilities offered,
+            long expiry
+    ) {
         var entries = new ArrayList<Property>();
+        if (expiry != requestedExpiry(request)) {
+            entries.add(new Property.FourByteValue(PropertyId.SESSION_EXPIRY_INTERVAL, expiry));
+        }
         if (!offered.subscriptionIdentifiersAvailable()) {
             entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
         }
@@ -344,10 +376,30 @@ final class Client {
         if (serverKeepAlive != null) {
             entries.add(new Property.TwoByteValue(PropertyId.SERVER_KEEP_ALIVE, serverKeepAlive));
         }
-        if (assigned) {
+        if (request.clientId().isEmpty()) {
             entries.add(new Property.StringValue(PropertyId.ASSIGNED_CLIENT_IDENTIFIER, id));
         }
         return new Properties(entries);
+    }
+
+    // How long the client of `request` asks its session to outlive its connection, in seconds.
+    // MQTT 3.1.1 leaves the retention of a Clean Session 0 session to the broker, and such a
+    // session asks for as long as the broker keeps any.
+    private static long requestedExpiry(Packet.Connect request) {
+        return switch (request.version()) {
+            case V3_1_1 -> request.cleanStart() ? 0 : Session.NEVER;
+            case V5 -> expiryOf(request.properties()).orElse(0);
+        };
+    }
+
+    // Why the broker refuses a CONNECT that one of its limits leaves no room for. MQTT 3.1.1
+    // has no return code for a limit, and its "Server unavailable" has a client try again
+    // later, as it should.
+    private static ReasonCode noRoom(MqttVersion version) {
+        return switch (version) {
+            case V3_1_1 -> ReasonCode.SERVER_UNAVAILABLE;
+            case V5 -> ReasonCode.QUOTA_EXCEEDED;
+        };
     }
 
     // The Subscription Identifier that a SUBSCRIBE gives every subscription that it makes or
@@ -503,7 +555,16 @@ final class Client {
                                     requested.retainHandling()
                             )
                             : requested;
-                    owner.subscribe(new Session.Subscribed(subscription, identifier));
+                    // The broker bounds the subscriptions of a session. One beyond its limits
+                    // subscribes to nothing, as a refused one, and the others of the request go
+                    // on.
+                    if (!owner.subscribe(new Session.Subscribed(subscription, identifier))) {
+                        grants.add(switch (owner.version) {
+                            case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
+                            case V5 -> ReasonCode.QUOTA_EXCEEDED;
+                        });
+                        continue;
+                    }
                     ReasonCode granted = switch (subscription.qos()) {
                         case AT_MOST_ONCE -> ReasonCode.SUCCESS;
                         case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
@@ -560,7 +621,9 @@ final class Client {
                     if (owner.expiry != 0 && expiry.getAsLong() == 0) {
                         routing.freePersistentPlace();
                     }
-                    owner.expiry = expiry.getAsLong();
+                    // A DISCONNECT has no answer, so a client that asks for longer than the
+                    // broker keeps a session does not learn of the shorter time.
+                    owner.expiry = Math.min(expiry.getAsLong(), settings.maxSessionExpiry());
                 }
                 // Only a normal disconnection discards the Will [MQTT-3.14.4-3]; MQTT 5.0
                 // publishes it for any other reason code, Disconnect with Will Message
@@ -827,6 +890,10 @@ final class Client {
         Session owner = session;
         if (owner == null) {
             return;
+        }
+        if (holdsPlace) {
+            holdsPlace = false;
+            routing.freeClientPlace();
         }
         owner.detach(connection);
         Packet.Will last = will;

@@ -479,6 +479,32 @@ class BrokerConnectionTest {
     }
 
     @Test
+    void a_broker_that_cannot_accept_a_connection_keeps_its_clients_and_accepts_it_later()
+            throws Exception {
+        // Arrange: the next three attempts to accept a connection fail, as they do while the
+        // process has no file descriptor left.
+        var failures = new AtomicInteger();
+        try (
+                BrokerServer sut = BrokerServer.builder().beforeAccept(() -> {
+                    if (failures.getAndUpdate(left -> Math.max(left - 1, 0)) > 0) {
+                        throw new IOException("injected failure to accept");
+                    }
+                }).start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession connected = connected(sut.port(), "connected")
+        ) {
+            failures.set(3);
+
+            // Act: the connection waits at the listener meanwhile.
+            try (RawSession later = connected(sut.port(), "later")) {
+                // Assert
+                assertThat(failures).hasValue(0);
+                later.ping();
+                connected.ping();
+            }
+        }
+    }
+
+    @Test
     void a_failed_selector_closes_the_listener_and_its_peers() throws Exception {
         var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
         var failing = new AtomicBoolean();

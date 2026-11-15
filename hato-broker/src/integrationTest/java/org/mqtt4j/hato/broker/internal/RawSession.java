@@ -173,6 +173,26 @@ final class RawSession implements AutoCloseable {
         );
     }
 
+    /// What the broker's memory limits count for one delivery of `publication` without
+    /// Subscription Identifiers: what the publication holds on the heap, and the delivery
+    /// itself. The limits on waiting deliveries and on the window count this, not the bytes of
+    /// the packet.
+    static long deliverySize(Packet.Publish publication) {
+        return PublicationMemory.sizeOf(publication) + MemoryBudget.DELIVERY_BYTES;
+    }
+
+    /// What the broker's memory limits count for the cursor of a subscription to `filter`
+    /// without a Subscription Identifier that matched `messages` retained messages, besides
+    /// those messages: what the cursor holds itself while it waits.
+    static long cursorSize(String filter, int messages) {
+        return RetainedCursor.sizeOf(
+                new TopicFilter(filter),
+                0,
+                messages,
+                MemoryBudget.DELIVERY_BYTES
+        );
+    }
+
     void subscribe(String filter, Qos qos) throws Exception {
         subscribe(subscription(filter, qos));
     }

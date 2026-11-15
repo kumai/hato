@@ -13,6 +13,8 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.internal.common.protocol.Packet;
+import org.mqtt4j.hato.broker.internal.common.protocol.Properties;
+import org.mqtt4j.hato.broker.internal.common.protocol.Property;
 import org.mqtt4j.hato.broker.internal.common.value.Qos;
 import org.mqtt4j.hato.broker.internal.common.value.Topic;
 import org.mqtt4j.hato.broker.internal.common.value.TopicFilter;
@@ -246,6 +248,37 @@ class BrokerRetainedTest {
     }
 
     @Test
+    void retained_messages_for_a_new_subscription_wait_behind_earlier_deliveries()
+            throws Exception {
+        try (BrokerServer sut = BrokerServer.builder().maxInflight(1).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            // Arrange: a retained message, and two deliveries, of which the first takes the
+            // window and the second waits.
+            publisher.publish(retained("kept/a", "a", AT_LEAST_ONCE));
+            subscriber.subscribe("live", AT_LEAST_ONCE);
+            publisher.publish("live", "first", AT_LEAST_ONCE, 7);
+            Packet.Publish first = subscriber.expect(Packet.Publish.class);
+            publisher.publish("live", "second", AT_LEAST_ONCE, 7);
+
+            // Act
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
+
+            // Assert: the delivery that waited before the subscription goes out ahead of the
+            // retained message.
+            subscriber.send(new Packet.PubAck(first.packetId(), SUCCESS, EMPTY));
+            Packet.Publish second = subscriber.expect(Packet.Publish.class);
+            assertThat(second.topic().name()).isEqualTo("live");
+            subscriber.send(new Packet.PubAck(second.packetId(), SUCCESS, EMPTY));
+            Packet.Publish kept = subscriber.expect(Packet.Publish.class);
+            assertThat(kept.topic().name()).isEqualTo("kept/a");
+            assertThat(kept.retain()).isTrue();
+            subscriber.send(new Packet.PubAck(kept.packetId(), SUCCESS, EMPTY));
+            subscriber.ping();
+        }
+    }
+
+    @Test
     void retained_messages_that_wait_go_on_when_the_session_resumes() throws Exception {
         try (BrokerServer sut = BrokerServer.builder().maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher")) {
@@ -400,8 +433,9 @@ class BrokerRetainedTest {
 
     @Test
     void a_retained_message_beyond_the_size_limit_leaves_its_topic_without_one() throws Exception {
-        // The limit holds the 17-byte MQTT 5.0 PUBLISH of the small message, but not two of them.
-        try (BrokerServer sut = BrokerServer.builder().maxRetainedBytes(20).start(loopback());
+        // The limit holds the small message, by what it holds on the heap, but not two of them.
+        long limit = PublicationMemory.sizeOf(retained("sized", "small", AT_LEAST_ONCE));
+        try (BrokerServer sut = BrokerServer.builder().maxRetainedBytes(limit).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher")) {
             // Arrange: replacing the small message frees its share of the limit.
             publisher.publish(retained("sized", "small", AT_LEAST_ONCE));
@@ -412,6 +446,53 @@ class BrokerRetainedTest {
 
             // Assert: the large message replaced the small one, so neither is kept, and the small
             // message fits again.
+            assertThat(retainedTopics(sut.port(), "first", "sized", 0)).isEmpty();
+            publisher.publish(retained("sized", "small", AT_LEAST_ONCE));
+            assertThat(retainedTopics(sut.port(), "second", "sized", 1)).containsExactly("sized");
+        }
+    }
+
+    @Test
+    void the_size_limit_bounds_the_retained_messages_of_all_topics_together() throws Exception {
+        // Arrange: a limit that holds one of the messages below, by what it holds on the heap.
+        long limit = PublicationMemory.sizeOf(retained("sized/a", "small", AT_LEAST_ONCE));
+        try (BrokerServer sut = BrokerServer.builder().maxRetainedBytes(limit).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            publisher.publish(retained("sized/a", "small", AT_LEAST_ONCE));
+
+            // Act: a message of the same size for another topic.
+            publisher.publish(retained("sized/b", "small", AT_LEAST_ONCE));
+
+            // Assert: the broker keeps the first alone.
+            assertThat(retainedTopics(sut.port(), "subscriber", "sized/#", 1))
+                    .containsExactly("sized/a");
+        }
+    }
+
+    @Test
+    void a_retained_message_counts_for_the_properties_that_it_holds() throws Exception {
+        // Arrange: a limit of four kilobytes, which holds the packet of the message below five
+        // times over.
+        try (BrokerServer sut = BrokerServer.builder().maxRetainedBytes(4096).start(loopback());
+                RawSession publisher = connectedV5(sut.port(), "publisher")) {
+            var entries = new ArrayList<Property>();
+            for (int number = 0; number < 100; number++) {
+                entries.add(new Property.UserProperty("a", "b"));
+            }
+
+            // Act: a hundred User Properties take 700 bytes in the packet, and at least twelve
+            // kilobytes on the heap.
+            publisher.publish(new Packet.Publish(
+                    new Topic("sized"),
+                    "small".getBytes(UTF_8),
+                    AT_LEAST_ONCE,
+                    true,
+                    false,
+                    1,
+                    new Properties(entries)
+            ));
+
+            // Assert: the broker keeps none, and still keeps a message that fits.
             assertThat(retainedTopics(sut.port(), "first", "sized", 0)).isEmpty();
             publisher.publish(retained("sized", "small", AT_LEAST_ONCE));
             assertThat(retainedTopics(sut.port(), "second", "sized", 1)).containsExactly("sized");
