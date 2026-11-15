@@ -289,6 +289,40 @@ class BrokerAuthenticationTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_decision_longer_than_the_keep_alive_leaves_the_accepted_client_connected(
+            MqttVersion version
+    ) throws Exception {
+        // Arrange: a client with a keep-alive of 2 seconds, and a decision that takes 4, longer
+        // than the one and a half keep-alives within which the broker must hear from a client.
+        var timer = new BrokerDeadlineTest.ManualTimer();
+        var deciding = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        Authenticator sut = _ -> {
+            deciding.countDown();
+            release.await();
+            return Authenticator.Decision.accept(Authenticator.Scope.all());
+        };
+        try (BrokerServer broker = BrokerServer.builder()
+                .authenticator(sut)
+                .scheduler(timer)
+                .start(loopback());
+                RawSession client = RawSession.open(broker.port(), version)) {
+            client.send(new Packet.Connect("slow", version, true, 2, null, null, null, EMPTY));
+            assertThat(deciding.await(5, SECONDS)).isTrue();
+            timer.clock.advance(Duration.ofSeconds(4));
+            // Act
+            release.countDown();
+            assertThat(client.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SUCCESS);
+            timer.clock.advance(Duration.ofSeconds(2));
+            // Assert: the keep-alive counts from the decision, as the broker read nothing from
+            // the client while it waited for it.
+            client.ping();
+        }
+    }
+
     @Test
     void a_failure_after_the_decision_ends_the_connection_and_frees_its_place() throws Exception {
         // Arrange: room for one connection that waits for its CONNECT, and a first decision that

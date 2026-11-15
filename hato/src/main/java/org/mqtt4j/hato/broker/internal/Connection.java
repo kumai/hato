@@ -875,16 +875,20 @@ final class Connection {
     // Ends the wait for the authenticator's decision. Returns false if the decision came too
     // late: the connection has ended, its deadline has refused the client already, or the
     // deadline has passed though its timer has not come yet, which refuses the client here.
+    // A decision in time has the client's keep-alive count from now, as the connection read
+    // nothing from the client while it waited.
     synchronized boolean decided() {
         String deciding = authenticating;
         authenticating = null;
         if (deciding == null || ended || lastPacket != null) {
             return false;
         }
-        if (scheduler.nanoTime() - lastReceived >= receiveTimeout) {
+        long now = scheduler.nanoTime();
+        if (now - lastReceived >= receiveTimeout) {
             refuseUndecided(deciding);
             return false;
         }
+        lastReceived = now;
         return true;
     }
 
