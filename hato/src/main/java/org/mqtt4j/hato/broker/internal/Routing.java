@@ -90,11 +90,13 @@ final class Routing {
     // How many sessions the closing broker has yet to clear, on whatever thread has their turn.
     private final AtomicInteger clearing = new AtomicInteger();
 
-    // Tells the application's listener, if there is one, of dropped QoS 1 and 2 deliveries and
-    // of a failure that stopped the broker.
+    // Tells the application's listener, if there is one, of dropped QoS 1 and 2 deliveries.
     final @Nullable DropReports dropReports;
 
-    // Where the selectors, the actor pool, and the listener's thread report their ends.
+    // Tells the application's listener, if there is one, of a failure that stopped the broker.
+    final @Nullable FailureNotice failureNotice;
+
+    // Where the selectors, the actor pool, and the listener's threads report their ends.
     final Termination termination;
 
     // The test controls. Until a test sets them, they change nothing.
@@ -153,6 +155,7 @@ final class Routing {
                 (int) Math.min(sessions, Integer.MAX_VALUE),
                 termination
         );
+        failureNotice = (listener == null) ? null : new FailureNotice(listener, port, termination);
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
         int workers = settings.actors();

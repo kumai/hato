@@ -164,8 +164,8 @@ public final class BrokerServer implements AutoCloseable {
             acceptKey = listener.register(acceptor, SelectionKey.OP_ACCEPT);
             int port = listener.socket().getLocalPort();
             // The parts whose ends end the broker: the accepting thread, the selectors, the actor
-            // pool, and the thread that calls the listener, if there is one.
-            int parts = 2 + settings.selectors() + ((settings.listener() == null) ? 0 : 1);
+            // pool, and the two threads that call the listener, if there is one.
+            int parts = 2 + settings.selectors() + ((settings.listener() == null) ? 0 : 2);
             routing = new Routing(settings, port, this::fail, new Termination(parts, port));
             accepting = Thread.ofPlatform().daemon()
                     .name("hato-broker-" + routing.port + "-accept")
@@ -554,6 +554,10 @@ public final class BrokerServer implements AutoCloseable {
                     if (reports != null) {
                         reports.start();
                     }
+                    FailureNotice notice = server.routing.failureNotice;
+                    if (notice != null) {
+                        notice.start();
+                    }
                     for (Reactor reactor : server.routing.reactors) {
                         reactor.start();
                     }
@@ -733,8 +737,9 @@ public final class BrokerServer implements AutoCloseable {
 
     // Ends the broker for `failure`, which stopped its accepting thread or a selector, as close()
     // ends it. The listener hears of the failure once, unless the broker had ended already: then
-    // the application asked for the end, or another failure came first. The notice goes out on
-    // the listener's thread, while this one ends the broker without waiting for it.
+    // the application asked for the end, or another failure came first. The notice goes out on a
+    // thread of its own (see FailureNotice), while this one ends the broker without waiting for
+    // it.
     private void fail(Throwable failure) {
         boolean first;
         synchronized (this) {
@@ -742,9 +747,9 @@ public final class BrokerServer implements AutoCloseable {
             routing.closed = true;
         }
         if (first) {
-            DropReports reports = routing.dropReports;
-            if (reports != null) {
-                reports.fail(failure);
+            FailureNotice notice = routing.failureNotice;
+            if (notice != null) {
+                notice.fail(failure);
             }
             end();
         }
@@ -793,6 +798,10 @@ public final class BrokerServer implements AutoCloseable {
             DropReports reports = routing.dropReports;
             if (reports != null) {
                 reports.close();
+            }
+            FailureNotice notice = routing.failureNotice;
+            if (notice != null) {
+                notice.end();
             }
             for (Reactor reactor : routing.reactors) {
                 reactor.close();

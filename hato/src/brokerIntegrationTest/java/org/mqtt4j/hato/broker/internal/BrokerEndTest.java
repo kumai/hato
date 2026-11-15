@@ -18,6 +18,7 @@ import org.mqtt4j.hato.broker.MqttBroker;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
@@ -171,6 +172,66 @@ class BrokerEndTest {
             }
             assertThat(sut.terminated()).isNotDone();
             release.countDown();
+            assertThat(sut.terminated()).succeedsWithin(WAIT);
+        }
+    }
+
+    @Test
+    void the_listener_hears_of_a_failure_while_another_call_takes_its_time() throws Exception {
+        // Arrange: a listener that holds its report of dropped deliveries until the test lets it
+        // go, and a session that loses one of two deliveries while its client is away.
+        var reporting = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var told = new CountDownLatch(1);
+        var holding = new BrokerListener() {
+            @Override
+            public void onDropped(String clientId, long count) {
+                reporting.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            @Override
+            public void onFailed(Throwable failure) {
+                told.countDown();
+            }
+        };
+        var failing = new AtomicBoolean();
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .maxQueued(1)
+                        .listener(holding)
+                        .beforeSelect(() -> {
+                            if (failing.compareAndSet(true, false)) {
+                                throw new AssertionError("injected selector failure");
+                            }
+                        })
+                        .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")
+        ) {
+            try (RawSession away = connected(sut.port(), "away", false, false)) {
+                away.subscribe("queued", AT_LEAST_ONCE);
+                away.disconnect();
+            }
+            publisher.publish("queued", "1", AT_LEAST_ONCE, 1);
+            publisher.publish("queued", "2", AT_LEAST_ONCE, 2);
+            assertThat(reporting.await(5, SECONDS)).isTrue();
+
+            // Act
+            failing.set(true);
+            publisher.send(publication("unheard", "", AT_MOST_ONCE, 0));
+
+            // Assert: the notice comes while the report still runs, and the broker ends once
+            // both have returned.
+            try {
+                assertThat(told.await(5, SECONDS)).isTrue();
+                assertThat(sut.terminated()).isNotDone();
+            } finally {
+                release.countDown();
+            }
             assertThat(sut.terminated()).succeedsWithin(WAIT);
         }
     }

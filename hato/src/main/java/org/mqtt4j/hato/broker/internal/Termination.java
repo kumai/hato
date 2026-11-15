@@ -4,7 +4,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
 // Tells when a broker has ended: its accepting thread, each of its selectors, its actor pool,
-// and the thread that calls the application's listener, if there is one. Each of these reports
+// and the threads that call the application's listener, if there is one. Each of these reports
 // its end here once, as the last thing that it does.
 //
 // The last of them completes the future on a thread of its own, which runs the application's

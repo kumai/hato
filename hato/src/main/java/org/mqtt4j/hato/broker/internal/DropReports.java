@@ -33,10 +33,6 @@ import org.mqtt4j.hato.internal.log.Log;
 // deliveries comes here once in a round: without the wait it came after nearly every report,
 // each time for the lock and to wake the thread. The listener hears of a delivery that moment
 // later.
-//
-// The thread also tells the listener of a failure that stopped the broker, as its last call, so
-// that the listener's calls still come one at a time. The broker ends meanwhile, without waiting
-// for that call.
 final class DropReports {
 
     private static final Log log = Log.of(DropReports.class);
@@ -70,10 +66,6 @@ final class DropReports {
 
     // Where the thread reports its end.
     private final Termination termination;
-
-    // The failure that stopped the broker, which the listener hears of last. Set before the
-    // reports close.
-    private volatile @Nullable Throwable stoppedBy;
 
     private volatile boolean closed;
 
@@ -141,13 +133,6 @@ final class DropReports {
         LockSupport.unpark(thread);
     }
 
-    // Ends the reports as `failure` stops the broker. The listener hears of the failure after
-    // the call that has begun, if one has, and of nothing else.
-    void fail(Throwable failure) {
-        stoppedBy = failure;
-        close();
-    }
-
     private void run() {
         try {
             while (!closed) {
@@ -165,25 +150,8 @@ final class DropReports {
                     }
                 }
             }
-            Throwable failure = stoppedBy;
-            if (failure != null) {
-                tellFailure(failure);
-            }
         } finally {
             termination.partEnded();
-        }
-    }
-
-    // Tells the listener of the failure that stopped the broker.
-    private void tellFailure(Throwable failure) {
-        try {
-            listener.onFailed(failure);
-        } catch (Throwable listenerFailure) {
-            log.warn("Broker on port {} could not tell its listener that it failed",
-                    port, listenerFailure);
-        } finally {
-            // As after any call, interrupt status that the call leaves is cleared.
-            boolean _ = Thread.interrupted();
         }
     }
 
