@@ -28,4 +28,18 @@ public interface BrokerListener {
     ///   how many such deliveries clients have lost since the last call
     default void onDroppedUnattributed(long count) {
     }
+
+    /// Called once if an internal failure stops the broker, rather than [MqttBroker#close()]; a
+    /// broker that the application closes first never calls it. The broker logs the failure as
+    /// well. The listener hears of nothing after it.
+    ///
+    /// The broker goes on ending without waiting for this call, so its listening port may still
+    /// be in use and its connections open while the call runs. [MqttBroker#close()], whether
+    /// called here or later, returns once the port is free and every connection is closed, and
+    /// [MqttBroker#terminated()] completes only after this call has returned.
+    ///
+    /// @param failure
+    ///   what stopped the broker
+    default void onFailed(Throwable failure) {
+    }
 }

@@ -29,7 +29,7 @@ class DropReportsTest {
         // comes to wait and a third finds no place. From then on, another client drops a
         // delivery during each report without a client, five times.
         var listener = new Listener();
-        var sut = new DropReports(listener, 0, 1);
+        var sut = new DropReports(listener, 0, 1, new Termination(1, 0));
         var others = new AtomicInteger();
         listener.duringReportWithoutClient = () -> {
             if (others.getAndIncrement() < 5) {
@@ -61,7 +61,7 @@ class DropReportsTest {
         // comes to wait and a third finds no place. From then on, a new client comes to wait
         // during each report of a client, five times.
         var listener = new Listener();
-        var sut = new DropReports(listener, 0, 1);
+        var sut = new DropReports(listener, 0, 1, new Termination(1, 0));
         var others = new AtomicInteger();
         listener.duringReportOfClient = () -> {
             if (others.getAndIncrement() < 5) {

@@ -12,6 +12,7 @@ import java.nio.channels.SocketChannel;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -161,7 +162,11 @@ public final class BrokerServer implements AutoCloseable {
         try {
             listener.configureBlocking(false);
             acceptKey = listener.register(acceptor, SelectionKey.OP_ACCEPT);
-            routing = new Routing(settings, listener.socket().getLocalPort(), this::close);
+            int port = listener.socket().getLocalPort();
+            // The parts whose ends end the broker: the accepting thread, the selectors, the actor
+            // pool, and the thread that calls the listener, if there is one.
+            int parts = 2 + settings.selectors() + ((settings.listener() == null) ? 0 : 1);
+            routing = new Routing(settings, port, this::fail, new Termination(parts, port));
             accepting = Thread.ofPlatform().daemon()
                     .name("hato-broker-" + routing.port + "-accept")
                     .unstarted(this::accept);
@@ -618,7 +623,9 @@ public final class BrokerServer implements AutoCloseable {
             if (!routing.closed) {
                 log.error("Broker listener on port {} failed", port(), failure);
             }
-            close();
+            fail(failure);
+        } finally {
+            routing.termination.partEnded();
         }
     }
 
@@ -704,7 +711,7 @@ public final class BrokerServer implements AutoCloseable {
     // selector closes the sockets of its connections on its own thread, as it ends, and the
     // accepting thread closes a socket that it took from the listener too late; every call
     // waits for those threads, so that a caller that closes the broker again meanwhile finds
-    // the same. Only a thread of the broker itself does not wait: one that closes the broker
+    // the same. Only a thread of the broker itself does not wait: one that ends the broker
     // after its failure goes on to close its own sockets.
     @Override
     public void close() {
@@ -716,6 +723,37 @@ public final class BrokerServer implements AutoCloseable {
         if (first) {
             end();
         }
+        awaitThreads();
+    }
+
+    /// Completes, normally, once the broker has ended; see MqttBroker.terminated().
+    public CompletableFuture<Void> terminated() {
+        return routing.termination.future();
+    }
+
+    // Ends the broker for `failure`, which stopped its accepting thread or a selector, as close()
+    // ends it. The listener hears of the failure once, unless the broker had ended already: then
+    // the application asked for the end, or another failure came first. The notice goes out on
+    // the listener's thread, while this one ends the broker without waiting for it.
+    private void fail(Throwable failure) {
+        boolean first;
+        synchronized (this) {
+            first = !routing.closed;
+            routing.closed = true;
+        }
+        if (first) {
+            DropReports reports = routing.dropReports;
+            if (reports != null) {
+                reports.fail(failure);
+            }
+            end();
+        }
+        awaitThreads();
+    }
+
+    // Returns once the accepting thread and the selectors have ended, unless the calling thread
+    // is one of them (see close()).
+    private void awaitThreads() {
         Thread current = Thread.currentThread();
         boolean own = current == accepting;
         for (Reactor reactor : routing.reactors) {

@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 
 import org.jspecify.annotations.Nullable;
 
@@ -89,8 +90,12 @@ final class Routing {
     // How many sessions the closing broker has yet to clear, on whatever thread has their turn.
     private final AtomicInteger clearing = new AtomicInteger();
 
-    // Tells the application of dropped QoS 1 and 2 deliveries, if it asked to hear of them.
+    // Tells the application's listener, if there is one, of dropped QoS 1 and 2 deliveries and
+    // of a failure that stopped the broker.
     final @Nullable DropReports dropReports;
+
+    // Where the selectors, the actor pool, and the listener's thread report their ends.
+    final Termination termination;
 
     // The test controls. Until a test sets them, they change nothing.
 
@@ -116,9 +121,16 @@ final class Routing {
 
     volatile boolean closed;
 
-    Routing(BrokerSettings settings, int port, Runnable stopBroker) throws IOException {
+    // `stopBroker` ends the broker for the failure of a selector.
+    Routing(
+            BrokerSettings settings,
+            int port,
+            Consumer<Throwable> stopBroker,
+            Termination termination
+    ) throws IOException {
         this.settings = settings;
         this.port = port;
+        this.termination = termination;
         retained = new RetainedMessages(
                 settings.maxRetained(),
                 settings.maxRetainedBytes(),
@@ -138,7 +150,8 @@ final class Routing {
         dropReports = (listener == null) ? null : new DropReports(
                 listener,
                 port,
-                (int) Math.min(sessions, Integer.MAX_VALUE)
+                (int) Math.min(sessions, Integer.MAX_VALUE),
+                termination
         );
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
@@ -166,6 +179,12 @@ final class Routing {
             protected void afterExecute(Runnable task, @Nullable Throwable failure) {
                 var worker = (Worker) Thread.currentThread();
                 worker.handOver();
+            }
+
+            // The pool ends once the broker has shut it down and its threads have ended.
+            @Override
+            protected void terminated() {
+                termination.partEnded();
             }
         };
         try {

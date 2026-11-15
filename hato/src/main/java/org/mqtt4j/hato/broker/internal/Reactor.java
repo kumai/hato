@@ -8,6 +8,7 @@ import java.nio.channels.SocketChannel;
 import java.util.Iterator;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import org.mqtt4j.hato.internal.log.Log;
 
@@ -30,11 +31,12 @@ final class Reactor implements AutoCloseable {
     // before it ends.
     final Thread thread;
 
-    private final Runnable stopBroker;
+    // Ends the broker for the failure that ends this selector's thread.
+    private final Consumer<Throwable> stopBroker;
 
     private volatile boolean closed;
 
-    Reactor(Routing routing, int index, Runnable stopBroker) throws IOException {
+    Reactor(Routing routing, int index, Consumer<Throwable> stopBroker) throws IOException {
         this.routing = routing;
         this.stopBroker = stopBroker;
         thread = Thread.ofPlatform().daemon()
@@ -42,10 +44,10 @@ final class Reactor implements AutoCloseable {
                 .unstarted(this::run);
     }
 
+    // Starts the thread even if the broker has ended meanwhile, as when another selector failed
+    // at once: the thread then ends at once, and reports its end as every selector does.
     synchronized void start() {
-        if (!closed) {
-            thread.start();
-        }
+        thread.start();
     }
 
     // Seals registration with close(), so even a peer whose registration task has not
@@ -152,7 +154,7 @@ final class Reactor implements AutoCloseable {
         } catch (Throwable failure) {
             if (!closed) {
                 try {
-                    stopBroker.run();
+                    stopBroker.accept(failure);
                 } finally {
                     log.error("Broker selector on port {} failed", routing.port, failure);
                 }
@@ -168,6 +170,7 @@ final class Reactor implements AutoCloseable {
             } finally {
                 tasks.clear();
                 closeSelector();
+                routing.termination.partEnded();
             }
         }
     }

@@ -3,6 +3,7 @@ package org.mqtt4j.hato.broker;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
 
 import org.mqtt4j.hato.broker.internal.BrokerServer;
 import org.mqtt4j.hato.internal.concurrent.ClassPreload;
@@ -161,6 +162,21 @@ public final class MqttBroker implements AutoCloseable {
     /// {@return the assigned listening port, including after close}
     public int port() {
         return server.port();
+    }
+
+    /// Observes the end of this broker without requesting it. The future completes once the
+    /// broker has ended, through [#close()] or because an internal failure stopped it: its port
+    /// is free, its connections are closed, it has finished its work, and it calls no
+    /// application code any more, the [BrokerListener] included. It completes normally either
+    /// way; the listener hears of a failure. Each call returns an independent future.
+    ///
+    /// A listener call that never returns keeps the future pending. To listen on the same port
+    /// again, the return of [#close()] is enough; this future waits for the listener as well.
+    ///
+    /// @return
+    ///   a future that completes at the end of this broker
+    public CompletableFuture<Void> terminated() {
+        return server.terminated().copy();
     }
 
     /// Stops accepting connections, closes all peers, and discards their session state and the
