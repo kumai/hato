@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -21,6 +22,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.concurrent.Timer;
@@ -130,6 +132,16 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final int ACTORS_ON_ONE_PROCESSOR = 1;
 
+    // How long the application's authenticator may take over one decision.
+    private static final Duration AUTHENTICATION_TIMEOUT = Duration.ofSeconds(10);
+
+    // How many decisions of the authenticator may run at once. With decisions of 50 ms each,
+    // these take about 300 clients a second, as hundreds that reconnect together after an
+    // outage do.
+    // Ceiling: an application whose decisions take long refuses more of a crowd that connects
+    // at once; a public setting, or an executor of the application's, would lift that.
+    private static final int MAX_AUTHENTICATIONS = 16;
+
     // How long the accepting thread waits before it tries again after a connection could not
     // be accepted. The cause, such as a process without a free file descriptor, lasts until
     // something else in the process gives way, so trying at once would only spin.
@@ -164,8 +176,12 @@ public final class BrokerServer implements AutoCloseable {
             acceptKey = listener.register(acceptor, SelectionKey.OP_ACCEPT);
             int port = listener.socket().getLocalPort();
             // The parts whose ends end the broker: the accepting thread, the selectors, the actor
-            // pool, and the two threads that call the listener, if there is one.
-            int parts = 2 + settings.selectors() + ((settings.listener() == null) ? 0 : 2);
+            // pool, the two threads that call the listener, if there is one, and the pool that
+            // calls the authenticator, if there is one.
+            int parts = 2
+                    + settings.selectors()
+                    + ((settings.listener() == null) ? 0 : 2)
+                    + ((settings.authenticator() == null) ? 0 : 1);
             routing = new Routing(settings, port, this::fail, new Termination(parts, port));
             accepting = Thread.ofPlatform().daemon()
                     .name("hato-broker-" + routing.port + "-accept")
@@ -270,6 +286,12 @@ public final class BrokerServer implements AutoCloseable {
         private Capabilities capabilities = Capabilities.DEFAULT;
 
         private @Nullable BrokerListener listener;
+
+        private @Nullable Authenticator authenticator;
+
+        private Duration authenticationTimeout = AUTHENTICATION_TIMEOUT;
+
+        private int maxAuthentications = MAX_AUTHENTICATIONS;
 
         private Timer scheduler = TimerService.broker;
 
@@ -410,6 +432,21 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        public Builder authenticator(Authenticator value) {
+            authenticator = requireNonNull(value, "authenticator must not be null");
+            return this;
+        }
+
+        public Builder authenticationTimeout(Duration value) {
+            authenticationTimeout = requireNonNull(value, "authenticationTimeout must not be null");
+            return this;
+        }
+
+        Builder maxAuthentications(int value) {
+            maxAuthentications = value;
+            return this;
+        }
+
         public Builder listener(BrokerListener value) {
             listener = requireNonNull(value, "listener must not be null");
             return this;
@@ -508,6 +545,9 @@ public final class BrokerServer implements AutoCloseable {
                 || deliveryMemoryUnit < 0
                 || selectors <= 0
                 || actors <= 0
+                || authenticationTimeout.isNegative()
+                || authenticationTimeout.isZero()
+                || maxAuthentications <= 0
             ) {
                 throw new IllegalArgumentException(
                         "Broker limits must be positive and window fit queue"
@@ -541,6 +581,9 @@ public final class BrokerServer implements AutoCloseable {
                     actors,
                     capabilities,
                     listener,
+                    authenticator,
+                    authenticationTimeout.toNanos(),
+                    maxAuthentications,
                     scheduler,
                     beforeProcess,
                     beforeHandle,
@@ -807,6 +850,12 @@ public final class BrokerServer implements AutoCloseable {
             routing.clear();
         } finally {
             routing.actors.shutdown();
+            ThreadPoolExecutor authentications = routing.authentications;
+            if (authentications != null) {
+                // The decisions that run are the application's code. An interrupt is all that
+                // asks them to return; the broker's end waits until they have.
+                authentications.shutdownNow();
+            }
             DropReports reports = routing.dropReports;
             if (reports != null) {
                 reports.close();

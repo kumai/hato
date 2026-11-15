@@ -1,12 +1,14 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.MqttBrokerBuilder;
@@ -165,6 +167,44 @@ class BrokerBuilderTest {
             assertThatTwoDeliveriesLeaveOne(sut);
             // Assert
             assertThat(dropped.poll(5, SECONDS)).isEqualTo("away lost 1");
+        }
+    }
+
+    @Test
+    void asks_its_authenticator_about_every_client() throws Exception {
+        try (MqttBroker sut = MqttBroker.builder()
+                .authenticator(_ -> Authenticator.Decision.refuseNotAuthorized())
+                .start();
+                RawSession client = RawSession.open(sut.port(), MqttVersion.V5)) {
+            // Act
+            client.send(connectV5("client", true, 0, 0));
+            // Assert
+            assertThat(client.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.NOT_AUTHORIZED);
+        }
+    }
+
+    @Test
+    void gives_its_authenticator_the_time_that_it_is_given() throws Exception {
+        // Arrange: a decision that waits until the test lets it go, far beyond the setting.
+        var release = new CountDownLatch(1);
+        try (MqttBroker sut = MqttBroker.builder()
+                .authenticator(_ -> {
+                    release.await();
+                    return Authenticator.Decision.accept(Authenticator.Scope.all());
+                })
+                .authenticationTimeout(Duration.ofMillis(200))
+                .start();
+                RawSession client = RawSession.open(sut.port(), MqttVersion.V5)) {
+            try {
+                // Act
+                client.send(connectV5("client", true, 0, 0));
+                // Assert: refused well before the default of ten seconds.
+                assertThat(client.expect(Packet.ConnAck.class).reasonCode())
+                        .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
+            } finally {
+                release.countDown();
+            }
         }
     }
 

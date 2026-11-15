@@ -95,6 +95,10 @@ final class Connection {
 
     private boolean connected;
 
+    // The identifier of the client whose CONNECT waits for the application's authenticator,
+    // while it waits; the connection's deadline is then the decision's. Guarded by this.
+    private @Nullable String authenticating;
+
     // Whether the connection counts among those that wait for the broker to accept a CONNECT on
     // them, as every connection does from its registration.
     private boolean awaitingConnect = true;
@@ -855,6 +859,27 @@ final class Connection {
         lastReceived = scheduler.nanoTime();
     }
 
+    // Has the connection wait for the authenticator's decision on the client `clientId`, which
+    // may take `timeout` nanoseconds from the CONNECT. Returns false if the connection has ended.
+    synchronized boolean awaitDecision(String clientId, long timeout) {
+        if (ended || lastPacket != null) {
+            return false;
+        }
+        authenticating = clientId;
+        cancelTimer();
+        receiveTimeout = timeout;
+        armTimer(receiveTimeout - (scheduler.nanoTime() - lastReceived));
+        return true;
+    }
+
+    // Ends the wait for the authenticator's decision. Returns false if the decision came too
+    // late: the connection has ended, or its deadline has refused the client already.
+    synchronized boolean decided() {
+        boolean waiting = authenticating != null && !ended && lastPacket == null;
+        authenticating = null;
+        return waiting;
+    }
+
     synchronized void keepAlive(int seconds) {
         cancelTimer();
         receiveTimeout = seconds * 1_500_000_000L;
@@ -913,6 +938,16 @@ final class Connection {
                 long remaining = receiveTimeout - (scheduler.nanoTime() - lastReceived);
                 if (remaining > 0) {
                     armTimer(remaining);
+                    return;
+                }
+                String deciding = authenticating;
+                if (deciding != null) {
+                    // The decision that comes later finds that it came too late.
+                    authenticating = null;
+                    refuse(
+                            ReasonCode.SERVER_UNAVAILABLE,
+                            "client '" + deciding + "', whose authentication took too long"
+                    );
                     return;
                 }
                 // Mark the deadline under the same lock as receipt; a late frame cannot

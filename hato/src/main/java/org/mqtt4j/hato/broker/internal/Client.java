@@ -8,6 +8,8 @@ import java.util.List;
 import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -17,6 +19,7 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.IncomingAliases;
 import org.mqtt4j.hato.internal.protocol.Packet;
@@ -97,8 +100,9 @@ final class Client {
     }
 
     // Checks CONNECT on the selector and reports through `done` whether the session attached.
-    // The connection pauses reads while its session actor takes the connection over.
-    // No selector thread waits for the acceptance to finish.
+    // The connection pauses reads while the application's authenticator decides, if there is
+    // one, and while its session actor takes the connection over. No selector thread waits for
+    // the decision or the acceptance to finish.
     void connect(Packet.Connect request, Consumer<Boolean> done) {
         // MQTT 3.1.1 refuses an empty identifier for a persistent session [MQTT-3.1.3-8];
         // MQTT 5.0 assigns one below whatever the session.
@@ -165,6 +169,115 @@ final class Client {
             done.accept(false);
             return;
         }
+        // The identifier is settled before the application decides, which then learns the one
+        // that the client will have.
+        String id = request.clientId();
+        if (id.isEmpty()) {
+            do {
+                id = "hato" + UUID.randomUUID().toString().replace("-", "");
+            } while (routing.sessions.containsKey(id));
+        }
+        Authenticator authenticator = settings.authenticator();
+        if (authenticator == null) {
+            admit(request, id, offered, expiry, done);
+        } else {
+            authenticate(authenticator, request, id, offered, expiry, done);
+        }
+    }
+
+    // Asks the application's authenticator about the client `id` on the broker's authentication
+    // pool, and admits the client if the decision accepts it in time. The connection's deadline
+    // meanwhile is the decision's. A CONNECT that finds as many decisions running as the pool
+    // allows, or no thread for another, is refused at once.
+    private void authenticate(
+            Authenticator authenticator,
+            Packet.Connect request,
+            String id,
+            Capabilities offered,
+            long expiry,
+            Consumer<Boolean> done
+    ) {
+        var asked = new ConnectRequest(request, id, connection.remoteAddress());
+        if (!connection.awaitDecision(id, settings.authenticationTimeout())) {
+            done.accept(false);
+            return;
+        }
+        ThreadPoolExecutor pool = requireNonNull(routing.authentications, "an authentication pool");
+        try {
+            pool.execute(() -> decide(authenticator, asked, request, offered, expiry, done));
+        } catch (RejectedExecutionException | OutOfMemoryError _) {
+            if (connection.decided()) {
+                // MQTT 3.1.1 has no return code for a busy server.
+                connection.refuse(
+                        (request.version() == MqttVersion.V5)
+                                ? ReasonCode.SERVER_BUSY
+                                : ReasonCode.SERVER_UNAVAILABLE,
+                        "client '" + id + "' while as many others waited for their decisions"
+                );
+            }
+            done.accept(false);
+        }
+    }
+
+    // Runs the authenticator on a thread of the authentication pool and acts on its decision,
+    // unless the connection has ended or been refused for its deadline meanwhile.
+    private void decide(
+            Authenticator authenticator,
+            ConnectRequest asked,
+            Packet.Connect request,
+            Capabilities offered,
+            long expiry,
+            Consumer<Boolean> done
+    ) {
+        Authenticator.Decision decision = null;
+        try {
+            decision = authenticator.authenticate(asked);
+        } catch (Throwable failure) {
+            // The failure is the application's. The request leaves the credentials out of the
+            // log, though what the application put into its exception is beyond the broker.
+            log.warn("Broker on port {} could not decide on client {} from {}",
+                    routing.port, asked.clientId(), connection.remoteAddress(), failure);
+        } finally {
+            // Interrupt status that the decision leaves must not reach the next one.
+            boolean _ = Thread.interrupted();
+        }
+        if (!connection.decided()) {
+            done.accept(false);
+            return;
+        }
+        String id = asked.clientId();
+        switch (decision) {
+            case Authenticator.Decision.Accepted _ -> admit(request, id, offered, expiry, done);
+            case Authenticator.Decision.Refused refused -> {
+                connection.refuse(
+                        switch (refused) {
+                            case BAD_CREDENTIALS -> ReasonCode.BAD_USER_NAME_OR_PASSWORD;
+                            case NOT_AUTHORIZED -> ReasonCode.NOT_AUTHORIZED;
+                        },
+                        "client '" + id + "' by its authenticator"
+                );
+                done.accept(false);
+            }
+            case null -> {
+                // An exception, or a decision that broke the authenticator's contract.
+                connection.refuse(
+                        ReasonCode.SERVER_UNAVAILABLE,
+                        "client '" + id + "' for want of a decision"
+                );
+                done.accept(false);
+            }
+        }
+    }
+
+    // Has the actor of the client `id` accept the connection, once the CONNECT has passed every
+    // check and decision.
+    private void admit(
+            Packet.Connect request,
+            String id,
+            Capabilities offered,
+            long expiry,
+            Consumer<Boolean> done
+    ) {
         // Inline expiry or a scheduling failure must happen before taking over a peer.
         // A Server Keep Alive replaces the client's own [MQTT-3.2.2-21] [MQTT-3.2.2-22].
         Integer serverKeepAlive = offered.serverKeepAlive();
@@ -174,12 +287,6 @@ final class Client {
         if (connection.isEnded()) {
             done.accept(false);
             return;
-        }
-        String id = request.clientId();
-        if (id.isEmpty()) {
-            do {
-                id = "hato" + UUID.randomUUID().toString().replace("-", "");
-            } while (routing.sessions.containsKey(id));
         }
         var acceptance = new Acceptance(request, id, offered, expiry);
         acceptance.post(Session.ELSEWHERE);

@@ -24,6 +24,9 @@ public final class MqttBrokerBuilder {
 
     private static final int MAX_PACKET_SIZE = 268_435_460;
 
+    // The longest wait that a setting may give, as for the client's timeouts.
+    private static final Duration MAX_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
+
     // The internal settings that this builder fills in. They hold the defaults of every limit,
     // so a setting that the application leaves alone keeps the broker's own value.
     private final BrokerServer.Builder settings = BrokerServer.builder();
@@ -183,6 +186,40 @@ public final class MqttBrokerBuilder {
             throw new IllegalArgumentException("Queued delivery memory limit must be positive");
         }
         settings.maxQueuedBytes(value);
+        return this;
+    }
+
+    /// Has `value` decide on every client that connects; see [Authenticator]. Without one, which
+    /// is the default, the broker accepts every client and lets it publish and subscribe to every
+    /// topic.
+    ///
+    /// @param value
+    ///   the authenticator
+    /// @return
+    ///   this builder
+    public MqttBrokerBuilder authenticator(Authenticator value) {
+        settings.authenticator(requireNonNull(value, "authenticator"));
+        return this;
+    }
+
+    /// Limits how long the broker waits for the [Authenticator]'s decision on a client, counted
+    /// from its CONNECT. Defaults to 10 seconds. Must be positive and at most 2147483647
+    /// milliseconds. A client whose decision takes longer is refused with Server unavailable,
+    /// return code 3 in MQTT 3.1.1, and the decision is ignored when it comes.
+    ///
+    /// @param value
+    ///   the longest wait for a decision
+    /// @return
+    ///   this builder
+    public MqttBrokerBuilder authenticationTimeout(Duration value) {
+        requireNonNull(value, "authenticationTimeout");
+        if (value.isNegative() || value.isZero() || value.compareTo(MAX_TIMEOUT) > 0) {
+            throw new IllegalArgumentException(
+                    "Authentication timeout must be positive and at most "
+                            + MAX_TIMEOUT.toMillis() + " ms"
+            );
+        }
+        settings.authenticationTimeout(value);
         return this;
     }
 

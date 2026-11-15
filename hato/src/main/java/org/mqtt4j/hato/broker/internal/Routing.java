@@ -10,6 +10,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -44,6 +45,9 @@ final class Routing {
     // How long a closing broker that checks its memory for deliveries waits for the sessions
     // and the pool to end before it gives the check up.
     private static final long MEMORY_CHECK_NANOS = 1_000_000_000L;
+
+    // How long a thread of the authentication pool waits for another decision before it ends.
+    private static final long AUTHENTICATION_IDLE_SECONDS = 30;
 
     final BrokerSettings settings;
 
@@ -95,6 +99,11 @@ final class Routing {
 
     // Tells the application's listener, if there is one, of a failure that stopped the broker.
     final @Nullable FailureNotice failureNotice;
+
+    // Runs the application's authenticator, if there is one, on threads of its own: at most as
+    // many decisions at once as the settings allow, and none on a thread of the broker's I/O or
+    // actors, since a decision may wait. A thread that has had no decision for a while ends.
+    final @Nullable ThreadPoolExecutor authentications;
 
     // Where the selectors, the actor pool, and the listener's threads report their ends.
     final Termination termination;
@@ -156,6 +165,27 @@ final class Routing {
                 termination
         );
         failureNotice = (listener == null) ? null : new FailureNotice(listener, port, termination);
+        var nextAuthentication = new AtomicInteger();
+        authentications = (settings.authenticator() == null) ? null : new ThreadPoolExecutor(
+                0,
+                settings.maxAuthentications(),
+                AUTHENTICATION_IDLE_SECONDS,
+                TimeUnit.SECONDS,
+                new SynchronousQueue<>(),
+                task -> {
+                    int number = nextAuthentication.getAndIncrement();
+                    return Thread.ofPlatform().daemon()
+                            .name("hato-broker-" + port + "-auth-" + number)
+                            .unstarted(task);
+                }
+        ) {
+
+            // The pool ends once the broker has shut it down and its decisions have returned.
+            @Override
+            protected void terminated() {
+                termination.partEnded();
+            }
+        };
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
         int workers = settings.actors();
@@ -201,6 +231,9 @@ final class Routing {
                 }
             }
             actors.shutdown();
+            if (authentications != null) {
+                authentications.shutdown();
+            }
             throw failure;
         }
     }

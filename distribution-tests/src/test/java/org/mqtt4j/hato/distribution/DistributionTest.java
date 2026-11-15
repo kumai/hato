@@ -611,6 +611,12 @@ class DistributionTest {
                 "org.mqtt4j.hato.Transport$Listener",
                 "org.mqtt4j.hato.Transport$SendResult",
                 "org.mqtt4j.hato.UserProperty",
+                "org.mqtt4j.hato.broker.Authenticator",
+                "org.mqtt4j.hato.broker.Authenticator$Decision",
+                "org.mqtt4j.hato.broker.Authenticator$Decision$Accepted",
+                "org.mqtt4j.hato.broker.Authenticator$Decision$Refused",
+                "org.mqtt4j.hato.broker.Authenticator$Request",
+                "org.mqtt4j.hato.broker.Authenticator$Scope",
                 "org.mqtt4j.hato.broker.BrokerListener",
                 "org.mqtt4j.hato.broker.MqttBroker",
                 "org.mqtt4j.hato.broker.MqttBrokerBuilder"

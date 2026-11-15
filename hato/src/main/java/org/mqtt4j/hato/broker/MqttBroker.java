@@ -26,8 +26,9 @@ import org.mqtt4j.hato.internal.log.Log;
 /// reuses such an identifier ends that wait, as a client that lost its session state does.
 /// Offline QoS 0 deliveries are discarded. An empty identifier with Clean Session false is
 /// refused with Identifier rejected. Overlapping subscriptions of a session receive one copy at
-/// their highest QoS. Credentials are not checked. Shared subscriptions are not supported: a
-/// `$share/` filter is refused, in MQTT 3.1.1 with failure 0x80.
+/// their highest QoS. An [Authenticator] decides on every client; without one, credentials are
+/// not checked. Shared subscriptions are not supported: a `$share/` filter is refused, in MQTT
+/// 3.1.1 with failure 0x80.
 ///
 /// A retained publication becomes the retained message of its topic in place of the previous
 /// one, and a retained publication with an empty payload removes it; both reach current
@@ -167,8 +168,8 @@ public final class MqttBroker implements AutoCloseable {
     /// Observes the end of this broker without requesting it. The future completes once the
     /// broker has ended, through [#close()] or because an internal failure stopped it: its port
     /// is free, its connections are closed, it has finished its work, and it calls no
-    /// application code any more, the [BrokerListener] included. It completes normally either
-    /// way; the listener hears of a failure.
+    /// application code any more, the [BrokerListener] and the [Authenticator] included. It
+    /// completes normally either way; the listener hears of a failure.
     ///
     /// Each call returns an independent future. The continuations attached while it waits run,
     /// as it completes, on a thread of its own, so one that waits, even for a future of another
@@ -191,7 +192,8 @@ public final class MqttBroker implements AutoCloseable {
     /// Stops accepting connections, closes all peers, and discards their session state and the
     /// retained messages, without publishing Wills, those that wait for their delay included.
     /// When it returns, the listening port is free and every connection is closed. Repeated
-    /// calls are harmless. Does not wait for peer I/O or send MQTT packets. Before it returns,
+    /// calls are harmless. Does not wait for peer I/O or send MQTT packets. It interrupts the
+    /// [Authenticator]'s decisions that are running and does not wait for them. Before it returns,
     /// it gives the logging backend a moment to take what the broker has logged.
     @Override
     public void close() {

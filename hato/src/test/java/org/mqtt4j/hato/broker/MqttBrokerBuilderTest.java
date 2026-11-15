@@ -40,6 +40,16 @@ class MqttBrokerBuilderTest {
                 Arguments.of(
                         "no queued delivery memory",
                         setting(sut -> sut.maxQueuedDeliveryBytes(0))
+                ),
+                Arguments.of(
+                        "no time for an authentication",
+                        setting(sut -> sut.authenticationTimeout(Duration.ZERO))
+                ),
+                Arguments.of(
+                        "an authentication timeout beyond 2147483647 ms",
+                        setting(sut -> sut.authenticationTimeout(
+                                Duration.ofMillis(Integer.MAX_VALUE).plusMillis(1)
+                        ))
                 )
         );
     }
@@ -72,6 +82,8 @@ class MqttBrokerBuilderTest {
                 .maxRetainedBytes(1)
                 .maxQueuedDeliveries(1)
                 .maxQueuedDeliveryBytes(1)
+                .authenticationTimeout(Duration.ofMillis(1))
+                .authenticationTimeout(Duration.ofMillis(Integer.MAX_VALUE))
         ).doesNotThrowAnyException();
     }
 
