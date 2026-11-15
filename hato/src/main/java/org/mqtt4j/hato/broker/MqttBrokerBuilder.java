@@ -11,7 +11,9 @@ import static java.util.Objects.requireNonNull;
 
 /// Configures and starts brokers. Not thread safe.
 /// Every setting has a default, so [#start()] can follow [MqttBroker#builder()] at once. Each
-/// setter rejects a value that is invalid on its own with [IllegalArgumentException] at once.
+/// setter rejects a value that is invalid on its own with [IllegalArgumentException] at once, and
+/// [#start()] rejects settings that do not work together in the same way: an address other than
+/// a loopback one without an [Authenticator] or [#allowAnonymous()].
 ///
 /// The limits here are the ones that an application may need to change. The broker keeps its
 /// other limits internal, and they may change. The limits on retained messages and on the
@@ -33,11 +35,18 @@ public final class MqttBrokerBuilder {
 
     private InetSocketAddress address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
 
+    // Whether an authenticator decides on the clients, or the application has allowed clients
+    // without one; either lets the broker listen beyond the loopback address.
+    private boolean authenticated;
+
+    private boolean anonymousAllowed;
+
     MqttBrokerBuilder() {
     }
 
     /// Listens at `value`; port zero selects a port that the system assigns. Defaults to the
-    /// loopback address with a port that the system assigns.
+    /// loopback address with a port that the system assigns. An address other than a loopback
+    /// one, the wildcard address included, needs an [Authenticator] or [#allowAnonymous()].
     ///
     /// @param value
     ///   the address to listen at
@@ -199,6 +208,19 @@ public final class MqttBrokerBuilder {
     ///   this builder
     public MqttBrokerBuilder authenticator(Authenticator value) {
         settings.authenticator(requireNonNull(value, "authenticator"));
+        authenticated = true;
+        return this;
+    }
+
+    /// Lets the broker accept clients without an [Authenticator] when it listens at an address
+    /// other than a loopback one. Without this or an authenticator, [#start()] refuses such an
+    /// address, so that a broker never opens to a network without a check on its clients unless
+    /// the application asks for it.
+    ///
+    /// @return
+    ///   this builder
+    public MqttBrokerBuilder allowAnonymous() {
+        anonymousAllowed = true;
         return this;
     }
 
@@ -241,7 +263,18 @@ public final class MqttBrokerBuilder {
     ///   the started broker
     /// @throws IOException
     ///   if the listening socket cannot be opened
+    /// @throws IllegalArgumentException
+    ///   if the address is not a loopback one and neither an [Authenticator] nor
+    ///   [#allowAnonymous()] is set
     public MqttBroker start() throws IOException {
+        InetAddress host = address.getAddress();
+        boolean loopback = host != null && host.isLoopbackAddress();
+        if (!loopback && !authenticated && !anonymousAllowed) {
+            throw new IllegalArgumentException(
+                    "A broker that listens beyond the loopback address needs an authenticator"
+                            + " or allowAnonymous()"
+            );
+        }
         return MqttBroker.start(settings, address);
     }
 }

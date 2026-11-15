@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -18,6 +19,7 @@ import org.mqtt4j.hato.internal.protocol.PropertyId;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.broker.internal.BrokerRetainedTest.retained;
 import static org.mqtt4j.hato.broker.internal.BrokerRetainedTest.retainedTopics;
@@ -205,6 +207,36 @@ class BrokerBuilderTest {
             } finally {
                 release.countDown();
             }
+        }
+    }
+
+    @Test
+    void refuses_to_listen_beyond_loopback_with_no_check_on_its_clients() {
+        // Arrange: the wildcard address, which reaches every network of the machine.
+        MqttBrokerBuilder sut = MqttBroker.builder().listen(new InetSocketAddress(0));
+        // Act & Assert
+        assertThatThrownBy(sut::start).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void listens_beyond_loopback_once_anonymous_clients_are_allowed() throws Exception {
+        try (MqttBroker sut = MqttBroker.builder()
+                .listen(new InetSocketAddress(0))
+                .allowAnonymous()
+                .start();
+                RawSession client = connected(sut.port(), "client")) {
+            client.ping();
+        }
+    }
+
+    @Test
+    void listens_beyond_loopback_with_an_authenticator() throws Exception {
+        try (MqttBroker sut = MqttBroker.builder()
+                .listen(new InetSocketAddress(0))
+                .authenticator(_ -> Authenticator.Decision.accept(Authenticator.Scope.all()))
+                .start();
+                RawSession client = connected(sut.port(), "client")) {
+            client.ping();
         }
     }
 
