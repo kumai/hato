@@ -40,43 +40,33 @@ public final class BrokerServer implements AutoCloseable {
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
 
-    // How many clients the broker serves at once.
-    private static final int MAX_CLIENTS = 10_000;
+    // The connections that may wait for the broker to accept a CONNECT on them, and the clients
+    // that it serves at once. Neither is bounded yet.
+    private static final int MAX_AWAITING_CONNECT = Integer.MAX_VALUE;
 
-    // How many connections may wait for the broker to accept a CONNECT on them. Clients that
-    // all connect at once wait here for a moment: on two processors, 10,000 and 20,000 such
-    // clients left a few hundred waiting at the most, and the broker closed none of them.
-    // Ceiling: the listen backlog, which is the platform's default, let those clients in
-    // slowly. A longer backlog lets more wait here at once, and needs the measurement again.
-    private static final int MAX_AWAITING_CONNECT = 1024;
+    private static final int MAX_CLIENTS = Integer.MAX_VALUE;
 
-    // The largest packet that the broker takes from a client. A smaller one than the framing
-    // format allows keeps what one client can have the broker hold at a time small.
-    private static final int MAX_PACKET_SIZE = 1024 * 1024;
+    // The largest packet that the broker takes from a client, and the largest that it takes as
+    // a CONNECT, before it knows the client. Each is the most that the framing format allows.
+    private static final int MAX_PACKET_SIZE = Connection.MAX_PACKET_SIZE;
 
-    // The largest CONNECT that the broker takes, from a peer that it knows nothing of yet. A
-    // CONNECT whose strings all have their greatest length is about a third of this, so only
-    // one that carries large properties besides is too large.
-    private static final int MAX_CONNECT_SIZE = 1024 * 1024;
+    private static final int MAX_CONNECT_SIZE = Connection.MAX_PACKET_SIZE;
 
     private static final long SEND_BYTES = 16L * 1024 * 1024;
 
     private static final int MAX_INFLIGHT = 128;
 
-    // How many QoS 1 and 2 deliveries may wait for a session, also while its client is away.
-    private static final int MAX_QUEUED = 1000;
+    private static final int MAX_QUEUED = 128;
 
     // The QoS 0 deliveries that may wait for a session have a number of their own, which stays
     // small whatever the other is: a deeper queue would only have a client that falls behind
     // get older ones, and none of them waits for a client that is away.
     private static final int MAX_QUEUED_AT_MOST_ONCE = 128;
 
-    // How many sessions may outlive their connections: as many as there may be clients.
-    private static final int MAX_SESSIONS = 10_000;
+    private static final int MAX_SESSIONS = 1024;
 
-    // How long a session may outlive its connection at the most. The sessions of clients that
-    // never come back give their places up after it, where nobody is there to remove them.
-    private static final Duration MAX_SESSION_EXPIRY = Duration.ofHours(24);
+    // How long a session may outlive its connection: as long as its client asks for.
+    private static final Duration MAX_SESSION_EXPIRY = Duration.ofSeconds(Session.NEVER);
 
     // One session's subscriptions are bounded by number, because every publication is matched
     // against each of them, and by the length of their filters in all, because a single filter
@@ -86,16 +76,8 @@ public final class BrokerServer implements AutoCloseable {
     private static final long MAX_SUBSCRIPTION_LENGTH = 1024 * 1024;
 
     // Retained messages are bounded like the other state that the broker keeps: by count, as
-    // sessions are, and by size, as each session's waiting deliveries are. The size is what
-    // they hold on the heap.
-    private static final int MAX_RETAINED = 10_000;
-
-    private static final long MAX_RETAINED_BYTES = 64L * 1024 * 1024;
-
-    // The share of the largest heap that the retained messages hold at most unless a setting
-    // says otherwise: an eighth, so that a small heap does not fill with what a large one may
-    // retain.
-    private static final int RETAINED_MEMORY_SHARE = 8;
+    // sessions are, and by size, as each session's waiting deliveries are.
+    private static final int MAX_RETAINED = 1024;
 
     // Every response that a test holds takes one of the client's packet identifiers, so a client
     // that follows the protocol never holds more.
@@ -244,10 +226,7 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxRetained = MAX_RETAINED;
 
-        private long maxRetainedBytes = Math.min(
-                MAX_RETAINED_BYTES,
-                Runtime.getRuntime().maxMemory() / RETAINED_MEMORY_SHARE
-        );
+        private long maxRetainedBytes = SEND_BYTES;
 
         private int maxHeld = MAX_HELD;
 

@@ -419,8 +419,6 @@ class BrokerSessionRaceTest {
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
     }
 
-    // A broker that keeps a session without end, so that a session without a connection has no
-    // timer, and the count of pending tasks tells of stray ones.
     private static BrokerServer.Builder builder(Timer timer) {
         return BrokerServer.builder()
                 .connectTimeout(Duration.ofSeconds(10))
@@ -430,7 +428,6 @@ class BrokerSessionRaceTest {
                 .maxQueued(16)
                 .maxQueuedBytes(65536L)
                 .maxSessions(16)
-                .maxSessionExpiry(Duration.ofSeconds(Session.NEVER))
                 .scheduler(timer);
     }
 

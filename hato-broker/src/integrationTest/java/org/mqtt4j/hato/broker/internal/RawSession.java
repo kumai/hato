@@ -122,13 +122,12 @@ final class RawSession implements AutoCloseable {
     }
 
     /// The CONNACK that accepts an MQTT 5.0 client that chose its identifier. It announces that
-    /// the broker does not support shared subscriptions, that a client may set up to 16 Topic
-    /// Aliases, and the largest packet that a broker with its default limits takes.
+    /// the broker does not support shared subscriptions, and that a client may set up to 16 Topic
+    /// Aliases.
     static Packet.ConnAck acceptedV5(boolean sessionPresent) {
         return new Packet.ConnAck(sessionPresent, SUCCESS, new Properties(List.of(
                 new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0),
-                new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16),
-                new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 1024 * 1024)
+                new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16)
         )));
     }
 

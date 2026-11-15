@@ -69,9 +69,7 @@ public final class BrokerCapabilities {
     }
 
     /// {@return what the broker announces until a test announces something else: the values that
-    /// MQTT 5.0 assumes, except that each client may set up to 16 Topic Aliases} The broker's
-    /// own limit on the packets that it takes holds besides, and is what it announces as the
-    /// largest packet while these capabilities allow a larger one.
+    /// MQTT 5.0 assumes, except that each client may set up to 16 Topic Aliases}
     public static BrokerCapabilities defaults() {
         return DEFAULTS;
     }
@@ -175,8 +173,7 @@ public final class BrokerCapabilities {
     }
 
     /// {@return a copy with a different largest packet, in bytes including the fixed header,
-    /// that a client may send} The broker announces it only if it is smaller than the broker's
-    /// own limit on packets, which holds whatever a test announces.
+    /// that a client may send}
     ///
     /// @param maximumPacketSize
     ///   the largest packet that a client may send, in bytes

@@ -42,11 +42,9 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 ///
 /// MQTT 5.0 support covers what client tests need. A positive Session Expiry Interval makes a
 /// session persistent, as Clean Session false does, and Clean Start false resumes it. The session
-/// ends once that many seconds have passed since its last connection ended; the client's
-/// DISCONNECT can change the interval, though not from 0. The broker bounds how long a session
-/// outlives its connection: a client that asks for longer, as with 0xFFFFFFFF, gets that bound and
-/// learns it from the Session Expiry Interval in CONNACK, and a Clean Session false session of MQTT
-/// 3.1.1 ends when the bound has passed. A session resumes only with the protocol version
+/// ends once that many seconds have passed since its last connection ended, unless the interval is
+/// 0xFFFFFFFF; the client's DISCONNECT can change the interval, though not from 0. A Clean Session
+/// false session of MQTT 3.1.1 does not expire. A session resumes only with the protocol version
 /// that created it. An empty client identifier is assigned and returned in CONNACK. Publication
 /// properties reach MQTT 5.0 subscribers unchanged and are dropped for MQTT 3.1.1 subscribers,
 /// except that a Message Expiry Interval arrives less the whole seconds that the message waited in
@@ -67,9 +65,8 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 /// the session within the delay, also by taking over, cancels the Will. The properties of a
 /// Will, except the delay, reach MQTT 5.0 subscribers as publication properties, and its Message
 /// Expiry Interval counts from its publication. By default, CONNACK
-/// announces only that shared subscriptions are not supported, the largest packet that the broker
-/// takes, and a Topic Alias Maximum of 16: the aliases that a client sets last for its
-/// connection. A test can make the broker announce smaller
+/// announces only that shared subscriptions are not supported, and a Topic Alias Maximum of 16: the
+/// aliases that a client sets last for its connection. A test can make the broker announce smaller
 /// limits with the test kit's `BrokerControls`, and the broker then holds clients to them; the test
 /// kit can also make it refuse publications, subscriptions, and connections, or end a connection,
 /// with a reason code of the test's choice. In turn, the broker keeps to the client's Receive
@@ -97,14 +94,6 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 /// sessions, is bounded as well. While it is used up, a session that is behind or has no
 /// connection misses some of them, whatever their QoS, before it reaches its own limits; a
 /// client that keeps up goes on receiving.
-/// The clients that the broker serves at once are bounded: a CONNECT beyond the limit is refused,
-/// in MQTT 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable, unless it comes for
-/// the session of a client that is connected, whose connection it takes over. Connections that
-/// have had no CONNECT accepted yet are bounded apart from the clients, and one beyond their
-/// limit is closed at once. A CONNECT larger than the broker takes from an unknown peer closes its
-/// connection without a CONNACK. A later packet larger than the broker takes ends the connection
-/// too: an MQTT 5.0 client, which learned the limit from CONNACK, receives DISCONNECT with Packet
-/// too large, and an MQTT 3.1.1 client, which cannot learn it, receives nothing.
 /// A new persistent session is refused when the persistent-session limit is reached, in MQTT
 /// 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable. The number and total size
 /// of retained messages are bounded too: a retained publication beyond either limit is
