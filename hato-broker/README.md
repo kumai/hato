@@ -58,12 +58,13 @@ Leaving the block stops the broker and disconnects its clients.
 When you need a particular address and port, or other limits, set them on
 `MqttBroker.builder()` before `start()`, as in
 `MqttBroker.builder().listen(address).start()`. The default listens only on
-loopback. Starting the broker throws `IOException` if it cannot open the listening
-socket.
+loopback, and an address beyond it needs an `Authenticator` or `allowAnonymous()`,
+as the next section describes. Starting the broker throws `IOException` if it
+cannot open the listening socket.
 
 ## Choosing where to use it
 
-Use the broker in local or trusted environments. It does not check credentials. It
+Use the broker in local or trusted environments. It does not encrypt connections. It
 supports MQTT 3.1.1, MQTT 5.0 as far as client tests need it, QoS 0/1/2, retained
 messages, and Wills. An MQTT 5.0 Will waits for its delay unless the session ends
 first, and the broker drops it if the client resumes the session within the delay. A
@@ -91,6 +92,12 @@ sessions together, so a subscriber that falls too far behind misses messages,
 whatever their QoS, while its connection and session go on. The clients that the
 broker serves at once are bounded too, and it refuses one beyond the limit as it
 connects.
+
+By default the broker accepts every client and lets it publish and subscribe to
+every topic. Set an `Authenticator` on `MqttBroker.builder()` to check each client's
+credentials and to limit the topics that it may publish and subscribe to. Without
+one, the broker listens beyond the loopback address only if you call
+`allowAnonymous()`.
 
 State lives in memory and is lost when the broker stops; use test fixtures or your
 application to recreate it. MQTT delivery acknowledgements do not mean that data
