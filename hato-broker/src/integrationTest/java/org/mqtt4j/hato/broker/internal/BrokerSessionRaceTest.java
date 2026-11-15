@@ -259,8 +259,8 @@ class BrokerSessionRaceTest {
                     }
                 })
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
-                var subscriber = connected(sut.port(), "subscriber");
-                var publisher = connected(sut.port(), "publisher")) {
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                RawSession publisher = connected(sut.port(), "publisher")) {
             subscriber.subscribe("queued", AT_MOST_ONCE);
 
             // Act
