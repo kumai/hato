@@ -1876,6 +1876,23 @@ final class Session {
         }
     }
 
+    // Has the session, which a takeover that failed on the way left without a connection, wait
+    // as if its connection had just ended: a kept session expires its expiry from now, with
+    // its timer set anew, and one that is not kept ends. A session that still has the
+    // connection that the takeover meant to end waits for that one's end instead.
+    void abandoned() {
+        if (connection != null) {
+            return;
+        }
+        if (kept()) {
+            detachedAt = settings.scheduler().nanoTime();
+            armTimer();
+        } else {
+            leave();
+            clear();
+        }
+    }
+
     // Marks the session as ended and takes it out of the session table, so that deliveries pass
     // it by and a CONNECT for its identifier makes a new actor.
     private void leave() {

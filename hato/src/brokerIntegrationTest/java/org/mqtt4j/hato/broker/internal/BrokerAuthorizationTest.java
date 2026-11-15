@@ -4,6 +4,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
@@ -17,6 +18,7 @@ import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.internal.protocol.Packet;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
@@ -260,6 +262,48 @@ class BrokerAuthorizationTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_delivery_that_the_new_scope_withdraws_is_not_sent_by_the_old_connection(
+            MqttVersion version
+    ) throws Exception {
+        // Arrange: the robot's open connection holds a QoS 2 delivery in a write that it has not
+        // marked as sent, and lets that write go just before the takeover attaches the robot's
+        // next connection, which has a scope that allows nothing.
+        var robotScope = new AtomicReference<>(subscribing("orders/#"));
+        var writer = new HeldWrite();
+        var atAttach = new AtomicReference<Runnable>(() -> { });
+        try (BrokerServer sut = BrokerServer.builder()
+                .authenticator(request -> Authenticator.Decision.accept(
+                        request.clientId().equals("robot")
+                                ? robotScope.get()
+                                : Authenticator.Scope.all()
+                ))
+                .holdDeliveryWrite(writer)
+                .beforeAttach(_ -> atAttach.get().run())
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession fleet = connected(sut.port(), "fleet");
+                RawSession first = persistent(sut.port(), version, false)) {
+            first.subscribe("orders/#", EXACTLY_ONCE);
+            writer.hold();
+            fleet.publish("orders/1/a", "withdrawn", EXACTLY_ONCE, 1);
+            writer.awaitHeld();
+            robotScope.set(Authenticator.Scope.of(List.of(), List.of()));
+            var writtenAfter = new CompletableFuture<Object>();
+            atAttach.set(() -> {
+                writer.release();
+                writtenAfter.complete(nextOrClosure(first));
+            });
+            // Act
+            try (RawSession robot = persistent(sut.port(), version, true)) {
+                // Assert: the old connection ends without the delivery, and the new one gets
+                // nothing of it either, as the client never held its identifier.
+                assertThat(writtenAfter.get(5, SECONDS)).isNotInstanceOf(Packet.Publish.class);
+                robot.ping();
+            }
+        }
+    }
+
     private static BrokerServer broker() throws Exception {
         return BrokerServer.builder()
                 .authenticator(authenticator)
@@ -282,6 +326,16 @@ class BrokerAuthorizationTest {
     // A scope that lets the client subscribe within `filter` and publish nothing.
     private static Authenticator.Scope subscribing(String filter) {
         return Authenticator.Scope.of(List.of(), List.of(new TopicFilter(filter)));
+    }
+
+    // The next packet that `session` receives, or the text "closed" if its connection closes
+    // instead.
+    private static Object nextOrClosure(RawSession session) {
+        try {
+            return session.expect(Packet.class);
+        } catch (Exception | AssertionError _) {
+            return "closed";
+        }
     }
 
     // The robot's connection with a session that outlives it, which the broker reports as

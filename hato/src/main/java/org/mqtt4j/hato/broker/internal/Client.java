@@ -394,8 +394,9 @@ final class Client {
         boolean present = !request.cleanStart()
                 && actor.kept()
                 && actor.version == request.version();
-        // A session that resumes or replaces a kept one takes over its place in the limit, and
-        // frees it if it is not kept itself.
+        // A session that resumes or replaces a kept one takes over its place in the limit, and a
+        // new kept session takes one here. Whether the session keeps the place is settled once
+        // it has changed, below.
         boolean placed = actor.kept();
         if (keep && !placed && !routing.takePersistentPlace()) {
             if (previous == null) {
@@ -408,63 +409,75 @@ final class Client {
             actor.leaveIfUnused();
             return false;
         }
-        if (placed && !keep) {
-            routing.freePersistentPlace();
-        }
-        if (previous != null) {
-            // The old peer ends before the session changes: its writer marks a delivery as sent
-            // only until then, and that mark decides how the scope below ends a delivery and
-            // whether the resend carries the DUP flag.
-            previous.disconnect(
-                    ReasonCode.SESSION_TAKEN_OVER,
-                    "taken over by " + connection.remoteAddress()
-            );
-            previous.client.holdsPlace = false;
-        }
-        holdsPlace = true;
-        // The Will that waits with the session goes out after CONNACK when this CONNECT ends
-        // the session, or when it continues the session after the Will's delay has passed; a
-        // connection within the delay cancels it [MQTT-3.1.3-9].
+        // From here on this connection takes the session over. A failure on the way, as on an
+        // OutOfMemoryError, ends this connection alone, and gives back what it took.
         Packet.Will waited;
-        if (present) {
+        try {
             if (previous != null) {
-                actor.detach(previous);
-                previous.client.cancelDelayedWill();
+                // The old peer ends before the session changes: its writer marks a delivery as
+                // sent only until then, and that mark decides how the scope below ends a
+                // delivery and whether the resend carries the DUP flag.
+                previous.disconnect(
+                        ReasonCode.SESSION_TAKEN_OVER,
+                        "taken over by " + connection.remoteAddress()
+                );
+                previous.client.holdsPlace = false;
             }
-            // The timer may not have come yet for a Will whose delay has passed.
-            if (actor.willDue(now)) {
-                waited = actor.takeWill();
+            holdsPlace = true;
+            // The Will that waits with the session goes out after CONNACK when this CONNECT
+            // ends the session, or when it continues the session after the Will's delay has
+            // passed; a connection within the delay cancels it [MQTT-3.1.3-9].
+            if (present) {
+                if (previous != null) {
+                    actor.detach(previous);
+                    previous.client.cancelDelayedWill();
+                }
+                // The timer may not have come yet for a Will whose delay has passed.
+                if (actor.willDue(now)) {
+                    waited = actor.takeWill();
+                } else {
+                    waited = null;
+                    actor.cancelWill();
+                }
+                actor.expiry = expiry;
+                // The session goes on within this connection's scope, which can allow less
+                // than the scopes of the connections that made it.
+                actor.limitTo(scope);
             } else {
-                waited = null;
-                actor.cancelWill();
+                // A new session ends the old one, and with it the delay of its Will (MQTT 5.0
+                // sections 3.1.3.2.2 and 3.1.4).
+                waited = actor.takeWill();
+                actor.reset(request.version(), expiry);
             }
-            actor.expiry = expiry;
-            // The session goes on within this connection's scope, which can allow less than
-            // the scopes of the connections that made it.
-            actor.limitTo(scope);
-        } else {
-            // A new session ends the old one, and with it the delay of its Will (MQTT 5.0
-            // sections 3.1.3.2.2 and 3.1.4).
-            waited = actor.takeWill();
-            actor.reset(request.version(), expiry);
-        }
-        connection.clientId = id;
-        will = request.will();
-        limits = offered;
-        sendQuota = sendQuotaOf(request);
-        sendLimit = sendLimitOf(request);
-        problemInformation = problemInformationOf(request);
-        if (offered.topicAliasMaximum() > 0) {
-            aliases = new IncomingAliases(offered.topicAliasMaximum());
-        }
-        Properties properties = switch (request.version()) {
-            case V3_1_1 -> Properties.EMPTY;
-            case V5 -> acceptanceV5(request, id, offered, expiry);
-        };
-        var connAck = new Packet.ConnAck(present, ReasonCode.SUCCESS, properties);
-        if (!actor.attach(connection, connAck)) {
-            // The connection ended before the session had it, so its end comes now.
-            actor.post(this::connectionEnded, Session.ALONE);
+            connection.clientId = id;
+            will = request.will();
+            limits = offered;
+            sendQuota = sendQuotaOf(request);
+            sendLimit = sendLimitOf(request);
+            problemInformation = problemInformationOf(request);
+            if (offered.topicAliasMaximum() > 0) {
+                aliases = new IncomingAliases(offered.topicAliasMaximum());
+            }
+            Properties properties = switch (request.version()) {
+                case V3_1_1 -> Properties.EMPTY;
+                case V5 -> acceptanceV5(request, id, offered, expiry);
+            };
+            var connAck = new Packet.ConnAck(present, ReasonCode.SUCCESS, properties);
+            settings.beforeAttach().accept(id);
+            if (!actor.attach(connection, connAck)) {
+                // The connection ended before the session had it, so its end comes now.
+                actor.post(this::connectionEnded, Session.ALONE);
+            }
+        } catch (Throwable failure) {
+            abandon(actor);
+            throw failure;
+        } finally {
+            // A session keeps its place among the persistent sessions only while it is kept:
+            // one that this connection does not keep gives it back, and so does a new one that
+            // a failure left before it was kept.
+            if ((placed || keep) && !actor.kept()) {
+                routing.freePersistentPlace();
+            }
         }
         // CONNACK, retransmissions, and queued deliveries stay ahead of later publications,
         // including the Will of the connection that this one took over and the Will that
@@ -477,6 +490,22 @@ final class Client {
             routing.publishWill(waited, actor);
         }
         return true;
+    }
+
+    // Settles what a takeover that failed before the session had this connection leaves of it.
+    // Its place among the clients goes back, since no end of an accepted connection will come
+    // for it, and the session, if it has no connection now, waits for its next one as if this
+    // one had ended. Once the session had this connection, the connection's end settles it like
+    // any other. Runs on the actor.
+    private void abandon(Session actor) {
+        if (session != null) {
+            return;
+        }
+        if (holdsPlace) {
+            holdsPlace = false;
+            routing.freeClientPlace();
+        }
+        actor.abandoned();
     }
 
     // The properties of an MQTT 5.0 CONNACK that accepts `request` for the client `id` with a

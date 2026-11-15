@@ -307,6 +307,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private Consumer<String> beforeHandOver = _ -> { };
 
+        private Consumer<String> beforeAttach = _ -> { };
+
         private Runnable beforeAcceptingStarts = () -> { };
 
         private Builder() {
@@ -500,6 +502,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder beforeAttach(Consumer<String> value) {
+            beforeAttach = requireNonNull(value, "beforeAttach must not be null");
+            return this;
+        }
+
         Builder beforeAcceptingStarts(Runnable value) {
             beforeAcceptingStarts = requireNonNull(value, "beforeAcceptingStarts must not be null");
             return this;
@@ -591,6 +598,7 @@ public final class BrokerServer implements AutoCloseable {
                     beforeSelect,
                     beforeAccept,
                     beforeHandOver,
+                    beforeAttach,
                     beforeAcceptingStarts
             );
             ServerSocketChannel listener = ServerSocketChannel.open();
