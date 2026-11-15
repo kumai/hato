@@ -236,6 +236,36 @@ class BrokerClientLimitsTest {
     }
 
     @Test
+    void a_qos_2_delivery_too_large_to_resend_goes_on_to_its_pubrel() throws Exception {
+        try (var sut = MqttBroker.start();
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a large QoS 2 delivery that the first connection received and left
+            // unanswered, so that the client may hold its identifier.
+            int id;
+            try (var first = RawSession.open(sut.port(), MqttVersion.V5)) {
+                accepted(first, connect("resumed", true, sessionExpiry()), false);
+                first.subscribe("resumed/#", EXACTLY_ONCE);
+                publisher.publish("resumed/large", "x".repeat(100), EXACTLY_ONCE, 1);
+                id = first.expect(Packet.Publish.class).packetId();
+            }
+            try (var second = RawSession.open(sut.port(), MqttVersion.V5)) {
+                // Act
+                accepted(
+                        second,
+                        connect("resumed", false, sessionExpiry(), maximumPacketSize(64)),
+                        true
+                );
+
+                // Assert: the message does not come again, and PUBREL frees the identifier.
+                assertThat(second.expect(Packet.PubRel.class))
+                        .isEqualTo(new Packet.PubRel(id, SUCCESS, EMPTY));
+                second.send(new Packet.PubComp(id, SUCCESS, EMPTY));
+                second.ping();
+            }
+        }
+    }
+
+    @Test
     void a_delivery_beyond_the_client_and_the_broker_limits_leaves_the_session_alone()
             throws Exception {
         // Arrange: a budget that holds the small delivery exactly.

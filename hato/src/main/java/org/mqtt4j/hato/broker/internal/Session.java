@@ -1468,14 +1468,13 @@ final class Session {
     // in one change of the map, which has publishers that matched the old one match again. The
     // deliveries that wait, and those in the window that await their answer, go unless the
     // scope lets the client receive their topics; otherwise a message that waits for a
-    // subscription that ends stays, as after an UNSUBSCRIBE. One in the window ends as if
-    // answered, but a QoS 2 delivery that went out goes on to its PUBREL, as after a PUBREC:
-    // the client may hold its identifier and would take the next PUBLISH with it for a
-    // duplicate. A PUBREL that awaits its PUBCOMP stays too, as the client has that message
-    // already, and QoS 0 deliveries ended with the connection that they waited for. A scope
-    // without limits, which every client of a broker without an authenticator has, leaves the
-    // session as it is. Runs on the actor before the connection attaches, once the connection
-    // that had the session can send no more, so that whether a delivery went out stays as read.
+    // subscription that ends stays, as after an UNSUBSCRIBE. One in the window is withdrawn,
+    // as withdraw() describes. A PUBREL that awaits its PUBCOMP stays, as the client has that
+    // message already, and QoS 0 deliveries ended with the connection that they waited for. A
+    // scope without limits, which every client of a broker without an authenticator has,
+    // leaves the session as it is. Runs on the actor before the connection attaches, once the
+    // connection that had the session can send no more, so that whether a delivery went out
+    // stays as read.
     void limitTo(Authenticator.Scope scope) {
         if (scope == Authenticator.Scope.all()) {
             return;
@@ -1512,15 +1511,7 @@ final class Session {
         }
         for (Map.Entry<Integer, Outgoing> entry : new LinkedHashMap<>(inflight).entrySet()) {
             if (entry.getValue() instanceof Delivery delivery && !receives(scope, delivery)) {
-                int id = entry.getKey();
-                if (delivery.qos == Qos.EXACTLY_ONCE && delivery.sent) {
-                    // The PUBREL goes out as the session resumes, in the delivery's place.
-                    inflightBytes -= delivery.memoryBytes;
-                    leaveWindow(delivery);
-                    inflight.replace(id, new Release(id));
-                } else {
-                    end(id, delivery);
-                }
+                withdraw(entry.getKey(), delivery);
                 withheld++;
             }
         }
@@ -1535,6 +1526,22 @@ final class Session {
     // subscribe to the name of the delivery's topic, a filter that matches that topic alone.
     private static boolean receives(Authenticator.Scope scope, Delivery delivery) {
         return scope.permitsSubscribe(new TopicFilter(delivery.topic().name()));
+    }
+
+    // Takes `delivery`, which awaits its answer under the identifier `id`, out of the window
+    // without sending it again. A QoS 2 delivery that went out goes on to its PUBREL, as after
+    // a PUBREC, which the session sends in its place as it resumes: the client may hold the
+    // identifier, and would take the next PUBLISH with it for a duplicate. Any other ends as
+    // if answered. Runs on the actor, once the connections that had the delivery can send no
+    // more.
+    private void withdraw(int id, Delivery delivery) {
+        if (delivery.qos == Qos.EXACTLY_ONCE && delivery.sent) {
+            inflightBytes -= delivery.memoryBytes;
+            leaveWindow(delivery);
+            inflight.replace(id, new Release(id));
+        } else {
+            end(id, delivery);
+        }
     }
 
     // Attaches `peer`, which a CONNECT accepted, and queues its CONNACK, so that publishers find
@@ -1558,12 +1565,15 @@ final class Session {
             return;
         }
         // A publication that an earlier connection sent first can be larger than the new one
-        // takes; it ends as if answered, and the rest go out again.
+        // takes; it is withdrawn, and what remains goes out again in its order.
         for (Map.Entry<Integer, Outgoing> entry : new LinkedHashMap<>(inflight).entrySet()) {
+            int id = entry.getKey();
             if (entry.getValue() instanceof Delivery replay && tooLargeFor(peer, replay)) {
-                end(entry.getKey(), replay);
-            } else {
-                deferred.put(entry.getKey(), entry.getValue());
+                withdraw(id, replay);
+            }
+            Outgoing remaining = inflight.get(id);
+            if (remaining != null) {
+                deferred.put(id, remaining);
             }
         }
         drain();
