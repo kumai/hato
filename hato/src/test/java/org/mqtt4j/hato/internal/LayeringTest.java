@@ -13,11 +13,13 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/// The shared implementation is layered. Each package of `org.mqtt4j.hato.internal` may import
-/// `java.*`, the JSpecify annotations, and the layers listed here, nothing else. The lowest
-/// layer, `value`, is the values that the public package shares with the broker, and they import
-/// nothing of Hato. Fully qualified references without an import are not detected; review covers
-/// those.
+/// The module is layered. The client, in the public package and in
+/// `org.mqtt4j.hato.client.internal`, imports nothing of the broker, and the broker imports
+/// nothing of the client's internals. The shared implementation in `org.mqtt4j.hato.internal`
+/// imports neither and is layered in turn: each of its packages may import `java.*`, the JSpecify
+/// annotations, and the layers listed here, nothing else. The lowest layer, `value`, is the
+/// values that the public package shares with the broker, and they import nothing of Hato. Fully
+/// qualified references without an import are not detected; review covers those.
 class LayeringTest {
 
     private static final Path SOURCES = Path.of("src/main/java/org/mqtt4j/hato");
@@ -43,24 +45,43 @@ class LayeringTest {
     @Test
     void each_layer_imports_only_the_layers_below_it() throws IOException {
         Path internal = SOURCES.resolve("internal");
-        try (Stream<Path> files = Files.walk(internal)) {
-            List<Path> sources = files.filter(path -> path.toString().endsWith(".java")).toList();
-            assertThat(sources).isNotEmpty();
-            for (Path source : sources) {
-                Path relative = internal.relativize(source);
-                assertThat(relative.getNameCount())
-                        .as("%s must be in a layer", source)
-                        .isGreaterThan(1);
-                checkImports(source, relative.getName(0).toString());
-            }
+        for (Path source : sources(internal, Integer.MAX_VALUE)) {
+            Path relative = internal.relativize(source);
+            assertThat(relative.getNameCount())
+                    .as("%s must be in a layer", source)
+                    .isGreaterThan(1);
+            checkLayer(source, relative.getName(0).toString());
         }
         for (String value : VALUES) {
             String file = value.substring(value.lastIndexOf('.') + 1) + ".java";
-            checkImports(SOURCES.resolve(file), "value");
+            checkLayer(SOURCES.resolve(file), "value");
         }
     }
 
-    private static void checkImports(Path source, String layer) throws IOException {
+    @Test
+    void the_client_imports_nothing_of_the_broker() throws IOException {
+        // The public package itself, without its subpackages, and the client's internals.
+        List<Path> client = Stream.concat(
+                sources(SOURCES, 1).stream(),
+                sources(SOURCES.resolve("client"), Integer.MAX_VALUE).stream()
+        ).toList();
+        for (Path source : client) {
+            assertThat(imports(source))
+                    .as("imports of %s", source)
+                    .noneMatch(imported -> imported.startsWith("org.mqtt4j.hato.broker."));
+        }
+    }
+
+    @Test
+    void the_broker_imports_nothing_of_the_client_internals() throws IOException {
+        for (Path source : sources(SOURCES.resolve("broker"), Integer.MAX_VALUE)) {
+            assertThat(imports(source))
+                    .as("imports of %s", source)
+                    .noneMatch(imported -> imported.startsWith("org.mqtt4j.hato.client."));
+        }
+    }
+
+    private static void checkLayer(Path source, String layer) throws IOException {
         assertThat(ALLOWED_IMPORTS).as("unknown layer in %s", source).containsKey(layer);
         for (String imported : imports(source)) {
             if (imported.startsWith("java.") || imported.startsWith("org.jspecify.annotations.")) {
@@ -80,6 +101,15 @@ class LayeringTest {
             assertThat(ALLOWED_IMPORTS.get(layer))
                     .as("%s is in layer %s and must not import %s", source, layer, imported)
                     .contains(target);
+        }
+    }
+
+    // The Java sources under `directory`, to `depth` levels of directories down.
+    private static List<Path> sources(Path directory, int depth) throws IOException {
+        try (Stream<Path> files = Files.walk(directory, depth)) {
+            List<Path> sources = files.filter(path -> path.toString().endsWith(".java")).toList();
+            assertThat(sources).as("sources in %s", directory).isNotEmpty();
+            return sources;
         }
     }
 
