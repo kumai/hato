@@ -22,6 +22,7 @@ import org.jspecify.annotations.Nullable;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
@@ -129,13 +130,13 @@ final class Routing {
                 settings.deliveryMemoryUnit(),
                 port
         );
-        BrokerSettings.DropListener dropListener = settings.dropListener();
+        BrokerListener listener = settings.listener();
         // The clients that wait for a report of their own are bounded by the sessions that the
         // broker can have at once. So a client with a session finds a place among them unless
         // clients that have gone still hold some.
         long sessions = (long) settings.maxClients() + settings.maxSessions();
-        dropReports = (dropListener == null) ? null : new DropReports(
-                dropListener,
+        dropReports = (listener == null) ? null : new DropReports(
+                listener,
                 port,
                 (int) Math.min(sessions, Integer.MAX_VALUE)
         );

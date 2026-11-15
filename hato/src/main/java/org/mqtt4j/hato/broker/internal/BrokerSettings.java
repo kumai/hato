@@ -6,6 +6,7 @@ import java.util.function.Predicate;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.internal.concurrent.Timer;
 import org.mqtt4j.hato.internal.protocol.Packet;
 
@@ -27,8 +28,8 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // PublicationMemory); `sendBytes` bounds both for what waits in a connection's send queue.
 // `selectors` and `actors` are the numbers of selector threads and of threads in the actor
 // pool. The capabilities are what the broker announces to MQTT 5.0 clients until a test
-// changes them, within its own limits. The drop listener, if there is one, hears of the
-// QoS 1 and 2 deliveries that the limits keep from a session.
+// changes them, within its own limits. The application's listener, if there is one, hears of
+// the QoS 1 and 2 deliveries that the limits keep from a session (see DropReports).
 //
 // The selector calls `beforeProcess` before handing a packet to its session. It asks
 // `deliveryWriteHeld` before marking the deliveries of a write as sent: while the answer is
@@ -67,7 +68,7 @@ record BrokerSettings(
         int selectors,
         int actors,
         Capabilities capabilities,
-        @Nullable DropListener dropListener,
+        @Nullable BrokerListener listener,
         Timer scheduler,
         Consumer<Packet> beforeProcess,
         Consumer<Packet> beforeHandle,
@@ -76,22 +77,6 @@ record BrokerSettings(
         AcceptHook beforeAccept,
         Consumer<String> beforeHandOver
 ) {
-
-    // What the application runs to learn that the broker's limits have kept QoS 1 or 2
-    // deliveries from a client, whose session goes on without them. The calls come one at a
-    // time, on a thread that the broker keeps for them, and may take their time. Meanwhile the
-    // broker counts on, for each client by its identifier; once it counts for as many clients
-    // as it may have clients and persistent sessions together, it counts for further ones
-    // without their identifiers.
-    interface DropListener {
-
-        // The client `clientId` has lost `count` deliveries since the last call for it.
-        void dropped(String clientId, long count);
-
-        // Clients that the broker does not name have lost `count` deliveries since the last
-        // such call: those whose identifiers it could not keep while the listener was behind.
-        void droppedUnattributed(long count);
-    }
 
     // What a test runs before each attempt to accept a connection.
     @FunctionalInterface

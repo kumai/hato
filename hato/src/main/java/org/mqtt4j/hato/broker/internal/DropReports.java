@@ -7,6 +7,7 @@ import java.util.concurrent.locks.LockSupport;
 
 import org.jspecify.annotations.Nullable;
 
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.internal.log.Log;
 
 // Tells the application how many QoS 1 and 2 deliveries the broker's limits have kept from each
@@ -41,7 +42,7 @@ final class DropReports {
     // once in this time, and the listener hears of a delivery this much later.
     private static final long GATHERING_NANOS = 1_000_000;
 
-    private final BrokerSettings.DropListener listener;
+    private final BrokerListener listener;
 
     // The port that the broker listens on, for the thread's name and logs.
     private final int port;
@@ -65,7 +66,7 @@ final class DropReports {
 
     private volatile boolean closed;
 
-    DropReports(BrokerSettings.DropListener listener, int port, int limit) {
+    DropReports(BrokerListener listener, int port, int limit) {
         this.listener = listener;
         this.port = port;
         this.limit = limit;
@@ -186,7 +187,7 @@ final class DropReports {
             clientId = next.getKey();
             count = next.getValue().take();
         }
-        report(() -> listener.dropped(clientId, count), count, clientId);
+        report(() -> listener.onDropped(clientId, count), count, clientId);
     }
 
     // Tells the listener of the deliveries that wait without a client, if there are any.
@@ -197,7 +198,7 @@ final class DropReports {
             unattributed = 0;
         }
         if (count != 0) {
-            report(() -> listener.droppedUnattributed(count), count, null);
+            report(() -> listener.onDroppedUnattributed(count), count, null);
         }
     }
 

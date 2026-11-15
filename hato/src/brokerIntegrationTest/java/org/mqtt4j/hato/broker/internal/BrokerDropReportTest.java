@@ -12,6 +12,7 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.Topic;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.internal.protocol.Packet;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -121,7 +122,7 @@ class BrokerDropReportTest {
         BrokerServer.Builder limited = BrokerServer.builder()
                 .maxInflight(1)
                 .maxQueuedBytes(1024)
-                .dropListener(recording());
+                .listener(recording());
         try (BrokerServer sut = limited.start(loopback());
                 RawSession subscriber = connected(sut.port(), "behind");
                 RawSession publisher = connected(sut.port(), "publisher")) {
@@ -144,7 +145,7 @@ class BrokerDropReportTest {
         BrokerServer.Builder limited = BrokerServer.builder()
                 .maxInflight(1)
                 .maxRetained(2)
-                .dropListener(recording());
+                .listener(recording());
         try (BrokerServer sut = limited.start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "behind")) {
@@ -248,7 +249,7 @@ class BrokerDropReportTest {
     @Test
     void a_listener_that_fails_still_hears_of_later_drops() throws Exception {
         // Arrange: a listener whose first call fails.
-        BrokerSettings.DropListener failing = recording(() -> {
+        BrokerListener failing = recording(() -> {
             throw new IllegalStateException("injected listener failure");
         });
         try (BrokerServer sut = broker(failing);
@@ -306,27 +307,27 @@ class BrokerDropReportTest {
     }
 
     /// A listener that records its calls.
-    private BrokerSettings.DropListener recording() {
+    private BrokerListener recording() {
         return recording(() -> { });
     }
 
     /// A listener that records its calls and does not return from the first one before
     /// `release` opens.
-    private BrokerSettings.DropListener busyWithFirstCall(CountDownLatch release) {
+    private BrokerListener busyWithFirstCall(CountDownLatch release) {
         return recording(() -> awaitUninterruptibly(release));
     }
 
     /// A listener that records its calls, and runs `firstCall` in the first of them once it has
     /// recorded it.
-    private BrokerSettings.DropListener recording(Runnable firstCall) {
-        return new BrokerSettings.DropListener() {
+    private BrokerListener recording(Runnable firstCall) {
+        return new BrokerListener() {
             @Override
-            public void dropped(String clientId, long count) {
+            public void onDropped(String clientId, long count) {
                 record(new Report(clientId, count));
             }
 
             @Override
-            public void droppedUnattributed(long count) {
+            public void onDroppedUnattributed(long count) {
                 record(new Report(null, count));
             }
 
@@ -381,12 +382,12 @@ class BrokerDropReportTest {
 
     /// A broker whose sessions take one unanswered delivery at a time and have two more wait
     /// for it, of each kind.
-    private static BrokerServer broker(BrokerSettings.DropListener listener) throws IOException {
+    private static BrokerServer broker(BrokerListener listener) throws IOException {
         return settings(listener).start(loopback());
     }
 
     /// The settings of such a broker, for a test that adds its own.
-    private static BrokerServer.Builder settings(BrokerSettings.DropListener listener) {
+    private static BrokerServer.Builder settings(BrokerListener listener) {
         return BrokerServer.builder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .sendBytes(64 * 1024)
@@ -396,7 +397,7 @@ class BrokerDropReportTest {
                 .maxQueuedBytes(1024)
                 .maxQueuedAtMostOnce(2)
                 .maxQueuedAtMostOnceBytes(1024)
-                .dropListener(listener);
+                .listener(listener);
     }
 
     private static InetSocketAddress loopback() {

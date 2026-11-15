@@ -1,17 +1,20 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.time.Duration;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.broker.MqttBrokerBuilder;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Property;
 import org.mqtt4j.hato.internal.protocol.PropertyId;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.broker.internal.BrokerRetainedTest.retained;
@@ -22,8 +25,9 @@ import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 
-/// The public builder: every start is a broker of its own, and every limit that the builder
-/// sets reaches the broker. The tests of each limit's behavior set it on the internal builder.
+/// The public builder: every start is a broker of its own, and every limit and the listener
+/// that the builder sets reach the broker. The tests of each limit's behavior set it on the
+/// internal builder.
 class BrokerBuilderTest {
 
     @Test
@@ -141,6 +145,26 @@ class BrokerBuilderTest {
         long limit = deliverySize(publication("queued", "1", AT_LEAST_ONCE, 1));
         try (MqttBroker sut = MqttBroker.builder().maxQueuedDeliveryBytes(limit).start()) {
             assertThatTwoDeliveriesLeaveOne(sut);
+        }
+    }
+
+    @Test
+    void tells_its_listener_of_the_deliveries_that_a_session_misses() throws Exception {
+        // Arrange
+        var dropped = new LinkedBlockingQueue<String>();
+        try (MqttBroker sut = MqttBroker.builder()
+                .maxQueuedDeliveries(1)
+                .listener(new BrokerListener() {
+                    @Override
+                    public void onDropped(String clientId, long count) {
+                        dropped.add(clientId + " lost " + count);
+                    }
+                })
+                .start()) {
+            // Act
+            assertThatTwoDeliveriesLeaveOne(sut);
+            // Assert
+            assertThat(dropped.poll(5, SECONDS)).isEqualTo("away lost 1");
         }
     }
 

@@ -96,7 +96,8 @@ import org.mqtt4j.hato.internal.log.Log;
 /// The memory that waiting deliveries and waiting retained messages take together, for all
 /// sessions, is bounded as well. While it is used up, a session that is behind or has no
 /// connection misses some of them, whatever their QoS, before it reaches its own limits; a
-/// client that keeps up goes on receiving.
+/// client that keeps up goes on receiving. A [BrokerListener] hears of the QoS 1 and QoS 2
+/// deliveries that a session misses.
 /// The clients that the broker serves at once are bounded: a CONNECT beyond the limit is refused,
 /// in MQTT 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable, unless it comes for
 /// the session of a client that is connected, whose connection it takes over. Connections that

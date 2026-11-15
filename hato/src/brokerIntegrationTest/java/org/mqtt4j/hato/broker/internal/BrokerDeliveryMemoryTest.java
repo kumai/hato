@@ -17,6 +17,7 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.Property;
@@ -1607,19 +1608,19 @@ class BrokerDeliveryMemoryTest {
         return BrokerServer.builder()
                 .maxDeliveryMemory(bytes)
                 .deliveryMemoryUnit(0)
-                .dropListener(new BrokerSettings.DropListener() {
+                .listener(new BrokerListener() {
                     @Override
-                    public void dropped(String clientId, long count) {
+                    public void onDropped(String clientId, long count) {
                         for (long each = 0; each < count; each++) {
                             reported.add(clientId);
                         }
                     }
 
                     @Override
-                    public void droppedUnattributed(long count) {
+                    public void onDroppedUnattributed(long count) {
                         // No test here has more clients than the broker reports by identifier,
                         // so a delivery reported without one shows as an unexpected client.
-                        dropped("no client", count);
+                        onDropped("no client", count);
                     }
                 });
     }

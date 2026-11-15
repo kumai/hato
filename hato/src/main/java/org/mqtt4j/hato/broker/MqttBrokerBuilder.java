@@ -186,6 +186,17 @@ public final class MqttBrokerBuilder {
         return this;
     }
 
+    /// Registers the single listener for the broker's notices; defaults to none.
+    ///
+    /// @param value
+    ///   the listener
+    /// @return
+    ///   this builder
+    public MqttBrokerBuilder listener(BrokerListener value) {
+        settings.listener(requireNonNull(value, "listener"));
+        return this;
+    }
+
     /// Starts a broker with these settings. Each call starts another broker, independent of the
     /// others, with the settings at that time.
     ///

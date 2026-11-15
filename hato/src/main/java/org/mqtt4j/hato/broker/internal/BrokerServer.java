@@ -20,6 +20,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.concurrent.Timer;
 import org.mqtt4j.hato.internal.concurrent.TimerService;
@@ -263,7 +264,7 @@ public final class BrokerServer implements AutoCloseable {
 
         private Capabilities capabilities = Capabilities.DEFAULT;
 
-        private BrokerSettings.@Nullable DropListener dropListener;
+        private @Nullable BrokerListener listener;
 
         private Timer scheduler = TimerService.broker;
 
@@ -402,8 +403,8 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
-        Builder dropListener(BrokerSettings.DropListener value) {
-            dropListener = requireNonNull(value, "dropListener must not be null");
+        public Builder listener(BrokerListener value) {
+            listener = requireNonNull(value, "listener must not be null");
             return this;
         }
 
@@ -527,7 +528,7 @@ public final class BrokerServer implements AutoCloseable {
                     selectors,
                     actors,
                     capabilities,
-                    dropListener,
+                    listener,
                     scheduler,
                     beforeProcess,
                     beforeHandle,

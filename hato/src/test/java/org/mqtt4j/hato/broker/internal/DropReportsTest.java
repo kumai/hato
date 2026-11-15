@@ -10,6 +10,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Test;
 
+import org.mqtt4j.hato.broker.BrokerListener;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /// How the reports of dropped deliveries take turns while the listener is behind: those of the
@@ -86,7 +88,7 @@ class DropReportsTest {
 
     /// Records its calls. The first one does not return before `release` opens; each later one
     /// first runs what the test has set for its kind.
-    private static final class Listener implements BrokerSettings.DropListener {
+    private static final class Listener implements BrokerListener {
 
         final CountDownLatch busy = new CountDownLatch(1);
 
@@ -99,12 +101,12 @@ class DropReportsTest {
         private final BlockingQueue<String> calls = new LinkedBlockingQueue<>();
 
         @Override
-        public void dropped(String clientId, long count) {
+        public void onDropped(String clientId, long count) {
             heard(clientId, duringReportOfClient);
         }
 
         @Override
-        public void droppedUnattributed(long count) {
+        public void onDroppedUnattributed(long count) {
             heard(NO_CLIENT, duringReportWithoutClient);
         }
 
