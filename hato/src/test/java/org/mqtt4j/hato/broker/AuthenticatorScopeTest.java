@@ -30,7 +30,14 @@ class AuthenticatorScopeTest {
             "+/x,     $SYS/x,   false",
             "$SYS/#,  $SYS/b/x, true",
             "a//b,    a//b,     true",
-            "a//b,    a/x/b,    false"
+            "a//b,    a/x/b,    false",
+            // A '#' also matches the topic of the levels above it, where they make one.
+            "+/#,     #,        true",
+            "/+/#,    /#,       true",
+            "+/+/#,   /#,       true",
+            "a/+/#,   a/#,      false",
+            "+/+/#,   #,        false",
+            "+,       #,        false"
     })
     void a_subscription_is_permitted_only_within_a_filter_of_the_scope(
             String scopeFilter,

@@ -200,9 +200,10 @@ public interface Authenticator {
 
         // Whether every topic that `inner` matches is one that `outer` matches. The levels are
         // compared in turn: a '#' of `outer` covers the rest of `inner`, and the level above it
-        // as well; a '+' covers any one level, a wildcard of `inner` included; any other level
-        // covers itself alone. A wildcard at the first level of `outer` covers no first level
-        // that starts with '$', which it does not match [MQTT-4.7.2-1].
+        // as well; a '+' covers any one level, a '+' of `inner` included; any other level covers
+        // itself alone. A '#' of `inner` needs more, as below. A wildcard at the first level of
+        // `outer` covers no first level that starts with '$', which it does not match
+        // [MQTT-4.7.2-1].
         private static boolean contains(TopicFilter outer, TopicFilter inner) {
             String[] outerLevels = outer.pattern().split("/", -1);
             String[] innerLevels = inner.pattern().split("/", -1);
@@ -215,12 +216,24 @@ public interface Authenticator {
                 if (covering.equals("#")) {
                     return true;
                 }
-                if (level >= innerLevels.length || innerLevels[level].equals("#")) {
-                    // `inner` matches a topic with fewer levels, or with more of any kind,
-                    // than a level that is not '#' covers.
+                if (level >= innerLevels.length) {
+                    // `inner` matches a topic with fewer levels than `outer` needs.
                     return false;
                 }
-                if (!covering.equals("+") && !covering.equals(innerLevels[level])) {
+                String covered = innerLevels[level];
+                if (covered.equals("#")) {
+                    // The '#' matches any further levels, and the topic of the levels above it
+                    // as well, if they make one. A '+' with a '#' after it covers the further
+                    // levels but not that topic, so it covers the '#' only where the levels
+                    // above make none: at the first level, which has none above, and below an
+                    // empty first level, as the empty name is no topic.
+                    boolean noTopicAbove = level == 0 || (level == 1 && innerLevels[0].isEmpty());
+                    return noTopicAbove
+                            && covering.equals("+")
+                            && outerLevels.length == level + 2
+                            && outerLevels[level + 1].equals("#");
+                }
+                if (!covering.equals("+") && !covering.equals(covered)) {
                     return false;
                 }
             }
