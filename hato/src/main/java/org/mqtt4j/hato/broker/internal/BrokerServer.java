@@ -730,9 +730,9 @@ public final class BrokerServer implements AutoCloseable {
         awaitThreads();
     }
 
-    /// Completes, normally, once the broker has ended; see MqttBroker.terminated().
+    /// An observation of the broker's end; see MqttBroker.terminated().
     public CompletableFuture<Void> terminated() {
-        return routing.termination.future();
+        return routing.termination.observe();
     }
 
     // Ends the broker for `failure`, which stopped its accepting thread or a selector, as close()

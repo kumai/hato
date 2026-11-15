@@ -168,7 +168,13 @@ public final class MqttBroker implements AutoCloseable {
     /// broker has ended, through [#close()] or because an internal failure stopped it: its port
     /// is free, its connections are closed, it has finished its work, and it calls no
     /// application code any more, the [BrokerListener] included. It completes normally either
-    /// way; the listener hears of a failure. Each call returns an independent future.
+    /// way; the listener hears of a failure.
+    ///
+    /// Each call returns an independent future. Its synchronous continuations run on a thread
+    /// of their own, so one that waits, even for a future of another call, holds up neither the
+    /// other futures nor the broker; cancelling one changes nothing else. Once the broker has
+    /// ended, a call returns a completed future. Keep a future rather than calling again while
+    /// the broker runs: each future that waits for the end takes a thread when it comes.
     ///
     /// A listener call that never returns keeps the future pending. To listen on the same port
     /// again, the return of [#close()] is enough; this future waits for the listener as well.
@@ -176,7 +182,7 @@ public final class MqttBroker implements AutoCloseable {
     /// @return
     ///   a future that completes at the end of this broker
     public CompletableFuture<Void> terminated() {
-        return server.terminated().copy();
+        return server.terminated();
     }
 
     /// Stops accepting connections, closes all peers, and discards their session state and the

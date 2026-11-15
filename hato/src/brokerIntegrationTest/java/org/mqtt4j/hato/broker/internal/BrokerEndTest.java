@@ -238,6 +238,23 @@ class BrokerEndTest {
 
     @Test
     @SuppressWarnings("try") // The explicit close is what the test is about.
+    void an_observation_whose_continuation_waits_for_another_holds_up_none() throws Exception {
+        try (MqttBroker sut = MqttBroker.start()) {
+            // Arrange: the observation made later waits, in its continuation, for the one made
+            // first.
+            CompletableFuture<Void> first = sut.terminated();
+            CompletableFuture<Void> later = sut.terminated();
+            CompletableFuture<Void> waited = later.thenRun(first::join);
+            // Act
+            sut.close();
+            // Assert
+            assertThat(first).succeedsWithin(WAIT);
+            assertThat(waited).succeedsWithin(WAIT);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // The explicit close is what the test is about.
     void every_call_of_terminated_observes_the_end_apart() throws Exception {
         try (MqttBroker sut = MqttBroker.start()) {
             // Arrange
