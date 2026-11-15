@@ -25,9 +25,21 @@ import org.mqtt4j.hato.broker.internal.common.log.Log;
 // A session comes here for the first delivery that it loses after a report, and adds the ones
 // that follow to the count that it got then, without the lock, until the next report takes that
 // count.
+//
+// The thread reports in rounds. Once deliveries wait, it waits a moment more before it takes
+// their counts, and then tells the listener of each client that waits by then. So the
+// deliveries of a burst reach the listener in one call, and a session that goes on losing
+// deliveries comes here once in a round: without the wait it came after nearly every report,
+// each time for the lock and to wake the thread. The listener hears of a delivery that moment
+// later.
 final class DropReports {
 
     private static final Log log = Log.of(DropReports.class);
+
+    // How long the thread waits, once deliveries wait to be reported, before it reports them.
+    // A session that goes on losing deliveries comes for the lock, and wakes the thread, about
+    // once in this time, and the listener hears of a delivery this much later.
+    private static final long GATHERING_NANOS = 1_000_000;
 
     private final BrokerSettings.DropListener listener;
 
@@ -73,6 +85,8 @@ final class DropReports {
     // the life of the broker.
     @Nullable Count add(String clientId) {
         Count count;
+        // Whether nothing waited to be reported until now.
+        boolean first;
         // Whether this client is the first of all to find the limit reached.
         boolean firstBeyond = false;
         synchronized (this) {
@@ -82,6 +96,7 @@ final class DropReports {
                 boolean _ = count.add();
                 return count;
             }
+            first = waiting.isEmpty() && unattributed == 0;
             if (waiting.size() < limit) {
                 count = new Count();
                 waiting.put(clientId, count);
@@ -93,8 +108,11 @@ final class DropReports {
                 limitReached = true;
             }
         }
-        // Something new waits, which the thread may be asleep without having seen.
-        LockSupport.unpark(thread);
+        if (first) {
+            // The thread waits to be woken only while nothing waits to be reported, so what
+            // comes to wait behind something else finds it awake or about to look.
+            LockSupport.unpark(thread);
+        }
         if (firstBeyond) {
             log.warn("Broker on port {} holds the dropped deliveries of {} clients for its"
                     + " listener, which is behind, and reports those of further clients in one"
@@ -112,48 +130,75 @@ final class DropReports {
 
     private void run() {
         while (!closed) {
+            int clients = awaitDeliveries();
             // One client and the count without a client take turns, so that neither kind of
-            // report keeps the other waiting for as long as it has more to say.
-            boolean client = reportNextClient();
-            boolean others = !closed && reportUnattributed();
-            if (!client && !others) {
-                LockSupport.park(this);
-                // An interrupted thread no longer parks, and this one has nothing to stop for.
-                boolean _ = Thread.interrupted();
+            // report keeps the other waiting for as long as it has more to say. Where no client
+            // waits, the round still goes once, for the count without one. The clients that
+            // come to wait during the round get their reports in the next one.
+            for (int turn = 0; turn < Math.max(clients, 1) && !closed; turn++) {
+                if (turn < clients) {
+                    reportNextClient();
+                }
+                if (!closed) {
+                    reportUnattributed();
+                }
             }
         }
     }
 
-    // Tells the listener of the client that has waited longest, and returns false if no client
-    // waits.
-    private boolean reportNextClient() {
+    // Waits until deliveries wait to be reported, and then a moment more, in which the others
+    // of their burst gather in the counts. Returns how many clients wait by then: those are
+    // the ones that the round which follows reports. It returns early, with what waits at that
+    // time, once the reports have ended.
+    private int awaitDeliveries() {
+        while (!closed && nothingWaits()) {
+            LockSupport.park(this);
+            // An interrupted thread no longer parks, and this one has nothing to stop for.
+            boolean _ = Thread.interrupted();
+        }
+        long deadline = System.nanoTime() + GATHERING_NANOS;
+        long left;
+        while (!closed && (left = deadline - System.nanoTime()) > 0) {
+            LockSupport.parkNanos(this, left);
+            boolean _ = Thread.interrupted();
+        }
+        synchronized (this) {
+            return waiting.size();
+        }
+    }
+
+    // Whether no delivery waits to be reported, with a client or without.
+    private boolean nothingWaits() {
+        synchronized (this) {
+            return waiting.isEmpty() && unattributed == 0;
+        }
+    }
+
+    // Tells the listener of the client that has waited longest, if one waits.
+    private void reportNextClient() {
         String clientId;
         long count;
         synchronized (this) {
             Map.Entry<String, Count> next = waiting.pollFirstEntry();
             if (next == null) {
-                return false;
+                return;
             }
             clientId = next.getKey();
             count = next.getValue().take();
         }
         report(() -> listener.dropped(clientId, count), count, clientId);
-        return true;
     }
 
-    // Tells the listener of the deliveries that wait without a client, and returns false if
-    // there are none.
-    private boolean reportUnattributed() {
+    // Tells the listener of the deliveries that wait without a client, if there are any.
+    private void reportUnattributed() {
         long count;
         synchronized (this) {
             count = unattributed;
             unattributed = 0;
         }
-        if (count == 0) {
-            return false;
+        if (count != 0) {
+            report(() -> listener.droppedUnattributed(count), count, null);
         }
-        report(() -> listener.droppedUnattributed(count), count, null);
-        return true;
     }
 
     // Makes `call`, which tells the listener of `count` deliveries of the client `clientId`, or
