@@ -55,9 +55,11 @@ void main() throws IOException {
 Each broker instance is independent, so tests can run with their own brokers.
 Leaving the block stops the broker and disconnects its clients.
 
-Use `MqttBroker.start(InetSocketAddress)` when you need a particular address and
-port. The default listens only on loopback. Starting the broker throws
-`IOException` if it cannot open the listening socket.
+When you need a particular address and port, or other limits, set them on
+`MqttBroker.builder()` before `start()`, as in
+`MqttBroker.builder().listen(address).start()`. The default listens only on
+loopback. Starting the broker throws `IOException` if it cannot open the listening
+socket.
 
 ## Choosing where to use it
 
