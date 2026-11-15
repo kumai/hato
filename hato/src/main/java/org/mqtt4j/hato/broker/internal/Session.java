@@ -16,6 +16,7 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.internal.concurrent.Timer;
 import org.mqtt4j.hato.internal.io.SendQueue;
 import org.mqtt4j.hato.internal.log.Log;
@@ -1459,6 +1460,80 @@ final class Session {
             log.debug("Broker on port {} dropped {} deliveries for client {}; first cause: {}",
                     routing.port, first ? count - 1 : count, clientId, cause);
         }
+    }
+
+    // Holds the session that a client resumes to `scope`, the scope of the connection that
+    // resumes it, which may allow less than those of the connections that made the session.
+    // The subscriptions outside the scope end, with the retained messages that wait for them,
+    // in one change of the map, which has publishers that matched the old one match again. The
+    // deliveries that wait, and those in the window that await their answer, go unless the
+    // scope lets the client receive their topics; otherwise a message that waits for a
+    // subscription that ends stays, as after an UNSUBSCRIBE. One in the window ends as if
+    // answered, but a QoS 2 delivery that went out goes on to its PUBREL, as after a PUBREC:
+    // the client may hold its identifier and would take the next PUBLISH with it for a
+    // duplicate. A PUBREL that awaits its PUBCOMP stays too, as the client has that message
+    // already, and QoS 0 deliveries ended with the connection that they waited for. A scope
+    // without limits, which every client of a broker without an authenticator has, leaves the
+    // session as it is. Runs on the actor, before the connection attaches.
+    void limitTo(Authenticator.Scope scope) {
+        if (scope == Authenticator.Scope.all()) {
+            return;
+        }
+        int endedSubscriptions = 0;
+        int withheld = 0;
+        synchronized (this) {
+            var kept = new LinkedHashMap<TopicFilter, Subscribed>();
+            for (Map.Entry<TopicFilter, Subscribed> entry : subscriptions.entrySet()) {
+                TopicFilter filter = entry.getKey();
+                if (scope.permitsSubscribe(filter)) {
+                    kept.put(filter, entry.getValue());
+                } else {
+                    dropRetained(filter);
+                    subscriptionLength -= filter.pattern().length();
+                    endedSubscriptions++;
+                }
+            }
+            if (endedSubscriptions > 0) {
+                subscriptions = kept;
+            }
+            Iterator<Delivery> waiting = acknowledgedQueue.deliveries.iterator();
+            while (waiting.hasNext()) {
+                Delivery delivery = waiting.next();
+                if (!receives(scope, delivery)) {
+                    waiting.remove();
+                    acknowledgedQueue.left(delivery);
+                    if (delivery.hasRoom) {
+                        giveRoom(delivery);
+                    }
+                    withheld++;
+                }
+            }
+        }
+        for (Map.Entry<Integer, Outgoing> entry : new LinkedHashMap<>(inflight).entrySet()) {
+            if (entry.getValue() instanceof Delivery delivery && !receives(scope, delivery)) {
+                int id = entry.getKey();
+                if (delivery.qos == Qos.EXACTLY_ONCE && delivery.sent) {
+                    // The PUBREL goes out as the session resumes, in the delivery's place.
+                    inflightBytes -= delivery.memoryBytes;
+                    leaveWindow(delivery);
+                    inflight.replace(id, new Release(id));
+                } else {
+                    end(id, delivery);
+                }
+                withheld++;
+            }
+        }
+        if (endedSubscriptions > 0 || withheld > 0) {
+            log.info("Broker on port {} ended {} subscriptions and dropped {} deliveries of"
+                    + " client {} outside the scope of its new connection",
+                    routing.port, endedSubscriptions, withheld, clientId);
+        }
+    }
+
+    // Whether `scope` lets the client receive `delivery`: whether it would let the client
+    // subscribe to the name of the delivery's topic, a filter that matches that topic alone.
+    private static boolean receives(Authenticator.Scope scope, Delivery delivery) {
+        return scope.permitsSubscribe(new TopicFilter(delivery.topic().name()));
     }
 
     // Attaches `peer`, which a CONNECT accepted, and queues its CONNACK, so that publishers find

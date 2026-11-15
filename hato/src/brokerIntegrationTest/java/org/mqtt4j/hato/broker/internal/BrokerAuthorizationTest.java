@@ -4,6 +4,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -29,7 +30,7 @@ import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.internal.protocol.Properties.EMPTY;
 
 /// The scope that the authenticator gives a client: the broker holds the client's publications,
-/// subscriptions, and Will to it.
+/// subscriptions, and Will to it, and the session that the client resumes.
 class BrokerAuthorizationTest {
 
     // A robot may publish its own topics and subscribe to its orders; the fleet may do anything.
@@ -166,9 +167,130 @@ class BrokerAuthorizationTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_resumed_session_keeps_only_the_subscriptions_within_the_new_scope(MqttVersion version)
+            throws Exception {
+        // Arrange: a session with two subscriptions, which the robot resumes with a scope that
+        // holds one of them.
+        var robotScope = new AtomicReference<>(subscribing("orders/#"));
+        try (BrokerServer sut = broker(robotScope)) {
+            try (RawSession robot = persistent(sut.port(), version, false)) {
+                robot.subscribe("orders/1/#", AT_LEAST_ONCE);
+                robot.subscribe("orders/2/#", AT_LEAST_ONCE);
+                robot.disconnect();
+            }
+            robotScope.set(subscribing("orders/1/#"));
+            try (RawSession robot = persistent(sut.port(), version, true);
+                    RawSession fleet = connected(sut.port(), "fleet")) {
+                // Act
+                fleet.publish("orders/2/a", "outside", AT_LEAST_ONCE, 1);
+                fleet.publish("orders/1/a", "within", AT_LEAST_ONCE, 2);
+                // Assert: the first publication to arrive is the second one.
+                assertThat(robot.expect(Packet.Publish.class).topic().name())
+                        .isEqualTo("orders/1/a");
+                robot.ping();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_resumed_session_drops_the_waiting_messages_outside_the_new_scope(MqttVersion version)
+            throws Exception {
+        // Arrange: two messages that wait for the session, which the robot resumes with a scope
+        // that allows the topic of one of them.
+        var robotScope = new AtomicReference<>(subscribing("orders/#"));
+        try (BrokerServer sut = broker(robotScope)) {
+            try (RawSession robot = persistent(sut.port(), version, false)) {
+                robot.subscribe("orders/#", AT_LEAST_ONCE);
+                robot.disconnect();
+            }
+            try (RawSession fleet = connected(sut.port(), "fleet")) {
+                fleet.publish("orders/2/a", "outside", AT_LEAST_ONCE, 1);
+                fleet.publish("orders/1/a", "within", AT_LEAST_ONCE, 2);
+            }
+            robotScope.set(subscribing("orders/1/#"));
+            // Act
+            try (RawSession robot = persistent(sut.port(), version, true)) {
+                // Assert: the one that the scope allows still comes, as messages that wait for a
+                // subscription that ends do.
+                assertThat(robot.expect(Packet.Publish.class).topic().name())
+                        .isEqualTo("orders/1/a");
+                robot.ping();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_resumed_session_sends_nothing_unacknowledged_outside_the_new_scope_again(
+            MqttVersion version
+    ) throws Exception {
+        // Arrange: the robot leaves a QoS 1 delivery and a QoS 2 one unanswered, and a QoS 2 one
+        // before its PUBCOMP, and resumes the session with a scope that allows nothing.
+        var robotScope = new AtomicReference<>(subscribing("orders/#"));
+        try (BrokerServer sut = broker(robotScope)) {
+            int unanswered;
+            int answered;
+            try (RawSession robot = persistent(sut.port(), version, false);
+                    RawSession fleet = connected(sut.port(), "fleet")) {
+                robot.subscribe("orders/#", EXACTLY_ONCE);
+                fleet.publish("orders/1/a", "unanswered", AT_LEAST_ONCE, 1);
+                fleet.publish("orders/1/b", "unanswered", EXACTLY_ONCE, 2);
+                fleet.publish("orders/1/c", "answered", EXACTLY_ONCE, 3);
+                robot.expect(Packet.Publish.class);
+                unanswered = robot.expect(Packet.Publish.class).packetId();
+                answered = robot.expect(Packet.Publish.class).packetId();
+                robot.send(new Packet.PubRec(answered, SUCCESS, EMPTY));
+                robot.expect(Packet.PubRel.class);
+            }
+            robotScope.set(Authenticator.Scope.of(List.of(), List.of()));
+            // Act
+            try (RawSession robot = persistent(sut.port(), version, true)) {
+                // Assert: a PUBREL ends each QoS 2 exchange, as the robot may hold their
+                // identifiers, and no message comes again.
+                List<Integer> released = List.of(
+                        robot.expect(Packet.PubRel.class).packetId(),
+                        robot.expect(Packet.PubRel.class).packetId()
+                );
+                assertThat(released).containsExactlyInAnyOrder(unanswered, answered);
+                robot.ping();
+            }
+        }
+    }
+
     private static BrokerServer broker() throws Exception {
         return BrokerServer.builder()
                 .authenticator(authenticator)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+    }
+
+    // A broker whose authenticator gives the robot the scope that `robotScope` holds as it
+    // connects, and the fleet a scope without limits.
+    private static BrokerServer broker(AtomicReference<Authenticator.Scope> robotScope)
+            throws Exception {
+        return BrokerServer.builder()
+                .authenticator(request -> Authenticator.Decision.accept(
+                        request.clientId().equals("robot")
+                                ? robotScope.get()
+                                : Authenticator.Scope.all()
+                ))
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+    }
+
+    // A scope that lets the client subscribe within `filter` and publish nothing.
+    private static Authenticator.Scope subscribing(String filter) {
+        return Authenticator.Scope.of(List.of(), List.of(new TopicFilter(filter)));
+    }
+
+    // The robot's connection with a session that outlives it, which the broker reports as
+    // present or not.
+    private static RawSession persistent(int port, MqttVersion version, boolean present)
+            throws Exception {
+        return switch (version) {
+            case V3_1_1 -> connected(port, "robot", false, present);
+            case V5 -> connectedV5(port, "robot", false, 60, present);
+        };
     }
 }

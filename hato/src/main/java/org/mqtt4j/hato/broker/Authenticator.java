@@ -120,6 +120,10 @@ public interface Authenticator {
     ///   of the scope matches; a filter that only overlaps the scope subscribes to nothing.
     ///   SUBACK refuses it, in MQTT 5.0 with Not authorized and in MQTT 3.1.1 with failure 0x80.
     /// - A CONNECT whose Will goes to a topic outside the scope is refused as not authorized.
+    /// - When a client resumes a persistent session, the broker holds the session to the
+    ///   client's scope as well: the session's subscriptions outside the scope end, and the
+    ///   messages that wait for the client, those that it has not acknowledged included, go
+    ///   unless the scope would let it subscribe to their topics.
     final class Scope {
 
         private static final Scope ALL = new Scope(true, List.of(), List.of());

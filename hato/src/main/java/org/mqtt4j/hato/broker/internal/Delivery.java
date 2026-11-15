@@ -5,6 +5,7 @@ import java.util.List;
 
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.PacketCodec;
 import org.mqtt4j.hato.internal.protocol.Properties;
@@ -173,6 +174,10 @@ final class Delivery implements Outgoing, Pending {
 
     byte[] payload() {
         return publication.payload();
+    }
+
+    Topic topic() {
+        return publication.topic();
     }
 
     // The properties with the Message Expiry Interval less the whole seconds waited, which is

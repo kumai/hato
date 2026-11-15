@@ -408,6 +408,9 @@ final class Client {
                 actor.cancelWill();
             }
             actor.expiry = expiry;
+            // The session goes on within this connection's scope, which can allow less than
+            // the scopes of the connections that made it.
+            actor.limitTo(scope);
         } else {
             // A new session ends the old one, and with it the delay of its Will (MQTT 5.0
             // sections 3.1.3.2.2 and 3.1.4).
