@@ -1,9 +1,13 @@
 package org.mqtt4j.hato.broker;
 
 import java.net.InetSocketAddress;
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Topic;
+import org.mqtt4j.hato.TopicFilter;
 
 import static java.util.Objects.requireNonNull;
 
@@ -104,18 +108,127 @@ public interface Authenticator {
         }
     }
 
-    /// What an accepted client may do.
+    /// What an accepted client may do: the topics that it may publish to, and the topic filters
+    /// that it may subscribe to. The broker holds the client to its scope for as long as its
+    /// connection lasts, without asking the application again.
+    ///
+    /// - A publication to a topic outside the scope reaches no subscriber and is not retained. An
+    ///   MQTT 5.0 client learns of it from Not authorized in PUBACK or PUBREC. A QoS 0
+    ///   publication, and an MQTT 3.1.1 client, which cannot be told, get their usual
+    ///   acknowledgements, and the connection goes on.
+    /// - A subscription is made only if every topic that its filter matches is one that a filter
+    ///   of the scope matches; a filter that only overlaps the scope subscribes to nothing.
+    ///   SUBACK refuses it, in MQTT 5.0 with Not authorized and in MQTT 3.1.1 with failure 0x80.
+    /// - A CONNECT whose Will goes to a topic outside the scope is refused as not authorized.
     final class Scope {
 
-        private static final Scope ALL = new Scope();
+        private static final Scope ALL = new Scope(true, List.of(), List.of());
 
-        private Scope() {
+        // Whether the scope has no limits, which its filters cannot say: a filter that starts
+        // with a wildcard matches no topic that starts with '$'.
+        private final boolean all;
+
+        private final List<TopicFilter> publish;
+
+        private final List<TopicFilter> subscribe;
+
+        private Scope(boolean all, List<TopicFilter> publish, List<TopicFilter> subscribe) {
+            this.all = all;
+            this.publish = publish;
+            this.subscribe = subscribe;
         }
 
         /// {@return a scope that lets the client publish to every topic and subscribe to every
         /// filter, as a broker without an authenticator lets every client}
         public static Scope all() {
             return ALL;
+        }
+
+        /// {@return a scope that lets the client publish to the topics that a filter of `publish`
+        /// matches, and subscribe to the filters that lie within a filter of `subscribe`} Either
+        /// may be empty, which allows no publication or no subscription.
+        ///
+        /// @param publish
+        ///   the filters of the topics that the client may publish to
+        /// @param subscribe
+        ///   the filters within which the client may subscribe
+        public static Scope of(Collection<TopicFilter> publish, Collection<TopicFilter> subscribe) {
+            return new Scope(false, List.copyOf(publish), List.copyOf(subscribe));
+        }
+
+        /// {@return whether the scope lets the client publish to `topic`}
+        ///
+        /// @param topic
+        ///   the topic of a publication
+        public boolean permitsPublish(Topic topic) {
+            requireNonNull(topic, "topic");
+            if (all) {
+                return true;
+            }
+            // Ceiling: the topic is matched against the filters in turn, as a session matches
+            // its subscriptions: about 40 ns a filter for each publication on an M1 Max. A scope
+            // of hundreds of filters would want them in a tree.
+            for (TopicFilter filter : publish) {
+                if (filter.matches(topic)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// {@return whether the scope lets the client subscribe to `filter`: whether every topic
+        /// that `filter` matches is one that a filter of the scope matches}
+        ///
+        /// @param filter
+        ///   the filter of a subscription
+        public boolean permitsSubscribe(TopicFilter filter) {
+            requireNonNull(filter, "filter");
+            if (all) {
+                return true;
+            }
+            for (TopicFilter outer : subscribe) {
+                if (contains(outer, filter)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Whether every topic that `inner` matches is one that `outer` matches. The levels are
+        // compared in turn: a '#' of `outer` covers the rest of `inner`, and the level above it
+        // as well; a '+' covers any one level, a wildcard of `inner` included; any other level
+        // covers itself alone. A wildcard at the first level of `outer` covers no first level
+        // that starts with '$', which it does not match [MQTT-4.7.2-1].
+        private static boolean contains(TopicFilter outer, TopicFilter inner) {
+            String[] outerLevels = outer.pattern().split("/", -1);
+            String[] innerLevels = inner.pattern().split("/", -1);
+            boolean outerWildcardFirst = outerLevels[0].equals("#") || outerLevels[0].equals("+");
+            if (outerWildcardFirst && innerLevels[0].startsWith("$")) {
+                return false;
+            }
+            for (int level = 0; level < outerLevels.length; level++) {
+                String covering = outerLevels[level];
+                if (covering.equals("#")) {
+                    return true;
+                }
+                if (level >= innerLevels.length || innerLevels[level].equals("#")) {
+                    // `inner` matches a topic with fewer levels, or with more of any kind,
+                    // than a level that is not '#' covers.
+                    return false;
+                }
+                if (!covering.equals("+") && !covering.equals(innerLevels[level])) {
+                    return false;
+                }
+            }
+            return outerLevels.length == innerLevels.length;
+        }
+
+        @Override
+        public String toString() {
+            if (all) {
+                return "Scope[all]";
+            }
+            return "Scope[publish=" + publish + ", subscribe=" + subscribe + "]";
         }
     }
 }

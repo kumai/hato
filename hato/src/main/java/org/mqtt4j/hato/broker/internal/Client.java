@@ -40,11 +40,19 @@ final class Client {
 
     private static final Log log = Log.of(Client.class);
 
+    // The refusal of a publication outside the client's scope.
+    private static final Reason OUTSIDE_SCOPE = new Reason(ReasonCode.NOT_AUTHORIZED, null, null);
+
     private final Connection connection;
 
     private final Routing routing;
 
     private final BrokerSettings settings;
+
+    // What the client may publish and subscribe to: what the authenticator's decision allowed,
+    // or everything without an authenticator. Set before the client is accepted, and read only
+    // by the actor of its session, which learns of the client after that.
+    private Authenticator.Scope scope = Authenticator.Scope.all();
 
     // The session that the CONNECT attached, written under the connection's monitor, under which
     // the end of the connection reads it.
@@ -247,7 +255,21 @@ final class Client {
         }
         String id = asked.clientId();
         switch (decision) {
-            case Authenticator.Decision.Accepted _ -> admit(request, id, offered, expiry, done);
+            case Authenticator.Decision.Accepted accepted -> {
+                Packet.Will will = request.will();
+                if (will != null && !accepted.scope().permitsPublish(will.topic())) {
+                    connection.refuse(
+                            ReasonCode.NOT_AUTHORIZED,
+                            "client '" + id + "' for a Will outside its scope"
+                    );
+                    done.accept(false);
+                } else {
+                    // Set before the acceptance goes to the actor of the session; the hand-off
+                    // publishes it to that actor, which alone handles the client's packets.
+                    scope = accepted.scope();
+                    admit(request, id, offered, expiry, done);
+                }
+            }
             case Authenticator.Decision.Refused refused -> {
                 connection.refuse(
                         switch (refused) {
@@ -629,6 +651,15 @@ final class Client {
                         grants.add(ReasonCode.UNSPECIFIED_ERROR);
                         continue;
                     }
+                    // The client's scope must hold the whole filter. One that only overlaps it
+                    // subscribes to nothing, as one that a test rule refuses below.
+                    if (!scope.permitsSubscribe(requested.filter())) {
+                        grants.add(switch (owner.version) {
+                            case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
+                            case V5 -> ReasonCode.NOT_AUTHORIZED;
+                        });
+                        continue;
+                    }
                     // A test rule can refuse the filter, which then subscribes to nothing
                     // and leaves an earlier subscription to it as it was, or grant it less
                     // than the requested QoS. A refusal gives MQTT 5.0 the rule's reason, and
@@ -840,9 +871,13 @@ final class Client {
             owner.received.clear(publish.packetId());
             unreleased.clear(publish.packetId());
         }
-        // A test rule can refuse the publication, which then reaches no subscriber and is not
-        // retained. The broker keeps no receipt of a refused QoS 2 publication, whose exchange
-        // ends with the refusal [MQTT-4.3.3-9].
+        // The client's scope, and then a test rule, can refuse the publication, which then
+        // reaches no subscriber and is not retained. The broker keeps no receipt of a refused
+        // QoS 2 publication, whose exchange ends with the refusal [MQTT-4.3.3-9].
+        if (!scope.permitsPublish(publish.topic())) {
+            refuse(owner, publish, OUTSIDE_SCOPE);
+            return;
+        }
         Reason refusal = routing.publicationRefusal(publish.topic());
         if (refusal != null) {
             refuse(owner, publish, refusal);
