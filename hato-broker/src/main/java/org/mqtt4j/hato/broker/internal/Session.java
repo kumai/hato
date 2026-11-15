@@ -170,6 +170,13 @@ final class Session {
 
     // Few sessions ever have a cursor, so the queue starts small. A cursor leaves it with its
     // last retained message, whichever way that one goes, so every cursor here has one left.
+    //
+    // Ceiling: the queue's array keeps the length that the most cursors at once gave it until
+    // the session ends, and the memory for deliveries does not count it. The session's limits
+    // on waiting retained messages bound that length, at about one element for each message
+    // that may wait, which is a small part of what the subscription limits let a session hold
+    // anyway. The queues of deliveries keep their longest length in the same way. Making a
+    // queue again once it holds a small part of its length would lift this.
     private final ArrayDeque<RetainedCursor> cursors = new ArrayDeque<>(1);
 
     // How many of the cursors have room in the broker's memory, for themselves and for the
