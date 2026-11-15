@@ -1,7 +1,6 @@
 package org.mqtt4j.hato.broker;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 
@@ -11,7 +10,8 @@ import org.mqtt4j.hato.internal.log.Log;
 
 /// An experimental, in-memory MQTT 3.1.1 and 5.0 broker for tests.
 ///
-/// Each start creates an independent broker. Clean Session true and false and QoS 0/1/2
+/// [#builder()] sets the address and the limits, and [#start()] starts a broker with the
+/// defaults. Each start creates an independent broker. Clean Session true and false and QoS 0/1/2
 /// publications are supported. A persistent session retains subscriptions, unacknowledged
 /// QoS 1/2 deliveries, received QoS 2 identifiers awaiting PUBREL, and queued QoS 1/2 deliveries
 /// while disconnected. Reconnecting with the same identifier resumes it with Session Present
@@ -111,8 +111,9 @@ import org.mqtt4j.hato.internal.log.Log;
 /// delivered but not kept, which leaves its topic without a retained message. So are the
 /// subscriptions of a session: one beyond their limit fails in SUBACK, in MQTT 5.0 with Quota
 /// exceeded, and subscribes to nothing, while subscribing again to a filter needs no room.
-/// These limits are provisional and may change. All state is lost when the broker stops. This
-/// experimental API is outside the compatibility promise.
+/// [MqttBrokerBuilder] sets the limits that an application may need to change, and documents
+/// their defaults; the other limits are internal and may change. All state is lost when the
+/// broker stops. This experimental API is outside the compatibility promise.
 public final class MqttBroker implements AutoCloseable {
 
     // How long close() gives the logging backend to take what was logged until then. A backend
@@ -125,31 +126,35 @@ public final class MqttBroker implements AutoCloseable {
         this.server = server;
     }
 
-    /// Starts on a system-assigned port on the loopback address.
+    /// {@return a builder whose settings all start at their defaults}
+    public static MqttBrokerBuilder builder() {
+        // First, before anything touches the other classes of the broker.
+        ClassPreload.broker.awaitLoaded();
+        return new MqttBrokerBuilder();
+    }
+
+    /// Starts a broker with the default settings, on a port that the system assigns on the
+    /// loopback address. The same as `builder().start()`.
     ///
     /// @return
     ///   the started broker
     /// @throws IOException
     ///   if the listening socket cannot be opened
     public static MqttBroker start() throws IOException {
-        return start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        return builder().start();
     }
 
-    /// Starts listening at `address`; port zero selects a system-assigned port.
-    ///
-    /// @param address
-    ///   the address to listen at
-    /// @return
-    ///   the started broker
-    /// @throws IOException
-    ///   if the listening socket cannot be opened
-    public static MqttBroker start(InetSocketAddress address) throws IOException {
-        // First, before anything touches the other classes of the broker.
-        ClassPreload.broker.awaitLoaded();
+    // Starts a broker at `address` with `settings` and the threads that suit this machine.
+    // MqttBrokerBuilder calls this, after MqttBroker.builder() has preloaded the broker's
+    // classes.
+    static MqttBroker start(
+            BrokerServer.Builder settings,
+            InetSocketAddress address
+    ) throws IOException {
         // The testkit's controls reach a broker's server through the internal control port,
         // which the module exports to the testkit alone.
         BrokerServer.serversOf(broker -> broker.server);
-        return new MqttBroker(BrokerServer.start(address));
+        return new MqttBroker(settings.start(address, Runtime.getRuntime().availableProcessors()));
     }
 
     /// {@return the assigned listening port, including after close}

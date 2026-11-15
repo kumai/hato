@@ -611,7 +611,8 @@ class DistributionTest {
                 "org.mqtt4j.hato.Transport$Listener",
                 "org.mqtt4j.hato.Transport$SendResult",
                 "org.mqtt4j.hato.UserProperty",
-                "org.mqtt4j.hato.broker.MqttBroker"
+                "org.mqtt4j.hato.broker.MqttBroker",
+                "org.mqtt4j.hato.broker.MqttBrokerBuilder"
         );
         assertThat(publicTypes(CLIENT_ALIAS)).isEmpty();
         assertThat(publicTypes(testkitJar())).containsExactlyInAnyOrder(

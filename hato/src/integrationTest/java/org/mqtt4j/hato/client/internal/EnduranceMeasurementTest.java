@@ -71,7 +71,7 @@ class EnduranceMeasurementTest {
     @Test
     void reconnecting_over_tcp_to_a_restarting_broker_leaks_nothing() throws Exception {
         var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), freePort());
-        var broker = new AtomicReference<MqttBroker>(MqttBroker.start(address));
+        var broker = new AtomicReference<MqttBroker>(MqttBroker.builder().listen(address).start());
         var events = new LinkedBlockingQueue<String>();
         try (MqttClient sut = builder(URI.create("mqtt://127.0.0.1:" + address.getPort()), events)
                 .build()) {
@@ -90,7 +90,7 @@ class EnduranceMeasurementTest {
     @Test
     void reconnecting_over_tls_to_a_restarting_broker_leaks_nothing() throws Exception {
         var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), freePort());
-        var broker = new AtomicReference<MqttBroker>(MqttBroker.start(address));
+        var broker = new AtomicReference<MqttBroker>(MqttBroker.builder().listen(address).start());
         var events = new LinkedBlockingQueue<String>();
         // The relay connects to the broker anew for each connection, so a restarted broker
         // ends the client's connection and takes its next one.
@@ -150,7 +150,7 @@ class EnduranceMeasurementTest {
         // measured client's own publications run into its inflight limit.
         var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
         var events = new LinkedBlockingQueue<String>();
-        try (MqttBroker broker = MqttBroker.start(address);
+        try (MqttBroker broker = MqttBroker.builder().listen(address).start();
                 MqttClient sut = MqttClient.builder()
                         .server(URI.create("mqtt://127.0.0.1:" + broker.port()))
                         .clientId(CLIENT_ID)
@@ -226,7 +226,7 @@ class EnduranceMeasurementTest {
             traffic.exchange();
             broker.get().close();
             await(events, "disconnected");
-            broker.set(MqttBroker.start(address));
+            broker.set(MqttBroker.builder().listen(address).start());
             await(events, "connected");
         });
         traffic.close();
@@ -284,9 +284,7 @@ class EnduranceMeasurementTest {
     }
 
     private static int freePort() throws IOException {
-        try (MqttBroker probe = MqttBroker.start(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0)
-        )) {
+        try (MqttBroker probe = MqttBroker.start()) {
             return probe.port();
         }
     }

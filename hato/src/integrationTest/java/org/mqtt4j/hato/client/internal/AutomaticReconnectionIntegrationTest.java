@@ -282,7 +282,7 @@ class AutomaticReconnectionIntegrationTest {
             throws Exception {
         // Arrange: a persistent client and an unfinished publication whose write is held.
         var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
-        MqttBroker broker = MqttBroker.start(address);
+        MqttBroker broker = MqttBroker.builder().listen(address).start();
         try (MqttClient sut = reconnectingClient(brokerEndpoint(broker))) {
             int port = broker.port();
             assertThat(sut.connect().get(5, SECONDS).sessionPresent()).isFalse();
@@ -303,7 +303,10 @@ class AutomaticReconnectionIntegrationTest {
             var restarted = new InetSocketAddress(address.getAddress(), port);
             broker = await().atMost(Duration.ofSeconds(5))
                     .ignoreException(BindException.class)
-                    .until(() -> MqttBroker.start(restarted), value -> value != null);
+                    .until(
+                            () -> MqttBroker.builder().listen(restarted).start(),
+                            value -> value != null
+                    );
             clock.advance(DELAY);
 
             // Assert: the outcome stays unknown, and the subscription is created again.

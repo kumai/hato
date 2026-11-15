@@ -68,7 +68,10 @@ class BrokerConnectionTest {
     @SuppressWarnings("try") // Explicit close verifies shutdown and idempotence before cleanup.
     void close_releases_connections_and_the_requested_listening_port() throws Exception {
         var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
-        try (var sut = MqttBroker.start(address); var client = connected(sut.port(), "close")) {
+        try (
+                var sut = MqttBroker.builder().listen(address).start();
+                var client = connected(sut.port(), "close")
+        ) {
             int port = sut.port();
             sut.close();
             sut.close();
@@ -76,7 +79,7 @@ class BrokerConnectionTest {
             var sameAddress = new InetSocketAddress(address.getAddress(), port);
             // close() has released the listening port when it returns.
             try (
-                    var restarted = MqttBroker.start(sameAddress);
+                    var restarted = MqttBroker.builder().listen(sameAddress).start();
                     RawSession next = connected(restarted.port(), "restarted")
             ) {
                 next.ping();
@@ -526,7 +529,7 @@ class BrokerConnectionTest {
             other.expectClosed();
             await().until(() -> selectors(port) == 0);
             var sameAddress = new InetSocketAddress(address.getAddress(), port);
-            try (var listener = MqttBroker.start(sameAddress)) {
+            try (var listener = MqttBroker.builder().listen(sameAddress).start()) {
                 assertThat(listener.port()).isEqualTo(port);
             }
         }
@@ -536,7 +539,7 @@ class BrokerConnectionTest {
     void an_interrupted_selector_ends_and_closes_the_listener_and_its_peers() throws Exception {
         var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
         try (
-                var sut = MqttBroker.start(address);
+                var sut = MqttBroker.builder().listen(address).start();
                 RawSession client = connected(sut.port(), "connected")
         ) {
             // Arrange
@@ -554,7 +557,7 @@ class BrokerConnectionTest {
             client.expectClosed();
             await().until(() -> selectors(port) == 0);
             var sameAddress = new InetSocketAddress(address.getAddress(), port);
-            try (var listener = MqttBroker.start(sameAddress)) {
+            try (var listener = MqttBroker.builder().listen(sameAddress).start()) {
                 assertThat(listener.port()).isEqualTo(port);
             }
         }

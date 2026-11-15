@@ -411,7 +411,7 @@ class BrokerSessionTest {
             sut.close();
 
             // close() has released the listening port when it returns.
-            try (var restarted = MqttBroker.start(address);
+            try (var restarted = MqttBroker.builder().listen(address).start();
                     RawSession replacement = connected(restarted.port(), "restart", false, false);
                     RawSession publisher = connected(restarted.port(), "publisher")) {
                 publisher.publish("restart", "discarded subscription", AT_LEAST_ONCE, 7);

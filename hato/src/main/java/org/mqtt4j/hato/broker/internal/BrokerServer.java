@@ -174,17 +174,15 @@ public final class BrokerServer implements AutoCloseable {
         }
     }
 
-    public static BrokerServer start(InetSocketAddress address) throws IOException {
+    // Starts a broker with the default settings and the threads that suit this machine.
+    static BrokerServer start(InetSocketAddress address) throws IOException {
         return start(address, Runtime.getRuntime().availableProcessors());
     }
 
-    // Starts a broker with the threads that suit a machine of `processors` processors.
+    // Starts a broker with the default settings and the threads that suit a machine of
+    // `processors` processors.
     static BrokerServer start(InetSocketAddress address, int processors) throws IOException {
-        Builder builder = builder();
-        if (processors == 1) {
-            builder.selectors(SELECTORS_ON_ONE_PROCESSOR).actors(ACTORS_ON_ONE_PROCESSOR);
-        }
-        return builder.start(address);
+        return builder().start(address, processors);
     }
 
     /// Lets [#of(MqttBroker)] find the server of each broker. MqttBroker calls this as it starts
@@ -199,16 +197,19 @@ public final class BrokerServer implements AutoCloseable {
         return requireNonNull(servers, "MqttBroker sets the lookup").apply(broker);
     }
 
-    static Builder builder() {
+    /// A builder with the broker's default settings, for MqttBrokerBuilder and the tests.
+    public static Builder builder() {
         return new Builder();
     }
 
     /// Internal limits and test hooks, copied when the broker starts. Not thread safe.
     /// Values are checked together at [#start(InetSocketAddress)], so they can be set in any order.
+    /// MqttBrokerBuilder checks the limits that it sets before it passes them on.
     ///
     /// A builder starts with the numbers of threads for two processors or more, whatever the
     /// machine has: a test that stops one thread of the broker counts on the others.
-    static final class Builder {
+    /// [#start(InetSocketAddress, int)] picks the numbers for the machine instead.
+    public static final class Builder {
 
         private Duration connectTimeout = CONNECT_TIMEOUT;
 
@@ -291,12 +292,12 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
-        Builder maxClients(int value) {
+        public Builder maxClients(int value) {
             maxClients = value;
             return this;
         }
 
-        Builder maxPacketSize(int value) {
+        public Builder maxPacketSize(int value) {
             maxPacketSize = value;
             return this;
         }
@@ -321,12 +322,12 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
-        Builder maxQueued(int value) {
+        public Builder maxQueued(int value) {
             maxQueued = value;
             return this;
         }
 
-        Builder maxQueuedBytes(long value) {
+        public Builder maxQueuedBytes(long value) {
             maxQueuedBytes = value;
             return this;
         }
@@ -341,12 +342,12 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
-        Builder maxSessions(int value) {
+        public Builder maxSessions(int value) {
             maxSessions = value;
             return this;
         }
 
-        Builder maxSessionExpiry(Duration value) {
+        public Builder maxSessionExpiry(Duration value) {
             maxSessionExpiry = requireNonNull(value, "maxSessionExpiry must not be null");
             return this;
         }
@@ -361,12 +362,12 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
-        Builder maxRetained(int value) {
+        public Builder maxRetained(int value) {
             maxRetained = value;
             return this;
         }
 
-        Builder maxRetainedBytes(long value) {
+        public Builder maxRetainedBytes(long value) {
             maxRetainedBytes = value;
             return this;
         }
@@ -452,6 +453,17 @@ public final class BrokerServer implements AutoCloseable {
         Builder beforeHandOver(Consumer<String> value) {
             beforeHandOver = requireNonNull(value, "beforeHandOver must not be null");
             return this;
+        }
+
+        /// Starts a broker at `address` with the numbers of threads that suit a machine of
+        /// `processors` processors, in place of those that the builder holds.
+        public BrokerServer start(InetSocketAddress address, int processors) throws IOException {
+            if (processors == 1) {
+                selectors(SELECTORS_ON_ONE_PROCESSOR).actors(ACTORS_ON_ONE_PROCESSOR);
+            } else {
+                selectors(SELECTORS).actors(ACTORS);
+            }
+            return start(address);
         }
 
         BrokerServer start(InetSocketAddress address) throws IOException {

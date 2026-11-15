@@ -499,7 +499,7 @@ class BrokerRetainedTest {
         }
     }
 
-    private static Packet.Publish retained(String topic, String payload, Qos qos) {
+    static Packet.Publish retained(String topic, String payload, Qos qos) {
         return new Packet.Publish(
                 new Topic(topic),
                 payload.getBytes(UTF_8),
@@ -528,7 +528,9 @@ class BrokerRetainedTest {
 
     /// The topics of the `count` retained messages that a new QoS 0 subscription to `filter`
     /// receives, after checking that no other message follows them.
-    private static List<String> retainedTopics(int port, String clientId, String filter, int count)
+    // The topics of the `count` retained messages that a new subscription of `clientId` to
+    // `filter` receives, after which no other one comes.
+    static List<String> retainedTopics(int port, String clientId, String filter, int count)
             throws Exception {
         try (RawSession subscriber = connected(port, clientId)) {
             subscriber.subscribe(filter, AT_MOST_ONCE);
