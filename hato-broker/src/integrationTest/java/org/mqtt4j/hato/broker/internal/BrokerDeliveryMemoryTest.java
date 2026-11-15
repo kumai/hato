@@ -950,7 +950,7 @@ class BrokerDeliveryMemoryTest {
             behind.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
             assertThat(received(behind, 1)).containsExactly("0001");
             behind.ping();
-            assertThat(reported).containsExactly("away");
+            await().untilAsserted(() -> assertThat(reported).containsExactly("away"));
         }
     }
 
