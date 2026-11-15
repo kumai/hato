@@ -550,6 +550,7 @@ public final class BrokerServer implements AutoCloseable {
                     // The pool would start a thread for each of its first tasks. Starting them
                     // now gives the broker all its threads from the start, whatever comes.
                     server.routing.actors.prestartAllCoreThreads();
+                    server.routing.termination.start();
                     DropReports reports = server.routing.dropReports;
                     if (reports != null) {
                         reports.start();
