@@ -405,6 +405,13 @@ final class Client {
             routing.freePersistentPlace();
         }
         if (previous != null) {
+            // The old peer ends before the session changes: its writer marks a delivery as sent
+            // only until then, and that mark decides how the scope below ends a delivery and
+            // whether the resend carries the DUP flag.
+            previous.disconnect(
+                    ReasonCode.SESSION_TAKEN_OVER,
+                    "taken over by " + connection.remoteAddress()
+            );
             previous.client.holdsPlace = false;
         }
         holdsPlace = true;
@@ -451,14 +458,6 @@ final class Client {
         if (!actor.attach(connection, connAck)) {
             // The connection ended before the session had it, so its end comes now.
             actor.post(this::connectionEnded, Session.ALONE);
-        }
-        // The old peer ends before the session resumes below: its writer marks a delivery as
-        // sent only until then, and the resend reads that mark for its DUP flag.
-        if (previous != null) {
-            previous.disconnect(
-                    ReasonCode.SESSION_TAKEN_OVER,
-                    "taken over by " + connection.remoteAddress()
-            );
         }
         // CONNACK, retransmissions, and queued deliveries stay ahead of later publications,
         // including the Will of the connection that this one took over and the Will that

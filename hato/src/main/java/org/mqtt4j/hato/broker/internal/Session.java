@@ -1474,7 +1474,8 @@ final class Session {
     // duplicate. A PUBREL that awaits its PUBCOMP stays too, as the client has that message
     // already, and QoS 0 deliveries ended with the connection that they waited for. A scope
     // without limits, which every client of a broker without an authenticator has, leaves the
-    // session as it is. Runs on the actor, before the connection attaches.
+    // session as it is. Runs on the actor before the connection attaches, once the connection
+    // that had the session can send no more, so that whether a delivery went out stays as read.
     void limitTo(Authenticator.Scope scope) {
         if (scope == Authenticator.Scope.all()) {
             return;
