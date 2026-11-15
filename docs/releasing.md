@@ -54,8 +54,9 @@ Gradle cache disabled.
 ```
 
 The bundle is `distribution-tests/build/distributions/hato-0.3.0.zip`. It contains
-the client, broker, and testkit publications under `org/mqtt4j/`. SNAPSHOT versions
-are rejected. A local bundle can be built without a signing key for inspection.
+the `hato`, `hato-client`, and `hato-testkit` publications under `org/mqtt4j/`.
+SNAPSHOT versions are rejected. A local bundle can be built without a signing key
+for inspection.
 When the signing environment variables are set, build and verify the signed bundle
 with:
 

@@ -37,7 +37,7 @@ vulnerability reporting for this repository instead.
 ## Proposing a change
 
 - Open an issue before changing the public API (the packages exported by the
-  module descriptors of `hato-client`, `hato-broker`, and `hato-testkit`), the
+  module descriptors of `hato` and `hato-testkit`), the
   protocol state machine, a module boundary, or anything a broker can observe
   on the wire. Agreeing on the direction up front is far less work for everyone
   than reworking it once the code is already written.
@@ -48,37 +48,31 @@ vulnerability reporting for this repository instead.
 
 | Project | Contents | Published |
 | --- | --- | --- |
-| `hato-common` | Shared values and implementation for client, broker, and testkit: protocol, logging, concurrency, I/O | no; embedded at build time |
-| `hato-client` | Client API/SPI, session, transport, and delivery | `org.mqtt4j:hato-client`, one standalone jar |
-| `hato-broker` | In-memory, single-node broker | `org.mqtt4j:hato-broker`, one standalone jar with no client dependency |
-| `hato-testkit` | Broker test wrapper, fake client, fault injection, manual scheduler | `org.mqtt4j:hato-testkit`; depends on client and broker |
+| `hato` | Client API/SPI, session, transport, and delivery; the in-memory, single-node broker; and the implementation they share: protocol, logging, concurrency, I/O | `org.mqtt4j:hato`, one standalone jar |
+| `hato-client` | The client's coordinates and module name from before client and broker became one jar: a module descriptor that requires `org.mqtt4j.hato`, and no class | `org.mqtt4j:hato-client`; depends on `hato` |
+| `hato-testkit` | Broker test wrapper, fake client, fault injection, manual scheduler | `org.mqtt4j:hato-testkit`; depends on `hato` |
 | `distribution-tests` | Final jar, JPMS, sources, and publication metadata checks | no |
 | `examples` | Usage examples | no |
 | `native-smoke` | GraalVM native-image smoke test | no |
 | `release-tools` | Release version and bundle checks, and the upload to Maven Central, run by the release workflow | no |
-| `build-logic` | Convention plugins and the source-embedding tasks | no |
+| `build-logic` | Convention plugins | no |
 
-The client's public API package is `org.mqtt4j.hato`; the JPMS modules are
-`org.mqtt4j.hato.client`, `org.mqtt4j.hato.broker`, and `org.mqtt4j.hato.testkit`.
-Client, broker, and testkit each embed the shared sources of `hato-common` in
-their own internal packages, so client and broker ship as standalone jars that
-work separately or together, on the classpath or the module path. There is no
-additional jar and no special classloader; `hato-testkit` deliberately uses
-ordinary dependencies on both.
+The public API packages are `org.mqtt4j.hato` for the client and
+`org.mqtt4j.hato.broker` for the broker; the JPMS modules are `org.mqtt4j.hato`,
+`org.mqtt4j.hato.client`, and `org.mqtt4j.hato.testkit`. Client and broker ship
+in one jar and share one implementation of the protocol, so the broker can work
+with the client's types. An application that uses only the client still loads no
+class of the broker. There is no additional jar and no special classloader;
+`hato-testkit` uses an ordinary dependency on `hato`.
 
-`./gradlew build` produces the complete runtime jars at
-`hato-client/build/libs/hato-client-<version>.jar` and
-`hato-broker/build/libs/hato-broker-<version>.jar`; the sources and Javadoc
-jars beside them are for development tools. The build also runs
-`distribution-tests`: fresh Java processes consume only the final jars,
-individually and together, and verify JPMS encapsulation and the publication
-metadata. Run `./gradlew :distribution-tests:test` for just these checks.
+`./gradlew build` produces the complete runtime jar at
+`hato/build/libs/hato-<version>.jar`; the sources and Javadoc jars beside it are
+for development tools. The build also runs `distribution-tests`: fresh Java
+processes consume only the final jars, on the classpath and the module path, and
+verify JPMS encapsulation and the publication metadata. Run
+`./gradlew :distribution-tests:test` for just these checks.
 
-The shared sources are maintained only in `hato-common`. The
-`embedCommonSources` task copies them to each consumer's `build/generated/`
-under `org.mqtt4j.hato.<distribution>.internal.common` before compilation; in
-the client, `common.value` maps onto the public `org.mqtt4j.hato` package. The
-rules for shared sources are in the code conventions below.
+The rules for the shared implementation are in the code conventions below.
 
 ## Before you open a pull request
 
@@ -109,16 +103,16 @@ before merge. Run the ones that match what you changed.
 | You changed | Run |
 | --- | --- |
 | Anything | `./gradlew build` |
-| One module | `./gradlew :hato-client:check` (substitute the module name) |
+| One module | `./gradlew :hato:check` (substitute the module name) |
 | `build-logic/`, `settings.gradle.kts`, or `gradle/libs.versions.toml` | `./gradlew build :build-logic:check` |
 | Anything that could affect native-image compatibility | `./gradlew :native-smoke:nativeRun` (needs a GraalVM JDK 25) |
 
 `./gradlew build` compiles with every javac lint on, `-Werror`, and NullAway,
 checks the sources with Checkstyle, and runs the unit tests, the integration
 tests, and the check that the published modules have no external runtime
-dependencies. Client and broker also reject dependencies on other Hato jars.
-`distribution-tests` compiles and runs probes using the final jars alone and
-together, checks JPMS encapsulation, and verifies sources and POM/Gradle
+dependencies. `hato` also rejects dependencies on other Hato jars.
+`distribution-tests` compiles and runs probes using the final jars,
+checks JPMS encapsulation, and verifies sources and POM/Gradle
 metadata. The separate
 `:build-logic:check` task is needed because `build-logic` is an included build;
 its checks do not run as part of `./gradlew build`.
@@ -136,8 +130,9 @@ covered. Checkstyle enforces the layout and import rules
 
 A few points sit outside code style and are checked in review:
 
-- Client and broker must each work with only their own jar and the JDK. Testkit
-  may depend on client and broker. External runtime dependencies are forbidden;
+- Client and broker must work with only the `hato` jar and the JDK, and an
+  application that uses only the client must not load any class of the broker.
+  Testkit may depend on `hato`. External runtime dependencies are forbidden;
   test-only and build-time dependencies are fine.
 - Nullness is documented with JSpecify: packages are `@NullMarked` and only what
   may be null carries `@Nullable`; the [Java Code Conventions](docs/conventions/java.md)
@@ -152,22 +147,20 @@ A few points sit outside code style and are checked in review:
   is only the vehicle: its own bug patterns are switched off. When a finding is
   wrong, add `@SuppressWarnings("NullAway")` to the smallest enclosing
   declaration with a comment that says why; do not weaken the configuration.
-- `hato-common` is an internal development project and is not published.
-  Shared sources live under `org.mqtt4j.hato.common` in the layers `value`, `util`, `log`,
-  `protocol`, `concurrent`, and `io`; the build embeds them into
-  `org.mqtt4j.hato.<distribution>.internal.common` in client, broker, and testkit.
-  The client maps `common.value` to its public `org.mqtt4j.hato` package instead:
-  `MqttVersion` and `Qos` have one source definition and no internal wrapper enum.
-  Edit only the originals, never generated copies. Each layer imports only
-  itself and the layers below it, which the `hato-common` tests check. Resources, module
-  descriptors, or other languages in the source archive require explicit build
-  support; unsupported files fail the build.
+- The implementation that client and broker share lives in
+  `org.mqtt4j.hato.internal`, in the layers `log`, `protocol`, `concurrent`, and
+  `io`. Below them are the values that the client's public API shares with the
+  broker, such as `MqttVersion` and `Qos`: they live in `org.mqtt4j.hato`, with
+  one definition and no internal wrapper enum. Each layer imports only itself
+  and the layers below it. Client code never imports the broker, and the broker
+  never imports the client's internals. A unit test of `hato` checks these
+  imports.
 - Keep internal shared types out of exported signatures. Reusable immutable
-  values belong in `common.value` and may be mapped into a distribution's public
-  API at build time. Protocol code imports these values from common; it never
-  depends on the client project. Keep APIs/SPI that own behavior and lifetimes in
-  their distributions. Shared code must not depend on actors or broker routing
-  state, and `protocol` must not depend on sockets or threads.
+  values that client and broker share live in the public package
+  `org.mqtt4j.hato` and import nothing else of Hato. Keep APIs/SPI that own
+  behavior and lifetimes in the client or the broker. Shared code must not
+  depend on the client's or the broker's state, such as actors or routing, and
+  `protocol` must not depend on sockets or threads.
 - Publication group is `org.mqtt4j`; Java packages and JPMS names are rooted at
   `org.mqtt4j.hato`. Include the artifact name only in module-specific packages
   and module names, not in the Maven group.
@@ -182,17 +175,19 @@ A few points sit outside code style and are checked in review:
   is internal and may change at any time. Adding a public type or method is a
   design decision; open an issue first.
 - Logging goes through `System.Logger` only, via the internal `Log` facade in
-  `common.log` with SLF4J-style `{}` placeholders. Each class owns a static
-  `Log.of(Class)` logger. Package names identify the distribution; individual
-  class names are implementation details. Client worker names include the
-  client id; connection lifecycle messages include the id and endpoint. Never log at
-  `INFO` on a hot path, and never log payloads below `TRACE`.
+  `org.mqtt4j.hato.internal.log` with SLF4J-style `{}` placeholders. Each class
+  owns a static `Log.of(Class)` logger. Package names tell the client, the
+  broker, and the test kit apart; individual class names are implementation
+  details. Client worker names include the client id; connection lifecycle
+  messages include the id and endpoint. Never log at `INFO` on a hot path, and
+  never log payloads below `TRACE`.
 - Java 25 is the baseline. Records, sealed types, pattern matching, and virtual
   threads are expected. Preview features are not used.
 - Unit tests must not need a network, a broker, or Docker. Use `hato-testkit`
   for that: the embedded broker, the fake client, the fault-injecting
   transport, and the manual scheduler. Tests that need a real broker belong in
-  the `integrationTest` suite.
+  the `integrationTest` suite, or in `brokerIntegrationTest` when they test the
+  broker.
 
 ## Commits and pull requests
 
@@ -210,12 +205,12 @@ better split.
 
 | Area | Covers |
 | --- | --- |
-| `client` | `hato-client`: the public API, sessions, reconnection, and delivery |
-| `broker` | `hato-broker` |
+| `client` | the client in `hato`: the public API, sessions, reconnection, and delivery |
+| `broker` | the broker in `hato` |
 | `testkit` | `hato-testkit` |
-| `protocol` | `protocol` and `value` in `hato-common`: packets, the codec, topics, and reason codes |
-| `io` | `io` in `hato-common`: TCP, TLS, WebSocket, and framing |
-| `common` | the other layers of `hato-common`, and changes that span several of its layers |
+| `protocol` | the shared `protocol` layer and values: packets, the codec, topics, and reason codes |
+| `io` | the shared `io` layer: TCP, TLS, WebSocket, and framing |
+| `common` | the other shared layers, and changes that span several of them |
 | `build` | the Gradle build, `build-logic`, dependency versions, `distribution-tests`, and `native-smoke` |
 | `ci` | GitHub Actions, the `release-tools` they run, and Dependabot |
 | `docs` | the README, this guide, the code conventions, and `examples` |

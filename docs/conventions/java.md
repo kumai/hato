@@ -11,9 +11,8 @@ and to remove notation that repeats without adding meaning.
 ### 1.1 Scope
 
 These conventions apply to the hand-written Java code in this repository: the client, the
-broker, the test kit, the shared sources in `hato-common`, and the tests. Tests follow the same
-rules; test-specific treatment is noted in the relevant sections. The copies of the shared
-sources that the build generates are out of scope; edit the originals.
+broker, the implementation that they share, the test kit, and the tests. Tests follow the same
+rules; test-specific treatment is noted in the relevant sections.
 Code examples are shortened for explanation and omit imports and surrounding declarations.
 
 ### 1.2 Rule levels
