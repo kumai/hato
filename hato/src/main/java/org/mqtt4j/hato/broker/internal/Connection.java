@@ -873,11 +873,28 @@ final class Connection {
     }
 
     // Ends the wait for the authenticator's decision. Returns false if the decision came too
-    // late: the connection has ended, or its deadline has refused the client already.
+    // late: the connection has ended, its deadline has refused the client already, or the
+    // deadline has passed though its timer has not come yet, which refuses the client here.
     synchronized boolean decided() {
-        boolean waiting = authenticating != null && !ended && lastPacket == null;
+        String deciding = authenticating;
         authenticating = null;
-        return waiting;
+        if (deciding == null || ended || lastPacket != null) {
+            return false;
+        }
+        if (scheduler.nanoTime() - lastReceived >= receiveTimeout) {
+            refuseUndecided(deciding);
+            return false;
+        }
+        return true;
+    }
+
+    // Refuses the client `deciding`, whose authentication did not end by its deadline. Called
+    // under this.
+    private void refuseUndecided(String deciding) {
+        refuse(
+                ReasonCode.SERVER_UNAVAILABLE,
+                "client '" + deciding + "', whose authentication took too long"
+        );
     }
 
     synchronized void keepAlive(int seconds) {
@@ -944,10 +961,7 @@ final class Connection {
                 if (deciding != null) {
                     // The decision that comes later finds that it came too late.
                     authenticating = null;
-                    refuse(
-                            ReasonCode.SERVER_UNAVAILABLE,
-                            "client '" + deciding + "', whose authentication took too long"
-                    );
+                    refuseUndecided(deciding);
                     return;
                 }
                 // Mark the deadline under the same lock as receipt; a late frame cannot

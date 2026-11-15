@@ -257,6 +257,40 @@ class BrokerAuthenticationTest {
 
     @ParameterizedTest
     @EnumSource(MqttVersion.class)
+    void a_decision_after_its_deadline_is_refused_even_if_the_timer_comes_late(
+            MqttVersion version
+    ) throws Exception {
+        // Arrange: a timer that runs its tasks a minute late, as a busy one might, and a decision
+        // that waits until the test lets it go.
+        var timer = new BrokerDeadlineTest.ManualTimer();
+        timer.lateness = Duration.ofMinutes(1);
+        var deciding = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        Authenticator sut = _ -> {
+            deciding.countDown();
+            release.await();
+            return Authenticator.Decision.accept(Authenticator.Scope.all());
+        };
+        try (BrokerServer broker = BrokerServer.builder()
+                .authenticator(sut)
+                .authenticationTimeout(Duration.ofMillis(100))
+                .scheduler(timer)
+                .start(loopback());
+                RawSession client = RawSession.open(broker.port(), version)) {
+            client.send(connect("late", version, null, null));
+            assertThat(deciding.await(5, SECONDS)).isTrue();
+            // Act: the deadline passes, and then the decision accepts the client.
+            timer.clock.advance(Duration.ofMillis(100));
+            release.countDown();
+            // Assert
+            assertThat(client.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
+            client.expectClosed();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
     void a_connect_beyond_the_decisions_that_may_run_is_refused_at_once(MqttVersion version)
             throws Exception {
         // Arrange: room for one decision, which waits until the test lets it go.
