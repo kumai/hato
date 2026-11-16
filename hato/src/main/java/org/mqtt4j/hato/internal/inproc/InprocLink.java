@@ -152,11 +152,17 @@ public final class InprocLink {
     // ---- The broker's side.
 
     /// Accepts the link: from now on `wake` has the broker look at it, from any thread and
-    /// without waiting.
+    /// without waiting. A client that has ended already has the broker look at once.
     public void accept(Runnable wake) {
         brokerWake = wake;
         answer = 1;
         unpark(clientReader);
+        // An end of the client's side before the broker could be woken woke nobody. The client
+        // marks its end before it looks for the wake, and the broker sets the wake before it
+        // looks for the end, so one of the two finds the other.
+        if (clientEnded) {
+            wake.run();
+        }
     }
 
     /// Refuses the link, which the client takes as a connection that could not be made.

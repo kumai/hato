@@ -27,6 +27,18 @@ class InprocLinkTest {
     }
 
     @Test
+    void a_client_that_ended_before_its_acceptance_has_the_broker_woken_as_it_accepts() {
+        // Arrange: the client's side ends before the broker can be woken.
+        var wakes = new AtomicInteger();
+        var sut = new InprocLink();
+        sut.endClient();
+        // Act
+        sut.accept(wakes::incrementAndGet);
+        // Assert
+        assertThat(wakes).hasValue(1);
+    }
+
+    @Test
     void a_broker_whose_packets_fill_the_queue_is_woken_once_the_client_takes_one() {
         // Arrange: a queue to the client that is full.
         var wakes = new AtomicInteger();
