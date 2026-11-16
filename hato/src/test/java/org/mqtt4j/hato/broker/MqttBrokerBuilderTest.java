@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -85,6 +86,15 @@ class MqttBrokerBuilderTest {
                 .authenticationTimeout(Duration.ofMillis(1))
                 .authenticationTimeout(Duration.ofMillis(Integer.MAX_VALUE))
         ).doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "Fleet", "fleet_a", "-fleet", "site..fleet"})
+    void rejects_a_name_that_is_no_host_name_in_lower_case_at_once(String name) {
+        // Arrange
+        MqttBrokerBuilder sut = MqttBroker.builder();
+        // Act & Assert
+        assertThatThrownBy(() -> sut.name(name)).isInstanceOf(IllegalArgumentException.class);
     }
 
     private static Consumer<MqttBrokerBuilder> setting(Consumer<MqttBrokerBuilder> setting) {

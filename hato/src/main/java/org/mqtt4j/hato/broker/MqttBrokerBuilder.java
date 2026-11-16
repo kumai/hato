@@ -6,6 +6,7 @@ import java.net.InetSocketAddress;
 import java.time.Duration;
 
 import org.mqtt4j.hato.broker.internal.BrokerServer;
+import org.mqtt4j.hato.internal.inproc.InprocBrokers;
 
 import static java.util.Objects.requireNonNull;
 
@@ -54,6 +55,23 @@ public final class MqttBrokerBuilder {
     ///   this builder
     public MqttBrokerBuilder listen(InetSocketAddress value) {
         address = requireNonNull(value, "address");
+        return this;
+    }
+
+    /// Names the broker; see [MqttBroker#name()]. A name is a host name in lower case: labels of
+    /// 1 to 63 letters, digits, and hyphens, separated by periods, at most 253 characters in all,
+    /// with no label that starts or ends with a hyphen, such as `fleet` or `site-a.fleet`.
+    /// Without a name, the broker takes `hato-` followed by a number that no running broker's name
+    /// has.
+    ///
+    /// @param value
+    ///   the name of the broker
+    /// @return
+    ///   this builder
+    public MqttBrokerBuilder name(String value) {
+        requireNonNull(value, "name");
+        InprocBrokers.check(value);
+        settings.name(value);
         return this;
     }
 
@@ -266,6 +284,8 @@ public final class MqttBrokerBuilder {
     /// @throws IllegalArgumentException
     ///   if the address is not a loopback one and neither an [Authenticator] nor
     ///   [#allowAnonymous()] is set
+    /// @throws IllegalStateException
+    ///   if a running broker has the name that this builder gives
     public MqttBroker start() throws IOException {
         InetAddress host = address.getAddress();
         boolean loopback = host != null && host.isLoopbackAddress();

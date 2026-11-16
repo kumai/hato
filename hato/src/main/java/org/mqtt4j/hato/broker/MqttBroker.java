@@ -165,6 +165,18 @@ public final class MqttBroker implements AutoCloseable {
         return server.port();
     }
 
+    /// The name of this broker: the one that [MqttBrokerBuilder#name(String)] gave, or the one
+    /// that the broker took without it. A broker holds its name from its start until it ends,
+    /// through [#close()] or because an internal failure stopped it, as it holds its port. While
+    /// it does, no other broker in the JVM starts with that name, except one whose Hato classes
+    /// come from another class loader; after that, one can.
+    ///
+    /// @return
+    ///   the name of this broker, including after close
+    public String name() {
+        return server.name();
+    }
+
     /// Observes the end of this broker without requesting it. The future completes once the
     /// broker has ended, through [#close()] or because an internal failure stopped it: its port
     /// is free, its connections are closed, it has finished its work, and it calls no

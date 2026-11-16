@@ -27,6 +27,7 @@ import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.concurrent.Timer;
 import org.mqtt4j.hato.internal.concurrent.TimerService;
+import org.mqtt4j.hato.internal.inproc.InprocBrokers;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.PacketType;
@@ -149,6 +150,9 @@ public final class BrokerServer implements AutoCloseable {
 
     private final ServerSocketChannel listener;
 
+    // The name that the broker holds while it runs.
+    private final InprocBrokers.Registration registration;
+
     // Tells the accepting thread that a connection waits at the listener, which is all that it
     // watches. The thread waits here and never inside accept: when a listener is closed just as
     // a thread enters a blocking accept, the closing thread can wait in the kernel until
@@ -168,8 +172,13 @@ public final class BrokerServer implements AutoCloseable {
     // limit on those that wait for their CONNECT. Only that thread uses it.
     private boolean turnedAway;
 
-    private BrokerServer(ServerSocketChannel listener, BrokerSettings settings) throws IOException {
+    private BrokerServer(
+            ServerSocketChannel listener,
+            InprocBrokers.Registration registration,
+            BrokerSettings settings
+    ) throws IOException {
         this.listener = listener;
+        this.registration = registration;
         acceptor = Selector.open();
         try {
             listener.configureBlocking(false);
@@ -232,6 +241,9 @@ public final class BrokerServer implements AutoCloseable {
     /// machine has: a test that stops one thread of the broker counts on the others.
     /// [#start(InetSocketAddress, int)] picks the numbers for the machine instead.
     public static final class Builder {
+
+        // The broker's name, or null for an automatic one.
+        private @Nullable String name;
 
         private Duration connectTimeout = CONNECT_TIMEOUT;
 
@@ -312,6 +324,11 @@ public final class BrokerServer implements AutoCloseable {
         private Runnable beforeAcceptingStarts = () -> { };
 
         private Builder() {
+        }
+
+        public Builder name(String value) {
+            name = requireNonNull(value, "name must not be null");
+            return this;
         }
 
         Builder connectTimeout(Duration value) {
@@ -601,10 +618,28 @@ public final class BrokerServer implements AutoCloseable {
                     beforeAttach,
                     beforeAcceptingStarts
             );
+            // The name first, so that a broker whose name another one holds binds no port.
+            String given = name;
+            InprocBrokers.Registration registration = given == null
+                    ? InprocBrokers.takeNext()
+                    : InprocBrokers.take(given);
+            try {
+                return open(address, registration, settings);
+            } catch (IOException | RuntimeException | Error failure) {
+                registration.release();
+                throw failure;
+            }
+        }
+
+        private static BrokerServer open(
+                InetSocketAddress address,
+                InprocBrokers.Registration registration,
+                BrokerSettings settings
+        ) throws IOException {
             ServerSocketChannel listener = ServerSocketChannel.open();
             try {
                 listener.bind(address);
-                var server = new BrokerServer(listener, settings);
+                var server = new BrokerServer(listener, registration, settings);
                 try {
                     // The pool would start a thread for each of its first tasks. Starting them
                     // now gives the broker all its threads from the start, whatever comes.
@@ -643,6 +678,10 @@ public final class BrokerServer implements AutoCloseable {
 
     public int port() {
         return routing.port;
+    }
+
+    public String name() {
+        return registration.name();
     }
 
     private void accept() {
@@ -841,6 +880,8 @@ public final class BrokerServer implements AutoCloseable {
     // Ends the listener, the connections, and the sessions, and has the selectors end.
     private void end() {
         try {
+            // Another broker can take the name from now on, as it can take the port.
+            registration.release();
             try {
                 listener.close();
             } catch (IOException failure) {
