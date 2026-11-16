@@ -270,7 +270,8 @@ class DistributionTest {
                                 false
                         );
                         sut.publish(sent).get(5, java.util.concurrent.TimeUnit.SECONDS);
-                        var arrived = handled.poll(5, java.util.concurrent.TimeUnit.SECONDS);
+                        org.mqtt4j.hato.MqttMessage arrived =
+                                handled.poll(5, java.util.concurrent.TimeUnit.SECONDS);
                         if (!sent.equals(arrived)) {
                             throw new AssertionError(version + " " + qos + " in memory changed it");
                         }
