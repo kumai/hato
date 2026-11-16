@@ -1,10 +1,7 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
-import java.net.Socket;
 import java.net.SocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.EnumSet;
@@ -18,27 +15,25 @@ import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.internal.concurrent.Timer;
-import org.mqtt4j.hato.internal.io.FrameAssembler;
 import org.mqtt4j.hato.internal.io.SendQueue;
-import org.mqtt4j.hato.internal.io.WriteParts;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.Packet;
-import org.mqtt4j.hato.internal.protocol.PacketCodec;
 import org.mqtt4j.hato.internal.protocol.PacketDecodeException;
 import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.UnsupportedProtocolVersionException;
 
 import static java.util.Objects.requireNonNull;
 
-// One network connection. The selector that it is assigned to reads and writes it; where a
-// comment speaks of the connection's reader or writer, it means that selector at the one work
-// or the other, and no thread of the connection's own. The reader hands the packets that it
-// decodes to the session that the CONNECT attached, whose actor handles them.
+// One connection of a client: the protocol and the state of the connection, over a wire that
+// carries its packets (see Wire). The selector that it is assigned to reads and writes it; where
+// a comment speaks of the connection's reader or writer, it means that selector at the one work
+// or the other, and no thread of the connection's own. The reader hands the packets that arrive
+// to the session that the CONNECT attached, whose actor handles them.
 final class Connection {
 
     private static final Log log = Log.of(Connection.class);
 
-    private static final Set<MqttVersion> SUPPORTED_VERSIONS = EnumSet.of(
+    static final Set<MqttVersion> SUPPORTED_VERSIONS = EnumSet.of(
             MqttVersion.V3_1_1,
             MqttVersion.V5
     );
@@ -67,9 +62,7 @@ final class Connection {
 
     private final Timer scheduler;
 
-    private final Socket socket;
-
-    private final ByteBuffer input = ByteBuffer.allocate(8192);
+    private final Wire wire;
 
     final Reactor reactor;
 
@@ -86,10 +79,6 @@ final class Connection {
     final Reactor.Task readiness = new Reactor.Task(this, this::ready);
 
     // I/O state belongs to the selector. Actor callbacks publish acceptance through its queue.
-
-    // Puts the packets together from the input. Its size limit is the one for a CONNECT until
-    // the broker accepts the client, and from then on the one for the client's packets.
-    private final FrameAssembler frames;
 
     private boolean connecting;
 
@@ -126,14 +115,7 @@ final class Connection {
     // What the deliveries of the write in progress hold on the heap.
     private long writingMemory;
 
-    private ByteBuffer[] writingParts = new ByteBuffer[0];
-
     private boolean writingLast;
-
-    // Only the selector sets this, after OP_READ, and clears it after a zero-byte read.
-    boolean readable;
-
-    @Nullable SelectionKey key;
 
     // Remaining state is guarded by this connection's monitor.
 
@@ -165,10 +147,10 @@ final class Connection {
     // delivery until it is written. So what the deliveries hold stays within the same limit.
     private long queuedMemory;
 
-    // Set once the connection is to end with these bytes, such as a refusal CONNACK or a
+    // Set once the connection is to end with this packet, such as a refusal CONNACK or a
     // DISCONNECT. The queue then admits nothing more; the writer writes what waits, except
-    // deliveries, then these bytes, and closes.
-    private byte @Nullable [] lastPacket;
+    // deliveries, then this packet, and closes.
+    private @Nullable Outbound lastPacket;
 
     // A delivery or PUBREL found its queue full; the writer's next completion resumes it.
     private boolean awaitingSpace;
@@ -186,7 +168,8 @@ final class Connection {
 
     private Timer.@Nullable Cancellable cancellation;
 
-    Connection(Socket socket, Routing routing) throws IOException {
+    Connection(Wire wire, Routing routing) {
+        this.wire = wire;
         this.routing = routing;
         settings = routing.settings;
         scheduler = settings.scheduler();
@@ -196,34 +179,25 @@ final class Connection {
                 RESERVED_COUNT,
                 RESERVED_BYTES
         );
-        frames = new FrameAssembler(
-                Math.min(settings.maxPacketSize(), settings.maxConnectSize())
-        );
         lastReceived = scheduler.nanoTime();
         receiveTimeout = settings.connectTimeout();
-        this.socket = socket;
-        socket.setTcpNoDelay(true);
         client = new Client(this, routing);
-        reactor = routing.reactors[Math.floorMod(
-                routing.nextReactor.getAndIncrement(),
-                routing.reactors.length
-        )];
-        socket.getChannel().configureBlocking(false);
+        reactor = wire.reactor();
     }
 
-    SocketAddress remoteAddress() {
-        return socket.getRemoteSocketAddress();
+    @Nullable SocketAddress remoteAddress() {
+        return wire.remoteAddress();
     }
 
     // Refuses the packets after this point that are larger than `maximumPacketSize`: the
     // broker's limit for an accepted client, which an MQTT 5.0 CONNACK announced. Acceptance
     // sets it before the selector resumes reads.
     void limitPacketSize(int maximumPacketSize) {
-        frames.limit(maximumPacketSize);
+        wire.limit(maximumPacketSize);
     }
 
     synchronized boolean start() {
-        if (!reactor.register(this, socket.getChannel())) {
+        if (!wire.register(this)) {
             return false;
         }
         armTimer(receiveTimeout - (scheduler.nanoTime() - lastReceived));
@@ -263,7 +237,7 @@ final class Connection {
         }
         try {
             if (!ioFailed && !isEnded() && !connecting && !readClosed && resumePending()
-                    && (readable || input.position() > 0)) {
+                    && wire.inputWaiting()) {
                 readReady();
             }
         } catch (IOException failure) {
@@ -271,14 +245,10 @@ final class Connection {
         } catch (PacketDecodeException failure) {
             decodeFailed(failure);
         }
-        if (key != null && key.isValid()) {
-            int interests = !isEnded() && !connecting && !readClosed && pending == null
-                    ? SelectionKey.OP_READ : 0;
-            if (!ioFailed && writingParts.length > 0) {
-                interests |= SelectionKey.OP_WRITE;
-            }
-            key.interestOps(interests);
-        }
+        wire.interest(
+                !isEnded() && !connecting && !readClosed && pending == null,
+                !ioFailed && wire.writing()
+        );
     }
 
     private synchronized boolean terminated() {
@@ -312,25 +282,16 @@ final class Connection {
     }
 
     private void readReady() throws IOException {
-        // A hot publisher gets at most one buffer of socket input per turn. Buffered frames
-        // resume first after backpressure, without waiting for another socket readiness edge.
-        input.flip();
+        // A hot publisher gets at most one read of input per turn. Input that has arrived
+        // resumes first after backpressure, without waiting for another readiness edge.
         if (consume()) {
-            input.compact();
             return;
         }
-        input.compact();
-        int count = socket.getChannel().read(input);
-        if (count == 0) {
-            readable = false;
-        }
-        if (count < 0) {
+        if (wire.read() < 0) {
             endRead("connection closed by the peer", false);
             return;
         }
-        input.flip();
         consume();
-        input.compact();
     }
 
     // A peer that goes away can leave packets behind, such as the DISCONNECT that discards its
@@ -356,10 +317,7 @@ final class Connection {
                 if (connecting || !resumePending()) {
                     return;
                 }
-                input.flip();
-                boolean waiting = consume();
-                input.compact();
-                if (!waiting && socket.getChannel().read(input) <= 0) {
+                if (!consume() && wire.read() <= 0) {
                     break;
                 }
             }
@@ -404,55 +362,56 @@ final class Connection {
 
     // Returns true while a CONNECT or one complete packet waits for its actor or response room.
     private boolean consume() {
-        while (input.hasRemaining()) {
-            byte[] bytes = frames.next(input);
-            if (bytes != null) {
+        while (true) {
+            Wire.Arrival arrival;
+            try {
+                arrival = wire.next(connected, version);
+            } catch (UnsupportedProtocolVersionException failure) {
                 received();
-                if (!connected) {
-                    Packet.Connect request;
-                    try {
-                        request = PacketCodec.decodeConnect(bytes, SUPPORTED_VERSIONS);
-                    } catch (UnsupportedProtocolVersionException failure) {
-                        refuse(
-                                ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,
-                                "unsupported version " + failure.protocolLevel()
-                        );
-                        return true;
-                    }
-                    synchronized (this) {
-                        version = request.version();
-                    }
-                    settings.beforeProcess().accept(request);
-                    connecting = true;
-                    client.connect(request, accepted -> {
-                        // The callback can be on an actor worker; only the selector resumes I/O.
-                        reactor.execute(this, () -> {
-                            connecting = false;
-                            connected = accepted;
-                            if (accepted) {
-                                leaveAwaitingConnect();
-                            }
-                            if (!accepted && !endsWithLastPacket()) {
-                                close("CONNECT refused");
-                            } else {
-                                wake();
-                            }
-                        });
+                refuse(
+                        ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,
+                        "unsupported version " + failure.protocolLevel()
+                );
+                return true;
+            }
+            if (arrival == null) {
+                return false;
+            }
+            received();
+            if (!connected) {
+                var request = (Packet.Connect) arrival.packet();
+                synchronized (this) {
+                    version = request.version();
+                }
+                settings.beforeProcess().accept(request);
+                connecting = true;
+                client.connect(request, accepted -> {
+                    // The callback can be on an actor worker; only the selector resumes I/O.
+                    reactor.execute(this, () -> {
+                        connecting = false;
+                        connected = accepted;
+                        if (accepted) {
+                            leaveAwaitingConnect();
+                        }
+                        if (!accepted && !endsWithLastPacket()) {
+                            close("CONNECT refused");
+                        } else {
+                            wake();
+                        }
                     });
-                    return true;
-                }
-                pending = PacketCodec.of(version).decode(bytes);
-                settings.beforeProcess().accept(pending);
-                log.debug("Broker received {} from {}",
-                        pending.getClass().getSimpleName(), socket.getRemoteSocketAddress());
-                pendingBytes = bytes.length;
-                pendingAnswered = answered(pending);
-                if (!resumePending() || isEnded()) {
-                    return true;
-                }
+                });
+                return true;
+            }
+            pending = arrival.packet();
+            settings.beforeProcess().accept(pending);
+            log.debug("Broker received {} from {}",
+                    pending.getClass().getSimpleName(), wire.peer());
+            pendingBytes = arrival.size();
+            pendingAnswered = answered(pending);
+            if (!resumePending() || isEnded()) {
+                return true;
             }
         }
-        return false;
     }
 
     void refuse(ReasonCode reason, String request) {
@@ -465,7 +424,7 @@ final class Connection {
     void refuse(Packet.ConnAck refusal, String request) {
         ReasonCode reason = refusal.reasonCode();
         log.info("Broker refused {} from {} on port {}: {}",
-                request, socket.getRemoteSocketAddress(), routing.port, reason);
+                request, wire.peer(), routing.port, reason);
         synchronized (this) {
             boolean answered = switch (version) {
                 case V3_1_1 -> switch (reason) {
@@ -514,11 +473,11 @@ final class Connection {
                 yield offered;
             }
             case Release release -> {
-                byte[] bytes = PacketCodec.of(version).encode(release.packet());
+                Outbound queued = wire.queued(release.packet(), version);
                 yield outgoing.offer(
                         ++ticket,
-                        new Outbound.Encoded(bytes),
-                        bytes.length,
+                        queued,
+                        queued.size(),
                         false
                 );
             }
@@ -614,14 +573,14 @@ final class Connection {
                 released.clear();
                 return;
             }
-            byte[] bytes = PacketCodec.of(version).encode(next);
-            if (outgoing.checkCapacity(bytes.length, true) != SendQueue.OfferResult.ACCEPTED) {
+            Outbound queued = wire.queued(next, version);
+            if (outgoing.checkCapacity(queued.size(), true) != SendQueue.OfferResult.ACCEPTED) {
                 return;
             }
             SendQueue.OfferResult result = outgoing.offer(
                     ++ticket,
-                    new Outbound.Encoded(bytes),
-                    bytes.length,
+                    queued,
+                    queued.size(),
                     true
             );
             if (result != SendQueue.OfferResult.ACCEPTED) {
@@ -632,16 +591,16 @@ final class Connection {
         }
     }
 
-    // Called under the connection monitor; no socket I/O occurs on a session's actor.
+    // Called under the connection monitor; no I/O occurs on a session's actor.
     boolean enqueue(Packet packet) {
         if (ended || lastPacket != null) {
             return false;
         }
-        byte[] bytes = PacketCodec.of(version).encode(packet);
+        Outbound queued = wire.queued(packet, version);
         boolean enqueueFailed = outgoing.offer(
                 ++ticket,
-                new Outbound.Encoded(bytes),
-                bytes.length,
+                queued,
+                queued.size(),
                 true
         ) != SendQueue.OfferResult.ACCEPTED;
         if (enqueueFailed) {
@@ -654,8 +613,8 @@ final class Connection {
     private void writeReady() throws IOException {
         // One batch per turn bounds the time a writable peer keeps the selector. Completed
         // batches requeue the connection; zero-byte writes wait only for OP_WRITE.
-        if (writingParts.length == 0) {
-            byte[] last;
+        if (!wire.writing()) {
+            Outbound last;
             synchronized (this) {
                 // A write that a test keeps back still has the sends that it took.
                 if (writing.isEmpty()) {
@@ -676,7 +635,7 @@ final class Connection {
                 if (last == null) {
                     return;
                 }
-                writingParts = new ByteBuffer[] {ByteBuffer.wrap(last)};
+                wire.prepareLast(last);
                 writingLast = true;
             } else {
                 // Every delivery holds something.
@@ -702,18 +661,12 @@ final class Connection {
                         }
                     }
                 }
-                writingParts = parts(writing, skip);
+                wire.prepare(writing, skip, scheduler.nanoTime());
             }
         }
-        if (writingParts.length > 0) {
-            writeParts();
-            for (ByteBuffer part : writingParts) {
-                if (part.hasRemaining()) {
-                    return;
-                }
-            }
+        if (!wire.write()) {
+            return;
         }
-        writingParts = new ByteBuffer[0];
         if (writingLast) {
             close("last packet written");
             return;
@@ -740,58 +693,15 @@ final class Connection {
         }
     }
 
-    // A gathering write copies heap buffers into temporary direct buffers. Cap the part of
-    // a large payload passed to each call, so a partial write does not copy its whole tail.
-    private void writeParts() throws IOException {
-        for (int i = 0; i < writingParts.length; i++) {
-            ByteBuffer part = writingParts[i];
-            if (part.remaining() > BATCH_BYTES) {
-                int limit = part.limit();
-                part.limit(part.position() + BATCH_BYTES);
-                try {
-                    if (socket.getChannel().write(writingParts, 0, i + 1) > 0) {
-                        wake();
-                    }
-                } finally {
-                    part.limit(limit);
-                }
-                return;
-            }
-        }
-        socket.getChannel().write(writingParts);
-    }
-
-    // The parts of the one write that carries `sends`: the bytes of each packet that was queued
-    // encoded, and the headers of each delivery, prepared now, before the payload that it shares
-    // with the publication's deliveries to other sessions. The deliveries that `skip` leaves
-    // unsent have none.
-    private ByteBuffer[] parts(List<SendQueue.Send<Outbound>> sends, boolean skip) {
-        var parts = new WriteParts();
-        long now = scheduler.nanoTime();
-        for (SendQueue.Send<Outbound> send : sends) {
-            switch (send.value()) {
-                case Outbound.Encoded(var bytes) -> parts.add(bytes);
-                case Outbound.Publish(var delivery, var sentBefore) -> {
-                    if (!skip) {
-                        parts.add(delivery.header(sentBefore, now));
-                        parts.add(delivery.payload());
-                    }
-                }
-            }
-        }
-        return parts.toArray();
-    }
-
     // Peer I/O and protocol errors end only this connection. Anything else is a broker
     // defect, such as an OutOfMemoryError, and keeps its stack trace at WARNING.
     private String failureReason(String loop, Throwable failure) {
         if (failure instanceof IOException || failure instanceof PacketDecodeException) {
             if (!isEnded()) {
-                log.debug("Broker {} for {} failed", loop, socket.getRemoteSocketAddress(),
-                        failure);
+                log.debug("Broker {} for {} failed", loop, wire.peer(), failure);
             }
         } else {
-            log.warn("Broker {} for {} failed", loop, socket.getRemoteSocketAddress(), failure);
+            log.warn("Broker {} for {} failed", loop, wire.peer(), failure);
         }
         return failure.getClass().getSimpleName() + ": " + failure.getMessage();
     }
@@ -805,10 +715,10 @@ final class Connection {
         }
         if (id.isEmpty()) {
             log.debug("Broker closed {} on port {} before accepting a client: {}",
-                    socket.getRemoteSocketAddress(), routing.port, reason);
+                    wire.peer(), routing.port, reason);
         } else {
             log.info("Broker disconnected client {} from {} on port {}: {}",
-                    id, socket.getRemoteSocketAddress(), routing.port, reason);
+                    id, wire.peer(), routing.port, reason);
         }
     }
 
@@ -840,17 +750,17 @@ final class Connection {
         if (ended || lastPacket != null) {
             return;
         }
-        byte[] bytes = PacketCodec.of(version).encode(packet);
+        Outbound last = wire.queued(packet, version);
         // The connect timeout bounds the wait for a writer that a slow peer holds up.
         cancelTimer();
         try {
             armTimer(settings.connectTimeout());
         } catch (RuntimeException failure) {
-            log.warn("Broker timer for {} failed", socket.getRemoteSocketAddress(), failure);
+            log.warn("Broker timer for {} failed", wire.peer(), failure);
             terminate(reason);
             return;
         }
-        lastPacket = bytes;
+        lastPacket = last;
         endReason = reason;
         wake();
     }
@@ -936,10 +846,10 @@ final class Connection {
         try {
             task.cancel();
         } catch (Throwable failure) {
-            // A failing injected timer must not prevent socket/queue cleanup.
+            // A failing injected timer must not prevent the cleanup of the wire and the queue.
             log.warn(
                     "Cancelling broker timer for {} failed",
-                    socket.getRemoteSocketAddress(),
+                    wire.peer(),
                     failure
             );
         }
@@ -977,7 +887,7 @@ final class Connection {
                 }
             }
         } catch (Throwable failure) {
-            log.warn("Broker timer for {} failed", socket.getRemoteSocketAddress(), failure);
+            log.warn("Broker timer for {} failed", wire.peer(), failure);
             synchronized (this) {
                 terminate("timer failure");
             }
@@ -1017,22 +927,19 @@ final class Connection {
         }
     }
 
-    // Only the selector cancels the key, closes the channel and releases its write batch.
+    // Only the selector lets go of the wire and releases its write batch.
     void dispose() {
         if (disposed) {
             return;
         }
         disposed = true;
         close("broker closed");
-        // Before the socket closes, so that a peer that sees the close finds the place free.
+        // Before the wire closes, so that a peer that sees the close finds the place free.
         leaveAwaitingConnect();
         try {
-            if (key != null) {
-                key.cancel();
-            }
-            socket.close();
+            wire.close();
         } catch (IOException failure) {
-            log.warn("Closing broker peer {} failed", socket.getRemoteSocketAddress(), failure);
+            log.warn("Closing broker peer {} failed", wire.peer(), failure);
         } finally {
             outgoing.ended();
             routing.connections.remove(this);
@@ -1069,14 +976,5 @@ final class Connection {
         if (!endsWithLastPacket()) {
             close(reason);
         }
-    }
-
-    // What waits in the send queue: a packet that was encoded as it was queued, or a delivery
-    // with whether a connection before this one started to send it.
-    private sealed interface Outbound {
-
-        record Encoded(byte[] bytes) implements Outbound {}
-
-        record Publish(Delivery delivery, boolean sentBefore) implements Outbound {}
     }
 }

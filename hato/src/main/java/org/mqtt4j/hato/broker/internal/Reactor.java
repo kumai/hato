@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
-import java.nio.channels.SocketChannel;
 import java.util.Iterator;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -52,7 +51,7 @@ final class Reactor implements AutoCloseable {
 
     // Seals registration with close(), so even a peer whose registration task has not
     // run yet is visible to the selector's shutdown.
-    synchronized boolean register(Connection connection, SocketChannel channel) {
+    synchronized boolean register(Connection connection, SocketWire wire) {
         if (closed || routing.closed) {
             return false;
         }
@@ -60,8 +59,8 @@ final class Reactor implements AutoCloseable {
         routing.awaitingConnect.incrementAndGet();
         execute(connection, () -> {
             try {
-                if (connection.key == null && !connection.isEnded()) {
-                    connection.key = channel.register(selector, SelectionKey.OP_READ, connection);
+                if (wire.key == null && !connection.isEnded()) {
+                    wire.key = wire.channel().register(selector, SelectionKey.OP_READ, wire);
                 }
             } catch (IOException failure) {
                 connection.failed("registration", failure);
@@ -143,11 +142,11 @@ final class Reactor implements AutoCloseable {
                     SelectionKey key = selected.next();
                     selected.remove();
                     if (key.isValid()) {
-                        var connection = (Connection) key.attachment();
+                        var wire = (SocketWire) key.attachment();
                         if (key.isReadable()) {
-                            connection.readable = true;
+                            wire.readable = true;
                         }
-                        wake(connection);
+                        wake(wire.connection());
                     }
                 }
             }

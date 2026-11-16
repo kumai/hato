@@ -696,7 +696,7 @@ public final class BrokerServer implements AutoCloseable {
                 }
                 Connection connection = null;
                 try {
-                    connection = new Connection(socket, routing);
+                    connection = new Connection(new SocketWire(socket, routing), routing);
                     if (!connection.start()) {
                         socket.close();
                         return;
