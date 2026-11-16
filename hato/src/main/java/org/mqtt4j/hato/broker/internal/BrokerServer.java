@@ -184,10 +184,11 @@ public final class BrokerServer implements AutoCloseable {
             listener.configureBlocking(false);
             acceptKey = listener.register(acceptor, SelectionKey.OP_ACCEPT);
             int port = listener.socket().getLocalPort();
-            // The parts whose ends end the broker: the accepting thread, the selectors, the actor
-            // pool, the two threads that call the listener, if there is one, and the pool that
-            // calls the authenticator, if there is one.
-            int parts = 2
+            // The parts whose ends end the broker: the accepting thread, the selectors, the loop
+            // of the in-process connections, the actor pool, the two threads that call the
+            // listener, if there is one, and the pool that calls the authenticator, if there is
+            // one.
+            int parts = 3
                     + settings.selectors()
                     + ((settings.listener() == null) ? 0 : 2)
                     + ((settings.authenticator() == null) ? 0 : 1);
@@ -655,8 +656,11 @@ public final class BrokerServer implements AutoCloseable {
                     for (Reactor reactor : server.routing.reactors) {
                         reactor.start();
                     }
+                    server.routing.inproc.start();
                     settings.beforeAcceptingStarts().run();
                     server.accepting.start();
+                    // Clients in the same JVM reach the broker from now on, as TCP clients do.
+                    registration.open(server.routing.inproc);
                     // Last, once every part is there to end: a start that fails before this
                     // leaves no thread that waits for parts that never started.
                     server.routing.termination.start();
@@ -688,8 +692,9 @@ public final class BrokerServer implements AutoCloseable {
         try {
             while (true) {
                 Socket socket = accepted();
-                // Only this thread adds to the connections that wait for their CONNECT, so the
-                // limit holds exactly.
+                // This thread and the loop of the in-process connections add to the connections
+                // that wait for their CONNECT, each after its own check, so at most one more than
+                // the limit waits at a time.
                 if (routing.awaitingConnect.get() >= routing.settings.maxAwaitingConnect()) {
                     turnAway(socket);
                     continue;
@@ -862,7 +867,7 @@ public final class BrokerServer implements AutoCloseable {
     // is one of them (see close()).
     private void awaitThreads() {
         Thread current = Thread.currentThread();
-        boolean own = current == accepting;
+        boolean own = current == accepting || current == routing.inproc.thread;
         for (Reactor reactor : routing.reactors) {
             own |= current == reactor.thread;
         }
@@ -873,6 +878,7 @@ public final class BrokerServer implements AutoCloseable {
         for (Reactor reactor : routing.reactors) {
             awaitEnd(reactor.thread);
         }
+        awaitEnd(routing.inproc.thread);
         // Only a broker that runs with assertions, as in tests, looks and waits here.
         assert routing.deliveryMemoryAddsUp();
     }
@@ -916,6 +922,7 @@ public final class BrokerServer implements AutoCloseable {
             for (Reactor reactor : routing.reactors) {
                 reactor.close();
             }
+            routing.inproc.close();
         }
     }
 

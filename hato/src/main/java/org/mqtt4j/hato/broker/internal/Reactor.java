@@ -14,7 +14,7 @@ import org.mqtt4j.hato.internal.log.Log;
 // One of the broker's selectors, which does the socket I/O of the connections assigned to it.
 // Actor work has a separate fixed pool.
 // A connection queues at most one readiness task; the number of connections bounds that queue.
-final class Reactor implements AutoCloseable {
+final class Reactor implements Loop, AutoCloseable {
 
     private static final Log log = Log.of(Reactor.class);
 
@@ -71,7 +71,8 @@ final class Reactor implements AutoCloseable {
 
     // Has the selector look at `connection`. A thread of the actor pool keeps the request until
     // its task ends (see Worker).
-    void wake(Connection connection) {
+    @Override
+    public void wake(Connection connection) {
         if (Thread.currentThread() instanceof Worker worker) {
             worker.hold(connection);
         } else {
@@ -80,13 +81,15 @@ final class Reactor implements AutoCloseable {
     }
 
     // Queues the readiness task of `connection` now, unless one waits already.
-    void schedule(Connection connection) {
+    @Override
+    public void schedule(Connection connection) {
         if (connection.scheduled.compareAndSet(false, true)) {
             enqueue(connection.readiness);
         }
     }
 
-    void execute(Connection connection, Runnable action) {
+    @Override
+    public void execute(Connection connection, Runnable action) {
         enqueue(new Task(connection, action));
     }
 
@@ -162,7 +165,7 @@ final class Reactor implements AutoCloseable {
             close();
             try {
                 for (Connection connection : routing.connections) {
-                    if (connection.reactor == this) {
+                    if (connection.loop == this) {
                         connection.dispose();
                     }
                 }

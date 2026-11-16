@@ -53,6 +53,9 @@ final class Routing {
 
     final Reactor[] reactors;
 
+    // The loop that serves the connections of clients in the same JVM.
+    final InprocLoop inproc;
+
     final AtomicInteger nextReactor = new AtomicInteger();
 
     final ThreadPoolExecutor actors;
@@ -188,6 +191,7 @@ final class Routing {
         };
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
+        inproc = new InprocLoop(this, stopBroker);
         int workers = settings.actors();
         var nextWorker = new AtomicInteger();
         actors = new ThreadPoolExecutor(

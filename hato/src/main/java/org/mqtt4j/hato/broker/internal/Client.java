@@ -156,7 +156,9 @@ final class Client {
         // The connection keeps what its CONNACK announces. MQTT 3.1.1 announces nothing.
         Capabilities offered = switch (request.version()) {
             case V3_1_1 -> Capabilities.UNANNOUNCED;
-            case V5 -> routing.capabilities;
+            case V5 -> connection.inProcess()
+                    ? routing.capabilities.withoutTopicAliases()
+                    : routing.capabilities;
         };
         // A Will that the announced capabilities cannot carry is refused [MQTT-3.2.2-12]
         // [MQTT-3.2.2-13].

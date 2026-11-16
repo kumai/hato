@@ -74,6 +74,21 @@ record Capabilities(
         );
     }
 
+    // These capabilities without Topic Aliases, for a client in the same JVM: an alias saves
+    // only bytes on a wire, which its packets never cross.
+    Capabilities withoutTopicAliases() {
+        return new Capabilities(
+                maximumQos,
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
+                receiveMaximum,
+                maximumPacketSize,
+                0,
+                serverKeepAlive
+        );
+    }
+
     private static void requireRange(
             @Nullable Integer value,
             int minimum,

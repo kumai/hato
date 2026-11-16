@@ -1,5 +1,7 @@
 package org.mqtt4j.hato.broker.internal;
 
+import org.mqtt4j.hato.internal.protocol.Packet;
+
 // What waits in a connection's send queue: a packet in the form that the connection's wire gives
 // it as it is queued, or a delivery, which the wire prepares as it writes it.
 sealed interface Outbound {
@@ -24,4 +26,7 @@ sealed interface Outbound {
             return delivery.byteCount;
         }
     }
+
+    // A packet as it is, for a client in the same JVM, and the bytes that it takes on the wire.
+    record Plain(Packet packet, int size) implements Outbound {}
 }

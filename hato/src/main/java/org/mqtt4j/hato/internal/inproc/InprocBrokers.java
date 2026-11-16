@@ -3,6 +3,8 @@ package org.mqtt4j.hato.internal.inproc;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.jspecify.annotations.Nullable;
+
 /// The names of the brokers that run in this JVM, by which clients reach them in process. The
 /// table is static, so each class loader that loads these classes has a table of its own.
 ///
@@ -54,6 +56,13 @@ public final class InprocBrokers {
         }
     }
 
+    /// The endpoint of the running broker named `name`, or null while none runs or the one that
+    /// holds the name has not opened yet.
+    public static @Nullable Endpoint find(String name) {
+        Registration registration = registrations.get(name);
+        return registration == null ? null : registration.endpoint;
+    }
+
     /// Checks that `name` can name a broker.
     ///
     /// @throws IllegalArgumentException if it cannot
@@ -90,10 +99,22 @@ public final class InprocBrokers {
         return true;
     }
 
+    /// What a running broker offers the clients that find it by name.
+    public interface Endpoint {
+
+        /// Takes `link` from a client, and answers it with [InprocLink#accept(Runnable)] or
+        /// [InprocLink#refuse()], at once or later. Called by a client's thread, which may be
+        /// virtual, so it returns at once and takes no lock that a thread of the broker takes.
+        void connect(InprocLink link);
+    }
+
     /// A name that a broker holds, until it gives it back.
     public static final class Registration {
 
         private final String name;
+
+        // How clients reach the broker, once it has started.
+        private volatile @Nullable Endpoint endpoint;
 
         private Registration(String name) {
             this.name = name;
@@ -102,6 +123,11 @@ public final class InprocBrokers {
         /// {@return the name}
         public String name() {
             return name;
+        }
+
+        /// Lets clients that find the name reach the broker through `endpoint`.
+        public void open(Endpoint endpoint) {
+            this.endpoint = endpoint;
         }
 
         /// Gives the name back, so that another broker can take it. Later calls do nothing.

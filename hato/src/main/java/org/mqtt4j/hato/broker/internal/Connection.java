@@ -64,7 +64,7 @@ final class Connection {
 
     private final Wire wire;
 
-    final Reactor reactor;
+    final Loop loop;
 
     private final SendQueue<Outbound> outgoing;
 
@@ -182,11 +182,16 @@ final class Connection {
         lastReceived = scheduler.nanoTime();
         receiveTimeout = settings.connectTimeout();
         client = new Client(this, routing);
-        reactor = wire.reactor();
+        loop = wire.loop();
     }
 
     @Nullable SocketAddress remoteAddress() {
         return wire.remoteAddress();
+    }
+
+    // Whether the client runs in the same JVM.
+    boolean inProcess() {
+        return wire.inProcess();
     }
 
     // Refuses the packets after this point that are larger than `maximumPacketSize`: the
@@ -208,13 +213,13 @@ final class Connection {
     // that it can take again. A thread of the actor pool keeps the request until its task ends
     // (see Worker).
     void wake() {
-        reactor.wake(this);
+        loop.wake(this);
     }
 
     // Has the selector look at the connection without waiting for the end of a pool thread's
     // task, as wake() does there.
     void wakeNow() {
-        reactor.schedule(this);
+        loop.schedule(this);
     }
 
     void ready() {
@@ -387,7 +392,7 @@ final class Connection {
                 connecting = true;
                 client.connect(request, accepted -> {
                     // The callback can be on an actor worker; only the selector resumes I/O.
-                    reactor.execute(this, () -> {
+                    loop.execute(this, () -> {
                         connecting = false;
                         connected = accepted;
                         if (accepted) {

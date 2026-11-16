@@ -83,7 +83,12 @@ final class SocketWire implements Wire {
     }
 
     @Override
-    public Reactor reactor() {
+    public boolean inProcess() {
+        return false;
+    }
+
+    @Override
+    public Loop loop() {
         return reactor;
     }
 
@@ -152,6 +157,9 @@ final class SocketWire implements Wire {
                         parts.add(delivery.payload());
                     }
                 }
+                case Outbound.Plain _ -> throw new IllegalStateException(
+                        "A socket queues every packet encoded"
+                );
             }
         }
         writingParts = parts.toArray();

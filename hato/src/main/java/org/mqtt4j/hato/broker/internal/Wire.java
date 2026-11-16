@@ -12,9 +12,9 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 
 // What carries the packets of one connection. The connection keeps the protocol and its state;
 // the wire takes the packets in and puts them out, in the form that it gives them on the way.
-// The connection's selector calls every method but queued(), which a session's actor calls too,
+// The connection's loop calls every method but queued(), which a session's actor calls too,
 // under the connection's monitor.
-sealed interface Wire permits SocketWire {
+sealed interface Wire permits SocketWire, MemoryWire {
 
     // Where the client connects from over a network, or null.
     @Nullable SocketAddress remoteAddress();
@@ -22,14 +22,17 @@ sealed interface Wire permits SocketWire {
     // The peer, as logs name it.
     Object peer();
 
-    // The selector that serves the connection.
-    Reactor reactor();
+    // Whether the client runs in the same JVM.
+    boolean inProcess();
 
-    // Has the selector serve `connection`, which this wire carries, from now on. Returns false
-    // if the selector has closed.
+    // The loop that serves the connection.
+    Loop loop();
+
+    // Has the loop serve `connection`, which this wire carries, from now on. Returns false if
+    // the loop has closed.
     boolean register(Connection connection);
 
-    // Whether input waits: what has arrived and not been taken, or the selector's word that more
+    // Whether input waits: what has arrived and not been taken, or the loop's word that more
     // can be read.
     boolean inputWaiting();
 
@@ -64,8 +67,8 @@ sealed interface Wire permits SocketWire {
     // Writes what it can of the prepared write. Returns true once all of it has gone out.
     boolean write() throws IOException;
 
-    // Tells the selector what the connection waits for: input when `read`, and room for the rest
-    // of a write when `write`.
+    // Tells the loop what the connection waits for: input when `read`, and room for the rest of
+    // a write when `write`.
     void interest(boolean read, boolean write);
 
     // Lets go of what carries the packets, once the connection has ended.

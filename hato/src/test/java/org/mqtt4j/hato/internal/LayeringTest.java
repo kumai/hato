@@ -39,7 +39,7 @@ class LayeringTest {
             "protocol", Set.of("value", "util"),
             "concurrent", Set.of("util", "log"),
             "io", Set.of("value", "util", "log", "concurrent", "protocol"),
-            "inproc", Set.of()
+            "inproc", Set.of("protocol")
     );
     private static final Pattern IMPORT = Pattern.compile("^import\\s+(?:static\\s+)?([\\w.]+)");
 

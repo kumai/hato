@@ -172,6 +172,20 @@ final class Delivery implements Outgoing, Pending {
         );
     }
 
+    // The PUBLISH that carries the delivery at `now` to a client in the same JVM, whose packets
+    // pass as they are: the one whose headers header() prepares, with the publication's payload.
+    Packet.Publish packet(boolean sentBefore, long now) {
+        return new Packet.Publish(
+                publication.topic(),
+                publication.payload(),
+                qos,
+                retain,
+                qos != Qos.AT_MOST_ONCE && sentBefore,
+                packetId,
+                remainingAt(now)
+        );
+    }
+
     byte[] payload() {
         return publication.payload();
     }
