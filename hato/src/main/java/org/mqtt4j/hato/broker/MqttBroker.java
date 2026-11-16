@@ -2,11 +2,13 @@ package org.mqtt4j.hato.broker;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
 import org.mqtt4j.hato.broker.internal.BrokerServer;
 import org.mqtt4j.hato.internal.concurrent.ClassPreload;
+import org.mqtt4j.hato.internal.inproc.InprocBrokers;
 import org.mqtt4j.hato.internal.log.Log;
 
 /// An experimental, in-memory MQTT 3.1.1 and 5.0 broker for tests.
@@ -175,6 +177,19 @@ public final class MqttBroker implements AutoCloseable {
     ///   the name of this broker, including after close
     public String name() {
         return server.name();
+    }
+
+    /// The URI by which a client in the same JVM reaches this broker: `inproc://` and its
+    /// [name][#name()]. A client built with it, by [org.mqtt4j.hato.MqttClientBuilder#server(URI)],
+    /// passes its packets to the broker in memory, through neither a socket nor their encoding,
+    /// and the broker serves it as it serves a client over TCP: the same [Authenticator], without
+    /// a remote address, and the same limits. Only a client whose Hato classes come from the same
+    /// class loader as the broker's reaches it.
+    ///
+    /// @return
+    ///   the URI of this broker for clients in the same JVM, including after close
+    public URI uri() {
+        return InprocBrokers.uri(server.name());
     }
 
     /// Observes the end of this broker without requesting it. The future completes once the

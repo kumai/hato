@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.internal.inproc;
 
+import java.net.URI;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -12,6 +13,9 @@ import org.jspecify.annotations.Nullable;
 /// a broker's own threads give names back as the broker ends, and must not wait for a client's
 /// thread, which may be virtual, that looks a name up meanwhile.
 public final class InprocBrokers {
+
+    /// The scheme of the URIs that name a broker in the same JVM: `inproc://<name>`.
+    public static final String SCHEME = "inproc";
 
     // A name is a host name in lower case: labels of letters, digits, and hyphens, separated by
     // periods, as DNS has them, so that it is the host of a URI as it stands.
@@ -63,6 +67,11 @@ public final class InprocBrokers {
         return registration == null ? null : registration.endpoint;
     }
 
+    /// The URI that names the broker of `name`.
+    public static URI uri(String name) {
+        return URI.create(SCHEME + "://" + name);
+    }
+
     /// Checks that `name` can name a broker.
     ///
     /// @throws IllegalArgumentException if it cannot
@@ -76,7 +85,8 @@ public final class InprocBrokers {
         }
     }
 
-    private static boolean valid(String name) {
+    /// Whether `name` can name a broker; see [#check(String)].
+    public static boolean valid(String name) {
         if (name.isEmpty() || name.length() > MAX_NAME_LENGTH) {
             return false;
         }

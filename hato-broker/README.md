@@ -62,6 +62,42 @@ loopback, and an address beyond it needs an `Authenticator` or `allowAnonymous()
 as the next section describes. Starting the broker throws `IOException` if it
 cannot open the listening socket.
 
+## Connecting clients in the same JVM
+
+A Hato client in the same JVM can reach the broker by its URI, `inproc://` and the
+broker's name, which `broker.uri()` returns. Such a client passes its packets to the
+broker in memory, without a socket and without encoding them, and otherwise works as
+over TCP: the broker checks it with the same `Authenticator`, which sees no remote
+address, and holds it to the same limits.
+
+```java
+import java.io.IOException;
+
+import org.mqtt4j.hato.MqttClient;
+import org.mqtt4j.hato.broker.MqttBroker;
+
+void main() throws IOException {
+    try (
+            MqttBroker broker = MqttBroker.builder().name("fleet").start();
+            MqttClient client = MqttClient.builder()
+                    .server(broker.uri())
+                    .build()
+    ) {
+        client.connect().join();
+        System.out.println("Connected to " + broker.uri());
+        client.disconnect().join();
+    }
+}
+```
+
+A name is a host name in lower case, such as `fleet` or `site-a.fleet`. Without one,
+the broker takes `hato-` and a number. A running broker holds its name until it stops,
+and another broker cannot start with that name meanwhile. Since the URI is a plain
+string, a client can be configured with `inproc://fleet` before the broker starts: a
+connection attempt while no broker of that name runs fails as one to an unreachable
+host does, and `ReconnectPolicy.withInitialRetry()` keeps the client trying until the
+broker is there.
+
 ## Choosing where to use it
 
 Use the broker in local or trusted environments. It does not encrypt connections. It

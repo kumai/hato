@@ -186,6 +186,7 @@ Choose the transport with the URI scheme:
 | `mqtts://broker.example.com` | TLS | 8883 |
 | `ws://broker.example.com:8080/mqtt` | WebSocket | 80 |
 | `wss://broker.example.com/mqtt` | WebSocket over TLS | 443 |
+| `inproc://fleet` | Memory, to an embedded broker in the same JVM | |
 
 - TLS uses the JDK's default trust and verifies the broker hostname. Supply
   `sslContext(context)` for your own CA or a client certificate, and
@@ -199,6 +200,9 @@ Choose the transport with the URI scheme:
 - Over WebSocket, the JDK can miss a connection that ends abruptly. The client then finds out
   through keep-alive, within about twice the `keepAlive` interval; shorten the interval if
   that is too long for you.
+- `inproc` reaches an [embedded broker](../hato-broker/README.md#connecting-clients-in-the-same-jvm)
+  by its name, without a socket. The client works as over TCP, subscriptions and their
+  handlers included, and takes no TLS settings or transport factory.
 
 ### Authenticating
 

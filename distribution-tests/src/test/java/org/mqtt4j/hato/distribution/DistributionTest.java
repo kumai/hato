@@ -242,6 +242,44 @@ class DistributionTest {
             }
             """;
 
+    private static final String INPROC_PROBE = """
+            // A client in the same JVM reaches the broker by its URI, through memory, in both
+            // protocol versions and at every QoS level.
+            for (var version : org.mqtt4j.hato.MqttVersion.values()) {
+                try (var broker = org.mqtt4j.hato.broker.MqttBroker.start();
+                        org.mqtt4j.hato.MqttClient sut = org.mqtt4j.hato.MqttClient.builder()
+                                .server(broker.uri())
+                                .version(version)
+                                .build()) {
+                    sut.connect().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    var handled = new java.util.concurrent.LinkedBlockingQueue<
+                            org.mqtt4j.hato.MqttMessage
+                    >();
+                    sut.subscribe(
+                            org.mqtt4j.hato.Subscribe.of(
+                                    new org.mqtt4j.hato.TopicFilter("probe/inproc"),
+                                    org.mqtt4j.hato.Qos.EXACTLY_ONCE
+                            ),
+                            delivery -> handled.add(delivery.message())
+                    ).established().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    for (var qos : org.mqtt4j.hato.Qos.values()) {
+                        var sent = org.mqtt4j.hato.MqttMessage.of(
+                                new org.mqtt4j.hato.Topic("probe/inproc"),
+                                new byte[] {42},
+                                qos,
+                                false
+                        );
+                        sut.publish(sent).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                        var arrived = handled.poll(5, java.util.concurrent.TimeUnit.SECONDS);
+                        if (!sent.equals(arrived)) {
+                            throw new AssertionError(version + " " + qos + " in memory changed it");
+                        }
+                    }
+                    sut.disconnect().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                }
+            }
+            """;
+
     private static final String CONNECT_PROBE = """
             try (var broker = org.mqtt4j.hato.broker.MqttBroker.start();
                     org.mqtt4j.hato.MqttClient client = org.mqtt4j.hato.MqttClient.builder()
@@ -334,7 +372,7 @@ class DistributionTest {
         runClasspathProbe(
                 "classpath",
                 HATO.toString(),
-                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE
+                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE + INPROC_PROBE
         );
     }
 
@@ -344,7 +382,7 @@ class DistributionTest {
                 "module",
                 HATO.toString(),
                 List.of("org.mqtt4j.hato"),
-                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE
+                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE + INPROC_PROBE
         );
     }
 
@@ -379,7 +417,7 @@ class DistributionTest {
                 "clientModule",
                 CLIENT_ALIAS + File.pathSeparator + HATO,
                 List.of("org.mqtt4j.hato.client"),
-                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE
+                CLIENT_PROBE + BROKER_PROBE + CONNECTION_PROBE + INPROC_PROBE
         );
         runClasspathProbe(
                 "clientClasspath",

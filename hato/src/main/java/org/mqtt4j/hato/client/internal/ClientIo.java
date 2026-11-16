@@ -9,23 +9,29 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.Transport;
+import org.mqtt4j.hato.internal.inproc.InprocBrokers;
+import org.mqtt4j.hato.internal.inproc.InprocLink;
 import org.mqtt4j.hato.internal.io.SendQueue;
 import org.mqtt4j.hato.internal.io.WriteParts;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.IncomingAliases;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.PacketCodec;
+import org.mqtt4j.hato.internal.protocol.PacketDecodeException;
 import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.Property;
 import org.mqtt4j.hato.internal.protocol.PropertyId;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Objects.requireNonNull;
+import static org.mqtt4j.hato.ReasonCode.PACKET_TOO_LARGE;
 
 /// Adapts byte callbacks to protocol events and serializes preparation and writes off the actor.
 /// One sender survives connection changes; queued and active sends share a client-wide budget.
@@ -130,7 +136,13 @@ final class ClientIo {
     // times the memory that the receive limits admit.
     static final int PROPERTY_COST = 128;
 
+    // What a send that passes a packet as it is holds in place of bytes.
+    private static final byte[] NO_BYTES = new byte[0];
+
     private final URI endpoint;
+
+    // Whether the broker runs in the same JVM, so that packets pass as they are, unencoded.
+    private final boolean inProcess;
 
     private final String clientId;
 
@@ -204,6 +216,7 @@ final class ClientIo {
             Function<MqttMessage, byte[]> payloadOf
     ) {
         this.endpoint = endpoint;
+        inProcess = InprocBrokers.SCHEME.equals(endpoint.getScheme());
         this.clientId = clientId;
         this.maxPacketSize = maxPacketSize;
         this.factory = factory;
@@ -232,43 +245,39 @@ final class ClientIo {
         var connection = new Connection(generation, transport, new SendQueue<>(budget));
         // The broker's Topic Aliases last for this connection, so its own callback resolves them.
         var aliases = new IncomingAliases(ConnectionEstablishment.TOPIC_ALIAS_MAXIMUM);
-        var frames = new IncomingFrames(
-                maxPacketSize,
-                codec,
-                (packet, size) -> {
-                    // Naming the packet's class costs a lookup on every packet, even with debug
-                    // logging off, so the name waits for the level.
-                    if (log.isLoggable(Level.DEBUG)) {
-                        log.debug("Received {} ({} bytes)",
-                                packet.getClass().getSimpleName(), size);
-                    }
-                    boolean here = connection.readsHere;
-                    if (packet instanceof Packet.PingResp && answersPing(connection)) {
-                        events.pingResponse(generation, packet, size, here);
-                    } else if (packet instanceof Packet.Publish publish) {
-                        Packet.Publish held = aliases.set(publish);
-                        events.received(generation, held, size + propertyCost(held), here);
-                    } else if (packet instanceof Packet.AliasPublish publish) {
-                        Packet.Publish resolved = aliases.resolve(publish);
-                        // Receive capacity counts the topic as if the broker had sent it, so an
-                        // alias saves bandwidth without changing what a delivery costs.
-                        int topicBytes = resolved.topic().name().getBytes(UTF_8).length;
-                        events.received(
-                                generation,
-                                resolved,
-                                size + topicBytes + propertyCost(resolved),
-                                here
-                        );
-                    } else {
-                        events.received(generation, packet, size + propertyCost(packet), here);
-                    }
-                }
-        );
+        BiConsumer<Packet, Integer> received = (packet, size) -> {
+            // Naming the packet's class costs a lookup on every packet, even with debug logging
+            // off, so the name waits for the level.
+            if (log.isLoggable(Level.DEBUG)) {
+                log.debug("Received {} ({} bytes)", packet.getClass().getSimpleName(), size);
+            }
+            boolean here = connection.readsHere;
+            if (packet instanceof Packet.PingResp && answersPing(connection)) {
+                events.pingResponse(generation, packet, size, here);
+            } else if (packet instanceof Packet.Publish publish) {
+                Packet.Publish held = aliases.set(publish);
+                events.received(generation, held, size + propertyCost(held), here);
+            } else if (packet instanceof Packet.AliasPublish publish) {
+                Packet.Publish resolved = aliases.resolve(publish);
+                // Receive capacity counts the topic as if the broker had sent it, so an alias
+                // saves bandwidth without changing what a delivery costs.
+                int topicBytes = resolved.topic().name().getBytes(UTF_8).length;
+                events.received(
+                        generation,
+                        resolved,
+                        size + topicBytes + propertyCost(resolved),
+                        here
+                );
+            } else {
+                events.received(generation, packet, size + propertyCost(packet), here);
+            }
+        };
+        var frames = new IncomingFrames(maxPacketSize, codec, received);
         synchronized (sending) {
             current = connection;
             openTransports++;
         }
-        var receiver = new BorrowingListener() {
+        var receiver = new PacketListener() {
             @Override
             public void onConnected() {
                 if (!isClosed(connection)) {
@@ -308,6 +317,30 @@ final class ClientIo {
             }
 
             @Override
+            public void onPackets(List<InprocLink.Item> packets, boolean filled) {
+                try {
+                    if (!isClosed(connection)) {
+                        // A read that took as many as one read may suggests that more waits
+                        // behind it, as a read that fills a buffer does.
+                        connection.readsHere = !filled;
+                        for (InprocLink.Item item : packets) {
+                            // The broker keeps to the size that the client announced; a packet
+                            // beyond it ends the connection, as a TCP frame beyond it does.
+                            if (item.size() > maxPacketSize) {
+                                throw new PacketDecodeException(
+                                        PACKET_TOO_LARGE,
+                                        "Packet exceeds maximum size " + maxPacketSize
+                                );
+                            }
+                            received.accept(item.packet(), item.size());
+                        }
+                    }
+                } catch (Throwable failure) {
+                    events.failed(generation, failure);
+                }
+            }
+
+            @Override
             public void afterBorrowedBytes() {
                 events.runAfterRead();
             }
@@ -322,7 +355,7 @@ final class ClientIo {
                 // The sender, or a thread that writes in its place, reports a write that it made
                 // itself here, before the write returns, and then runs what the write completes
                 // rather than wake the actor thread.
-                if (connection.transport instanceof BlockingWriteTransport
+                if (writesOnCaller(connection.transport)
                         && (Thread.currentThread() == sender
                                 || Thread.currentThread() == standInWriter)) {
                     events.hold();
@@ -430,11 +463,36 @@ final class ClientIo {
                 return capacity;
             }
         }
-        byte[] header = publishHeader(message, packetId, alias);
+        Outbound outbound;
+        if (inProcess) {
+            // The broker in the same JVM announces no Topic Aliases, so the packet carries its
+            // topic.
+            var publish = new Packet.Publish(
+                    message.topic(),
+                    payloadOf.apply(message),
+                    message.qos(),
+                    message.retain(),
+                    false,
+                    packetId,
+                    MessageProperties.of(message)
+            );
+            outbound = new Outbound(
+                    NO_BYTES,
+                    message,
+                    false,
+                    false,
+                    receipt,
+                    publish,
+                    codec.size(publish)
+            );
+        } else {
+            byte[] header = publishHeader(message, packetId, alias);
+            outbound = new Outbound(header, message, false, false, receipt, null, 0);
+        }
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(header, message, false, false, receipt),
+                outbound,
                 false,
                 false,
                 Packet.Publish.class,
@@ -477,7 +535,6 @@ final class ClientIo {
             Packet packet,
             @Nullable SendReceipt receipt
     ) {
-        byte[] bytes = codec.encode(packet);
         // Reserve capacity for connection progress, not for every MQTT control packet.
         boolean acknowledgement = packet instanceof Packet.PubAck
                 || packet instanceof Packet.PubRec
@@ -486,18 +543,34 @@ final class ClientIo {
         boolean reserved = acknowledgement || packet instanceof Packet.Connect
                 || packet instanceof Packet.PingReq
                 || packet instanceof Packet.Disconnect;
+        boolean notifyWritten = packet instanceof Packet.PubAck
+                || packet instanceof Packet.PubRec
+                || packet instanceof Packet.PubComp;
+        // CONNECT carries credentials, so its bytes never reach a log.
+        boolean redacted = packet instanceof Packet.Connect;
+        Outbound outbound = inProcess
+                ? new Outbound(
+                        NO_BYTES,
+                        null,
+                        notifyWritten,
+                        redacted,
+                        receipt,
+                        packet,
+                        codec.size(packet)
+                )
+                : new Outbound(
+                        codec.encode(packet),
+                        null,
+                        notifyWritten,
+                        redacted,
+                        receipt,
+                        null,
+                        0
+                );
         return enqueue(
                 generation,
                 ticket,
-                new Outbound(
-                        bytes,
-                        null,
-                        packet instanceof Packet.PubAck || packet instanceof Packet.PubRec
-                                || packet instanceof Packet.PubComp,
-                        // CONNECT carries credentials, so its bytes never reach a log.
-                        packet instanceof Packet.Connect,
-                        receipt
-                ),
+                outbound,
                 reserved,
                 acknowledgement,
                 packet.getClass(),
@@ -660,6 +733,9 @@ final class ClientIo {
     /// [#APART_PAYLOAD_BYTES] leaves as its header and then its payload on a transport that lets
     /// the sender write, and anything else leaves as one array.
     private Encoded encode(Connection connection, List<SendQueue.Send<Outbound>> sends) {
+        if (connection.transport instanceof InprocTransport) {
+            return new Encoded.Packets(packets(sends));
+        }
         if (withoutPayloads(sends)) {
             return new Encoded.Whole(headers(sends));
         }
@@ -709,6 +785,22 @@ final class ClientIo {
             parts.add(payload);
         }
         return parts.toArray();
+    }
+
+    /// The packets of `sends` as an in-process transport takes them, each as this attempt sends
+    /// it, with the bytes that it takes on the wire.
+    private static List<InprocLink.Item> packets(List<SendQueue.Send<Outbound>> sends) {
+        var packets = new ArrayList<InprocLink.Item>(sends.size());
+        for (SendQueue.Send<Outbound> send : sends) {
+            Outbound outbound = send.value();
+            Packet packet = outbound.currentPacket();
+            if (log.isLoggable(Level.TRACE)) {
+                log.trace("Write attempt for ticket {}: {} ({} bytes)",
+                        send.ticket(), packet.getClass().getSimpleName(), outbound.packetSize());
+            }
+            packets.add(new InprocLink.Item(packet, outbound.packetSize()));
+        }
+        return packets;
     }
 
     private static boolean withoutPayloads(List<SendQueue.Send<Outbound>> sends) {
@@ -853,8 +945,7 @@ final class ClientIo {
             deferringThread = null;
             Connection connection = current;
             if (connection != null && connection.queue.hasReady()) {
-                if (senderIdle && !shutdown
-                        && connection.transport instanceof BlockingWriteTransport) {
+                if (senderIdle && !shutdown && writesOnCaller(connection.transport)) {
                     List<SendQueue.Send<Outbound>> batch =
                             connection.queue.pollBatch(batchByteLimit);
                     connection.activeTicket = batch.getLast().ticket();
@@ -892,6 +983,12 @@ final class ClientIo {
             senderIdle = false;
             LockSupport.unpark(sender);
         }
+    }
+
+    /// Whether `transport` lets the client write on its own thread, rather than hand each write
+    /// to a thread of the transport's.
+    private static boolean writesOnCaller(Transport transport) {
+        return transport instanceof BlockingWriteTransport || transport instanceof InprocTransport;
     }
 
     /// No PINGREQ precedes CONNACK, so an answering PINGRESP cannot overtake it.
@@ -1092,17 +1189,44 @@ final class ClientIo {
         }
     }
 
-    /// The complete packet, or a PUBLISH header to which the sender appends the message's payload.
+    /// The complete packet, or a PUBLISH header to which the sender appends the message's payload;
+    /// or, for a broker in the same JVM, the packet as it is, with the bytes that it takes on the
+    /// wire, and no header.
     private record Outbound(
             byte[] header,
             @Nullable MqttMessage message,
             boolean notifyWritten,
             boolean redacted,
-            @Nullable SendReceipt receipt
+            @Nullable SendReceipt receipt,
+            @Nullable Packet packet,
+            int packetSize
     ) {
 
         int size() {
+            if (packet != null) {
+                return packetSize;
+            }
             return header.length + (message == null ? 0 : message.payloadSize());
+        }
+
+        /// The packet as this attempt passes it, with DUP set once the transport has accepted an
+        /// earlier attempt, as [#currentHeader()] sets it.
+        Packet currentPacket() {
+            Packet current = requireNonNull(packet, "packet");
+            SendReceipt earlier = receipt;
+            boolean resent = earlier != null && earlier.accepted();
+            if (resent && current instanceof Packet.Publish publish) {
+                return new Packet.Publish(
+                        publish.topic(),
+                        publish.payload(),
+                        publish.qos(),
+                        publish.retain(),
+                        true,
+                        publish.packetId(),
+                        publish.properties()
+                );
+            }
+            return current;
         }
 
         byte[] encode(PacketCodec codec, Function<MqttMessage, byte[]> payloadOf) {
@@ -1161,6 +1285,15 @@ final class ClientIo {
             @Override
             public Transport.SendResult writeTo(Transport transport, long ticket) {
                 return ((BlockingWriteTransport) transport).writeParts(ticket, parts);
+            }
+        }
+
+        record Packets(List<InprocLink.Item> packets) implements Encoded {
+
+            // Only an in-process transport takes packets; see encode.
+            @Override
+            public Transport.SendResult writeTo(Transport transport, long ticket) {
+                return ((InprocTransport) transport).write(ticket, packets);
             }
         }
     }

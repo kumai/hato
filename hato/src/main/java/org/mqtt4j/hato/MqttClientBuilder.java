@@ -22,9 +22,11 @@ import org.mqtt4j.hato.client.internal.ClientActor;
 import org.mqtt4j.hato.client.internal.ClientLimits;
 import org.mqtt4j.hato.client.internal.CoreThreads;
 import org.mqtt4j.hato.client.internal.DefaultTimerScheduler;
+import org.mqtt4j.hato.client.internal.InprocTransport;
 import org.mqtt4j.hato.client.internal.MessageProperties;
 import org.mqtt4j.hato.client.internal.TcpTransport;
 import org.mqtt4j.hato.client.internal.WebSocketTransports;
+import org.mqtt4j.hato.internal.inproc.InprocBrokers;
 import org.mqtt4j.hato.internal.protocol.MqttString;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
@@ -130,14 +132,21 @@ public final class MqttClientBuilder {
     }
 
     /// A required broker URI using `mqtt` for TCP, `mqtts` for TLS over TCP, `ws` for WebSocket,
-    /// or `wss` for WebSocket over TLS. The default ports are 1883, 8883, 80, and 443,
-    /// respectively; a broker's WebSocket listener often has its own port and path, such as
-    /// `ws://broker.example.com:8080/mqtt`. A `ws` or `wss` URI keeps its path and query for the
-    /// opening handshake, and connects directly, without a proxy that the JVM configures for
-    /// HTTP. Hosts must satisfy [URI#parseServerAuthority()]; names containing underscores are
-    /// rejected. Schemes must be in lower case. User information and fragments are not accepted,
-    /// nor are paths and queries for `mqtt` and `mqtts`. Rejection messages hide any user
-    /// information in the given URI.
+    /// `wss` for WebSocket over TLS, or `inproc` for a broker in the same JVM. The default ports
+    /// are 1883, 8883, 80, and 443, respectively; a broker's WebSocket listener often has its own
+    /// port and path, such as `ws://broker.example.com:8080/mqtt`. A `ws` or `wss` URI keeps its
+    /// path and query for the opening handshake, and connects directly, without a proxy that the
+    /// JVM configures for HTTP. Hosts must satisfy [URI#parseServerAuthority()]; names containing
+    /// underscores are rejected. Schemes must be in lower case. User information and fragments
+    /// are not accepted, nor are paths and queries for `mqtt` and `mqtts`. Rejection messages
+    /// hide any user information in the given URI.
+    ///
+    /// An `inproc` URI is `inproc://` and the name of a broker that runs in the same JVM, as
+    /// [org.mqtt4j.hato.broker.MqttBroker#uri()] gives it, with no port, path, or query. The
+    /// client passes its packets to that broker in memory, through neither a socket nor their
+    /// encoding, and otherwise works as over TCP. A connection attempt while no broker of that
+    /// name runs fails as one to an unreachable host does, and the reconnection policy applies.
+    /// Such a client takes no TLS settings or transport factory.
     ///
     /// @param value
     ///   the broker URI
@@ -150,6 +159,24 @@ public final class MqttClientBuilder {
         } catch (URISyntaxException failure) {
             // The exception's message and input repeat the whole URI, so only the reason is kept.
             throw new IllegalArgumentException(failure.getReason() + ": " + redactUserInfo(value));
+        }
+        if (InprocBrokers.SCHEME.equals(value.getScheme())) {
+            String name = value.getHost();
+            if (name == null
+                || !InprocBrokers.valid(name)
+                || value.getRawUserInfo() != null
+                || value.getRawFragment() != null
+                || value.getRawQuery() != null
+                || (value.getRawPath() != null && !value.getRawPath().isEmpty())
+                || value.getPort() != -1
+            ) {
+                throw new IllegalArgumentException(
+                        "Expected inproc://name, with a broker name in lower case: "
+                                + redactUserInfo(value)
+                );
+            }
+            server = value;
+            return this;
         }
         boolean tcp = "mqtt".equals(value.getScheme()) || "mqtts".equals(value.getScheme());
         boolean webSocket = "ws".equals(value.getScheme()) || "wss".equals(value.getScheme());
@@ -164,8 +191,9 @@ public final class MqttClientBuilder {
         ) {
             throw new IllegalArgumentException(
                     "Expected mqtt://host[:port], mqtts://host[:port],"
-                            + " ws://host[:port][/path][?query], or"
-                            + " wss://host[:port][/path][?query]: " + redactUserInfo(value)
+                            + " ws://host[:port][/path][?query],"
+                            + " wss://host[:port][/path][?query], or inproc://name: "
+                            + redactUserInfo(value)
             );
         }
         server = value;
@@ -660,10 +688,11 @@ public final class MqttClientBuilder {
     /// @throws IllegalStateException
     ///   if the server has not been specified
     /// @throws IllegalArgumentException
-    ///   if TLS settings are invalid or incompatible, a persistent session has no explicit
-    ///   client id, a session file has no persistent session or no existing directory, the
-    ///   Will's properties exceed 65535 bytes with the Will delay, the Will delay is positive
-    ///   without a Will, or MQTT 3.1.1 is chosen with Will properties or a positive Will delay
+    ///   if TLS settings are invalid or incompatible, an `inproc` server has a transport
+    ///   factory, a persistent session has no explicit client id, a session file has no
+    ///   persistent session or no existing directory, the Will's properties exceed 65535 bytes
+    ///   with the Will delay, the Will delay is positive without a Will, or MQTT 3.1.1 is chosen
+    ///   with Will properties or a positive Will delay
     public MqttClient build() {
         URI endpoint = server;
         if (endpoint == null) {
@@ -671,6 +700,9 @@ public final class MqttClientBuilder {
         }
         boolean tls = "mqtts".equals(endpoint.getScheme()) || "wss".equals(endpoint.getScheme());
         Transport.Factory factory = transportFactory;
+        if (factory != null && InprocBrokers.SCHEME.equals(endpoint.getScheme())) {
+            throw new IllegalArgumentException("An inproc server takes no transport factory");
+        }
         if ((sslContext != null || sslParameters != null) && (!tls || factory != null)) {
             throw new IllegalArgumentException(
                     "TLS settings require mqtts or wss and the default transport factory"
@@ -726,6 +758,7 @@ public final class MqttClientBuilder {
                         );
                         yield new WebSocketTransports(id, timer, context, parameters);
                     }
+                    case InprocBrokers.SCHEME -> value -> new InprocTransport(value, cores);
                     default -> value -> new TcpTransport(value, timer, cores);
                 };
             }

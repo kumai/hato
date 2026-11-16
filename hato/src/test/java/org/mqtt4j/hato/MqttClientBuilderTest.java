@@ -56,7 +56,9 @@ class MqttClientBuilderTest {
             "wss://localhost",
             "wss://mqtt-broker:8443/mqtt",
             "wss://127.0.0.1/mqtt?tenant=a",
-            "wss://[::1]:8443/mqtt"
+            "wss://[::1]:8443/mqtt",
+            "inproc://fleet",
+            "inproc://site-a.fleet"
     })
     void supported_hosts_and_ip_literals_are_accepted(String uri) {
         // Arrange
@@ -218,7 +220,15 @@ class MqttClientBuilderTest {
             "WSS://localhost/mqtt",
             "wss://localhost:65536/mqtt",
             "wss://localhost/mqtt#fragment",
-            "wss:/mqtt"
+            "wss:/mqtt",
+            "inproc://Fleet",
+            "inproc://fleet:1883",
+            "inproc://fleet/mqtt",
+            "inproc://fleet?x=1",
+            "inproc://fleet#fragment",
+            "inproc://-fleet",
+            "inproc:/fleet",
+            "INPROC://fleet"
     })
     void unsupported_or_ambiguous_uris_are_rejected(String uri) {
         // Arrange
@@ -691,8 +701,20 @@ class MqttClientBuilderTest {
         assertThatCode(() -> sut.build().close()).doesNotThrowAnyException();
     }
 
+    @Test
+    void an_inproc_server_rejects_a_transport_factory_at_build() {
+        // Arrange
+        MqttClientBuilder sut = configuredBuilder("inproc://fleet")
+                .transportFactory(Transport::tcp);
+
+        // Act & Assert
+        assertThatThrownBy(sut::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("transport factory");
+    }
+
     @ParameterizedTest(name = "{0}")
-    @ValueSource(strings = {"mqtt://localhost", "ws://localhost/mqtt"})
+    @ValueSource(strings = {"mqtt://localhost", "ws://localhost/mqtt", "inproc://fleet"})
     void plaintext_connections_reject_an_explicit_tls_context_at_build(String uri)
             throws Exception {
         SSLContext context = SSLContext.getDefault();
@@ -707,7 +729,7 @@ class MqttClientBuilderTest {
     }
 
     @ParameterizedTest(name = "{0}")
-    @ValueSource(strings = {"mqtt://localhost", "ws://localhost/mqtt"})
+    @ValueSource(strings = {"mqtt://localhost", "ws://localhost/mqtt", "inproc://fleet"})
     void plaintext_connections_reject_a_tls_customizer_without_invoking_it(String uri) {
         var calls = new AtomicInteger();
         MqttClientBuilder sut = configuredBuilder(uri).sslParameters(_ -> calls.incrementAndGet());
