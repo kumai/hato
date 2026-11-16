@@ -60,9 +60,9 @@ public final class MqttBrokerBuilder {
 
     /// Names the broker; see [MqttBroker#name()]. A name is a host name in lower case: labels of
     /// 1 to 63 letters, digits, and hyphens, separated by periods, at most 253 characters in all,
-    /// with no label that starts or ends with a hyphen, such as `fleet` or `site-a.fleet`.
-    /// Without a name, the broker takes `hato-` followed by a number that no running broker's name
-    /// has.
+    /// with no label that starts or ends with a hyphen, and, if it has several labels, a last one
+    /// that starts with a letter, such as `fleet` or `site-a.fleet`. Without a name, the broker
+    /// takes `hato-` followed by a number that no running broker's name has.
     ///
     /// @param value
     ///   the name of the broker

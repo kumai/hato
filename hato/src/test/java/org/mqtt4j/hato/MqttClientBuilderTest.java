@@ -227,6 +227,7 @@ class MqttClientBuilderTest {
             "inproc://fleet?x=1",
             "inproc://fleet#fragment",
             "inproc://-fleet",
+            "inproc://fleet.1",
             "inproc:/fleet",
             "INPROC://fleet"
     })

@@ -89,7 +89,7 @@ class MqttBrokerBuilderTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"", "Fleet", "fleet_a", "-fleet", "site..fleet"})
+    @ValueSource(strings = {"", "Fleet", "fleet_a", "-fleet", "site..fleet", "fleet.1"})
     void rejects_a_name_that_is_no_host_name_in_lower_case_at_once(String name) {
         // Arrange
         MqttBrokerBuilder sut = MqttBroker.builder();

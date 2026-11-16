@@ -16,13 +16,17 @@ class InprocBrokersTest {
         "fleet",
         "site-a.fleet",
         "0",
+        "1a",
+        "9fleet.x",
         "a-0.b-1.c-2",
         // A label of 63 characters.
         "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijk"
     })
-    void accepts_a_host_name_in_lower_case(String name) {
-        // Act & Assert
+    void accepts_a_host_name_in_lower_case_that_a_uri_takes_as_its_host(String name)
+            throws Exception {
+        // Act & Assert: a client can take the broker's URI.
         assertThatCode(() -> InprocBrokers.check(name)).doesNotThrowAnyException();
+        assertThat(InprocBrokers.uri(name).parseServerAuthority().getHost()).isEqualTo(name);
     }
 
     @ParameterizedTest
@@ -41,6 +45,13 @@ class InprocBrokersTest {
         "flëet",
         "[::1]",
         "fleet:1883",
+        // A last label that starts with a digit: a URI takes no such host name, or takes it
+        // for an IP address.
+        "fleet.1",
+        "a.1b",
+        "1.2",
+        "a.1-b",
+        "1.2.3.4",
         // A label of 64 characters.
         "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl"
     })

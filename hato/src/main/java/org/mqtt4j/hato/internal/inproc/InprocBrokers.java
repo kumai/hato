@@ -80,7 +80,8 @@ public final class InprocBrokers {
             throw new IllegalArgumentException(
                     "A broker name is lower-case labels of letters, digits, and hyphens, each of"
                             + " 1 to 63 characters, separated by periods, at most 253 characters"
-                            + " in all, with no label that starts or ends with a hyphen: " + name
+                            + " in all, with no label that starts or ends with a hyphen, and with"
+                            + " several labels, a last one that starts with a letter: " + name
             );
         }
     }
@@ -106,7 +107,11 @@ public final class InprocBrokers {
                 return false;
             }
         }
-        return true;
+        // A URI takes a host name of several labels only if its last label starts with a letter,
+        // so that it cannot be taken for an IP address; without that, no client could take the
+        // broker's URI.
+        int lastLabel = name.lastIndexOf('.') + 1;
+        return lastLabel == 0 || (name.charAt(lastLabel) >= 'a' && name.charAt(lastLabel) <= 'z');
     }
 
     /// What a running broker offers the clients that find it by name.
