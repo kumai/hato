@@ -26,7 +26,10 @@ import static java.util.Objects.requireNonNull;
 ///
 /// A read takes the packets that wait, up to [#READ_LIMIT]. A read that takes fewer has emptied
 /// the queue, so the client runs its events on the reading thread, as after a TCP read that does
-/// not fill its buffer; one that takes the limit leaves them to the client's actor.
+/// not fill its buffer; one that takes the limit leaves them to the client's actor. The reading
+/// thread follows the rules of a TCP transport's: a client whose core runs on platform threads
+/// reads on one of its own, and one on virtual threads takes a platform reader while the JVM has
+/// one to spare, and moves between the two kinds as [PlatformReaders] says.
 public final class InprocTransport implements Transport, PausableTransport {
 
     // The most packets that one read takes.
@@ -35,6 +38,8 @@ public final class InprocTransport implements Transport, PausableTransport {
     private final String threadName;
 
     private final CoreThreads cores;
+
+    private final PlatformReaders platformReaders;
 
     // Guards the state below and serializes the listener's calls. Only the client's threads take
     // it; the link to the broker takes no lock.
@@ -60,8 +65,13 @@ public final class InprocTransport implements Transport, PausableTransport {
 
     /// A transport for the client `clientId`, whose reading thread is of the kind of `cores`.
     public InprocTransport(String clientId, CoreThreads cores) {
+        this(clientId, cores, PlatformReaders.shared);
+    }
+
+    InprocTransport(String clientId, CoreThreads cores, PlatformReaders platformReaders) {
         threadName = "hato-" + requireNonNull(clientId, "clientId");
         this.cores = requireNonNull(cores, "cores");
+        this.platformReaders = requireNonNull(platformReaders, "platformReaders");
     }
 
     @Override
@@ -130,8 +140,20 @@ public final class InprocTransport implements Transport, PausableTransport {
                 }
                 connected = true;
                 receiver.onConnected();
+                if (closed) {
+                    return;
+                }
+                // A thread of a core on platform threads reads on itself.
+                if (!cores.platform() && readOnPlatformThread(joined, receiver)) {
+                    // That thread ends this worker when it stops reading.
+                    attached = false;
+                    return;
+                }
             }
-            read(joined, receiver);
+            if (read(joined, receiver)) {
+                // The reading moved to a thread that ends this worker when it stops.
+                attached = false;
+            }
         } catch (Throwable failure) {
             terminate(failure);
         } finally {
@@ -141,11 +163,109 @@ public final class InprocTransport implements Transport, PausableTransport {
         }
     }
 
-    // Reads until the broker ends its side or the transport closes.
-    private void read(InprocLink joined, PacketListener receiver) throws InterruptedException {
+    /// Caller holds callbacks, once connected and still open. Hands the reading to a platform
+    /// thread of its own while the JVM has one to spare, and returns whether it did; otherwise
+    /// the caller reads on.
+    private boolean readOnPlatformThread(InprocLink joined, PacketListener receiver) {
+        if (!platformReaders.take()) {
+            return false;
+        }
+        Thread platform = Thread.ofPlatform()
+                .daemon()
+                .name(threadName + "-reader")
+                .unstarted(() -> readAfterMove(joined, receiver, true));
+        try {
+            platform.start();
+        } catch (OutOfMemoryError _) {
+            // The system refused another thread; the caller reads instead.
+            platformReaders.giveBack();
+            return false;
+        }
+        return true;
+    }
+
+    /// Caller holds callbacks, on a platform reader of a connection that is still open. Hands
+    /// the reading to a virtual thread and gives the platform thread back, and returns whether it
+    /// did; otherwise the caller reads on.
+    private boolean readOnVirtualThread(InprocLink joined, PacketListener receiver) {
+        Thread virtual = Thread.ofVirtual()
+                .name(threadName + "-reader")
+                .unstarted(() -> readAfterMove(joined, receiver, false));
+        try {
+            virtual.start();
+        } catch (OutOfMemoryError _) {
+            // The system refused another thread; the caller reads instead.
+            return false;
+        }
+        platformReaders.giveBack();
+        return true;
+    }
+
+    /// Runs on a thread that the reading moved to: reads until the reading ends or moves on
+    /// again, and ends the worker unless it moved.
+    private void readAfterMove(InprocLink joined, PacketListener receiver, boolean platform) {
+        boolean moved = false;
+        try {
+            moved = read(joined, receiver);
+        } catch (Throwable failure) {
+            terminate(failure);
+        } finally {
+            if (!moved) {
+                if (platform) {
+                    // Before onClosed, so that a connection that replaces this one can take the
+                    // slot.
+                    platformReaders.giveBack();
+                }
+                workerEnded();
+            }
+        }
+    }
+
+    /// Called by the reading thread between reads, with no lock held: moves the reading to a
+    /// platform thread of its own when `toPlatform`, and otherwise to a virtual thread, unless
+    /// the transport has closed; returns whether it did.
+    private boolean moveReading(InprocLink joined, PacketListener receiver, boolean toPlatform) {
+        synchronized (callbacks) {
+            if (closed) {
+                return false;
+            }
+            return toPlatform
+                    ? readOnPlatformThread(joined, receiver)
+                    : readOnVirtualThread(joined, receiver);
+        }
+    }
+
+    // Reads until the broker ends its side or the transport closes, and returns false; or moves
+    // the reading, between reads, to a thread of the other kind and returns true.
+    private boolean read(InprocLink joined, PacketListener receiver) throws InterruptedException {
         var packets = new ArrayList<InprocLink.Item>(READ_LIMIT);
         // A platform reader holds no carrier that others wait for.
         boolean sharesCarrier = Thread.currentThread().isVirtual();
+        // Tells this thread when the reading should move to a thread of the other kind; null
+        // where the platform readers stay with the connections that took them, and for a core on
+        // platform threads, whose reading stays on its thread and holds no platform reader.
+        PlatformReaders.Watch watch = cores.platform()
+                ? null
+                : platformReaders.watch(!sharesCarrier, receiver, System.nanoTime());
+        try {
+            return read(joined, receiver, packets, sharesCarrier, watch);
+        } finally {
+            if (watch != null) {
+                watch.stop();
+            }
+        }
+    }
+
+    private boolean read(
+            InprocLink joined,
+            PacketListener receiver,
+            List<InprocLink.Item> packets,
+            boolean sharesCarrier,
+            PlatformReaders.@Nullable Watch watch
+    ) throws InterruptedException {
+        // Only a platform reader whose thread may move bounds its waits, to look up from a
+        // connection that receives nothing.
+        long timeout = watch == null ? 0 : watch.readTimeout().toNanos();
         // The time spent on what arrived since the reader last let others run. A wait for the
         // broker frees the carrier, so only the work on the packets counts.
         long worked = 0;
@@ -160,16 +280,25 @@ public final class InprocTransport implements Transport, PausableTransport {
             if (packets.isEmpty()) {
                 if (ended) {
                     terminate(new EOFException("Broker closed the connection"));
-                    return;
+                    return false;
                 }
-                joined.awaitPackets();
+                joined.awaitPackets(timeout);
                 worked = 0;
+                if (timeout > 0) {
+                    long now = System.nanoTime();
+                    if (watch != null && watch.afterTimeout(now)) {
+                        if (moveReading(joined, receiver, false)) {
+                            return true;
+                        }
+                        watch.stay(now);
+                    }
+                }
                 continue;
             }
             long started = System.nanoTime();
             synchronized (callbacks) {
                 if (closed) {
-                    return;
+                    return false;
                 }
                 receiver.onPackets(packets, packets.size() == READ_LIMIT);
             }
@@ -186,6 +315,16 @@ public final class InprocTransport implements Transport, PausableTransport {
                     }
                 }
                 worked = 0;
+                if (watch != null) {
+                    watch.restart(System.nanoTime());
+                }
+            }
+            // The client is done with what this read returned, so another thread can read next.
+            if (watch != null && watch.afterRead(started)) {
+                if (moveReading(joined, receiver, sharesCarrier)) {
+                    return true;
+                }
+                watch.stay(started);
             }
             // A broker that keeps sending keeps the reader from waiting, and a virtual reader from
             // freeing its carrier for the client's other threads, so the reader parks once its
@@ -195,6 +334,7 @@ public final class InprocTransport implements Transport, PausableTransport {
                 worked = 0;
             }
         }
+        return false;
     }
 
     /// Hands `packets` to the broker on the calling thread, which may wait for room, and reports

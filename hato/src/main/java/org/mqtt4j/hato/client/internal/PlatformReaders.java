@@ -9,7 +9,7 @@ import org.jspecify.annotations.Nullable;
 import org.mqtt4j.hato.Transport;
 
 /// The platform threads that the JVM spares for reading connections, which every TCP transport
-/// shares, and the rules by which they move between connections.
+/// and in-process transport shares, and the rules by which they move between connections.
 ///
 /// A virtual thread that waits for its socket is woken by the JDK's poller, a hand-off that each
 /// read pays when it arrives after a pause. On Linux, where the poller runs on virtual threads
@@ -18,7 +18,9 @@ import org.mqtt4j.hato.Transport;
 /// connection does not scale, though: with a thousand of them, a message to every connection
 /// took 14 to 50 times as long to reach them all. So as many connections as the JVM has
 /// processors read on platform threads of their own, and the others on virtual threads; a shared
-/// event loop would serve every connection without either cost.
+/// event loop would serve every connection without either cost. A virtual thread that reads an
+/// in-process connection is woken instead by the broker's thread, which hands it to the scheduler
+/// as the poller does; such connections follow the same rules, which were measured over TCP only.
 ///
 /// A connection takes a free platform thread once connected, busy or not, so the connections
 /// that come up first take them all. The threads then move: a connection that reads busily on a
@@ -69,6 +71,10 @@ final class PlatformReaders {
 
     private static final Duration READ_TIMEOUT = Duration.ofSeconds(5);
 
+    /// The JVM's platform readers, which the TCP and in-process connections of every client
+    /// share. It follows the bounds that it reads, since statics initialize in order.
+    static final PlatformReaders shared = forThisJvm();
+
     private final Semaphore slots;
     private final @Nullable Moves moves;
     private final long windowNanos;
@@ -90,7 +96,7 @@ final class PlatformReaders {
 
     /// The JVM's platform readers: as many as it has processors, unless the internal property
     /// says otherwise.
-    static PlatformReaders forThisJvm() {
+    private static PlatformReaders forThisJvm() {
         int processors = Runtime.getRuntime().availableProcessors();
         int slots = Integer.getInteger("hato.client.platformReaders", processors);
         return new PlatformReaders(

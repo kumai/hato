@@ -23,7 +23,7 @@ class InprocLinkTest {
         var sut = new InprocLink();
         sut.endClient();
         // Act & Assert
-        assertTimeoutPreemptively(WAIT, sut::awaitPackets);
+        assertTimeoutPreemptively(WAIT, () -> sut.awaitPackets(0));
     }
 
     @Test

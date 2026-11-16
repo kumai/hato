@@ -115,15 +115,20 @@ public final class InprocLink {
         return item;
     }
 
-    /// Waits until a packet from the broker waits, either side has ended, or another thread
-    /// unparks the calling one, which reads for the client.
-    public void awaitPackets() {
+    /// Waits until a packet from the broker waits, either side has ended, `nanos` nanoseconds
+    /// have passed if `nanos` is positive, or another thread unparks the calling one, which reads
+    /// for the client.
+    public void awaitPackets(long nanos) {
         clientReader = Thread.currentThread();
         try {
             // An end of the client's side before the reader was known to it woke nobody, so the
             // reader looks for it after making itself known.
             if (toClient.isEmpty() && !brokerEnded && !clientEnded) {
-                LockSupport.park(this);
+                if (nanos > 0) {
+                    LockSupport.parkNanos(this, nanos);
+                } else {
+                    LockSupport.park(this);
+                }
             }
         } finally {
             clientReader = null;

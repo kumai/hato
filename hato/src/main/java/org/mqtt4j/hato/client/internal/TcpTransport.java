@@ -112,7 +112,7 @@ public final class TcpTransport implements Transport, PausableTransport, Blockin
     // Once connected, a connection reads on a platform thread of its own while the JVM has one
     // to spare, and otherwise on the virtual thread that connected it; between reads, the
     // reading can move between the two kinds. See PlatformReaders.
-    private static final PlatformReaders platformReading = PlatformReaders.forThisJvm();
+    private static final PlatformReaders platformReading = PlatformReaders.shared;
 
     private final String threadName;
     private final String scheme;
