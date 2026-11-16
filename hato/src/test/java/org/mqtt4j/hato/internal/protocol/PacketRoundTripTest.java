@@ -59,6 +59,33 @@ class PacketRoundTripTest {
         return IntStream.range(0, 200);
     }
 
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void the_size_of_every_packet_is_the_length_of_its_encoding(int seed) {
+        var random = new Random(seed);
+        for (Packet packet : randomPackets(random)) {
+            assertThat(codec.size(packet)).as("%s", packet).isEqualTo(codec.encode(packet).length);
+        }
+    }
+
+    @Test
+    void counts_no_packet_that_mqtt_3_1_1_cannot_carry() {
+        var properties = new Properties(List.of(new Property.UserProperty("name", "value")));
+        var publish = new Packet.Publish(
+                new Topic("a"),
+                new byte[1],
+                Qos.AT_LEAST_ONCE,
+                false,
+                false,
+                1,
+                properties
+        );
+        var refusal = new Packet.PubAck(1, ReasonCode.NO_MATCHING_SUBSCRIBERS, EMPTY);
+
+        assertThatThrownBy(() -> codec.size(publish)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> codec.size(refusal)).isInstanceOf(IllegalArgumentException.class);
+    }
+
     @ParameterizedTest
     @CsvSource({"124, 1", "125, 2", "16380, 2", "16381, 3", "2097148, 3", "2097149, 4"})
     void publish_crosses_every_remaining_length_encoding_boundary(int payloadSize, int lengthSize) {

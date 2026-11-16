@@ -95,6 +95,21 @@ public interface PacketCodec {
         return publishSize(topic, qos, propertiesSize, payloadSize);
     }
 
+    /// The bytes of `packet` as [#encode(Packet)] encodes it, checked as encoding checks it. A
+    /// PUBLISH is counted as [#publishSize(Topic, Qos, Properties, int)] counts it, and an
+    /// acknowledgement that succeeds without properties takes its four bytes; any other packet
+    /// is encoded to be counted.
+    ///
+    /// @throws IllegalArgumentException as [#encode(Packet)] does
+    default int size(Packet packet) {
+        requireNonNull(packet, "packet must not be null");
+        if (packet instanceof Packet.Publish p) {
+            return publishSize(p.topic(), p.qos(), p.properties(), p.payload().length);
+        }
+        // The fixed header, a Remaining Length of 2, and the packet identifier.
+        return plainAcknowledgement(packet) ? 4 : encode(packet).length;
+    }
+
     /// Prepares the headers of an MQTT 5.0 PUBLISH that omits its topic name, like
     /// [#encodePublishHeader] for an [Packet.AliasPublish]: `properties` must carry the Topic
     /// Alias that stands for the topic.
@@ -228,5 +243,21 @@ public interface PacketCodec {
         } catch (BufferUnderflowException e) {
             throw new PacketDecodeException(MALFORMED_PACKET, "Truncated CONNECT prelude", e);
         }
+    }
+
+    // Whether `packet` is an acknowledgement that carries its packet identifier alone, as every
+    // version encodes one that succeeds without properties.
+    private static boolean plainAcknowledgement(Packet packet) {
+        return switch (packet) {
+            case Packet.PubAck p -> plain(p.reasonCode(), p.properties());
+            case Packet.PubRec p -> plain(p.reasonCode(), p.properties());
+            case Packet.PubRel p -> plain(p.reasonCode(), p.properties());
+            case Packet.PubComp p -> plain(p.reasonCode(), p.properties());
+            default -> false;
+        };
+    }
+
+    private static boolean plain(ReasonCode reason, Properties properties) {
+        return reason == ReasonCode.SUCCESS && properties.isEmpty();
     }
 }

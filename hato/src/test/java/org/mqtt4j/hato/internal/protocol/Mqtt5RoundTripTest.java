@@ -33,6 +33,16 @@ class Mqtt5RoundTripTest {
         return IntStream.range(0, 200);
     }
 
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("seeds")
+    void the_size_of_every_packet_is_the_length_of_its_encoding(int seed) {
+        var random = new Random(seed);
+        for (Packet packet : packets(random)) {
+            assertThat(sut.size(packet)).as("seed %s: %s", seed, packet)
+                    .isEqualTo(sut.encode(packet).length);
+        }
+    }
+
     @Test
     void mutations_and_arbitrary_bytes_only_produce_declared_decode_failures() {
         var random = new Random(0x4D51545405L);
