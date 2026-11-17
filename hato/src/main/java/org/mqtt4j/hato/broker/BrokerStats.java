@@ -37,8 +37,7 @@ public final class BrokerStats {
     /// {@return the deliveries that wait in the sessions now for their clients to take them}
     /// They are the deliveries at any QoS, those for clients that are away included, and the
     /// retained messages that new subscriptions have yet to receive; the deliveries on their way
-    /// to a client, and those that await its acknowledgement, are not. Reading this value takes
-    /// time in proportion to the sessions.
+    /// to a client, and those that await its acknowledgement, are not.
     public long queuedDeliveries() {
         return counts.queuedDeliveries();
     }

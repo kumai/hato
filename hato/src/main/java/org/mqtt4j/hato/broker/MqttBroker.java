@@ -262,7 +262,9 @@ public final class MqttBroker implements AutoCloseable {
     }
 
     /// Reads what the broker counts; see [BrokerStats]. It reads the counts without stopping the
-    /// broker's work, and works after the broker has ended too.
+    /// broker's work, and works after the broker has ended too. A call takes time in proportion
+    /// to the sessions that the broker holds, so a monitor that reports several of the values
+    /// reads them from one call.
     ///
     /// @return
     ///   the counts
