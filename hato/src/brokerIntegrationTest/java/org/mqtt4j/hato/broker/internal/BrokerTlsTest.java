@@ -34,12 +34,14 @@ import javax.net.ssl.X509ExtendedTrustManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.ConnAck;
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Topic;
@@ -58,6 +60,10 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// The TLS listener: clients that exchange messages through it, beside the plain one or alone,
 /// what the authenticator learns of them, and handshakes that fail, take long, or come again.
 class BrokerTlsTest {
+
+    // A whole TLS application record whose authentication fails: its header, then 32 bytes that no
+    // key encrypted.
+    private static final byte[] BROKEN_RECORD = brokenRecord();
 
     @ParameterizedTest
     @EnumSource(MqttVersion.class)
@@ -426,6 +432,57 @@ class BrokerTlsTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"TLSv1.2", "TLSv1.3"})
+    void a_broken_record_ends_the_connection_after_the_packets_before_it(String protocol)
+            throws Exception {
+        // Arrange: a selector that a PINGREQ holds while the client sends DISCONNECT and then a
+        // record that fails its authentication, so that one read takes both.
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var disconnects = new AtomicInteger();
+        SSLContext context = Tls.serverContext();
+        try (BrokerServer broker = BrokerServer.builder()
+                .listenTls(loopback(), context, serverParameters(context, _ -> { }))
+                .beforeProcess(packet -> {
+                    if (packet instanceof Packet.PingReq) {
+                        held.countDown();
+                        awaitUninterruptibly(release);
+                    }
+                    if (packet instanceof Packet.Disconnect) {
+                        disconnects.incrementAndGet();
+                    }
+                })
+                .start(null);
+                var raw = new Socket(InetAddress.getLoopbackAddress(), broker.tlsPort())) {
+            var client = (SSLSocket) Tls.clientContext().getSocketFactory().createSocket(
+                    raw,
+                    "localhost",
+                    raw.getPort(),
+                    false
+            );
+            client.setEnabledProtocols(new String[] {protocol});
+            client.startHandshake();
+            try (RawSession session = RawSession.over(client, MqttVersion.V3_1_1)) {
+                session.send(RawSession.connect("disconnecting", true, 60));
+                session.expect(Packet.ConnAck.class);
+                session.send(new Packet.PingReq());
+                assertThat(held.await(5, SECONDS)).isTrue();
+                // Act
+                try {
+                    session.send(new Packet.Disconnect(ReasonCode.SUCCESS, Properties.EMPTY));
+                    raw.getOutputStream().write(BROKEN_RECORD);
+                } finally {
+                    release.countDown();
+                }
+                // Assert: the broker ends the connection once its session has the DISCONNECT,
+                // which keeps the Will from going out.
+                assertClosed(raw);
+                assertThat(disconnects).hasValue(1);
+            }
+        }
+    }
+
     @Test
     void a_long_stream_holds_the_selector_to_work_in_proportion_to_its_bytes() throws Exception {
         // Arrange: one selector, whose allocations show the work that each byte takes, and
@@ -719,6 +776,33 @@ class BrokerTlsTest {
 
     private static MqttMessage message(String topic, byte[] payload, Qos qos) {
         return MqttMessage.of(new Topic(topic), payload, qos, false);
+    }
+
+    private static byte[] brokenRecord() {
+        var record = new byte[5 + 32];
+        // Application data, the record version of TLS 1.2 and 1.3, and the length.
+        record[0] = 23;
+        record[1] = 3;
+        record[2] = 3;
+        record[4] = 32;
+        return record;
+    }
+
+    // Waits for `latch` on a thread of the broker, which a test holds this way, and keeps the
+    // interrupt that comes meanwhile.
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                boolean _ = latch.await(10, SECONDS);
+                break;
+            } catch (InterruptedException _) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static InetSocketAddress loopback() {

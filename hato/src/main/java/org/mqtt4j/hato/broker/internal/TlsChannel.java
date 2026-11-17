@@ -79,6 +79,11 @@ final class TlsChannel {
     // Records that the socket has not taken yet, which go out before any later ones, or null.
     private @Nullable ByteBuffer pendingOutput;
 
+    // A failure of the ciphertext that came after the bytes of packets that the same read
+    // decrypted, or null. It reaches the connection once the connection has taken those bytes, as
+    // a plain connection ends after the packets before a broken one, a DISCONNECT among them.
+    private @Nullable SSLException deferredFailure;
+
     // Whether the first handshake has finished.
     private boolean established;
 
@@ -127,7 +132,8 @@ final class TlsChannel {
 
     // Whether the connection has TLS work to go on with without new input from the socket.
     boolean wantsTurn() {
-        return !delegated && (resumed || (pendingOutput != null && !outputFailed));
+        return !delegated
+                && (resumed || deferredFailure != null || (pendingOutput != null && !outputFailed));
     }
 
     // Takes in what has arrived, and puts the bytes of packets that it decrypts into `input`,
@@ -137,6 +143,11 @@ final class TlsChannel {
     // returns until they end.
     int read(ByteBuffer input) throws IOException {
         resumed = false;
+        SSLException deferred = deferredFailure;
+        if (deferred != null) {
+            deferredFailure = null;
+            throw deferred;
+        }
         if (delegated) {
             return 0;
         }
@@ -163,6 +174,11 @@ final class TlsChannel {
             int produced = input.position() - start;
             return (produced == 0 && inputEnded && pendingInput == null) ? -1 : produced;
         } catch (SSLException failure) {
+            int produced = input.position() - start;
+            if (produced > 0) {
+                deferredFailure = failure;
+                return produced;
+            }
             failed(failure);
             throw failure;
         }
