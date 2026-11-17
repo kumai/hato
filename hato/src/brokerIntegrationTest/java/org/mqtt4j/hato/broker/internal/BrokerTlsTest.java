@@ -484,6 +484,76 @@ class BrokerTlsTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"TLSv1.2", "TLSv1.3"})
+    void a_broken_record_after_a_publication_ends_the_connection_and_sends_the_will(
+            String protocol
+    ) throws Exception {
+        // Arrange: a selector that a QoS 0 publication to "hold" holds while a client without a
+        // keep-alive sends another one and then a record that fails its authentication, so that
+        // one read takes both, and nothing that needs an answer gives the connection another
+        // turn; and a plain client that waits for the Will.
+        var hold = new Topic("hold");
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        SSLContext context = Tls.serverContext();
+        try (BrokerServer broker = BrokerServer.builder()
+                .listenTls(loopback(), context, serverParameters(context, _ -> { }))
+                .beforeProcess(packet -> {
+                    if (packet instanceof Packet.Publish publication
+                            && publication.topic().equals(hold)) {
+                        held.countDown();
+                        awaitUninterruptibly(release);
+                    }
+                })
+                .start(loopback());
+                RawSession watcher = RawSession.connected(broker.plainPort(), "watcher");
+                var raw = new Socket(InetAddress.getLoopbackAddress(), broker.tlsPort())) {
+            watcher.subscribe("wills/#", Qos.AT_MOST_ONCE);
+            var client = (SSLSocket) Tls.clientContext().getSocketFactory().createSocket(
+                    raw,
+                    "localhost",
+                    raw.getPort(),
+                    false
+            );
+            client.setEnabledProtocols(new String[] {protocol});
+            client.startHandshake();
+            try (RawSession session = RawSession.over(client, MqttVersion.V3_1_1)) {
+                session.send(new Packet.Connect(
+                        "publishing",
+                        MqttVersion.V3_1_1,
+                        true,
+                        0,
+                        new Packet.Will(
+                                new Topic("wills/publishing"),
+                                new byte[] {1},
+                                Qos.AT_MOST_ONCE,
+                                false,
+                                Properties.EMPTY
+                        ),
+                        null,
+                        null,
+                        Properties.EMPTY
+                ));
+                session.expect(Packet.ConnAck.class);
+                session.send(publication(hold));
+                assertThat(held.await(5, SECONDS)).isTrue();
+                // Act
+                try {
+                    session.send(publication(new Topic("readings")));
+                    raw.getOutputStream().write(BROKEN_RECORD);
+                } finally {
+                    release.countDown();
+                }
+                // Assert: the broker ends the connection without more input to wait for, and the
+                // failure sends the Will.
+                assertClosed(raw);
+                assertThat(watcher.expect(Packet.Publish.class).topic())
+                        .isEqualTo(new Topic("wills/publishing"));
+            }
+        }
+    }
+
     @Test
     void a_long_stream_holds_the_selector_to_work_in_proportion_to_its_bytes() throws Exception {
         // Arrange: one selector, whose allocations show the work that each byte takes, and
@@ -777,6 +847,19 @@ class BrokerTlsTest {
 
     private static MqttMessage message(String topic, byte[] payload, Qos qos) {
         return MqttMessage.of(new Topic(topic), payload, qos, false);
+    }
+
+    // A QoS 0 publication of one byte to `topic`.
+    private static Packet.Publish publication(Topic topic) {
+        return new Packet.Publish(
+                topic,
+                new byte[] {2},
+                Qos.AT_MOST_ONCE,
+                false,
+                false,
+                0,
+                Properties.EMPTY
+        );
     }
 
     private static byte[] brokenRecord() {

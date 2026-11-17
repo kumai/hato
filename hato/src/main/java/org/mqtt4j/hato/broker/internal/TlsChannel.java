@@ -186,7 +186,10 @@ final class TlsChannel {
         } catch (SSLException failure) {
             int produced = input.position() - start;
             if (produced > 0) {
+                // The connection takes those bytes, then comes back for the failure of its own:
+                // nothing may arrive after a broken record to bring it back.
                 deferredFailure = failure;
+                requireNonNull(connection, "registered").wake();
                 return produced;
             }
             failed(failure);
