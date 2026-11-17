@@ -36,6 +36,11 @@ import static java.util.Objects.requireNonNull;
 // for the bytes of a whole record. So the ciphertext that a connection keeps never grows past a
 // record, however fast the client sends.
 //
+// What the broker sends of its own as it reads, such as its answers to the client's key updates,
+// waits for no MQTT limit. So reading waits while those records wait to go out: a client that does
+// not read has the broker stop reading too, as TCP holds back a client that does not read its
+// responses.
+//
 // The broker takes part in no handshake on an accepted connection: a client that asks for a new
 // one, as TLS 1.2 renegotiation does, loses its connection. A key update of TLS 1.3 is no
 // handshake, and the engine answers it as it reads. All but the delegated tasks runs on the
@@ -78,6 +83,9 @@ final class TlsChannel {
 
     // Records that the socket has not taken yet, which go out before any later ones, or null.
     private @Nullable ByteBuffer pendingOutput;
+
+    // Whether records that the engine made as it read wait among those, which reading waits for.
+    private boolean ownWaiting;
 
     // A failure of the ciphertext that came after the bytes of packets that the same read
     // decrypted, or null. It reaches the connection once the connection has taken those bytes, as
@@ -153,7 +161,9 @@ final class TlsChannel {
         }
         int start = input.position();
         try {
-            boolean _ = flushBeforeReading();
+            if (!flushBeforeReading()) {
+                return 0;
+            }
             for (int round = 0; round < ROUNDS_PER_READ; round++) {
                 ByteBuffer net = ciphertext();
                 int count = 0;
@@ -167,7 +177,7 @@ final class TlsChannel {
                 unwrap(net, input);
                 keep(net);
                 boolean decrypted = input.position() > start;
-                if (decrypted || count <= 0 || delegated || resumed) {
+                if (decrypted || count <= 0 || delegated || resumed || ownWaiting) {
                     break;
                 }
             }
@@ -216,7 +226,8 @@ final class TlsChannel {
                 return;
             }
             if (status == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
-                if (!wrapOwn()) {
+                // Reading goes on once the socket has taken what the engine made.
+                if (!wrapOwn() || ownWaiting) {
                     return;
                 }
                 continue;
@@ -274,6 +285,9 @@ final class TlsChannel {
             send(out);
         } catch (IOException _) {
             // Nothing goes out any more; the next write meets the failure.
+        }
+        if (pendingOutput != null) {
+            ownWaiting = true;
         }
         return result.bytesProduced() > 0;
     }
@@ -402,19 +416,22 @@ final class TlsChannel {
             return false;
         }
         pendingOutput = null;
+        ownWaiting = false;
         return true;
     }
 
-    // Sends what waits to go out before a read, as far as the socket takes it. A failure leaves
-    // the read to go on: what has arrived is still read, and the next write meets the failure.
+    // Sends what waits to go out before a read, as far as the socket takes it. Returns whether
+    // reading may go on: unless records that the engine made as it read still wait. A failure
+    // leaves reading to go on: what has arrived is still read, and the next write meets the
+    // failure.
     private boolean flushBeforeReading() {
         if (outputFailed) {
-            return false;
+            return true;
         }
         try {
-            return flush();
+            return flush() || !ownWaiting;
         } catch (IOException _) {
-            return false;
+            return true;
         }
     }
 
@@ -424,19 +441,21 @@ final class TlsChannel {
         } catch (IOException failure) {
             outputFailed = true;
             pendingOutput = null;
+            ownWaiting = false;
             throw failure;
         }
     }
 
     // What the connection waits for on its socket: input when `read`, and room for the rest of a
     // write when `write`, besides what TLS waits for itself. While the delegated tasks run, the
-    // connection waits for nothing, and their end brings it back.
+    // connection waits for nothing, and their end brings it back. While records that the engine
+    // made as it read wait to go out, it waits for room for them rather than for input.
     int interest(boolean read, boolean write) {
         if (delegated) {
             return 0;
         }
-        int interests = read ? SelectionKey.OP_READ : 0;
-        // Records of the engine's own wait for room only while the connection reads, which
+        int interests = (read && !ownWaiting) ? SelectionKey.OP_READ : 0;
+        // Records that wait go out as the socket takes them while the connection reads, which
         // flushes them; otherwise its next write takes them along.
         if (write || (read && pendingOutput != null && !outputFailed)) {
             interests |= SelectionKey.OP_WRITE;
