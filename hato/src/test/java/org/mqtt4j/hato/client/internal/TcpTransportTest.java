@@ -569,6 +569,10 @@ class TcpTransportTest {
             };
             pausedSut.start(SERVER, TIMEOUT, pausedListener);
             pausedListener.connected.get(5, SECONDS);
+            // The connection takes the platform thread only after reporting that it connected,
+            // so the busy one starts once a read has timed out: only a platform reader's reads
+            // time out.
+            await().atMost(5, SECONDS).until(() -> paused.timeouts.get() > 0);
             var busyListener = new ReadingListener();
             busySut.start(SERVER, TIMEOUT, busyListener);
             busyListener.connected.get(5, SECONDS);
