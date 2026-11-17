@@ -198,7 +198,9 @@ public final class MqttBroker implements AutoCloseable {
     /// broker has ended, through [#close()] or because an internal failure stopped it: its port
     /// is free, its connections are closed, it has finished its work, and it calls no
     /// application code any more, the [BrokerListener] and the [Authenticator] included. It
-    /// completes normally either way; the listener hears of a failure.
+    /// completes normally either way; the listener hears of a failure. Before the future
+    /// completes, the broker gives the logging backend a moment to take what it has logged, as
+    /// [#close()] does.
     ///
     /// Each call returns an independent future. The continuations attached while it waits run,
     /// as it completes, on a thread of its own, so one that waits, even for a future of another

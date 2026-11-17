@@ -1,9 +1,12 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
+
+import org.mqtt4j.hato.internal.log.Log;
 
 // Tells when a broker has ended: its accepting thread, each of its selectors, its actor pool,
 // and the threads that call the application's listener, if there is one. Each of these reports
@@ -20,6 +23,10 @@ import java.util.function.Consumer;
 // An observation that can have no thread of its own completes on the end's thread instead: it
 // still holds up no part of the broker, but the observations after it wait for it.
 final class Termination {
+
+    // How long the end gives the logging backend to take what was logged until then, as long as
+    // MqttBroker.close() gives it.
+    private static final Duration LOG_WAIT = Duration.ofSeconds(1);
 
     private final AtomicInteger running;
 
@@ -64,6 +71,11 @@ final class Termination {
             // An interrupted thread no longer parks, and this one has nothing to stop for.
             boolean _ = Thread.interrupted();
         }
+        // An application may exit as soon as its broker has ended, also when a failure ended it
+        // and nothing closed it. What the broker logged until now, such as that failure, has
+        // reached the logging backend by then; if it has not within the limit, the end goes on
+        // without it. A close() that waits for the same at the same time adds nothing to it.
+        boolean _ = Log.awaitWritten(LOG_WAIT);
         ended.complete(null);
     }
 
