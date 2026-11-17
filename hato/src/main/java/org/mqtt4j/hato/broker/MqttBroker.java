@@ -149,9 +149,10 @@ import static java.util.Objects.requireNonNull;
 ///
 /// [MqttBrokerBuilder#listenTls(InetSocketAddress, javax.net.ssl.SSLContext)] has the broker
 /// listen with TLS, alone or besides a plain listener on another port, and [#tlsPort()] tells
-/// its port. The broker can ask the clients for certificates, which the TLS context checks. A
-/// client whose handshake fails, or that does not finish it and send its CONNECT in time, loses
-/// its connection, and so does one that asks for a new handshake once it has connected.
+/// its port. The broker can ask the clients for certificates, which the [Authenticator] then
+/// sees, along with whether a client came through TLS. A client whose handshake fails, or that
+/// does not finish it and send its CONNECT in time, loses its connection, and so does one that
+/// asks for a new handshake once it has connected.
 ///
 /// ## Clients in the same JVM
 ///

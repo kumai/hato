@@ -224,7 +224,13 @@ final class Client {
             long expiry,
             Consumer<Boolean> done
     ) {
-        var asked = new ConnectRequest(request, id, connection.remoteAddress());
+        var asked = new ConnectRequest(
+                request,
+                id,
+                connection.remoteAddress(),
+                connection.overTls(),
+                connection.clientCertificates()
+        );
         if (!connection.awaitDecision(id, settings.authenticationTimeout())) {
             done.accept(false);
             return;

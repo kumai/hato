@@ -4,12 +4,15 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.RejectedExecutionException;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLPeerUnverifiedException;
 
 import org.jspecify.annotations.Nullable;
 
@@ -449,5 +452,23 @@ final class TlsChannel {
         } catch (IOException | RuntimeException _) {
             // The connection closes anyway, and a client that misses the record sees it close.
         }
+    }
+
+    // The certificates that the client presented in its handshake and the context's trust manager
+    // accepted, its own first, or none.
+    List<X509Certificate> clientCertificates() {
+        Certificate[] chain;
+        try {
+            chain = engine.getSession().getPeerCertificates();
+        } catch (SSLPeerUnverifiedException _) {
+            return List.of();
+        }
+        var certificates = new ArrayList<X509Certificate>(chain.length);
+        for (Certificate certificate : chain) {
+            if (certificate instanceof X509Certificate x509) {
+                certificates.add(x509);
+            }
+        }
+        return List.copyOf(certificates);
     }
 }

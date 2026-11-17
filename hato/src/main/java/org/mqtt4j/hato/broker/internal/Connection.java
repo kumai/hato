@@ -2,6 +2,7 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
 import java.net.SocketAddress;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Arrays;
@@ -230,6 +231,17 @@ final class Connection {
     // Whether the client runs in the same JVM.
     boolean inProcess() {
         return wire.inProcess();
+    }
+
+    // Whether the client connected to the TLS listener.
+    boolean overTls() {
+        return wire.overTls();
+    }
+
+    // The certificates that the client presented in its TLS handshake, its own first, or none.
+    // Called on the selector once the client has sent its CONNECT.
+    List<X509Certificate> clientCertificates() {
+        return wire.clientCertificates();
     }
 
     // Refuses the packets after this point that are larger than `maximumPacketSize`: the

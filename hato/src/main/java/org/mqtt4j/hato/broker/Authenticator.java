@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.broker;
 
 import java.net.InetSocketAddress;
+import java.security.cert.X509Certificate;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -66,6 +67,31 @@ public interface Authenticator {
 
         /// {@return the protocol version of the CONNECT}
         MqttVersion version();
+
+        /// {@return whether the client connected to the broker's TLS listener} A client in the
+        /// same JVM connects through no network, and has no [#remoteAddress()].
+        default boolean overTls() {
+            return false;
+        }
+
+        /// The certificate chain that the client presented in its TLS handshake and the trust
+        /// manager of the broker's TLS context accepted, the client's own certificate first.
+        /// [MqttBrokerBuilder#sslParameters(java.util.function.Consumer)] has the broker ask for
+        /// one: with [javax.net.ssl.SSLParameters#setNeedClientAuth(boolean)], the handshake of a
+        /// client without one fails before it can connect, and with
+        /// [javax.net.ssl.SSLParameters#setWantClientAuth(boolean)], such a client connects with
+        /// none.
+        ///
+        /// A client that resumes a TLS session presents the certificates of that session, which
+        /// the trust manager does not check again. The broker asks for a decision on every
+        /// CONNECT, after a resumed session too, so an authenticator that refuses certificates
+        /// that are no longer valid keeps their clients out.
+        ///
+        /// @return the client's certificate chain, or an empty list for a client that connected
+        ///   without TLS or presented no certificate
+        default List<X509Certificate> clientCertificates() {
+            return List.of();
+        }
     }
 
     /// A decision on a client: to accept it, which lets it do what a [Scope] allows, or to

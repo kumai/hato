@@ -2,6 +2,7 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
 import java.net.SocketAddress;
+import java.security.cert.X509Certificate;
 import java.util.List;
 
 import org.jspecify.annotations.Nullable;
@@ -24,6 +25,13 @@ sealed interface Wire permits SocketWire, MemoryWire {
 
     // Whether the client runs in the same JVM.
     boolean inProcess();
+
+    // Whether the client connected to the TLS listener.
+    boolean overTls();
+
+    // The certificates that the client presented in its TLS handshake and the broker's TLS
+    // context accepted, its own first, or none. Called once the client has sent its CONNECT.
+    List<X509Certificate> clientCertificates();
 
     // The loop that serves the connection.
     Loop loop();

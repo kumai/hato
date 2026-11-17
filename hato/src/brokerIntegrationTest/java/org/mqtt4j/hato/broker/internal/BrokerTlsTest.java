@@ -13,9 +13,12 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.IntStream;
@@ -40,6 +43,7 @@ import org.mqtt4j.hato.ReconnectPolicy;
 import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.testsupport.Tls;
@@ -49,7 +53,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /// The TLS listener: clients that exchange messages through it, beside the plain one or alone,
-/// and handshakes that fail, take long, or come again.
+/// what the authenticator learns of them, and handshakes that fail, take long, or come again.
 class BrokerTlsTest {
 
     @ParameterizedTest
@@ -186,6 +190,93 @@ class BrokerTlsTest {
     void a_broker_without_a_tls_listener_has_no_tls_port() throws Exception {
         try (MqttBroker sut = MqttBroker.start()) {
             assertThatThrownBy(sut::tlsPort).isInstanceOf(IllegalStateException.class);
+        }
+    }
+
+    @Test
+    void the_authenticator_sees_the_certificate_that_a_client_presents() throws Exception {
+        // Arrange
+        var asked = new AtomicReference<Authenticator.Request>();
+        try (MqttBroker broker = MqttBroker.builder()
+                .listenTls(loopback(), Tls.serverContext())
+                .sslParameters(parameters -> parameters.setNeedClientAuth(true))
+                .authenticator(request -> {
+                    asked.set(request);
+                    return Authenticator.Decision.accept(Authenticator.Scope.all());
+                })
+                .start();
+                MqttClient sut = tlsClient(
+                        broker.tlsPort(),
+                        Tls.clientContextWithCertificate(),
+                        MqttVersion.V5
+                )) {
+            // Act
+            sut.connect().get(5, SECONDS);
+            // Assert
+            Authenticator.Request request = asked.get();
+            assertThat(request.overTls()).isTrue();
+            List<X509Certificate> chain = request.clientCertificates();
+            assertThat(chain).hasSize(2);
+            assertThat(chain.getFirst().getSubjectX500Principal().getName())
+                    .contains("CN=Hato Test client");
+            assertThat(chain.get(1).getSubjectX500Principal().getName())
+                    .contains("CN=Hato Test CA");
+        }
+    }
+
+    @Test
+    void the_authenticator_tells_a_tls_client_without_a_certificate_from_a_plain_one()
+            throws Exception {
+        // Arrange: a TLS listener that asks for a certificate without requiring one.
+        var asked = new LinkedBlockingQueue<Authenticator.Request>();
+        try (MqttBroker broker = MqttBroker.builder()
+                .listen(loopback())
+                .listenTls(loopback(), Tls.serverContext())
+                .sslParameters(parameters -> parameters.setWantClientAuth(true))
+                .authenticator(request -> {
+                    asked.add(request);
+                    return Authenticator.Decision.accept(Authenticator.Scope.all());
+                })
+                .start();
+                MqttClient secure = tlsClient(
+                        broker.tlsPort(),
+                        Tls.clientContext(),
+                        MqttVersion.V5
+                );
+                MqttClient plain = plainClient(broker.port())) {
+            // Act
+            secure.connect().get(5, SECONDS);
+            Authenticator.Request overTls = asked.poll(5, SECONDS);
+            plain.connect().get(5, SECONDS);
+            Authenticator.Request overPlain = asked.poll(5, SECONDS);
+            // Assert
+            assertThat(overTls).isNotNull();
+            assertThat(overTls.overTls()).isTrue();
+            assertThat(overTls.clientCertificates()).isEmpty();
+            assertThat(overPlain).isNotNull();
+            assertThat(overPlain.overTls()).isFalse();
+            assertThat(overPlain.clientCertificates()).isEmpty();
+        }
+    }
+
+    @Test
+    void a_required_certificate_keeps_a_client_without_one_away_from_the_authenticator()
+            throws Exception {
+        // Arrange
+        var asked = new AtomicInteger();
+        try (MqttBroker broker = MqttBroker.builder()
+                .listenTls(loopback(), Tls.serverContext())
+                .sslParameters(parameters -> parameters.setNeedClientAuth(true))
+                .authenticator(_ -> {
+                    asked.incrementAndGet();
+                    return Authenticator.Decision.accept(Authenticator.Scope.all());
+                })
+                .start();
+                MqttClient sut = tlsClient(broker.tlsPort(), Tls.clientContext(), MqttVersion.V5)) {
+            // Act & Assert
+            assertThatThrownBy(() -> sut.connect().get(5, SECONDS))
+                    .isInstanceOf(ExecutionException.class);
+            assertThat(asked).hasValue(0);
         }
     }
 

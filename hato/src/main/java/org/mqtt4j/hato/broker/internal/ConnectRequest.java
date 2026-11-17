@@ -2,6 +2,8 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.security.cert.X509Certificate;
+import java.util.List;
 import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
@@ -24,14 +26,29 @@ final class ConnectRequest implements Authenticator.Request {
 
     private final MqttVersion version;
 
+    private final boolean overTls;
+
+    private final List<X509Certificate> clientCertificates;
+
     // `clientId` is the identifier that the client has once accepted, which the broker may have
     // assigned, and `remoteAddress` where the connection comes from, if it comes over a network.
-    ConnectRequest(Packet.Connect request, String clientId, @Nullable SocketAddress remoteAddress) {
+    // `overTls` tells whether it comes to the TLS listener, and `clientCertificates` are those that
+    // its handshake presented, which the selector has taken from the engine already, so that the
+    // decision does not touch the engine.
+    ConnectRequest(
+            Packet.Connect request,
+            String clientId,
+            @Nullable SocketAddress remoteAddress,
+            boolean overTls,
+            List<X509Certificate> clientCertificates
+    ) {
         this.clientId = clientId;
         username = request.username();
         password = request.password();
         this.remoteAddress = (remoteAddress instanceof InetSocketAddress address) ? address : null;
         version = request.version();
+        this.overTls = overTls;
+        this.clientCertificates = clientCertificates;
     }
 
     @Override
@@ -62,7 +79,18 @@ final class ConnectRequest implements Authenticator.Request {
     }
 
     @Override
+    public boolean overTls() {
+        return overTls;
+    }
+
+    @Override
+    public List<X509Certificate> clientCertificates() {
+        return clientCertificates;
+    }
+
+    @Override
     public String toString() {
-        return "ConnectRequest[clientId=" + clientId + ", version=" + version + "]";
+        return "ConnectRequest[clientId=" + clientId + ", version=" + version
+                + ", overTls=" + overTls + "]";
     }
 }

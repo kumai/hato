@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.net.SocketAddress;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -53,6 +54,16 @@ final class MemoryWire implements Wire {
     @Override
     public boolean inProcess() {
         return true;
+    }
+
+    @Override
+    public boolean overTls() {
+        return false;
+    }
+
+    @Override
+    public List<X509Certificate> clientCertificates() {
+        return List.of();
     }
 
     @Override

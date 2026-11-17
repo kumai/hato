@@ -6,6 +6,7 @@ import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
+import java.security.cert.X509Certificate;
 import java.util.List;
 
 import org.jspecify.annotations.Nullable;
@@ -104,6 +105,16 @@ final class SocketWire implements Wire {
     @Override
     public boolean inProcess() {
         return false;
+    }
+
+    @Override
+    public boolean overTls() {
+        return tls != null;
+    }
+
+    @Override
+    public List<X509Certificate> clientCertificates() {
+        return (tls == null) ? List.of() : tls.clientCertificates();
     }
 
     @Override
