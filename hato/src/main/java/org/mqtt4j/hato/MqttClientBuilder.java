@@ -143,7 +143,8 @@ public final class MqttClientBuilder {
     ///
     /// An `inproc` URI is `inproc://` and the name of a broker that runs in the same JVM, as
     /// [org.mqtt4j.hato.broker.MqttBroker#uri()] gives it, with no port, path, or query. The
-    /// client passes its packets to that broker in memory, through neither a socket nor their
+    /// client reaches only a broker whose Hato classes come from the same class loader as its
+    /// own. It passes its packets to that broker in memory, through neither a socket nor their
     /// encoding, and otherwise works as over TCP. A connection attempt while no broker of that
     /// name runs fails as one to an unreachable host does, and the reconnection policy applies.
     /// Such a client takes no TLS settings or transport factory.
