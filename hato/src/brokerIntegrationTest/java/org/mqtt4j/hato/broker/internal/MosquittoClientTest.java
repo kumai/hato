@@ -1,12 +1,17 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -15,10 +20,13 @@ import org.testcontainers.DockerClientFactory;
 import org.testcontainers.Testcontainers;
 import org.testcontainers.containers.Container;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.images.builder.Transferable;
 
+import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.testsupport.Docker;
 import org.mqtt4j.hato.testsupport.Mosquitto;
+import org.mqtt4j.hato.testsupport.Tls;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -28,6 +36,14 @@ import static org.awaitility.Awaitility.await;
 /// Neither endpoint uses the Hato codec: both programs come from the Mosquitto image.
 @EnabledIf(value = "dockerIsAvailableOrRequired", disabledReason = "Docker explicitly optional")
 class MosquittoClientTest {
+
+    // Where the TLS tests put the test CA's certificate and the test client's identity in the
+    // clients' container, in the PEM form that Mosquitto's programs read.
+    private static final String CA_FILE = "/tls/ca.crt";
+
+    private static final String CERTIFICATE_FILE = "/tls/client.crt";
+
+    private static final String KEY_FILE = "/tls/client.key";
 
     static boolean dockerIsAvailableOrRequired() {
         return Docker.availableOrRequired();
@@ -267,6 +283,180 @@ class MosquittoClientTest {
                         .isEqualTo("1 1 connection broken");
             }
         }
+    }
+
+    @Test
+    void independent_mosquitto_clients_exchange_over_tls_that_authenticates_the_broker()
+            throws Exception {
+        // Arrange: the broker's TLS listener alone, and the test CA in the clients' container.
+        try (
+                var sut = MqttBroker.builder().listenTls(loopback(), Tls.serverContext()).start();
+                GenericContainer<?> clientTools = Mosquitto.container()
+                        .withCopyToContainer(Transferable.of(Tls.certificatePem("ca")), CA_FILE)
+        ) {
+            Testcontainers.exposeHostPorts(sut.tlsPort());
+            Docker.start(clientTools);
+            String port = Integer.toString(sut.tlsPort());
+            String topic = "interop/tls";
+            try (
+                    var subscriber = Program.start(
+                            clientTools,
+                            tlsCommand(
+                                    "mosquitto_sub",
+                                    port,
+                                    "mqttv5",
+                                    "-q",
+                                    "1",
+                                    "-t",
+                                    topic,
+                                    "-C",
+                                    "1",
+                                    "-W",
+                                    "10",
+                                    "-d",
+                                    "-F",
+                                    "%q %p"
+                            )
+                    )
+            ) {
+                subscriber.awaitOutput("Subscribed (mid: 1): 1");
+
+                // Act
+                Container.ExecResult published = clientTools.execInContainer(tlsCommand(
+                        "mosquitto_pub",
+                        port,
+                        "mqttv5",
+                        "-q",
+                        "1",
+                        "-t",
+                        topic,
+                        "-m",
+                        "over tls"
+                ));
+
+                // Assert
+                assertThat(published.getExitCode()).as(published.getStderr()).isZero();
+                assertThat(subscriber.awaitSuccess()).contains("1 over tls");
+            }
+        }
+    }
+
+    @Test
+    void the_authenticator_sees_the_certificates_of_independent_mosquitto_clients()
+            throws Exception {
+        // Arrange: a TLS listener that requires a client certificate, an authenticator that
+        // notes whose certificate each client presents, and the test client's identity in the
+        // clients' container.
+        var subjects = new LinkedBlockingQueue<String>();
+        try (
+                var sut = MqttBroker.builder()
+                        .listenTls(loopback(), Tls.serverContext())
+                        .sslParameters(parameters -> parameters.setNeedClientAuth(true))
+                        .authenticator(request -> {
+                            List<X509Certificate> chain = request.clientCertificates();
+                            String subject = chain.isEmpty()
+                                    ? "no certificate"
+                                    : chain.getFirst().getSubjectX500Principal().getName();
+                            subjects.add(subject);
+                            return Authenticator.Decision.accept(Authenticator.Scope.all());
+                        })
+                        .start();
+                GenericContainer<?> clientTools = Mosquitto.container()
+                        .withCopyToContainer(Transferable.of(Tls.certificatePem("ca")), CA_FILE)
+                        .withCopyToContainer(
+                                Transferable.of(Tls.certificatePem("client")),
+                                CERTIFICATE_FILE
+                        )
+                        .withCopyToContainer(
+                                Transferable.of(Tls.privateKeyPem("client")),
+                                KEY_FILE
+                        )
+        ) {
+            Testcontainers.exposeHostPorts(sut.tlsPort());
+            Docker.start(clientTools);
+            String port = Integer.toString(sut.tlsPort());
+            String topic = "interop/mutual-tls";
+            try (
+                    var subscriber = Program.start(
+                            clientTools,
+                            tlsCommand(
+                                    "mosquitto_sub",
+                                    port,
+                                    "mqttv311",
+                                    "--cert",
+                                    CERTIFICATE_FILE,
+                                    "--key",
+                                    KEY_FILE,
+                                    "-q",
+                                    "1",
+                                    "-t",
+                                    topic,
+                                    "-C",
+                                    "1",
+                                    "-W",
+                                    "10",
+                                    "-d",
+                                    "-F",
+                                    "%q %p"
+                            )
+                    )
+            ) {
+                subscriber.awaitOutput("Subscribed (mid: 1): 1");
+
+                // Act
+                Container.ExecResult published = clientTools.execInContainer(tlsCommand(
+                        "mosquitto_pub",
+                        port,
+                        "mqttv311",
+                        "--cert",
+                        CERTIFICATE_FILE,
+                        "--key",
+                        KEY_FILE,
+                        "-q",
+                        "1",
+                        "-t",
+                        topic,
+                        "-m",
+                        "mutual tls"
+                ));
+
+                // Assert: the exchange, and the test client's name in both decisions.
+                assertThat(published.getExitCode()).as(published.getStderr()).isZero();
+                assertThat(subscriber.awaitSuccess()).contains("1 mutual tls");
+                assertThat(List.of(subjects.poll(5, SECONDS), subjects.poll(5, SECONDS)))
+                        .allSatisfy(subject -> assertThat(subject).contains("CN=Hato Test client"));
+            }
+        }
+    }
+
+    /// A command line of the image's `program` that connects with TLS to the broker on `port`
+    /// with `version`, trusting the test CA, with `options` added. The broker's certificate
+    /// names `localhost`, by which the container does not reach the broker, so the program
+    /// checks the certificate's chain but not the name in it.
+    private static String[] tlsCommand(
+            String program,
+            String port,
+            String version,
+            String... options
+    ) {
+        var command = new ArrayList<>(List.of(
+                program,
+                "-h",
+                "host.testcontainers.internal",
+                "-p",
+                port,
+                "--cafile",
+                CA_FILE,
+                "--insecure",
+                "-V",
+                version
+        ));
+        command.addAll(List.of(options));
+        return command.toArray(String[]::new);
+    }
+
+    private static InetSocketAddress loopback() {
+        return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
     }
 
     /// Publishes `message` with the image's `mosquitto_pub`, with `options` added to its command

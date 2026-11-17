@@ -93,15 +93,18 @@ public final class Tls {
         return context;
     }
 
-    /// The PEM form of an identity's certificate, for a broker that cannot read PKCS12.
-    static String certificatePem(String identity) throws IOException, GeneralSecurityException {
+    /// The PEM form of an identity's certificate, for a program that cannot read PKCS12. The
+    /// identities are `ca`, `server`, and `client`.
+    public static String certificatePem(String identity)
+            throws IOException, GeneralSecurityException {
         Certificate certificate = requireNonNull(keyStore(identity).getCertificate(identity));
         return pem("CERTIFICATE", certificate.getEncoded());
     }
 
-    /// The unencrypted PKCS #8 PEM form of an identity's private key. It is exported only at run
-    /// time, so the repository keeps no PEM keys.
-    static String privateKeyPem(String identity) throws IOException, GeneralSecurityException {
+    /// The unencrypted PKCS #8 PEM form of an identity's private key: `server` or `client`. It is
+    /// exported only at run time, so the repository keeps no PEM keys.
+    public static String privateKeyPem(String identity)
+            throws IOException, GeneralSecurityException {
         Key key = requireNonNull(keyStore(identity).getKey(identity, PASSWORD.toCharArray()));
         return pem("PRIVATE KEY", key.getEncoded());
     }
