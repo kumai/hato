@@ -10,7 +10,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -109,8 +108,9 @@ final class Routing {
     final @Nullable FailureNotice failureNotice;
 
     // Runs the application's authenticator, if there is one, on threads of its own: at most as
-    // many decisions at once as the settings allow, and none on a thread of the broker's I/O or
-    // actors, since a decision may wait. A thread that has had no decision for a while ends.
+    // many decisions at once as the settings allow, while further CONNECTs wait in its queue,
+    // and none on a thread of the broker's I/O or actors, since a decision may wait. A thread
+    // that has had no decision for a while ends.
     final @Nullable ThreadPoolExecutor authentications;
 
     // Where the selectors, the actor pool, and the listener's threads report their ends.
@@ -176,27 +176,14 @@ final class Routing {
                 termination
         );
         failureNotice = (listener == null) ? null : new FailureNotice(listener, port, termination);
-        var nextAuthentication = new AtomicInteger();
-        authentications = (settings.authenticator() == null) ? null : new ThreadPoolExecutor(
-                0,
-                settings.maxAuthentications(),
-                AUTHENTICATION_IDLE_SECONDS,
-                TimeUnit.SECONDS,
-                new SynchronousQueue<>(),
-                task -> {
-                    int number = nextAuthentication.getAndIncrement();
-                    return Thread.ofPlatform().daemon()
-                            .name("hato-broker-" + port + "-auth-" + number)
-                            .unstarted(task);
-                }
-        ) {
-
-            // The pool ends once the broker has shut it down and its decisions have returned.
-            @Override
-            protected void terminated() {
-                termination.partEnded();
-            }
-        };
+        authentications = (settings.authenticator() == null)
+                ? null
+                : authenticationPool(
+                        settings.maxAuthentications(),
+                        settings.maxAwaitingConnect(),
+                        port,
+                        termination
+                );
         capabilities = settings.capabilities().withPacketSizeWithin(settings.maxPacketSize());
         reactors = new Reactor[settings.selectors()];
         inproc = new InprocLoop(this, stopBroker);
@@ -248,6 +235,43 @@ final class Routing {
             }
             throw failure;
         }
+    }
+
+    // The pool that runs the application's authenticator, which ends its part of `termination`
+    // once the broker has shut it down and its decisions have returned. A CONNECT that finds
+    // `decisions` running waits in the queue for one of them to end, for its deadline at most
+    // (see Client.decide). The queue holds `waiting`, as many connections as may wait for
+    // their CONNECT, which one that waits for its decision still does: their limit keeps the
+    // queue from filling. The threads start as decisions come, and end once idle.
+    private static ThreadPoolExecutor authenticationPool(
+            int decisions,
+            int waiting,
+            int port,
+            Termination termination
+    ) {
+        var nextAuthentication = new AtomicInteger();
+        var pool = new ThreadPoolExecutor(
+                decisions,
+                decisions,
+                AUTHENTICATION_IDLE_SECONDS,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(waiting),
+                task -> {
+                    int number = nextAuthentication.getAndIncrement();
+                    return Thread.ofPlatform().daemon()
+                            .name("hato-broker-" + port + "-auth-" + number)
+                            .unstarted(task);
+                }
+        ) {
+
+            // The pool ends once the broker has shut it down and its decisions have returned.
+            @Override
+            protected void terminated() {
+                termination.partEnded();
+            }
+        };
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
     }
 
     // Counts a connection out of those that wait for their CONNECT. The accepting thread waits

@@ -366,12 +366,16 @@ class BrokerAuthenticationTest {
 
     @ParameterizedTest
     @EnumSource(MqttVersion.class)
-    void a_connect_beyond_the_decisions_that_may_run_is_refused_at_once(MqttVersion version)
+    void a_connect_beyond_the_decisions_that_may_run_waits_for_one_to_end(MqttVersion version)
             throws Exception {
-        // Arrange: room for one decision, which waits until the test lets it go.
+        // Arrange: room for one decision, which waits until the test lets it go, and a hook that
+        // tells when the second CONNECT has reached the broker.
         var deciding = new CountDownLatch(1);
         var release = new CountDownLatch(1);
+        var secondArrived = new CountDownLatch(1);
+        var asked = new CopyOnWriteArrayList<String>();
         Authenticator sut = request -> {
+            asked.add(request.clientId());
             if (request.clientId().equals("first")) {
                 deciding.countDown();
                 release.await();
@@ -381,25 +385,72 @@ class BrokerAuthenticationTest {
         try (BrokerServer broker = BrokerServer.builder()
                 .authenticator(sut)
                 .maxAuthentications(1)
+                .beforeProcess(packet -> {
+                    if (packet instanceof Packet.Connect request
+                            && request.clientId().equals("second")) {
+                        secondArrived.countDown();
+                    }
+                })
                 .start(loopback());
                 RawSession first = RawSession.open(broker.port(), MqttVersion.V5);
                 RawSession second = RawSession.open(broker.port(), version)) {
             first.send(connect("first", MqttVersion.V5, null, null));
             assertThat(deciding.await(5, SECONDS)).isTrue();
+            // Act: the second CONNECT comes while the first decision runs, which then ends.
+            second.send(connect("second", version, null, null));
+            assertThat(secondArrived.await(5, SECONDS)).isTrue();
+            release.countDown();
+            // Assert: the second client is decided on in its turn, rather than refused.
+            assertThat(first.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SUCCESS);
+            assertThat(second.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SUCCESS);
+            assertThat(asked).containsExactly("first", "second");
+        }
+    }
+
+    @Test
+    void a_connect_that_waits_past_its_deadline_is_refused_without_a_decision() throws Exception {
+        // Arrange: room for one decision, which waits until the test lets it go, well after the
+        // deadline of a CONNECT that waits for it.
+        var deciding = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var asked = new CopyOnWriteArrayList<String>();
+        Authenticator sut = request -> {
+            asked.add(request.clientId());
+            if (request.clientId().equals("first")) {
+                deciding.countDown();
+                release.await();
+            }
+            return Authenticator.Decision.accept(Authenticator.Scope.all());
+        };
+        try (BrokerServer broker = BrokerServer.builder()
+                .authenticator(sut)
+                .maxAuthentications(1)
+                .authenticationTimeout(Duration.ofMillis(200))
+                .start(loopback());
+                RawSession first = RawSession.open(broker.port(), MqttVersion.V5);
+                RawSession waiting = RawSession.open(broker.port(), MqttVersion.V5)) {
+            first.send(connect("first", MqttVersion.V5, null, null));
+            assertThat(deciding.await(5, SECONDS)).isTrue();
             try {
                 // Act
-                second.send(connect("second", version, null, null));
-                // Assert: MQTT 3.1.1 has no return code for a busy server.
-                assertThat(second.expect(Packet.ConnAck.class).reasonCode()).isEqualTo(
-                        (version == MqttVersion.V5)
-                                ? ReasonCode.SERVER_BUSY
-                                : ReasonCode.SERVER_UNAVAILABLE
-                );
+                waiting.send(connect("waiting", MqttVersion.V5, null, null));
+                // Assert: the deadline refuses the waiting client as unavailable, not as busy.
+                assertThat(waiting.expect(Packet.ConnAck.class).reasonCode())
+                        .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
+                waiting.expectClosed();
             } finally {
                 release.countDown();
             }
-            assertThat(first.expect(Packet.ConnAck.class).reasonCode())
-                    .isEqualTo(ReasonCode.SUCCESS);
+            // Assert: once the first decision ends, the authenticator hears of the next client,
+            // whose turn comes after the refused one's, and never of the refused one.
+            try (RawSession next = RawSession.open(broker.port(), MqttVersion.V5)) {
+                next.send(connect("next", MqttVersion.V5, null, null));
+                assertThat(next.expect(Packet.ConnAck.class).reasonCode())
+                        .isEqualTo(ReasonCode.SUCCESS);
+            }
+            assertThat(asked).containsExactly("first", "next");
         }
     }
 

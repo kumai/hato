@@ -787,6 +787,15 @@ final class Connection {
         return true;
     }
 
+    // Whether the connection still waits for the authenticator's decision in time: it has not
+    // ended, and the deadline has not passed. A false answer stays false.
+    synchronized boolean awaitsDecision() {
+        return authenticating != null
+                && !ended
+                && lastPacket == null
+                && scheduler.nanoTime() - lastReceived < receiveTimeout;
+    }
+
     // Ends the wait for the authenticator's decision. Returns false if the decision came too
     // late: the connection has ended, its deadline has refused the client already, or the
     // deadline has passed though its timer has not come yet, which refuses the client here.

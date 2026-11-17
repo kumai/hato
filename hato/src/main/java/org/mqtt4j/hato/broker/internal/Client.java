@@ -198,7 +198,9 @@ final class Client {
     // Asks the application's authenticator about the client `id` on the broker's authentication
     // pool, and admits the client if the decision accepts it in time. The connection's deadline
     // meanwhile is the decision's. A CONNECT that finds as many decisions running as the pool
-    // allows, or no thread for another, is refused at once.
+    // allows waits in the pool's queue, which the limit on the connections that wait for their
+    // CONNECT keeps from filling; one that still finds no room there, or no thread for another
+    // decision, is refused at once.
     private void authenticate(
             Authenticator authenticator,
             Packet.Connect request,
@@ -230,8 +232,11 @@ final class Client {
     }
 
     // Runs the authenticator on a thread of the authentication pool and acts on its decision.
-    // A failure in acting on it ends the connection, as a failure in handling a CONNECT on the
-    // selector does, which frees its place among the connections that wait for their CONNECT.
+    // A CONNECT that waited in the pool's queue until its deadline passed, or whose connection
+    // ended meanwhile, is not put to the authenticator: acting on no decision then finds it late,
+    // and refuses the client unless its deadline has already. A failure in acting on a decision
+    // ends the connection, as a failure in handling a CONNECT on the selector does, which frees
+    // its place among the connections that wait for their CONNECT.
     private void decide(
             Authenticator authenticator,
             ConnectRequest asked,
@@ -241,23 +246,26 @@ final class Client {
             Consumer<Boolean> done
     ) {
         Authenticator.Decision decision = null;
-        try {
-            decision = authenticator.authenticate(asked);
-        } catch (Throwable failure) {
-            // The failure is the application's. The request leaves the credentials out of the
-            // log, though what the application put into its exception is beyond the broker. A
-            // failure while the broker closes, as when closing interrupts the decision, is no
-            // cause for a warning: the client goes unanswered along with every other.
-            if (routing.closed) {
-                log.debug("Broker on port {} closed while it decided on client {}",
-                        routing.port, asked.clientId(), failure);
-            } else {
-                log.warn("Broker on port {} could not decide on client {} from {}",
-                        routing.port, asked.clientId(), connection.remoteAddress(), failure);
+        if (connection.awaitsDecision()) {
+            try {
+                decision = authenticator.authenticate(asked);
+            } catch (Throwable failure) {
+                // The failure is the application's. The request leaves the credentials out of
+                // the log, though what the application put into its exception is beyond the
+                // broker. A failure while the broker closes, as when closing interrupts the
+                // decision, is no cause for a warning: the client goes unanswered along with
+                // every other.
+                if (routing.closed) {
+                    log.debug("Broker on port {} closed while it decided on client {}",
+                            routing.port, asked.clientId(), failure);
+                } else {
+                    log.warn("Broker on port {} could not decide on client {} from {}",
+                            routing.port, asked.clientId(), connection.remoteAddress(), failure);
+                }
+            } finally {
+                // Interrupt status that the decision leaves must not reach the next one.
+                boolean _ = Thread.interrupted();
             }
-        } finally {
-            // Interrupt status that the decision leaves must not reach the next one.
-            boolean _ = Thread.interrupted();
         }
         try {
             act(decision, asked.clientId(), request, offered, expiry, done);

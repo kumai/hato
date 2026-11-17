@@ -25,8 +25,9 @@ import static java.util.Objects.requireNonNull;
 /// 5.0 with Bad user name or password and Not authorized. It is refused with Server unavailable,
 /// return code 3 in MQTT 3.1.1, when the decision throws, returns null, or takes longer than
 /// [MqttBrokerBuilder#authenticationTimeout(java.time.Duration)]; a decision that returns after
-/// that is ignored. A CONNECT that comes while as many decisions run as the broker allows is
-/// refused at once, in MQTT 5.0 with Server busy and in MQTT 3.1.1 with Server unavailable.
+/// that is ignored. A CONNECT that comes while as many decisions run as the broker allows waits
+/// for one of them to end, and the wait counts toward that timeout: a client that is still
+/// waiting when the timeout runs out is refused with Server unavailable, without a decision.
 ///
 /// The broker keeps the client's credentials out of its logs. [MqttBroker#close()] interrupts
 /// the decisions that are running, and [MqttBroker#terminated()] completes only once they have
