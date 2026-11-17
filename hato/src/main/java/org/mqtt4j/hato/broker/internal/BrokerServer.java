@@ -48,12 +48,18 @@ public final class BrokerServer implements AutoCloseable {
     // How many clients the broker serves at once.
     private static final int MAX_CLIENTS = 10_000;
 
-    // How many connections may wait for the broker to accept a CONNECT on them. Clients that
-    // all connect at once wait here for a moment: on two processors, 10,000 and 20,000 such
-    // clients left a few hundred waiting at the most, and the broker closed none of them.
-    // Ceiling: the listen backlog, which is the platform's default, let those clients in
-    // slowly. A longer backlog lets more wait here at once, and needs the measurement again.
+    // How many connections may wait for the broker to accept a CONNECT on them. While that many
+    // wait, the accepting thread takes no further connection, which waits in the listener's
+    // backlog until one of them is accepted or ends.
     private static final int MAX_AWAITING_CONNECT = 1024;
+
+    // How many connections the listener holds before the broker takes them, as when thousands
+    // of clients connect again at once after an outage. With the platform's default of 50,
+    // 10,000 clients that connected at once to a broker on two processors took 31 seconds to
+    // all have their CONNACK, as many had to send their SYN or their CONNECT again; with this
+    // backlog and the wait at the limit above, they took under a second. Linux holds no more
+    // than its somaxconn, 4,096 by default.
+    private static final int BACKLOG = 4096;
 
     // The largest packet that the broker takes from a client. A smaller one than the framing
     // format allows keeps what one client can have the broker hold at a time small.
@@ -154,10 +160,11 @@ public final class BrokerServer implements AutoCloseable {
     private final InprocBrokers.Registration registration;
 
     // Tells the accepting thread that a connection waits at the listener, which is all that it
-    // watches. The thread waits here and never inside accept: when a listener is closed just as
-    // a thread enters a blocking accept, the closing thread can wait in the kernel until
-    // something else in the process uses a file descriptor (seen on macOS), which a quiet
-    // process never does.
+    // watches, and wakes it as a place frees among the connections that wait for their CONNECT
+    // while it waits for one. The thread waits here and never inside accept: when a listener is
+    // closed just as a thread enters a blocking accept, the closing thread can wait in the
+    // kernel until something else in the process uses a file descriptor (seen on macOS), which
+    // a quiet process never does.
     private final Selector acceptor;
 
     // The listener's registration with that selector.
@@ -168,9 +175,9 @@ public final class BrokerServer implements AutoCloseable {
     // The thread that accepts the connections.
     private final Thread accepting;
 
-    // Whether the accepting thread has warned yet that it closed a connection at once, for the
-    // limit on those that wait for their CONNECT. Only that thread uses it.
-    private boolean turnedAway;
+    // Whether the accepting thread has told yet that it waits for a place among the connections
+    // that wait for their CONNECT. Only that thread uses it.
+    private boolean waitedForPlace;
 
     private BrokerServer(
             ServerSocketChannel listener,
@@ -192,7 +199,13 @@ public final class BrokerServer implements AutoCloseable {
                     + settings.selectors()
                     + ((settings.listener() == null) ? 0 : 2)
                     + ((settings.authenticator() == null) ? 0 : 1);
-            routing = new Routing(settings, port, this::fail, new Termination(parts, port));
+            routing = new Routing(
+                    settings,
+                    port,
+                    this::fail,
+                    acceptor::wakeup,
+                    new Termination(parts, port)
+            );
             accepting = Thread.ofPlatform().daemon()
                     .name("hato-broker-" + routing.port + "-accept")
                     .unstarted(this::accept);
@@ -639,7 +652,7 @@ public final class BrokerServer implements AutoCloseable {
         ) throws IOException {
             ServerSocketChannel listener = ServerSocketChannel.open();
             try {
-                listener.bind(address);
+                listener.bind(address, BACKLOG);
                 var server = new BrokerServer(listener, registration, settings);
                 try {
                     // The pool would start a thread for each of its first tasks. Starting them
@@ -691,14 +704,8 @@ public final class BrokerServer implements AutoCloseable {
     private void accept() {
         try {
             while (true) {
+                awaitPlace();
                 Socket socket = accepted();
-                // This thread and the loop of the in-process connections add to the connections
-                // that wait for their CONNECT, each after its own check, so at most one more than
-                // the limit waits at a time.
-                if (routing.awaitingConnect.get() >= routing.settings.maxAwaitingConnect()) {
-                    turnAway(socket);
-                    continue;
-                }
                 Connection connection = null;
                 try {
                     connection = new Connection(new SocketWire(socket, routing), routing);
@@ -740,30 +747,38 @@ public final class BrokerServer implements AutoCloseable {
         }
     }
 
-    // Closes a connection that came while as many as the broker allows waited for their
-    // CONNECT. It has sent nothing that the broker has read, and learns nothing but the close:
-    // the broker does not know which protocol version it speaks.
-    private void turnAway(Socket socket) {
-        if (turnedAway) {
-            log.debug("Broker on port {} closed the connection from {} at once",
-                    port(), socket.getRemoteSocketAddress());
+    // Waits while as many connections as the broker allows wait for their CONNECT, until one of
+    // them is accepted or ends; the connections that come meanwhile wait in the listener's
+    // backlog, rather than be closed. The connection that frees a place wakes this thread
+    // through the selector (see Routing.leftAwaitingConnect). This thread and the loop of the
+    // in-process connections add to the waiting connections, each after its own check, so at
+    // most one more than the limit waits at a time.
+    private void awaitPlace() throws IOException {
+        int limit = routing.settings.maxAwaitingConnect();
+        if (routing.awaitingConnect.get() < limit) {
+            return;
+        }
+        if (waitedForPlace) {
+            log.debug("Broker on port {} waits for a place among the {} connections that wait"
+                    + " for their CONNECT", port(), limit);
         } else {
-            turnedAway = true;
-            log.warn(
-                    "Broker on port {} closed the connection from {} at once, because {}"
-                            + " connections wait for their CONNECT, its limit; later ones are"
-                            + " logged at debug level",
+            waitedForPlace = true;
+            log.info(
+                    "Broker on port {} accepts no further connection while {} connections wait"
+                            + " for their CONNECT, its limit, and goes on as they leave; later"
+                            + " waits are logged at debug level",
                     port(),
-                    socket.getRemoteSocketAddress(),
-                    routing.settings.maxAwaitingConnect()
+                    limit
             );
         }
-        try {
-            socket.close();
-        } catch (IOException failure) {
-            log.debug("Closing the connection from {} failed",
-                    socket.getRemoteSocketAddress(), failure);
+        // The connections that wait at the listener keep its key ready, so the wait looks away
+        // from it. Closing the selector still ends the wait.
+        acceptKey.interestOps(0);
+        while (routing.awaitingConnect.get() >= limit) {
+            acceptor.select(_ -> { });
+            endIfInterrupted();
         }
+        acceptKey.interestOps(SelectionKey.OP_ACCEPT);
     }
 
     // The next connection that waits at the listener, once there is one. close() ends the wait

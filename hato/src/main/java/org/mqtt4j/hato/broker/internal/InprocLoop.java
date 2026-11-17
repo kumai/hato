@@ -181,9 +181,9 @@ final class InprocLoop implements Loop, InprocBrokers.Endpoint {
         }
     }
 
-    // Makes a connection of `link` and has the loop serve it, or refuses the link: as the
-    // accepting thread closes a TCP connection at once while as many connections as the broker
-    // allows wait for their CONNECT.
+    // Makes a connection of `link` and has the loop serve it, or refuses the link while as many
+    // connections as the broker allows wait for their CONNECT. A TCP connection waits at the
+    // listener then; a link has no backlog to wait in.
     private void accept(InprocLink link) {
         if (routing.awaitingConnect.get() >= routing.settings.maxAwaitingConnect()) {
             log.debug("Broker on port {} refused an in-process connection, because {}"

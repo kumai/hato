@@ -115,19 +115,26 @@ class BrokerClientLimitTest {
     }
 
     @Test
-    void a_connection_beyond_those_that_may_wait_for_their_connect_is_closed_at_once()
+    void a_connection_beyond_those_that_may_wait_for_their_connect_waits_for_a_place()
             throws Exception {
         try (BrokerServer sut = waitingAtMost(2);
                 RawSession first = RawSession.open(sut.port());
                 RawSession second = RawSession.open(sut.port());
                 RawSession third = RawSession.open(sut.port())) {
-            // Assert: the broker closes the third, and still takes the CONNECT of the others.
-            third.expectClosed();
-            for (RawSession waiting : new RawSession[] {first, second}) {
-                waiting.send(connect("", true, 0));
-                assertThat(waiting.expect(Packet.ConnAck.class).reasonCode())
-                        .isEqualTo(ReasonCode.SUCCESS);
-            }
+            // Arrange: the first two take the places, and the third waits at the listener with
+            // its CONNECT sent.
+            third.send(connect("third", true, 0));
+            // Act: the first client's acceptance frees a place.
+            first.send(connect("first", true, 0));
+            // Assert: the broker takes the third connection then, rather than close it, and still
+            // takes the CONNECT of the second.
+            assertThat(first.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SUCCESS);
+            assertThat(third.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SUCCESS);
+            second.send(connect("second", true, 0));
+            assertThat(second.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SUCCESS);
         }
     }
 
@@ -146,20 +153,20 @@ class BrokerClientLimitTest {
     }
 
     @Test
-    void a_connection_that_ends_without_a_connect_makes_room_for_another_to_wait()
-            throws Exception {
-        try (BrokerServer sut = waitingAtMost(1)) {
-            // Arrange: a connection that sends nothing, which the broker's limit then closes
-            // the next one for.
-            try (RawSession _ = RawSession.open(sut.port());
-                    RawSession turnedAway = RawSession.open(sut.port())) {
-                turnedAway.expectClosed();
-            }
-
-            // Act & Assert: the silent one has gone, and the next one waits in its place.
-            try (RawSession next = connectedEventually(sut.port(), "next", true, false)) {
-                next.ping();
-            }
+    @SuppressWarnings("try") // The explicit close is what the test is about.
+    void a_connection_that_ends_without_a_connect_lets_a_waiting_one_in() throws Exception {
+        try (BrokerServer sut = waitingAtMost(1);
+                RawSession silent = RawSession.open(sut.port());
+                RawSession waiting = RawSession.open(sut.port())) {
+            // Arrange: a connection that sends nothing holds the only place, and the next one
+            // waits at the listener with its CONNECT sent.
+            waiting.send(connect("waiting", true, 0));
+            // Act
+            silent.close();
+            // Assert: the end of the silent connection lets the waiting one in.
+            assertThat(waiting.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SUCCESS);
+            waiting.ping();
         }
     }
 
@@ -192,8 +199,8 @@ class BrokerClientLimitTest {
     }
 
     /// An MQTT 3.1.1 session that the broker on `port` accepts once it has room, which it gets
-    /// as it learns of the end of an earlier connection. Until then it refuses the client or
-    /// closes its connection, and the client tries again.
+    /// as it learns of the end of an earlier connection. Until then it refuses the client, and
+    /// the client tries again.
     private static RawSession connectedEventually(
             int port,
             String clientId,

@@ -67,8 +67,13 @@ final class Routing {
 
     // How many of the connections wait for the broker to accept a CONNECT on them, which their
     // limit bounds. A connection counts from its registration with its selector, which the
-    // accepting thread makes, until the broker accepts its client or the connection ends.
+    // accepting thread makes, until the broker accepts its client or the connection ends. The
+    // accepting thread waits while they are at their limit, and one that leaves wakes it.
     final AtomicInteger awaitingConnect = new AtomicInteger();
+
+    // Wakes the accepting thread as a place frees among the connections that wait for their
+    // CONNECT.
+    private final Runnable placeFreed;
 
     // How many clients the broker serves, which the client limit bounds: the connections that
     // it has accepted a CONNECT on and whose end has not come to their session yet. A
@@ -135,15 +140,18 @@ final class Routing {
 
     volatile boolean closed;
 
-    // `stopBroker` ends the broker for the failure of a selector.
+    // `stopBroker` ends the broker for the failure of a selector, and `placeFreed` wakes the
+    // accepting thread as a connection stops waiting for its CONNECT.
     Routing(
             BrokerSettings settings,
             int port,
             Consumer<Throwable> stopBroker,
+            Runnable placeFreed,
             Termination termination
     ) throws IOException {
         this.settings = settings;
         this.port = port;
+        this.placeFreed = placeFreed;
         this.termination = termination;
         retained = new RetainedMessages(
                 settings.maxRetained(),
@@ -239,6 +247,14 @@ final class Routing {
                 authentications.shutdown();
             }
             throw failure;
+        }
+    }
+
+    // Counts a connection out of those that wait for their CONNECT. The accepting thread waits
+    // while they are at their limit, so the one that frees a place wakes it.
+    void leftAwaitingConnect() {
+        if (awaitingConnect.getAndDecrement() >= settings.maxAwaitingConnect()) {
+            placeFreed.run();
         }
     }
 

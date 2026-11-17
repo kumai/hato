@@ -957,7 +957,7 @@ final class Connection {
     private void leaveAwaitingConnect() {
         if (awaitingConnect) {
             awaitingConnect = false;
-            routing.awaitingConnect.decrementAndGet();
+            routing.leftAwaitingConnect();
         }
     }
 
