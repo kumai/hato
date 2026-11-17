@@ -115,7 +115,7 @@ public interface BrokerListener {
         /// Another connection with the same client identifier took the session over.
         TAKEN_OVER,
 
-        /// The application closed the connection.
+        /// The application closed the connection with [MqttBroker#disconnect(String)].
         APPLICATION,
 
         /// The client broke the protocol, or a limit that the broker set for it, such as the

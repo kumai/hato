@@ -11,6 +11,8 @@ import org.mqtt4j.hato.internal.concurrent.ClassPreload;
 import org.mqtt4j.hato.internal.inproc.InprocBrokers;
 import org.mqtt4j.hato.internal.log.Log;
 
+import static java.util.Objects.requireNonNull;
+
 /// An MQTT 3.1.1 and 5.0 broker that runs inside the application.
 ///
 /// [#builder()] sets the address, the name, the limits, the [Authenticator], and the
@@ -149,7 +151,7 @@ import org.mqtt4j.hato.internal.log.Log;
 /// ## Operation
 ///
 /// The [BrokerListener] hears of each client that the broker accepts, and of the end of its
-/// connection with the reason.
+/// connection with the reason. [#disconnect(String)] closes the connection of a client.
 ///
 /// ## Ending
 ///
@@ -232,6 +234,28 @@ public final class MqttBroker implements AutoCloseable {
     ///   the URI of this broker for clients in the same JVM, including after close
     public URI uri() {
         return InprocBrokers.uri(server.name());
+    }
+
+    /// Closes the connection of the client `clientId`, as for an administrative reason: an MQTT
+    /// 5.0 client receives DISCONNECT with Administrative action first. The client did not
+    /// disconnect, so its Will is published as for a lost connection, after its Will Delay
+    /// Interval if it has one. Its session stays as the client asked: a session that outlives
+    /// its connection waits for the client to come back, and expires as any other. A client that
+    /// connects again meets the [Authenticator], if there is one, as any other, which keeps the
+    /// client out by refusing it. The [BrokerListener] hears that the connection ended for
+    /// [BrokerListener.DisconnectReason#APPLICATION].
+    ///
+    /// The call returns at once. From then on, the broker begins to handle no packet that the
+    /// client sent on the connection.
+    ///
+    /// @param clientId
+    ///   the identifier of the client to disconnect
+    /// @return
+    ///   whether the client had a connection that this call closes; false if it has none, or
+    ///   if its connection was closing already
+    public boolean disconnect(String clientId) {
+        requireNonNull(clientId, "clientId");
+        return server.disconnect(clientId);
     }
 
     /// Observes the end of this broker without requesting it. The future completes once the

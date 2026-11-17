@@ -258,11 +258,11 @@ public final class BrokerControls {
         return port.connectedClients();
     }
 
-    /// Closes the open connection of the client with `clientId`, as a broker does for an
-    /// administrative reason: an MQTT 5.0 client first receives DISCONNECT with Administrative
-    /// action. The client did not disconnect, so its Will is published as for a lost connection,
-    /// after its Will Delay Interval if it has one. Does nothing if the client has no open
-    /// connection.
+    /// Closes the open connection of the client with `clientId`, as
+    /// [MqttBroker#disconnect(String)] does for an administrative reason: an MQTT 5.0 client
+    /// first receives DISCONNECT with Administrative action. The client did not disconnect, so
+    /// its Will is published as for a lost connection, after its Will Delay Interval if it has
+    /// one. Does nothing if the client has no open connection.
     ///
     /// @param clientId
     ///   the identifier of the client to disconnect

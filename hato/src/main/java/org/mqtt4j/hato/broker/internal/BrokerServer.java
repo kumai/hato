@@ -1068,9 +1068,13 @@ public final class BrokerServer implements AutoCloseable {
 
     /// Ends the open connection of `clientId` for an administrative reason, which an MQTT 5.0
     /// client learns from DISCONNECT. The client did not disconnect, so its Will goes out as for
-    /// a lost connection. Does nothing when the client has no open connection.
-    public void disconnect(String clientId) {
-        routing.disconnect(clientId, new Reason(ReasonCode.ADMINISTRATIVE_ACTION, null, null));
+    /// a lost connection. Does nothing when the client has no open connection. Returns whether
+    /// it ended one: false also for a connection that was ending already.
+    public boolean disconnect(String clientId) {
+        return routing.disconnect(
+                clientId,
+                new Reason(ReasonCode.ADMINISTRATIVE_ACTION, null, null)
+        );
     }
 
     /// Ends the open connection of `clientId` as [#disconnect(String)] does, but tells an MQTT
