@@ -6,6 +6,8 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.broker.internal.BrokerServer;
 import org.mqtt4j.hato.internal.concurrent.ClassPreload;
 import org.mqtt4j.hato.internal.inproc.InprocBrokers;
@@ -15,7 +17,7 @@ import static java.util.Objects.requireNonNull;
 
 /// An MQTT 3.1.1 and 5.0 broker that runs inside the application.
 ///
-/// [#builder()] sets the address, the name, the limits, the [Authenticator], and the
+/// [#builder()] sets the addresses, TLS, the name, the limits, the [Authenticator], and the
 /// [BrokerListener], and [#start()] starts a broker with the defaults. Each start creates an
 /// independent broker. Its methods are safe to call concurrently from any thread. The broker
 /// keeps all of its state in memory, and all of it is lost when the broker stops.
@@ -143,6 +145,14 @@ import static java.util.Objects.requireNonNull;
 /// address only with an authenticator, or when [MqttBrokerBuilder#allowAnonymous()] lets it
 /// accept clients without one.
 ///
+/// ## TLS
+///
+/// [MqttBrokerBuilder#listenTls(InetSocketAddress, javax.net.ssl.SSLContext)] has the broker
+/// listen with TLS, alone or besides a plain listener on another port, and [#tlsPort()] tells
+/// its port. The broker can ask the clients for certificates, which the TLS context checks. A
+/// client whose handshake fails, or that does not finish it and send its CONNECT in time, loses
+/// its connection, and so does one that asks for a new handshake once it has connected.
+///
 /// ## Clients in the same JVM
 ///
 /// A Hato client in the same JVM can reach the broker by its [URI][#uri()]. It passes its
@@ -195,12 +205,12 @@ public final class MqttBroker implements AutoCloseable {
         return builder().start();
     }
 
-    // Starts a broker at `address` with `settings` and the threads that suit this machine.
-    // MqttBrokerBuilder calls this, after MqttBroker.builder() has preloaded the broker's
-    // classes.
+    // Starts a broker that listens plain at `address`, or not at all for null, and with TLS as
+    // `settings` say, with the threads that suit this machine. MqttBrokerBuilder calls this, after
+    // MqttBroker.builder() has preloaded the broker's classes.
     static MqttBroker start(
             BrokerServer.Builder settings,
-            InetSocketAddress address
+            @Nullable InetSocketAddress address
     ) throws IOException {
         // The testkit's controls reach a broker's server through the internal control port,
         // which the module exports to the testkit alone.
@@ -208,15 +218,30 @@ public final class MqttBroker implements AutoCloseable {
         return new MqttBroker(settings.start(address, Runtime.getRuntime().availableProcessors()));
     }
 
-    /// {@return the assigned listening port, including after close}
+    /// The port of the plain listener, as the system assigned it for port zero.
+    ///
+    /// @return
+    ///   the port of the plain listener, including after close
+    /// @throws IllegalStateException
+    ///   if the broker listens with TLS alone
     public int port() {
-        return server.port();
+        return server.plainPort();
+    }
+
+    /// The port of the TLS listener, as the system assigned it for port zero.
+    ///
+    /// @return
+    ///   the port of the TLS listener, including after close
+    /// @throws IllegalStateException
+    ///   if the broker has no TLS listener
+    public int tlsPort() {
+        return server.tlsPort();
     }
 
     /// The name of this broker: the one that [MqttBrokerBuilder#name(String)] gave, or the one
     /// that the broker took without it. A broker holds its name from its start until it ends,
     /// through [#close()] or because an internal failure stopped it, or until a
-    /// [#shutdown(Duration)] begins, as it holds its port. While it does, no other broker in the
+    /// [#shutdown(Duration)] begins, as it holds its ports. While it does, no other broker in the
     /// JVM starts with that name, except one whose Hato classes come from another class loader;
     /// after that, one can.
     ///
@@ -273,10 +298,11 @@ public final class MqttBroker implements AutoCloseable {
     }
 
     /// Observes the end of this broker without requesting it. The future completes once the
-    /// broker has ended, through [#close()] or because an internal failure stopped it: its port
-    /// is free, its connections are closed, it has finished its work, and it calls no
-    /// application code any more, the [BrokerListener] and the [Authenticator] included. It
-    /// completes normally either way; the listener hears of a failure. Before the future
+    /// broker has ended, through [#close()] or because an internal failure stopped it: its ports
+    /// are free, its connections are closed, it has finished its work, and it calls no
+    /// application code any more, the [BrokerListener], the [Authenticator], and the key and
+    /// trust managers of the TLS context included. It completes normally either way; the
+    /// listener hears of a failure. Before the future
     /// completes, the broker gives the logging backend a moment to take what it has logged, as
     /// [#close()] does.
     ///
@@ -301,7 +327,7 @@ public final class MqttBroker implements AutoCloseable {
     /// Shuts the broker down once its clients have what waits for them; [#close()] stops it at
     /// once instead.
     ///
-    /// The broker takes no further connection from the start: it frees its port and its name,
+    /// The broker takes no further connection from the start: it frees its ports and its name,
     /// which another broker can take from then on, and refuses a client that it has yet to
     /// accept with Server unavailable, return code 3 in MQTT 3.1.1. It goes on serving the
     /// clients that are connected, also reading what they send, until each of them has what
@@ -315,7 +341,7 @@ public final class MqttBroker implements AutoCloseable {
     /// their sessions. To have what the application's own clients publish last delivered, it
     /// disconnects them before this call.
     ///
-    /// The call returns once the broker has closed, its port free and every connection closed,
+    /// The call returns once the broker has closed, its ports free and every connection closed,
     /// which can be a moment after `timeout`, and gives the logging backend a moment to take
     /// what the broker has logged, as [#close()] does. [#close()] and an interrupt of the calling
     /// thread cut the shutdown short, as `timeout` does, and the interrupt stays with the thread.
@@ -345,11 +371,12 @@ public final class MqttBroker implements AutoCloseable {
 
     /// Stops accepting connections, closes all peers, and discards their session state and the
     /// retained messages, without publishing Wills, those that wait for their delay included.
-    /// When it returns, the listening port is free and every connection is closed. Repeated
+    /// When it returns, the listening ports are free and every connection is closed. Repeated
     /// calls are harmless, and a call while [#shutdown(Duration)] runs cuts it short. Does not
-    /// wait for peer I/O or send MQTT packets. It interrupts the [Authenticator]'s decisions that
-    /// are running and does not wait for them. Before it returns, it gives the logging backend a
-    /// moment to take what the broker has logged.
+    /// wait for peer I/O or send MQTT packets. It interrupts the [Authenticator]'s decisions and
+    /// the TLS handshakes' calls into the key and trust managers that are running, and does not
+    /// wait for them. Before it returns, it gives the logging backend a moment to take what the
+    /// broker has logged.
     @Override
     public void close() {
         server.close();

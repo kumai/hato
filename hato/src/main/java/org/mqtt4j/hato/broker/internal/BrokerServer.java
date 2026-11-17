@@ -10,6 +10,7 @@ import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -19,6 +20,8 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 
 import org.jspecify.annotations.Nullable;
 
@@ -36,7 +39,8 @@ import org.mqtt4j.hato.internal.protocol.PacketType;
 
 import static java.util.Objects.requireNonNull;
 
-/// One listener whose connections share the bounded, in-memory sessions of one broker.
+/// The listeners of one broker, plain, TLS, or both, whose connections share its bounded,
+/// in-memory sessions.
 public final class BrokerServer implements AutoCloseable {
 
     private static final Log log = Log.of(BrokerServer.class);
@@ -151,6 +155,14 @@ public final class BrokerServer implements AutoCloseable {
     // at once; a public setting, or an executor of the application's, would lift that.
     private static final int MAX_AUTHENTICATIONS = 16;
 
+    // How many threads run the delegated tasks of TLS handshakes at once: the costly part of a
+    // handshake, about a millisecond and a half of a processor each for an RSA key of 2048 bits,
+    // and the calls into the application's key and trust managers.
+    // Ceiling: unmeasured under a crowd of clients that connect at once with TLS, which waits for
+    // these threads; the numbers worth comparing are one, two, the processors, and as many as
+    // the decisions of the authenticator take.
+    private static final int MAX_TLS_TASKS = 4;
+
     // How long the accepting thread waits before it tries again after a connection could not
     // be accepted. The cause, such as a process without a free file descriptor, lasts until
     // something else in the process gives way, so trying at once would only spin.
@@ -167,21 +179,28 @@ public final class BrokerServer implements AutoCloseable {
     // so only one that has stopped reading takes this long.
     private static final long CLOSING_NANOS = 1_000_000_000;
 
-    private final ServerSocketChannel listener;
+    // The sockets that the broker listens on: the plain one, the TLS one, or both, in that order.
+    private final List<Listening> listenings;
+
+    // The ports of the plain listener and of the TLS listener, or -1 for one that the broker does
+    // not have.
+    private final int plainPort;
+
+    private final int tlsPort;
+
+    // What the connections of the TLS listener share, if the broker has one.
+    private final @Nullable TlsListener tls;
 
     // The name that the broker holds while it runs.
     private final InprocBrokers.Registration registration;
 
-    // Tells the accepting thread that a connection waits at the listener, which is all that it
+    // Tells the accepting thread that a connection waits at a listener, which is all that it
     // watches, and wakes it as a place frees among the connections that wait for their CONNECT
     // while it waits for one. The thread waits here and never inside accept: when a listener is
     // closed just as a thread enters a blocking accept, the closing thread can wait in the
     // kernel until something else in the process uses a file descriptor (seen on macOS), which
     // a quiet process never does.
     private final Selector acceptor;
-
-    // The listener's registration with that selector.
-    private final SelectionKey acceptKey;
 
     private final Routing routing;
 
@@ -200,33 +219,61 @@ public final class BrokerServer implements AutoCloseable {
     // shutdown end the broker at once.
     private volatile boolean cutShort;
 
+    // The listener that the accepting thread asks first for the next connection, so that one
+    // whose connections keep coming leaves the other its turn. Only that thread uses it.
+    private int nextListening;
+
+    // `plain` and `secure` are the bound sockets of the plain and the TLS listener, or null for
+    // one that the broker does not have, and `tlsSettings` what the TLS listener's connections
+    // take.
     private BrokerServer(
-            ServerSocketChannel listener,
+            @Nullable ServerSocketChannel plain,
+            @Nullable ServerSocketChannel secure,
+            @Nullable TlsSettings tlsSettings,
             InprocBrokers.Registration registration,
             BrokerSettings settings
     ) throws IOException {
-        this.listener = listener;
         this.registration = registration;
         acceptor = Selector.open();
         try {
-            listener.configureBlocking(false);
-            acceptKey = listener.register(acceptor, SelectionKey.OP_ACCEPT);
-            int port = listener.socket().getLocalPort();
+            plainPort = (plain == null) ? -1 : plain.socket().getLocalPort();
+            tlsPort = (secure == null) ? -1 : secure.socket().getLocalPort();
+            // Threads and logs know the broker by the port of its plain listener, or of its TLS
+            // listener when it has no plain one.
+            int port = (plain == null) ? tlsPort : plainPort;
             // The parts whose ends end the broker: the accepting thread, the selectors, the loop
             // of the in-process connections, the actor pool, the two threads that call the
-            // listener, if there is one, and the pool that calls the authenticator, if there is
-            // one.
+            // listener, if there is one, the pool that calls the authenticator, if there is
+            // one, and the threads of the TLS handshakes, if there is a TLS listener.
             int parts = 3
                     + settings.selectors()
                     + ((settings.listener() == null) ? 0 : 2)
-                    + ((settings.authenticator() == null) ? 0 : 1);
+                    + ((settings.authenticator() == null) ? 0 : 1)
+                    + ((secure == null) ? 0 : 1);
+            var termination = new Termination(parts, port);
             routing = new Routing(
                     settings,
                     port,
                     this::fail,
                     acceptor::wakeup,
-                    new Termination(parts, port)
+                    termination
             );
+            tls = (secure == null || tlsSettings == null) ? null : new TlsListener(
+                    tlsSettings.context(),
+                    tlsSettings.parameters(),
+                    tlsPort,
+                    settings.maxTlsTasks(),
+                    settings.maxAwaitingConnect(),
+                    termination
+            );
+            var listening = new ArrayList<Listening>(2);
+            if (plain != null) {
+                listening.add(listen(plain, null));
+            }
+            if (secure != null) {
+                listening.add(listen(secure, tls));
+            }
+            listenings = List.copyOf(listening);
             accepting = Thread.ofPlatform().daemon()
                     .name("hato-broker-" + routing.port + "-accept")
                     .unstarted(this::accept);
@@ -238,6 +285,16 @@ public final class BrokerServer implements AutoCloseable {
             }
             throw failure;
         }
+    }
+
+    // Has the accepting thread watch `channel` for connections, which come through TLS with `tls`
+    // or plain for null.
+    private Listening listen(
+            ServerSocketChannel channel,
+            @Nullable TlsListener tls
+    ) throws IOException {
+        channel.configureBlocking(false);
+        return new Listening(channel, channel.register(acceptor, SelectionKey.OP_ACCEPT), tls);
     }
 
     // Starts a broker with the default settings and the threads that suit this machine.
@@ -279,6 +336,11 @@ public final class BrokerServer implements AutoCloseable {
 
         // The broker's name, or null for an automatic one.
         private @Nullable String name;
+
+        // The TLS listener, or null for none.
+        private @Nullable TlsSettings tls;
+
+        private int maxTlsTasks = MAX_TLS_TASKS;
 
         private Duration connectTimeout = CONNECT_TIMEOUT;
 
@@ -365,6 +427,27 @@ public final class BrokerServer implements AutoCloseable {
 
         public Builder name(String value) {
             name = requireNonNull(value, "name must not be null");
+            return this;
+        }
+
+        /// Listens with TLS at `address` too, or alone: every connection there takes an engine of
+        /// `context` that `parameters` set, which the caller has checked and does not change any
+        /// more.
+        public Builder listenTls(
+                InetSocketAddress address,
+                SSLContext context,
+                SSLParameters parameters
+        ) {
+            tls = new TlsSettings(
+                    requireNonNull(address, "address must not be null"),
+                    requireNonNull(context, "context must not be null"),
+                    requireNonNull(parameters, "parameters must not be null")
+            );
+            return this;
+        }
+
+        Builder maxTlsTasks(int value) {
+            maxTlsTasks = value;
             return this;
         }
 
@@ -571,9 +654,13 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
-        /// Starts a broker at `address` with the numbers of threads that suit a machine of
-        /// `processors` processors, in place of those that the builder holds.
-        public BrokerServer start(InetSocketAddress address, int processors) throws IOException {
+        /// Starts a broker that listens plain at `address`, or not at all for null, and with TLS
+        /// as [#listenTls] set, with the numbers of threads that suit a machine of `processors`
+        /// processors, in place of those that the builder holds.
+        public BrokerServer start(
+                @Nullable InetSocketAddress address,
+                int processors
+        ) throws IOException {
             if (processors == 1) {
                 selectors(SELECTORS_ON_ONE_PROCESSOR).actors(ACTORS_ON_ONE_PROCESSOR);
             } else {
@@ -582,8 +669,10 @@ public final class BrokerServer implements AutoCloseable {
             return start(address);
         }
 
-        BrokerServer start(InetSocketAddress address) throws IOException {
-            requireNonNull(address, "address must not be null");
+        BrokerServer start(@Nullable InetSocketAddress address) throws IOException {
+            if (address == null && tls == null) {
+                throw new IllegalArgumentException("A broker needs a listener");
+            }
             if (connectTimeout.isNegative()
                 || connectTimeout.isZero()
                 || maxAwaitingConnect <= 0
@@ -614,6 +703,7 @@ public final class BrokerServer implements AutoCloseable {
                 || authenticationTimeout.isNegative()
                 || authenticationTimeout.isZero()
                 || maxAuthentications <= 0
+                || maxTlsTasks <= 0
             ) {
                 throw new IllegalArgumentException(
                         "Broker limits must be positive and window fit queue"
@@ -650,6 +740,7 @@ public final class BrokerServer implements AutoCloseable {
                     authenticator,
                     authenticationTimeout.toNanos(),
                     maxAuthentications,
+                    maxTlsTasks,
                     scheduler,
                     beforeProcess,
                     beforeHandle,
@@ -667,7 +758,7 @@ public final class BrokerServer implements AutoCloseable {
                     ? InprocBrokers.takeNext()
                     : InprocBrokers.take(given);
             try {
-                return open(address, registration, settings);
+                return open(address, tls, registration, settings);
             } catch (IOException | RuntimeException | Error failure) {
                 registration.release();
                 throw failure;
@@ -675,14 +766,23 @@ public final class BrokerServer implements AutoCloseable {
         }
 
         private static BrokerServer open(
-                InetSocketAddress address,
+                @Nullable InetSocketAddress address,
+                @Nullable TlsSettings tls,
                 InprocBrokers.Registration registration,
                 BrokerSettings settings
         ) throws IOException {
-            ServerSocketChannel listener = ServerSocketChannel.open();
+            ServerSocketChannel plain = null;
+            ServerSocketChannel secure = null;
             try {
-                listener.bind(address, BACKLOG);
-                var server = new BrokerServer(listener, registration, settings);
+                if (address != null) {
+                    plain = ServerSocketChannel.open();
+                    plain.bind(address, BACKLOG);
+                }
+                if (tls != null) {
+                    secure = ServerSocketChannel.open();
+                    secure.bind(tls.address(), BACKLOG);
+                }
+                var server = new BrokerServer(plain, secure, tls, registration, settings);
                 try {
                     // The pool would start a thread for each of its first tasks. Starting them
                     // now gives the broker all its threads from the start, whatever comes.
@@ -712,18 +812,70 @@ public final class BrokerServer implements AutoCloseable {
                 }
                 return server;
             } catch (IOException | RuntimeException | Error failure) {
-                try {
-                    listener.close();
-                } catch (IOException closeFailure) {
-                    failure.addSuppressed(closeFailure);
-                }
+                closeAfter(plain, failure);
+                closeAfter(secure, failure);
                 throw failure;
+            }
+        }
+
+        // Closes `channel`, if there is one, after `failure`, which keeps a failure to close.
+        private static void closeAfter(@Nullable ServerSocketChannel channel, Throwable failure) {
+            if (channel == null) {
+                return;
+            }
+            try {
+                channel.close();
+            } catch (IOException closeFailure) {
+                failure.addSuppressed(closeFailure);
             }
         }
     }
 
+    // The TLS listener of a broker: where it listens, and what every connection there takes.
+    private record TlsSettings(
+            InetSocketAddress address,
+            SSLContext context,
+            SSLParameters parameters
+    ) {
+    }
+
+    // One socket that the broker listens on, its registration with the accepting thread's
+    // selector, and the TLS that its connections come through, or null for plain ones.
+    private record Listening(
+            ServerSocketChannel channel,
+            SelectionKey key,
+            @Nullable TlsListener tls
+    ) {
+    }
+
+    // A connection that a listener gave, and the TLS that it comes through, or null.
+    private record Accepted(Socket socket, @Nullable TlsListener tls) {
+    }
+
+    /// The port that the broker goes by in its threads' names and its logs: that of its plain
+    /// listener, or of its TLS listener when it has no plain one.
     public int port() {
         return routing.port;
+    }
+
+    /// The port of the plain listener, including after close.
+    ///
+    /// @throws IllegalStateException if the broker listens with TLS alone
+    public int plainPort() {
+        if (plainPort < 0) {
+            throw new IllegalStateException("The broker listens with TLS alone");
+        }
+        return plainPort;
+    }
+
+    /// The port of the TLS listener, including after close.
+    ///
+    /// @throws IllegalStateException if the broker has no TLS listener
+    public int tlsPort() {
+        if (tlsPort < 0) {
+            throw new IllegalStateException("The broker has no TLS listener");
+        }
+        return tlsPort;
     }
 
     public String name() {
@@ -734,10 +886,14 @@ public final class BrokerServer implements AutoCloseable {
         try {
             while (true) {
                 awaitPlace();
-                Socket socket = accepted();
+                Accepted next = accepted();
+                Socket socket = next.socket();
                 Connection connection = null;
                 try {
-                    connection = new Connection(new SocketWire(socket, routing), routing);
+                    connection = new Connection(
+                            new SocketWire(socket, routing, next.tls()),
+                            routing
+                    );
                     if (!connection.start()) {
                         socket.close();
                         return;
@@ -804,34 +960,47 @@ public final class BrokerServer implements AutoCloseable {
                     limit
             );
         }
-        // The connections that wait at the listener keep its key ready, so the wait looks away
-        // from it. Closing the selector still ends the wait.
-        acceptKey.interestOps(0);
+        // The connections that wait at the listeners keep their keys ready, so the wait looks
+        // away from them. Closing the selector still ends the wait.
+        watchListeners(false);
         while (routing.awaitingConnect.get() >= limit) {
             acceptor.select(_ -> { });
             endIfInterrupted();
         }
-        acceptKey.interestOps(SelectionKey.OP_ACCEPT);
+        watchListeners(true);
     }
 
-    // The next connection that waits at the listener, once there is one. close() ends the wait
-    // with an exception, by closing the listener and the selector.
+    // Has the accepting thread's selector watch the listeners for connections, or look away.
+    private void watchListeners(boolean watch) {
+        for (Listening listening : listenings) {
+            listening.key().interestOps(watch ? SelectionKey.OP_ACCEPT : 0);
+        }
+    }
+
+    // The next connection that waits at a listener, once there is one. Each attempt asks the
+    // listeners in turn, starting after the one that gave the last connection. close() ends the
+    // wait with an exception, by closing the listeners and the selector.
     //
-    // An attempt can fail while the listener is sound: the process may lack what a connection
+    // An attempt can fail while the listeners are sound: the process may lack what a connection
     // takes, as when it has no file descriptor left. That passes, and the connection waits at
-    // the listener meanwhile. So the thread tries again after a pause, rather than end the
-    // listener and with it the broker and the connections that it serves.
-    private Socket accepted() throws IOException {
+    // its listener meanwhile. So the thread tries again after a pause, rather than end the
+    // listeners and with them the broker and the connections that it serves.
+    private Accepted accepted() throws IOException {
         boolean failing = false;
         while (true) {
             try {
                 routing.settings.beforeAccept().run();
-                SocketChannel channel = listener.accept();
-                if (channel != null) {
-                    if (failing) {
-                        log.info("Broker on port {} accepts connections again", port());
+                for (int i = 0; i < listenings.size(); i++) {
+                    int index = (nextListening + i) % listenings.size();
+                    Listening listening = listenings.get(index);
+                    SocketChannel channel = listening.channel().accept();
+                    if (channel != null) {
+                        if (failing) {
+                            log.info("Broker on port {} accepts connections again", port());
+                        }
+                        nextListening = (index + 1) % listenings.size();
+                        return new Accepted(channel.socket(), listening.tls());
                     }
-                    return channel.socket();
                 }
             } catch (ClosedChannelException closed) {
                 throw closed;
@@ -843,15 +1012,15 @@ public final class BrokerServer implements AutoCloseable {
                     log.warn("Broker on port {} cannot accept a connection and keeps trying;"
                             + " later failures are logged at debug level", port(), failure);
                 }
-                // The connection that could not be accepted keeps the key ready, so the pause
-                // looks away from it. Closing the selector still ends the wait.
-                acceptKey.interestOps(0);
+                // The connection that could not be accepted keeps its key ready, so the pause
+                // looks away from the listeners. Closing the selector still ends the wait.
+                watchListeners(false);
                 acceptor.select(_ -> { }, ACCEPT_RETRY_MILLIS);
-                acceptKey.interestOps(SelectionKey.OP_ACCEPT);
+                watchListeners(true);
                 endIfInterrupted();
                 continue;
             }
-            // The key tells nothing more than the return does: the loop asks the listener.
+            // The keys tell nothing more than the returns do: the loop asks the listeners.
             acceptor.select(_ -> { });
             endIfInterrupted();
         }
@@ -1097,18 +1266,21 @@ public final class BrokerServer implements AutoCloseable {
         assert routing.deliveryMemoryAddsUp();
     }
 
-    // Stops taking connections: frees the name and the port, which another broker can take from
-    // now on, and has the accepting thread end. Doing so again does nothing.
+    // Stops taking connections: frees the name and the ports, which another broker can take
+    // from now on, and has the accepting thread end. Doing so again does nothing.
     private void stopAccepting() {
         registration.release();
-        try {
-            listener.close();
-        } catch (IOException failure) {
-            log.warn("Closing broker listener on port {} failed", port(), failure);
+        for (Listening listening : listenings) {
+            try {
+                listening.channel().close();
+            } catch (IOException failure) {
+                log.warn("Closing broker listener on port {} failed",
+                        listening.channel().socket().getLocalPort(), failure);
+            }
         }
         // A channel that a selector watches keeps its socket until the selector lets go of it.
-        // Closing the selector does that here, so the port is free from now on, and it wakes the
-        // accepting thread.
+        // Closing the selector does that here, so the ports are free from now on, and it wakes
+        // the accepting thread.
         try {
             acceptor.close();
         } catch (IOException failure) {
@@ -1117,7 +1289,7 @@ public final class BrokerServer implements AutoCloseable {
         }
     }
 
-    // Ends the listener, the connections, and the sessions, and has the selectors end.
+    // Ends the listeners, the connections, and the sessions, and has the selectors end.
     private void end() {
         try {
             stopAccepting();
@@ -1129,6 +1301,10 @@ public final class BrokerServer implements AutoCloseable {
                 // The decisions that run are the application's code. An interrupt is all that
                 // asks them to return; the broker's end waits until they have.
                 authentications.shutdownNow();
+            }
+            TlsListener listener = tls;
+            if (listener != null) {
+                listener.close();
             }
             Notices notices = routing.notices;
             if (notices != null) {

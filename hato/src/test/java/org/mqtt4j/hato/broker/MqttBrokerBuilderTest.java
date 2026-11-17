@@ -1,9 +1,12 @@
 package org.mqtt4j.hato.broker;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
+import javax.net.ssl.SSLContext;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -98,6 +101,63 @@ class MqttBrokerBuilderTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
+    @Test
+    void rejects_an_unresolved_tls_address_at_once() throws Exception {
+        // Arrange
+        MqttBrokerBuilder sut = MqttBroker.builder();
+        SSLContext context = initializedContext();
+        // Act & Assert
+        assertThatThrownBy(() -> sut.listenTls(
+                InetSocketAddress.createUnresolved("localhost", 0),
+                context
+        )).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    static Stream<Arguments> unusableTlsSettings() throws Exception {
+        SSLContext uninitialized = SSLContext.getInstance("TLS");
+        SSLContext initialized = initializedContext();
+        return Stream.of(
+                Arguments.of(
+                        "TLS parameters without a TLS listener",
+                        setting(sut -> sut.sslParameters(_ -> { }))
+                ),
+                Arguments.of(
+                        "a context that is not initialized",
+                        setting(sut -> sut.listenTls(loopback(), uninitialized))
+                ),
+                Arguments.of(
+                        "parameters that the context cannot use",
+                        setting(sut -> sut.listenTls(loopback(), initialized)
+                                .sslParameters(parameters -> parameters.setProtocols(
+                                        new String[] {"TLSv0.9"}
+                                )))
+                )
+        );
+    }
+
+    @ParameterizedTest(name = "rejects {0}")
+    @MethodSource("unusableTlsSettings")
+    void start_rejects_tls_settings_that_it_cannot_use(
+            String description,
+            Consumer<MqttBrokerBuilder> setting
+    ) {
+        // Arrange
+        MqttBrokerBuilder sut = MqttBroker.builder();
+        setting.accept(sut);
+        // Act & Assert
+        assertThatThrownBy(sut::start).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void start_refuses_a_tls_listener_beyond_the_loopback_address_without_an_authenticator()
+            throws Exception {
+        // Arrange
+        MqttBrokerBuilder sut = MqttBroker.builder()
+                .listenTls(new InetSocketAddress(0), initializedContext());
+        // Act & Assert
+        assertThatThrownBy(sut::start).isInstanceOf(IllegalArgumentException.class);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"", "Fleet", "fleet_a", "-fleet", "site..fleet", "fleet.1"})
     void rejects_a_name_that_is_no_host_name_in_lower_case_at_once(String name) {
@@ -109,5 +169,17 @@ class MqttBrokerBuilderTest {
 
     private static Consumer<MqttBrokerBuilder> setting(Consumer<MqttBrokerBuilder> setting) {
         return setting;
+    }
+
+    // A context with neither keys nor trust of its own, enough for settings that start no
+    // handshake.
+    private static SSLContext initializedContext() throws GeneralSecurityException {
+        SSLContext context = SSLContext.getInstance("TLS");
+        context.init(null, null, null);
+        return context;
+    }
+
+    private static InetSocketAddress loopback() {
+        return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
     }
 }

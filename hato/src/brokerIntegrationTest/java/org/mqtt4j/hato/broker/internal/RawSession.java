@@ -1,8 +1,12 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketException;
 import java.time.Duration;
 import java.util.List;
@@ -42,17 +46,22 @@ final class RawSession implements AutoCloseable {
     static final PacketCodec codec = PacketCodec.of(MqttVersion.V3_1_1);
     private static final Duration READ_TIMEOUT = Duration.ofSeconds(5);
 
-    private final TcpConnection connection;
+    private final Closeable connection;
     private final MqttVersion version;
     private final FrameReader reader;
     private final FrameWriter writer;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
-    private RawSession(TcpConnection connection, MqttVersion version) {
+    private RawSession(
+            Closeable connection,
+            InputStream input,
+            OutputStream output,
+            MqttVersion version
+    ) {
         this.connection = connection;
         this.version = version;
-        reader = new FrameReader(connection.input(), 1024 * 1024);
-        writer = new FrameWriter(connection.output());
+        reader = new FrameReader(input, 1024 * 1024);
+        writer = new FrameWriter(output);
     }
 
     static RawSession open(int port) throws IOException {
@@ -60,13 +69,16 @@ final class RawSession implements AutoCloseable {
     }
 
     static RawSession open(int port, MqttVersion version) throws IOException {
-        return new RawSession(
-                TcpConnection.connect(
-                        new InetSocketAddress(InetAddress.getLoopbackAddress(), port),
-                        Duration.ofSeconds(5)
-                ),
-                version
+        TcpConnection connection = TcpConnection.connect(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), port),
+                Duration.ofSeconds(5)
         );
+        return new RawSession(connection, connection.input(), connection.output(), version);
+    }
+
+    /// A session over `socket`, which is connected, as through TLS; the session owns it.
+    static RawSession over(Socket socket, MqttVersion version) throws IOException {
+        return new RawSession(socket, socket.getInputStream(), socket.getOutputStream(), version);
     }
 
     static RawSession connected(int port, String clientId) throws Exception {

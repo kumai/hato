@@ -22,7 +22,8 @@ import static java.util.Objects.requireNonNull;
 // A network connection's socket, which the selector that it is assigned to reads and writes.
 // Packets arrive as bytes that it puts together and decodes, and leave encoded: a packet as it is
 // queued, and a delivery as it is written, its headers before the payload that it shares with the
-// publication's deliveries to other sessions.
+// publication's deliveries to other sessions. A connection to the TLS listener has those bytes
+// pass through TLS on the way (see TlsChannel).
 final class SocketWire implements Wire {
 
     private final Socket socket;
@@ -32,8 +33,12 @@ final class SocketWire implements Wire {
 
     private final Reactor reactor;
 
-    // What has arrived and not been taken, ready to be read from.
-    private final ByteBuffer input = ByteBuffer.allocate(8192).flip();
+    // The TLS between the socket and the bytes of the packets, or null for a plain connection.
+    private final @Nullable TlsChannel tls;
+
+    // What has arrived and not been taken, ready to be read from. Through TLS, it has room for
+    // the bytes of a whole record.
+    private final ByteBuffer input;
 
     // Puts the packets together from the input. Its size limit is the one for a CONNECT until
     // the broker accepts the client, and from then on the one for the client's packets.
@@ -49,7 +54,8 @@ final class SocketWire implements Wire {
 
     @Nullable SelectionKey key;
 
-    SocketWire(Socket socket, Routing routing) throws IOException {
+    // A wire for `socket`, through TLS when it comes from `listener`, or plain for null.
+    SocketWire(Socket socket, Routing routing, @Nullable TlsListener listener) throws IOException {
         this.socket = socket;
         remote = socket.getRemoteSocketAddress();
         socket.setTcpNoDelay(true);
@@ -61,6 +67,19 @@ final class SocketWire implements Wire {
                 routing.reactors.length
         )];
         socket.getChannel().configureBlocking(false);
+        if (listener == null) {
+            tls = null;
+            input = ByteBuffer.allocate(8192).flip();
+        } else {
+            tls = new TlsChannel(
+                    listener.engine(remote),
+                    socket.getChannel(),
+                    reactor,
+                    listener,
+                    peer()
+            );
+            input = ByteBuffer.allocate(tls.inputCapacity()).flip();
+        }
     }
 
     SocketChannel channel() {
@@ -95,12 +114,15 @@ final class SocketWire implements Wire {
     @Override
     public boolean register(Connection connection) {
         this.connection = connection;
+        if (tls != null) {
+            tls.attach(connection);
+        }
         return reactor.register(connection, this);
     }
 
     @Override
     public boolean inputWaiting() {
-        return readable || input.hasRemaining();
+        return readable || input.hasRemaining() || (tls != null && tls.wantsTurn());
     }
 
     @Override
@@ -122,7 +144,7 @@ final class SocketWire implements Wire {
         input.compact();
         int count;
         try {
-            count = socket.getChannel().read(input);
+            count = (tls == null) ? socket.getChannel().read(input) : tls.read(input);
         } finally {
             input.flip();
         }
@@ -206,10 +228,16 @@ final class SocketWire implements Wire {
     @Override
     public boolean write() throws IOException {
         if (writingParts.length > 0) {
-            writeParts();
-            for (ByteBuffer part : writingParts) {
-                if (part.hasRemaining()) {
+            if (tls != null) {
+                if (!tls.write(writingParts)) {
                     return false;
+                }
+            } else {
+                writeParts();
+                for (ByteBuffer part : writingParts) {
+                    if (part.hasRemaining()) {
+                        return false;
+                    }
                 }
             }
         }
@@ -242,9 +270,14 @@ final class SocketWire implements Wire {
     public void interest(boolean read, boolean write) {
         SelectionKey current = key;
         if (current != null && current.isValid()) {
-            int interests = read ? SelectionKey.OP_READ : 0;
-            if (write) {
-                interests |= SelectionKey.OP_WRITE;
+            int interests;
+            if (tls != null) {
+                interests = tls.interest(read, write);
+            } else {
+                interests = read ? SelectionKey.OP_READ : 0;
+                if (write) {
+                    interests |= SelectionKey.OP_WRITE;
+                }
             }
             current.interestOps(interests);
         }
@@ -255,6 +288,9 @@ final class SocketWire implements Wire {
         SelectionKey current = key;
         if (current != null) {
             current.cancel();
+        }
+        if (tls != null) {
+            tls.close();
         }
         socket.close();
     }

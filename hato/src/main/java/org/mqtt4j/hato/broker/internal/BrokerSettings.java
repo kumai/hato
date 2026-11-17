@@ -33,7 +33,9 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // the clients that connect and disconnect and of the QoS 1 and 2 deliveries that the limits keep
 // from a session (see Notices). The application's authenticator, if there is one, decides on
 // every CONNECT; a decision may take `authenticationTimeout` nanoseconds, and at most
-// `maxAuthentications` run at once, while further CONNECTs wait for one of them to end.
+// `maxAuthentications` run at once, while further CONNECTs wait for one of them to end. At most
+// `maxTlsTasks` threads run the delegated tasks of the TLS handshakes, if the broker has a TLS
+// listener (see TlsListener).
 //
 // The selector calls `beforeProcess` before handing a packet to its session. It asks
 // `deliveryWriteHeld` before marking the deliveries of a write as sent: while the answer is
@@ -84,6 +86,7 @@ record BrokerSettings(
         @Nullable Authenticator authenticator,
         long authenticationTimeout,
         int maxAuthentications,
+        int maxTlsTasks,
         Timer scheduler,
         Consumer<Packet> beforeProcess,
         Consumer<Packet> beforeHandle,

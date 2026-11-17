@@ -8,11 +8,14 @@ import java.security.Key;
 import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.util.Base64;
+import java.util.function.UnaryOperator;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509ExtendedTrustManager;
 
 import org.jspecify.annotations.Nullable;
 
@@ -39,6 +42,25 @@ public final class Tls {
     /// Presents a certificate for `localhost` and `test.hato.invalid`, with no IP address SAN.
     public static SSLContext serverContext() throws IOException, GeneralSecurityException {
         return context("server");
+    }
+
+    /// Presents the certificate of [#serverContext()], and checks the certificates of clients
+    /// with the trust manager that `trust` makes of one that trusts only the test CA, so that a
+    /// test can watch or hold the checks.
+    public static SSLContext serverContext(UnaryOperator<X509ExtendedTrustManager> trust)
+            throws IOException, GeneralSecurityException {
+        KeyManagerFactory keys = KeyManagerFactory.getInstance(
+                KeyManagerFactory.getDefaultAlgorithm()
+        );
+        keys.init(keyStore("server"), PASSWORD.toCharArray());
+        TrustManagerFactory trusted = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm()
+        );
+        trusted.init(keyStore("ca"));
+        var ca = (X509ExtendedTrustManager) trusted.getTrustManagers()[0];
+        SSLContext context = SSLContext.getInstance("TLS");
+        context.init(keys.getKeyManagers(), new TrustManager[] {trust.apply(ca)}, null);
+        return context;
     }
 
     /// Creates a loopback peer whose TLS settings and accepted sockets tests can inspect directly.

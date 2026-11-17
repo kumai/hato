@@ -2,6 +2,7 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.util.Iterator;
@@ -34,6 +35,13 @@ final class Reactor implements Loop, AutoCloseable {
     private final Consumer<Throwable> stopBroker;
 
     private final Traffic traffic = new Traffic();
+
+    // The ciphertext of this selector's TLS connections passes through these on its way in and
+    // out, one connection at a time, on this selector's thread alone. A connection keeps only what
+    // is left over (see TlsChannel), so one that waits holds none of them.
+    private ByteBuffer tlsInput = ByteBuffer.allocate(0);
+
+    private ByteBuffer tlsOutput = ByteBuffer.allocate(0);
 
     private volatile boolean closed;
 
@@ -99,6 +107,22 @@ final class Reactor implements Loop, AutoCloseable {
     @Override
     public Traffic traffic() {
         return traffic;
+    }
+
+    // An empty buffer of at least `capacity` bytes for the ciphertext that a TLS connection reads.
+    ByteBuffer tlsInput(int capacity) {
+        if (tlsInput.capacity() < capacity) {
+            tlsInput = ByteBuffer.allocate(capacity);
+        }
+        return tlsInput.clear();
+    }
+
+    // An empty buffer of at least `capacity` bytes for the ciphertext that a TLS connection writes.
+    ByteBuffer tlsOutput(int capacity) {
+        if (tlsOutput.capacity() < capacity) {
+            tlsOutput = ByteBuffer.allocate(capacity);
+        }
+        return tlsOutput.clear();
     }
 
     private void enqueue(Task task) {

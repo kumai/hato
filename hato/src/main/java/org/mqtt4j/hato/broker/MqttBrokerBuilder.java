@@ -4,6 +4,12 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.function.Consumer;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLParameters;
+
+import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.broker.internal.BrokerServer;
 import org.mqtt4j.hato.internal.inproc.InprocBrokers;
@@ -13,8 +19,9 @@ import static java.util.Objects.requireNonNull;
 /// Configures and starts brokers. Not thread safe.
 /// Every setting has a default, so [#start()] can follow [MqttBroker#builder()] at once. Each
 /// setter rejects a value that is invalid on its own with [IllegalArgumentException] at once, and
-/// [#start()] rejects settings that do not work together in the same way: an address other than
-/// a loopback one without an [Authenticator] or [#allowAnonymous()].
+/// [#start()] rejects settings that do not work together in the same way: a listener at an
+/// address other than a loopback one without an [Authenticator] or [#allowAnonymous()], TLS
+/// parameters without a TLS listener, and TLS settings that it cannot use.
 ///
 /// The limits here are the ones that an application may need to change. The broker keeps its
 /// other limits internal, and they may change. The limits on retained messages and on the
@@ -35,7 +42,15 @@ public final class MqttBrokerBuilder {
     // so a setting that the application leaves alone keeps the broker's own value.
     private final BrokerServer.Builder settings = BrokerServer.builder();
 
-    private InetSocketAddress address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+    // Where the broker listens plain, and where with TLS; null for a listener that the
+    // application has not set.
+    private @Nullable InetSocketAddress address;
+
+    private @Nullable InetSocketAddress tlsAddress;
+
+    private @Nullable SSLContext sslContext;
+
+    private @Nullable Consumer<SSLParameters> sslParameters;
 
     // Whether an authenticator decides on the clients, or the application has allowed clients
     // without one; either lets the broker listen beyond the loopback address.
@@ -46,8 +61,10 @@ public final class MqttBrokerBuilder {
     MqttBrokerBuilder() {
     }
 
-    /// Listens at `value`, which must be resolved; port zero selects a port that the system
-    /// assigns. Defaults to the loopback address with a port that the system assigns. An address
+    /// Listens plain at `value`, which must be resolved; port zero selects a port that the system
+    /// assigns. Without this or [#listenTls(InetSocketAddress, SSLContext)], the broker listens
+    /// plain at the loopback address with a port that the system assigns; with
+    /// [#listenTls(InetSocketAddress, SSLContext)] alone, it listens with TLS alone. An address
     /// other than a loopback one, the wildcard address included, needs an [Authenticator] or
     /// [#allowAnonymous()].
     ///
@@ -56,12 +73,61 @@ public final class MqttBrokerBuilder {
     /// @return
     ///   this builder
     public MqttBrokerBuilder listen(InetSocketAddress value) {
+        address = resolved(value);
+        return this;
+    }
+
+    /// Listens with TLS at `address`, which must be resolved; port zero selects a port that the
+    /// system assigns. Every connection there takes an engine of `context`, which holds the
+    /// broker's key and the trust in client certificates, with the parameters that
+    /// [#sslParameters(Consumer)] sets. The TLS listener comes besides a plain one that
+    /// [#listen(InetSocketAddress)] sets, on another port, or alone. An address other than a
+    /// loopback one, the wildcard address included, needs an [Authenticator] or
+    /// [#allowAnonymous()], as for a plain listener: TLS authenticates the broker, and the
+    /// clients only through the certificates that the application has the broker ask for and
+    /// check.
+    ///
+    /// Initialize `context` before [#start()] and do not initialize it again while the broker
+    /// runs. The broker creates an engine of it for each connection, so key and trust managers
+    /// that change what they return, as for renewed certificates, take effect for the
+    /// connections that come afterwards.
+    ///
+    /// @param address
+    ///   the address to listen at with TLS
+    /// @param context
+    ///   the TLS context
+    /// @return
+    ///   this builder
+    public MqttBrokerBuilder listenTls(InetSocketAddress address, SSLContext context) {
+        tlsAddress = resolved(address);
+        sslContext = requireNonNull(context, "context");
+        return this;
+    }
+
+    /// Customizes the TLS parameters of the TLS listener once per [#start()], starting with the
+    /// context's defaults for a server. For example, `setNeedClientAuth(true)` requires a client
+    /// certificate that the context's trust manager accepts, and `setWantClientAuth(true)` asks
+    /// for one without requiring it. [#start()] checks the parameters on an engine of the
+    /// context, and a detached snapshot is used for every connection; custom algorithm
+    /// constraints and SNI matchers remain shared, so do not change those objects while the
+    /// broker runs. A later call replaces the customizer. Requires
+    /// [#listenTls(InetSocketAddress, SSLContext)].
+    ///
+    /// @param value
+    ///   the customizer of the TLS parameters
+    /// @return
+    ///   this builder
+    public MqttBrokerBuilder sslParameters(Consumer<SSLParameters> value) {
+        sslParameters = requireNonNull(value, "sslParameters");
+        return this;
+    }
+
+    private static InetSocketAddress resolved(InetSocketAddress value) {
         requireNonNull(value, "address");
         if (value.isUnresolved()) {
             throw new IllegalArgumentException("Address must be resolved: " + value);
         }
-        address = value;
-        return this;
+        return value;
     }
 
     /// Names the broker; see [MqttBroker#name()]. A name is a host name in lower case: labels of
@@ -286,21 +352,64 @@ public final class MqttBrokerBuilder {
     /// @return
     ///   the started broker
     /// @throws IOException
-    ///   if the listening socket cannot be opened
+    ///   if a listening socket cannot be opened
     /// @throws IllegalArgumentException
-    ///   if the address is not a loopback one and neither an [Authenticator] nor
-    ///   [#allowAnonymous()] is set
+    ///   if a listener's address is not a loopback one and neither an [Authenticator] nor
+    ///   [#allowAnonymous()] is set, if TLS parameters are set without a TLS listener, or if the
+    ///   TLS context or parameters cannot be used
     /// @throws IllegalStateException
     ///   if a running broker has the name that this builder gives
     public MqttBroker start() throws IOException {
-        InetAddress host = address.getAddress();
-        boolean loopback = host != null && host.isLoopbackAddress();
-        if (!loopback && !authenticated && !anonymousAllowed) {
+        InetSocketAddress secure = tlsAddress;
+        InetSocketAddress plain = address;
+        if (plain == null && secure == null) {
+            plain = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        }
+        boolean beyondLoopback = beyondLoopback(plain) || beyondLoopback(secure);
+        if (beyondLoopback && !authenticated && !anonymousAllowed) {
             throw new IllegalArgumentException(
                     "A broker that listens beyond the loopback address needs an authenticator"
                             + " or allowAnonymous()"
             );
         }
-        return MqttBroker.start(settings, address);
+        SSLContext context = sslContext;
+        if (secure == null || context == null) {
+            if (sslParameters != null) {
+                throw new IllegalArgumentException("TLS parameters need listenTls");
+            }
+        } else {
+            settings.listenTls(secure, context, serverParameters(context));
+        }
+        return MqttBroker.start(settings, plain);
+    }
+
+    private static boolean beyondLoopback(@Nullable InetSocketAddress address) {
+        if (address == null) {
+            return false;
+        }
+        InetAddress host = address.getAddress();
+        return host == null || !host.isLoopbackAddress();
+    }
+
+    // The parameters of every connection of the TLS listener: the context's defaults for a
+    // server, as the application's customizer changes them, checked on an engine of the context
+    // and read back, which detaches them from the customizer's object.
+    private SSLParameters serverParameters(SSLContext context) {
+        SSLEngine engine;
+        try {
+            engine = context.createSSLEngine();
+        } catch (IllegalStateException failure) {
+            // JSSE reports a context without init as an illegal state; here it is a setting to
+            // fix.
+            throw new IllegalArgumentException("Cannot initialize TLS configuration", failure);
+        }
+        engine.setUseClientMode(false);
+        SSLParameters parameters = engine.getSSLParameters();
+        Consumer<SSLParameters> customizer = sslParameters;
+        if (customizer != null) {
+            customizer.accept(parameters);
+        }
+        engine.setSSLParameters(parameters);
+        return engine.getSSLParameters();
     }
 }
