@@ -3,6 +3,7 @@ package org.mqtt4j.hato.broker.internal;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
+import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -55,6 +56,7 @@ import org.mqtt4j.hato.testsupport.Tls;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// The TLS listener: clients that exchange messages through it, beside the plain one or alone,
@@ -638,6 +640,59 @@ class BrokerTlsTest {
     // Runs `client`'s side of a handshake over `socket` until the engine has no more to do, as
     // a client does that has sent its last flight, or until the broker ends the handshake with
     // an alert or by closing the connection.
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_shutdown_frees_the_tls_port_at_once_and_ends_tls_with_close_notify(MqttVersion version)
+            throws Exception {
+        // Arrange: a TLS client that has yet to acknowledge a delivery, for which the shutdown
+        // waits.
+        try (MqttBroker broker = MqttBroker.builder()
+                .listen(loopback())
+                .listenTls(loopback(), Tls.serverContext())
+                .start();
+                RawSession app = RawSession.connected(broker.port(), "app");
+                var raw = new Socket(InetAddress.getLoopbackAddress(), broker.tlsPort())) {
+            var client = (SSLSocket) Tls.clientContext().getSocketFactory().createSocket(
+                    raw,
+                    "localhost",
+                    raw.getPort(),
+                    false
+            );
+            client.startHandshake();
+            try (RawSession robot = RawSession.over(client, version)) {
+                robot.send((version == MqttVersion.V5)
+                        ? RawSession.connectV5("robot", true, 0, 0)
+                        : RawSession.connect("robot", true, 0));
+                robot.expect(Packet.ConnAck.class);
+                robot.subscribe("orders", Qos.AT_LEAST_ONCE);
+                app.publish("orders", "go", Qos.AT_LEAST_ONCE, 1);
+                Packet.Publish order = robot.expect(Packet.Publish.class);
+                // Act
+                CompletableFuture<Boolean> shutdown = CompletableFuture.supplyAsync(
+                        () -> broker.shutdown(Duration.ofSeconds(5))
+                );
+                // Assert: the TLS port refuses connections while the broker waits for the robot,
+                // which then learns of the end: an MQTT 5.0 robot from DISCONNECT, and both from
+                // close_notify, the one record that comes before the end of the stream.
+                awaitRefused(broker.tlsPort());
+                robot.send(new Packet.PubAck(
+                        order.packetId(),
+                        ReasonCode.SUCCESS,
+                        Properties.EMPTY
+                ));
+                if (version == MqttVersion.V5) {
+                    assertThat(robot.expect(Packet.Disconnect.class).reasonCode())
+                            .isEqualTo(ReasonCode.SERVER_SHUTTING_DOWN);
+                }
+                raw.setSoTimeout(5_000);
+                byte[] rest = raw.getInputStream().readAllBytes();
+                assertThat(rest).hasSizeGreaterThan(5);
+                assertThat(rest).hasSize(5 + ((rest[3] & 0xff) << 8 | (rest[4] & 0xff)));
+                assertThat(shutdown).succeedsWithin(Duration.ofSeconds(5)).isEqualTo(true);
+            }
+        }
+    }
+
     private static void handshake(SSLEngine client, Socket socket) throws IOException {
         socket.setSoTimeout(5_000);
         var empty = ByteBuffer.allocate(0);
@@ -843,6 +898,16 @@ class BrokerTlsTest {
         } catch (IOException _) {
             // Closed with a failure.
         }
+    }
+
+    // Waits until nothing listens at `port` any more, as once the broker that listened there
+    // shuts down.
+    private static void awaitRefused(int port) {
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertThatThrownBy(() -> {
+            try (var socket = new Socket(InetAddress.getLoopbackAddress(), port)) {
+                socket.getInputStream();
+            }
+        }).isInstanceOf(ConnectException.class));
     }
 
     private static MqttMessage message(String topic, byte[] payload, Qos qos) {

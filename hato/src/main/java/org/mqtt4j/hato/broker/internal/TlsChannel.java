@@ -487,8 +487,9 @@ final class TlsChannel {
         sendLast();
     }
 
-    // Tells the client that the broker closes the connection, with close_notify, if the socket
-    // takes it at once; the connection closes either way. Called once the connection has ended.
+    // Tells the client that the broker sends no more, with close_notify, if the socket takes it
+    // at once; the output ends either way. Called as the connection ends its output, or once it
+    // has ended; a second call sends nothing.
     void close() {
         // The engine's methods take the lock that running delegated tasks hold.
         if (!delegated && !engine.isOutboundDone()) {

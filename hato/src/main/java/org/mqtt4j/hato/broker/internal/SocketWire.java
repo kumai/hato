@@ -172,6 +172,10 @@ final class SocketWire implements Wire {
 
     @Override
     public void endOutput() throws IOException {
+        if (tls != null) {
+            // TLS ends its output with close_notify, before the end of the TCP output.
+            tls.close();
+        }
         socket.getChannel().shutdownOutput();
     }
 
