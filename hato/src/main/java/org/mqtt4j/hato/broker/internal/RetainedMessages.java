@@ -111,6 +111,12 @@ final class RetainedMessages {
         noteExpiry(message);
     }
 
+    // How many messages the store keeps, as the retained limit counts them: a message whose
+    // lifetime has passed counts until the store finds it so.
+    int size() {
+        return messages.size();
+    }
+
     // Whether the retained limits have room for `message`.
     private boolean fits(Message message) {
         return messages.size() < maxCount && message.memory().bytes() <= maxBytes - bytes;

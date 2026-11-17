@@ -151,7 +151,8 @@ import static java.util.Objects.requireNonNull;
 /// ## Operation
 ///
 /// The [BrokerListener] hears of each client that the broker accepts, and of the end of its
-/// connection with the reason. [#disconnect(String)] closes the connection of a client.
+/// connection with the reason. [#disconnect(String)] closes the connection of a client, and
+/// [#stats()] counts the clients, sessions, retained messages, and deliveries.
 ///
 /// ## Ending
 ///
@@ -256,6 +257,15 @@ public final class MqttBroker implements AutoCloseable {
     public boolean disconnect(String clientId) {
         requireNonNull(clientId, "clientId");
         return server.disconnect(clientId);
+    }
+
+    /// Reads what the broker counts; see [BrokerStats]. It reads the counts without stopping the
+    /// broker's work, and works after the broker has ended too.
+    ///
+    /// @return
+    ///   the counts
+    public BrokerStats stats() {
+        return new BrokerStats(server.counts());
     }
 
     /// Observes the end of this broker without requesting it. The future completes once the

@@ -14,6 +14,8 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
@@ -106,6 +108,12 @@ final class Routing {
 
     // How many sessions the closing broker has yet to clear, on whatever thread has their turn.
     private final AtomicInteger clearing = new AtomicInteger();
+
+    // The deliveries that the limits have dropped, by QoS level, as the sessions log them, and
+    // the publications that the broker refused because they were outside their client's scope.
+    private final AtomicLongArray dropped = new AtomicLongArray(3);
+
+    private final AtomicLong refusedPublications = new AtomicLong();
 
     // Tells the application's listener, if there is one, of the clients that connect and
     // disconnect and of dropped QoS 1 and 2 deliveries.
@@ -456,6 +464,48 @@ final class Routing {
     // Frees the place of a session that ends, or stops outliving its connection.
     void freePersistentPlace() {
         persistentSessions.decrementAndGet();
+    }
+
+    // How many clients the broker serves now, as the client limit counts them.
+    int clients() {
+        return clients.get();
+    }
+
+    // How many sessions outlive their connection now, as the session limit counts them.
+    int persistentSessions() {
+        return persistentSessions.get();
+    }
+
+    // Counts `count` deliveries at QoS `level` that a session's limits have dropped.
+    void countDropped(int level, long count) {
+        if (count != 0) {
+            dropped.addAndGet(level, count);
+        }
+    }
+
+    // How many deliveries at QoS `level` the limits have dropped so far.
+    long dropped(int level) {
+        return dropped.get(level);
+    }
+
+    // Counts a publication that the broker refused because it is outside its client's scope.
+    void refusedPublication() {
+        refusedPublications.incrementAndGet();
+    }
+
+    long refusedPublications() {
+        return refusedPublications.get();
+    }
+
+    // How many deliveries wait in the sessions for their clients now.
+    // Ceiling: it visits every session under its inbox, so its time grows with the sessions; a
+    // count that the queues kept as they change would cost the delivery path instead.
+    long queuedDeliveries() {
+        long queued = 0;
+        for (Session session : sessions.values()) {
+            queued += session.queued();
+        }
+        return queued;
     }
 
     // Publishes `will` as its client would have published the message, from the session of

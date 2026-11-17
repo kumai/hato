@@ -37,6 +37,8 @@ final class InprocLoop implements Loop, InprocBrokers.Endpoint {
     // Ends the broker for the failure that ends this loop's thread.
     private final Consumer<Throwable> stopBroker;
 
+    private final Traffic traffic = new Traffic();
+
     private volatile boolean closed;
 
     InprocLoop(Routing routing, Consumer<Throwable> stopBroker) {
@@ -87,6 +89,11 @@ final class InprocLoop implements Loop, InprocBrokers.Endpoint {
     @Override
     public void execute(Connection connection, Runnable action) {
         enqueue(new Reactor.Task(connection, action));
+    }
+
+    @Override
+    public Traffic traffic() {
+        return traffic;
     }
 
     // Counts `connection` among the broker's connections, as a selector counts one that it

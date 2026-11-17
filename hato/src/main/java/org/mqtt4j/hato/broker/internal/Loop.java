@@ -15,4 +15,7 @@ sealed interface Loop permits Reactor, InprocLoop {
 
     // Runs `action` for `connection` on the loop's thread.
     void execute(Connection connection, Runnable action);
+
+    // What the loop counts of the PUBLISH packets that its connections read and write.
+    Traffic traffic();
 }

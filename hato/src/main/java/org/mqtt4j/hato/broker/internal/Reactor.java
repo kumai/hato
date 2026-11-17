@@ -33,6 +33,8 @@ final class Reactor implements Loop, AutoCloseable {
     // Ends the broker for the failure that ends this selector's thread.
     private final Consumer<Throwable> stopBroker;
 
+    private final Traffic traffic = new Traffic();
+
     private volatile boolean closed;
 
     Reactor(Routing routing, int index, Consumer<Throwable> stopBroker) throws IOException {
@@ -91,6 +93,11 @@ final class Reactor implements Loop, AutoCloseable {
     @Override
     public void execute(Connection connection, Runnable action) {
         enqueue(new Task(connection, action));
+    }
+
+    @Override
+    public Traffic traffic() {
+        return traffic;
     }
 
     private void enqueue(Task task) {

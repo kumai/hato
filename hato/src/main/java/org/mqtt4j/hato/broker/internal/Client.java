@@ -995,6 +995,7 @@ final class Client {
         // reaches no subscriber and is not retained. The broker keeps no receipt of a refused
         // QoS 2 publication, whose exchange ends with the refusal [MQTT-4.3.3-9].
         if (!scope.permitsPublish(publish.topic())) {
+            routing.refusedPublication();
             refuse(owner, publish, OUTSIDE_SCOPE);
             return;
         }

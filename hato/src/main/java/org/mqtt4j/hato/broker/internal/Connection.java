@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
@@ -116,6 +117,15 @@ final class Connection {
     // What the deliveries of the write in progress hold on the heap.
     private long writingMemory;
 
+    // The deliveries of the write in progress, by QoS level, and whether the write leaves them
+    // out: they count as delivered once the write completes with them.
+    private final int[] writingDeliveries = new int[3];
+
+    private boolean writingSkips;
+
+    // Where the loop counts the PUBLISH packets that it reads and writes.
+    private final Traffic traffic;
+
     private boolean writingLast;
 
     // Remaining state is guarded by this connection's monitor.
@@ -189,6 +199,7 @@ final class Connection {
         receiveTimeout = settings.connectTimeout();
         client = new Client(this, routing);
         loop = wire.loop();
+        traffic = loop.traffic();
     }
 
     @Nullable SocketAddress remoteAddress() {
@@ -414,6 +425,11 @@ final class Connection {
                 return true;
             }
             pending = arrival.packet();
+            if (pending instanceof Packet.Publish publish) {
+                traffic.received(publish.qos());
+            } else if (pending instanceof Packet.AliasPublish publish) {
+                traffic.received(publish.qos());
+            }
             settings.beforeProcess().accept(pending);
             log.debug("Broker received {} from {}",
                     pending.getClass().getSimpleName(), wire.peer());
@@ -634,6 +650,7 @@ final class Connection {
                     for (SendQueue.Send<Outbound> send : writing) {
                         if (send.value() instanceof Outbound.Publish publish) {
                             writingMemory += publish.delivery().memoryBytes;
+                            writingDeliveries[publish.delivery().qos.level()]++;
                         }
                     }
                 }
@@ -672,6 +689,7 @@ final class Connection {
                         }
                     }
                 }
+                writingSkips = skip;
                 wire.prepare(writing, skip, scheduler.nanoTime());
             }
         }
@@ -683,6 +701,10 @@ final class Connection {
             close("last packet written", null);
             return;
         }
+        if (!writingSkips) {
+            traffic.delivered(writingDeliveries);
+        }
+        Arrays.fill(writingDeliveries, 0);
         boolean resume;
         boolean more;
         Session owner;

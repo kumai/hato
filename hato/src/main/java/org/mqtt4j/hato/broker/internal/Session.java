@@ -211,10 +211,11 @@ final class Session {
     private @Nullable Connection waitingReader;
 
     // At most one log statement per session waits for the pool, even if many deliveries are
-    // dropped.
+    // dropped. It takes the deliveries dropped since the last one, by QoS level, to the log and
+    // to the broker's counts.
     private @Nullable String dropCause;
 
-    private long droppedCount;
+    private final long[] droppedByLevel = new long[3];
 
     // Where the session counts the QoS 1 and 2 deliveries that the limits keep from it, for the
     // application to hear of: the count that it got for the first of them since its client's
@@ -285,6 +286,14 @@ final class Session {
     // Whether the session has ended and left the session table.
     synchronized boolean hasEnded() {
         return ended;
+    }
+
+    // How many deliveries wait for the client: in the queues, and as the retained messages that
+    // the cursors of new subscriptions still hold.
+    synchronized int queued() {
+        return atMostOnceQueue.deliveries.size()
+                + acknowledgedQueue.deliveries.size()
+                + retainedRoom.count;
     }
 
     // Posts `event`, which the actor runs after those posted before. If the turn is free, the
@@ -1415,10 +1424,11 @@ final class Session {
     }
 
     // Records under the inbox that the broker's limits kept a delivery at `qos` from the
-    // session. The log statement runs without the inbox or topic lock. A QoS 1 or 2 delivery is
-    // also counted for the application, whose listener hears of the client's count on a thread
-    // of its own. The session adds to the count that it has; once the report has taken that
-    // one, or if it has none, it gets the next from the reports.
+    // session. The log statement runs without the inbox or topic lock, and adds what it logs to
+    // the broker's counts. A QoS 1 or 2 delivery is also counted for the application's listener,
+    // which hears of the client's count on a thread of its own. The session adds to the count
+    // that it has; once the report has taken that one, or if it has none, it gets the next from
+    // the reports.
     private void dropped(Qos qos, String cause) {
         Notices notices = routing.notices;
         if (qos != Qos.AT_MOST_ONCE && notices != null) {
@@ -1427,7 +1437,7 @@ final class Session {
                 unreported = notices.add(clientId);
             }
         }
-        droppedCount++;
+        droppedByLevel[qos.level()]++;
         if (dropCause == null && !routing.closed) {
             dropCause = cause;
             try {
@@ -1442,13 +1452,16 @@ final class Session {
 
     private void logDrops() {
         String cause;
-        long count;
+        long count = 0;
         boolean first;
         synchronized (this) {
             cause = requireNonNull(dropCause);
             dropCause = null;
-            count = droppedCount;
-            droppedCount = 0;
+            for (int level = 0; level < droppedByLevel.length; level++) {
+                count += droppedByLevel[level];
+                routing.countDropped(level, droppedByLevel[level]);
+                droppedByLevel[level] = 0;
+            }
             first = !dropLogged;
             dropLogged = true;
         }

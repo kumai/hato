@@ -1066,6 +1066,38 @@ public final class BrokerServer implements AutoCloseable {
         return routing.connectedClients();
     }
 
+    /// What the broker counts, for MqttBroker.stats(). Once the broker has ended, it holds
+    /// nothing, whatever its parts have yet to let go of, and its lifetime counts stay.
+    public Counts counts() {
+        var received = new long[3];
+        var delivered = new long[3];
+        for (Reactor reactor : routing.reactors) {
+            reactor.traffic().addTo(received, delivered);
+        }
+        routing.inproc.traffic().addTo(received, delivered);
+        var dropped = new long[3];
+        for (int level = 0; level < dropped.length; level++) {
+            dropped[level] = routing.dropped(level);
+        }
+        long retained;
+        synchronized (routing.retained) {
+            retained = routing.retained.size();
+        }
+        Notices notices = routing.notices;
+        boolean ended = routing.closed;
+        return new Counts(
+                ended ? 0 : routing.clients(),
+                ended ? 0 : routing.persistentSessions(),
+                ended ? 0 : retained,
+                ended ? 0 : routing.queuedDeliveries(),
+                received,
+                delivered,
+                dropped,
+                routing.refusedPublications(),
+                (notices == null) ? 0 : notices.droppedNotices()
+        );
+    }
+
     /// Ends the open connection of `clientId` for an administrative reason, which an MQTT 5.0
     /// client learns from DISCONNECT. The client did not disconnect, so its Will goes out as for
     /// a lost connection. Does nothing when the client has no open connection. Returns whether
@@ -1132,5 +1164,20 @@ public final class BrokerServer implements AutoCloseable {
 
     /// A response that a connection of `clientId` holds back.
     public record Held(String clientId, Packet response) {
+    }
+
+    /// What a broker counts: what it holds now, and lifetime counts, the arrays of which are by
+    /// QoS level. See MqttBroker.stats().
+    public record Counts(
+            long connections,
+            long persistentSessions,
+            long retainedMessages,
+            long queuedDeliveries,
+            long[] received,
+            long[] delivered,
+            long[] dropped,
+            long refusedPublications,
+            long droppedNotices
+    ) {
     }
 }
