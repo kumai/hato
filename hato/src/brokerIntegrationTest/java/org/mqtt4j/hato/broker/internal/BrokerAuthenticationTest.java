@@ -454,6 +454,53 @@ class BrokerAuthenticationTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_connect_that_finds_no_room_to_wait_is_refused_at_once(MqttVersion version)
+            throws Exception {
+        // Arrange: room for one decision, which waits until the test lets it go, and for two
+        // connections that wait for their CONNECT, as many CONNECTs as the queue holds. Two
+        // clients that wait past their deadline are refused, and their CONNECTs stay queued.
+        var deciding = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        Authenticator sut = _ -> {
+            deciding.countDown();
+            release.await();
+            return Authenticator.Decision.accept(Authenticator.Scope.all());
+        };
+        try (BrokerServer broker = BrokerServer.builder()
+                .authenticator(sut)
+                .maxAuthentications(1)
+                .maxAwaitingConnect(2)
+                .authenticationTimeout(Duration.ofMillis(200))
+                .start(loopback());
+                RawSession first = RawSession.open(broker.port(), MqttVersion.V5)) {
+            first.send(connect("first", MqttVersion.V5, null, null));
+            assertThat(deciding.await(5, SECONDS)).isTrue();
+            try {
+                for (String id : List.of("refused-1", "refused-2")) {
+                    try (RawSession refused = RawSession.open(broker.port(), MqttVersion.V5)) {
+                        refused.send(connect(id, MqttVersion.V5, null, null));
+                        assertThat(refused.expect(Packet.ConnAck.class).reasonCode())
+                                .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
+                    }
+                }
+                try (RawSession late = RawSession.open(broker.port(), version)) {
+                    // Act
+                    late.send(connect("late", version, null, null));
+                    // Assert: MQTT 3.1.1 has no return code for a busy server.
+                    assertThat(late.expect(Packet.ConnAck.class).reasonCode()).isEqualTo(
+                            (version == MqttVersion.V5)
+                                    ? ReasonCode.SERVER_BUSY
+                                    : ReasonCode.SERVER_UNAVAILABLE
+                    );
+                }
+            } finally {
+                release.countDown();
+            }
+        }
+    }
+
     @Test
     @SuppressWarnings("try") // The explicit close is what the test is about.
     void closing_the_broker_interrupts_a_decision_and_its_end_waits_for_it() throws Exception {

@@ -198,9 +198,11 @@ final class Client {
     // Asks the application's authenticator about the client `id` on the broker's authentication
     // pool, and admits the client if the decision accepts it in time. The connection's deadline
     // meanwhile is the decision's. A CONNECT that finds as many decisions running as the pool
-    // allows waits in the pool's queue, which the limit on the connections that wait for their
-    // CONNECT keeps from filling; one that still finds no room there, or no thread for another
-    // decision, is refused at once.
+    // allows waits in the pool's queue, and one that finds no room there, or no thread for
+    // another decision, is refused at once. The limit on the connections that wait for their
+    // CONNECT leaves room for all of them, but a CONNECT stays queued after its deadline has
+    // refused its client and freed its connection's place, until a thread takes it up:
+    // decisions that hold up every thread past the deadlines can fill the queue that way.
     private void authenticate(
             Authenticator authenticator,
             Packet.Connect request,

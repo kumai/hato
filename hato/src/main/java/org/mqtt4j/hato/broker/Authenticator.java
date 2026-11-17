@@ -28,6 +28,9 @@ import static java.util.Objects.requireNonNull;
 /// that is ignored. A CONNECT that comes while as many decisions run as the broker allows waits
 /// for one of them to end, and the wait counts toward that timeout: a client that is still
 /// waiting when the timeout runs out is refused with Server unavailable, without a decision.
+/// A CONNECT that finds no room to wait, as when the decisions fall so far behind that waiting
+/// clients run out of time, is refused at once, in MQTT 5.0 with Server busy and in MQTT 3.1.1
+/// with Server unavailable.
 ///
 /// The broker keeps the client's credentials out of its logs. [MqttBroker#close()] interrupts
 /// the decisions that are running, and [MqttBroker#terminated()] completes only once they have
