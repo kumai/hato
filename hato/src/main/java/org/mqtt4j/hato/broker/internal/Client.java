@@ -389,14 +389,19 @@ final class Client {
             Capabilities offered,
             long expiry
     ) {
-        if (routing.closed || connection.isEnded()) {
+        if (connection.isEnded()) {
             actor.leaveIfUnused();
             return false;
         }
         // A broker that began to shut down after the CONNECT came, while the authenticator
-        // decided or the acceptance waited for the actor, accepts the client no more.
+        // decided or the acceptance waited for the actor, accepts the client no more, and says
+        // so also once the shutdown has come to closing the broker.
         if (routing.stopping) {
             refuseWhileStopping(id);
+            actor.leaveIfUnused();
+            return false;
+        }
+        if (routing.closed) {
             actor.leaveIfUnused();
             return false;
         }

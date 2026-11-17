@@ -155,6 +155,10 @@ final class Connection {
     // unsupported protocol level uses the MQTT 3.1.1 form, which every client can read.
     private MqttVersion version = MqttVersion.V3_1_1;
 
+    // Whether the connection has received its CONNECT, which a shutdown that comes before the
+    // broker accepts the client answers.
+    private boolean connectReceived;
+
     boolean ended;
 
     // Whether the end of the connection has gone to its session, or found none attached.
@@ -348,8 +352,10 @@ final class Connection {
     }
 
     // Ends the connection as the broker shuts down. The broker gives no notice of it, as it
-    // closes: it is to end the connection after this. A connection whose client the broker has
-    // not accepted ends at once. Otherwise an MQTT 5.0 client receives DISCONNECT with Server
+    // closes: it is to end the connection after this. A client whose CONNECT the broker has yet
+    // to accept, such as one that waits for the authenticator's decision, receives CONNACK with
+    // Server unavailable, as one that connects during the shutdown does, and a connection
+    // without CONNECT ends at once. Otherwise an MQTT 5.0 client receives DISCONNECT with Server
     // shutting down after what waits to be written, deliveries aside, as for any end with a last
     // packet, and an MQTT 3.1.1 client the end of the output. Over a network, the connection
     // then waits for the client to close it (see endOutput).
@@ -357,11 +363,15 @@ final class Connection {
         if (ended || lastPacket != null) {
             return;
         }
+        lingering = !wire.inProcess();
         if (client.session == null) {
-            terminate("broker shut down", null);
+            if (connectReceived) {
+                refuse(ReasonCode.SERVER_UNAVAILABLE, "a client while the broker shuts down");
+            } else {
+                terminate("broker shut down", null);
+            }
             return;
         }
-        lingering = !wire.inProcess();
         switch (version) {
             case V5 -> closeAfter(
                     new Packet.Disconnect(ReasonCode.SERVER_SHUTTING_DOWN, Properties.EMPTY),
@@ -544,6 +554,7 @@ final class Connection {
                 var request = (Packet.Connect) arrival.packet();
                 synchronized (this) {
                     version = request.version();
+                    connectReceived = true;
                 }
                 settings.beforeProcess().accept(request);
                 connecting = true;

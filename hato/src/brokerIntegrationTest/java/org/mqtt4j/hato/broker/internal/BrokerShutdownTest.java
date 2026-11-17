@@ -12,6 +12,7 @@ import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import org.mqtt4j.hato.MqttClient;
@@ -36,6 +37,7 @@ import static org.mqtt4j.hato.ReasonCode.SERVER_SHUTTING_DOWN;
 import static org.mqtt4j.hato.ReasonCode.SERVER_UNAVAILABLE;
 import static org.mqtt4j.hato.ReasonCode.SUCCESS;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
+import static org.mqtt4j.hato.broker.internal.RawSession.connectV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
@@ -178,6 +180,41 @@ class BrokerShutdownTest {
             assertThat(late.expect(Packet.ConnAck.class).reasonCode())
                     .isEqualTo(SERVER_UNAVAILABLE);
             robot.send(new Packet.PubAck(order.packetId(), SUCCESS, EMPTY));
+            assertThat(shutdown).succeedsWithin(WAIT).isEqualTo(true);
+        } finally {
+            decide.countDown();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_client_whose_authentication_outlasts_the_shutdown_is_refused(MqttVersion version)
+            throws Exception {
+        // Arrange: the decision on the client waits until the test lets it go, and no other
+        // client keeps the shutdown from coming to its end.
+        var deciding = new CountDownLatch(1);
+        var decide = new CountDownLatch(1);
+        Authenticator holding = _ -> {
+            deciding.countDown();
+            decide.await();
+            return Authenticator.Decision.accept(Authenticator.Scope.all());
+        };
+        try (MqttBroker sut = MqttBroker.builder().authenticator(holding).start();
+                RawSession late = RawSession.open(sut.port(), version)) {
+            late.send(switch (version) {
+                case V3_1_1 -> connect("late", true, 0);
+                case V5 -> connectV5("late", true, 0, 0);
+            });
+            assertThat(deciding.await(5, SECONDS)).isTrue();
+
+            // Act
+            CompletableFuture<Boolean> shutdown = shutdownInBackground(sut, WAIT);
+
+            // Assert
+            assertThat(late.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(SERVER_UNAVAILABLE);
+            late.expectClosed();
+            late.close();
             assertThat(shutdown).succeedsWithin(WAIT).isEqualTo(true);
         } finally {
             decide.countDown();
