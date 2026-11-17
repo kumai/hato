@@ -1578,8 +1578,8 @@ final class Session {
 
     // Attaches `peer`, which a CONNECT accepted, and queues its CONNACK, so that publishers find
     // the connection only behind it. The session's timer stops, because a session with a
-    // connection neither expires nor has a Will waiting. Returns false if the connection's end
-    // has come already, and then did not reach the session.
+    // connection neither expires nor has a Will waiting. Returns false if the connection ends
+    // before its CONNACK, whose end the caller then hands to the session.
     boolean attach(Connection peer, Packet.ConnAck connAck) {
         cancelTimer();
         synchronized (this) {

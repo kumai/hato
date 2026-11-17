@@ -449,6 +449,7 @@ final class Client {
         // From here on this connection takes the session over. A failure on the way, as on an
         // OutOfMemoryError, ends this connection alone, and gives back what it took.
         Packet.Will waited;
+        boolean attached;
         try {
             if (previous != null) {
                 // The old peer ends before the session changes: its writer marks a delivery as
@@ -505,11 +506,13 @@ final class Client {
             };
             var connAck = new Packet.ConnAck(present, ReasonCode.SUCCESS, properties);
             settings.beforeAttach().accept(id);
-            if (actor.attach(connection, connAck)) {
+            attached = actor.attach(connection, connAck);
+            if (attached) {
                 tellConnected(id, request.version());
             } else {
-                // The connection ended before the session had it, so its end comes now, and the
-                // listener hears of neither.
+                // The connection ends before its CONNACK, as when it has ended already or a
+                // shutdown has refused the client meanwhile. The broker has not accepted the
+                // client, so the listener hears of neither, and the end comes to the session now.
                 actor.post(this::connectionEnded, Session.ALONE);
             }
         } catch (Throwable failure) {
@@ -533,7 +536,7 @@ final class Client {
         if (waited != null) {
             routing.publishWill(waited, actor);
         }
-        return true;
+        return attached;
     }
 
     // Settles what a takeover that failed before the session had this connection leaves of it.

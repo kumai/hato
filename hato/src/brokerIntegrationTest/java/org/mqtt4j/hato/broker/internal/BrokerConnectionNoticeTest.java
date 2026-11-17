@@ -5,6 +5,7 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -32,6 +33,7 @@ import static org.mqtt4j.hato.broker.BrokerListener.DisconnectReason.KEEP_ALIVE_
 import static org.mqtt4j.hato.broker.BrokerListener.DisconnectReason.PROTOCOL_ERROR;
 import static org.mqtt4j.hato.broker.BrokerListener.DisconnectReason.TAKEN_OVER;
 import static org.mqtt4j.hato.broker.internal.RawSession.connect;
+import static org.mqtt4j.hato.broker.internal.RawSession.connectV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 
@@ -256,6 +258,61 @@ class BrokerConnectionNoticeTest {
                 assertThat(next().connection().clientId()).isEqualTo("robot");
                 witness.ping();
             }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    @SuppressWarnings("try") // The test closes the client early; closing it again does nothing.
+    void the_listener_hears_nothing_of_a_client_that_a_shutdown_refuses_on_its_way_in(
+            MqttVersion version
+    ) throws Exception {
+        // Arrange: the acceptance of the client waits just before its session takes the
+        // connection, so that the shutdown comes to its end first and refuses the client.
+        var attaching = new CountDownLatch(1);
+        var attach = new CountDownLatch(1);
+        var left = new CountDownLatch(1);
+        BrokerServer.Builder waitingToAttach = BrokerServer.builder()
+                .listener(listener)
+                .beforeAttach(_ -> {
+                    attaching.countDown();
+                    try {
+                        // The wait has a limit, so that a test that fails cannot hold the actor
+                        // for good; whether it was released or the limit came makes no
+                        // difference here.
+                        boolean _ = attach.await(WAIT.toSeconds(), SECONDS);
+                    } catch (InterruptedException _) {
+                        Thread.currentThread().interrupt();
+                    }
+                })
+                .afterLeave(_ -> left.countDown());
+        try (BrokerServer sut = waitingToAttach.start(loopback());
+                RawSession late = RawSession.open(sut.port(), version)) {
+            late.send(switch (version) {
+                case V3_1_1 -> connect("late", true, 0);
+                case V5 -> connectV5("late", true, 0, 0);
+            });
+            assertThat(attaching.await(WAIT.toSeconds(), SECONDS)).isTrue();
+            // The shutdown cannot settle the session while its acceptance waits, so it comes to
+            // its end at its deadline.
+            var delivered = new CompletableFuture<Boolean>();
+            Thread.ofPlatform().start(
+                    () -> delivered.complete(sut.shutdown(Duration.ofMillis(100)))
+            );
+            assertThat(late.expect(Packet.ConnAck.class).reasonCode())
+                    .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
+
+            // Act
+            attach.countDown();
+
+            // Assert: the session lets the connection go, and the listener heard nothing of it.
+            assertThat(left.await(WAIT.toSeconds(), SECONDS)).isTrue();
+            assertThat(heard).isEmpty();
+            late.expectClosed();
+            late.close();
+            assertThat(delivered).succeedsWithin(WAIT).isEqualTo(false);
+        } finally {
+            attach.countDown();
         }
     }
 

@@ -1188,12 +1188,17 @@ final class Connection {
     }
 
     // Has the connection's client belong to `session`, whose actor accepted the CONNECT, and
-    // queues `connAck`. Returns false if the connection's end has come already and found no
-    // session. Called under the session's inbox.
+    // queues `connAck`. Returns false if the connection ends before its CONNACK: it has ended
+    // already, or ends with another last packet, such as the refusal of a shutdown that came
+    // meanwhile. The caller then hands the end to the session at once, so the end itself hands
+    // over nothing when it comes. Called under the session's inbox.
     synchronized boolean attach(Session session, Packet.ConnAck connAck) {
         client.session = session;
-        enqueue(connAck);
-        return !endHandled;
+        if (enqueue(connAck)) {
+            return true;
+        }
+        endHandled = true;
+        return false;
     }
 
     // Ends the connection for a failure in handling one of its packets, as the reader ends it for
