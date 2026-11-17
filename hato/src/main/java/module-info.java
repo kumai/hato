@@ -1,6 +1,5 @@
 /// The Hato client and embedded broker. Applications see only the exported packages; everything
-/// else is internal and may change without notice. The broker's package is experimental and
-/// outside the API compatibility promise.
+/// else is internal and may change without notice.
 @SuppressWarnings("module") // Exports to the testkit, which this module cannot see.
 module org.mqtt4j.hato {
     // Nullness annotations are compile-time only. Never 'transitive': that would force module-path
