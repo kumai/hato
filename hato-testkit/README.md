@@ -151,4 +151,4 @@ try (MqttBroker broker = MqttBroker.start()) {
   response before checking the result.
 
 `BrokerControls`, `BrokerCapabilities`, `BrokerReason`, `ResponseKind`, and
-`HeldResponse` are experimental, like the broker that they control.
+`HeldResponse` are experimental and outside the compatibility promise.

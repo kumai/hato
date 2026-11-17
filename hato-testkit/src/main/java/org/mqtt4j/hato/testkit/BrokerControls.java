@@ -13,8 +13,8 @@ import static java.util.Objects.requireNonNull;
 /// Experimental test controls for an embedded broker: rules that refuse publications,
 /// subscriptions, or connections, or grant subscriptions a lower QoS, responses held back until
 /// the test releases them, the capabilities that the broker announces to MQTT 5.0 clients, and
-/// the clients connected now, which the test can disconnect. Like the broker API, the controls
-/// are outside the compatibility promise until productization.
+/// the clients connected now, which the test can disconnect. The controls are outside the
+/// compatibility promise.
 ///
 /// The test starts and closes the broker through the broker's own API, and the controls act on
 /// it; the controls that [#of(MqttBroker)] returns for one broker share its state. Each method
