@@ -156,12 +156,17 @@ public final class BrokerServer implements AutoCloseable {
     private static final int MAX_AUTHENTICATIONS = 16;
 
     // How many threads run the delegated tasks of TLS handshakes at once: the costly part of a
-    // handshake, about a millisecond and a half of a processor each for an RSA key of 2048 bits,
-    // and the calls into the application's key and trust managers.
-    // Ceiling: unmeasured under a crowd of clients that connect at once with TLS, which waits for
-    // these threads; the numbers worth comparing are one, two, the processors, and as many as
-    // the decisions of the authenticator take.
-    private static final int MAX_TLS_TASKS = 4;
+    // handshake, about two milliseconds of a processor each with an RSA key of 2048 bits and a
+    // client certificate, and the calls into the application's key and trust managers. One
+    // leaves the other processors to the clients already connected while a crowd reconnects
+    // with TLS. With 10,000 clients reconnecting beside 200 that publish, on two processors,
+    // more threads let the slowest waits of those 200 pass a second near the end of the crowd,
+    // for a crowd that got in a fifth sooner at most; on one processor, every number tried left
+    // them waiting for seconds, and one the least.
+    // Ceiling: the handshakes of a crowd take turns on this thread, about 500 a second on any
+    // machine, and behind a key or trust manager that waits, as for a revocation check; more
+    // threads, or a setting for them, would lift that. More than two processors are unmeasured.
+    private static final int MAX_TLS_TASKS = 1;
 
     // How long the accepting thread waits before it tries again after a connection could not
     // be accepted. The cause, such as a process without a free file descriptor, lasts until
