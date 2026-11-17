@@ -1932,6 +1932,7 @@ final class Session {
             ended = true;
         }
         routing.sessions.remove(clientId, this);
+        settings.afterLeave().accept(clientId);
     }
 
     // Drops the session state, the Will that waits with it and the timer included, which leaves

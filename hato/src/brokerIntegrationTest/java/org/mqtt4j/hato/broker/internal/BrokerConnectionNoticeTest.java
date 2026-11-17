@@ -5,6 +5,7 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import org.jspecify.annotations.Nullable;
@@ -19,6 +20,7 @@ import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.BrokerListener.DisconnectReason;
 import org.mqtt4j.hato.internal.protocol.Packet;
+import org.mqtt4j.hato.internal.protocol.Properties;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -126,6 +128,57 @@ class BrokerConnectionNoticeTest {
                 first.expectClosed();
                 second.ping();
             }
+        }
+    }
+
+    @Test
+    void the_end_of_a_session_comes_before_the_next_connection_of_its_client() throws Exception {
+        // Arrange: the actor of a session that ends with its connection waits once the session
+        // has left the session table, while the client's next connection reaches a new actor on
+        // the other actor thread.
+        var left = new CountDownLatch(1);
+        var resume = new CountDownLatch(1);
+        BrokerServer.Builder waitingAfterLeaving = BrokerServer.builder()
+                .listener(listener)
+                .actors(2)
+                .afterLeave(_ -> {
+                    if (left.getCount() == 0) {
+                        return;
+                    }
+                    left.countDown();
+                    try {
+                        // The wait has a limit, so that a test that fails cannot hold the actor
+                        // for good; whether it was released or the limit came makes no
+                        // difference here.
+                        boolean _ = resume.await(WAIT.toSeconds(), SECONDS);
+                    } catch (InterruptedException _) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+        try (BrokerServer sut = waitingAfterLeaving.start(loopback());
+                RawSession first = connectedV5(sut.port(), "robot")) {
+            Heard firstConnected = next();
+            // The broker closes the socket only after the actor has let go, so the test waits for
+            // the session to leave rather than for the close.
+            first.send(new Packet.Disconnect(ReasonCode.SUCCESS, Properties.EMPTY));
+            assertThat(left.await(WAIT.toSeconds(), SECONDS)).isTrue();
+
+            // Act
+            try (RawSession second = connectedV5(sut.port(), "robot")) {
+                resume.countDown();
+
+                // Assert
+                Heard firstEnded = next();
+                Heard secondConnected = next();
+                assertThat(firstEnded.connection()).isSameAs(firstConnected.connection());
+                assertThat(firstEnded.reason()).isEqualTo(CLIENT_DISCONNECT);
+                assertThat(secondConnected.connection()).isNotSameAs(firstConnected.connection());
+                assertThat(secondConnected.reason()).isNull();
+                first.expectClosed();
+                second.ping();
+            }
+        } finally {
+            resume.countDown();
         }
     }
 

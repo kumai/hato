@@ -356,6 +356,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private Consumer<String> beforeAttach = _ -> { };
 
+        private Consumer<String> afterLeave = _ -> { };
+
         private Runnable beforeAcceptingStarts = () -> { };
 
         private Builder() {
@@ -559,6 +561,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder afterLeave(Consumer<String> value) {
+            afterLeave = requireNonNull(value, "afterLeave must not be null");
+            return this;
+        }
+
         Builder beforeAcceptingStarts(Runnable value) {
             beforeAcceptingStarts = requireNonNull(value, "beforeAcceptingStarts must not be null");
             return this;
@@ -651,6 +658,7 @@ public final class BrokerServer implements AutoCloseable {
                     beforeAccept,
                     beforeHandOver,
                     beforeAttach,
+                    afterLeave,
                     beforeAcceptingStarts
             );
             // The name first, so that a broker whose name another one holds binds no port.

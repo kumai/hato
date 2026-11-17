@@ -1167,10 +1167,11 @@ final class Client {
         return filter.pattern().contains("+") || filter.pattern().contains("#");
     }
 
-    // Detaches the session from the connection, which has ended, sets the session's timer, and
-    // publishes the Will. A Will with a delay waits with the session instead when the session
-    // outlives the connection, and never goes out when another connection has already continued
-    // the session [MQTT-3.1.3-9]. Runs on the actor, once the connection's end reaches it.
+    // Tells the listener of the end, detaches the session from the connection, which has ended,
+    // sets the session's timer, and publishes the Will. A Will with a delay waits with the
+    // session instead when the session outlives the connection, and never goes out when another
+    // connection has already continued the session [MQTT-3.1.3-9]. Runs on the actor, once the
+    // connection's end reaches it.
     void connectionEnded() {
         Session owner = session;
         if (owner == null) {
@@ -1180,8 +1181,11 @@ final class Client {
             holdsPlace = false;
             routing.freeClientPlace();
         }
-        owner.detach(connection);
+        // The listener hears of the end first: a session that ends with its connection leaves
+        // the session table as it detaches, and a CONNECT for the identifier then makes a new
+        // actor, which could otherwise tell of the next connection before this end.
         tellEnded();
+        owner.detach(connection);
         Packet.Will last = will;
         long delay = (last == null) ? 0 : delayOf(last);
         if (last != null && delay > 0 && routing.sessions.get(owner.clientId) == owner) {
