@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker;
 
+import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
@@ -86,6 +87,15 @@ class MqttBrokerBuilderTest {
                 .authenticationTimeout(Duration.ofMillis(1))
                 .authenticationTimeout(Duration.ofMillis(Integer.MAX_VALUE))
         ).doesNotThrowAnyException();
+    }
+
+    @Test
+    void rejects_an_unresolved_address_at_once() {
+        // Arrange
+        MqttBrokerBuilder sut = MqttBroker.builder();
+        // Act & Assert
+        assertThatThrownBy(() -> sut.listen(InetSocketAddress.createUnresolved("localhost", 0)))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @ParameterizedTest

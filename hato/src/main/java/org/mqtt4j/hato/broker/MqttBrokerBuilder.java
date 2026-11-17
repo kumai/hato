@@ -45,16 +45,21 @@ public final class MqttBrokerBuilder {
     MqttBrokerBuilder() {
     }
 
-    /// Listens at `value`; port zero selects a port that the system assigns. Defaults to the
-    /// loopback address with a port that the system assigns. An address other than a loopback
-    /// one, the wildcard address included, needs an [Authenticator] or [#allowAnonymous()].
+    /// Listens at `value`, which must be resolved; port zero selects a port that the system
+    /// assigns. Defaults to the loopback address with a port that the system assigns. An address
+    /// other than a loopback one, the wildcard address included, needs an [Authenticator] or
+    /// [#allowAnonymous()].
     ///
     /// @param value
     ///   the address to listen at
     /// @return
     ///   this builder
     public MqttBrokerBuilder listen(InetSocketAddress value) {
-        address = requireNonNull(value, "address");
+        requireNonNull(value, "address");
+        if (value.isUnresolved()) {
+            throw new IllegalArgumentException("Address must be resolved: " + value);
+        }
+        address = value;
         return this;
     }
 
