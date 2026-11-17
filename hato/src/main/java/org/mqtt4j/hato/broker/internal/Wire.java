@@ -48,6 +48,17 @@ sealed interface Wire permits SocketWire, MemoryWire {
     // the end of the input.
     int read() throws IOException;
 
+    // Has the loop's next look at the connection read, whether or not the loop has seen input
+    // arrive since the last read.
+    void expectInput();
+
+    // Ends the output, after the writes so far, while the input goes on.
+    void endOutput() throws IOException;
+
+    // Takes in what has arrived and drops it. Returns how much, 0 if nothing, or -1 at the end
+    // of the input.
+    int discard() throws IOException;
+
     // Refuses the packets from now on that are larger than `maximumPacketSize`.
     void limit(int maximumPacketSize);
 
@@ -58,7 +69,8 @@ sealed interface Wire permits SocketWire, MemoryWire {
     // deliveries out when `skip`.
     void prepare(List<SendQueue.Send<Outbound>> sends, boolean skip, long now);
 
-    // Prepares the write of the last packet, after which the connection closes.
+    // Prepares the write of the last packet, after which the connection closes; nothing for the
+    // end of the output without a packet.
     void prepareLast(Outbound last);
 
     // Whether some of the prepared write has yet to go out.

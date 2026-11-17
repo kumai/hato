@@ -133,6 +133,28 @@ final class SocketWire implements Wire {
     }
 
     @Override
+    public void expectInput() {
+        readable = true;
+    }
+
+    @Override
+    public void endOutput() throws IOException {
+        socket.getChannel().shutdownOutput();
+    }
+
+    @Override
+    public int discard() throws IOException {
+        input.clear();
+        int count;
+        try {
+            count = socket.getChannel().read(input);
+        } finally {
+            input.clear().flip();
+        }
+        return count;
+    }
+
+    @Override
     public void limit(int maximumPacketSize) {
         frames.limit(maximumPacketSize);
     }
@@ -157,7 +179,7 @@ final class SocketWire implements Wire {
                         parts.add(delivery.payload());
                     }
                 }
-                case Outbound.Plain _ -> throw new IllegalStateException(
+                case Outbound.Plain _, Outbound.End _ -> throw new IllegalStateException(
                         "A socket queues every packet encoded"
                 );
             }
@@ -167,10 +189,13 @@ final class SocketWire implements Wire {
 
     @Override
     public void prepareLast(Outbound last) {
-        if (!(last instanceof Outbound.Encoded(var bytes))) {
-            throw new IllegalStateException("A last packet is queued encoded: " + last);
-        }
-        writingParts = new ByteBuffer[] {ByteBuffer.wrap(bytes)};
+        writingParts = switch (last) {
+            case Outbound.Encoded(var bytes) -> new ByteBuffer[] {ByteBuffer.wrap(bytes)};
+            case Outbound.End _ -> new ByteBuffer[0];
+            case Outbound.Plain _, Outbound.Publish _ -> throw new IllegalStateException(
+                    "A last packet is queued encoded: " + last
+            );
+        };
     }
 
     @Override

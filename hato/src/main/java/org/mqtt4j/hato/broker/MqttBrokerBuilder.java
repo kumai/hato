@@ -27,8 +27,9 @@ public final class MqttBrokerBuilder {
 
     private static final int MAX_PACKET_SIZE = 268_435_460;
 
-    // The longest wait that a setting may give, as for the client's timeouts.
-    private static final Duration MAX_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
+    // The longest wait that a setting may give, as for the client's timeouts, and that
+    // MqttBroker.shutdown takes.
+    static final Duration MAX_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
 
     // The internal settings that this builder fills in. They hold the defaults of every limit,
     // so a setting that the application leaves alone keeps the broker's own value.

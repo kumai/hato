@@ -288,6 +288,25 @@ final class Session {
         return ended;
     }
 
+    // Whether no thread runs the session's events and none is to. What only the actor touches
+    // is then as the last turn left it, which handed it over as it let go of the turn under the
+    // inbox, and it stays so while the caller holds the inbox, which taking the turn needs.
+    synchronized boolean idle() {
+        return runner == null && !turnQueued && events.isEmpty();
+    }
+
+    // Whether the session is idle and has nothing for its client: no delivery or retained
+    // message waits to go out, and none that went out awaits the client's answer. As the
+    // session is idle, reading its window, which only the actor touches, is safe here.
+    synchronized boolean settled() {
+        return idle()
+                && atMostOnceQueue.deliveries.isEmpty()
+                && acknowledgedQueue.deliveries.isEmpty()
+                && cursors.isEmpty()
+                && inflight.isEmpty()
+                && deferred.isEmpty();
+    }
+
     // How many deliveries wait for the client: in the queues, and as the retained messages that
     // the cursors of new subscriptions still hold.
     synchronized int queued() {

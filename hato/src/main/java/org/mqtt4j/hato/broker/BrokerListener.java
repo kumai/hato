@@ -17,7 +17,8 @@ import org.mqtt4j.hato.MqttVersion;
 /// listener can follow which clients are connected. While the listener falls behind, the broker
 /// holds these notices up to an internal limit, beyond which it drops the oldest one that the
 /// listener has yet to hear of. The broker gives no notice of the connections that its own end
-/// closes: those that [MqttBroker#close()] closes, and those that an internal failure ends.
+/// closes: those that [MqttBroker#close()] closes, those that a shutdown closes as it ends (see
+/// [MqttBroker#shutdown(java.time.Duration)]), and those that an internal failure ends.
 ///
 /// Listener exceptions are logged and do not affect the broker. Interrupt status left by a call
 /// is cleared before the next call.

@@ -104,6 +104,23 @@ final class Connection {
 
     private boolean disposed;
 
+    // Whether the broker shuts down, which has the connection read the input that has arrived,
+    // and whether it has: once a read found nothing more, or once it ended. The selector sets
+    // both; the thread that shuts the broker down reads the second.
+    private boolean catchingUp;
+
+    private volatile boolean caughtUp;
+
+    // Whether the connection waits, after its last packet, for the client to close it, which
+    // only a shutdown of the broker has a connection do; guarded by this. Then whether its output
+    // has ended, after which it drops what the client still sends (see endOutput), and whether
+    // the write in progress is the last packet of such a connection; the selector's.
+    private boolean lingering;
+
+    private boolean outputEnded;
+
+    private boolean writingLastLingers;
+
     private @Nullable Packet pending;
 
     private boolean pendingAnswered;
@@ -248,6 +265,10 @@ final class Connection {
             dispose();
             return;
         }
+        if (outputEnded) {
+            discardInput();
+            return;
+        }
         if (writeFailure != null) {
             handOverLastInput();
         } else if (!ioFailed) {
@@ -256,6 +277,11 @@ final class Connection {
             } catch (IOException failure) {
                 writeFailed(failure);
             }
+        }
+        if (outputEnded) {
+            // The last packet has just gone out: from now on, the connection reads only to drop
+            // what the client still sends (see endOutput).
+            return;
         }
         try {
             if (!ioFailed && !isEnded() && !connecting && !readClosed && resumePending()
@@ -271,6 +297,120 @@ final class Connection {
                 !isEnded() && !connecting && !readClosed && pending == null,
                 !ioFailed && wire.writing()
         );
+        if (catchingUp && !caughtUp) {
+            catchUpOrReadOn();
+        }
+    }
+
+    // Has the connection read the input that has arrived by now, as the broker begins to shut
+    // down: the broker delivers what that input asks for before it ends (see
+    // BrokerServer.shutdown). Runs on the loop.
+    void catchUp() {
+        catchingUp = true;
+        // The loop may not have seen the input arrive yet.
+        wire.expectInput();
+        ready();
+    }
+
+    // Notes that the connection has read the input that had arrived as the shutdown began, once
+    // a read finds nothing more or the connection has ended, and otherwise has the loop come
+    // back to read on: a read takes a part of what waits. A packet that waits for its session or
+    // for the CONNECT's acceptance keeps the connection from reading until that is done, which
+    // brings the loop back here.
+    private void catchUpOrReadOn() {
+        if (isEnded() || readClosed || ioFailed) {
+            caughtUp = true;
+        } else if (!connecting && pending == null) {
+            if (wire.inputWaiting()) {
+                loop.schedule(this);
+            } else {
+                caughtUp = true;
+            }
+        }
+    }
+
+    // Whether the connection has read the input that had arrived as the broker began to shut
+    // down; see catchUp().
+    boolean caughtUp() {
+        return caughtUp;
+    }
+
+    // Whether the connection is still to take deliveries: it has not ended, is not about to,
+    // and can still write.
+    synchronized boolean takesDeliveries() {
+        return !ended && lastPacket == null && !outputFailed;
+    }
+
+    // Whether everything that the connection had to send has been written: nothing waits in
+    // its send queue, nothing is being written, and no response that a test released waits.
+    synchronized boolean sentAll() {
+        return writing.isEmpty() && !outgoing.hasReady() && released.isEmpty();
+    }
+
+    // Ends the connection as the broker shuts down. The broker gives no notice of it, as it
+    // closes: it is to end the connection after this. A connection whose client the broker has
+    // not accepted ends at once. Otherwise an MQTT 5.0 client receives DISCONNECT with Server
+    // shutting down after what waits to be written, deliveries aside, as for any end with a last
+    // packet, and an MQTT 3.1.1 client the end of the output. Over a network, the connection
+    // then waits for the client to close it (see endOutput).
+    synchronized void shutDown() {
+        if (ended || lastPacket != null) {
+            return;
+        }
+        if (client.session == null) {
+            terminate("broker shut down", null);
+            return;
+        }
+        lingering = !wire.inProcess();
+        switch (version) {
+            case V5 -> closeAfter(
+                    new Packet.Disconnect(ReasonCode.SERVER_SHUTTING_DOWN, Properties.EMPTY),
+                    "broker shut down",
+                    null
+            );
+            case V3_1_1 -> {
+                if (lingering) {
+                    closeAfter(new Outbound.End(), "broker shut down", null);
+                } else {
+                    terminate("broker shut down", null);
+                }
+            }
+        }
+    }
+
+    // Ends the output once the last packet is written, and waits for the client to close the
+    // connection, taking in and dropping what it still sends. A socket that closes while input
+    // that has arrived lies unread resets the connection, which can lose what the client has
+    // yet to read: the deliveries before the last packet, and that packet. The end of the
+    // broker closes the connection if the client does not.
+    private void endOutput() {
+        outputEnded = true;
+        try {
+            wire.endOutput();
+        } catch (IOException failure) {
+            close(failureReason("I/O", failure), null);
+            return;
+        }
+        discardInput();
+    }
+
+    // Takes in and drops what the client sends after the end of the output, until it closes the
+    // connection.
+    private void discardInput() {
+        try {
+            int read;
+            do {
+                read = wire.discard();
+            } while (read > 0);
+            if (read < 0) {
+                close("closed by the client after the end", null);
+                return;
+            }
+        } catch (IOException failure) {
+            close(failureReason("I/O", failure), null);
+            return;
+        }
+        wire.interest(true, false);
     }
 
     private synchronized boolean terminated() {
@@ -642,6 +782,7 @@ final class Connection {
         // batches requeue the connection; zero-byte writes wait only for OP_WRITE.
         if (!wire.writing()) {
             Outbound last;
+            boolean lingers;
             synchronized (this) {
                 // A write that a test keeps back still has the sends that it took.
                 if (writing.isEmpty()) {
@@ -658,6 +799,7 @@ final class Connection {
                     return;
                 }
                 last = lastPacket;
+                lingers = lingering;
             }
             if (writing.isEmpty()) {
                 if (last == null) {
@@ -665,6 +807,7 @@ final class Connection {
                 }
                 wire.prepareLast(last);
                 writingLast = true;
+                writingLastLingers = lingers;
             } else {
                 // Every delivery holds something.
                 boolean delivers = writingMemory > 0;
@@ -697,8 +840,12 @@ final class Connection {
             return;
         }
         if (writingLast) {
-            // The connection's end has its reason since the last packet was queued.
-            close("last packet written", null);
+            if (writingLastLingers) {
+                endOutput();
+            } else {
+                // The connection's end has its reason since the last packet was queued.
+                close("last packet written", null);
+            }
             return;
         }
         if (!writingSkips) {
@@ -793,7 +940,15 @@ final class Connection {
         if (ended || lastPacket != null) {
             return;
         }
-        Outbound last = wire.queued(packet, version);
+        closeAfter(wire.queued(packet, version), reason, kind);
+    }
+
+    // Ends the connection with `last`, a packet as it waits to be written or the end of the
+    // output without one, after the sends that wait. Called under the connection monitor.
+    private void closeAfter(Outbound last, String reason, @Nullable DisconnectReason kind) {
+        if (ended || lastPacket != null) {
+            return;
+        }
         // The connect timeout bounds the wait for a writer that a slow peer holds up.
         cancelTimer();
         try {

@@ -52,9 +52,10 @@ final class Reactor implements Loop, AutoCloseable {
     }
 
     // Seals registration with close(), so even a peer whose registration task has not
-    // run yet is visible to the selector's shutdown.
+    // run yet is visible to the selector's shutdown. A broker that shuts down takes no
+    // further connection either.
     synchronized boolean register(Connection connection, SocketWire wire) {
-        if (closed || routing.closed) {
+        if (closed || routing.closed || routing.stopping) {
             return false;
         }
         routing.connections.add(connection);

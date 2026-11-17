@@ -155,6 +155,10 @@ final class Routing {
 
     volatile boolean closed;
 
+    // Set as a shutdown begins (see BrokerServer.shutdown): the broker takes no further
+    // connection and accepts no further client, while it serves those that it has.
+    volatile boolean stopping;
+
     // `stopBroker` ends the broker for the failure of a selector, and `placeFreed` wakes the
     // accepting thread as a connection stops waiting for its CONNECT.
     Routing(

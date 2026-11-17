@@ -13,7 +13,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -154,6 +156,17 @@ public final class BrokerServer implements AutoCloseable {
     // something else in the process gives way, so trying at once would only spin.
     private static final long ACCEPT_RETRY_MILLIS = 100;
 
+    // How long a shutdown waits between its looks at whether the clients have what waits for
+    // them: briefly at first, as a broker with little to deliver soon has, then longer.
+    private static final long FIRST_LOOK_NANOS = 1_000_000;
+
+    private static final long LAST_LOOK_NANOS = 16_000_000;
+
+    // How long a shutdown gives the clients to close their connections once they have learned
+    // of its end, whether or not its deadline has passed. A client closes as it reads the end,
+    // so only one that has stopped reading takes this long.
+    private static final long CLOSING_NANOS = 1_000_000_000;
+
     private final ServerSocketChannel listener;
 
     // The name that the broker holds while it runs.
@@ -178,6 +191,14 @@ public final class BrokerServer implements AutoCloseable {
     // Whether the accepting thread has told yet that it waits for a place among the connections
     // that wait for their CONNECT. Only that thread uses it.
     private boolean waitedForPlace;
+
+    // The result of the shutdown, once one has begun: whether the clients had what waited for
+    // them. Guarded by this.
+    private @Nullable CompletableFuture<Boolean> shutdown;
+
+    // Set by close(), and by an interrupt of a caller that waits for a shutdown, to have a
+    // shutdown end the broker at once.
+    private volatile boolean cutShort;
 
     private BrokerServer(
             ServerSocketChannel listener,
@@ -738,10 +759,14 @@ public final class BrokerServer implements AutoCloseable {
                 }
             }
         } catch (Throwable failure) {
-            if (!routing.closed) {
-                log.error("Broker listener on port {} failed", port(), failure);
+            // A shutdown closes the listener as close() does, which ends this thread without a
+            // failure of the broker's.
+            if (!routing.stopping) {
+                if (!routing.closed) {
+                    log.error("Broker listener on port {} failed", port(), failure);
+                }
+                fail(failure);
             }
-            fail(failure);
         } finally {
             routing.termination.partEnded();
         }
@@ -846,10 +871,176 @@ public final class BrokerServer implements AutoCloseable {
             first = !routing.closed;
             routing.closed = true;
         }
+        // A shutdown that waits for its clients to close ends the broker at once.
+        cutShort = true;
         if (first) {
             end();
         }
         awaitThreads();
+    }
+
+    /// Shuts the broker down, as MqttBroker.shutdown(Duration) describes: returns once the
+    /// broker has closed, and whether the clients that were connected had what waited for them
+    /// within `timeout`.
+    public boolean shutdown(Duration timeout) {
+        CompletableFuture<Boolean> result;
+        boolean first;
+        synchronized (this) {
+            if (shutdown == null && routing.closed) {
+                return false;
+            }
+            first = shutdown == null;
+            if (first) {
+                shutdown = new CompletableFuture<>();
+                routing.stopping = true;
+            }
+            result = requireNonNull(shutdown);
+        }
+        if (!first) {
+            return awaitShutdown(result);
+        }
+        boolean delivered = false;
+        try {
+            delivered = shutDown(System.nanoTime() + timeout.toNanos());
+        } catch (RuntimeException | Error failure) {
+            // A broker that takes no further client must not stay so: it ends as close() ends it.
+            close();
+            throw failure;
+        } finally {
+            result.complete(delivered);
+        }
+        return delivered;
+    }
+
+    // Shuts the broker down by `deadline`, and returns whether the clients that were connected
+    // had what waited for them by then. The broker takes no further connection: it frees its
+    // name and its port at once, and its clients refuse a CONNECT that comes now (see Client).
+    // It goes on serving the clients that it has, and has each connection read what has arrived
+    // by now, which they sent before the shutdown and is theirs to have delivered. Once they
+    // have it all, or at the deadline, the broker ends: it tells them so, and closes.
+    private boolean shutDown(long deadline) {
+        log.info("Broker on port {} shuts down: it takes no further connection, and delivers"
+                + " what waits for its clients first", port());
+        stopAccepting();
+        for (Connection connection : routing.connections) {
+            connection.loop.execute(connection, connection::catchUp);
+        }
+        boolean delivered = false;
+        boolean interrupted = false;
+        long pause = FIRST_LOOK_NANOS;
+        while (!routing.closed && !cutShort) {
+            if (delivered()) {
+                delivered = true;
+                break;
+            }
+            long left = deadline - System.nanoTime();
+            if (left <= 0) {
+                break;
+            }
+            LockSupport.parkNanos(this, Math.min(pause, left));
+            if (Thread.interrupted()) {
+                interrupted = true;
+                break;
+            }
+            pause = Math.min(2 * pause, LAST_LOOK_NANOS);
+        }
+        if (delivered) {
+            log.info("Broker on port {} delivered what waited for its clients, and closes",
+                    port());
+        } else if (!routing.closed) {
+            log.info("Broker on port {} closes with {} deliveries waiting for its clients",
+                    port(), routing.queuedDeliveries());
+        }
+        interrupted |= closeAfterShutdown();
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return delivered;
+    }
+
+    // Whether the clients that are connected have what waits for them, judged by two looks at
+    // the sessions in a row. Each look finds that every connected client has read what had
+    // arrived as the shutdown began, that its session is idle and has nothing left for it, and
+    // that its connection has written everything; and that every other session is idle. What a
+    // client sent before the shutdown has then been routed by the end of the first look, as its
+    // session has handled it, and a delivery that its routing made for a session that the first
+    // look had passed by shows in the second one.
+    // Ceiling: each look visits every session, so a shutdown of a broker with many sessions
+    // looks less often; telling the shutdown as sessions settle would lift that.
+    private boolean delivered() {
+        return settled() && settled();
+    }
+
+    private boolean settled() {
+        for (Session session : routing.sessions.values()) {
+            Connection peer = session.connection;
+            boolean done = (peer != null && peer.takesDeliveries())
+                    ? peer.caughtUp() && peer.sentAll() && session.settled()
+                    : session.idle();
+            if (!done) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Ends the broker once a shutdown has delivered what it could, unless close() or a failure
+    // has ended it already: the clients learn that the broker shuts down, and have a moment to
+    // close their connections before the broker closes as close() does. Returns whether the
+    // calling thread was interrupted meanwhile, which ends the moment at once.
+    private boolean closeAfterShutdown() {
+        boolean first;
+        synchronized (this) {
+            first = !routing.closed;
+            routing.closed = true;
+        }
+        boolean interrupted = false;
+        if (first) {
+            try {
+                for (Connection connection : routing.connections) {
+                    connection.shutDown();
+                }
+                long until = System.nanoTime() + CLOSING_NANOS;
+                while (!routing.connections.isEmpty()
+                        && !cutShort
+                        && System.nanoTime() - until < 0) {
+                    LockSupport.parkNanos(this, FIRST_LOOK_NANOS);
+                    if (Thread.interrupted()) {
+                        interrupted = true;
+                        break;
+                    }
+                }
+            } finally {
+                // The broker has closed, as close() finds it, so the end is this call's to make.
+                end();
+            }
+        }
+        awaitThreads();
+        return interrupted;
+    }
+
+    // Waits for the shutdown that another call began, and returns its result. An interrupt has
+    // that shutdown end the broker at once, as an interrupt of its own caller does, and stays
+    // with the calling thread.
+    private boolean awaitShutdown(CompletableFuture<Boolean> result) {
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try {
+                    return result.get();
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                    cutShort = true;
+                } catch (ExecutionException _) {
+                    // The shutdown completes its result normally, also when it fails.
+                    return false;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /// An observation of the broker's end; see MqttBroker.terminated().
@@ -898,25 +1089,30 @@ public final class BrokerServer implements AutoCloseable {
         assert routing.deliveryMemoryAddsUp();
     }
 
+    // Stops taking connections: frees the name and the port, which another broker can take from
+    // now on, and has the accepting thread end. Doing so again does nothing.
+    private void stopAccepting() {
+        registration.release();
+        try {
+            listener.close();
+        } catch (IOException failure) {
+            log.warn("Closing broker listener on port {} failed", port(), failure);
+        }
+        // A channel that a selector watches keeps its socket until the selector lets go of it.
+        // Closing the selector does that here, so the port is free from now on, and it wakes the
+        // accepting thread.
+        try {
+            acceptor.close();
+        } catch (IOException failure) {
+            log.warn("Closing the accept selector of the broker on port {} failed",
+                    port(), failure);
+        }
+    }
+
     // Ends the listener, the connections, and the sessions, and has the selectors end.
     private void end() {
         try {
-            // Another broker can take the name from now on, as it can take the port.
-            registration.release();
-            try {
-                listener.close();
-            } catch (IOException failure) {
-                log.warn("Closing broker listener on port {} failed", port(), failure);
-            }
-            // A channel that a selector watches keeps its socket until the selector lets go of
-            // it. Closing the selector does that here, so the port is free from now on, and it
-            // wakes the accepting thread.
-            try {
-                acceptor.close();
-            } catch (IOException failure) {
-                log.warn("Closing the accept selector of the broker on port {} failed",
-                        port(), failure);
-            }
+            stopAccepting();
             routing.clear();
         } finally {
             routing.actors.shutdown();

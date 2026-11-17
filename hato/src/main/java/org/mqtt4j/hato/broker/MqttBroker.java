@@ -156,8 +156,9 @@ import static java.util.Objects.requireNonNull;
 ///
 /// ## Ending
 ///
-/// [#close()] stops the broker. An internal failure can stop it as well, which the
-/// [BrokerListener] hears of, and [#terminated()] observes either end.
+/// [#close()] stops the broker at once, and [#shutdown(Duration)] once its clients have what
+/// waits for them. An internal failure can stop it as well, which the [BrokerListener] hears of,
+/// and [#terminated()] observes every end.
 ///
 /// ## Tests
 ///
@@ -214,9 +215,10 @@ public final class MqttBroker implements AutoCloseable {
 
     /// The name of this broker: the one that [MqttBrokerBuilder#name(String)] gave, or the one
     /// that the broker took without it. A broker holds its name from its start until it ends,
-    /// through [#close()] or because an internal failure stopped it, as it holds its port. While
-    /// it does, no other broker in the JVM starts with that name, except one whose Hato classes
-    /// come from another class loader; after that, one can.
+    /// through [#close()] or because an internal failure stopped it, or until a
+    /// [#shutdown(Duration)] begins, as it holds its port. While it does, no other broker in the
+    /// JVM starts with that name, except one whose Hato classes come from another class loader;
+    /// after that, one can.
     ///
     /// @return
     ///   the name of this broker, including after close
@@ -294,12 +296,58 @@ public final class MqttBroker implements AutoCloseable {
         return server.terminated();
     }
 
+    /// Shuts the broker down once its clients have what waits for them; [#close()] stops it at
+    /// once instead.
+    ///
+    /// The broker takes no further connection from the start: it frees its port and its name,
+    /// which another broker can take from then on, and refuses a client that it has yet to
+    /// accept with Server unavailable, return code 3 in MQTT 3.1.1. It goes on serving the
+    /// clients that are connected, also reading what they send, until each of them has what
+    /// waits for it, a QoS 1 or QoS 2 delivery once the client has acknowledged it, or until
+    /// `timeout` has passed. A publication that a client sent before this call, and that the
+    /// broker had yet to read, waits for them too. Then each MQTT 5.0 client receives DISCONNECT
+    /// with Server shutting down, the clients have a moment to close their connections, and the
+    /// broker closes as [#close()] does: it discards the session state and the retained
+    /// messages, publishes no Will of the connections that it closes, and tells the
+    /// [BrokerListener] nothing of them. What waits for the clients that are away is lost with
+    /// their sessions. To have what the application's own clients publish last delivered, it
+    /// disconnects them before this call.
+    ///
+    /// The call returns once the broker has closed, its port free and every connection closed,
+    /// which can be a moment after `timeout`, and gives the logging backend a moment to take
+    /// what the broker has logged, as [#close()] does. [#close()] and an interrupt of the calling
+    /// thread cut the shutdown short, as `timeout` does, and the interrupt stays with the thread.
+    /// An internal failure meanwhile ends the broker as it otherwise does. A later call waits for
+    /// the same shutdown and returns the same result, and a call after [#close()] returns false.
+    ///
+    /// @param timeout
+    ///   how long the clients may take to have what waits for them; zero to wait for nothing.
+    ///   Must be at most 2147483647 milliseconds
+    /// @return
+    ///   whether the clients that were connected had what waited for them within `timeout`
+    /// @throws IllegalArgumentException
+    ///   if `timeout` is negative or longer than allowed
+    public boolean shutdown(Duration timeout) {
+        requireNonNull(timeout, "timeout");
+        if (timeout.isNegative() || timeout.compareTo(MqttBrokerBuilder.MAX_TIMEOUT) > 0) {
+            throw new IllegalArgumentException(
+                    "Shutdown timeout must be zero or positive and at most "
+                            + MqttBrokerBuilder.MAX_TIMEOUT.toMillis() + " ms"
+            );
+        }
+        boolean delivered = server.shutdown(timeout);
+        // As after close(), the application may exit now.
+        boolean _ = Log.awaitWritten(LOG_WAIT_AT_CLOSE);
+        return delivered;
+    }
+
     /// Stops accepting connections, closes all peers, and discards their session state and the
     /// retained messages, without publishing Wills, those that wait for their delay included.
     /// When it returns, the listening port is free and every connection is closed. Repeated
-    /// calls are harmless. Does not wait for peer I/O or send MQTT packets. It interrupts the
-    /// [Authenticator]'s decisions that are running and does not wait for them. Before it returns,
-    /// it gives the logging backend a moment to take what the broker has logged.
+    /// calls are harmless, and a call while [#shutdown(Duration)] runs cuts it short. Does not
+    /// wait for peer I/O or send MQTT packets. It interrupts the [Authenticator]'s decisions that
+    /// are running and does not wait for them. Before it returns, it gives the logging backend a
+    /// moment to take what the broker has logged.
     @Override
     public void close() {
         server.close();

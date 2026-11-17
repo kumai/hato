@@ -143,6 +143,12 @@ final class Client {
             done.accept(false);
             return;
         }
+        // A broker that shuts down accepts no further client; see also takeOver.
+        if (routing.stopping) {
+            refuseWhileStopping(request.clientId());
+            done.accept(false);
+            return;
+        }
         Packet.Will requestedWill = request.will();
         long expiry = Math.min(requestedExpiry(request), settings.maxSessionExpiry());
         // A test rule can refuse the client before anything else, which leaves the session and
@@ -384,6 +390,13 @@ final class Client {
             long expiry
     ) {
         if (routing.closed || connection.isEnded()) {
+            actor.leaveIfUnused();
+            return false;
+        }
+        // A broker that began to shut down after the CONNECT came, while the authenticator
+        // decided or the acceptance waited for the actor, accepts the client no more.
+        if (routing.stopping) {
+            refuseWhileStopping(id);
             actor.leaveIfUnused();
             return false;
         }
@@ -661,6 +674,15 @@ final class Client {
             case Property.ByteValue(var _, var value) -> value != 0;
             case null, default -> true;
         };
+    }
+
+    // Refuses the client `id`, which comes while the broker shuts down, as a broker that cannot
+    // serve it: the client may find a broker that can later.
+    private void refuseWhileStopping(String id) {
+        connection.refuse(
+                ReasonCode.SERVER_UNAVAILABLE,
+                "client '" + id + "' while the broker shuts down"
+        );
     }
 
     // Tells the application's listener, if there is one, that the broker has accepted this

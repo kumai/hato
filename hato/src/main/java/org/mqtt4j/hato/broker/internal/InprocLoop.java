@@ -99,9 +99,9 @@ final class InprocLoop implements Loop, InprocBrokers.Endpoint {
     // Counts `connection` among the broker's connections, as a selector counts one that it
     // registers. Runs on the loop's thread, which ends the connections that it counted as it
     // ends, so registration needs no lock against the end. Returns false once the loop or the
-    // broker has closed.
+    // broker has closed, or the broker shuts down.
     boolean register(Connection connection) {
-        if (closed || routing.closed) {
+        if (closed || routing.closed || routing.stopping) {
             return false;
         }
         routing.connections.add(connection);

@@ -29,4 +29,14 @@ sealed interface Outbound {
 
     // A packet as it is, for a client in the same JVM, and the bytes that it takes on the wire.
     record Plain(Packet packet, int size) implements Outbound {}
+
+    // No packet: the end of the output, which a connection takes as its last packet to end its
+    // output without one, as for an MQTT 3.1.1 client, which has no DISCONNECT from a server.
+    record End() implements Outbound {
+
+        @Override
+        public int size() {
+            return 0;
+        }
+    }
 }

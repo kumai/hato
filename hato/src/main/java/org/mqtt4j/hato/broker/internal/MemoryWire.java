@@ -96,6 +96,25 @@ final class MemoryWire implements Wire {
         return link.clientEnded() ? -1 : 0;
     }
 
+    // The link's queues wake the loop as input arrives, so the loop looks at it anyway.
+    @Override
+    public void expectInput() {
+    }
+
+    @Override
+    public void endOutput() {
+        link.endBroker();
+    }
+
+    @Override
+    public int discard() {
+        int count = 0;
+        while (link.take() != null) {
+            count++;
+        }
+        return (count == 0 && link.clientEnded()) ? -1 : count;
+    }
+
     @Override
     public void limit(int maximumPacketSize) {
         limit = maximumPacketSize;
@@ -122,7 +141,7 @@ final class MemoryWire implements Wire {
                         ));
                     }
                 }
-                case Outbound.Encoded _ -> throw new IllegalStateException(
+                case Outbound.Encoded _, Outbound.End _ -> throw new IllegalStateException(
                         "An in-process connection queues no encoded packet"
                 );
             }
@@ -133,10 +152,13 @@ final class MemoryWire implements Wire {
 
     @Override
     public void prepareLast(Outbound last) {
-        if (!(last instanceof Outbound.Plain(var packet, var size))) {
-            throw new IllegalStateException("A last packet is queued as it is: " + last);
-        }
-        writingItems = List.of(new InprocLink.Item(packet, size));
+        writingItems = switch (last) {
+            case Outbound.Plain(var packet, var size) -> List.of(new InprocLink.Item(packet, size));
+            case Outbound.End _ -> List.of();
+            case Outbound.Encoded _, Outbound.Publish _ -> throw new IllegalStateException(
+                    "A last packet is queued as it is: " + last
+            );
+        };
         given = 0;
     }
 
