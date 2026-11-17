@@ -262,6 +262,7 @@ public final class BrokerServer implements AutoCloseable {
                     tlsSettings.context(),
                     tlsSettings.parameters(),
                     tlsPort,
+                    port,
                     settings.maxTlsTasks(),
                     settings.maxAwaitingConnect(),
                     termination

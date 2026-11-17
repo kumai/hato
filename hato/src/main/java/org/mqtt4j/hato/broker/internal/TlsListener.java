@@ -41,12 +41,14 @@ final class TlsListener {
     final ThreadPoolExecutor tasks;
 
     // `threads` bounds the delegated tasks that run at once, and `waiting` the batches that wait
-    // for a thread. The pool ends its part of `termination` once the broker has shut it down and
-    // its tasks have returned.
+    // for a thread. The threads' names carry `brokerPort`, as those of the broker's other threads
+    // do (see Routing). The pool ends its part of `termination` once the broker has shut it down
+    // and its tasks have returned.
     TlsListener(
             SSLContext context,
             SSLParameters parameters,
             int port,
+            int brokerPort,
             int threads,
             int waiting,
             Termination termination
@@ -62,7 +64,7 @@ final class TlsListener {
                 TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(waiting),
                 task -> Thread.ofPlatform().daemon()
-                        .name("hato-broker-" + port + "-tls-" + next.getAndIncrement())
+                        .name("hato-broker-" + brokerPort + "-tls-" + next.getAndIncrement())
                         .unstarted(task)
         ) {
 

@@ -355,8 +355,9 @@ class BrokerTlsTest {
                 other.expect(Packet.Publish.class);
                 other.ping();
             }
-            // Assert: the check ran on a thread for TLS, and the held client goes on.
-            assertThat(check.thread.get()).contains("-tls-");
+            // Assert: the check ran on a thread for TLS, named after the broker's port as its other
+            // threads are, and the held client goes on.
+            assertThat(check.thread.get()).startsWith("hato-broker-" + broker.port() + "-tls-");
             check.release.countDown();
             connecting.get(5, SECONDS);
         }
