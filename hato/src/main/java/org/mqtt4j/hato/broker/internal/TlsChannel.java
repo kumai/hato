@@ -31,8 +31,10 @@ import static java.util.Objects.requireNonNull;
 //
 // Ciphertext passes through the selector's buffers, and a connection keeps only what is left over:
 // a record that has partly arrived, and records that the socket has not taken yet, which go out
-// before any later ones. The input of a connection is empty whenever it reads (see Connection), and
-// it has room for the bytes of a whole record, so what one read takes from the socket fits it.
+// before any later ones. One read takes a record's worth of ciphertext at most, what was left over
+// included, and the input of a connection is empty whenever it reads (see Connection), with room
+// for the bytes of a whole record. So the ciphertext that a connection keeps never grows past a
+// record, however fast the client sends.
 //
 // The broker takes part in no handshake on an accepted connection: a client that asks for a new
 // one, as TLS 1.2 renegotiation does, loses its connection. A key update of TLS 1.3 is no
@@ -70,7 +72,8 @@ final class TlsChannel {
     private @Nullable Connection connection;
 
     // Ciphertext that has arrived and makes no whole record yet, or that the input had no room
-    // for, or null.
+    // for, ready to be read from, or null. It holds a record at most, in a buffer of a record's
+    // size that the connection keeps while ciphertext waits.
     private @Nullable ByteBuffer pendingInput;
 
     // Records that the socket has not taken yet, which go out before any later ones, or null.
@@ -137,33 +140,27 @@ final class TlsChannel {
         if (delegated) {
             return 0;
         }
+        int start = input.position();
         try {
             boolean _ = flushBeforeReading();
-            int produced = 0;
             for (int round = 0; round < ROUNDS_PER_READ; round++) {
-                ByteBuffer left = pendingInput;
-                pendingInput = null;
-                ByteBuffer net = reactor.tlsInput(
-                        recordSize + ((left == null) ? 0 : left.remaining())
-                );
-                if (left != null) {
-                    net.put(left);
-                }
-                int count = inputEnded ? -1 : channel.read(net);
-                if (count < 0) {
-                    inputEnded = true;
+                ByteBuffer net = ciphertext();
+                int count = 0;
+                if (!inputEnded && net.hasRemaining()) {
+                    count = channel.read(net);
+                    if (count < 0) {
+                        inputEnded = true;
+                    }
                 }
                 net.flip();
-                produced += unwrap(net, input);
-                // A record that has partly arrived waits for the rest, unless the input has
-                // ended, which leaves it incomplete for good.
-                if (net.hasRemaining() && !(inputEnded && wanting)) {
-                    pendingInput = ByteBuffer.allocate(net.remaining()).put(net).flip();
-                }
-                if (produced > 0 || count <= 0 || delegated || resumed) {
+                unwrap(net, input);
+                keep(net);
+                boolean decrypted = input.position() > start;
+                if (decrypted || count <= 0 || delegated || resumed) {
                     break;
                 }
             }
+            int produced = input.position() - start;
             return (produced == 0 && inputEnded && pendingInput == null) ? -1 : produced;
         } catch (SSLException failure) {
             failed(failure);
@@ -171,30 +168,48 @@ final class TlsChannel {
         }
     }
 
+    // The ciphertext to decrypt, ready to take more from the socket: what waits of the
+    // connection's first, in a buffer that holds a record at most.
+    private ByteBuffer ciphertext() {
+        ByteBuffer waiting = pendingInput;
+        if (waiting != null) {
+            return waiting.compact();
+        }
+        return reactor.tlsInput(recordSize).limit(recordSize);
+    }
+
+    // Keeps what is left of `net` for the next read: a record that has partly arrived, or records
+    // that the input had no room for. A record that the end of the input leaves incomplete is
+    // dropped.
+    private void keep(ByteBuffer net) {
+        if (!net.hasRemaining() || (inputEnded && wanting)) {
+            pendingInput = null;
+        } else if (net != pendingInput) {
+            pendingInput = ByteBuffer.allocate(recordSize).put(net).flip();
+        }
+    }
+
     // Decrypts the records of `net` into `input` as far as both allow, and carries the handshake
-    // on: it sends the records that the engine makes, and hands the delegated tasks over. Returns
-    // how many bytes of packets it put into `input`.
-    private int unwrap(ByteBuffer net, ByteBuffer input) throws IOException {
-        int produced = 0;
+    // on: it sends the records that the engine makes, and hands the delegated tasks over.
+    private void unwrap(ByteBuffer net, ByteBuffer input) throws IOException {
         wanting = false;
         while (true) {
             SSLEngineResult.HandshakeStatus status = engine.getHandshakeStatus();
             if (status == SSLEngineResult.HandshakeStatus.NEED_TASK) {
                 delegate();
-                return produced;
+                return;
             }
             if (status == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
                 if (!wrapOwn()) {
-                    return produced;
+                    return;
                 }
                 continue;
             }
             if (!net.hasRemaining()) {
                 wanting = true;
-                return produced;
+                return;
             }
             SSLEngineResult result = engine.unwrap(net, input);
-            produced += result.bytesProduced();
             if (result.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.FINISHED) {
                 established = true;
             }
@@ -203,12 +218,12 @@ final class TlsChannel {
                     // A record goes in whole, so no progress means that none waits whole.
                     if (result.bytesConsumed() == 0 && result.bytesProduced() == 0) {
                         wanting = true;
-                        return produced;
+                        return;
                     }
                 }
                 case BUFFER_UNDERFLOW -> {
                     wanting = true;
-                    return produced;
+                    return;
                 }
                 case BUFFER_OVERFLOW -> {
                     // The input has no room for the next record's bytes, which wait until the
@@ -216,7 +231,7 @@ final class TlsChannel {
                     // the connection back for them, so it comes back of its own.
                     resumed = true;
                     requireNonNull(connection, "registered").wake();
-                    return produced;
+                    return;
                 }
                 case CLOSED -> {
                     // The client's close_notify ends the input, and nothing after it is read.

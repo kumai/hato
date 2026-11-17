@@ -2,6 +2,7 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -46,11 +47,13 @@ import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.protocol.Packet;
+import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.testsupport.Tls;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// The TLS listener: clients that exchange messages through it, beside the plain one or alone,
 /// what the authenticator learns of them, and handshakes that fail, take long, or come again.
@@ -419,6 +422,57 @@ class BrokerTlsTest {
                 socket.startHandshake();
                 // Assert
                 sut.ping();
+            }
+        }
+    }
+
+    @Test
+    void a_long_stream_holds_the_selector_to_work_in_proportion_to_its_bytes() throws Exception {
+        // Arrange: one selector, whose allocations show the work that each byte takes, and
+        // publications of many records each, which leave records partly read.
+        var bean = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        assumeTrue(bean.isThreadAllocatedMemorySupported());
+        int publications = 512;
+        var processed = new CountDownLatch(publications);
+        SSLContext context = Tls.serverContext();
+        try (BrokerServer broker = BrokerServer.builder()
+                .selectors(1)
+                .listenTls(loopback(), context, serverParameters(context, _ -> { }))
+                .beforeProcess(packet -> {
+                    if (packet instanceof Packet.Publish) {
+                        processed.countDown();
+                    }
+                })
+                .start(null)) {
+            SSLSocket socket = tlsSocket(broker.tlsPort(), "TLSv1.3");
+            try (RawSession sut = RawSession.over(socket, MqttVersion.V3_1_1)) {
+                sut.send(RawSession.connect("streaming", true, 60));
+                sut.expect(Packet.ConnAck.class);
+                byte[] publication = RawSession.codec.encode(new Packet.Publish(
+                        new Topic("stream"),
+                        new byte[64 * 1024],
+                        Qos.AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        Properties.EMPTY
+                ));
+                String name = "hato-broker-" + broker.port() + "-selector-0";
+                long selector = Thread.getAllStackTraces().keySet().stream()
+                        .filter(thread -> thread.getName().equals(name))
+                        .findFirst()
+                        .orElseThrow()
+                        .threadId();
+                long before = bean.getThreadAllocatedBytes(selector);
+                // Act
+                for (int i = 0; i < publications; i++) {
+                    sut.sendRaw(publication);
+                }
+                assertThat(processed.await(30, SECONDS)).isTrue();
+                // Assert: about four bytes a byte when ciphertext waits a record at most; a
+                // selector that kept and copied what waited took over thirty at this length.
+                long allocated = bean.getThreadAllocatedBytes(selector) - before;
+                assertThat(allocated).isLessThan(12L * publications * publication.length);
             }
         }
     }
