@@ -146,6 +146,11 @@ import org.mqtt4j.hato.internal.log.Log;
 /// A Hato client in the same JVM can reach the broker by its [URI][#uri()]. It passes its
 /// packets in memory, and the broker serves it as it serves a client over TCP.
 ///
+/// ## Operation
+///
+/// The [BrokerListener] hears of each client that the broker accepts, and of the end of its
+/// connection with the reason.
+///
 /// ## Ending
 ///
 /// [#close()] stops the broker. An internal failure can stop it as well, which the

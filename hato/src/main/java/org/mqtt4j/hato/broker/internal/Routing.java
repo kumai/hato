@@ -24,6 +24,7 @@ import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.BrokerListener;
+import org.mqtt4j.hato.broker.BrokerListener.DisconnectReason;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
@@ -47,6 +48,11 @@ final class Routing {
 
     // How long a thread of the authentication pool waits for another decision before it ends.
     private static final long AUTHENTICATION_IDLE_SECONDS = 30;
+
+    // How many notices of connections wait for a listener that is behind, for each client that
+    // the broker may serve: the end of a connection and the start of the next, twice over, as
+    // when every client connects again after an outage while the listener is behind.
+    private static final int NOTICES_PER_CLIENT = 4;
 
     final BrokerSettings settings;
 
@@ -101,8 +107,9 @@ final class Routing {
     // How many sessions the closing broker has yet to clear, on whatever thread has their turn.
     private final AtomicInteger clearing = new AtomicInteger();
 
-    // Tells the application's listener, if there is one, of dropped QoS 1 and 2 deliveries.
-    final @Nullable DropReports dropReports;
+    // Tells the application's listener, if there is one, of the clients that connect and
+    // disconnect and of dropped QoS 1 and 2 deliveries.
+    final @Nullable Notices notices;
 
     // Tells the application's listener, if there is one, of a failure that stopped the broker.
     final @Nullable FailureNotice failureNotice;
@@ -169,10 +176,14 @@ final class Routing {
         // broker can have at once. So a client with a session finds a place among them unless
         // clients that have gone still hold some.
         long sessions = (long) settings.maxClients() + settings.maxSessions();
-        dropReports = (listener == null) ? null : new DropReports(
+        notices = (listener == null) ? null : new Notices(
                 listener,
                 port,
                 (int) Math.min(sessions, Integer.MAX_VALUE),
+                (int) Math.min(
+                        (long) NOTICES_PER_CLIENT * settings.maxClients(),
+                        Integer.MAX_VALUE
+                ),
                 termination
         );
         failureNotice = (listener == null) ? null : new FailureNotice(listener, port, termination);
@@ -360,16 +371,24 @@ final class Routing {
         return Set.copyOf(clients);
     }
 
-    void disconnect(String clientId, Reason reason) {
+    // Ends the connection of the client `clientId` for the application, telling an MQTT 5.0
+    // client `reason`, and returns false if the client has no connection or it was ending
+    // already.
+    boolean disconnect(String clientId, Reason reason) {
         Session session = sessions.get(clientId);
         Connection peer = (session == null) ? null : session.connection;
-        if (peer != null) {
-            Packet.Disconnect disconnect = reason.fitted(
-                    properties -> new Packet.Disconnect(reason.code(), properties),
-                    peer.client.sendLimit
-            );
-            peer.disconnect(disconnect, "disconnected by a test");
+        if (peer == null) {
+            return false;
         }
+        Packet.Disconnect disconnect = reason.fitted(
+                properties -> new Packet.Disconnect(reason.code(), properties),
+                peer.client.sendLimit
+        );
+        return peer.disconnect(
+                disconnect,
+                "disconnected by the application",
+                DisconnectReason.APPLICATION
+        );
     }
 
     // A connection copies the capabilities as it accepts the CONNECT, so each one works by those
@@ -547,7 +566,7 @@ final class Routing {
     // closes. Each session ends here if no thread holds its turn, and otherwise soon after.
     void clear() {
         for (Connection connection : connections) {
-            connection.close("broker closed");
+            connection.close("broker closed", null);
         }
         sessions.values().forEach(Session::close);
         sessions.clear();

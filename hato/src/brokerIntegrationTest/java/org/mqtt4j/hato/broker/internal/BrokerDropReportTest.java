@@ -343,7 +343,7 @@ class BrokerDropReportTest {
 
     /// The thread on which the broker on `port` calls its listener.
     private static Thread reportingThread(int port) {
-        String name = "hato-broker-" + port + "-reports";
+        String name = "hato-broker-" + port + "-notices";
         return Thread.getAllStackTraces().keySet().stream()
                 .filter(thread -> thread.getName().equals(name))
                 .findFirst()

@@ -20,6 +20,7 @@ import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.Authenticator;
+import org.mqtt4j.hato.broker.BrokerListener.DisconnectReason;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.IncomingAliases;
 import org.mqtt4j.hato.internal.protocol.Packet;
@@ -100,6 +101,12 @@ final class Client {
     // its end comes to the session, or until another connection takes the session over and the
     // place with it. Only the session's actor uses it.
     private boolean holdsPlace;
+
+    // The connection as the application's listener heard that it connected, until the listener
+    // hears that it ended; null before and after that, and without a listener. Only the
+    // session's actor uses it, which tells the listener of all the connections of the client in
+    // their order.
+    private @Nullable ClientConnection told;
 
     Client(Connection connection, Routing routing) {
         this.connection = connection;
@@ -431,9 +438,13 @@ final class Client {
                 // delivery and whether the resend carries the DUP flag.
                 previous.disconnect(
                         ReasonCode.SESSION_TAKEN_OVER,
-                        "taken over by " + connection.remoteAddress()
+                        "taken over by " + connection.remoteAddress(),
+                        DisconnectReason.TAKEN_OVER
                 );
                 previous.client.holdsPlace = false;
+                // The old connection's end reaches the session after this one's CONNACK, but the
+                // listener hears of it first, so that the client's notices keep their order.
+                previous.client.tellEnded();
             }
             holdsPlace = true;
             // The Will that waits with the session goes out after CONNACK when this CONNECT
@@ -476,8 +487,11 @@ final class Client {
             };
             var connAck = new Packet.ConnAck(present, ReasonCode.SUCCESS, properties);
             settings.beforeAttach().accept(id);
-            if (!actor.attach(connection, connAck)) {
-                // The connection ended before the session had it, so its end comes now.
+            if (actor.attach(connection, connAck)) {
+                tellConnected(id, request.version());
+            } else {
+                // The connection ended before the session had it, so its end comes now, and the
+                // listener hears of neither.
                 actor.post(this::connectionEnded, Session.ALONE);
             }
         } catch (Throwable failure) {
@@ -649,6 +663,39 @@ final class Client {
         };
     }
 
+    // Tells the application's listener, if there is one, that the broker has accepted this
+    // connection of the client `id`. Runs on the actor, once the session has the connection.
+    private void tellConnected(String id, MqttVersion version) {
+        Notices notices = routing.notices;
+        if (notices != null) {
+            var connected = new ClientConnection(id, connection.remoteAddress(), version);
+            told = connected;
+            notices.connected(connected);
+        }
+    }
+
+    // Tells the listener that this connection has ended, once, if it heard that the connection
+    // connected. A closing broker tells nothing. Runs on the actor, after the connection's end:
+    // as the end reaches the session, or as another connection takes the session over.
+    void tellEnded() {
+        ClientConnection connected = told;
+        Notices notices = routing.notices;
+        if (connected == null || notices == null) {
+            return;
+        }
+        told = null;
+        if (routing.closed) {
+            return;
+        }
+        DisconnectReason reason = connection.endKind();
+        // Every end of an accepted connection has its kind; one without would be a defect of
+        // the broker's, as the listener hears.
+        notices.disconnected(
+                connected,
+                (reason == null) ? DisconnectReason.BROKER_ERROR : reason
+        );
+    }
+
     // Publishes the Will of this connection, which ended without a DISCONNECT that discards
     // it. Runs on the actor; taking the Will means that no later end publishes it again.
     void publishWill() {
@@ -681,7 +728,8 @@ final class Client {
                 if (identifier != 0 && !limits.subscriptionIdentifiersAvailable()) {
                     connection.disconnect(
                             ReasonCode.SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED,
-                            "Subscription Identifier although none are supported"
+                            "Subscription Identifier although none are supported",
+                            DisconnectReason.PROTOCOL_ERROR
                     );
                     return;
                 }
@@ -692,7 +740,8 @@ final class Client {
                         .anyMatch(requested -> SharedTopicFilter.isShared(requested.filter()))) {
                     connection.disconnect(
                             ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED,
-                            "shared subscription although none are supported"
+                            "shared subscription although none are supported",
+                            DisconnectReason.PROTOCOL_ERROR
                     );
                     return;
                 }
@@ -702,7 +751,8 @@ final class Client {
                         .anyMatch(requested -> hasWildcard(requested.filter()))) {
                     connection.disconnect(
                             ReasonCode.WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED,
-                            "wildcard subscription although none are supported"
+                            "wildcard subscription although none are supported",
+                            DisconnectReason.PROTOCOL_ERROR
                     );
                     return;
                 }
@@ -840,7 +890,8 @@ final class Client {
                 connection.close(
                         normal
                                 ? "client sent DISCONNECT"
-                                : "client sent DISCONNECT with " + disconnect.reasonCode()
+                                : "client sent DISCONNECT with " + disconnect.reasonCode(),
+                        DisconnectReason.CLIENT_DISCONNECT
                 );
             }
             // Name only the type; the INFO end log must not carry fields such as AUTH data.
@@ -901,14 +952,16 @@ final class Client {
         if (publish.qos().level() > limits.maximumQos().level()) {
             connection.disconnect(
                     ReasonCode.QOS_NOT_SUPPORTED,
-                    "PUBLISH above the announced Maximum QoS"
+                    "PUBLISH above the announced Maximum QoS",
+                    DisconnectReason.PROTOCOL_ERROR
             );
             return;
         }
         if (publish.retain() && !limits.retainAvailable()) {
             connection.disconnect(
                     ReasonCode.RETAIN_NOT_SUPPORTED,
-                    "retained PUBLISH although retained messages are not supported"
+                    "retained PUBLISH although retained messages are not supported",
+                    DisconnectReason.PROTOCOL_ERROR
             );
             return;
         }
@@ -1028,7 +1081,7 @@ final class Client {
         }
         // Closing takes the session's inbox, which comes before the connection's monitor.
         if (overLimit) {
-            connection.close("held responses over their limit");
+            connection.close("held responses over their limit", DisconnectReason.BROKER_ERROR);
             return;
         }
         connection.respond(packet);
@@ -1105,6 +1158,7 @@ final class Client {
             routing.freeClientPlace();
         }
         owner.detach(connection);
+        tellEnded();
         Packet.Will last = will;
         long delay = (last == null) ? 0 : delayOf(last);
         if (last != null && delay > 0 && routing.sessions.get(owner.clientId) == owner) {

@@ -202,7 +202,7 @@ final class InprocLoop implements Loop, InprocBrokers.Endpoint {
             // thread's does for one over TCP.
             log.warn("Starting an in-process broker peer failed", failure);
             if (connection != null) {
-                connection.close("start failed");
+                connection.close("start failed", null);
             }
             link.refuse();
             return;

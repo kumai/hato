@@ -14,6 +14,7 @@ import org.jspecify.annotations.Nullable;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.broker.BrokerListener.DisconnectReason;
 import org.mqtt4j.hato.internal.concurrent.Timer;
 import org.mqtt4j.hato.internal.io.SendQueue;
 import org.mqtt4j.hato.internal.log.Log;
@@ -138,6 +139,11 @@ final class Connection {
 
     // Why the connection ended first; later failures are consequences of that end.
     private String endReason = "";
+
+    // The same, as the application's listener hears of it. It is null while the connection goes
+    // on, and stays null for one that ends before the broker accepts its client, or as the
+    // broker closes, of which the listener hears nothing.
+    private @Nullable DisconnectReason endKind;
 
     private long ticket;
 
@@ -355,11 +361,11 @@ final class Connection {
         ioFailed = failed;
         Session owner = client.session;
         if (owner == null) {
-            close(reason);
+            close(reason, DisconnectReason.CONNECTION_LOST);
         } else if (failed || !alreadyPosted) {
             owner.post(() -> {
                 if (failed || !endsWithLastPacket()) {
-                    close(reason);
+                    close(reason, DisconnectReason.CONNECTION_LOST);
                 }
             }, Session.ELSEWHERE);
         }
@@ -399,7 +405,7 @@ final class Connection {
                             leaveAwaitingConnect();
                         }
                         if (!accepted && !endsWithLastPacket()) {
-                            close("CONNECT refused");
+                            close("CONNECT refused", null);
                         } else {
                             wake();
                         }
@@ -443,9 +449,9 @@ final class Connection {
                 case V5 -> true;
             };
             if (answered) {
-                closeAfter(refusal, "refusal sent");
+                closeAfter(refusal, "refusal sent", null);
             } else {
-                terminate("refusal without an MQTT 3.1.1 return code");
+                terminate("refusal without an MQTT 3.1.1 return code", null);
             }
         }
     }
@@ -557,7 +563,7 @@ final class Connection {
             accepted = enqueue(packet);
         }
         if (!accepted) {
-            close("send queue full");
+            close("send queue full", DisconnectReason.BROKER_ERROR);
         }
     }
 
@@ -673,7 +679,8 @@ final class Connection {
             return;
         }
         if (writingLast) {
-            close("last packet written");
+            // The connection's end has its reason since the last packet was queued.
+            close("last packet written", null);
             return;
         }
         boolean resume;
@@ -736,22 +743,31 @@ final class Connection {
         return lastPacket != null;
     }
 
-    // Ends the connection, first telling an MQTT 5.0 client why with DISCONNECT. MQTT 3.1.1
-    // has no DISCONNECT from a server.
-    synchronized void disconnect(ReasonCode reasonCode, String reason) {
-        disconnect(new Packet.Disconnect(reasonCode, Properties.EMPTY), reason);
+    // Ends the connection for `kind`, first telling an MQTT 5.0 client why with DISCONNECT. MQTT
+    // 3.1.1 has no DISCONNECT from a server.
+    synchronized void disconnect(ReasonCode reasonCode, String reason, DisconnectReason kind) {
+        disconnect(new Packet.Disconnect(reasonCode, Properties.EMPTY), reason, kind);
     }
 
-    synchronized void disconnect(Packet.Disconnect disconnect, String reason) {
-        switch (version) {
-            case V3_1_1 -> terminate(reason);
-            case V5 -> closeAfter(disconnect, reason);
+    // Ends the connection as above with `disconnect`, and returns false if it was ending already.
+    synchronized boolean disconnect(
+            Packet.Disconnect disconnect,
+            String reason,
+            DisconnectReason kind
+    ) {
+        if (ended || lastPacket != null) {
+            return false;
         }
+        switch (version) {
+            case V3_1_1 -> terminate(reason, kind);
+            case V5 -> closeAfter(disconnect, reason, kind);
+        }
+        return true;
     }
 
-    // Ends the connection with `packet` after the sends that wait. Called under the
+    // Ends the connection with `packet` after the sends that wait, for `kind`. Called under the
     // connection monitor.
-    private void closeAfter(Packet packet, String reason) {
+    private void closeAfter(Packet packet, String reason, @Nullable DisconnectReason kind) {
         if (ended || lastPacket != null) {
             return;
         }
@@ -762,11 +778,12 @@ final class Connection {
             armTimer(settings.connectTimeout());
         } catch (RuntimeException failure) {
             log.warn("Broker timer for {} failed", wire.peer(), failure);
-            terminate(reason);
+            terminate(reason, kind);
             return;
         }
         lastPacket = last;
         endReason = reason;
+        endKind = kind;
         wake();
     }
 
@@ -877,7 +894,7 @@ final class Connection {
                 }
                 if (lastPacket != null) {
                     // The writer did not get the last packet out within the connect timeout.
-                    terminate(endReason);
+                    terminate(endReason, endKind);
                     return;
                 }
                 long remaining = receiveTimeout - (scheduler.nanoTime() - lastReceived);
@@ -895,23 +912,27 @@ final class Connection {
                 // Mark the deadline under the same lock as receipt; a late frame cannot
                 // revive this connection while its end goes to the session.
                 if (clientId.isEmpty()) {
-                    terminate("CONNECT timeout");
+                    terminate("CONNECT timeout", null);
                 } else {
-                    disconnect(ReasonCode.KEEP_ALIVE_TIMEOUT, "keep-alive timeout");
+                    disconnect(
+                            ReasonCode.KEEP_ALIVE_TIMEOUT,
+                            "keep-alive timeout",
+                            DisconnectReason.KEEP_ALIVE_TIMEOUT
+                    );
                 }
             }
         } catch (Throwable failure) {
             log.warn("Broker timer for {} failed", wire.peer(), failure);
             synchronized (this) {
-                terminate("timer failure");
+                terminate("timer failure", DisconnectReason.BROKER_ERROR);
             }
         }
         // Ending reserves selector work to hand the end to the session. The shared timer waits
         // for no actor before checking another peer.
     }
 
-    // Stops I/O and reserves selector work for any remaining session cleanup.
-    private void terminate(String reason) {
+    // Stops I/O for `kind` and reserves selector work for any remaining session cleanup.
+    private void terminate(String reason, @Nullable DisconnectReason kind) {
         if (ended) {
             return;
         }
@@ -919,17 +940,25 @@ final class Connection {
         // A connection that ends with a last packet already holds its reason.
         if (endReason.isEmpty()) {
             endReason = reason;
+            endKind = kind;
         }
         cancelTimer();
         outgoing.close();
         wake();
     }
 
-    // Ends the connection and hands its end, once, to the session that it is attached to.
-    void close(String reason) {
+    // Why the connection ended first, as the application's listener hears of it, or null if it
+    // goes on or ended before the broker accepted its client.
+    synchronized @Nullable DisconnectReason endKind() {
+        return endKind;
+    }
+
+    // Ends the connection for `kind` and hands its end, once, to the session that it is attached
+    // to.
+    void close(String reason, @Nullable DisconnectReason kind) {
         Session owner;
         synchronized (this) {
-            terminate(reason);
+            terminate(reason, kind);
             if (endHandled) {
                 return;
             }
@@ -947,7 +976,7 @@ final class Connection {
             return;
         }
         disposed = true;
-        close("broker closed");
+        close("broker closed", null);
         // Before the wire closes, so that a peer that sees the close finds the place free.
         leaveAwaitingConnect();
         try {
@@ -984,11 +1013,16 @@ final class Connection {
     // closes it.
     void failed(String operation, Throwable failure) {
         String reason = failureReason(operation, failure);
+        DisconnectReason kind = switch (failure) {
+            case PacketDecodeException _ -> DisconnectReason.PROTOCOL_ERROR;
+            case IOException _ -> DisconnectReason.CONNECTION_LOST;
+            default -> DisconnectReason.BROKER_ERROR;
+        };
         if (failure instanceof PacketDecodeException violation) {
-            disconnect(violation.reasonCode(), reason);
+            disconnect(violation.reasonCode(), reason, kind);
         }
         if (!endsWithLastPacket()) {
-            close(reason);
+            close(reason, kind);
         }
     }
 }

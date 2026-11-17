@@ -219,7 +219,7 @@ final class Session {
     // Where the session counts the QoS 1 and 2 deliveries that the limits keep from it, for the
     // application to hear of: the count that it got for the first of them since its client's
     // last report. Null before any, and while the reports have no place for the client.
-    private DropReports.@Nullable Count unreported;
+    private Notices.@Nullable Count unreported;
 
     // The connection attached to the session, which publishers and the test controls read.
     volatile @Nullable Connection connection;
@@ -1420,11 +1420,11 @@ final class Session {
     // of its own. The session adds to the count that it has; once the report has taken that
     // one, or if it has none, it gets the next from the reports.
     private void dropped(Qos qos, String cause) {
-        DropReports reports = routing.dropReports;
-        if (qos != Qos.AT_MOST_ONCE && reports != null) {
-            DropReports.Count count = unreported;
+        Notices notices = routing.notices;
+        if (qos != Qos.AT_MOST_ONCE && notices != null) {
+            Notices.Count count = unreported;
             if (count == null || !count.add()) {
-                unreported = reports.add(clientId);
+                unreported = notices.add(clientId);
             }
         }
         droppedCount++;

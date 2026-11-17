@@ -658,9 +658,9 @@ public final class BrokerServer implements AutoCloseable {
                     // The pool would start a thread for each of its first tasks. Starting them
                     // now gives the broker all its threads from the start, whatever comes.
                     server.routing.actors.prestartAllCoreThreads();
-                    DropReports reports = server.routing.dropReports;
-                    if (reports != null) {
-                        reports.start();
+                    Notices notices = server.routing.notices;
+                    if (notices != null) {
+                        notices.start();
                     }
                     FailureNotice notice = server.routing.failureNotice;
                     if (notice != null) {
@@ -715,7 +715,7 @@ public final class BrokerServer implements AutoCloseable {
                     }
                 } catch (Throwable failure) {
                     if (connection != null) {
-                        connection.close("start failed");
+                        connection.close("start failed", null);
                     } else {
                         try {
                             socket.close();
@@ -926,9 +926,9 @@ public final class BrokerServer implements AutoCloseable {
                 // asks them to return; the broker's end waits until they have.
                 authentications.shutdownNow();
             }
-            DropReports reports = routing.dropReports;
-            if (reports != null) {
-                reports.close();
+            Notices notices = routing.notices;
+            if (notices != null) {
+                notices.close();
             }
             FailureNotice notice = routing.failureNotice;
             if (notice != null) {

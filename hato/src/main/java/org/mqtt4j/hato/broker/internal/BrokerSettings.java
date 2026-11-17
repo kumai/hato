@@ -30,10 +30,10 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // `selectors` and `actors` are the numbers of selector threads and of threads in the actor
 // pool. The capabilities are what the broker announces to MQTT 5.0 clients until a test
 // changes them, within its own limits. The application's listener, if there is one, hears of
-// the QoS 1 and 2 deliveries that the limits keep from a session (see DropReports). The
-// application's authenticator, if there is one, decides on every CONNECT; a decision may take
-// `authenticationTimeout` nanoseconds, and at most `maxAuthentications` run at once, while
-// further CONNECTs wait for one of them to end.
+// the clients that connect and disconnect and of the QoS 1 and 2 deliveries that the limits keep
+// from a session (see Notices). The application's authenticator, if there is one, decides on
+// every CONNECT; a decision may take `authenticationTimeout` nanoseconds, and at most
+// `maxAuthentications` run at once, while further CONNECTs wait for one of them to end.
 //
 // The selector calls `beforeProcess` before handing a packet to its session. It asks
 // `deliveryWriteHeld` before marking the deliveries of a write as sent: while the answer is
