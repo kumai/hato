@@ -15,11 +15,13 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 
@@ -1054,6 +1056,13 @@ public final class BrokerServer implements AutoCloseable {
     // after its failure goes on to close its own sockets.
     @Override
     public void close() {
+        Boolean _ = offVirtualThread("close", () -> {
+            closeHere();
+            return true;
+        });
+    }
+
+    private void closeHere() {
         boolean first;
         synchronized (this) {
             first = !routing.closed;
@@ -1071,6 +1080,10 @@ public final class BrokerServer implements AutoCloseable {
     /// broker has closed, and whether the clients that were connected had what waited for them
     /// within `timeout`.
     public boolean shutdown(Duration timeout) {
+        return offVirtualThread("shutdown", () -> shutdownHere(timeout));
+    }
+
+    private boolean shutdownHere(Duration timeout) {
         CompletableFuture<Boolean> result;
         boolean first;
         synchronized (this) {
@@ -1334,6 +1347,49 @@ public final class BrokerServer implements AutoCloseable {
 
     // Waits until `thread` has ended; one that never started has. An interrupt does not end
     // the wait, and stays with the calling thread.
+    // Runs `work`, the operation `name` of the application's, here, or on a platform thread of its
+    // own that this thread waits for when this thread is virtual. Ending connections, sessions,
+    // and the broker takes locks that the broker's threads take too, and a platform thread that
+    // waits for a lock behind a virtual thread sleeps while every carrier is busy, though the
+    // lock is free (JDK 25; see Log): the broker's threads would stop with it. An interrupt of
+    // the waiting thread goes on to the one that does the work, and stays with the waiting
+    // thread as well. What `work` throws, this throws.
+    private <T> T offVirtualThread(String name, Supplier<T> work) {
+        if (!Thread.currentThread().isVirtual()) {
+            return work.get();
+        }
+        var task = new FutureTask<T>(work::get);
+        Thread worker = Thread.ofPlatform()
+                .daemon()
+                .inheritInheritableThreadLocals(false)
+                .name("hato-broker-" + port() + "-" + name)
+                .start(task);
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try {
+                    return task.get();
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                    worker.interrupt();
+                } catch (ExecutionException failure) {
+                    Throwable cause = failure.getCause();
+                    if (cause instanceof RuntimeException unchecked) {
+                        throw unchecked;
+                    }
+                    if (cause instanceof Error error) {
+                        throw error;
+                    }
+                    throw new IllegalStateException(cause);
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
     private static void awaitEnd(Thread thread) {
         boolean interrupted = false;
         while (true) {
@@ -1476,10 +1532,7 @@ public final class BrokerServer implements AutoCloseable {
         for (int level = 0; level < dropped.length; level++) {
             dropped[level] = routing.dropped(level);
         }
-        long retained;
-        synchronized (routing.retained) {
-            retained = routing.retained.size();
-        }
+        long retained = routing.retained.count();
         Notices notices = routing.notices;
         boolean ended = routing.closed;
         return new Counts(
@@ -1500,10 +1553,8 @@ public final class BrokerServer implements AutoCloseable {
     /// a lost connection. Does nothing when the client has no open connection. Returns whether
     /// it ended one: false also for a connection that was ending already.
     public boolean disconnect(String clientId) {
-        return routing.disconnect(
-                clientId,
-                new Reason(ReasonCode.ADMINISTRATIVE_ACTION, null, null)
-        );
+        var reason = new Reason(ReasonCode.ADMINISTRATIVE_ACTION, null, null);
+        return offVirtualThread("disconnect", () -> routing.disconnect(clientId, reason));
     }
 
     /// Ends the connection that the listener heard of as `connection` as [#disconnect(String)]
@@ -1511,10 +1562,8 @@ public final class BrokerServer implements AutoCloseable {
     /// client stays open. Returns whether it ended it: false for a connection that has ended or
     /// was ending already, and for one that this broker did not report.
     public boolean disconnect(BrokerListener.Connection connection) {
-        return routing.disconnect(
-                connection,
-                new Reason(ReasonCode.ADMINISTRATIVE_ACTION, null, null)
-        );
+        var reason = new Reason(ReasonCode.ADMINISTRATIVE_ACTION, null, null);
+        return offVirtualThread("disconnect", () -> routing.disconnect(connection, reason));
     }
 
     /// Ends the open connection of `clientId` as [#disconnect(String)] does, but tells an MQTT
@@ -1537,7 +1586,7 @@ public final class BrokerServer implements AutoCloseable {
                 reasonString,
                 serverReference
         );
-        routing.disconnect(clientId, reason);
+        boolean _ = offVirtualThread("disconnect", () -> routing.disconnect(clientId, reason));
     }
 
     /// Makes the broker announce these capabilities to the MQTT 5.0 connections that it accepts

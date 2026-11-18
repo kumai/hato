@@ -50,6 +50,10 @@ final class RetainedMessages {
 
     private long bytes;
 
+    // How many messages the store keeps, as size() says, for count(); written under the topic
+    // lock.
+    private volatile int count;
+
     // Whether a kept message has a Message Expiry Interval, and if so a time before which none
     // of them has used its interval up, so that nobody needs to look at them before it. The
     // time is the earliest end of a lifetime among the messages that the store kept at its
@@ -83,6 +87,7 @@ final class RetainedMessages {
         if (previous != null) {
             bytes -= counted(previous);
             byTopic.remove(publication.topic());
+            count = messages.size();
         }
         if (publication.payload().length == 0) {
             return;
@@ -124,12 +129,20 @@ final class RetainedMessages {
         nextPlace++;
         bytes += size;
         noteExpiry(message);
+        count = messages.size();
     }
 
     // How many messages the store keeps, as the retained limit counts them: a message whose
     // lifetime has passed counts until the store finds it so.
     int size() {
         return messages.size();
+    }
+
+    // The same as size(), as it was a moment ago, for a caller without the topic lock: the
+    // application's threads, virtual ones among them, take no lock that the broker's threads
+    // wait for.
+    int count() {
+        return count;
     }
 
     // The place in the order stored that the next message takes: every message stored so far has
@@ -195,6 +208,7 @@ final class RetainedMessages {
                 noteExpiry(message);
             }
         }
+        count = messages.size();
     }
 
     // The retained messages whose topics `filter` matches, in the order they were stored,
@@ -212,6 +226,7 @@ final class RetainedMessages {
         messages.clear();
         byTopic.clear();
         bytes = 0;
+        count = 0;
         expiring = false;
     }
 

@@ -79,7 +79,8 @@ final class Notices {
     private final ArrayDeque<Notice> notices = new ArrayDeque<>();
 
     // How many notices of connections the limit has dropped, and whether that has been logged.
-    private long droppedNotices;
+    // Written under this, and read without it (see droppedNotices).
+    private volatile long droppedNotices;
 
     private boolean noticeLimitReached;
 
@@ -168,8 +169,10 @@ final class Notices {
         queue(order -> new Notice.Disconnected(order, connection, reason));
     }
 
-    // How many notices of connections the limit has dropped so far.
-    synchronized long droppedNotices() {
+    // How many notices of connections the limit has dropped so far. It takes no lock, so that
+    // the application's threads, virtual ones among them, take none that the broker's threads
+    // wait for.
+    long droppedNotices() {
         return droppedNotices;
     }
 

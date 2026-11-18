@@ -537,9 +537,11 @@ final class Routing {
         return refusedPublications.get();
     }
 
-    // How many deliveries wait in the sessions for their clients now.
-    // Ceiling: it visits every session under its inbox, so its time grows with the sessions; a
-    // count that the queues kept as they change would cost the delivery path instead.
+    // How many deliveries wait in the sessions for their clients now, each count as it was a
+    // moment ago. It takes no lock, so that the application's threads take none that the
+    // broker's threads wait for.
+    // Ceiling: it visits every session, so its time grows with the sessions; a count for all of
+    // them that the sessions kept as they change would cost the delivery path instead.
     long queuedDeliveries() {
         long queued = 0;
         for (Session session : sessions.values()) {

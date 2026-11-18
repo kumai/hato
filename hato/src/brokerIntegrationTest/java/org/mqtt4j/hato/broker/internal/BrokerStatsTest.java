@@ -1,6 +1,11 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.ToLongFunction;
 
 import org.junit.jupiter.api.Test;
@@ -13,6 +18,8 @@ import org.mqtt4j.hato.broker.BrokerStats;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.protocol.Packet;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
@@ -151,6 +158,55 @@ class BrokerStatsTest {
         }
     }
 
+    @Test
+    void the_counts_are_read_while_the_broker_holds_its_locks() throws Exception {
+        // Arrange: room in the memory for deliveries for one delivery, which a session that is
+        // away holds. A retained publication then needs that room, which the session hands over
+        // under the topic lock and its inbox; there the broker waits until another thread has
+        // read the counts, for two seconds at most.
+        long room = RawSession.deliverySize(publication("kept", "0001", AT_LEAST_ONCE, 7));
+        var server = new AtomicReference<BrokerServer>();
+        var read = new CompletableFuture<BrokerServer.Counts>();
+        BrokerServer.Builder holding = BrokerServer.builder()
+                .maxDeliveryMemory(room)
+                .deliveryMemoryUnit(0)
+                .beforeHandOver(_ -> {
+                    try {
+                        read.complete(CompletableFuture.supplyAsync(server.get()::counts)
+                                .get(2, SECONDS));
+                    } catch (Exception failure) {
+                        read.completeExceptionally(failure);
+                    }
+                });
+        try (BrokerServer sut = holding.start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            server.set(sut);
+            try (RawSession away = connected(sut.port(), "away", false, false)) {
+                away.subscribe("kept", AT_LEAST_ONCE);
+                away.disconnect();
+            }
+            publisher.publish("kept", "0001", AT_LEAST_ONCE, 7);
+
+            // Act
+            publisher.publish(new Packet.Publish(
+                    new Topic("kept"),
+                    "0002".getBytes(UTF_8),
+                    AT_LEAST_ONCE,
+                    true,
+                    false,
+                    7,
+                    EMPTY
+            ));
+
+            // Assert: the counts came while the broker held its locks, with the retained
+            // message and the delivery that waited.
+            assertThat(read).succeedsWithin(Duration.ofSeconds(5)).satisfies(counts -> {
+                assertThat(counts.retainedMessages()).isEqualTo(1);
+                assertThat(counts.queuedDeliveries()).isEqualTo(1);
+            });
+        }
+    }
+
     /// The counts of QoS 0, 1, and 2 that `count` reads.
     private static List<Long> countsOf(ToLongFunction<Qos> count) {
         return List.of(
@@ -158,5 +214,9 @@ class BrokerStatsTest {
                 count.applyAsLong(AT_LEAST_ONCE),
                 count.applyAsLong(EXACTLY_ONCE)
         );
+    }
+
+    private static InetSocketAddress loopback() {
+        return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
     }
 }

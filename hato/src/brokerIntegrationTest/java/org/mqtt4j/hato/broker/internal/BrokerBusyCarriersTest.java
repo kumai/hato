@@ -2,8 +2,11 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.logging.Handler;
 import java.util.logging.LogRecord;
@@ -11,6 +14,8 @@ import java.util.logging.Logger;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.protocol.Packet;
@@ -18,6 +23,7 @@ import org.mqtt4j.hato.testsupport.BusyCarriers;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.ReasonCode.SUCCESS;
 import static org.mqtt4j.hato.broker.internal.RawSession.codec;
@@ -28,7 +34,8 @@ import static org.mqtt4j.hato.internal.protocol.Properties.EMPTY;
 
 /// A broker keeps serving whatever the application does with its own threads: while its virtual
 /// threads keep every carrier busy, as an application that computes on them can, and while its
-/// logging backend is held up. No thread of the broker needs a carrier or enters the backend.
+/// logging backend is held up. No thread of the broker needs a carrier or enters the backend, and
+/// the application's calls on virtual threads take no lock that the broker's threads wait for.
 ///
 /// The clients here read and write on the thread of the test, which is a platform thread. A
 /// [RawSession] reads on a virtual thread, which would wait for a carrier with the broker.
@@ -131,12 +138,48 @@ class BrokerBusyCarriersTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"close", "shutdown"})
+    void ending_the_broker_on_a_virtual_thread_ends_its_sessions_on_a_platform_thread(String end)
+            throws Exception {
+        // Arrange: a session that outlives its connection, which ending the broker clears on
+        // the thread that ends it while no other thread has its turn.
+        var virtual = new CopyOnWriteArrayList<Boolean>();
+        BrokerServer sut = BrokerServer.builder()
+                .afterLeave(_ -> virtual.add(Thread.currentThread().isVirtual()))
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        try (Socket client = connected(sut.port(), "kept", 0, false)) {
+            exchange(client, new Packet.Disconnect(SUCCESS, EMPTY), new byte[0]);
+        }
+        await().until(() -> sut.counts().connections() == 0);
+
+        // Act
+        Thread ending = Thread.ofVirtual().start(() -> {
+            switch (end) {
+                case "close" -> sut.close();
+                default -> {
+                    boolean _ = sut.shutdown(Duration.ofSeconds(5));
+                }
+            }
+        });
+        ending.join();
+
+        // Assert: the session's end took the broker's locks on a platform thread.
+        assertThat(virtual).containsExactly(false);
+    }
+
     // Opens a connection on which the broker has accepted an MQTT 3.1.1 client.
     private static Socket connected(int port, String clientId, int keepAlive) throws IOException {
+        return connected(port, clientId, keepAlive, true);
+    }
+
+    // The same, for a client that starts clean if `clean`, and else for a session that lasts.
+    private static Socket connected(int port, String clientId, int keepAlive, boolean clean)
+            throws IOException {
         var socket = new Socket(InetAddress.getLoopbackAddress(), port);
         try {
             socket.setSoTimeout(5_000);
-            exchange(socket, connect(clientId, true, keepAlive), CONNACK);
+            exchange(socket, connect(clientId, clean, keepAlive), CONNACK);
             return socket;
         } catch (IOException | RuntimeException | Error failure) {
             socket.close();

@@ -351,11 +351,11 @@ final class Session {
     }
 
     // How many deliveries wait for the client: in the queues, and as the retained messages that
-    // the cursors of new subscriptions still hold.
-    synchronized int queued() {
-        return atMostOnceQueue.deliveries.size()
-                + acknowledgedQueue.deliveries.size()
-                + retainedRoom.count;
+    // the cursors of new subscriptions still hold. Read without the inbox, which the counts are
+    // written under, so that the application's threads, virtual ones among them, take no lock
+    // that the broker's threads wait for: each count is as it was a moment ago.
+    int queued() {
+        return atMostOnceQueue.count + acknowledgedQueue.count + retainedRoom.count;
     }
 
     // Posts `event`, which the actor runs after those posted before. If the turn is free, the
@@ -2567,6 +2567,9 @@ final class Session {
         // are the oldest: those that came later have none until the limits are applied again.
         int withRoom;
 
+        // How many deliveries wait, as queued() reads them without the inbox; written under it.
+        volatile int count;
+
         DeliveryQueue(int maxCount, long maxBytes) {
             this.maxCount = maxCount;
             this.maxBytes = maxBytes;
@@ -2579,6 +2582,7 @@ final class Session {
 
         void add(Delivery delivery) {
             deliveries.addLast(delivery);
+            count++;
             bytes += delivery.memoryBytes;
             if (delivery.hasRoom) {
                 withRoom++;
@@ -2595,6 +2599,7 @@ final class Session {
         // Takes account of `delivery` having left the deliveries, before it gives any room in
         // the broker's memory back.
         void left(Delivery delivery) {
+            count--;
             bytes -= delivery.memoryBytes;
             if (delivery.hasRoom) {
                 withRoom--;
@@ -2603,19 +2608,21 @@ final class Session {
 
         void clear() {
             deliveries.clear();
+            count = 0;
             bytes = 0;
             withRoom = 0;
         }
     }
 
     // The number and bytes of the retained messages that cursors hold, and the limits on them.
+    // The number is written under the inbox, and queued() reads it without.
     private static final class Room {
 
         final int maxCount;
 
         final long maxBytes;
 
-        int count;
+        volatile int count;
 
         long bytes;
 
