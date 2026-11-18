@@ -3,7 +3,11 @@ package org.mqtt4j.hato.broker.internal;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.locks.LockSupport;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -12,6 +16,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.Topic;
+import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
@@ -19,15 +24,21 @@ import org.mqtt4j.hato.internal.protocol.Property;
 import org.mqtt4j.hato.internal.protocol.PropertyId;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.Qos.EXACTLY_ONCE;
+import static org.mqtt4j.hato.ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR;
+import static org.mqtt4j.hato.ReasonCode.PACKET_TOO_LARGE;
 import static org.mqtt4j.hato.ReasonCode.SUCCESS;
+import static org.mqtt4j.hato.broker.internal.BrokerSessionRaceTest.awaitRelease;
 import static org.mqtt4j.hato.broker.internal.RawSession.acceptedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
+import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.internal.protocol.Properties.EMPTY;
 
 /// The limits that an MQTT 5.0 client announces in CONNECT, which the broker keeps to: its
@@ -286,6 +297,134 @@ class BrokerClientLimitsTest {
                     .isEqualTo(publication("sized/small", "small", AT_LEAST_ONCE, 1));
             subscriber.ping();
         }
+    }
+
+    @Test
+    void a_client_that_takes_no_connack_is_refused_and_leaves_the_connection_of_its_identifier()
+            throws Exception {
+        try (var sut = MqttBroker.start();
+                var first = RawSession.open(sut.port(), MqttVersion.V5);
+                var second = RawSession.open(sut.port(), MqttVersion.V5)) {
+            // Arrange: the CONNACK that accepts a client announces the broker's limits in 15
+            // bytes.
+            accepted(first, connect("robot", true), false);
+
+            // Act
+            second.send(connect("robot", true, maximumPacketSize(10)));
+
+            // Assert: a refusal of 5 bytes, and the connection that it would have taken over
+            // goes on.
+            assertThat(second.expect(Packet.ConnAck.class))
+                    .isEqualTo(new Packet.ConnAck(false, IMPLEMENTATION_SPECIFIC_ERROR, EMPTY));
+            second.expectClosed();
+            first.ping();
+        }
+    }
+
+    @Test
+    void a_client_that_takes_not_even_a_refusal_loses_its_connection_without_connack()
+            throws Exception {
+        try (var sut = MqttBroker.start();
+                var client = RawSession.open(sut.port(), MqttVersion.V5)) {
+            // Act: a CONNACK takes 5 bytes at least.
+            client.send(connect("robot", true, maximumPacketSize(4)));
+
+            // Assert
+            client.expectClosed();
+        }
+    }
+
+    @Test
+    void a_shutdown_that_refuses_a_client_as_its_connect_arrives_keeps_to_its_limit()
+            throws Exception {
+        // Arrange: the selector holds the CONNECT of a client that takes 4 bytes at most, while
+        // a shutdown refuses the client and waits for its connection to close.
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .beforeProcess(packet -> {
+                            if (packet instanceof Packet.Connect) {
+                                held.countDown();
+                                awaitRelease(release);
+                            }
+                        })
+                        .start(loopback());
+                var client = RawSession.open(sut.port(), MqttVersion.V5)
+        ) {
+            client.send(connect("robot", true, maximumPacketSize(4)));
+            assertThat(held.await(5, SECONDS)).isTrue();
+            Thread shuttingDown = Thread.ofPlatform().start(() -> sut.shutdown(Duration.ZERO));
+            await().until(() -> LockSupport.getBlocker(shuttingDown) == sut);
+
+            // Act
+            release.countDown();
+
+            // Assert: no CONNACK, which takes 5 bytes at least.
+            client.expectClosed();
+            shuttingDown.join();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void a_subscribe_whose_suback_the_client_does_not_take_ends_the_connection_unsubscribed()
+            throws Exception {
+        try (BrokerServer sut = BrokerServer.builder().start(loopback());
+                var client = RawSession.open(sut.port(), MqttVersion.V5)) {
+            // Arrange: a session that outlives the connection.
+            accepted(client, connect("robot", true, maximumPacketSize(64), sessionExpiry()), false);
+
+            // Act: the SUBACK for 64 filters takes 69 bytes.
+            client.send(new Packet.Subscribe(1, subscriptions(0, 64), EMPTY));
+
+            // Assert
+            assertThat(client.expect(Packet.Disconnect.class))
+                    .isEqualTo(new Packet.Disconnect(PACKET_TOO_LARGE, EMPTY));
+            client.expectClosed();
+            assertThat(sut.indexedFor(new Topic("topic/0"))).isEmpty();
+        }
+    }
+
+    @Test
+    void an_unsubscribe_whose_unsuback_the_client_does_not_take_ends_the_connection_subscribed()
+            throws Exception {
+        try (BrokerServer sut = BrokerServer.builder().start(loopback());
+                var client = RawSession.open(sut.port(), MqttVersion.V5)) {
+            // Arrange: a session that outlives the connection, with 64 subscriptions made 32 at
+            // a time, whose SUBACKs take 37 bytes.
+            accepted(client, connect("robot", true, maximumPacketSize(64), sessionExpiry()), false);
+            client.send(new Packet.Subscribe(1, subscriptions(0, 32), EMPTY));
+            client.expect(Packet.SubAck.class);
+            client.send(new Packet.Subscribe(2, subscriptions(32, 32), EMPTY));
+            client.expect(Packet.SubAck.class);
+
+            // Act: the UNSUBACK for all 64 takes 69 bytes.
+            List<TopicFilter> filters = subscriptions(0, 64).stream()
+                    .map(Packet.Subscription::filter)
+                    .toList();
+            client.send(new Packet.Unsubscribe(3, filters, EMPTY));
+
+            // Assert
+            assertThat(client.expect(Packet.Disconnect.class))
+                    .isEqualTo(new Packet.Disconnect(PACKET_TOO_LARGE, EMPTY));
+            client.expectClosed();
+            assertThat(sut.indexedFor(new Topic("topic/0"))).containsExactly("robot");
+        }
+    }
+
+    /// QoS 0 subscriptions to `count` topics, from topic/`first` on.
+    private static List<Packet.Subscription> subscriptions(int first, int count) {
+        var subscriptions = new ArrayList<Packet.Subscription>();
+        for (int index = first; index < first + count; index++) {
+            subscriptions.add(subscription("topic/" + index, AT_MOST_ONCE));
+        }
+        return subscriptions;
+    }
+
+    private static InetSocketAddress loopback() {
+        return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
     }
 
     /// Sends `connect` and checks that the broker accepts it, resuming a session or not.

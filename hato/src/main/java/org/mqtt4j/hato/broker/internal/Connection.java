@@ -569,9 +569,12 @@ final class Connection {
             long receivedAt = received();
             if (!connected) {
                 var request = (Packet.Connect) arrival.packet();
+                // The client's Maximum Packet Size holds from the moment that the CONNECT counts as
+                // received, for a shutdown that refuses the client before the CONNECT is checked.
                 synchronized (this) {
                     version = request.version();
                     connectReceived = true;
+                    client.sendLimit = Client.sendLimitOf(request);
                 }
                 settings.beforeProcess().accept(request);
                 connecting = true;
@@ -787,12 +790,27 @@ final class Connection {
         }
     }
 
+    // Queues `packet`, a packet other than a delivery, and returns false if the send queue is full
+    // or the connection ends anyway. One that the client's Maximum Packet Size does not take ends
+    // the connection instead, with DISCONNECT Packet too large if that fits [MQTT-3.1.2-24], and
+    // counts as queued, since its sender goes on as for one that will go out. The client checks
+    // the answers that can grow before it carries out their requests, so this is a last guard.
     // Called under the connection monitor; no I/O occurs on a session's actor.
     boolean enqueue(Packet packet) {
         if (ended || lastPacket != null) {
             return false;
         }
         Outbound queued = wire.queued(packet, version);
+        if (queued.size() > client.sendLimit) {
+            closeAfter(
+                    new Packet.Disconnect(ReasonCode.PACKET_TOO_LARGE, Properties.EMPTY),
+                    "a " + packet.getClass().getSimpleName() + " of " + queued.size()
+                            + " bytes that the client's Maximum Packet Size of "
+                            + client.sendLimit + " bytes does not take",
+                    DisconnectReason.PROTOCOL_ERROR
+            );
+            return true;
+        }
         boolean enqueueFailed = outgoing.offer(
                 ++ticket,
                 queued,
@@ -963,13 +981,15 @@ final class Connection {
         return true;
     }
 
-    // Ends the connection with `packet` after the sends that wait, for `kind`. Called under the
+    // Ends the connection with `packet` after the sends that wait, for `kind`, or without it when
+    // the client's Maximum Packet Size does not take it [MQTT-3.1.2-24]. Called under the
     // connection monitor.
     private void closeAfter(Packet packet, String reason, @Nullable DisconnectReason kind) {
         if (ended || lastPacket != null) {
             return;
         }
-        closeAfter(wire.queued(packet, version), reason, kind);
+        Outbound last = wire.queued(packet, version);
+        closeAfter((last.size() <= client.sendLimit) ? last : new Outbound.End(), reason, kind);
     }
 
     // Ends the connection with `last`, a packet as it waits to be written or the end of the

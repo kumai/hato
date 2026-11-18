@@ -4,6 +4,7 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.OptionalLong;
@@ -26,6 +27,7 @@ import org.mqtt4j.hato.broker.BrokerListener.DisconnectReason;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.IncomingAliases;
 import org.mqtt4j.hato.internal.protocol.Packet;
+import org.mqtt4j.hato.internal.protocol.PacketCodec;
 import org.mqtt4j.hato.internal.protocol.PacketDecodeException;
 import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.Property;
@@ -101,10 +103,14 @@ final class Client {
     // What the client announced in its CONNECT, which the session keeps to on this connection.
     // The send quota is its Receive Maximum: how many QoS 1 and QoS 2 publications the broker
     // may send it unanswered at once (MQTT 5.0 section 4.9). The send limit is its Maximum
-    // Packet Size. MQTT 3.1.1 announces neither, which leaves the broker's own window and limits.
+    // Packet Size, which no packet of the broker's exceeds [MQTT-3.1.2-24]; it holds from the
+    // CONNECT on, for the packets that refuse the client too, so the selector sets it as the
+    // connection takes the CONNECT as received, under the connection's monitor, and any thread
+    // that ends the connection reads it. MQTT 3.1.1 announces neither, which leaves the broker's
+    // own window and limits.
     int sendQuota = 65_535;
 
-    int sendLimit = Connection.MAX_PACKET_SIZE;
+    volatile int sendLimit = Connection.MAX_PACKET_SIZE;
 
     // Whether the connection has a place among the broker's clients: from its acceptance until
     // its end comes to the session, or until another connection takes the session over and the
@@ -209,6 +215,26 @@ final class Client {
             do {
                 id = "hato" + UUID.randomUUID().toString().replace("-", "");
             } while (routing.sessions.containsKey(id));
+        }
+        // The CONNACK that would accept the client carries the capabilities that the connection
+        // keeps to, of which none can be left out. A client whose Maximum Packet Size cannot take
+        // it is refused here, before anything touches its session [MQTT-3.1.2-24]; the refusal
+        // goes out only if it fits.
+        if (request.version() == MqttVersion.V5 && sendLimit < Connection.MAX_PACKET_SIZE) {
+            int size = sizeOf(new Packet.ConnAck(
+                    false,
+                    ReasonCode.SUCCESS,
+                    acceptanceV5(request, id, offered, expiry)
+            ));
+            if (size > sendLimit) {
+                connection.refuse(
+                        ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR,
+                        "client '" + request.clientId() + "', whose Maximum Packet Size of "
+                                + sendLimit + " bytes takes no CONNACK of " + size
+                );
+                done.accept(false);
+                return;
+            }
         }
         Authenticator authenticator = settings.authenticator();
         if (authenticator != null || routing.notices != null) {
@@ -514,7 +540,6 @@ final class Client {
             will = request.will();
             limits = offered;
             sendQuota = sendQuotaOf(request);
-            sendLimit = sendLimitOf(request);
             problemInformation = problemInformationOf(request);
             if (offered.topicAliasMaximum() > 0) {
                 aliases = new IncomingAliases(offered.topicAliasMaximum());
@@ -684,12 +709,40 @@ final class Client {
 
     // The largest packet that the client takes: the Maximum Packet Size of its CONNECT, and
     // without one, or above it, the largest that MQTT allows [MQTT-3.1.2-24].
-    private static int sendLimitOf(Packet.Connect request) {
+    static int sendLimitOf(Packet.Connect request) {
         return switch (request.properties().find(PropertyId.MAXIMUM_PACKET_SIZE).orElse(null)) {
             case Property.FourByteValue(var _, var value) ->
                     (int) Math.min(value, Connection.MAX_PACKET_SIZE);
             case null, default -> Connection.MAX_PACKET_SIZE;
         };
+    }
+
+    // Whether the client cannot take `answer`, the smallest answer to its request, which no
+    // Reason String or User Property makes larger. If so, the connection ends with DISCONNECT
+    // Packet too large instead, before the request is carried out [MQTT-3.1.2-24], and the
+    // DISCONNECT goes out only if it fits. Runs on the actor.
+    private boolean beyondSendLimit(Packet answer) {
+        if (sendLimit == Connection.MAX_PACKET_SIZE) {
+            return false;
+        }
+        int size = sizeOf(answer);
+        if (size <= sendLimit) {
+            return false;
+        }
+        connection.disconnect(
+                ReasonCode.PACKET_TOO_LARGE,
+                "a request whose " + answer.getClass().getSimpleName() + " of " + size
+                        + " bytes the client's Maximum Packet Size of " + sendLimit
+                        + " bytes does not take",
+                DisconnectReason.PROTOCOL_ERROR
+        );
+        return true;
+    }
+
+    // The bytes that `packet` takes in MQTT 5.0, the version in which a client has a Maximum
+    // Packet Size.
+    private static int sizeOf(Packet packet) {
+        return PacketCodec.of(MqttVersion.V5).encode(packet).length;
     }
 
     // Whether the CONNECT leaves the client's Request Problem Information at 1, as it is without
@@ -817,6 +870,16 @@ final class Client {
                     );
                     return;
                 }
+                // SUBACK carries a reason code for each filter, which no Reason String can make
+                // room for, so a request whose SUBACK the client cannot take subscribes to
+                // nothing.
+                if (beyondSendLimit(new Packet.SubAck(
+                        request.packetId(),
+                        Collections.nCopies(request.subscriptions().size(), ReasonCode.SUCCESS),
+                        Properties.EMPTY
+                ))) {
+                    return;
+                }
                 var grants = new ArrayList<ReasonCode>();
                 // The first refusal with a Reason String, which SUBACK carries; it has room for
                 // one.
@@ -897,6 +960,15 @@ final class Client {
                 owner.drain();
             }
             case Packet.Unsubscribe request -> {
+                // So does an MQTT 5.0 UNSUBACK, and a request whose UNSUBACK the client cannot
+                // take ends none of its subscriptions.
+                if (owner.version == MqttVersion.V5 && beyondSendLimit(new Packet.UnsubAck(
+                        request.packetId(),
+                        Collections.nCopies(request.filters().size(), ReasonCode.SUCCESS),
+                        Properties.EMPTY
+                ))) {
+                    return;
+                }
                 var results = new ArrayList<ReasonCode>();
                 for (TopicFilter filter : request.filters()) {
                     boolean existed = owner.unsubscribe(filter);

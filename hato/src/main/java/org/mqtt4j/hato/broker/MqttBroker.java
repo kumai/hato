@@ -93,12 +93,16 @@ import static java.util.Objects.requireNonNull;
 /// for its connection. In turn, the broker keeps to the client's Receive Maximum on each
 /// connection, resending on a resumed session no more than the new connection allows, and
 /// discards a publication larger than the client's Maximum Packet Size as if the client had
-/// received and acknowledged it. An Authentication Method is refused with Bad authentication
-/// method. AUTH, a PUBLISH with a Subscription Identifier or an invalid Topic Alias, or a
-/// SUBSCRIBE with a `$share/` filter closes the connection. A PUBREC with a failure reason code
-/// ends the QoS 2 delivery without PUBREL. Before it closes an MQTT 5.0 connection for a
-/// malformed or forbidden packet, an expired keep-alive, or another connection with the same
-/// client identifier, the broker sends DISCONNECT with the reason code; a peer that stops
+/// received and acknowledged it. No other packet exceeds that size either: a client whose
+/// Maximum Packet Size takes no CONNACK is refused before its session changes, with
+/// Implementation specific error where that fits, and a SUBSCRIBE or UNSUBSCRIBE whose answer
+/// does not fit ends the connection with Packet too large before it is carried out. A refusal
+/// or DISCONNECT that does not fit is left out. An Authentication Method is refused with Bad
+/// authentication method. AUTH, a PUBLISH with a Subscription Identifier or an invalid Topic
+/// Alias, or a SUBSCRIBE with a `$share/` filter closes the connection. A PUBREC with a failure
+/// reason code ends the QoS 2 delivery without PUBREL. Before it closes an MQTT 5.0 connection
+/// for a malformed or forbidden packet, an expired keep-alive, or another connection with the
+/// same client identifier, the broker sends DISCONNECT with the reason code; a peer that stops
 /// reading may not receive it.
 ///
 /// ## Flow control and limits

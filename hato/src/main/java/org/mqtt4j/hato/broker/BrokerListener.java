@@ -143,7 +143,8 @@ public interface BrokerListener {
         APPLICATION,
 
         /// The client broke the protocol, or a limit that the broker set for it, such as the
-        /// largest packet that the broker takes.
+        /// largest packet that the broker takes, or made a request whose answer its own Maximum
+        /// Packet Size does not take.
         PROTOCOL_ERROR,
 
         /// The broker failed to handle the connection, and ended it alone.
