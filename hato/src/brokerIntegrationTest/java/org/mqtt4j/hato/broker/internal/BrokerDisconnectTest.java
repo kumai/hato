@@ -1,19 +1,29 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.IOException;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.protocol.Packet;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 
-/// How the application closes the connection of a client by its identifier, and what the
-/// client keeps of its session.
+/// How the application closes the connection of a client, by its identifier or as the listener
+/// heard of it, and what the client keeps of its session.
 class BrokerDisconnectTest {
+
+    // The connections that the listener heard of, in the order of its calls.
+    private final BlockingQueue<BrokerListener.Connection> connections =
+            new LinkedBlockingQueue<>();
 
     @Test
     void the_application_closes_the_connection_of_a_client_which_learns_why() throws Exception {
@@ -63,5 +73,62 @@ class BrokerDisconnectTest {
                 assertThat(robot.expect(Packet.Publish.class).topic().name()).isEqualTo("orders");
             }
         }
+    }
+
+    @Test
+    void the_application_closes_a_connection_that_the_listener_heard_of() throws Exception {
+        try (MqttBroker sut = brokerHearingConnections();
+                RawSession client = connectedV5(sut.port(), "robot")) {
+            // Arrange
+            BrokerListener.Connection connection = nextConnection();
+
+            // Act
+            boolean disconnected = sut.disconnect(connection);
+
+            // Assert
+            assertThat(disconnected).isTrue();
+            assertThat(client.expect(Packet.Disconnect.class).reasonCode())
+                    .isEqualTo(ReasonCode.ADMINISTRATIVE_ACTION);
+            client.expectClosed();
+        }
+    }
+
+    @Test
+    void closing_a_connection_that_the_listener_heard_of_leaves_a_later_one_open()
+            throws Exception {
+        try (MqttBroker sut = brokerHearingConnections();
+                RawSession first = connected(sut.port(), "robot")) {
+            // Arrange: the client connects again, and the second connection takes the session
+            // over, before the application closes the first one.
+            BrokerListener.Connection firstConnection = nextConnection();
+            try (RawSession second = connected(sut.port(), "robot")) {
+                first.expectClosed();
+
+                // Act
+                boolean disconnected = sut.disconnect(firstConnection);
+
+                // Assert
+                assertThat(disconnected).isFalse();
+                second.ping();
+            }
+        }
+    }
+
+    private MqttBroker brokerHearingConnections() throws IOException {
+        return MqttBroker.builder()
+                .listener(new BrokerListener() {
+                    @Override
+                    public void onConnected(Connection connection) {
+                        connections.add(connection);
+                    }
+                })
+                .start();
+    }
+
+    /// The next connection that the listener heard of, which must come within a few seconds.
+    private BrokerListener.Connection nextConnection() throws InterruptedException {
+        BrokerListener.Connection next = connections.poll(5, SECONDS);
+        assertThat(next).as("a connection that the listener heard of").isNotNull();
+        return next;
     }
 }

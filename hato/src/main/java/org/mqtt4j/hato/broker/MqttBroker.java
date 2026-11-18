@@ -163,7 +163,8 @@ import static java.util.Objects.requireNonNull;
 ///
 /// The [BrokerListener] hears of each client that the broker accepts, and of the end of its
 /// connection with the reason. [#disconnect(String)] closes the connection of a client, and
-/// [#stats()] counts the clients, sessions, retained messages, and deliveries.
+/// [#disconnect(BrokerListener.Connection)] a connection that the listener heard of. [#stats()]
+/// counts the clients, sessions, retained messages, and deliveries.
 ///
 /// ## Ending
 ///
@@ -277,6 +278,10 @@ public final class MqttBroker implements AutoCloseable {
     /// The call returns at once. From then on, the broker begins to handle no packet that the
     /// client sent on the connection.
     ///
+    /// The call closes the connection that the client has as it comes, which can be newer than
+    /// the last one that the listener heard of. [#disconnect(BrokerListener.Connection)] closes
+    /// a connection that the listener heard of, and never a later one of the same client.
+    ///
     /// @param clientId
     ///   the identifier of the client to disconnect
     /// @return
@@ -285,6 +290,23 @@ public final class MqttBroker implements AutoCloseable {
     public boolean disconnect(String clientId) {
         requireNonNull(clientId, "clientId");
         return server.disconnect(clientId);
+    }
+
+    /// Closes `connection`, which the [BrokerListener] heard of, if it is still open, as
+    /// [#disconnect(String)] closes the connection of a client. A later connection of the same
+    /// client stays open, so an application that decides about one connection, for example by
+    /// the certificate that [BrokerListener.Connection#clientCertificates()] gives, closes that
+    /// one alone, also when the client has connected again meanwhile.
+    ///
+    /// @param connection
+    ///   the object that [BrokerListener#onConnected(BrokerListener.Connection)] received for
+    ///   the connection
+    /// @return
+    ///   whether this call closes the connection; false if it has ended or was closing already,
+    ///   or if this broker did not report it
+    public boolean disconnect(BrokerListener.Connection connection) {
+        requireNonNull(connection, "connection");
+        return server.disconnect(connection);
     }
 
     /// Reads what the broker counts; see [BrokerStats]. It reads the counts without stopping the

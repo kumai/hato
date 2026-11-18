@@ -1495,6 +1495,17 @@ public final class BrokerServer implements AutoCloseable {
         );
     }
 
+    /// Ends the connection that the listener heard of as `connection` as [#disconnect(String)]
+    /// does, while it is the open connection of its client; a later connection of the same
+    /// client stays open. Returns whether it ended it: false for a connection that has ended or
+    /// was ending already, and for one that this broker did not report.
+    public boolean disconnect(BrokerListener.Connection connection) {
+        return routing.disconnect(
+                connection,
+                new Reason(ReasonCode.ADMINISTRATIVE_ACTION, null, null)
+        );
+    }
+
     /// Ends the open connection of `clientId` as [#disconnect(String)] does, but tells an MQTT
     /// 5.0 client `reasonCode`, `reasonString`, and `serverReference`, the last two if not
     /// null. Even Normal disconnection leaves the Will to go out, because the client did not

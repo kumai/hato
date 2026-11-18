@@ -389,9 +389,21 @@ final class Routing {
     boolean disconnect(String clientId, Reason reason) {
         Session session = sessions.get(clientId);
         Connection peer = (session == null) ? null : session.connection;
-        if (peer == null) {
-            return false;
-        }
+        return peer != null && endForApplication(peer, reason);
+    }
+
+    // Ends for the application, as above, the connection that the listener heard of as
+    // `reported`, if it is still the open connection of its client, and returns whether it did.
+    // A later connection of the same client, or a connection of another broker, is never ended.
+    boolean disconnect(BrokerListener.Connection reported, Reason reason) {
+        Session session = sessions.get(reported.clientId());
+        Connection peer = (session == null) ? null : session.connection;
+        return peer != null && peer.client.toldAs(reported) && endForApplication(peer, reason);
+    }
+
+    // Ends `peer` for the application, telling an MQTT 5.0 client `reason`, unless it was ending
+    // already.
+    private static boolean endForApplication(Connection peer, Reason reason) {
         Packet.Disconnect disconnect = reason.fitted(
                 properties -> new Packet.Disconnect(reason.code(), properties),
                 peer.client.sendLimit

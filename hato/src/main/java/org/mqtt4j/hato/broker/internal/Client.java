@@ -21,6 +21,7 @@ import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.Authenticator;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.BrokerListener.DisconnectReason;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.IncomingAliases;
@@ -112,9 +113,10 @@ final class Client {
 
     // The connection as the application's listener heard that it connected, until the listener
     // hears that it ended; null before and after that, and without a listener. Only the
-    // session's actor uses it, which tells the listener of all the connections of the client in
-    // their order.
-    private @Nullable ClientConnection told;
+    // session's actor writes it, which tells the listener of all the connections of the client
+    // in their order. The application's thread reads it to find the connection that it asks to
+    // close by the object that the listener received.
+    private volatile @Nullable ClientConnection told;
 
     Client(Connection connection, Routing routing) {
         this.connection = connection;
@@ -725,6 +727,12 @@ final class Client {
             told = connected;
             notices.connected(connected);
         }
+    }
+
+    // Whether the listener heard that this connection connected as `reported`, and has yet to
+    // hear that it ended. Any thread may ask.
+    boolean toldAs(BrokerListener.Connection reported) {
+        return told == reported;
     }
 
     // Tells the listener that this connection has ended, once, if it heard that the connection

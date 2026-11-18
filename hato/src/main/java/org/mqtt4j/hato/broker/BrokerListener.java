@@ -85,9 +85,10 @@ public interface BrokerListener {
     }
 
     /// A connection of a client, as the broker reports it. The broker passes the same object to
-    /// both notices of a connection, and the object has no equality of its own. Later versions
-    /// may add methods with default implementations, so that a listener's tests can implement
-    /// this interface.
+    /// both notices of a connection, and the object has no equality of its own.
+    /// [MqttBroker#disconnect(BrokerListener.Connection)] closes the connection that the object
+    /// stands for. Later versions may add methods with default implementations, so that a
+    /// listener's tests can implement this interface.
     interface Connection {
 
         /// {@return the identifier of the client, which the broker assigns to an MQTT 5.0 client
@@ -109,7 +110,10 @@ public interface BrokerListener {
         /// The certificate chain that the client presented in its TLS handshake, the client's own
         /// certificate first: the chain that the [Authenticator], if the broker has one, received
         /// in [Authenticator.Request#clientCertificates()]. Nothing checks the chain again while
-        /// the connection lasts.
+        /// the connection lasts, so an application that ends the connections whose certificates
+        /// expire or are revoked meanwhile does so with
+        /// [MqttBroker#disconnect(BrokerListener.Connection)], which leaves a later connection of
+        /// the same client open.
         ///
         /// @return the client's certificate chain, or an empty list for a client that connected
         ///   without TLS or presented no certificate
@@ -134,7 +138,8 @@ public interface BrokerListener {
         /// Another connection with the same client identifier took the session over.
         TAKEN_OVER,
 
-        /// The application closed the connection with [MqttBroker#disconnect(String)].
+        /// The application closed the connection with [MqttBroker#disconnect(String)] or
+        /// [MqttBroker#disconnect(BrokerListener.Connection)].
         APPLICATION,
 
         /// The client broke the protocol, or a limit that the broker set for it, such as the
