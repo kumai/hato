@@ -711,6 +711,46 @@ class BrokerTlsTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"TLSv1.2", "TLSv1.3"})
+    void a_close_notify_that_comes_with_the_last_publication_ends_the_connection(String protocol)
+            throws Exception {
+        // Arrange: a client without a keep-alive and with a Will, and a plain client that waits
+        // for the Will.
+        SSLContext context = Tls.serverContext();
+        try (BrokerServer broker = BrokerServer.builder()
+                .listenTls(loopback(), context, serverParameters(context, _ -> { }))
+                .start(loopback());
+                RawSession watcher = RawSession.connected(broker.plainPort(), "watcher");
+                var sut = new EngineClient(broker.tlsPort(), Tls.clientContext(), protocol)) {
+            watcher.subscribe("wills/#", Qos.AT_MOST_ONCE);
+            sut.handshake(false);
+            sut.send(RawSession.codec.encode(new Packet.Connect(
+                    "leaving",
+                    MqttVersion.V3_1_1,
+                    true,
+                    0,
+                    new Packet.Will(
+                            new Topic("wills/leaving"),
+                            new byte[] {1},
+                            Qos.AT_MOST_ONCE,
+                            false,
+                            Properties.EMPTY
+                    ),
+                    null,
+                    null,
+                    Properties.EMPTY
+            )), false);
+            assertThat(sut.receive(4)).containsExactly(0x20, 0x02, 0x00, 0x00);
+            // Act: a publication and close_notify in one write, after which the client sends
+            // nothing more and leaves its TCP connection open.
+            sut.send(RawSession.codec.encode(publication(new Topic("readings"))), true);
+            // Assert: the broker ends the connection without a DISCONNECT, so the Will goes out.
+            assertThat(watcher.expect(Packet.Publish.class).topic())
+                    .isEqualTo(new Topic("wills/leaving"));
+        }
+    }
+
     @Test
     void a_trust_manager_that_throws_an_error_fails_that_handshake_alone() throws Exception {
         // Arrange: a trust manager that breaks its contract with an Error, and a client whose

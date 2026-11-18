@@ -190,6 +190,14 @@ final class TlsChannel {
                 }
             }
             int produced = input.position() - start;
+            if (produced > 0 && inputEnded) {
+                // The end of the input came with the last bytes of packets, such as a
+                // close_notify in the same read, and no readiness of the socket tells of it
+                // again. So the connection comes back of its own, and its next read returns the
+                // end.
+                resumed = true;
+                requireNonNull(connection, "registered").wake();
+            }
             return (produced == 0 && inputEnded && pendingInput == null) ? -1 : produced;
         } catch (SSLException failure) {
             int produced = input.position() - start;
