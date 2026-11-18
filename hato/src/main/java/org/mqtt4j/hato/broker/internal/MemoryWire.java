@@ -104,12 +104,15 @@ final class MemoryWire implements Wire {
         return new Arrival(item.packet(), item.size());
     }
 
+    // The end is read before the input: a client puts its last packet in before it ends, so
+    // input that comes between the two looks is still found.
     @Override
     public int read() {
+        boolean ended = link.clientEnded();
         if (link.input()) {
             return 1;
         }
-        return link.clientEnded() ? -1 : 0;
+        return ended ? -1 : 0;
     }
 
     // The link's queues wake the loop as input arrives, so the loop looks at it anyway.
