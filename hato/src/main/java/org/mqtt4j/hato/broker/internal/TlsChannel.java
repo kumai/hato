@@ -260,10 +260,29 @@ final class TlsChannel {
                     }
                 }
                 case BUFFER_UNDERFLOW -> {
+                    // The engine takes records of up to twice the size that it gave as it was
+                    // made, from peers that break the limit, while the connection keeps a
+                    // record of that size at most. One that does not fit never arrives whole,
+                    // and waiting for the rest would keep the selector turning until the
+                    // deadline, since the socket stays ready with what is left unread.
+                    if (net.remaining() >= recordSize) {
+                        throw new SSLException(
+                                "A TLS record is larger than the " + recordSize
+                                        + " bytes that the broker takes"
+                        );
+                    }
                     wanting = true;
                     return;
                 }
                 case BUFFER_OVERFLOW -> {
+                    // For the same reason, a record whose bytes do not fit in the input while
+                    // it is empty is never read.
+                    if (input.position() == 0) {
+                        throw new SSLException(
+                                "A TLS record holds more than the " + input.capacity()
+                                        + " bytes that the broker takes from one"
+                        );
+                    }
                     // The input has no room for the next record's bytes, which wait until the
                     // connection has taken those before. No readiness of the socket will bring
                     // the connection back for them, so it comes back of its own.
@@ -288,6 +307,13 @@ final class TlsChannel {
     private boolean wrapOwn() throws SSLException {
         ByteBuffer out = reactor.tlsOutput(recordSize);
         SSLEngineResult result = engine.wrap(NOTHING, out);
+        if (result.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW) {
+            // The engine makes records larger than it said as it was made, as the application's
+            // TLS parameters can have it do, and no buffer of the connection takes them.
+            throw new SSLException(
+                    "The TLS engine makes records larger than " + recordSize + " bytes"
+            );
+        }
         if (result.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.FINISHED) {
             established = true;
         }

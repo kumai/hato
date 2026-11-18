@@ -2,6 +2,7 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.management.ManagementFactory;
 import java.net.ConnectException;
 import java.net.InetAddress;
@@ -659,6 +660,29 @@ class BrokerTlsTest {
                 long allocated = bean.getThreadAllocatedBytes(selector) - before;
                 assertThat(allocated).isLessThan(12L * publications * publication.length);
             }
+        }
+    }
+
+    @Test
+    void a_record_larger_than_the_broker_takes_ends_the_connection_at_once() throws Exception {
+        // Arrange
+        try (MqttBroker broker = MqttBroker.builder()
+                .listenTls(loopback(), Tls.serverContext())
+                .start();
+                var socket = new Socket(InetAddress.getLoopbackAddress(), broker.tlsPort())) {
+            // Act: before any handshake, the header of a record of 24,576 bytes, which the
+            // engine takes from peers that break the limit, and more of its bytes than the broker
+            // keeps of a record.
+            try {
+                OutputStream output = socket.getOutputStream();
+                output.write(new byte[] {0x16, 0x03, 0x03, 0x60, 0x00});
+                output.write(new byte[20_000]);
+            } catch (IOException _) {
+                // The broker may close the connection before the rest has gone out.
+            }
+            // Assert: the broker closes the connection at once, rather than wait for the rest
+            // until the connect deadline.
+            assertClosed(socket);
         }
     }
 
