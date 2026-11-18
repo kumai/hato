@@ -288,6 +288,7 @@ public final class BrokerServer implements AutoCloseable {
             }
             listenings = List.copyOf(listening);
             accepting = Thread.ofPlatform().daemon()
+                    .inheritInheritableThreadLocals(false)
                     .name("hato-broker-" + routing.port + "-accept")
                     .unstarted(this::accept);
         } catch (IOException | RuntimeException | Error failure) {

@@ -45,6 +45,7 @@ final class InprocLoop implements Loop, InprocBrokers.Endpoint {
         this.routing = routing;
         this.stopBroker = stopBroker;
         thread = Thread.ofPlatform().daemon()
+                .inheritInheritableThreadLocals(false)
                 .name("hato-broker-" + routing.port + "-inproc")
                 .unstarted(this::run);
     }

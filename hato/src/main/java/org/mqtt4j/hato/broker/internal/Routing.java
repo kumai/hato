@@ -304,6 +304,7 @@ final class Routing {
                 task -> {
                     int number = nextAuthentication.getAndIncrement();
                     return Thread.ofPlatform().daemon()
+                            .inheritInheritableThreadLocals(false)
                             .name("hato-broker-" + port + "-auth-" + number)
                             .unstarted(task);
                 }

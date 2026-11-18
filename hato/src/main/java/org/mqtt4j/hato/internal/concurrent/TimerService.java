@@ -24,7 +24,11 @@ public final class TimerService implements Timer {
     private TimerService(String owner) {
         executor = new ScheduledThreadPoolExecutor(
                 1,
-                Thread.ofPlatform().daemon().name("hato-" + owner + "-timer").factory()
+                Thread.ofPlatform()
+                        .daemon()
+                        .inheritInheritableThreadLocals(false)
+                        .name("hato-" + owner + "-timer")
+                        .factory()
         );
         executor.setRemoveOnCancelPolicy(true);
     }

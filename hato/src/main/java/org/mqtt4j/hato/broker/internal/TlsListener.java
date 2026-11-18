@@ -64,6 +64,7 @@ final class TlsListener {
                 TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(waiting),
                 task -> Thread.ofPlatform().daemon()
+                        .inheritInheritableThreadLocals(false)
                         .name("hato-broker-" + brokerPort + "-tls-" + next.getAndIncrement())
                         .unstarted(task)
         ) {

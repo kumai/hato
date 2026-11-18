@@ -107,6 +107,7 @@ final class Notices {
         this.noticeLimit = noticeLimit;
         this.termination = termination;
         thread = Thread.ofPlatform().daemon()
+                .inheritInheritableThreadLocals(false)
                 .name("hato-broker-" + port + "-notices")
                 .unstarted(this::run);
     }

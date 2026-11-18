@@ -1,5 +1,7 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -26,6 +28,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.broker.Authenticator;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.internal.concurrent.Timer;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.Packet;
@@ -34,6 +37,7 @@ import org.mqtt4j.hato.internal.protocol.PropertyId;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.internal.protocol.Properties.EMPTY;
 
 /// The application's authenticator: what it learns, how its decisions answer the client, and
@@ -667,6 +671,48 @@ class BrokerAuthenticationTest {
             // Assert
             assertThat(client.expect(Packet.ConnAck.class).reasonCode()).isEqualTo(expected);
             client.expectClosed();
+        }
+    }
+
+    @Test
+    void the_threads_of_the_broker_take_no_inheritable_thread_local_of_the_thread_that_starts_it()
+            throws Exception {
+        // Arrange: an application that keeps a value for each thread, inherited by the threads
+        // that a thread starts, and that starts the broker on a thread where it has one.
+        var tenant = new InheritableThreadLocal<String>();
+        var seen = new CopyOnWriteArrayList<String>();
+        Authenticator authenticator = _ -> {
+            seen.add("authenticator: " + tenant.get());
+            return Authenticator.Decision.accept(Authenticator.Scope.all());
+        };
+        BrokerListener listener = new BrokerListener() {
+            @Override
+            public void onConnected(BrokerListener.Connection connection) {
+                seen.add("listener: " + tenant.get());
+            }
+        };
+        var started = new AtomicReference<BrokerServer>();
+        Thread starting = Thread.ofPlatform().start(() -> {
+            tenant.set("the starting thread's");
+            try {
+                started.set(BrokerServer.builder()
+                        .authenticator(authenticator)
+                        .listener(listener)
+                        .start(loopback()));
+            } catch (IOException failure) {
+                throw new UncheckedIOException(failure);
+            }
+        });
+        starting.join();
+        try (BrokerServer sut = started.get();
+                RawSession client = RawSession.open(sut.port())) {
+            // Act
+            client.send(connect("client", MqttVersion.V3_1_1, null, null));
+            client.expect(Packet.ConnAck.class);
+
+            // Assert: the application's code on the broker's threads sees no value.
+            await().until(() -> seen.size() == 2);
+            assertThat(seen).containsExactlyInAnyOrder("authenticator: null", "listener: null");
         }
     }
 

@@ -49,6 +49,7 @@ final class Reactor implements Loop, AutoCloseable {
         this.routing = routing;
         this.stopBroker = stopBroker;
         thread = Thread.ofPlatform().daemon()
+                .inheritInheritableThreadLocals(false)
                 .name("hato-broker-" + routing.port + "-selector-" + index)
                 .unstarted(this::run);
     }

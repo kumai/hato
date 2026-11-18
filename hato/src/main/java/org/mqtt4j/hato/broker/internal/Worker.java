@@ -24,8 +24,10 @@ final class Worker extends Thread {
     // give back to (see MemoryBudget). This thread alone uses it while it runs tasks.
     long memory;
 
+    // Takes none of the inheritable thread locals of the thread that starts the broker, which
+    // the application's code that runs here, for no client in particular, must not see.
     Worker(Runnable loop, String name) {
-        super(loop, name);
+        super(null, loop, name, 0, false);
         setDaemon(true);
     }
 

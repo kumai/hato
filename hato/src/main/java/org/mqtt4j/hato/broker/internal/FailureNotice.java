@@ -38,6 +38,7 @@ final class FailureNotice {
         this.port = port;
         this.termination = termination;
         thread = Thread.ofPlatform().daemon()
+                .inheritInheritableThreadLocals(false)
                 .name("hato-broker-" + port + "-failure")
                 .unstarted(this::run);
     }

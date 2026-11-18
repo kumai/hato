@@ -41,6 +41,7 @@ final class Termination {
 
     Termination(int parts, int port) {
         this(parts, port, task -> Thread.ofPlatform().daemon()
+                .inheritInheritableThreadLocals(false)
                 .name("hato-broker-" + port + "-end")
                 .start(task));
     }
@@ -49,6 +50,7 @@ final class Termination {
         running = new AtomicInteger(parts);
         this.startThread = startThread;
         thread = Thread.ofPlatform().daemon()
+                .inheritInheritableThreadLocals(false)
                 .name("hato-broker-" + port + "-end")
                 .unstarted(this::run);
     }
