@@ -60,6 +60,9 @@ final class SocketWire implements Wire {
         this.socket = socket;
         remote = socket.getRemoteSocketAddress();
         socket.setTcpNoDelay(true);
+        // A client with a Keep Alive of 0 has no deadline, so the system's keep-alive probes are
+        // what ends a connection whose peer has gone without a word, as at a power failure.
+        socket.setKeepAlive(true);
         frames = new FrameAssembler(
                 Math.min(routing.settings.maxPacketSize(), routing.settings.maxConnectSize())
         );
