@@ -1227,7 +1227,7 @@ final class Connection {
     private void leaveAwaitingConnect() {
         if (awaitingConnect) {
             awaitingConnect = false;
-            routing.leftAwaitingConnect();
+            routing.leftAwaitingConnect(wire.inProcess());
         }
     }
 

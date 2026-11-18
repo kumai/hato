@@ -126,13 +126,14 @@ import static java.util.Objects.requireNonNull;
 /// The clients that the broker serves at once are bounded: a CONNECT beyond the limit is refused,
 /// in MQTT 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable, unless it comes for
 /// the session of a client that is connected, whose connection it takes over. Connections that
-/// have had no CONNECT accepted yet are bounded apart from the clients: while as many wait as
-/// their limit allows, a further TCP connection waits to be accepted until one of them is
-/// accepted or ends, and a further in-process connection is refused. A CONNECT that is larger,
-/// or carries more properties, than the broker takes from an unknown peer closes its connection
-/// without a CONNACK. A later packet larger than the broker takes ends the connection too: an
-/// MQTT 5.0 client, which learned the limit from CONNACK, receives DISCONNECT with Packet too
-/// large, and an MQTT 3.1.1 client, which cannot learn it, receives nothing.
+/// have had no CONNECT accepted yet are bounded apart from the clients, and network connections
+/// apart from in-process ones: while as many network connections wait as their limit allows, a
+/// further one waits to be accepted until one of them is accepted or ends, and while as many
+/// in-process connections wait, a further one is refused. A CONNECT that is larger, or carries
+/// more properties, than the broker takes from an unknown peer closes its connection without a
+/// CONNACK. A later packet larger than the broker takes ends the connection too: an MQTT 5.0
+/// client, which learned the limit from CONNACK, receives DISCONNECT with Packet too large, and
+/// an MQTT 3.1.1 client, which cannot learn it, receives nothing.
 /// A new persistent session is refused when the persistent-session limit is reached, in MQTT
 /// 5.0 with Quota exceeded and in MQTT 3.1.1 with Server unavailable. The number and total size
 /// of retained messages are bounded too: a retained publication beyond either limit is

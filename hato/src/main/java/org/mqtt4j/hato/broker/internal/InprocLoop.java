@@ -105,7 +105,7 @@ final class InprocLoop implements Loop, InprocBrokers.Endpoint {
             return false;
         }
         routing.connections.add(connection);
-        routing.awaitingConnect.incrementAndGet();
+        routing.awaitingInproc.incrementAndGet();
         return true;
     }
 
@@ -189,12 +189,13 @@ final class InprocLoop implements Loop, InprocBrokers.Endpoint {
     }
 
     // Makes a connection of `link` and has the loop serve it, or refuses the link while as many
-    // connections as the broker allows wait for their CONNECT. A TCP connection waits at the
-    // listener then; a link has no backlog to wait in.
+    // in-process connections as the broker allows wait for their CONNECT. A TCP connection waits
+    // at the listener then; a link has no backlog to wait in. The connections over a network
+    // count apart, so that they cannot keep the application's own clients out.
     private void accept(InprocLink link) {
-        if (routing.awaitingConnect.get() >= routing.settings.maxAwaitingConnect()) {
+        if (routing.awaitingInproc.get() >= routing.settings.maxAwaitingConnect()) {
             log.debug("Broker on port {} refused an in-process connection, because {}"
-                    + " connections wait for their CONNECT", routing.port,
+                    + " in-process connections wait for their CONNECT", routing.port,
                     routing.settings.maxAwaitingConnect());
             link.refuse();
             return;

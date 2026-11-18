@@ -947,12 +947,12 @@ public final class BrokerServer implements AutoCloseable {
         }
     }
 
-    // Waits while as many connections as the broker allows wait for their CONNECT, until one of
-    // them is accepted or ends; the connections that come meanwhile wait in the listener's
+    // Waits while as many network connections as the broker allows wait for their CONNECT, until
+    // one of them is accepted or ends; the connections that come meanwhile wait in the listener's
     // backlog, rather than be closed. The connection that frees a place wakes this thread
-    // through the selector (see Routing.leftAwaitingConnect). This thread and the loop of the
-    // in-process connections add to the waiting connections, each after its own check, so at
-    // most one more than the limit waits at a time.
+    // through the selector (see Routing.leftAwaitingConnect). Only this thread adds to the
+    // network connections that wait, after this check, so no more than the limit wait at a
+    // time.
     private void awaitPlace() throws IOException {
         int limit = routing.settings.maxAwaitingConnect();
         if (routing.awaitingConnect.get() < limit) {

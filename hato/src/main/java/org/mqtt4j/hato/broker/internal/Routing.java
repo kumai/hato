@@ -76,11 +76,16 @@ final class Routing {
 
     final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 
-    // How many of the connections wait for the broker to accept a CONNECT on them, which their
-    // limit bounds. A connection counts from its registration with its selector, which the
+    // How many of the network connections wait for the broker to accept a CONNECT on them, which
+    // their limit bounds. A connection counts from its registration with its selector, which the
     // accepting thread makes, until the broker accepts its client or the connection ends. The
     // accepting thread waits while they are at their limit, and one that leaves wakes it.
     final AtomicInteger awaitingConnect = new AtomicInteger();
+
+    // The same for the in-process connections, which the same limit bounds apart, so that peers
+    // on the network cannot keep the application's own clients from connecting. The loop of the
+    // in-process connections refuses a link while they are at their limit.
+    final AtomicInteger awaitingInproc = new AtomicInteger();
 
     // Wakes the accepting thread as a place frees among the connections that wait for their
     // CONNECT.
@@ -218,7 +223,7 @@ final class Routing {
                 ? null
                 : authenticationPool(
                         settings.maxAuthentications(),
-                        settings.maxAwaitingConnect(),
+                        (int) Math.min(2L * settings.maxAwaitingConnect(), Integer.MAX_VALUE),
                         port,
                         termination
                 );
@@ -279,9 +284,10 @@ final class Routing {
     // once the broker has shut it down and its decisions have returned. A CONNECT that finds
     // `decisions` running waits in the queue for one of them to end, for its deadline at most
     // (see Client.decide). The queue holds `waiting`, as many connections as may wait for
-    // their CONNECT, which one that waits for its decision still does: a CONNECT leaves the
-    // queue as its connection stops waiting for the decision (see Client.waiting), so the queue
-    // always has room. The threads start as decisions come, and end once idle.
+    // their CONNECT over a network and in process together, which one that waits for its
+    // decision still does: a CONNECT leaves the queue as its connection stops waiting for the
+    // decision (see Client.waiting), so the queue always has room. The threads start as
+    // decisions come, and end once idle.
     private static ThreadPoolExecutor authenticationPool(
             int decisions,
             int waiting,
@@ -313,10 +319,13 @@ final class Routing {
         return pool;
     }
 
-    // Counts a connection out of those that wait for their CONNECT. The accepting thread waits
-    // while they are at their limit, so the one that frees a place wakes it.
-    void leftAwaitingConnect() {
-        if (awaitingConnect.getAndDecrement() >= settings.maxAwaitingConnect()) {
+    // Counts a connection out of those that wait for their CONNECT, `inProcess` or over a
+    // network. The accepting thread waits while the network ones are at their limit, so the one
+    // that frees a place wakes it.
+    void leftAwaitingConnect(boolean inProcess) {
+        if (inProcess) {
+            awaitingInproc.decrementAndGet();
+        } else if (awaitingConnect.getAndDecrement() >= settings.maxAwaitingConnect()) {
             placeFreed.run();
         }
     }
