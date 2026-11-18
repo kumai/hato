@@ -666,6 +666,13 @@ final class Session {
             Session publisher,
             long received
     ) {
+        // A session without a connection takes no QoS 0 delivery, and one that ends with its
+        // connection takes none at all (see admit), so it is passed over before its
+        // subscriptions are matched. A connection that attaches meanwhile comes as late for the
+        // publication as one that attaches just after it.
+        if (connection == null && (publication.qos() == Qos.AT_MOST_ONCE || !kept())) {
+            return;
+        }
         Map<String, Subscribed> matchedOn = subscriptions;
         MqttVersion sized = version;
         List<Delivery> deliveries = deliveries(
