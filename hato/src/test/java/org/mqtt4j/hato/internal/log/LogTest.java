@@ -384,7 +384,7 @@ class LogTest {
     void a_text_deep_in_a_chain_is_escaped_however_deep() {
         var logger = new RecordingLogger(Level.TRACE);
         var sut = Log.of(logger);
-        Throwable top = new IllegalStateException("deepest\nforged");
+        var top = new IllegalStateException("deepest\nforged");
         for (int level = 0; level < 100; level++) {
             top = new IllegalStateException("level " + level, top);
         }
@@ -405,7 +405,7 @@ class LogTest {
         var sut = Log.of(logger);
         // 1,100 throwables, of which the escaping looks at the first 1,024: the text of the
         // deepest, which it never sees, must not reach the backend.
-        Throwable top = new IllegalStateException("deepest\nforged");
+        var top = new IllegalStateException("deepest\nforged");
         for (int level = 0; level < 1_099; level++) {
             top = new IllegalStateException("level " + level, top);
         }
