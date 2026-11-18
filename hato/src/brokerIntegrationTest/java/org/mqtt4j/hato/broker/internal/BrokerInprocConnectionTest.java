@@ -4,12 +4,19 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.MqttClient;
+import org.mqtt4j.hato.MqttMessage;
+import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReconnectPolicy;
+import org.mqtt4j.hato.Topic;
+import org.mqtt4j.hato.UserProperty;
 import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.internal.inproc.InprocBrokers;
 import org.mqtt4j.hato.internal.inproc.InprocLink;
@@ -17,6 +24,7 @@ import org.mqtt4j.hato.internal.inproc.InprocLink;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 
@@ -78,6 +86,34 @@ class BrokerInprocConnectionTest {
             } finally {
                 release.countDown();
             }
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try") // The client reaches the broker by its name alone.
+    void an_in_process_publication_with_more_properties_than_a_packet_takes_ends_its_connection()
+            throws Exception {
+        // Arrange: an MQTT 5.0 client in the same JVM, whose packets the broker takes undecoded.
+        try (BrokerServer broker = BrokerServer.builder()
+                .name("many-properties-test")
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                MqttClient sut = MqttClient.builder()
+                        .server(URI.create("inproc://many-properties-test"))
+                        .version(MqttVersion.V5)
+                        .reconnectPolicy(ReconnectPolicy.disabled())
+                        .build()) {
+            sut.connect().get(5, SECONDS);
+            MqttMessage message = MqttMessage.of(
+                    new Topic("readings"),
+                    new byte[] {1},
+                    Qos.AT_LEAST_ONCE,
+                    false
+            ).withUserProperties(Collections.nCopies(65_537, new UserProperty("k", "v")));
+
+            // Act & Assert: the broker ends the connection rather than pass on a packet that no
+            // client over a network would decode.
+            assertThatThrownBy(() -> sut.publish(message).get(5, SECONDS))
+                    .isInstanceOf(ExecutionException.class);
         }
     }
 }

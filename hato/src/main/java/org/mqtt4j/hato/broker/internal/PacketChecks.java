@@ -3,6 +3,7 @@ package org.mqtt4j.hato.broker.internal;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.internal.protocol.Packet;
+import org.mqtt4j.hato.internal.protocol.PacketCodec;
 import org.mqtt4j.hato.internal.protocol.PacketDecodeException;
 import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.Property;
@@ -92,7 +93,16 @@ final class PacketChecks {
         }
     }
 
+    // Checks the strings of `properties`, and that there are no more of them than decoding
+    // takes: a packet of an in-process client, which arrives undecoded, may have more, which no
+    // client that the broker passes it on to over a network would take.
     private static void properties(Properties properties) {
+        if (properties.entries().size() > PacketCodec.MAX_PROPERTIES) {
+            throw new PacketDecodeException(
+                    ReasonCode.PACKET_TOO_LARGE,
+                    "More than " + PacketCodec.MAX_PROPERTIES + " MQTT properties"
+            );
+        }
         for (Property property : properties.entries()) {
             switch (property) {
                 case Property.StringValue value -> text(value.value());
