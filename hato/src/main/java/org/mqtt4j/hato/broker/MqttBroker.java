@@ -143,6 +143,14 @@ import static java.util.Objects.requireNonNull;
 /// [MqttBrokerBuilder] sets the limits that an application may need to change, and documents
 /// their defaults; the other limits are internal and may change.
 ///
+/// The strings of the packets that the broker passes on, topics and properties among them,
+/// contain no control character, from U+0001 to U+001F or from U+007F to U+009F, and no Unicode
+/// noncharacter: MQTT lets a receiver treat a packet with one as malformed, and some clients
+/// drop their connection over it. So a packet from a client with such a character in any of its
+/// strings ends the connection as a malformed packet does: an MQTT 5.0 client receives
+/// DISCONNECT with Malformed Packet, an MQTT 3.1.1 client nothing, and a CONNECT with one closes
+/// its connection without a CONNACK.
+///
 /// ## Authentication and authorization
 ///
 /// An [Authenticator] decides on every client that connects, and on what it may publish and
