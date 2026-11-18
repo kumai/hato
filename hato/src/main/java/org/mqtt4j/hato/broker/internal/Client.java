@@ -778,9 +778,9 @@ final class Client {
         }
     }
 
-    // Handles one packet that the client sent on its accepted connection. Runs on the actor of
-    // `owner`.
-    void process(Session owner, Packet packet) {
+    // Handles one packet that the client sent on its accepted connection, which the broker
+    // received at `received` by its clock. Runs on the actor of `owner`.
+    void process(Session owner, Packet packet, long received) {
         switch (packet) {
             case Packet.Subscribe request -> {
                 int identifier = identifierOf(request);
@@ -911,8 +911,8 @@ final class Client {
                 };
                 send(new Packet.UnsubAck(request.packetId(), reasonCodes, Properties.EMPTY));
             }
-            case Packet.Publish publish -> receive(owner, resolved(publish));
-            case Packet.AliasPublish publish -> receive(owner, resolved(publish));
+            case Packet.Publish publish -> receive(owner, resolved(publish), received);
+            case Packet.AliasPublish publish -> receive(owner, resolved(publish), received);
             case Packet.PubAck ack -> owner.acknowledge(ack.packetId(), false);
             case Packet.PubRec ack -> owner.release(ack.packetId(), ack.reasonCode());
             case Packet.PubRel ack -> {
@@ -997,9 +997,10 @@ final class Client {
         );
     }
 
-    // Forwards a publication from the client and acknowledges it. Only a server sets
-    // Subscription Identifiers. MQTT 3.1.1 has no properties.
-    private void receive(Session owner, Packet.Publish publish) {
+    // Forwards a publication from the client, which the broker received at `received` by its
+    // clock, and acknowledges it. Only a server sets Subscription Identifiers. MQTT 3.1.1 has no
+    // properties.
+    private void receive(Session owner, Packet.Publish publish, long received) {
         if (publish.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
             throw new PacketDecodeException(
                     ReasonCode.PROTOCOL_ERROR,
@@ -1069,7 +1070,7 @@ final class Client {
             unreleased.set(publish.packetId());
             owner.received.set(publish.packetId());
         }
-        routing.route(publish, owner);
+        routing.route(publish, owner, received);
         // Acknowledge only after every delivery was enqueued or its target closed.
         if (publish.qos() == Qos.AT_LEAST_ONCE) {
             send(new Packet.PubAck(

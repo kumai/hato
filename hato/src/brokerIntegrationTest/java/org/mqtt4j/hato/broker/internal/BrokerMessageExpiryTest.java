@@ -102,6 +102,58 @@ class BrokerMessageExpiryTest {
     }
 
     @Test
+    void a_lifetime_counts_from_the_arrival_of_its_message_while_its_session_is_busy()
+            throws Exception {
+        // Arrange: the publisher's session is held on a first publication, while a second one,
+        // retained with a lifetime of a second, arrives behind it and two seconds pass.
+        var held = new CountDownLatch(1);
+        var arrived = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (
+                BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(Duration.ofSeconds(5))
+                        .scheduler(timer)
+                        .beforeHandle(packet -> {
+                            if (published(packet, "expiring/first")) {
+                                held.countDown();
+                                awaitRelease(release);
+                            }
+                        })
+                        .beforeProcess(packet -> {
+                            if (published(packet, "expiring/second")) {
+                                arrived.countDown();
+                            }
+                        })
+                        .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession subscriber = connectedV5(sut.port(), "subscriber");
+                RawSession publisher = connectedV5(sut.port(), "publisher")
+        ) {
+            subscriber.subscribe("expiring/#", AT_MOST_ONCE);
+            publisher.publish("expiring/first", "first", AT_MOST_ONCE, 0);
+            assertThat(held.await(5, SECONDS)).isTrue();
+            publisher.send(retained("expiring/second", 2, 1));
+            assertThat(arrived.await(5, SECONDS)).isTrue();
+            timer.clock.advance(Duration.ofSeconds(2));
+
+            // Act
+            release.countDown();
+            publisher.expect(Packet.PubAck.class);
+
+            // Assert: the second publication had no lifetime left as its session took it up, so
+            // it reaches neither the subscriber nor, as a retained message, a later one.
+            assertThat(subscriber.expect(Packet.Publish.class).topic())
+                    .isEqualTo(new Topic("expiring/first"));
+            subscriber.ping();
+            try (RawSession late = connectedV5(sut.port(), "late")) {
+                late.subscribe("expiring/second", AT_MOST_ONCE);
+                late.ping();
+            }
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void a_message_whose_lifetime_passed_before_it_could_be_sent_is_dropped() throws Exception {
         try (BrokerServer sut = broker(128);
                 RawSession subscriber = oneAtATime(sut);
@@ -295,6 +347,12 @@ class BrokerMessageExpiryTest {
                 packetId,
                 publication.properties()
         );
+    }
+
+    /// Whether `packet` is a publication to `topic`.
+    private static boolean published(Packet packet, String topic) {
+        return packet instanceof Packet.Publish publication
+                && publication.topic().name().equals(topic);
     }
 
     /// A publication of `topic`, which is also its payload, with a Message Expiry Interval of

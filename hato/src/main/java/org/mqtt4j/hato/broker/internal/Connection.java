@@ -128,6 +128,10 @@ final class Connection {
 
     private int pendingBytes;
 
+    // When the reader took the pending packet, by the broker's clock: the time at which the
+    // broker received it, from which the lifetime of a publication counts down.
+    private long pendingReceived;
+
     private boolean pendingReserved;
 
     private List<SendQueue.Send<Outbound>> writing = List.of();
@@ -456,7 +460,8 @@ final class Connection {
                 this,
                 pending,
                 pendingAnswered,
-                pendingBytes
+                pendingBytes,
+                pendingReceived
         )) {
             return false;
         }
@@ -561,7 +566,7 @@ final class Connection {
             if (arrival == null) {
                 return false;
             }
-            received();
+            long receivedAt = received();
             if (!connected) {
                 var request = (Packet.Connect) arrival.packet();
                 synchronized (this) {
@@ -598,6 +603,7 @@ final class Connection {
                     pending.getClass().getSimpleName(), wire.peer());
             pendingBytes = arrival.size();
             pendingAnswered = answered(pending);
+            pendingReceived = receivedAt;
             if (!resumePending() || isEnded()) {
                 return true;
             }
@@ -987,8 +993,10 @@ final class Connection {
         wake();
     }
 
-    private synchronized void received() {
+    // Notes that a packet has arrived, and returns when, by the broker's clock.
+    private synchronized long received() {
         lastReceived = scheduler.nanoTime();
+        return lastReceived;
     }
 
     // Has the connection wait for the authenticator's decision on the client `clientId`, which

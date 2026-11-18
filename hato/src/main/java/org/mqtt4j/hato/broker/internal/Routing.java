@@ -561,16 +561,18 @@ final class Routing {
                 (will.qos() == Qos.AT_MOST_ONCE) ? 0 : 1,
                 properties
         );
-        route(publication, publisher);
+        // The Will's lifetime counts from its publication, which is now.
+        route(publication, publisher, settings.scheduler().nanoTime());
     }
 
     // Delivers `publication` from `publisher`'s client to every matching subscription, after
     // making it the retained message of its topic if its RETAIN flag asks for that. Called on
     // the actor of `publisher`, which drains the sessions that it delivers to, here where no
-    // thread holds their turn: under the topic lock for a retained publication.
-    void route(Packet.Publish publication, Session publisher) {
-        // A Message Expiry Interval counts from here.
-        long received = settings.scheduler().nanoTime();
+    // thread holds their turn: under the topic lock for a retained publication. A Message Expiry
+    // Interval counts from `received`, when the broker received the publication by its clock: the
+    // time that the publication waited for its session's actor is time in the broker
+    // [MQTT-3.3.2-6].
+    void route(Packet.Publish publication, Session publisher, long received) {
         // What the publication holds on the heap, which its deliveries and its retained message
         // share.
         var room = new PublicationMemory(publication);

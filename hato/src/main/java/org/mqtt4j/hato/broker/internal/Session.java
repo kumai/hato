@@ -346,11 +346,11 @@ final class Session {
         }
     }
 
-    // Posts a packet that `from` received, as post() does for a connection's reader, which
-    // reserved room for its response if `answered`. The selector pauses reads
-    // while received packets fill their limits.
-    boolean receive(Connection from, Packet packet, boolean answered, int bytes) {
-        var event = new Received(from, packet, answered, bytes);
+    // Posts a packet that `from` received at `at` by the broker's clock, as post() does for a
+    // connection's reader, which reserved room for its response if `answered`. The selector
+    // pauses reads while received packets fill their limits.
+    boolean receive(Connection from, Packet packet, boolean answered, int bytes, long at) {
+        var event = new Received(from, packet, answered, bytes, at);
         boolean unacknowledged = !answered
                 && (packet instanceof Packet.Publish || packet instanceof Packet.AliasPublish);
         int limit = unacknowledged ? UNACKNOWLEDGED_COUNT : RECEIVED_COUNT;
@@ -504,7 +504,7 @@ final class Session {
         try {
             if (connection == from && !from.isEnded()) {
                 settings.beforeHandle().accept(received.packet);
-                from.client.process(this, received.packet);
+                from.client.process(this, received.packet, received.at);
             }
         } catch (Throwable failure) {
             from.failed("packet handling", failure);
@@ -2067,8 +2067,8 @@ final class Session {
         }, ALONE);
     }
 
-    // A packet that `from` received, which the actor handles; `answered` says whether its reader
-    // reserved room for the response.
+    // A packet that `from` received at `at` by the broker's clock, which the actor handles;
+    // `answered` says whether its reader reserved room for the response.
     private final class Received implements Runnable {
 
         final Connection from;
@@ -2079,11 +2079,14 @@ final class Session {
 
         final int bytes;
 
-        Received(Connection from, Packet packet, boolean answered, int bytes) {
+        final long at;
+
+        Received(Connection from, Packet packet, boolean answered, int bytes, long at) {
             this.from = from;
             this.packet = packet;
             this.answered = answered;
             this.bytes = bytes;
+            this.at = at;
         }
 
         @Override
