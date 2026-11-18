@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.security.cert.X509Certificate;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -54,6 +55,13 @@ final class Client {
     // or everything without an authenticator. Set before the client is accepted, and read only
     // by the actor of its session, which learns of the client after that.
     private Authenticator.Scope scope = Authenticator.Scope.all();
+
+    // The certificates that the client presented in its TLS handshake, its own first, or none.
+    // Taken on the selector when the CONNECT comes, since the selector alone works the TLS engine,
+    // and only for a broker with an authenticator or a listener, the two that see them. The
+    // authenticator's request gets them there, and the actor of the session reads them for the
+    // listener's notice after the acceptance has handed the client over, which publishes them.
+    private List<X509Certificate> clientCertificates = List.of();
 
     // The session that the CONNECT attached, written under the connection's monitor, under which
     // the end of the connection reads it.
@@ -201,6 +209,9 @@ final class Client {
             } while (routing.sessions.containsKey(id));
         }
         Authenticator authenticator = settings.authenticator();
+        if (authenticator != null || routing.notices != null) {
+            clientCertificates = connection.clientCertificates();
+        }
         if (authenticator == null) {
             admit(request, id, offered, expiry, done);
         } else {
@@ -229,7 +240,7 @@ final class Client {
                 id,
                 connection.remoteAddress(),
                 connection.overTls(),
-                connection.clientCertificates()
+                clientCertificates
         );
         if (!connection.awaitDecision(id, settings.authenticationTimeout())) {
             done.accept(false);
@@ -704,7 +715,13 @@ final class Client {
     private void tellConnected(String id, MqttVersion version) {
         Notices notices = routing.notices;
         if (notices != null) {
-            var connected = new ClientConnection(id, connection.remoteAddress(), version);
+            var connected = new ClientConnection(
+                    id,
+                    connection.remoteAddress(),
+                    version,
+                    connection.overTls(),
+                    clientCertificates
+            );
             told = connected;
             notices.connected(connected);
         }

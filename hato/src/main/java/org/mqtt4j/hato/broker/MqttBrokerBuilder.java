@@ -107,7 +107,8 @@ public final class MqttBrokerBuilder {
     /// Customizes the TLS parameters of the TLS listener once per [#start()], starting with the
     /// context's defaults for a server. For example, `setNeedClientAuth(true)` requires a client
     /// certificate that the context's trust manager accepts, which
-    /// [Authenticator.Request#clientCertificates()] then shows, and `setWantClientAuth(true)`
+    /// [Authenticator.Request#clientCertificates()] and
+    /// [BrokerListener.Connection#clientCertificates()] then show, and `setWantClientAuth(true)`
     /// asks for one without requiring it. [#start()] checks the parameters on an engine of the
     /// context, and a detached snapshot is used for every connection; custom algorithm
     /// constraints and SNI matchers remain shared, so do not change those objects while the

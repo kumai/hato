@@ -2,6 +2,8 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.security.cert.X509Certificate;
+import java.util.List;
 import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
@@ -19,12 +21,26 @@ final class ClientConnection implements BrokerListener.Connection {
 
     private final MqttVersion version;
 
-    // `clientId` is the identifier that the broker accepted the client with, and `remoteAddress`
-    // where the connection comes from, if it comes over a network.
-    ClientConnection(String clientId, @Nullable SocketAddress remoteAddress, MqttVersion version) {
+    private final boolean overTls;
+
+    private final List<X509Certificate> clientCertificates;
+
+    // `clientId` is the identifier that the broker accepted the client with, `remoteAddress`
+    // where the connection comes from, if it comes over a network, and `overTls` and
+    // `clientCertificates` whether it came to the TLS listener and the certificates, if any, that
+    // the client presented there.
+    ClientConnection(
+            String clientId,
+            @Nullable SocketAddress remoteAddress,
+            MqttVersion version,
+            boolean overTls,
+            List<X509Certificate> clientCertificates
+    ) {
         this.clientId = clientId;
         this.remoteAddress = (remoteAddress instanceof InetSocketAddress address) ? address : null;
         this.version = version;
+        this.overTls = overTls;
+        this.clientCertificates = clientCertificates;
     }
 
     @Override
@@ -43,8 +59,18 @@ final class ClientConnection implements BrokerListener.Connection {
     }
 
     @Override
+    public boolean overTls() {
+        return overTls;
+    }
+
+    @Override
+    public List<X509Certificate> clientCertificates() {
+        return clientCertificates;
+    }
+
+    @Override
     public String toString() {
         return "Connection[clientId=" + clientId + ", remoteAddress=" + remoteAddress
-                + ", version=" + version + "]";
+                + ", version=" + version + ", overTls=" + overTls + "]";
     }
 }

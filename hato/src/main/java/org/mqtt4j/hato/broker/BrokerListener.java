@@ -1,6 +1,8 @@
 package org.mqtt4j.hato.broker;
 
 import java.net.InetSocketAddress;
+import java.security.cert.X509Certificate;
+import java.util.List;
 import java.util.Optional;
 
 import org.mqtt4j.hato.MqttVersion;
@@ -98,6 +100,22 @@ public interface BrokerListener {
 
         /// {@return the MQTT version of the connection}
         MqttVersion version();
+
+        /// {@return whether the client connected to the broker's TLS listener}
+        default boolean overTls() {
+            return false;
+        }
+
+        /// The certificate chain that the client presented in its TLS handshake, the client's own
+        /// certificate first: the chain that the [Authenticator], if the broker has one, received
+        /// in [Authenticator.Request#clientCertificates()]. Nothing checks the chain again while
+        /// the connection lasts.
+        ///
+        /// @return the client's certificate chain, or an empty list for a client that connected
+        ///   without TLS or presented no certificate
+        default List<X509Certificate> clientCertificates() {
+            return List.of();
+        }
     }
 
     /// Why a connection ended. Later versions may add reasons.

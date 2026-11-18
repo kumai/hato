@@ -48,6 +48,7 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.Authenticator;
+import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
@@ -60,7 +61,8 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// The TLS listener: clients that exchange messages through it, beside the plain one or alone,
-/// what the authenticator learns of them, and handshakes that fail, take long, or come again.
+/// what the authenticator and the listener learn of them, and handshakes that fail, take long, or
+/// come again.
 class BrokerTlsTest {
 
     // A whole TLS application record whose authentication fails: its header, then 32 bytes that no
@@ -264,6 +266,59 @@ class BrokerTlsTest {
             assertThat(overTls).isNotNull();
             assertThat(overTls.overTls()).isTrue();
             assertThat(overTls.clientCertificates()).isEmpty();
+            assertThat(overPlain).isNotNull();
+            assertThat(overPlain.overTls()).isFalse();
+            assertThat(overPlain.clientCertificates()).isEmpty();
+        }
+    }
+
+    @Test
+    void the_listener_tells_tls_clients_with_and_without_a_certificate_from_a_plain_one()
+            throws Exception {
+        // Arrange: a TLS listener that asks for a certificate without requiring one, beside a
+        // plain one, and no authenticator.
+        var connected = new LinkedBlockingQueue<BrokerListener.Connection>();
+        try (MqttBroker broker = MqttBroker.builder()
+                .listen(loopback())
+                .listenTls(loopback(), Tls.serverContext())
+                .sslParameters(parameters -> parameters.setWantClientAuth(true))
+                .listener(new BrokerListener() {
+                    @Override
+                    public void onConnected(BrokerListener.Connection connection) {
+                        connected.add(connection);
+                    }
+                })
+                .start();
+                MqttClient certified = tlsClient(
+                        broker.tlsPort(),
+                        Tls.clientContextWithCertificate(),
+                        MqttVersion.V5
+                );
+                MqttClient uncertified = tlsClient(
+                        broker.tlsPort(),
+                        Tls.clientContext(),
+                        MqttVersion.V5
+                );
+                MqttClient plain = plainClient(broker.port())) {
+            // Act
+            certified.connect().get(5, SECONDS);
+            BrokerListener.Connection withCertificate = connected.poll(5, SECONDS);
+            uncertified.connect().get(5, SECONDS);
+            BrokerListener.Connection withoutCertificate = connected.poll(5, SECONDS);
+            plain.connect().get(5, SECONDS);
+            BrokerListener.Connection overPlain = connected.poll(5, SECONDS);
+            // Assert
+            assertThat(withCertificate).isNotNull();
+            assertThat(withCertificate.overTls()).isTrue();
+            List<X509Certificate> chain = withCertificate.clientCertificates();
+            assertThat(chain).hasSize(2);
+            assertThat(chain.getFirst().getSubjectX500Principal().getName())
+                    .contains("CN=Hato Test client");
+            assertThat(chain.get(1).getSubjectX500Principal().getName())
+                    .contains("CN=Hato Test CA");
+            assertThat(withoutCertificate).isNotNull();
+            assertThat(withoutCertificate.overTls()).isTrue();
+            assertThat(withoutCertificate.clientCertificates()).isEmpty();
             assertThat(overPlain).isNotNull();
             assertThat(overPlain.overTls()).isFalse();
             assertThat(overPlain.clientCertificates()).isEmpty();

@@ -153,7 +153,13 @@ class NoticesTest {
 
     /// A connection of the client `clientId` from the same JVM.
     private static ClientConnection connection(String clientId) {
-        return new ClientConnection(clientId, null, MqttVersion.V5);
+        return new ClientConnection(
+                clientId,
+                null,
+                MqttVersion.V5,
+                false,
+                List.of()
+        );
     }
 
     /// Records its calls. The first one does not return before `release` opens; each later one
