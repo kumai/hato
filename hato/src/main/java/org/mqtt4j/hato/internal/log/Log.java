@@ -91,6 +91,9 @@ public final class Log {
     // goes out cut there.
     private static final int CHAIN_LIMIT = 1024;
 
+    // The most characters that one value takes in a statement, escapes included (see limited).
+    private static final int MAX_VALUE_CHARS = 1024;
+
     private final System.Logger logger;
 
     // The levels that the backend enables, one bit for each by ordinal, as it last answered: as
@@ -309,7 +312,20 @@ public final class Log {
             // A broken toString() must not take the log statement, or the caller, down with it.
             text = "[toString failed: " + e + "]";
         }
-        return escaped(text);
+        return limited(escaped(text));
+    }
+
+    // `text`, or its first MAX_VALUE_CHARS characters with its length after them. A peer chooses
+    // the text of many values, such as a client identifier of 65,535 characters, each of which
+    // takes six once escaped, and would choose the length of the lines with them otherwise.
+    private static String limited(String text) {
+        if (text.length() <= MAX_VALUE_CHARS) {
+            return text;
+        }
+        int end = Character.isHighSurrogate(text.charAt(MAX_VALUE_CHARS - 1))
+                ? MAX_VALUE_CHARS - 1
+                : MAX_VALUE_CHARS;
+        return text.substring(0, end) + "... (" + text.length() + " characters)";
     }
 
     // `text` with each control character, line separator, and paragraph separator written as an

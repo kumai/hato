@@ -329,6 +329,19 @@ class LogTest {
     }
 
     @Test
+    void a_long_argument_renders_cut_with_its_length() {
+        var logger = new RecordingLogger(Level.TRACE);
+        var sut = Log.of(logger);
+
+        sut.info("refused client '{}'", "\u0001".repeat(65_535));
+        awaitWritten();
+
+        // Each control character takes six characters once escaped.
+        assertThat(logger.records.getFirst().message()).isEqualTo("refused client '"
+                + "\\u0001".repeat(170) + "\\u00... (393210 characters)'");
+    }
+
+    @Test
     void a_trailing_throwable_whose_chain_carries_control_characters_reaches_the_backend_escaped() {
         var logger = new RecordingLogger(Level.TRACE);
         var sut = Log.of(logger);
