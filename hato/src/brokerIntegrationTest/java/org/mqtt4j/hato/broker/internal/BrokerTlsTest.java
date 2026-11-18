@@ -687,6 +687,31 @@ class BrokerTlsTest {
     }
 
     @Test
+    void a_connect_that_comes_with_the_last_flight_of_a_handshake_without_a_ticket_is_answered()
+            throws Exception {
+        // Arrange: a broker whose sessions last longer than a TLS 1.3 ticket may, so that its
+        // engine ends a handshake without sending one, and a TLS 1.3 client with a certificate,
+        // whose engine sends its last flight in one record.
+        SSLContext context = Tls.serverContext();
+        context.getServerSessionContext().setSessionTimeout((int) Duration.ofDays(8).toSeconds());
+        try (MqttBroker broker = MqttBroker.builder()
+                .listenTls(loopback(), context)
+                .sslParameters(parameters -> parameters.setNeedClientAuth(true))
+                .start();
+                var sut = new EngineClient(
+                        broker.tlsPort(),
+                        Tls.clientContextWithCertificate(),
+                        "TLSv1.3"
+                )) {
+            sut.handshake(true);
+            // Act: the CONNECT in the same write as the last flight, so that one read takes both.
+            sut.send(RawSession.codec.encode(RawSession.connect("certified", true, 60)), false);
+            // Assert
+            assertThat(sut.receive(4)).containsExactly(0x20, 0x02, 0x00, 0x00);
+        }
+    }
+
+    @Test
     void a_trust_manager_that_throws_an_error_fails_that_handshake_alone() throws Exception {
         // Arrange: a trust manager that breaks its contract with an Error, and a client whose
         // engine sends its certificate and the rest of its last flight in one record, which
@@ -822,6 +847,120 @@ class BrokerTlsTest {
                     return;
                 }
             }
+        }
+    }
+
+    // A TLS client of the broker that runs its own engine over a plain socket, so that a test
+    // decides which records go out in one write.
+    private static final class EngineClient implements AutoCloseable {
+
+        private static final ByteBuffer NOTHING = ByteBuffer.allocate(0);
+
+        private final Socket socket;
+
+        private final SSLEngine engine;
+
+        // Ciphertext from the broker that the engine has yet to take.
+        private final ByteBuffer in;
+
+        // The bytes of packets that the engine has decrypted.
+        private final ByteBuffer app;
+
+        // Records that wait for the next write.
+        private final ByteBuffer out;
+
+        EngineClient(int port, SSLContext context, String protocol) throws IOException {
+            socket = new Socket(InetAddress.getLoopbackAddress(), port);
+            socket.setSoTimeout(5_000);
+            socket.setTcpNoDelay(true);
+            engine = context.createSSLEngine("localhost", port);
+            engine.setUseClientMode(true);
+            engine.setEnabledProtocols(new String[] {protocol});
+            int record = engine.getSession().getPacketBufferSize();
+            in = ByteBuffer.allocate(4 * record);
+            app = ByteBuffer.allocate(4 * engine.getSession().getApplicationBufferSize());
+            out = ByteBuffer.allocate(8 * record);
+        }
+
+        // Runs the client's side of the handshake, writing each flight as the engine makes it.
+        // With `holdLastFlight`, everything after the first flight waits for the next write
+        // instead, which in TLS 1.3 is the client's last flight.
+        void handshake(boolean holdLastFlight) throws IOException {
+            engine.beginHandshake();
+            boolean first = true;
+            while (true) {
+                switch (engine.getHandshakeStatus()) {
+                    case NEED_TASK -> engine.getDelegatedTask().run();
+                    case NEED_WRAP -> {
+                        SSLEngineResult _ = engine.wrap(NOTHING, out);
+                        if (first || !holdLastFlight) {
+                            flush();
+                        }
+                        first = false;
+                    }
+                    case NEED_UNWRAP, NEED_UNWRAP_AGAIN -> unwrap();
+                    case NOT_HANDSHAKING, FINISHED -> {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Writes the records of `packet` after those that wait, and close_notify after them if
+        // `closing`, in one write. The TCP connection stays open.
+        void send(byte[] packet, boolean closing) throws IOException {
+            SSLEngineResult _ = engine.wrap(ByteBuffer.wrap(packet), out);
+            if (closing) {
+                engine.closeOutbound();
+                SSLEngineResult _ = engine.wrap(NOTHING, out);
+            }
+            flush();
+        }
+
+        // Reads until the broker has sent `count` bytes of packets, and returns them, each as an
+        // unsigned value.
+        int[] receive(int count) throws IOException {
+            while (app.position() < count) {
+                unwrap();
+            }
+            var received = new int[count];
+            for (int i = 0; i < count; i++) {
+                received[i] = app.get(i) & 0xff;
+            }
+            return received;
+        }
+
+        private void unwrap() throws IOException {
+            in.flip();
+            SSLEngineResult result = engine.unwrap(in, app);
+            in.compact();
+            switch (result.getStatus()) {
+                case BUFFER_UNDERFLOW -> {
+                    int count = socket.getInputStream().read(
+                            in.array(),
+                            in.position(),
+                            in.remaining()
+                    );
+                    if (count < 0) {
+                        throw new IOException("The broker closed the connection");
+                    }
+                    in.position(in.position() + count);
+                }
+                case CLOSED -> throw new IOException("The broker ended TLS");
+                case OK, BUFFER_OVERFLOW -> {
+                    // Decrypted, or handled the handshake.
+                }
+            }
+        }
+
+        private void flush() throws IOException {
+            socket.getOutputStream().write(out.array(), 0, out.position());
+            out.clear();
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
         }
     }
 

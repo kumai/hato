@@ -238,8 +238,17 @@ final class TlsChannel {
             }
             if (status == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
                 // Reading goes on once the socket has taken what the engine made.
-                if (!wrapOwn() || ownWaiting) {
+                boolean made = wrapOwn();
+                if (ownWaiting) {
                     return;
+                }
+                // An engine can move on without a record, as one does that ends a handshake
+                // whose last task took the client's Finished and that has no session ticket to
+                // send: the records after the handshake, such as the CONNECT, are read on. One
+                // that asks again for what it does not make goes no further.
+                if (!made && engine.getHandshakeStatus()
+                        == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
+                    throw new SSLException("The TLS engine asks to send but makes nothing");
                 }
                 continue;
             }
