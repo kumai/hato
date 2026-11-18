@@ -1,13 +1,19 @@
 package org.mqtt4j.hato.internal.log;
 
+import java.io.Serial;
 import java.lang.System.Logger.Level;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HexFormat;
+import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Optional;
 import java.util.ResourceBundle;
 import java.util.ServiceLoader;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -26,6 +32,16 @@ import static java.util.Objects.requireNonNull;
 /// Arguments are rendered only when the level is enabled, so pass values as they are instead of
 /// preformatting them or guarding the call. Arrays render their elements; byte arrays render as
 /// hexadecimal, as in wire dumps.
+///
+/// An argument's control characters, and line and paragraph separators, render as escapes:
+/// `\n`, `\r`, and `\t`, and for the others a backslash, `u`, and four hexadecimal digits, as in
+/// Java source. So text from a peer, such as a client identifier or a topic, can neither start
+/// a line of its own in the log nor rewrite one. A message, which is never text from a peer,
+/// renders as it is: whatever comes from outside goes in an argument. So do the texts of a
+/// trailing Throwable and of the causes and suppressed throwables in its chain, which can carry
+/// a peer's text, such as a Reason String: where one of them has such a character, the backend
+/// receives in place of the chain one that shows the same texts escaped, each with the stack
+/// trace of the throwable that it stands for. A chain without one reaches the backend as it is.
 ///
 /// Each class owns a static log named after that class. Package names tell the client, the
 /// broker, and the test kit apart; individual class names are implementation details.
@@ -69,6 +85,11 @@ public final class Log {
             findOwnLoaderFinder().orElse(null);
 
     private static final Level[] LEVELS = Level.values();
+
+    // How many throwables of a chain the escaping of their texts looks at, far more than a chain
+    // of causes and suppressed throwables has: it only bounds the work for a broken one, which
+    // goes out cut there.
+    private static final int CHAIN_LIMIT = 1024;
 
     private final System.Logger logger;
 
@@ -214,7 +235,7 @@ public final class Log {
             int used = args.length;
             Throwable thrown = null;
             if (used > countPlaceholders(message) && args[used - 1] instanceof Throwable last) {
-                thrown = last;
+                thrown = escaped(last);
                 used--;
             }
             String text = substitute(message, args, used);
@@ -267,9 +288,11 @@ public final class Log {
         return text.toString();
     }
 
+    // The text of `value`, with the escapes that the class description gives.
     private static String render(@Nullable Object value) {
+        String text;
         try {
-            return switch (value) {
+            text = switch (value) {
                 case null -> "null";
                 case Object[] array -> Arrays.deepToString(array);
                 case byte[] array -> HexFormat.of().formatHex(array);
@@ -284,7 +307,153 @@ public final class Log {
             };
         } catch (RuntimeException e) {
             // A broken toString() must not take the log statement, or the caller, down with it.
-            return "[toString failed: " + e + "]";
+            text = "[toString failed: " + e + "]";
+        }
+        return escaped(text);
+    }
+
+    // `text` with each control character, line separator, and paragraph separator written as an
+    // escape: \n, \r, and \t as such, and any other as a backslash, u, and four hexadecimal
+    // digits. Text without any comes back as it is.
+    private static String escaped(String text) {
+        int i = 0;
+        while (i < text.length() && !escapes(text.charAt(i))) {
+            i++;
+        }
+        if (i == text.length()) {
+            return text;
+        }
+        var escaped = new StringBuilder(text.length() + 16);
+        escaped.append(text, 0, i);
+        for (; i < text.length(); i++) {
+            char c = text.charAt(i);
+            switch (c) {
+                case '\n' -> escaped.append("\\n");
+                case '\r' -> escaped.append("\\r");
+                case '\t' -> escaped.append("\\t");
+                default -> {
+                    if (escapes(c)) {
+                        escaped.append("\\u").append(HexFormat.of().toHexDigits(c));
+                    } else {
+                        escaped.append(c);
+                    }
+                }
+            }
+        }
+        return escaped.toString();
+    }
+
+    private static boolean escapes(char c) {
+        return Character.isISOControl(c) || c == '\u2028' || c == '\u2029';
+    }
+
+    // `thrown` itself when no text that its chain shows has a character that escapes, and
+    // otherwise a chain of stand-ins that show the same texts escaped (see the class
+    // description). The chain is what printStackTrace prints: `thrown`, and the causes and
+    // suppressed throwables that it reaches, each once however they are shared or come round,
+    // and the text of each is its first line there. A chain of more than CHAIN_LIMIT
+    // throwables, as one whose getCause makes a new one at each call, goes out cut where the
+    // look stopped: nothing that it did not check reaches the backend.
+    private static Throwable escaped(Throwable thrown) {
+        var chain = new ArrayList<Throwable>();
+        boolean whole = collect(thrown, chain);
+        var texts = new ArrayList<String>(chain.size());
+        boolean escapes = !whole;
+        for (Throwable member : chain) {
+            String text = describe(member);
+            texts.add(text);
+            escapes |= escaped(text) != text;
+        }
+        if (!escapes) {
+            return thrown;
+        }
+        var standIns = new IdentityHashMap<Throwable, Shown>();
+        for (int i = 0; i < chain.size(); i++) {
+            Throwable member = chain.get(i);
+            standIns.put(member, new Shown(escaped(texts.get(i)), member.getStackTrace()));
+        }
+        // Each stand-in takes the stand-ins of the cause and the suppressed throwables of the
+        // one that it stands for, so that the stand-ins share and come round as those do. One
+        // beyond the cut has none, and is left out.
+        for (Throwable member : chain) {
+            Shown standIn = requireNonNull(standIns.get(member));
+            Throwable cause = member.getCause();
+            Shown causeStandIn = (cause == null) ? null : standIns.get(cause);
+            if (causeStandIn != null) {
+                standIn.initCause(causeStandIn);
+            }
+            for (Throwable suppressed : member.getSuppressed()) {
+                Shown suppressedStandIn = standIns.get(suppressed);
+                if (suppressedStandIn != null) {
+                    standIn.addSuppressed(suppressedStandIn);
+                }
+            }
+        }
+        return requireNonNull(standIns.get(thrown));
+    }
+
+    // Adds to `chain` the throwables that printStackTrace prints for `thrown`, each once and
+    // `thrown` first, without recursion, so that a long chain takes no stack. Returns false if
+    // it stopped at CHAIN_LIMIT before it had them all.
+    private static boolean collect(Throwable thrown, List<Throwable> chain) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        var pending = new ArrayDeque<Throwable>();
+        pending.push(thrown);
+        while (!pending.isEmpty()) {
+            Throwable next = pending.pop();
+            if (!seen.add(next)) {
+                continue;
+            }
+            if (chain.size() == CHAIN_LIMIT) {
+                return false;
+            }
+            chain.add(next);
+            Throwable cause = next.getCause();
+            if (cause != null) {
+                pending.push(cause);
+            }
+            for (Throwable suppressed : next.getSuppressed()) {
+                pending.push(suppressed);
+            }
+        }
+        return true;
+    }
+
+    // The first line that printStackTrace prints for `thrown`: its class and message.
+    private static String describe(Throwable thrown) {
+        try {
+            return thrown.toString();
+        } catch (RuntimeException e) {
+            // A broken toString() must not take the log statement down with it.
+            return "[toString failed: " + e.getClass().getName() + "]";
+        }
+    }
+
+    // A throwable that stands in a chain handed to the backend for one whose text has
+    // characters that escape: it shows that text escaped, with the other's stack trace.
+    private static final class Shown extends Throwable {
+
+        @Serial
+        private static final long serialVersionUID = 1L;
+
+        private final String text;
+
+        // Its cause comes later, from initCause, once the stand-ins of a chain are all made.
+        Shown(String text, StackTraceElement[] stackTrace) {
+            super(text);
+            this.text = text;
+            setStackTrace(stackTrace);
+        }
+
+        @Override
+        public String toString() {
+            return text;
+        }
+
+        // The stack trace is the one that the constructor sets: the other throwable's.
+        @Override
+        public synchronized Throwable fillInStackTrace() {
+            return this;
         }
     }
 

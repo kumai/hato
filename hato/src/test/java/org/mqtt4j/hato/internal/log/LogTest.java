@@ -21,9 +21,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 class LogTest {
 
@@ -312,6 +314,113 @@ class LogTest {
         awaitWritten();
 
         assertThat(logger.records.getFirst().message()).isEqualTo("payload {} first one then {}");
+    }
+
+    @Test
+    void control_characters_and_line_separators_in_an_argument_render_as_escapes() {
+        var logger = new RecordingLogger(Level.TRACE);
+        var sut = Log.of(logger);
+
+        sut.info("refused client '{}'", "a\nINFO forged\r\tline\u001b[31m\u2028end");
+        awaitWritten();
+
+        assertThat(logger.records.getFirst().message())
+                .isEqualTo("refused client 'a\\nINFO forged\\r\\tline\\u001b[31m\\u2028end'");
+    }
+
+    @Test
+    void a_trailing_throwable_whose_chain_carries_control_characters_reaches_the_backend_escaped() {
+        var logger = new RecordingLogger(Level.TRACE);
+        var sut = Log.of(logger);
+        var cause = new IllegalStateException("cause\rline");
+        var failure = new IllegalArgumentException("ended (reason\nINFO forged)", cause);
+
+        sut.warn("connection lost", failure);
+        awaitWritten();
+
+        Throwable thrown = logger.records.getFirst().thrown();
+        assertThat(thrown).isNotNull();
+        assertThat(thrown)
+                .hasToString("java.lang.IllegalArgumentException: ended (reason\\nINFO forged)");
+        assertThat(thrown.getStackTrace()).isEqualTo(failure.getStackTrace());
+        assertThat(thrown.getCause())
+                .hasToString("java.lang.IllegalStateException: cause\\rline");
+    }
+
+    @Test
+    void a_chain_that_shares_throwables_and_comes_round_is_looked_at_once_for_each() {
+        var logger = new RecordingLogger(Level.TRACE);
+        var sut = Log.of(logger);
+        // Each throwable has the next one as its cause and as a suppressed one, and the last
+        // comes round to the first: every path through the chain would take 2^39 steps.
+        var chain = new ArrayList<Throwable>();
+        for (int level = 0; level < 39; level++) {
+            chain.add(new IllegalStateException("level " + level));
+        }
+        chain.add(new IllegalStateException("level 39\nforged"));
+        for (int level = 0; level < 39; level++) {
+            chain.get(level).initCause(chain.get(level + 1));
+            chain.get(level).addSuppressed(chain.get(level + 1));
+        }
+        chain.getLast().addSuppressed(chain.getFirst());
+
+        assertTimeoutPreemptively(
+                Duration.ofSeconds(5),
+                () -> sut.warn("failed", chain.getFirst())
+        );
+        awaitWritten();
+
+        Throwable first = requireNonNull(logger.records.getFirst().thrown());
+        Throwable shown = first;
+        for (int level = 0; level < 39; level++) {
+            assertThat(shown.getSuppressed()).containsExactly(shown.getCause());
+            shown = requireNonNull(shown.getCause());
+        }
+        assertThat(shown).hasToString("java.lang.IllegalStateException: level 39\\nforged");
+        assertThat(shown.getSuppressed()).containsExactly(first);
+    }
+
+    @Test
+    void a_text_deep_in_a_chain_is_escaped_however_deep() {
+        var logger = new RecordingLogger(Level.TRACE);
+        var sut = Log.of(logger);
+        Throwable top = new IllegalStateException("deepest\nforged");
+        for (int level = 0; level < 100; level++) {
+            top = new IllegalStateException("level " + level, top);
+        }
+
+        sut.warn("failed", top);
+        awaitWritten();
+
+        Throwable shown = requireNonNull(logger.records.getFirst().thrown());
+        for (int level = 0; level < 100; level++) {
+            shown = requireNonNull(shown.getCause());
+        }
+        assertThat(shown).hasToString("java.lang.IllegalStateException: deepest\\nforged");
+    }
+
+    @Test
+    void a_chain_longer_than_the_escaping_looks_at_goes_out_cut_where_it_stopped() {
+        var logger = new RecordingLogger(Level.TRACE);
+        var sut = Log.of(logger);
+        // 1,100 throwables, of which the escaping looks at the first 1,024: the text of the
+        // deepest, which it never sees, must not reach the backend.
+        Throwable top = new IllegalStateException("deepest\nforged");
+        for (int level = 0; level < 1_099; level++) {
+            top = new IllegalStateException("level " + level, top);
+        }
+
+        sut.warn("failed", top);
+        awaitWritten();
+
+        Throwable shown = requireNonNull(logger.records.getFirst().thrown());
+        int length = 1;
+        for (Throwable cause = shown.getCause(); cause != null; cause = cause.getCause()) {
+            shown = cause;
+            length++;
+        }
+        assertThat(length).isEqualTo(1_024);
+        assertThat(shown).hasToString("java.lang.IllegalStateException: level 75");
     }
 
     @Test
