@@ -27,9 +27,12 @@ import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.internal.protocol.Properties.EMPTY;
 
-/// The broker's limits on the subscriptions of one session: their number, and the length of
-/// their filters in all.
+/// The broker's limits on the subscriptions of one session: their number, and what they hold
+/// on the heap in all, their filters with their levels in the index of subscriptions.
 class BrokerSubscriptionLimitTest {
+
+    // A limit on the bytes of the subscriptions that the tests of their number do not reach.
+    private static final long ROOMY = 1024 * 1024;
 
     @ParameterizedTest
     @EnumSource(MqttVersion.class)
@@ -37,7 +40,7 @@ class BrokerSubscriptionLimitTest {
             MqttVersion version
     ) throws Exception {
         // Arrange: a session may have two subscriptions, and has one.
-        try (BrokerServer sut = broker(2, 1024);
+        try (BrokerServer sut = broker(2, ROOMY);
                 RawSession subscriber = connectedAs(version, sut.port(), "subscriber");
                 RawSession publisher = connected(sut.port(), "publisher")) {
             subscriber.subscribe("first", AT_MOST_ONCE);
@@ -61,10 +64,10 @@ class BrokerSubscriptionLimitTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void unsubscribing_makes_room_for_another_subscription(boolean lengthLimit) throws Exception {
-        // Arrange: a session may have one subscription, or filters of six characters in all,
-        // and its subscription leaves no room for another one.
-        try (BrokerServer sut = lengthLimit ? broker(16, 6) : broker(1, 1024);
+    void unsubscribing_makes_room_for_another_subscription(boolean byteLimit) throws Exception {
+        // Arrange: a session may have one subscription, or filters that hold as much as one to
+        // "second", and its subscription leaves no room for another one.
+        try (BrokerServer sut = byteLimit ? broker(16, sizeOf("second")) : broker(1, ROOMY);
                 RawSession subscriber = connected(sut.port(), "subscriber")) {
             subscriber.subscribe("first", AT_MOST_ONCE);
             assertThat(subscribe(subscriber, "second")).containsExactly(UNSPECIFIED_ERROR);
@@ -79,24 +82,42 @@ class BrokerSubscriptionLimitTest {
     }
 
     @Test
-    void filters_that_are_longer_in_all_than_the_limit_are_refused() throws Exception {
-        // Arrange: the filters of a session may have ten characters in all, and have six.
-        try (BrokerServer sut = broker(16, 10);
+    void filters_that_hold_more_in_all_than_the_limit_are_refused() throws Exception {
+        // Arrange: the filters of a session may hold as much as "123456" and "1234" together,
+        // and the session has the first of them.
+        try (BrokerServer sut = broker(16, sizeOf("123456") + sizeOf("1234"));
                 RawSession subscriber = connected(sut.port(), "subscriber")) {
             subscriber.subscribe("123456", AT_MOST_ONCE);
 
-            // Act: five more characters, then four, then the six that the session has already.
+            // Act: one character more than the room left, then the room left, then the filter
+            // that the session has already.
             List<ReasonCode> results = subscribe(subscriber, "12345", "1234", "123456");
 
-            // Assert: the last one replaces a subscription, which adds no characters.
+            // Assert: the last one replaces a subscription, which takes no room.
             assertThat(results).containsExactly(UNSPECIFIED_ERROR, SUCCESS, SUCCESS);
         }
     }
 
     @Test
+    void a_filter_of_more_levels_takes_more_room() throws Exception {
+        // Arrange: the filters of a session may hold as much as one of one level and ten
+        // characters. A filter of as many characters in six levels takes more in the index.
+        try (BrokerServer sut = broker(16, sizeOf("aaaaaaaaaa"));
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            // Act
+            List<ReasonCode> deep = subscribe(subscriber, "a/a/a/a/a/");
+            List<ReasonCode> flat = subscribe(subscriber, "aaaaaaaaaa");
+
+            // Assert
+            assertThat(deep).containsExactly(UNSPECIFIED_ERROR);
+            assertThat(flat).containsExactly(SUCCESS);
+        }
+    }
+
+    @Test
     void a_new_session_has_all_of_its_room_again() throws Exception {
-        // Arrange: a session whose filters take all ten characters that they may have.
-        try (BrokerServer sut = broker(16, 10)) {
+        // Arrange: a session whose filter takes all the room that its filters may have.
+        try (BrokerServer sut = broker(16, sizeOf("1234567890"))) {
             try (RawSession previous = connected(sut.port(), "subscriber", false, false)) {
                 previous.subscribe("1234567890", AT_MOST_ONCE);
                 previous.disconnect();
@@ -110,12 +131,17 @@ class BrokerSubscriptionLimitTest {
         }
     }
 
-    private static BrokerServer broker(int maxSubscriptions, long maxSubscriptionLength)
+    private static BrokerServer broker(int maxSubscriptions, long maxSubscriptionBytes)
             throws IOException {
         return BrokerServer.builder()
                 .maxSubscriptions(maxSubscriptions)
-                .maxSubscriptionLength(maxSubscriptionLength)
+                .maxSubscriptionBytes(maxSubscriptionBytes)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+    }
+
+    /// What a subscription to `filter` counts for against the limit on the bytes.
+    private static long sizeOf(String filter) {
+        return Session.sizeOf(new TopicFilter(filter));
     }
 
     private static RawSession connectedAs(MqttVersion version, int port, String clientId)

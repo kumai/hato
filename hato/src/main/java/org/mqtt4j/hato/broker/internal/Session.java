@@ -36,7 +36,8 @@ import static java.util.Objects.requireNonNull;
 // The selector and timers normally post work for the actor pool. A publisher can take a
 // subscriber's idle turn to drain it in place. A thread holding a turn never waits for another,
 // and the selector pauses reads when the inbox has no room. Lock order is
-// topic lock -> inbox -> Connection.
+// topic lock -> inbox -> Connection; the monitor of the routing's index of subscriptions, which
+// the subscriptions enter and leave under the inbox, is taken last, with nothing under it.
 //
 // One actor serves a client identifier while the session table holds it: a CONNECT that starts
 // a new session resets the state in place. The actor leaves the table only as its session ends,
@@ -82,6 +83,21 @@ final class Session {
     // Why a delivery is dropped that the broker's memory for deliveries has no room for.
     private static final String MEMORY_USED_UP = "the broker's memory for deliveries is used up";
 
+    // What one level of a filter holds in the index of subscriptions at most, beside its
+    // characters, by the estimates of PublicationMemory: its node with three references, the
+    // entry that leads to it in its parent's map, a map of its own children with the first table
+    // of a ConcurrentHashMap, and the string of the level.
+    private static final long INDEX_LEVEL_BYTES = PublicationMemory.OBJECT_BYTES
+            + PublicationMemory.REFERENCE_BYTES
+            + PublicationMemory.OBJECT_BYTES + 2L * PublicationMemory.REFERENCE_BYTES
+            + 2L * PublicationMemory.OBJECT_BYTES
+            + PublicationMemory.ARRAY_BYTES + 16L * PublicationMemory.REFERENCE_BYTES
+            + PublicationMemory.OBJECT_BYTES + PublicationMemory.ARRAY_BYTES;
+
+    // The entry of a session among those of a filter in the index of subscriptions.
+    private static final long INDEX_ENTRY_BYTES =
+            PublicationMemory.OBJECT_BYTES + 2L * PublicationMemory.REFERENCE_BYTES;
+
     private final Routing routing;
 
     private final BrokerSettings settings;
@@ -122,9 +138,9 @@ final class Session {
     // once set.
     private volatile Map<TopicFilter, Subscribed> subscriptions = Map.of();
 
-    // The characters of the filters of all the subscriptions, which the subscription limits
-    // bound with their number.
-    private long subscriptionLength;
+    // What the subscriptions hold on the heap in all, as sizeOf(TopicFilter) counts each, which
+    // the subscription limits bound with their number.
+    private long subscriptionBytes;
 
     // Whether the session has logged a refused subscription at warning level yet.
     private boolean refusalLogged;
@@ -988,6 +1004,18 @@ final class Session {
         return (missing <= 0) ? count : -1;
     }
 
+    // What a subscription to `filter` counts for against the subscription limits: the string of
+    // its filter, the entry of the session in the index of subscriptions, and what the filter's
+    // levels hold in the index at most, with two bytes for each character. Filters that share
+    // levels share their nodes in the index, which this counts for each of them.
+    static long sizeOf(TopicFilter filter) {
+        String pattern = filter.pattern();
+        return PublicationMemory.sizeOf(pattern)
+                + INDEX_ENTRY_BYTES
+                + TopicTree.levelsOf(pattern) * INDEX_LEVEL_BYTES
+                + 2L * pattern.length();
+    }
+
     // Makes or replaces the subscription to its filter, and returns false if the subscription
     // limits leave no room for a new one, which then subscribes to nothing; replacing a
     // subscription takes no room. Retain Handling 0 queues the retained messages that it
@@ -998,15 +1026,15 @@ final class Session {
     // queue behind them. Runs on the actor.
     boolean subscribe(Subscribed subscribed) {
         Packet.Subscription subscription = subscribed.subscription();
-        int length = subscription.filter().pattern().length();
+        long size = sizeOf(subscription.filter());
         boolean added = !subscriptions.containsKey(subscription.filter());
         if (added && (subscriptions.size() >= settings.maxSubscriptions()
-                || length > settings.maxSubscriptionLength() - subscriptionLength)) {
+                || size > settings.maxSubscriptionBytes() - subscriptionBytes)) {
             logRefusal(subscription.filter());
             return false;
         }
         if (added) {
-            subscriptionLength += length;
+            subscriptionBytes += size;
         }
         synchronized (routing.retained) {
             Map<TopicFilter, Subscribed> current = subscriptions;
@@ -1021,6 +1049,11 @@ final class Session {
             var changed = new LinkedHashMap<>(current);
             changed.put(subscription.filter(), subscribed);
             synchronized (this) {
+                // Into the index before the table: should the index fail to take it, no
+                // subscription stays that publications cannot find.
+                if (added) {
+                    routing.subscribed(subscription.filter(), this);
+                }
                 queueRetained(subscribed, matched);
                 subscriptions = changed;
             }
@@ -1060,7 +1093,8 @@ final class Session {
             var changed = new LinkedHashMap<>(current);
             changed.remove(filter);
             subscriptions = changed;
-            subscriptionLength -= filter.pattern().length();
+            routing.unsubscribed(filter, this);
+            subscriptionBytes -= sizeOf(filter);
             return true;
         }
     }
@@ -1511,8 +1545,8 @@ final class Session {
         if (scope == Authenticator.Scope.all()) {
             return;
         }
-        int endedSubscriptions = 0;
         int withheld = 0;
+        var ended = new ArrayList<TopicFilter>();
         synchronized (this) {
             var kept = new LinkedHashMap<TopicFilter, Subscribed>();
             for (Map.Entry<TopicFilter, Subscribed> entry : subscriptions.entrySet()) {
@@ -1521,12 +1555,15 @@ final class Session {
                     kept.put(filter, entry.getValue());
                 } else {
                     dropRetained(filter);
-                    subscriptionLength -= filter.pattern().length();
-                    endedSubscriptions++;
+                    subscriptionBytes -= sizeOf(filter);
+                    ended.add(filter);
                 }
             }
-            if (endedSubscriptions > 0) {
+            if (!ended.isEmpty()) {
                 subscriptions = kept;
+                for (TopicFilter filter : ended) {
+                    routing.unsubscribed(filter, this);
+                }
             }
             Iterator<Delivery> waiting = acknowledgedQueue.deliveries.iterator();
             while (waiting.hasNext()) {
@@ -1547,10 +1584,10 @@ final class Session {
                 withheld++;
             }
         }
-        if (endedSubscriptions > 0 || withheld > 0) {
+        if (!ended.isEmpty() || withheld > 0) {
             log.info("Broker on port {} ended {} subscriptions and dropped {} deliveries of"
                     + " client {} outside the scope of its new connection",
-                    routing.port, endedSubscriptions, withheld, clientId);
+                    routing.port, ended.size(), withheld, clientId);
         }
     }
 
@@ -1940,7 +1977,11 @@ final class Session {
     void clear() {
         int unaccounted;
         synchronized (this) {
+            Map<TopicFilter, Subscribed> ended = subscriptions;
             subscriptions = Map.of();
+            for (TopicFilter filter : ended.keySet()) {
+                routing.unsubscribed(filter, this);
+            }
             empty(atMostOnceQueue);
             empty(acknowledgedQueue);
             for (RetainedCursor cursor : cursors) {
@@ -1963,7 +2004,7 @@ final class Session {
         if (unaccounted != 0) {
             routing.memory.lost(unaccounted);
         }
-        subscriptionLength = 0;
+        subscriptionBytes = 0;
         expiry = 0;
         received.clear();
         inflight.clear();

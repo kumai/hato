@@ -27,6 +27,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
@@ -95,12 +96,14 @@ public final class BrokerServer implements AutoCloseable {
     // never come back give their places up after it, where nobody is there to remove them.
     private static final Duration MAX_SESSION_EXPIRY = Duration.ofHours(24);
 
-    // One session's subscriptions are bounded by number, because every publication is matched
-    // against each of them, and by the length of their filters in all, because a single filter
-    // can have 65,535 bytes.
+    // One session's subscriptions are bounded by number, because every publication that reaches
+    // the session is matched against each of them, and by what they hold on the heap in all (see
+    // Session.sizeOf), because a single filter can have 65,535 bytes and each of its levels
+    // takes room in the index of subscriptions. The bytes hold as many filters of six levels and
+    // some sixty characters as the number allows.
     private static final int MAX_SUBSCRIPTIONS = 10_000;
 
-    private static final long MAX_SUBSCRIPTION_LENGTH = 1024 * 1024;
+    private static final long MAX_SUBSCRIPTION_BYTES = 24L * 1024 * 1024;
 
     // Retained messages are bounded like the other state that the broker keeps: by count, as
     // sessions are, and by size, as each session's waiting deliveries are. The size is what
@@ -378,7 +381,7 @@ public final class BrokerServer implements AutoCloseable {
 
         private int maxSubscriptions = MAX_SUBSCRIPTIONS;
 
-        private long maxSubscriptionLength = MAX_SUBSCRIPTION_LENGTH;
+        private long maxSubscriptionBytes = MAX_SUBSCRIPTION_BYTES;
 
         private int maxRetained = MAX_RETAINED;
 
@@ -532,8 +535,8 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
-        Builder maxSubscriptionLength(long value) {
-            maxSubscriptionLength = value;
+        Builder maxSubscriptionBytes(long value) {
+            maxSubscriptionBytes = value;
             return this;
         }
 
@@ -698,7 +701,7 @@ public final class BrokerServer implements AutoCloseable {
                 || maxSessions <= 0
                 || maxSessionExpiry.toSeconds() <= 0
                 || maxSubscriptions <= 0
-                || maxSubscriptionLength <= 0
+                || maxSubscriptionBytes <= 0
                 || maxRetained <= 0
                 || maxRetainedBytes <= 0
                 || maxHeld <= 0
@@ -733,7 +736,7 @@ public final class BrokerServer implements AutoCloseable {
                     // for, which keeps it without end.
                     Math.min(maxSessionExpiry.toSeconds(), Session.NEVER),
                     maxSubscriptions,
-                    maxSubscriptionLength,
+                    maxSubscriptionBytes,
                     maxRetained,
                     maxRetainedBytes,
                     maxHeld,
@@ -1450,6 +1453,12 @@ public final class BrokerServer implements AutoCloseable {
     /// The identifiers of the clients whose connections are open.
     public Set<String> connectedClients() {
         return routing.connectedClients();
+    }
+
+    // The identifiers of the sessions that the index of subscriptions finds for `topic`, for
+    // tests.
+    Set<String> indexedFor(Topic topic) {
+        return routing.indexedFor(topic);
     }
 
     /// What the broker counts, for MqttBroker.stats(). Once the broker has ended, it holds

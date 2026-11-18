@@ -2,8 +2,10 @@ package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,6 +30,7 @@ import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.BrokerListener.DisconnectReason;
 import org.mqtt4j.hato.internal.log.Log;
+import org.mqtt4j.hato.internal.protocol.FilterTree;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.PropertyId;
@@ -37,9 +40,10 @@ import org.mqtt4j.hato.internal.protocol.PropertyId;
 // connections (see Session), and what they share here is concurrent or replaced as a whole;
 // the retained messages have a lock of their own, the topic lock.
 //
-// Routing a publication looks through every session and its subscriptions, which bounds its
-// throughput with many sessions; an index of the subscriptions would replace the scan if broker
-// measurements justify productization. Lock order is topic lock -> session inbox -> Connection.
+// Routing a publication looks up the sessions whose subscriptions select its topic in an index of
+// the filters, so that its time does not grow with the sessions that it does not reach. Lock
+// order is topic lock -> session inbox -> Connection; the index's monitor is taken last, with
+// nothing under it.
 final class Routing {
 
     private static final Log log = Log.of(Routing.class);
@@ -99,6 +103,17 @@ final class Routing {
     private final AtomicInteger persistentSessions = new AtomicInteger();
 
     final RetainedMessages retained;
+
+    // The sessions by the filters of their subscriptions, which routing looks up without a lock.
+    // A session changes it as its subscriptions change, one change at a time under its monitor,
+    // which no thread holds while it takes another lock: SUBSCRIBE under the topic lock and the
+    // session's inbox, so that a retained publication, which looks up under the topic lock,
+    // finds a subscription together with its retained messages or not at all; the ends of
+    // subscriptions under the inbox, after the session's own table has changed, so that a
+    // publisher that still finds one checks the table under the inbox and passes it by. The
+    // closing broker replaces it with an empty one (see clear()), so that a closed broker that
+    // the application still holds keeps no session through it.
+    private volatile FilterTree<Session> subscribers = FilterTree.concurrent();
 
     // The memory that the deliveries of all the sessions may take together.
     final MemoryBudget memory;
@@ -575,10 +590,51 @@ final class Routing {
             Session publisher,
             long received
     ) {
-        // The table lets a target leave it during delivery, as one whose connection ended does.
-        for (Session target : sessions.values()) {
+        // A session whose overlapping filters select the topic comes once from each, and must
+        // match the publication once, which sends one copy to it. A session that has ended since
+        // the look-up passes it by.
+        var targets = new ArrayList<Session>();
+        int filters = subscribers.match(publication.topic(), targets::add);
+        Collection<Session> distinct = (filters > 1) ? new LinkedHashSet<>(targets) : targets;
+        for (Session target : distinct) {
             target.deliverMatching(publication, room, publisher, received);
         }
+    }
+
+    // Takes `filter` of `session` into the index of subscriptions, unless the broker is closing,
+    // when it leaves the index alone: the closing broker replaces the index as a whole rather
+    // than changing it, since the closing thread may be one of the application's virtual
+    // threads, which must not hold the index's monitor that the actors wait for. The index is
+    // read before `closed`, which the closing broker sets before it replaces the index: an actor
+    // that finds the replacement finds `closed` as well, and one that finds the former index
+    // changes only what nothing holds any more.
+    void subscribed(TopicFilter filter, Session session) {
+        FilterTree<Session> index = subscribers;
+        if (closed) {
+            return;
+        }
+        synchronized (index) {
+            index.add(filter, session);
+        }
+    }
+
+    // Takes `filter` of `session` out of the index of subscriptions, as subscribed() takes it in.
+    void unsubscribed(TopicFilter filter, Session session) {
+        FilterTree<Session> index = subscribers;
+        if (closed) {
+            return;
+        }
+        synchronized (index) {
+            index.remove(filter, session);
+        }
+    }
+
+    // The identifiers of the sessions that the index of subscriptions finds for `topic`, for
+    // tests.
+    Set<String> indexedFor(Topic topic) {
+        var found = new HashSet<String>();
+        int _ = subscribers.match(topic, session -> found.add(session.clientId));
+        return found;
     }
 
     // Counts a session that the closing broker has asked to clear itself, and one that has.
@@ -629,13 +685,15 @@ final class Routing {
     }
 
     // Ends every connection and session and forgets every retained message, as the broker
-    // closes. Each session ends here if no thread holds its turn, and otherwise soon after.
+    // closes. Each session ends here if no thread holds its turn, and otherwise soon after. The
+    // index of subscriptions goes with the sessions, replaced as subscribed() describes.
     void clear() {
         for (Connection connection : connections) {
             connection.close("broker closed", null);
         }
         sessions.values().forEach(Session::close);
         sessions.clear();
+        subscribers = FilterTree.concurrent();
         persistentSessions.set(0);
         synchronized (retained) {
             retained.clear();

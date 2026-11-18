@@ -20,13 +20,15 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // bounds a CONNECT. `maxQueued` and `maxQueuedBytes` bound the QoS 1 and 2 deliveries that wait
 // for one session, and `maxQueuedAtMostOnce` and `maxQueuedAtMostOnceBytes` its QoS 0
 // deliveries. `maxSessionExpiry` is the longest that a session outlives its connection,
-// in seconds. `maxSubscriptions` and `maxSubscriptionLength` bound the subscriptions of
-// one session: their number, and the characters of their filters in all. `maxDeliveryMemory`
+// in seconds. `maxSubscriptions` and `maxSubscriptionBytes` bound the subscriptions of
+// one session: their number, and what they hold on the heap in all, their filters with their
+// levels in the index of subscriptions (see Session.sizeOf). `maxDeliveryMemory`
 // is the memory in bytes that the deliveries that wait for all the sessions may take
 // together, and `deliveryMemoryUnit` how much of it a thread of the actor pool fetches for
-// itself at a time (see MemoryBudget). The byte limits on deliveries and on retained messages
-// count what these hold on the heap, which can be many times the bytes of their packets (see
-// PublicationMemory); `sendBytes` bounds both for what waits in a connection's send queue.
+// itself at a time (see MemoryBudget). The byte limits on deliveries, on retained messages, and
+// on subscriptions count what these hold on the heap, which can be many times the bytes of
+// their packets (see PublicationMemory); `sendBytes` bounds deliveries and retained messages
+// for what waits in a connection's send queue.
 // `selectors` and `actors` are the numbers of selector threads and of threads in the actor
 // pool. The capabilities are what the broker announces to MQTT 5.0 clients until a test
 // changes them, within its own limits. The application's listener, if there is one, hears of
@@ -73,7 +75,7 @@ record BrokerSettings(
         int maxSessions,
         long maxSessionExpiry,
         int maxSubscriptions,
-        long maxSubscriptionLength,
+        long maxSubscriptionBytes,
         int maxRetained,
         long maxRetainedBytes,
         int maxHeld,
