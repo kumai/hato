@@ -369,7 +369,8 @@ public final class Log {
     // suppressed throwables that it reaches, each once however they are shared or come round,
     // and the text of each is its first line there. A chain of more than CHAIN_LIMIT
     // throwables, as one whose getCause makes a new one at each call, goes out cut where the
-    // look stopped: nothing that it did not check reaches the backend.
+    // look stopped: nothing that it did not check reaches the backend. So does one with a
+    // throwable whose getCause or getSuppressed throws, cut at that one.
     private static Throwable escaped(Throwable thrown) {
         var chain = new ArrayList<Throwable>();
         boolean whole = collect(thrown, chain);
@@ -393,12 +394,19 @@ public final class Log {
         // beyond the cut has none, and is left out.
         for (Throwable member : chain) {
             Shown standIn = requireNonNull(standIns.get(member));
-            Throwable cause = member.getCause();
+            Throwable cause;
+            Throwable[] suppressions;
+            try {
+                cause = member.getCause();
+                suppressions = member.getSuppressed();
+            } catch (RuntimeException _) {
+                continue;
+            }
             Shown causeStandIn = (cause == null) ? null : standIns.get(cause);
             if (causeStandIn != null) {
                 standIn.initCause(causeStandIn);
             }
-            for (Throwable suppressed : member.getSuppressed()) {
+            for (Throwable suppressed : suppressions) {
                 Shown suppressedStandIn = standIns.get(suppressed);
                 if (suppressedStandIn != null) {
                     standIn.addSuppressed(suppressedStandIn);
@@ -410,7 +418,8 @@ public final class Log {
 
     // Adds to `chain` the throwables that printStackTrace prints for `thrown`, each once and
     // `thrown` first, without recursion, so that a long chain takes no stack. Returns false if
-    // it stopped at CHAIN_LIMIT before it had them all.
+    // it stopped before it had them all: at CHAIN_LIMIT, or at a throwable whose getCause or
+    // getSuppressed throws, which must not take the log statement down with it.
     private static boolean collect(Throwable thrown, List<Throwable> chain) {
         Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         var pending = new ArrayDeque<Throwable>();
@@ -424,11 +433,18 @@ public final class Log {
                 return false;
             }
             chain.add(next);
-            Throwable cause = next.getCause();
+            Throwable cause;
+            Throwable[] suppressions;
+            try {
+                cause = next.getCause();
+                suppressions = next.getSuppressed();
+            } catch (RuntimeException _) {
+                return false;
+            }
             if (cause != null) {
                 pending.push(cause);
             }
-            for (Throwable suppressed : next.getSuppressed()) {
+            for (Throwable suppressed : suppressions) {
                 pending.push(suppressed);
             }
         }

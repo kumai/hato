@@ -485,6 +485,27 @@ class LogTest {
     }
 
     @Test
+    void a_throwable_whose_cause_cannot_be_had_does_not_break_the_log_statement() {
+        var logger = new RecordingLogger(Level.TRACE);
+        var sut = Log.of(logger);
+        var broken = new IllegalStateException("broken") {
+            @Override
+            public synchronized Throwable getCause() {
+                throw new UnsupportedOperationException("no cause");
+            }
+        };
+
+        sut.warn("connection lost", broken);
+        awaitWritten();
+
+        assertThat(logger.records).singleElement().satisfies(record -> {
+            assertThat(record.message()).isEqualTo("connection lost");
+            assertThat(record.thrown()).isNotNull();
+            assertThat(record.thrown().getCause()).isNull();
+        });
+    }
+
+    @Test
     void a_failing_backend_does_not_reach_the_caller() {
         // Arrange
         var logger = new FailingLogger();
