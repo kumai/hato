@@ -1,11 +1,16 @@
-package org.mqtt4j.hato.client.internal;
+package org.mqtt4j.hato.internal.protocol;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
@@ -18,11 +23,14 @@ class FilterTreeTest {
     // a level that starts with $, which matters only at the start of a topic.
     private static final List<String> LITERALS = List.of("a", "b", "", "$a");
 
-    @Test
-    void selects_the_filters_that_topic_filter_matching_selects_for_every_small_pair() {
+    @ParameterizedTest(name = "concurrent: {0}")
+    @ValueSource(booleans = {false, true})
+    void selects_the_filters_that_topic_filter_matching_selects_for_every_small_pair(
+            boolean concurrent
+    ) {
         // Arrange: every filter of up to three levels, in one tree.
         List<TopicFilter> filters = filters();
-        var sut = new FilterTree<TopicFilter>();
+        FilterTree<TopicFilter> sut = tree(concurrent);
         for (TopicFilter filter : filters) {
             sut.add(filter, filter);
         }
@@ -35,11 +43,12 @@ class FilterTreeTest {
         }
     }
 
-    @Test
-    void removed_filters_select_nothing_and_leave_no_levels_behind() {
+    @ParameterizedTest(name = "concurrent: {0}")
+    @ValueSource(booleans = {false, true})
+    void removed_filters_select_nothing_and_leave_no_levels_behind(boolean concurrent) {
         // Arrange
         List<TopicFilter> filters = filters();
-        var sut = new FilterTree<TopicFilter>();
+        FilterTree<TopicFilter> sut = tree(concurrent);
         for (TopicFilter filter : filters) {
             sut.add(filter, filter);
         }
@@ -70,13 +79,15 @@ class FilterTreeTest {
         assertThat(sut.isEmpty()).isTrue();
     }
 
-    @Test
-    void a_filter_holds_several_values_and_loses_only_the_one_removed() {
+    @ParameterizedTest(name = "concurrent: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_filter_holds_several_values_and_loses_only_the_one_removed(boolean concurrent) {
         // Arrange
-        var sut = new FilterTree<String>();
+        FilterTree<String> sut = tree(concurrent);
         var filter = new TopicFilter("devices/+/state");
         sut.add(filter, "first");
         sut.add(filter, "second");
+        sut.add(filter, "third");
         sut.add(new TopicFilter("devices/#"), "all");
 
         // Act
@@ -86,13 +97,56 @@ class FilterTreeTest {
 
         // Assert
         assertThat(selected(sut, new Topic("devices/7/state")))
-                .containsExactlyInAnyOrder("second", "all");
+                .containsExactlyInAnyOrder("second", "third", "all");
+        sut.remove(filter, "second");
+        assertThat(selected(sut, new Topic("devices/7/state")))
+                .containsExactlyInAnyOrder("third", "all");
+        sut.remove(filter, "third");
+        sut.remove(new TopicFilter("devices/#"), "all");
+        assertThat(sut.isEmpty()).isTrue();
     }
 
-    @Test
-    void a_topic_deeper_than_any_stack_is_matched_level_by_level() {
+    @ParameterizedTest(name = "concurrent: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_value_added_twice_under_a_filter_is_held_once(boolean concurrent) {
+        // Arrange
+        FilterTree<String> sut = tree(concurrent);
+        var filter = new TopicFilter("devices/+/state");
+
+        // Act
+        sut.add(filter, "only");
+        sut.add(filter, "only");
+        sut.remove(filter, "only");
+
+        // Assert
+        assertThat(selected(sut, new Topic("devices/7/state"))).isEmpty();
+        assertThat(sut.isEmpty()).isTrue();
+    }
+
+    @ParameterizedTest(name = "concurrent: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_match_counts_the_filters_that_passed_values(boolean concurrent) {
+        // Arrange: one value under two overlapping filters, and another filter of its own.
+        FilterTree<String> sut = tree(concurrent);
+        sut.add(new TopicFilter("devices/+/state"), "overlapping");
+        sut.add(new TopicFilter("devices/#"), "overlapping");
+        sut.add(new TopicFilter("devices/7/state"), "single");
+        sut.add(new TopicFilter("devices/7/state"), "other");
+        var passed = new ArrayList<String>();
+
+        // Act & Assert
+        assertThat(sut.match(new Topic("devices/7/state"), passed::add)).isEqualTo(3);
+        assertThat(passed)
+                .containsExactlyInAnyOrder("overlapping", "overlapping", "single", "other");
+        assertThat(sut.match(new Topic("devices/7/other"), _ -> {})).isEqualTo(1);
+        assertThat(sut.match(new Topic("elsewhere"), _ -> {})).isZero();
+    }
+
+    @ParameterizedTest(name = "concurrent: {0}")
+    @ValueSource(booleans = {false, true})
+    void a_topic_deeper_than_any_stack_is_matched_level_by_level(boolean concurrent) {
         // Arrange: 20,000 levels, each a + of the filter and an "a" of the topic.
-        var sut = new FilterTree<String>();
+        FilterTree<String> sut = tree(concurrent);
         String levels = "+/".repeat(19_999) + "+";
         sut.add(new TopicFilter(levels), "deep");
         sut.add(new TopicFilter(levels + "/#"), "deeper");
@@ -103,10 +157,64 @@ class FilterTreeTest {
         assertThat(selected(sut, new Topic(topic + "/a"))).containsExactly("deeper");
     }
 
+    @Test
+    void a_concurrent_match_during_changes_passes_every_value_that_stays() throws Exception {
+        // Arrange: values that stay under three filters that select a/b/c, and a writer that
+        // keeps adding and removing others beside them, so that the holders of those filters
+        // go between one value and a set, and the levels of a sibling filter come and go.
+        FilterTree<String> sut = FilterTree.concurrent();
+        List<TopicFilter> staying = List.of(
+                new TopicFilter("a/b/c"),
+                new TopicFilter("a/+/c"),
+                new TopicFilter("a/#")
+        );
+        for (TopicFilter filter : staying) {
+            sut.add(filter, "stays");
+        }
+        var sibling = new TopicFilter("a/b/c/d/e");
+        var done = new AtomicBoolean();
+        var failure = new AtomicReference<@Nullable String>();
+        Thread writer = Thread.ofPlatform().start(() -> {
+            for (int i = 0; i < 200_000; i++) {
+                for (TopicFilter filter : staying) {
+                    sut.add(filter, "comes and goes");
+                }
+                sut.add(sibling, "comes and goes");
+                for (TopicFilter filter : staying) {
+                    sut.remove(filter, "comes and goes");
+                }
+                sut.remove(sibling, "comes and goes");
+            }
+            done.set(true);
+        });
+
+        // Act: match while the writer runs.
+        var topic = new Topic("a/b/c");
+        while (!done.get()) {
+            var passed = new ArrayList<String>();
+            int sources = sut.match(topic, passed::add);
+            long staysPassed = passed.stream().filter("stays"::equals).count();
+            if (staysPassed != 3 || sources != 3) {
+                failure.compareAndSet(null, "passed " + passed + " from " + sources + " filters");
+            }
+        }
+        writer.join();
+
+        // Assert
+        assertThat(failure.get()).isNull();
+        var passed = new ArrayList<String>();
+        assertThat(sut.match(topic, passed::add)).isEqualTo(3);
+        assertThat(passed).containsExactly("stays", "stays", "stays");
+    }
+
+    private static <T> FilterTree<T> tree(boolean concurrent) {
+        return concurrent ? FilterTree.concurrent() : new FilterTree<>();
+    }
+
     /// The values that `tree` passes for `topic`, failing if it passes one twice.
     private static <T> List<T> selected(FilterTree<T> tree, Topic topic) {
         var values = new ArrayList<T>();
-        tree.match(topic, values::add);
+        int _ = tree.match(topic, values::add);
         assertThat(new HashSet<>(values)).as("each value once").hasSameSizeAs(values);
         return values;
     }

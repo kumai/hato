@@ -36,6 +36,7 @@ import org.mqtt4j.hato.Subscribe;
 import org.mqtt4j.hato.Subscription;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.internal.protocol.FilterTree;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.PacketCodec;
 import org.mqtt4j.hato.internal.protocol.Properties;
@@ -225,7 +226,7 @@ class SubscriptionMeasurementTest {
         Consumer<Integer> sink = _ -> selected[0]++;
         long start = System.nanoTime();
         for (int index = 0; index < MATCHES; index++) {
-            tree.match(topics[index % topics.length], sink);
+            int _ = tree.match(topics[index % topics.length], sink);
         }
         long elapsed = System.nanoTime() - start;
         if (selected[0] != MATCHES) {

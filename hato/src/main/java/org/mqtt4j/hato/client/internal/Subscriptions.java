@@ -33,6 +33,7 @@ import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.client.internal.SessionCore.State;
 import org.mqtt4j.hato.internal.io.SendQueue;
 import org.mqtt4j.hato.internal.log.Log;
+import org.mqtt4j.hato.internal.protocol.FilterTree;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.PacketCodec;
 import org.mqtt4j.hato.internal.protocol.Properties;
@@ -298,8 +299,9 @@ final class Subscriptions {
     /// [#matching(Packet.Publish)] describes.
     private List<Long> matching(Topic topic, List<Integer> identifiers) {
         var matches = new ArrayList<LocalSubscription>();
+        // Each registration holds one filter, so none comes twice.
         if (identifiers.isEmpty()) {
-            byTopic.match(topic, matches::add);
+            int _ = byTopic.match(topic, matches::add);
         } else {
             for (int identifier : identifiers) {
                 LocalSubscription named = byIdentifier.get(identifier);
@@ -310,7 +312,7 @@ final class Subscriptions {
             // A broker that sends one copy for overlapping subscriptions names only those that
             // it holds with an identifier, so the others still need their filters matched.
             if (someHeldWithoutIdentifier) {
-                byTopic.match(topic, local -> {
+                int _ = byTopic.match(topic, local -> {
                     if (local.heldWithoutIdentifier) {
                         matches.add(local);
                     }
