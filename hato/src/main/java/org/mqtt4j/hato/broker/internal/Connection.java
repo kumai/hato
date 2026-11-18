@@ -557,6 +557,15 @@ final class Connection {
             try {
                 arrival = wire.next(connected, version);
             } catch (UnsupportedProtocolVersionException failure) {
+                // A CONNECT after the one accepted breaks the protocol whatever its version
+                // [MQTT-3.1.0-2], and the client has had its CONNACK.
+                if (connected) {
+                    throw new PacketDecodeException(
+                            ReasonCode.PROTOCOL_ERROR,
+                            "A second CONNECT",
+                            failure
+                    );
+                }
                 received();
                 refuse(
                         ReasonCode.UNSUPPORTED_PROTOCOL_VERSION,

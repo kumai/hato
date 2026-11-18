@@ -156,6 +156,20 @@ class BrokerConnectionTest {
     }
 
     @Test
+    void a_second_connect_of_another_version_closes_the_connection_without_connack()
+            throws Exception {
+        try (var sut = MqttBroker.start(); var client = connected(sut.port(), "twice")) {
+            // Act: an MQTT 5.0 CONNECT on a connection of MQTT 3.1.1.
+            client.sendRaw(PacketCodec.of(MqttVersion.V5).encode(
+                    RawSession.connectV5("twice", true, 0, 0)
+            ));
+
+            // Assert: no second CONNACK [MQTT-3.1.0-2].
+            client.expectClosed();
+        }
+    }
+
+    @Test
     void a_duplicate_client_id_replaces_the_connection_and_discards_old_subscriptions()
             throws Exception {
         try (var sut = MqttBroker.start(); var previous = connected(sut.port(), "same-id")) {

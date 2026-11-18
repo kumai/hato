@@ -506,6 +506,13 @@ class BrokerMqtt5Test {
                         connectV5("violating", true, 0, 0),
                         ReasonCode.PROTOCOL_ERROR
                 ),
+                new Violation(
+                        "a second CONNECT of MQTT 3.1.1",
+                        PacketCodec.of(MqttVersion.V3_1_1).encode(
+                                RawSession.connect("violating", true, 0)
+                        ),
+                        ReasonCode.PROTOCOL_ERROR
+                ),
                 // A PUBLISH whose QoS bits hold the reserved value 3.
                 new Violation(
                         "a malformed packet",
