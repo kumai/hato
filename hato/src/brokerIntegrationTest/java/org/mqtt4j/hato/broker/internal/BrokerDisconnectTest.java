@@ -1,11 +1,15 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.MqttBroker;
@@ -51,6 +55,22 @@ class BrokerDisconnectTest {
             // Act & Assert
             assertThat(sut.disconnect("away")).isFalse();
             assertThat(sut.disconnect("unknown")).isFalse();
+        }
+    }
+
+    @Test
+    void a_connection_that_the_application_made_up_closes_nothing() throws Exception {
+        try (MqttBroker sut = MqttBroker.start();
+                RawSession client = connected(sut.port(), "robot")) {
+            // Arrange: objects of the application's own, as a listener's test makes, one that
+            // names the client and one that names none.
+            BrokerListener.Connection named = madeUp("robot");
+            BrokerListener.Connection unnamed = madeUp(null);
+
+            // Act & Assert
+            assertThat(sut.disconnect(named)).isFalse();
+            assertThat(sut.disconnect(unnamed)).isFalse();
+            client.ping();
         }
     }
 
@@ -130,5 +150,29 @@ class BrokerDisconnectTest {
         BrokerListener.Connection next = connections.poll(5, SECONDS);
         assertThat(next).as("a connection that the listener heard of").isNotNull();
         return next;
+    }
+
+    // A connection of the application's own that names `clientId`, which may be null as a
+    // careless test makes it.
+    private static BrokerListener.Connection madeUp(@Nullable String clientId) {
+        return new BrokerListener.Connection() {
+
+            // Breaks the contract on purpose for null, as a careless test may.
+            @SuppressWarnings("NullAway")
+            @Override
+            public String clientId() {
+                return clientId;
+            }
+
+            @Override
+            public Optional<InetSocketAddress> remoteAddress() {
+                return Optional.empty();
+            }
+
+            @Override
+            public MqttVersion version() {
+                return MqttVersion.V3_1_1;
+            }
+        };
     }
 }

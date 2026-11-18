@@ -421,6 +421,11 @@ final class Routing {
     // `reported`, if it is still the open connection of its client, and returns whether it did.
     // A later connection of the same client, or a connection of another broker, is never ended.
     boolean disconnect(BrokerListener.Connection reported, Reason reason) {
+        // An object of the application's own, as a listener's test makes, stands for no
+        // connection of the broker's, whatever its methods return.
+        if (!(reported instanceof ClientConnection)) {
+            return false;
+        }
         Session session = sessions.get(reported.clientId());
         Connection peer = (session == null) ? null : session.connection;
         return peer != null && peer.client.toldAs(reported) && endForApplication(peer, reason);
