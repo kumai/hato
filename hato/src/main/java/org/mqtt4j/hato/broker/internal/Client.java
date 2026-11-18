@@ -880,25 +880,31 @@ final class Client {
                 ))) {
                     return;
                 }
-                var grants = new ArrayList<ReasonCode>();
+                int count = request.subscriptions().size();
+                var grants = new ReasonCode[count];
+                // The subscriptions that the request makes, which the session makes at once
+                // below, and where each stands in the request.
+                var making = new ArrayList<Session.Subscribed>();
+                var makingAt = new ArrayList<Integer>();
                 // The first refusal with a Reason String, which SUBACK carries; it has room for
                 // one.
                 Reason described = null;
-                for (Packet.Subscription requested : request.subscriptions()) {
+                for (int index = 0; index < count; index++) {
+                    Packet.Subscription requested = request.subscriptions().get(index);
                     // An MQTT 3.1.1 client cannot learn that shared subscriptions are missing,
                     // so the broker refuses the filter rather than match it as written: a
                     // client that means a shared subscription would wait for nothing.
                     if (SharedTopicFilter.isShared(requested.filter())) {
-                        grants.add(ReasonCode.UNSPECIFIED_ERROR);
+                        grants[index] = ReasonCode.UNSPECIFIED_ERROR;
                         continue;
                     }
                     // The client's scope must hold the whole filter. One that only overlaps it
                     // subscribes to nothing, as one that a test rule refuses below.
                     if (!scope.permitsSubscribe(requested.filter())) {
-                        grants.add(switch (owner.version) {
+                        grants[index] = switch (owner.version) {
                             case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
                             case V5 -> ReasonCode.NOT_AUTHORIZED;
-                        });
+                        };
                         continue;
                     }
                     // A test rule can refuse the filter, which then subscribes to nothing
@@ -909,10 +915,10 @@ final class Client {
                     // accepts every SUBSCRIBE [MQTT-3.2.2-10].
                     Routing.SubscriptionRule rule = routing.subscriptionRule(requested.filter());
                     if (rule instanceof Routing.SubscriptionRule.Refusal(Reason refusal)) {
-                        grants.add(switch (owner.version) {
+                        grants[index] = switch (owner.version) {
                             case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
                             case V5 -> refusal.code();
-                        });
+                        };
                         if (described == null && refusal.reasonString() != null) {
                             described = refusal;
                         }
@@ -934,27 +940,34 @@ final class Client {
                                     requested.retainHandling()
                             )
                             : requested;
-                    // The broker bounds the subscriptions of a session. One beyond its limits
-                    // subscribes to nothing, as a refused one, and the others of the request go
-                    // on.
-                    if (!owner.subscribe(new Session.Subscribed(subscription, identifier))) {
-                        grants.add(switch (owner.version) {
-                            case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
-                            case V5 -> ReasonCode.QUOTA_EXCEEDED;
-                        });
-                        continue;
-                    }
-                    ReasonCode granted = switch (subscription.qos()) {
+                    making.add(new Session.Subscribed(subscription, identifier));
+                    makingAt.add(index);
+                    grants[index] = switch (subscription.qos()) {
                         case AT_MOST_ONCE -> ReasonCode.SUCCESS;
                         case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
                         case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
                     };
-                    grants.add(granted);
+                }
+                // The broker bounds the subscriptions of a session. One beyond its limits
+                // subscribes to nothing, as a refused one, and the others of the request go
+                // on.
+                boolean[] subscribed = owner.subscribe(making);
+                for (int made = 0; made < subscribed.length; made++) {
+                    if (!subscribed[made]) {
+                        grants[makingAt.get(made)] = switch (owner.version) {
+                            case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
+                            case V5 -> ReasonCode.QUOTA_EXCEEDED;
+                        };
+                    }
                 }
                 send(acknowledgement(
                         owner,
                         described,
-                        properties -> new Packet.SubAck(request.packetId(), grants, properties)
+                        properties -> new Packet.SubAck(
+                                request.packetId(),
+                                List.of(grants),
+                                properties
+                        )
                 ));
                 // The retained messages that the subscriptions queued follow SUBACK.
                 owner.drain();
@@ -969,12 +982,10 @@ final class Client {
                 ))) {
                     return;
                 }
-                var results = new ArrayList<ReasonCode>();
-                for (TopicFilter filter : request.filters()) {
-                    boolean existed = owner.unsubscribe(filter);
-                    results.add(
-                            existed ? ReasonCode.SUCCESS : ReasonCode.NO_SUBSCRIPTION_EXISTED
-                    );
+                boolean[] existed = owner.unsubscribe(request.filters());
+                var results = new ArrayList<ReasonCode>(existed.length);
+                for (boolean ended : existed) {
+                    results.add(ended ? ReasonCode.SUCCESS : ReasonCode.NO_SUBSCRIPTION_EXISTED);
                 }
                 // MQTT 3.1.1 UNSUBACK carries no results.
                 List<ReasonCode> reasonCodes = switch (owner.version) {

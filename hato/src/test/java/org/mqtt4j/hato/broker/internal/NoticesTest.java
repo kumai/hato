@@ -38,15 +38,15 @@ class NoticesTest {
         var others = new AtomicInteger();
         listener.duringReportWithoutClient = () -> {
             if (others.getAndIncrement() < 5) {
-                sut.add("other-" + others.get());
+                sut.add("other-" + others.get(), 1);
             }
         };
         sut.start();
         try {
-            sut.add("first");
+            sut.add("first", 1);
             assertThat(listener.busy.await(5, TimeUnit.SECONDS)).isTrue();
-            sut.add("waiting");
-            sut.add("without a place");
+            sut.add("waiting", 1);
+            sut.add("without a place", 1);
 
             // Act
             listener.release.countDown();
@@ -70,15 +70,15 @@ class NoticesTest {
         var others = new AtomicInteger();
         listener.duringReportOfClient = () -> {
             if (others.getAndIncrement() < 5) {
-                sut.add("other-" + others.get());
+                sut.add("other-" + others.get(), 1);
             }
         };
         sut.start();
         try {
-            sut.add("first");
+            sut.add("first", 1);
             assertThat(listener.busy.await(5, TimeUnit.SECONDS)).isTrue();
-            sut.add("waiting");
-            sut.add("without a place");
+            sut.add("waiting", 1);
+            sut.add("without a place", 1);
 
             // Act
             listener.release.countDown();
@@ -98,11 +98,11 @@ class NoticesTest {
         var sut = new Notices(listener, 0, NOTICE_LIMIT, NOTICE_LIMIT, new Termination(1, 0));
         sut.start();
         try {
-            sut.add("first");
+            sut.add("first", 1);
             assertThat(listener.busy.await(5, TimeUnit.SECONDS)).isTrue();
             ClientConnection robot = connection("robot");
             sut.connected(robot);
-            sut.add("other");
+            sut.add("other", 1);
             sut.disconnected(robot, CLIENT_DISCONNECT);
 
             // Act

@@ -7,7 +7,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.internal.concurrent.Timer;
 import org.mqtt4j.hato.internal.log.Log;
@@ -39,7 +38,9 @@ final class RetainedMessages {
     // The port that the broker listens on, for logs.
     private final int port;
 
-    private final Map<Topic, Message> messages = new LinkedHashMap<>();
+    // By the names of their topics: strings, whose order the map's bins fall back on when their
+    // hash codes collide, which names chosen to collide would make slow to look up otherwise.
+    private final Map<String, Message> messages = new LinkedHashMap<>();
 
     // The same messages by the levels of their topics, each with its place in the order stored.
     private final TopicTree<Stored> byTopic = new TopicTree<>();
@@ -78,7 +79,7 @@ final class RetainedMessages {
     // deliveries that the deliveries of the retained message share with those of the
     // publication itself.
     void store(Packet.Publish publication, long received, PublicationMemory memory) {
-        Message previous = messages.remove(publication.topic());
+        Message previous = messages.remove(publication.topic().name());
         if (previous != null) {
             bytes -= counted(previous);
             byTopic.remove(publication.topic());
@@ -117,7 +118,7 @@ final class RetainedMessages {
             }
             return;
         }
-        messages.put(publication.topic(), message);
+        messages.put(publication.topic().name(), message);
         byTopic.put(publication.topic(), new Stored(nextPlace++, message));
         bytes += size;
         noteExpiry(message);

@@ -22,9 +22,11 @@ import org.mqtt4j.hato.internal.protocol.Property;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.Qos.EXACTLY_ONCE;
+import static org.mqtt4j.hato.ReasonCode.GRANTED_QOS_1;
 import static org.mqtt4j.hato.ReasonCode.SUCCESS;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
@@ -164,6 +166,75 @@ class BrokerRetainedTest {
             // Assert
             assertThat(receivedForNew).isEqualTo(sentForNew);
             assertThat(receivedForRepeated).isEqualTo(sentForRepeated);
+        }
+    }
+
+    @Test
+    void a_subscribe_that_lists_a_filter_again_sends_its_retained_message_for_each_entry()
+            throws Exception {
+        try (var sut = MqttBroker.start();
+                RawSession publisher = connectedV5(sut.port(), "publisher");
+                RawSession subscriber = connectedV5(sut.port(), "subscriber")) {
+            // Arrange
+            publisher.publish(retained("twice/a", "kept", AT_LEAST_ONCE));
+
+            // Act: one SUBSCRIBE that lists the filter at QoS 0, another filter, and the first
+            // filter again at QoS 1, as a sequence of three SUBSCRIBEs would.
+            subscriber.send(new Packet.Subscribe(
+                    1,
+                    List.of(
+                            RawSession.subscription("twice/#", AT_MOST_ONCE),
+                            RawSession.subscription("other/#", AT_MOST_ONCE),
+                            RawSession.subscription("twice/#", AT_LEAST_ONCE)
+                    ),
+                    EMPTY
+            ));
+
+            // Assert: a result for each entry, the retained message once for each entry of the
+            // filter at its QoS [MQTT-3.8.4-3], and later publications at the QoS of the last.
+            assertThat(subscriber.expect(Packet.SubAck.class).reasonCodes())
+                    .containsExactly(SUCCESS, SUCCESS, GRANTED_QOS_1);
+            assertThat(subscriber.expect(Packet.Publish.class).qos()).isEqualTo(AT_MOST_ONCE);
+            Packet.Publish again = subscriber.expect(Packet.Publish.class);
+            assertThat(again.topic()).isEqualTo(new Topic("twice/a"));
+            assertThat(again.qos()).isEqualTo(AT_LEAST_ONCE);
+            subscriber.send(new Packet.PubAck(again.packetId(), SUCCESS, EMPTY));
+            subscriber.ping();
+            publisher.publish(publication("twice/b", "later", AT_LEAST_ONCE, 2));
+            assertThat(subscriber.expect(Packet.Publish.class).qos()).isEqualTo(AT_LEAST_ONCE);
+        }
+    }
+
+    @Test
+    void a_subscribe_that_lists_a_filter_many_times_queues_no_more_than_the_broker_retains()
+            throws Exception {
+        try (BrokerServer sut = BrokerServer.builder().maxRetained(100).start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            // Arrange: as many retained messages as the broker retains.
+            for (int index = 0; index < 100; index++) {
+                publisher.publish(retained("many/" + index, "kept", AT_MOST_ONCE));
+            }
+            publisher.ping();
+            var subscriptions = new ArrayList<Packet.Subscription>();
+            for (int entry = 0; entry < 10_000; entry++) {
+                subscriptions.add(RawSession.subscription("many/#", AT_MOST_ONCE));
+            }
+
+            // Act: one SUBSCRIBE that lists the filter 10,000 times, each a request for all the
+            // retained messages.
+            subscriber.send(new Packet.Subscribe(1, subscriptions, EMPTY));
+
+            // Assert: the broker answers at once and queues no more retained messages than it
+            // retains, the newest copies; the others count as dropped.
+            assertThat(subscriber.expect(Packet.SubAck.class).reasonCodes()).hasSize(10_000);
+            for (int received = 0; received < 100; received++) {
+                assertThat(subscriber.expect(Packet.Publish.class).retain()).isTrue();
+            }
+            subscriber.ping();
+            await().untilAsserted(
+                    () -> assertThat(sut.counts().dropped()[0]).isEqualTo(9_999L * 100)
+            );
         }
     }
 

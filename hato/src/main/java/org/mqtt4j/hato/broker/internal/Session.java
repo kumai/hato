@@ -4,10 +4,12 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
 
 import org.jspecify.annotations.Nullable;
@@ -55,9 +57,20 @@ final class Session {
 
     // How many events a pool thread runs before it lets the turns that wait in the pool go
     // first, so that a session with events without end does not keep the thread.
-    // Ceiling: an event that routes a publication to many sessions counts as one, so the time
-    // of a turn has no bound. A limit on the time or on the deliveries would give it one.
+    // Ceiling: an event that routes a publication to many sessions counts as one, and so does a
+    // SUBSCRIBE whose filters match many retained messages, so the time of a turn has no bound.
+    // A limit on the time, on the deliveries, or on the retained messages that one SUBSCRIBE
+    // queues would give it one.
     private static final int TURN_EVENTS = 256;
+
+    // How many deliveries of retained messages one SUBSCRIBE queues at most under one hold of the
+    // topic lock, beyond those of the first copy there, a copy being what one entry queues of the
+    // retained messages of its filter: the subscriptions made so far then take effect, and the
+    // lock is let go before the next copy. So a SUBSCRIBE of many entries, of many filters or of
+    // one, holds up the retained publications and the subscriptions of other clients about as
+    // long as one filter that matches every retained message does, and its subscriptions are
+    // copied once for this many deliveries at most.
+    private static final int RETAINED_PER_HOLD = 1024;
 
     // The received packets that may wait in the inbox. A reader that finds no room waits until
     // the actor takes one, which holds its client back through TCP; one packet always fits,
@@ -82,6 +95,10 @@ final class Session {
 
     // Why a delivery is dropped that the broker's memory for deliveries has no room for.
     private static final String MEMORY_USED_UP = "the broker's memory for deliveries is used up";
+
+    // Why a retained message is dropped that the cursors of the session hold beyond their room.
+    private static final String RETAINED_BEYOND_ROOM =
+            "its retained messages wait beyond what the broker retains";
 
     // What one level of a filter holds in the index of subscriptions at most, beside its
     // characters, by the estimates of PublicationMemory: its node with three references, the
@@ -133,10 +150,12 @@ final class Session {
     // no Will waiting has none.
     private Timer.@Nullable Cancellable timer;
 
-    // Each filter's subscription with the options that the client requested, in the order the
-    // client made them. A change replaces the map under the inbox, and the map is never changed
-    // once set.
-    private volatile Map<TopicFilter, Subscribed> subscriptions = Map.of();
+    // Each filter's subscription with the options that the client requested, by the pattern of
+    // the filter, in the order the client made them. A change replaces the map under the inbox,
+    // and the map is never changed once set. The keys are strings, whose order the map's bins
+    // fall back on when their hash codes collide, which filters chosen to collide would make
+    // slow to look up otherwise.
+    private volatile Map<String, Subscribed> subscriptions = Map.of();
 
     // What the subscriptions hold on the heap in all, as sizeOf(TopicFilter) counts each, which
     // the subscription limits bound with their number.
@@ -628,7 +647,9 @@ final class Session {
     //
     // The subscriptions are matched without the inbox and checked under it: a change made
     // meanwhile, such as an UNSUBSCRIBE, has the publication matched again, so that none goes to
-    // a subscription once the client has learned that it ended [MQTT-3.10.4-2]. Called by the
+    // a subscription once the client has learned that it ended [MQTT-3.10.4-2]. That second
+    // match is made under the inbox, where the subscriptions cannot change, so that a client
+    // that changes them without pause cannot keep a publisher matching. Called by the
     // publisher's actor, which drains the session here if it can take its turn, or holds it as
     // the publisher's own; otherwise the actor that holds the turn drains it.
     void deliverMatching(
@@ -637,108 +658,134 @@ final class Session {
             Session publisher,
             long received
     ) {
-        while (true) {
-            Map<TopicFilter, Subscribed> matchedOn = subscriptions;
-            MqttVersion sized = version;
-            // The highest QoS granted by the matching subscriptions with Retain As Published,
-            // and by the other matching subscriptions; -1 while none matches. Their identifiers
-            // repeat one that several of them have, as MQTT 5.0 section 3.3.4 describes.
-            int asPublished = -1;
-            int cleared = -1;
-            List<Integer> asPublishedIdentifiers = List.of();
-            List<Integer> clearedIdentifiers = List.of();
-            for (Subscribed subscribed : matchedOn.values()) {
-                Packet.Subscription subscription = subscribed.subscription();
-                // No Local withholds a client's own publications [MQTT-3.8.3-3].
-                boolean withheld = subscription.noLocal() && publisher == this;
-                if (withheld || !subscription.filter().matches(publication.topic())) {
-                    continue;
-                }
-                int level = subscription.qos().level();
-                if (subscription.retainAsPublished()) {
-                    asPublished = Math.max(asPublished, level);
-                    asPublishedIdentifiers = withIdentifier(asPublishedIdentifiers, subscribed);
-                } else {
-                    cleared = Math.max(cleared, level);
-                    clearedIdentifiers = withIdentifier(clearedIdentifiers, subscribed);
-                }
-            }
-            int published = publication.qos().level();
-            List<Delivery> deliveries;
-            if (publication.retain() && asPublished >= 0 && cleared >= 0) {
-                deliveries = List.of(
-                        new Delivery(
-                                publication,
-                                room,
-                                received,
-                                Qos.of(Math.min(asPublished, published)),
-                                true,
-                                asPublishedIdentifiers,
-                                sized
-                        ),
-                        new Delivery(
-                                publication,
-                                room,
-                                received,
-                                Qos.of(Math.min(cleared, published)),
-                                false,
-                                clearedIdentifiers,
-                                sized
-                        )
-                );
-            } else if (asPublished >= 0 || cleared >= 0) {
-                Qos qos = Qos.of(Math.min(Math.max(asPublished, cleared), published));
-                var identifiers = new ArrayList<>(asPublishedIdentifiers);
-                identifiers.addAll(clearedIdentifiers);
-                boolean retain = publication.retain() && asPublished >= 0;
-                deliveries = List.of(
-                        new Delivery(
-                                publication,
-                                room,
-                                received,
-                                qos,
-                                retain,
-                                identifiers,
-                                sized
-                        )
-                );
-            } else {
-                return;
-            }
-            boolean claimed = false;
-            synchronized (this) {
-                if (subscriptions != matchedOn || version != sized) {
-                    continue;
-                }
-                if (ended) {
-                    return;
-                }
-                boolean here = turnFree() || runner == Thread.currentThread();
-                boolean waits = false;
-                for (Delivery delivery : deliveries) {
-                    waits |= admit(delivery, received, here);
-                }
-                if (!waits) {
-                    return;
-                }
-                if (!here) {
-                    // The thread that holds the turn drains the session.
-                    queueDrain();
-                    return;
-                }
-                if (turnFree()) {
-                    queueDrain();
-                    claimed = claimTurn(ALONE);
-                }
-            }
-            if (claimed) {
-                run(ALONE);
-            } else {
-                // This thread holds the turn already, as for the publisher's own session.
-                drain();
-            }
+        Map<String, Subscribed> matchedOn = subscriptions;
+        MqttVersion sized = version;
+        List<Delivery> deliveries = deliveries(
+                publication,
+                room,
+                publisher,
+                received,
+                matchedOn,
+                sized
+        );
+        if (deliveries.isEmpty()) {
             return;
         }
+        boolean claimed = false;
+        synchronized (this) {
+            if (subscriptions != matchedOn || version != sized) {
+                deliveries = deliveries(
+                        publication,
+                        room,
+                        publisher,
+                        received,
+                        subscriptions,
+                        version
+                );
+            }
+            if (ended || deliveries.isEmpty()) {
+                return;
+            }
+            boolean here = turnFree() || runner == Thread.currentThread();
+            boolean waits = false;
+            for (Delivery delivery : deliveries) {
+                waits |= admit(delivery, received, here);
+            }
+            if (!waits) {
+                return;
+            }
+            if (!here) {
+                // The thread that holds the turn drains the session.
+                queueDrain();
+                return;
+            }
+            if (turnFree()) {
+                queueDrain();
+                claimed = claimTurn(ALONE);
+            }
+        }
+        if (claimed) {
+            run(ALONE);
+        } else {
+            // This thread holds the turn already, as for the publisher's own session.
+            drain();
+        }
+    }
+
+    // The deliveries of `publication` from `publisher` that `matchedOn`, the subscriptions of the
+    // session, call for, sized for `sized`: none if no subscription matches.
+    private List<Delivery> deliveries(
+            Packet.Publish publication,
+            PublicationMemory room,
+            Session publisher,
+            long received,
+            Map<String, Subscribed> matchedOn,
+            MqttVersion sized
+    ) {
+        // The highest QoS granted by the matching subscriptions with Retain As Published, and by
+        // the other matching subscriptions; -1 while none matches. Their identifiers repeat one
+        // that several of them have, as MQTT 5.0 section 3.3.4 describes.
+        int asPublished = -1;
+        int cleared = -1;
+        List<Integer> asPublishedIdentifiers = List.of();
+        List<Integer> clearedIdentifiers = List.of();
+        for (Subscribed subscribed : matchedOn.values()) {
+            Packet.Subscription subscription = subscribed.subscription();
+            // No Local withholds a client's own publications [MQTT-3.8.3-3].
+            boolean withheld = subscription.noLocal() && publisher == this;
+            if (withheld || !subscription.filter().matches(publication.topic())) {
+                continue;
+            }
+            int level = subscription.qos().level();
+            if (subscription.retainAsPublished()) {
+                asPublished = Math.max(asPublished, level);
+                asPublishedIdentifiers = withIdentifier(asPublishedIdentifiers, subscribed);
+            } else {
+                cleared = Math.max(cleared, level);
+                clearedIdentifiers = withIdentifier(clearedIdentifiers, subscribed);
+            }
+        }
+        int published = publication.qos().level();
+        if (publication.retain() && asPublished >= 0 && cleared >= 0) {
+            return List.of(
+                    new Delivery(
+                            publication,
+                            room,
+                            received,
+                            Qos.of(Math.min(asPublished, published)),
+                            true,
+                            asPublishedIdentifiers,
+                            sized
+                    ),
+                    new Delivery(
+                            publication,
+                            room,
+                            received,
+                            Qos.of(Math.min(cleared, published)),
+                            false,
+                            clearedIdentifiers,
+                            sized
+                    )
+            );
+        }
+        if (asPublished < 0 && cleared < 0) {
+            return List.of();
+        }
+        Qos qos = Qos.of(Math.min(Math.max(asPublished, cleared), published));
+        var identifiers = new ArrayList<>(asPublishedIdentifiers);
+        identifiers.addAll(clearedIdentifiers);
+        boolean retain = publication.retain() && asPublished >= 0;
+        return List.of(
+                new Delivery(
+                        publication,
+                        room,
+                        received,
+                        qos,
+                        retain,
+                        identifiers,
+                        sized
+                )
+        );
     }
 
     // `identifiers` with the identifier of `subscribed`, if it has one. The list is created for
@@ -1016,54 +1063,189 @@ final class Session {
                 + 2L * pattern.length();
     }
 
-    // Makes or replaces the subscription to its filter, and returns false if the subscription
-    // limits leave no room for a new one, which then subscribes to nothing; replacing a
-    // subscription takes no room. Retain Handling 0 queues the retained messages that it
-    // matches for every SUBSCRIBE, 1 only for a new subscription, and 2, the only other value,
-    // never [MQTT-3.3.1-9] [MQTT-3.3.1-10] [MQTT-3.3.1-11]; MQTT 3.1.1 uses 0. They wait for the
-    // next drain, which follows SUBACK. Under the topic lock, a retained publication either is
-    // among them or is delivered to the subscription, and the deliveries after the subscription
-    // queue behind them. Runs on the actor.
-    boolean subscribe(Subscribed subscribed) {
-        Packet.Subscription subscription = subscribed.subscription();
-        long size = sizeOf(subscription.filter());
-        boolean added = !subscriptions.containsKey(subscription.filter());
-        if (added && (subscriptions.size() >= settings.maxSubscriptions()
-                || size > settings.maxSubscriptionBytes() - subscriptionBytes)) {
-            logRefusal(subscription.filter());
-            return false;
-        }
-        if (added) {
-            subscriptionBytes += size;
-        }
-        synchronized (routing.retained) {
-            Map<TopicFilter, Subscribed> current = subscriptions;
+    // Makes or replaces the subscriptions of one SUBSCRIBE, which `requested` lists in its order,
+    // and returns for each of them whether it subscribes: one that the subscription limits leave
+    // no room for subscribes to nothing; replacing a subscription takes no room. Retain Handling
+    // 0 queues the retained messages that a subscription matches for every SUBSCRIBE, 1 only for
+    // a new subscription, and 2, the only other value, never [MQTT-3.3.1-9] [MQTT-3.3.1-10]
+    // [MQTT-3.3.1-11]; MQTT 3.1.1 uses 0. They wait for the next drain, which follows SUBACK.
+    // Under the topic lock, a retained publication either is among them or is delivered to the
+    // subscription, and the deliveries after the subscription queue behind them. Runs on the
+    // actor.
+    //
+    // MQTT has a SUBSCRIBE of several filters handled as a sequence of SUBSCRIBEs, and only the
+    // end of that sequence matters to anyone else. So the subscriptions change at once rather
+    // than filter by filter: a filter that the SUBSCRIBE lists more than once ends as its last
+    // entry has it, while each entry that asks for its retained messages queues them, which the
+    // filter's messages are matched once for. The work then grows with the filters of the
+    // SUBSCRIBE and the subscriptions of the session, and not with their product. Copies of an
+    // older entry beyond what the room for retained messages takes beside the newer ones would
+    // go as soon as those came (see dropOldestRetained), so they are not made: they count as
+    // dropped at once. The subscriptions take effect in parts, though, so that the topic lock
+    // is let go between copies of many retained messages, of one filter or of several (see
+    // RETAINED_PER_HOLD), and the cursors of each part take their room in the broker's memory
+    // before the next part makes more.
+    boolean[] subscribe(List<Subscribed> requested) {
+        var subscribes = new boolean[requested.size()];
+        Map<String, Subscribed> current = subscriptions;
+        // What the SUBSCRIBE does to each filter, in the order in which it first lists them.
+        var changes = new LinkedHashMap<String, Change>();
+        int count = current.size();
+        long bytes = subscriptionBytes;
+        for (int index = 0; index < requested.size(); index++) {
+            Subscribed subscribed = requested.get(index);
+            Packet.Subscription subscription = subscribed.subscription();
+            TopicFilter filter = subscription.filter();
+            Change change = changes.get(filter.pattern());
+            boolean exists = change != null || current.containsKey(filter.pattern());
+            if (!exists) {
+                long size = sizeOf(filter);
+                if (count >= settings.maxSubscriptions()
+                        || size > settings.maxSubscriptionBytes() - bytes) {
+                    logRefusal(filter);
+                    continue;
+                }
+                count++;
+                bytes += size;
+            }
             boolean sendsRetained = switch (subscription.retainHandling()) {
                 case 0 -> true;
-                case 1 -> !current.containsKey(subscription.filter());
+                case 1 -> !exists;
                 default -> false;
             };
-            List<RetainedMessages.Message> matched = sendsRetained
-                    ? routing.retained.matching(subscription.filter())
-                    : List.of();
-            var changed = new LinkedHashMap<>(current);
-            changed.put(subscription.filter(), subscribed);
-            synchronized (this) {
-                // Into the index before the table: should the index fail to take it, no
-                // subscription stays that publications cannot find.
-                if (added) {
-                    routing.subscribed(subscription.filter(), this);
+            if (change == null) {
+                change = new Change(subscribed, !exists);
+                changes.put(filter.pattern(), change);
+            } else {
+                change.subscribed = subscribed;
+            }
+            if (sendsRetained) {
+                change.retained.add(subscribed);
+            }
+            subscribes[index] = true;
+        }
+        Iterator<Change> pending = changes.values().iterator();
+        // The change whose entries have copies left for the next part, if one has.
+        Change continuing = null;
+        while (continuing != null || pending.hasNext()) {
+            synchronized (routing.retained) {
+                var changed = new LinkedHashMap<>(subscriptions);
+                var added = new ArrayList<TopicFilter>();
+                var queued = new ArrayList<Matched>();
+                // The deliveries that copies not made would have had, by QoS level.
+                var skipped = new long[3];
+                long addedBytes = 0;
+                long matchedCount = 0;
+                while ((continuing != null || pending.hasNext())
+                        && matchedCount < RETAINED_PER_HOLD) {
+                    Change change;
+                    if (continuing != null) {
+                        change = continuing;
+                        continuing = null;
+                    } else {
+                        change = pending.next();
+                        TopicFilter filter = change.subscribed.subscription().filter();
+                        changed.put(filter.pattern(), change.subscribed);
+                        if (change.added) {
+                            added.add(filter);
+                            addedBytes += sizeOf(filter);
+                        }
+                    }
+                    if (change.copied < change.retained.size()) {
+                        TopicFilter filter = change.subscribed.subscription().filter();
+                        List<RetainedMessages.Message> matched = routing.retained.matching(filter);
+                        matchedCount += copies(change, matched, queued, skipped, matchedCount);
+                        if (change.copied < change.retained.size()) {
+                            continuing = change;
+                        }
+                    }
                 }
-                queueRetained(subscribed, matched);
-                subscriptions = changed;
+                synchronized (this) {
+                    // Into the index before the table: should the index fail to take them, no
+                    // subscription stays that publications cannot find.
+                    for (TopicFilter filter : added) {
+                        routing.subscribed(filter, this);
+                    }
+                    for (Matched matched : queued) {
+                        queueRetained(matched.subscribed(), matched.messages());
+                    }
+                    for (int level = 0; level < skipped.length; level++) {
+                        dropped(Qos.of(level), skipped[level], RETAINED_BEYOND_ROOM);
+                    }
+                    subscriptions = changed;
+                    subscriptionBytes += addedBytes;
+                }
+            }
+            // Outside the topic lock, which the retained messages and subscriptions of every
+            // client wait for. The session's limits on what its cursors hold apply now if they
+            // overflow, and the cursors of a part take their room in the broker's memory before
+            // the next part makes more, so that what the cursors hold besides their messages
+            // stays within that memory however many entries the SUBSCRIBE lists. Otherwise the
+            // cursors take their room as the session sends what it can, after SUBACK, so that
+            // a message that goes out at once needs none. If the cursors that came find no room,
+            // a message goes alone, and only then do the oldest go until the room holds its
+            // limits again: in this order the session gives up no older message for one that
+            // the memory then refuses.
+            synchronized (this) {
+                if (continuing != null || pending.hasNext() || retainedRoom.overflows()) {
+                    takeRoomForRetained();
+                    dropOldestRetained();
+                }
             }
         }
-        // Outside the topic lock, which the retained messages and subscriptions of every
-        // client wait for.
-        synchronized (this) {
-            limitRetained();
+        return subscribes;
+    }
+
+    // Adds to `queued` copies of `matched`, the retained messages that the filter of `change`
+    // matches now, for the entries of the change that ask for them, from the first one not yet
+    // dealt with on: one copy at least, and more while the deliveries of the part, `count` before
+    // these, stay below RETAINED_PER_HOLD. The next part goes on with the entries left, and
+    // matches the filter again for them. At the first look at the change, the oldest entries
+    // whose copies the room for retained messages could not hold beside those of the newer ones
+    // are passed over, and their deliveries added to `skipped` by QoS level instead. Returns how
+    // many deliveries the copies have.
+    private long copies(
+            Change change,
+            List<RetainedMessages.Message> matched,
+            List<Matched> queued,
+            long[] skipped,
+            long count
+    ) {
+        List<Subscribed> asking = change.retained;
+        if (matched.isEmpty()) {
+            change.copied = asking.size();
+            return 0;
         }
-        return true;
+        if (change.copied == 0) {
+            long bytes = 0;
+            // The messages by the QoS of their publications.
+            var atLevel = new long[3];
+            for (RetainedMessages.Message message : matched) {
+                bytes += message.memory().bytes();
+                atLevel[message.publication().qos().level()]++;
+            }
+            // One copy more than fits whole may still fit in part.
+            long fit = 1 + Math.min(
+                    retainedRoom.maxCount / matched.size(),
+                    (bytes == 0) ? Long.MAX_VALUE : retainedRoom.maxBytes / bytes
+            );
+            var made = (int) Math.min(asking.size(), fit);
+            int first = asking.size() - made;
+            for (int index = 0; index < first; index++) {
+                int granted = asking.get(index).subscription().qos().level();
+                for (int level = 0; level < atLevel.length; level++) {
+                    skipped[Math.min(granted, level)] += atLevel[level];
+                }
+            }
+            change.copied = first;
+        }
+        long deliveries = 0;
+        do {
+            queued.add(new Matched(asking.get(change.copied), matched));
+            change.copied++;
+            deliveries += matched.size();
+        } while (change.copied < asking.size() && count + deliveries < RETAINED_PER_HOLD);
+        return deliveries;
     }
 
     // Logs that the subscription limits refused `filter`: the first time for the session as a
@@ -1080,23 +1262,35 @@ final class Session {
         }
     }
 
-    // Ends the subscription to `filter`, and returns whether there was one. The retained
-    // messages that still wait for it go too: the broker completes only the deliveries that it
-    // has started [MQTT-3.10.4-3], and they have not started. Runs on the actor.
-    boolean unsubscribe(TopicFilter filter) {
+    // Ends the subscriptions to the filters of one UNSUBSCRIBE, which `filters` lists in its
+    // order, and returns for each of them whether a subscription to it ended: a filter that the
+    // UNSUBSCRIBE lists again finds none, as in a sequence of UNSUBSCRIBEs. The retained messages
+    // that still wait for them go too: the broker completes only the deliveries that it has
+    // started [MQTT-3.10.4-3], and they have not started. As for a SUBSCRIBE, the subscriptions
+    // change at once. Runs on the actor.
+    boolean[] unsubscribe(List<TopicFilter> filters) {
+        var ended = new boolean[filters.size()];
         synchronized (this) {
-            dropRetained(filter);
-            Map<TopicFilter, Subscribed> current = subscriptions;
-            if (!current.containsKey(filter)) {
-                return false;
+            Map<String, Subscribed> current = subscriptions;
+            var gone = new HashSet<String>();
+            for (int index = 0; index < filters.size(); index++) {
+                String pattern = filters.get(index).pattern();
+                ended[index] = current.containsKey(pattern) && gone.add(pattern);
             }
+            if (gone.isEmpty()) {
+                return ended;
+            }
+            dropRetained(gone);
             var changed = new LinkedHashMap<>(current);
-            changed.remove(filter);
+            changed.keySet().removeAll(gone);
             subscriptions = changed;
-            routing.unsubscribed(filter, this);
-            subscriptionBytes -= sizeOf(filter);
-            return true;
+            for (String pattern : gone) {
+                TopicFilter filter = requireNonNull(current.get(pattern)).subscription().filter();
+                routing.unsubscribed(filter, this);
+                subscriptionBytes -= sizeOf(filter);
+            }
         }
+        return ended;
     }
 
     // Queues `matched`, the retained messages that match `subscribed`, which the client is
@@ -1107,11 +1301,11 @@ final class Session {
     //
     // They take the window like every other delivery, but wait as one cursor in the queue,
     // which no delivery queue limit drops, so the subscription receives all of them, however
-    // many it matches. A cursor that still waits for the same filter stays: replacing the
-    // subscription must lose none of its messages, while Retain Handling 0 sends the retained
-    // ones again [MQTT-3.8.4-3]. The session's limits on what its cursors hold apply right
-    // after, once the topic lock is free (see limitRetained). Called under the topic lock and
-    // the inbox.
+    // many it matches, unless more wait than the broker retains (see dropOldestRetained). A
+    // cursor that still waits for the same filter stays: replacing the subscription must lose
+    // none of its messages, while Retain Handling 0 sends the retained ones again
+    // [MQTT-3.8.4-3]. The session's limits on what its cursors hold apply right after, once the
+    // topic lock is free (see subscribe). Called under the topic lock and the inbox.
     private void queueRetained(Subscribed subscribed, List<RetainedMessages.Message> matched) {
         if (matched.isEmpty()) {
             return;
@@ -1129,20 +1323,6 @@ final class Session {
         );
     }
 
-    // Sees to it that the session's cursors hold no more retained messages than may wait for
-    // it, once a subscription has queued its own. If they do, some go now, and which ones
-    // depends on whether the broker's memory has room for those that came. So the cursors
-    // that came take their room first, as they do when they still wait after the session has
-    // sent what it could (see takeRoomForRetained): a message that finds none goes alone. Only
-    // then do the oldest go until the room holds its limits again. In this order the session
-    // gives up no older message for one that the memory then refuses. Called under the inbox.
-    private void limitRetained() {
-        if (retainedRoom.overflows()) {
-            takeRoomForRetained();
-            dropOldestRetained();
-        }
-    }
-
     // Drops the oldest retained messages that the cursors hold until their room holds its limits
     // again. The newest cursor holds part of what the broker retains and fits the room alone, so
     // only older cursors lose any, which takes SUBSCRIBEs faster than the client takes their
@@ -1154,7 +1334,7 @@ final class Session {
             while (retainedRoom.overflows() && cursor.hasNext()) {
                 Qos qos = cursor.nextQos();
                 pass(cursor);
-                dropped(qos, "its retained messages wait beyond what the broker retains");
+                dropped(qos, RETAINED_BEYOND_ROOM);
             }
             if (!cursor.hasNext()) {
                 oldest.remove();
@@ -1163,12 +1343,13 @@ final class Session {
         }
     }
 
-    // Drops the retained messages that still wait for `filter`. Called under the inbox.
-    private void dropRetained(TopicFilter filter) {
+    // Drops the retained messages that still wait for the filters whose patterns `patterns`
+    // holds. Called under the inbox.
+    private void dropRetained(Set<String> patterns) {
         Iterator<RetainedCursor> queued = cursors.iterator();
         while (queued.hasNext()) {
             RetainedCursor cursor = queued.next();
-            if (cursor.filter.equals(filter)) {
+            if (patterns.contains(cursor.filter.pattern())) {
                 queued.remove();
                 retainedRoom.remove(cursor.remainingCount(), cursor.remainingBytes());
                 cursor.eachWithRoom(this::giveRoom);
@@ -1483,14 +1664,22 @@ final class Session {
     // that it has; once the report has taken that one, or if it has none, it gets the next from
     // the reports.
     private void dropped(Qos qos, String cause) {
+        dropped(qos, 1, cause);
+    }
+
+    // Records `deliveries` such deliveries at once, as dropped(Qos, String) records one.
+    private void dropped(Qos qos, long deliveries, String cause) {
+        if (deliveries == 0) {
+            return;
+        }
         Notices notices = routing.notices;
         if (qos != Qos.AT_MOST_ONCE && notices != null) {
             Notices.Count count = unreported;
-            if (count == null || !count.add()) {
-                unreported = notices.add(clientId);
+            if (count == null || !count.add(deliveries)) {
+                unreported = notices.add(clientId, deliveries);
             }
         }
-        droppedByLevel[qos.level()]++;
+        droppedByLevel[qos.level()] += deliveries;
         if (dropCause == null && !routing.closed) {
             dropCause = cause;
             try {
@@ -1548,18 +1737,20 @@ final class Session {
         int withheld = 0;
         var ended = new ArrayList<TopicFilter>();
         synchronized (this) {
-            var kept = new LinkedHashMap<TopicFilter, Subscribed>();
-            for (Map.Entry<TopicFilter, Subscribed> entry : subscriptions.entrySet()) {
-                TopicFilter filter = entry.getKey();
+            var kept = new LinkedHashMap<String, Subscribed>();
+            var gone = new HashSet<String>();
+            for (Map.Entry<String, Subscribed> entry : subscriptions.entrySet()) {
+                TopicFilter filter = entry.getValue().subscription().filter();
                 if (scope.permitsSubscribe(filter)) {
-                    kept.put(filter, entry.getValue());
+                    kept.put(entry.getKey(), entry.getValue());
                 } else {
-                    dropRetained(filter);
+                    gone.add(entry.getKey());
                     subscriptionBytes -= sizeOf(filter);
                     ended.add(filter);
                 }
             }
             if (!ended.isEmpty()) {
+                dropRetained(gone);
                 subscriptions = kept;
                 for (TopicFilter filter : ended) {
                     routing.unsubscribed(filter, this);
@@ -1977,10 +2168,10 @@ final class Session {
     void clear() {
         int unaccounted;
         synchronized (this) {
-            Map<TopicFilter, Subscribed> ended = subscriptions;
+            Map<String, Subscribed> ended = subscriptions;
             subscriptions = Map.of();
-            for (TopicFilter filter : ended.keySet()) {
-                routing.unsubscribed(filter, this);
+            for (Subscribed subscribed : ended.values()) {
+                routing.unsubscribed(subscribed.subscription().filter(), this);
             }
             empty(atMostOnceQueue);
             empty(acknowledgedQueue);
@@ -2099,6 +2290,30 @@ final class Session {
     // identifier takes, for none. Making the subscription again replaces both (MQTT 5.0 section
     // 3.8.4).
     record Subscribed(Packet.Subscription subscription, int identifier) {
+    }
+
+    // What one SUBSCRIBE does to the subscription to one filter that it lists, once or more: the
+    // subscription that it ends with, whether that one is new to the session, the entries that
+    // queue the filter's retained messages, in their order, and how many of those have been
+    // dealt with, queued or passed over (see copies).
+    private static final class Change {
+
+        Subscribed subscribed;
+
+        final boolean added;
+
+        final List<Subscribed> retained = new ArrayList<>(1);
+
+        int copied;
+
+        Change(Subscribed subscribed, boolean added) {
+            this.subscribed = subscribed;
+            this.added = added;
+        }
+    }
+
+    // The retained messages that a subscription queues.
+    private record Matched(Subscribed subscribed, List<RetainedMessages.Message> messages) {
     }
 
     // The deliveries of one kind that wait, oldest first, with what they hold on the heap in

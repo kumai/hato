@@ -120,6 +120,33 @@ class RetainedMessagesTest {
         assertThat(kept(sut)).containsExactly("aaaaaaaaaa");
     }
 
+    @Test
+    void messages_whose_topics_hash_alike_are_stored_at_once() {
+        // Arrange: room for 16,384 topics with one hash code, each of fourteen pairs of "Aa" or
+        // "BB", which hash alike.
+        var sut = new RetainedMessages(16_384, Long.MAX_VALUE, clock, 0);
+        var topics = new ArrayList<String>();
+        for (int bits = 0; bits < 16_384; bits++) {
+            var topic = new StringBuilder();
+            for (int pair = 0; pair < 14; pair++) {
+                topic.append(((bits >> pair) & 1) == 0 ? "Aa" : "BB");
+            }
+            topics.add(topic.toString());
+        }
+        long started = System.nanoTime();
+
+        // Act
+        for (String topic : topics) {
+            store(sut, retained(topic, 60), 0);
+        }
+
+        // Assert: far within the three seconds that a store by the topics' records took for
+        // these.
+        assertThat(Duration.ofNanos(System.nanoTime() - started))
+                .isLessThan(Duration.ofSeconds(1));
+        assertThat(sut.size()).isEqualTo(16_384);
+    }
+
     /// The topics of the retained messages that `filter` finds in `store`, in the order given.
     private static List<String> topics(RetainedMessages store, String filter) {
         return store.matching(new TopicFilter(filter)).stream()

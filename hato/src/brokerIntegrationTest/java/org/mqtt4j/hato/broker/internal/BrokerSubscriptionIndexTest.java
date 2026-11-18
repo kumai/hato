@@ -4,12 +4,14 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.Authenticator;
@@ -62,6 +64,32 @@ class BrokerSubscriptionIndexTest {
             try (RawSession device = lasting(sut, "device-8", false, true)) {
                 device.ping();
             }
+        }
+    }
+
+    @Test
+    void a_subscribe_of_filters_whose_hash_codes_collide_is_answered_at_once() throws Exception {
+        try (BrokerServer sut = broker(BrokerServer.builder());
+                RawSession subscriber = RawSession.connected(sut.port(), "subscriber")) {
+            // Arrange: 2,048 filters with one hash code, each of eleven pairs of "Aa" or "BB",
+            // which hash alike.
+            var subscriptions = new ArrayList<Packet.Subscription>();
+            for (int bits = 0; bits < 2048; bits++) {
+                var pattern = new StringBuilder();
+                for (int pair = 0; pair < 11; pair++) {
+                    pattern.append(((bits >> pair) & 1) == 0 ? "Aa" : "BB");
+                }
+                subscriptions.add(RawSession.subscription(pattern.toString(), AT_MOST_ONCE));
+            }
+
+            // Act
+            subscriber.send(new Packet.Subscribe(1, subscriptions, EMPTY));
+
+            // Assert: the SUBACK comes within the time that the session waits for a packet,
+            // where subscriptions kept by their filters' records took ten seconds for these.
+            assertThat(subscriber.expect(Packet.SubAck.class).reasonCodes())
+                    .hasSize(2048)
+                    .containsOnly(ReasonCode.SUCCESS);
         }
     }
 

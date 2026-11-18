@@ -114,12 +114,12 @@ final class Notices {
         thread.start();
     }
 
-    // Counts one delivery that the limits kept from the client `clientId`, for the listener to
-    // hear of, and returns the count that the client's sessions add its later ones to, or null
-    // if the client found no place and each of its deliveries has to come here. The caller holds
-    // the inbox of a session, so this never waits for the listener, and it logs once at most in
-    // the life of the broker.
-    @Nullable Count add(String clientId) {
+    // Counts `deliveries`, at least one, that the limits kept from the client `clientId`, for the
+    // listener to hear of, and returns the count that the client's sessions add its later ones
+    // to, or null if the client found no place and each of its deliveries has to come here. The
+    // caller holds the inbox of a session, so this never waits for the listener, and it logs
+    // once at most in the life of the broker.
+    @Nullable Count add(String clientId, long deliveries) {
         Count count;
         // Whether nothing waited to be told until now.
         boolean first;
@@ -128,16 +128,18 @@ final class Notices {
         synchronized (this) {
             count = waiting.get(clientId);
             if (count != null) {
-                // The count still waits, so it takes the delivery.
-                boolean _ = count.add();
+                // The count still waits, so it takes the deliveries.
+                boolean _ = count.add(deliveries);
                 return count;
             }
             first = nothingWaits();
             if (waiting.size() < limit) {
-                count = new Count(nextOrder++);
+                count = new Count(nextOrder++, deliveries);
                 waiting.put(clientId, count);
             } else {
-                if (unattributed++ != 0) {
+                long before = unattributed;
+                unattributed += deliveries;
+                if (before != 0) {
                     return null;
                 }
                 firstBeyond = !limitReached;
@@ -347,18 +349,19 @@ final class Notices {
         // of late deliveries brings it back up.
         private static final long TAKEN = Long.MIN_VALUE;
 
-        private final AtomicLong deliveries = new AtomicLong(1);
+        private final AtomicLong deliveries;
 
         private final long order;
 
-        private Count(long order) {
+        private Count(long order, long deliveries) {
             this.order = order;
+            this.deliveries = new AtomicLong(deliveries);
         }
 
-        // Counts one more delivery, and returns false if the report has taken the count, which
-        // then leaves the delivery uncounted.
-        boolean add() {
-            return deliveries.getAndIncrement() >= 0;
+        // Counts `more` deliveries, and returns false if the report has taken the count, which
+        // then leaves them uncounted.
+        boolean add(long more) {
+            return deliveries.getAndAdd(more) >= 0;
         }
 
         // The deliveries so far, which the caller reports. Called once, under the monitor of

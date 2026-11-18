@@ -4,13 +4,20 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.MqttVersion;
@@ -283,6 +290,68 @@ class BrokerDeliveryMemoryTest {
                 back.send(new Packet.PubAck(delivery.packetId(), SUCCESS, EMPTY));
                 back.ping();
             }
+        }
+    }
+
+    /// The filters of a SUBSCRIBE of 32 entries that each match the 128 retained messages under
+    /// `a/b/c/d`: 32 filters, which take each of the first four levels as it is or as a
+    /// single-level wildcard and the last as either wildcard, or one of them 32 times.
+    static Stream<Arguments> entriesOfOneSubscribe() {
+        var filters = new ArrayList<String>();
+        for (int wildcards = 0; wildcards < 16; wildcards++) {
+            for (String last : List.of("+", "#")) {
+                var levels = new ArrayList<String>();
+                for (int level = 0; level < 4; level++) {
+                    boolean wild = ((wildcards >> level) & 1) == 1;
+                    levels.add(wild ? "+" : String.valueOf("abcd".charAt(level)));
+                }
+                levels.add(last);
+                filters.add(String.join("/", levels));
+            }
+        }
+        List<String> repeated = Collections.nCopies(32, "a/b/c/d/+");
+        return Stream.of(
+                Arguments.of(Named.of("32 filters", filters)),
+                Arguments.of(Named.of("one filter 32 times", repeated))
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("entriesOfOneSubscribe")
+    void the_cursors_of_a_subscribe_of_many_entries_take_their_room_part_by_part(
+            List<String> filters
+    ) throws Exception {
+        // Arrange: 128 retained messages, which each entry matches, and memory for deliveries
+        // that runs out within the first part of one SUBSCRIBE of all the entries. The first time
+        // that the session hands room over, the test reads how many deliveries wait.
+        var waiting = new AtomicLong(-1);
+        var server = new AtomicReference<BrokerServer>();
+        BrokerServer.Builder small = settings(8 * 1024)
+                .maxInflight(1)
+                .beforeHandOver(_ -> {
+                    long queued = server.get().counts().queuedDeliveries();
+                    boolean _ = waiting.compareAndSet(-1, queued);
+                });
+        try (BrokerServer sut = small.start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            server.set(sut);
+            for (int index = 0; index < 128; index++) {
+                publisher.publish(retained("a/b/c/d/" + index, "0001"));
+            }
+            var subscriptions = new ArrayList<Packet.Subscription>();
+            for (String filter : filters) {
+                subscriptions.add(subscription(filter, AT_LEAST_ONCE));
+            }
+
+            // Act
+            subscriber.send(new Packet.Subscribe(1, subscriptions, EMPTY));
+            subscriber.expect(Packet.SubAck.class);
+
+            // Assert: the first hand-over came while the cursors of one part waited, a thousand
+            // deliveries or so, rather than those of all 32 entries.
+            await().until(() -> waiting.get() >= 0);
+            assertThat(waiting.get()).isLessThan(2 * 1024);
         }
     }
 
