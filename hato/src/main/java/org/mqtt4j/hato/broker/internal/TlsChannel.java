@@ -138,17 +138,22 @@ final class TlsChannel {
         this.connection = connection;
     }
 
-    // Whether the connection has TLS work to go on with without new input from the socket. That
-    // includes records that reading left while the broker's own records waited to go out: the
-    // write that sends the last of those does not bring the connection back for them, and the
-    // socket has nothing more to tell.
+    // Whether the connection has TLS work to go on with without new input from the socket: input
+    // to read on, or records that wait to go out, which a read sends first.
     boolean wantsTurn() {
+        return inputWaiting() || (!delegated && pendingOutput != null && !outputFailed);
+    }
+
+    // Whether input waits that the connection can read on without new input from the socket.
+    // That includes records that reading left while the broker's own records waited to go out:
+    // the write that sends the last of those does not bring the connection back for them, and
+    // the socket has nothing more to tell.
+    boolean inputWaiting() {
         if (delegated) {
             return false;
         }
         return resumed
                 || deferredFailure != null
-                || (pendingOutput != null && !outputFailed)
                 || (pendingInput != null && !wanting && !ownWaiting);
     }
 

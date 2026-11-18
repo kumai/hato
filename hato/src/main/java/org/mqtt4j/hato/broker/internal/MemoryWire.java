@@ -82,6 +82,11 @@ final class MemoryWire implements Wire {
     }
 
     @Override
+    public boolean unreadInput() {
+        return inputWaiting();
+    }
+
+    @Override
     public @Nullable Arrival next(boolean connected, MqttVersion version) {
         InprocLink.Item item = link.take();
         if (item == null) {

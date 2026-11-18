@@ -22,6 +22,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.IntStream;
@@ -748,6 +749,58 @@ class BrokerTlsTest {
             // Assert: the broker ends the connection without a DISCONNECT, so the Will goes out.
             assertThat(watcher.expect(Packet.Publish.class).topic())
                     .isEqualTo(new Topic("wills/leaving"));
+        }
+    }
+
+    @Test
+    void a_shutdown_that_waits_for_a_tls_client_that_reads_nothing_leaves_the_selector_idle()
+            throws Exception {
+        // Arrange: one selector, whose turns the test counts, and a TLS subscriber that has
+        // stopped reading while records of its deliveries wait to go out.
+        var turns = new AtomicLong();
+        SSLContext context = Tls.serverContext();
+        try (BrokerServer broker = BrokerServer.builder()
+                .selectors(1)
+                .listenTls(loopback(), context, serverParameters(context, _ -> { }))
+                .beforeSelect(turns::incrementAndGet)
+                .start(loopback());
+                RawSession publisher = RawSession.connected(broker.plainPort(), "publisher");
+                var raw = new Socket()) {
+            raw.setReceiveBufferSize(4096);
+            raw.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), broker.tlsPort()));
+            var client = (SSLSocket) Tls.clientContext().getSocketFactory().createSocket(
+                    raw,
+                    "localhost",
+                    raw.getPort(),
+                    false
+            );
+            client.startHandshake();
+            try (RawSession subscriber = RawSession.over(client, MqttVersion.V3_1_1)) {
+                subscriber.send(RawSession.connect("stalled", true, 0));
+                subscriber.expect(Packet.ConnAck.class);
+                subscriber.subscribe("readings", Qos.AT_MOST_ONCE);
+                var reading = new Packet.Publish(
+                        new Topic("readings"),
+                        new byte[32 * 1024],
+                        Qos.AT_MOST_ONCE,
+                        false,
+                        false,
+                        0,
+                        Properties.EMPTY
+                );
+                for (int i = 0; i < 200; i++) {
+                    publisher.send(reading);
+                }
+                publisher.ping();
+                long before = turns.get();
+                // Act
+                boolean delivered = broker.shutdown(Duration.ofSeconds(1));
+                // Assert: the shutdown waited for the subscriber until its deadline, while the
+                // selector waited for the socket rather than turning for the records that it
+                // could not send.
+                assertThat(delivered).isFalse();
+                assertThat(turns.get() - before).isLessThan(100);
+            }
         }
     }
 

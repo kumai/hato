@@ -137,6 +137,11 @@ final class SocketWire implements Wire {
     }
 
     @Override
+    public boolean unreadInput() {
+        return readable || input.hasRemaining() || (tls != null && tls.inputWaiting());
+    }
+
+    @Override
     public @Nullable Arrival next(boolean connected, MqttVersion version) {
         while (input.hasRemaining()) {
             byte[] bytes = frames.next(input);

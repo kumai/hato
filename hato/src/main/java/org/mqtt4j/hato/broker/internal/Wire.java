@@ -41,8 +41,13 @@ sealed interface Wire permits SocketWire, MemoryWire {
     boolean register(Connection connection);
 
     // Whether input waits: what has arrived and not been taken, or the loop's word that more
-    // can be read.
+    // can be read. Through TLS, it also counts the records that wait to go out, which a read
+    // sends first.
     boolean inputWaiting();
+
+    // Whether input waits as inputWaiting() says, leaving out the records that wait to go out:
+    // whether a read can take in more of what has arrived.
+    boolean unreadInput();
 
     // The next packet that has arrived whole, and the bytes that it took, or null until more
     // arrives. Until the broker has accepted a CONNECT on the connection, as `connected` says,

@@ -336,12 +336,13 @@ final class Connection {
     // a read finds nothing more or the connection has ended, and otherwise has the loop come
     // back to read on: a read takes a part of what waits. A packet that waits for its session or
     // for the CONNECT's acceptance keeps the connection from reading until that is done, which
-    // brings the loop back here.
+    // brings the loop back here. Records that wait to go out to a client that does not read are
+    // no input: the loop would come back for them without end.
     private void catchUpOrReadOn() {
         if (isEnded() || readClosed || ioFailed) {
             caughtUp = true;
         } else if (!connecting && pending == null) {
-            if (wire.inputWaiting()) {
+            if (wire.unreadInput()) {
                 loop.schedule(this);
             } else {
                 caughtUp = true;
