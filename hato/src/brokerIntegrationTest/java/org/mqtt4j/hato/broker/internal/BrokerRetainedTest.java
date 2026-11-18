@@ -434,7 +434,7 @@ class BrokerRetainedTest {
     @Test
     void a_retained_message_beyond_the_size_limit_leaves_its_topic_without_one() throws Exception {
         // The limit holds the small message, by what it holds on the heap, but not two of them.
-        long limit = PublicationMemory.sizeOf(retained("sized", "small", AT_LEAST_ONCE));
+        long limit = RetainedMessages.sizeOf(retained("sized", "small", AT_LEAST_ONCE));
         try (BrokerServer sut = BrokerServer.builder().maxRetainedBytes(limit).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher")) {
             // Arrange: replacing the small message frees its share of the limit.
@@ -455,7 +455,7 @@ class BrokerRetainedTest {
     @Test
     void the_size_limit_bounds_the_retained_messages_of_all_topics_together() throws Exception {
         // Arrange: a limit that holds one of the messages below, by what it holds on the heap.
-        long limit = PublicationMemory.sizeOf(retained("sized/a", "small", AT_LEAST_ONCE));
+        long limit = RetainedMessages.sizeOf(retained("sized/a", "small", AT_LEAST_ONCE));
         try (BrokerServer sut = BrokerServer.builder().maxRetainedBytes(limit).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher")) {
             publisher.publish(retained("sized/a", "small", AT_LEAST_ONCE));

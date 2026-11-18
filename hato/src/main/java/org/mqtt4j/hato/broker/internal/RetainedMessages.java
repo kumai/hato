@@ -1,6 +1,7 @@
 package org.mqtt4j.hato.broker.internal;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -19,14 +20,15 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // publication once, either as a retained message or as a delivery, and its later deliveries
 // follow its retained messages.
 //
-// A new subscription scans them all, which the retained limits keep short; an index by topic
-// level would replace the scan if productization needs it.
+// A new subscription finds the messages that its filter selects by the levels of their topics,
+// without going through the others.
 final class RetainedMessages {
 
     private static final Log log = Log.of(RetainedMessages.class);
 
     // The retained limits: how many messages the broker keeps, and what they hold on the heap
-    // in all (see PublicationMemory).
+    // in all, their publications (see PublicationMemory) and the levels of their topics in the
+    // index (see TopicTree.sizeOf).
     private final int maxCount;
 
     private final long maxBytes;
@@ -38,6 +40,12 @@ final class RetainedMessages {
     private final int port;
 
     private final Map<Topic, Message> messages = new LinkedHashMap<>();
+
+    // The same messages by the levels of their topics, each with its place in the order stored.
+    private final TopicTree<Stored> byTopic = new TopicTree<>();
+
+    // The place in the order stored that the next message takes.
+    private long nextPlace;
 
     private long bytes;
 
@@ -65,13 +73,15 @@ final class RetainedMessages {
     // previous one [MQTT-3.3.1-6] [MQTT-3.3.1-7]. A message beyond the retained limits is not
     // kept either, which leaves its topic without a retained message rather than with an
     // outdated one. The messages whose lifetime has passed make room first. `memory` says what
-    // the publication holds on the heap, which is what the message counts for here, and is the
-    // room in the broker's memory for deliveries that the deliveries of the retained message
-    // share with those of the publication itself.
+    // the publication holds on the heap, which with what the levels of its topic hold in the
+    // index is what the message counts for here, and is the room in the broker's memory for
+    // deliveries that the deliveries of the retained message share with those of the
+    // publication itself.
     void store(Packet.Publish publication, long received, PublicationMemory memory) {
         Message previous = messages.remove(publication.topic());
         if (previous != null) {
-            bytes -= previous.memory().bytes();
+            bytes -= counted(previous);
+            byTopic.remove(publication.topic());
         }
         if (publication.payload().length == 0) {
             return;
@@ -82,13 +92,14 @@ final class RetainedMessages {
                 Delivery.lifetimeOf(publication),
                 memory
         );
-        if (!fits(message)) {
+        long size = counted(message);
+        if (!fits(size)) {
             // The lifetimes are judged by the time now, not by `received`: the publication may
             // have waited for the topic lock since then, and a message that expired meanwhile
             // must not keep it out.
             discardExpired(clock.nanoTime());
         }
-        if (!fits(message)) {
+        if (!fits(size)) {
             if (!limitReached) {
                 limitReached = true;
                 log.warn(
@@ -107,7 +118,8 @@ final class RetainedMessages {
             return;
         }
         messages.put(publication.topic(), message);
-        bytes += message.memory().bytes();
+        byTopic.put(publication.topic(), new Stored(nextPlace++, message));
+        bytes += size;
         noteExpiry(message);
     }
 
@@ -117,9 +129,21 @@ final class RetainedMessages {
         return messages.size();
     }
 
-    // Whether the retained limits have room for `message`.
-    private boolean fits(Message message) {
-        return messages.size() < maxCount && message.memory().bytes() <= maxBytes - bytes;
+    // What a retained `publication` counts for against the byte limit, as store() counts it
+    // when its memory is the publication's own, for tests that set the limit.
+    static long sizeOf(Packet.Publish publication) {
+        return PublicationMemory.sizeOf(publication) + TopicTree.sizeOf(publication.topic());
+    }
+
+    // What `message` counts for against the byte limit: what its publication holds on the
+    // heap, and what the levels of its topic hold in the index.
+    private static long counted(Message message) {
+        return message.memory().bytes() + TopicTree.sizeOf(message.publication().topic());
+    }
+
+    // Whether the retained limits have room for one more message that counts `size` bytes.
+    private boolean fits(long size) {
+        return messages.size() < maxCount && size <= maxBytes - bytes;
     }
 
     // Takes account of the lifetime of `message`, which the store keeps: the earliest end is
@@ -156,7 +180,8 @@ final class RetainedMessages {
             Message message = kept.next();
             if (message.expired(now)) {
                 kept.remove();
-                bytes -= message.memory().bytes();
+                byTopic.remove(message.publication().topic());
+                bytes -= counted(message);
             } else {
                 noteExpiry(message);
             }
@@ -167,11 +192,12 @@ final class RetainedMessages {
     // without those whose Message Expiry Interval has passed.
     List<Message> matching(TopicFilter filter) {
         discardExpired(clock.nanoTime());
-        var matched = new ArrayList<Message>();
-        for (Message message : messages.values()) {
-            if (filter.matches(message.publication().topic())) {
-                matched.add(message);
-            }
+        var found = new ArrayList<Stored>();
+        byTopic.match(filter, found::add);
+        found.sort(Comparator.comparingLong(Stored::place));
+        var matched = new ArrayList<Message>(found.size());
+        for (Stored stored : found) {
+            matched.add(stored.message());
         }
         return matched;
     }
@@ -179,8 +205,14 @@ final class RetainedMessages {
     // Forgets every retained message, as the broker closes.
     void clear() {
         messages.clear();
+        byTopic.clear();
         bytes = 0;
         expiring = false;
+    }
+
+    // A retained message and its place in the order stored, which a later message of the same
+    // topic takes over at the end.
+    private record Stored(long place, Message message) {
     }
 
     // A retained message, when the broker received it, its Message Expiry Interval in seconds,

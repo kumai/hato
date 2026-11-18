@@ -61,6 +61,72 @@ class RetainedMessagesTest {
         );
     }
 
+    @Test
+    void a_filter_finds_the_messages_whose_topics_it_selects_in_the_order_stored() {
+        // Arrange: the connection states of three devices and a factsheet, where device 1
+        // reports again after the others, which puts its message last.
+        var sut = new RetainedMessages(16, 1 << 20, clock, 0);
+        store(sut, retained("devices/1/connection", 60), 0);
+        store(sut, retained("devices/2/connection", 60), 0);
+        store(sut, retained("devices/2/factsheet", 60), 0);
+        store(sut, retained("devices/3/connection", 60), 0);
+        store(sut, retained("devices/1/connection", 60), 0);
+
+        // Act & Assert
+        assertThat(topics(sut, "devices/+/connection")).containsExactly(
+                "devices/2/connection",
+                "devices/3/connection",
+                "devices/1/connection"
+        );
+        assertThat(topics(sut, "devices/2/#"))
+                .containsExactly("devices/2/connection", "devices/2/factsheet");
+        assertThat(topics(sut, "devices/3/connection")).containsExactly("devices/3/connection");
+        assertThat(topics(sut, "devices/4/connection")).isEmpty();
+    }
+
+    @Test
+    void a_message_that_leaves_the_store_is_found_no_more() {
+        // Arrange: one message that an empty one removes, and one whose lifetime passes.
+        var sut = new RetainedMessages(16, 1 << 20, clock, 0);
+        store(sut, retained("devices/1/connection", 60), 0);
+        store(sut, retained("devices/2/connection", 5), 0);
+
+        // Act
+        store(sut, removal("devices/1/connection"), 0);
+        clock.now = 5_000_000_000L;
+
+        // Assert
+        assertThat(topics(sut, "devices/#")).isEmpty();
+        store(sut, retained("devices/1/connection", 60), clock.now);
+        assertThat(topics(sut, "devices/#")).containsExactly("devices/1/connection");
+        sut.clear();
+        assertThat(topics(sut, "#")).isEmpty();
+    }
+
+    @Test
+    void the_byte_limit_counts_what_the_levels_of_a_topic_hold_in_the_index() {
+        // Arrange: a byte limit that holds a message whose topic has one level of ten
+        // characters. A topic of as many characters in six levels takes more in the index.
+        Packet.Publish flat = retained("aaaaaaaaaa", 60);
+        var sut = new RetainedMessages(16, 1 + TopicTree.sizeOf(flat.topic()), clock, 0);
+
+        // Act
+        store(sut, retained("a/a/a/a/a/", 60), 0);
+        List<String> keptOfDeep = kept(sut);
+        store(sut, flat, 0);
+
+        // Assert
+        assertThat(keptOfDeep).isEmpty();
+        assertThat(kept(sut)).containsExactly("aaaaaaaaaa");
+    }
+
+    /// The topics of the retained messages that `filter` finds in `store`, in the order given.
+    private static List<String> topics(RetainedMessages store, String filter) {
+        return store.matching(new TopicFilter(filter)).stream()
+                .map(message -> message.publication().topic().name())
+                .toList();
+    }
+
     /// Hands `publication`, which arrived at `received`, to `store`. Its room in the broker's
     /// memory for deliveries plays no part in what the store keeps.
     private static void store(RetainedMessages store, Packet.Publish publication, long received) {
@@ -85,6 +151,20 @@ class RetainedMessagesTest {
                 false,
                 0,
                 new Properties(List.of(expiry))
+        );
+    }
+
+    /// A retained publication to `topic` with an empty payload, which removes the message of the
+    /// topic.
+    private static Packet.Publish removal(String topic) {
+        return new Packet.Publish(
+                new Topic(topic),
+                new byte[0],
+                AT_MOST_ONCE,
+                true,
+                false,
+                0,
+                Properties.EMPTY
         );
     }
 

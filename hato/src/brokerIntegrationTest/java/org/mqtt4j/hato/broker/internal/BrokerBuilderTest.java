@@ -124,7 +124,7 @@ class BrokerBuilderTest {
     @Test
     void keeps_no_retained_message_beyond_its_memory() throws Exception {
         // Arrange: a limit that holds one of the messages below.
-        long limit = PublicationMemory.sizeOf(retained("sized/a", "small", AT_LEAST_ONCE));
+        long limit = RetainedMessages.sizeOf(retained("sized/a", "small", AT_LEAST_ONCE));
         try (MqttBroker sut = MqttBroker.builder().maxRetainedBytes(limit).start();
                 RawSession publisher = connected(sut.port(), "publisher")) {
             // Act

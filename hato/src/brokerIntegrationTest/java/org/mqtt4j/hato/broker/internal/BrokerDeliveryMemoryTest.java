@@ -1110,7 +1110,7 @@ class BrokerDeliveryMemoryTest {
         BrokerServer.Builder roomy = settings(cursorSize("#", 1) + message).maxInflight(1);
         BrokerServer.Builder limited = limit.equals("number")
                 ? roomy.maxRetained(1)
-                : roomy.maxRetainedBytes(message + 1);
+                : roomy.maxRetainedBytes(RetainedMessages.sizeOf(retained("a/1", "0001")) + 1);
         try (BrokerServer sut = limited.start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "subscriber")) {
