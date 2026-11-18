@@ -567,6 +567,7 @@ final class Connection {
             if (arrival == null) {
                 return false;
             }
+            PacketChecks.check(arrival.packet());
             long receivedAt = received();
             if (!connected) {
                 var request = (Packet.Connect) arrival.packet();
@@ -999,6 +1000,7 @@ final class Connection {
         if (ended || lastPacket != null) {
             return;
         }
+        client.letGoOfWaitingConnect();
         // The connect timeout bounds the wait for a writer that a slow peer holds up.
         cancelTimer();
         try {
@@ -1166,6 +1168,7 @@ final class Connection {
             return;
         }
         ended = true;
+        client.letGoOfWaitingConnect();
         // A connection that ends with a last packet already holds its reason.
         if (endReason.isEmpty()) {
             endReason = reason;

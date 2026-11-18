@@ -12,6 +12,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -123,6 +124,13 @@ final class Client {
     // in their order. The application's thread reads it to find the connection that it asks to
     // close by the object that the listener received.
     private volatile @Nullable ClientConnection told;
+
+    // The task in the queue of the authentication pool that is to decide on the client's
+    // CONNECT, or null. The connection takes it out of the queue as soon as it stops waiting for
+    // the decision, at its deadline or its end, so that the queue holds the CONNECTs that still
+    // wait and no others: a peer that the broker knows nothing of can make a CONNECT much larger
+    // in memory than on the wire, and the queue has room for as many as may wait.
+    private final AtomicReference<@Nullable Waiting> waiting = new AtomicReference<>();
 
     Client(Connection connection, Routing routing) {
         this.connection = connection;
@@ -250,11 +258,9 @@ final class Client {
     // Asks the application's authenticator about the client `id` on the broker's authentication
     // pool, and admits the client if the decision accepts it in time. The connection's deadline
     // meanwhile is the decision's. A CONNECT that finds as many decisions running as the pool
-    // allows waits in the pool's queue, and one that finds no room there, or no thread for
-    // another decision, is refused at once. The limit on the connections that wait for their
-    // CONNECT leaves room for all of them, but a CONNECT stays queued after its deadline has
-    // refused its client and freed its connection's place, until a thread takes it up:
-    // decisions that hold up every thread past the deadlines can fill the queue that way.
+    // allows waits in the pool's queue, which has room for every connection that may wait for
+    // its CONNECT, and leaves it as the connection stops waiting (see waiting). One that finds no
+    // thread for another decision is refused at once.
     private void authenticate(
             Authenticator authenticator,
             Packet.Connect request,
@@ -263,21 +269,31 @@ final class Client {
             long expiry,
             Consumer<Boolean> done
     ) {
-        var asked = new ConnectRequest(
+        var task = new Waiting(
+                authenticator,
                 request,
-                id,
-                connection.remoteAddress(),
-                connection.overTls(),
-                clientCertificates
+                new ConnectRequest(
+                        request,
+                        id,
+                        connection.remoteAddress(),
+                        connection.overTls(),
+                        clientCertificates
+                ),
+                offered,
+                expiry,
+                done
         );
+        waiting.set(task);
         if (!connection.awaitDecision(id, settings.authenticationTimeout())) {
+            waiting.set(null);
             done.accept(false);
             return;
         }
         ThreadPoolExecutor pool = requireNonNull(routing.authentications, "an authentication pool");
         try {
-            pool.execute(() -> decide(authenticator, asked, request, offered, expiry, done));
+            pool.execute(task);
         } catch (RejectedExecutionException | OutOfMemoryError _) {
+            waiting.set(null);
             if (connection.decided()) {
                 // MQTT 3.1.1 has no return code for a busy server.
                 connection.refuse(
@@ -288,6 +304,23 @@ final class Client {
                 );
             }
             done.accept(false);
+            return;
+        }
+        // The connection may have stopped waiting before the queue had the task, as when its
+        // deadline has passed by the time the wait begins, and found nothing to take out then.
+        if (waiting.get() != task) {
+            pool.remove(task);
+        }
+    }
+
+    // Takes the task that is to decide on the client's CONNECT out of the queue of the
+    // authentication pool, if it waits there, as the connection stops waiting for the decision.
+    // A task that a thread has taken up already finds the decision too late. Any thread.
+    void letGoOfWaitingConnect() {
+        Waiting task = waiting.getAndSet(null);
+        ThreadPoolExecutor pool = routing.authentications;
+        if (task != null && pool != null) {
+            pool.remove(task);
         }
     }
 
@@ -297,18 +330,11 @@ final class Client {
     // and refuses the client unless its deadline has already. A failure in acting on a decision
     // ends the connection, as a failure in handling a CONNECT on the selector does, which frees
     // its place among the connections that wait for their CONNECT.
-    private void decide(
-            Authenticator authenticator,
-            ConnectRequest asked,
-            Packet.Connect request,
-            Capabilities offered,
-            long expiry,
-            Consumer<Boolean> done
-    ) {
+    private void decide(Waiting task) {
         Authenticator.Decision decision = null;
-        if (connection.awaitsDecision()) {
+        if (waiting.compareAndSet(task, null) && connection.awaitsDecision()) {
             try {
-                decision = authenticator.authenticate(asked);
+                decision = task.authenticator.authenticate(task.asked);
             } catch (Throwable failure) {
                 // The failure is the application's. The request leaves the credentials out of
                 // the log, though what the application put into its exception is beyond the
@@ -317,10 +343,11 @@ final class Client {
                 // every other.
                 if (routing.closed) {
                     log.debug("Broker on port {} closed while it decided on client {}",
-                            routing.port, asked.clientId(), failure);
+                            routing.port, task.asked.clientId(), failure);
                 } else {
                     log.warn("Broker on port {} could not decide on client {} from {}",
-                            routing.port, asked.clientId(), connection.remoteAddress(), failure);
+                            routing.port, task.asked.clientId(), connection.remoteAddress(),
+                            failure);
                 }
             } finally {
                 // Interrupt status that the decision leaves must not reach the next one.
@@ -328,7 +355,14 @@ final class Client {
             }
         }
         try {
-            act(decision, asked.clientId(), request, offered, expiry, done);
+            act(
+                    decision,
+                    task.asked.clientId(),
+                    task.request,
+                    task.offered,
+                    task.expiry,
+                    task.done
+            );
         } catch (Throwable failure) {
             connection.failed("acceptance", failure);
         }
@@ -1387,5 +1421,43 @@ final class Client {
             case Property.FourByteValue(var _, var value) -> value;
             case null, default -> 0;
         };
+    }
+
+    // The task that decides on a CONNECT, which waits for a thread of the authentication pool: the
+    // CONNECT, what the authenticator learns of it, and what acting on the decision needs.
+    private final class Waiting implements Runnable {
+
+        final Authenticator authenticator;
+
+        final Packet.Connect request;
+
+        final ConnectRequest asked;
+
+        final Capabilities offered;
+
+        final long expiry;
+
+        final Consumer<Boolean> done;
+
+        Waiting(
+                Authenticator authenticator,
+                Packet.Connect request,
+                ConnectRequest asked,
+                Capabilities offered,
+                long expiry,
+                Consumer<Boolean> done
+        ) {
+            this.authenticator = authenticator;
+            this.request = request;
+            this.asked = asked;
+            this.offered = offered;
+            this.expiry = expiry;
+            this.done = done;
+        }
+
+        @Override
+        public void run() {
+            decide(this);
+        }
     }
 }

@@ -72,10 +72,12 @@ public final class BrokerServer implements AutoCloseable {
     // format allows keeps what one client can have the broker hold at a time small.
     private static final int MAX_PACKET_SIZE = 1024 * 1024;
 
-    // The largest CONNECT that the broker takes, from a peer that it knows nothing of yet. A
-    // CONNECT whose strings all have their greatest length is about a third of this, so only
-    // one that carries large properties besides is too large.
-    private static final int MAX_CONNECT_SIZE = 1024 * 1024;
+    // The largest CONNECT that the broker takes, from a peer that it knows nothing of yet. As
+    // many such peers as may wait for their CONNECT can each have the broker hold this much
+    // before the broker knows any of them, and a decoded CONNECT more than that, so it is kept
+    // small. Credentials and Wills of the usual sizes fit many times over; a CONNECT whose
+    // strings all have their greatest length, about 320 KiB, does not.
+    private static final int MAX_CONNECT_SIZE = 64 * 1024;
 
     private static final long SEND_BYTES = 16L * 1024 * 1024;
 

@@ -3,6 +3,7 @@ package org.mqtt4j.hato.broker.internal;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.Collections;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -10,8 +11,10 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.PacketCodec;
+import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.Property;
 import org.mqtt4j.hato.internal.protocol.PropertyId;
 
@@ -147,6 +150,58 @@ class BrokerPacketSizeTest {
 
     @ParameterizedTest
     @EnumSource(MqttVersion.class)
+    void a_broker_takes_a_connect_of_64_kib_from_an_unknown_peer_and_no_larger(MqttVersion version)
+            throws Exception {
+        // Arrange: a broker with its default limits, and an identifier that makes a CONNECT of
+        // exactly 64 KiB. Its Remaining Length takes a byte more than that of a short one.
+        int length = 64 * 1024 - connectSize(version, "");
+        while (connectSize(version, "c".repeat(length)) > 64 * 1024) {
+            length--;
+        }
+        String fitting = "c".repeat(length);
+        assertThat(connectSize(version, fitting)).isEqualTo(64 * 1024);
+        try (BrokerServer sut = BrokerServer.builder()
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession accepted = RawSession.open(sut.port(), version);
+                RawSession refused = RawSession.open(sut.port(), version)) {
+            accepted.send(connectOf(version, fitting));
+            assertThat(accepted.expect(Packet.ConnAck.class).reasonCode()).isEqualTo(SUCCESS);
+
+            // Act: one byte more.
+            refused.send(connectOf(version, fitting + "c"));
+
+            // Assert
+            refused.expectClosed();
+            accepted.ping();
+        }
+    }
+
+    @ParameterizedTest(name = "{0} user properties in the CONNECT, {1} in its Will")
+    @CsvSource({"257, 0", "0, 257"})
+    void a_connect_with_more_properties_than_the_broker_takes_closes_without_connack(
+            int connectProperties,
+            int willProperties
+    ) throws Exception {
+        try (BrokerServer sut = BrokerServer.builder()
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession accepted = RawSession.open(sut.port(), MqttVersion.V5);
+                RawSession refused = RawSession.open(sut.port(), MqttVersion.V5)) {
+            // Arrange: a client whose CONNECT and Will carry 256 properties each, which the
+            // broker takes.
+            accepted.send(withProperties("accepted", 256, 256));
+            assertThat(accepted.expect(Packet.ConnAck.class).reasonCode()).isEqualTo(SUCCESS);
+
+            // Act
+            refused.send(withProperties("refused", connectProperties, willProperties));
+
+            // Assert
+            refused.expectClosed();
+            accepted.ping();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
     void an_accepted_client_may_send_packets_larger_than_a_connect(MqttVersion version)
             throws Exception {
         // Arrange: a CONNECT may have 64 bytes, other packets 1,024.
@@ -194,6 +249,35 @@ class BrokerPacketSizeTest {
             case V3_1_1 -> connect(clientId, true, 0);
             case V5 -> connectV5(clientId, true, 0, 0);
         };
+    }
+
+    /// An MQTT 5.0 CONNECT of `clientId` with `connectProperties` User Properties, and a Will with
+    /// `willProperties` of them.
+    private static Packet.Connect withProperties(
+            String clientId,
+            int connectProperties,
+            int willProperties
+    ) {
+        return new Packet.Connect(
+                clientId,
+                MqttVersion.V5,
+                true,
+                0,
+                new Packet.Will(
+                        new Topic("wills/" + clientId),
+                        new byte[] {1},
+                        AT_MOST_ONCE,
+                        false,
+                        userProperties(willProperties)
+                ),
+                null,
+                null,
+                userProperties(connectProperties)
+        );
+    }
+
+    private static Properties userProperties(int count) {
+        return new Properties(Collections.nCopies(count, new Property.UserProperty("k", "v")));
     }
 
     private static int connectSize(MqttVersion version, String clientId) {

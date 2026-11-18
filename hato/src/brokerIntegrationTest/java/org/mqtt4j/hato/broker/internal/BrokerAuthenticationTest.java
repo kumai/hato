@@ -11,6 +11,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -25,6 +26,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.broker.Authenticator;
+import org.mqtt4j.hato.internal.concurrent.Timer;
 import org.mqtt4j.hato.internal.log.Log;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Property;
@@ -456,11 +458,11 @@ class BrokerAuthenticationTest {
 
     @ParameterizedTest
     @EnumSource(MqttVersion.class)
-    void a_connect_that_finds_no_room_to_wait_is_refused_at_once(MqttVersion version)
+    void a_connect_refused_at_its_deadline_leaves_the_queue_of_decisions(MqttVersion version)
             throws Exception {
         // Arrange: room for one decision, which waits until the test lets it go, and for two
-        // connections that wait for their CONNECT, as many CONNECTs as the queue holds. Two
-        // clients that wait past their deadline are refused, and their CONNECTs stay queued.
+        // connections that wait for their CONNECT. More clients wait past their deadline and are
+        // refused than the queue of decisions holds.
         var deciding = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         Authenticator sut = _ -> {
@@ -478,22 +480,75 @@ class BrokerAuthenticationTest {
             first.send(connect("first", MqttVersion.V5, null, null));
             assertThat(deciding.await(5, SECONDS)).isTrue();
             try {
-                for (String id : List.of("refused-1", "refused-2")) {
+                for (int refusal = 1; refusal <= 5; refusal++) {
                     try (RawSession refused = RawSession.open(broker.port(), MqttVersion.V5)) {
-                        refused.send(connect(id, MqttVersion.V5, null, null));
+                        refused.send(connect("refused-" + refusal, MqttVersion.V5, null, null));
                         assertThat(refused.expect(Packet.ConnAck.class).reasonCode())
                                 .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
                     }
                 }
                 try (RawSession late = RawSession.open(broker.port(), version)) {
-                    // Act
+                    // Act: a further client, whose decision waits for the first one.
                     late.send(connect("late", version, null, null));
-                    // Assert: MQTT 3.1.1 has no return code for a busy server.
-                    assertThat(late.expect(Packet.ConnAck.class).reasonCode()).isEqualTo(
-                            (version == MqttVersion.V5)
-                                    ? ReasonCode.SERVER_BUSY
-                                    : ReasonCode.SERVER_UNAVAILABLE
-                    );
+                    release.countDown();
+                    // Assert: it waited in the queue, which the refused CONNECTs had left.
+                    assertThat(late.expect(Packet.ConnAck.class).reasonCode())
+                            .isEqualTo(ReasonCode.SUCCESS);
+                }
+            } finally {
+                release.countDown();
+            }
+        }
+    }
+
+    @Test
+    void a_connect_whose_deadline_passes_as_its_wait_begins_leaves_the_queue_of_decisions()
+            throws Exception {
+        // Arrange: room for one decision, which waits until the test lets it go, and for two
+        // connections that wait for their CONNECT, so a queue of four for the decisions. The
+        // broker's timer runs a task that is due where it is scheduled, as a timer may, and the
+        // selector takes so long over each late CONNECT that its decision is due as its wait
+        // begins, before its task reaches the queue.
+        var deciding = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        Authenticator sut = request -> {
+            if (request.clientId().equals("first")) {
+                deciding.countDown();
+                release.await();
+            }
+            return Authenticator.Decision.accept(Authenticator.Scope.all());
+        };
+        try (BrokerServer broker = BrokerServer.builder()
+                .authenticator(sut)
+                .maxAuthentications(1)
+                .maxAwaitingConnect(2)
+                .authenticationTimeout(Duration.ofMillis(200))
+                .scheduler(new DueAtOnce())
+                .beforeProcess(packet -> {
+                    if (packet instanceof Packet.Connect connect
+                            && connect.clientId().startsWith("late-")) {
+                        LockSupport.parkNanos(Duration.ofMillis(300).toNanos());
+                    }
+                })
+                .start(loopback());
+                RawSession first = RawSession.open(broker.port(), MqttVersion.V5)) {
+            first.send(connect("first", MqttVersion.V5, null, null));
+            assertThat(deciding.await(5, SECONDS)).isTrue();
+            try {
+                for (int late = 1; late <= 4; late++) {
+                    try (RawSession refused = RawSession.open(broker.port(), MqttVersion.V5)) {
+                        refused.send(connect("late-" + late, MqttVersion.V5, null, null));
+                        assertThat(refused.expect(Packet.ConnAck.class).reasonCode())
+                                .isEqualTo(ReasonCode.SERVER_UNAVAILABLE);
+                    }
+                }
+                try (RawSession next = RawSession.open(broker.port(), MqttVersion.V5)) {
+                    // Act: a further client, whose decision waits for the first one.
+                    next.send(connect("next", MqttVersion.V5, null, null));
+                    release.countDown();
+                    // Assert: it waited in the queue, which the late CONNECTs had left.
+                    assertThat(next.expect(Packet.ConnAck.class).reasonCode())
+                            .isEqualTo(ReasonCode.SUCCESS);
                 }
             } finally {
                 release.countDown();
@@ -627,5 +682,23 @@ class BrokerAuthenticationTest {
 
     private static InetSocketAddress loopback() {
         return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+    }
+
+    // A timer that runs a task that is due at once where it is scheduled, as a timer may, and
+    // never runs the others: the tests that use it let no other time pass.
+    private static final class DueAtOnce implements Timer {
+
+        @Override
+        public long nanoTime() {
+            return System.nanoTime();
+        }
+
+        @Override
+        public Cancellable schedule(Duration delay, Runnable task) {
+            if (delay.isZero()) {
+                task.run();
+            }
+            return () -> { };
+        }
     }
 }

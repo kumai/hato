@@ -279,9 +279,9 @@ final class Routing {
     // once the broker has shut it down and its decisions have returned. A CONNECT that finds
     // `decisions` running waits in the queue for one of them to end, for its deadline at most
     // (see Client.decide). The queue holds `waiting`, as many connections as may wait for
-    // their CONNECT, which one that waits for its decision still does; only the CONNECTs of
-    // clients that their deadline refused meanwhile can fill it (see Client.authenticate). The
-    // threads start as decisions come, and end once idle.
+    // their CONNECT, which one that waits for its decision still does: a CONNECT leaves the
+    // queue as its connection stops waiting for the decision (see Client.waiting), so the queue
+    // always has room. The threads start as decisions come, and end once idle.
     private static ThreadPoolExecutor authenticationPool(
             int decisions,
             int waiting,
