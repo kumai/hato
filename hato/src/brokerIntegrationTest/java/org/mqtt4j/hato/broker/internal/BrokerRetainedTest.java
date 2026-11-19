@@ -1,15 +1,24 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.Topic;
@@ -20,6 +29,7 @@ import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.Property;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.awaitility.Awaitility.await;
@@ -28,6 +38,7 @@ import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.Qos.EXACTLY_ONCE;
 import static org.mqtt4j.hato.ReasonCode.GRANTED_QOS_1;
 import static org.mqtt4j.hato.ReasonCode.SUCCESS;
+import static org.mqtt4j.hato.broker.internal.RawSession.codec;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
@@ -234,6 +245,117 @@ class BrokerRetainedTest {
             subscriber.ping();
             await().untilAsserted(
                     () -> assertThat(sut.counts().dropped()[0]).isEqualTo(9_999L * 100)
+            );
+        }
+    }
+
+    /// The SUBSCRIBEs of the next test, which go out in one write: nine filters in one
+    /// SUBSCRIBE, or each in a SUBSCRIBE of its own. The first eight filters differ, and each
+    /// matches every retained message of the test; the last one matches none.
+    static Stream<Arguments> subscribesThatCopyManyRetainedMessages() {
+        var filters = List.of(
+                "r/a/b/+",
+                "r/a/+/+",
+                "r/+/b/+",
+                "r/+/+/+",
+                "+/a/b/+",
+                "+/a/+/+",
+                "+/+/b/+",
+                "+/+/+/+",
+                "last/one"
+        );
+        List<Packet.Subscription> subscriptions = filters.stream()
+                .map(filter -> RawSession.subscription(filter, AT_MOST_ONCE))
+                .toList();
+        List<Packet.Subscribe> separate = IntStream.range(0, subscriptions.size())
+                .mapToObj(index -> new Packet.Subscribe(
+                        index + 1,
+                        List.of(subscriptions.get(index)),
+                        EMPTY
+                ))
+                .toList();
+        return Stream.of(
+                Arguments.of(Named.of(
+                        "one SUBSCRIBE of nine filters",
+                        List.of(new Packet.Subscribe(1, subscriptions, EMPTY))
+                )),
+                Arguments.of(Named.of("nine SUBSCRIBEs of one filter", separate))
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("subscribesThatCopyManyRetainedMessages")
+    void other_clients_go_first_between_the_parts_of_subscribes_that_copy_many_retained_messages(
+            List<Packet.Subscribe> requests
+    ) throws Exception {
+        var armed = new AtomicBoolean();
+        var begun = new AtomicBoolean();
+        var making = new CountDownLatch(1);
+        // The SUBSCRIBEs and the other client's PINGREQ, as the broker reads them.
+        var arrived = new CountDownLatch(requests.size() + 1);
+        var lastMadeBeforePing = new AtomicReference<Boolean>();
+        var broker = new AtomicReference<BrokerServer>();
+        try (BrokerServer sut = BrokerServer.builder()
+                .actors(1)
+                .beforeProcess(packet -> {
+                    if (armed.get() && (packet instanceof Packet.Subscribe
+                            || packet instanceof Packet.PingReq)) {
+                        arrived.countDown();
+                    }
+                })
+                .beforeHandle(packet -> {
+                    if (!armed.get()) {
+                        return;
+                    }
+                    if (packet instanceof Packet.Subscribe && begun.compareAndSet(false, true)) {
+                        making.countDown();
+                        try {
+                            // The one actor goes on once the broker has read everything, so that
+                            // the other client's turn waits behind the SUBSCRIBEs. The wait has
+                            // a limit, so that a test that fails cannot hold the thread for good.
+                            boolean _ = arrived.await(10, SECONDS);
+                        } catch (InterruptedException _) {
+                            Thread.currentThread().interrupt();
+                        }
+                    } else if (packet instanceof Packet.PingReq) {
+                        Set<String> indexed = broker.get().indexedFor(new Topic("last/one"));
+                        lastMadeBeforePing.set(indexed.contains("subscriber"));
+                    }
+                })
+                .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                RawSession other = connected(sut.port(), "other")) {
+            broker.set(sut);
+            // Arrange: 1,024 retained messages, as many as a part of a SUBSCRIBE copies at least,
+            // so that each of the first eight filters takes a part of its own, and the last filter
+            // comes in the last part.
+            for (int index = 0; index < 1024; index++) {
+                publisher.publish(retained("r/a/b/" + index, "kept", AT_MOST_ONCE));
+            }
+            publisher.ping();
+            var bytes = new ByteArrayOutputStream();
+            for (Packet.Subscribe request : requests) {
+                bytes.writeBytes(codec.encode(request));
+            }
+            armed.set(true);
+
+            // Act: the SUBSCRIBEs, and a PINGREQ of another client once the one actor has begun
+            // to make them.
+            subscriber.sendRaw(bytes.toByteArray());
+            assertThat(making.await(5, SECONDS)).isTrue();
+            other.send(new Packet.PingReq());
+
+            // Assert: the broker answers the other client before it makes the subscription to
+            // the last filter, and still answers and makes the SUBSCRIBEs whole.
+            other.expect(Packet.PingResp.class);
+            assertThat(lastMadeBeforePing.get()).isFalse();
+            assertThat(subscriber.expect(Packet.SubAck.class).reasonCodes())
+                    .hasSize(requests.getFirst().subscriptions().size())
+                    .containsOnly(SUCCESS);
+            await().untilAsserted(
+                    () -> assertThat(sut.indexedFor(new Topic("last/one")))
+                            .containsExactly("subscriber")
             );
         }
     }

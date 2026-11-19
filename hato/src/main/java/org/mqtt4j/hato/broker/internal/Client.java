@@ -986,27 +986,30 @@ final class Client {
                 }
                 // The broker bounds the subscriptions of a session. One beyond its limits
                 // subscribes to nothing, as a refused one, and the others of the request go
-                // on.
-                boolean[] subscribed = owner.subscribe(making);
-                for (int made = 0; made < subscribed.length; made++) {
-                    if (!subscribed[made]) {
-                        grants[makingAt.get(made)] = switch (owner.version) {
-                            case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
-                            case V5 -> ReasonCode.QUOTA_EXCEEDED;
-                        };
+                // on. The session answers once it has made them, which can take later turns of
+                // its actor when they queue many retained messages.
+                Reason firstRefusal = described;
+                owner.subscribe(making, subscribed -> {
+                    for (int made = 0; made < subscribed.length; made++) {
+                        if (!subscribed[made]) {
+                            grants[makingAt.get(made)] = switch (owner.version) {
+                                case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
+                                case V5 -> ReasonCode.QUOTA_EXCEEDED;
+                            };
+                        }
                     }
-                }
-                send(acknowledgement(
-                        owner,
-                        described,
-                        properties -> new Packet.SubAck(
-                                request.packetId(),
-                                List.of(grants),
-                                properties
-                        )
-                ));
-                // The retained messages that the subscriptions queued follow SUBACK.
-                owner.drain();
+                    send(acknowledgement(
+                            owner,
+                            firstRefusal,
+                            properties -> new Packet.SubAck(
+                                    request.packetId(),
+                                    List.of(grants),
+                                    properties
+                            )
+                    ));
+                    // The retained messages that the subscriptions queued follow SUBACK.
+                    owner.drain();
+                });
             }
             case Packet.Unsubscribe request -> {
                 // So does an MQTT 5.0 UNSUBACK, and a request whose UNSUBACK the client cannot
