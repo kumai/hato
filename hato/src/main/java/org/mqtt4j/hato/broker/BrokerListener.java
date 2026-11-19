@@ -74,9 +74,9 @@ public interface BrokerListener {
     /// as a report of dropped deliveries, is still in progress or just beginning as the broker
     /// stops. No other notification begins once the broker has ended.
     ///
-    /// The broker goes on ending without waiting for this call, so its listening port may still
+    /// The broker goes on ending without waiting for this call, so its listening ports may still
     /// be in use and its connections open while the call runs. [MqttBroker#close()], whether
-    /// called here or later, returns once the port is free and every connection is closed, and
+    /// called here or later, returns once the ports are free and every connection is closed, and
     /// [MqttBroker#terminated()] completes only after this call and any other call in progress
     /// have returned.
     ///

@@ -152,10 +152,10 @@ public final class MqttBrokerBuilder {
     /// Limits the packets that the broker takes from a client, in bytes including the fixed
     /// header. Defaults to 1 MiB. Must be between 2 and 268435460 bytes. The broker tells MQTT
     /// 5.0 clients the limit when they connect. A client that sends a larger packet loses its
-    /// connection: an MQTT 5.0 client receives DISCONNECT with Packet too large first, and an
-    /// MQTT 3.1.1 client, which cannot learn the limit, receives nothing. Whatever this limit,
-    /// the broker takes no larger CONNECT than an internal limit allows from a peer that it
-    /// knows nothing of yet.
+    /// connection: a larger CONNECT closes it without a CONNACK, and after the CONNECT an MQTT
+    /// 5.0 client receives DISCONNECT with Packet too large first, while an MQTT 3.1.1 client,
+    /// which cannot learn the limit, receives nothing. Whatever this limit, the broker takes no
+    /// larger CONNECT than an internal limit allows from a peer that it knows nothing of yet.
     ///
     /// @param value
     ///   the largest packet in bytes, including the fixed header

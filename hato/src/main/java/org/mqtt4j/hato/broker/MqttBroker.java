@@ -336,13 +336,12 @@ public final class MqttBroker implements AutoCloseable {
     }
 
     /// Observes the end of this broker without requesting it. The future completes once the
-    /// broker has ended, through [#close()] or because an internal failure stopped it: its ports
-    /// are free, its connections are closed, it has finished its work, and it calls no
-    /// application code any more, the [BrokerListener], the [Authenticator], and the key and
-    /// trust managers of the TLS context included. It completes normally either way; the
-    /// listener hears of a failure. Before the future
-    /// completes, the broker gives the logging backend a moment to take what it has logged, as
-    /// [#close()] does.
+    /// broker has ended, through [#close()], through [#shutdown(Duration)], or because an
+    /// internal failure stopped it: its ports are free, its connections are closed, it has
+    /// finished its work, and it calls no application code any more, the [BrokerListener], the
+    /// [Authenticator], and the key and trust managers of the TLS context included. It completes
+    /// normally either way; the listener hears of a failure. Before the future completes, the
+    /// broker gives the logging backend a moment to take what it has logged, as [#close()] does.
     ///
     /// Each call returns an independent future. The continuations attached while it waits run,
     /// as it completes, on a thread of its own, so one that waits, even for a future of another
@@ -384,7 +383,8 @@ public final class MqttBroker implements AutoCloseable {
     /// what the broker has logged, as [#close()] does. [#close()] and an interrupt of the calling
     /// thread cut the shutdown short, as `timeout` does, and the interrupt stays with the thread.
     /// An internal failure meanwhile ends the broker as it otherwise does. A later call waits for
-    /// the same shutdown and returns the same result, and a call after [#close()] returns false.
+    /// the same shutdown and returns the same result, and a call after [#close()], or after an
+    /// internal failure has stopped the broker, returns false.
     ///
     /// @param timeout
     ///   how long the clients may take to have what waits for them; zero to wait for nothing.
