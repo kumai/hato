@@ -1250,15 +1250,22 @@ MqttBroker broker = MqttBroker.builder()
 
 - Initialize the context before `start()`. The broker takes a TLS engine from it for each
   connection, so key and trust managers that return renewed certificates serve the connections
-  that come afterwards.
+  that come afterwards. A key manager of your own extends `X509ExtendedKeyManager` and
+  implements `chooseEngineServerAlias`, as the JDK's do; with another, every handshake fails.
 - `sslParameters(...)` adjusts the TLS parameters. With `setNeedClientAuth(true)`, a client
   needs a certificate that the context trusts; with `setWantClientAuth(true)`, it may connect
   without one. The authenticator sees the certificates in `request.clientCertificates()`.
+- Give the context the trust that you mean for client certificates: one initialized without
+  trust managers, as `SSLContext.getDefault()` is, accepts a certificate from any certificate
+  authority that the JDK trusts.
 - TLS authenticates the broker, and the clients only through the certificates that your
   authenticator checks. So a TLS listener beyond the loopback address needs an authenticator or
   `allowAnonymous()`, as a plain one does.
 - Nothing checks a client's certificate again while its connection lasts. To end the
   connections whose certificates expire or are revoked meanwhile, use `disconnect(connection)`.
+- A trust manager that waits, as for a revocation check over the network, holds up the
+  handshakes of the clients that connect meanwhile. Checking revocation in the authenticator,
+  which the broker asks on every CONNECT and which may take its time, avoids that.
 
 ### What the broker supports
 
