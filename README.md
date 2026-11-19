@@ -320,6 +320,11 @@ MqttMessage reading = MqttMessage.of(topic, payload, Qos.AT_LEAST_ONCE, false)
 Subscribers read them from the received message, for example with `contentType()`. For a
 request that expects a reply, set `withResponseTopic(...)` and `withCorrelationData(...)`.
 
+Keep control characters, such as a newline, out of topics and properties: MQTT lets brokers
+treat them as malformed, and many end the connection over them. The client sends none, so a
+publication with one fails with `IllegalArgumentException` instead, while the connection goes
+on.
+
 ### Subscribing
 
 #### Handling each message

@@ -6,7 +6,9 @@ import java.util.Objects;
 ///
 /// The complete pattern must be non-empty, contain no NUL or unpaired surrogates, and encode
 /// to at most 65535 bytes in UTF-8. A `+` occupies an entire level; a `#` occupies the entire
-/// final level. Whitespace, empty levels, and the original spelling are kept.
+/// final level. Whitespace, empty levels, and the original spelling are kept. A pattern may
+/// contain control characters and noncharacters, but the client subscribes to no such filter;
+/// see [MqttPublisher#publish(MqttMessage)].
 ///
 /// This type gives `$share/` no special meaning, as MQTT 3.1.1 does: validation and
 /// [#matches] treat the whole pattern as an ordinary filter.

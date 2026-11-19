@@ -5031,6 +5031,80 @@ class ClientActorTest {
         }
     }
 
+    static Stream<Named<MqttMessage>> messagesWithDisallowedText() {
+        MqttMessage message = message(new byte[] {1});
+        return Stream.of(
+                Named.of("a tab in the topic", message.withTopic(new Topic("messages\tnew"))),
+                Named.of(
+                        "a newline in a User Property value",
+                        message.withUserProperties(List.of(new UserProperty("note", "1\n2")))
+                ),
+                Named.of(
+                        "a C1 control in a User Property name",
+                        message.withUserProperties(List.of(new UserProperty("\u0085", "")))
+                ),
+                Named.of("a noncharacter in the content type", message.withContentType("a￿")),
+                Named.of(
+                        "a bell in the Response Topic",
+                        message.withResponseTopic(new Topic("replies\u0007"))
+                )
+        );
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("messagesWithDisallowedText")
+    void a_publication_with_a_control_character_or_a_noncharacter_fails_without_being_sent(
+            MqttMessage message
+    ) throws Exception {
+        // Arrange
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+
+            // Act
+            CompletableFuture<PublishResult> publication = sut.publish(message);
+
+            // Assert: the failure is immediate, the connection goes on, and the next publication
+            // is the first one sent.
+            assertThat(publication).isCompletedExceptionally();
+            assertThatThrownBy(publication::join)
+                    .hasCauseInstanceOf(IllegalArgumentException.class);
+            sut.publish(message(new byte[] {2})).get(5, SECONDS);
+            assertThat(transport.sent.poll(5, SECONDS)).isInstanceOfSatisfying(
+                    Packet.Publish.class,
+                    publish -> assertThat(publish.payload()).containsExactly(2)
+            );
+            assertThat(ends).isEmpty();
+        }
+    }
+
+    @Test
+    void the_client_takes_control_characters_from_a_broker_but_sends_none_on() throws Exception {
+        // Arrange
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+            PullSubscription subscription = subscribePull(sut, transport, request());
+            var properties = new Properties(List.of(new Property.UserProperty("note", "1\n2")));
+
+            // Act
+            transport.receive(new Packet.Publish(
+                    new Topic("messages"),
+                    new byte[] {1},
+                    Qos.AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    properties
+            ));
+            MqttMessage received = received(subscription.receive(Duration.ofSeconds(5))).message();
+
+            // Assert
+            assertThat(received.userProperties()).containsExactly(new UserProperty("note", "1\n2"));
+            assertThatThrownBy(() -> sut.publish(received).join())
+                    .hasCauseInstanceOf(IllegalArgumentException.class);
+            assertThat(ends).isEmpty();
+        }
+    }
+
     static Stream<Named<BiFunction<MqttClient, Subscribe, Subscription>>> subscribeCalls() {
         return Stream.of(
                 Named.of("push", (client, request) -> client.subscribe(request, _ -> { })),
@@ -5071,6 +5145,28 @@ class ClientActorTest {
             // Act & Assert: the filter stays free, so the default request is the only one sent.
             establish(transport, call.apply(sut, qosOneRequest()));
             assertThat(transport.sent).isEmpty();
+        }
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("subscribeCalls")
+    void a_filter_with_a_control_character_or_a_noncharacter_is_refused_without_registering(
+            BiFunction<MqttClient, Subscribe, Subscription> call
+    ) throws Exception {
+        // Arrange
+        try (MqttClient sut = mqtt5Client()) {
+            ScriptTransport transport = connect(sut);
+
+            // Act & Assert
+            for (String pattern : List.of("messages\t", "messages/\u009F", "﷐/#")) {
+                Subscribe request = Subscribe.of(new TopicFilter(pattern), Qos.AT_LEAST_ONCE);
+                assertThatThrownBy(() -> call.apply(sut, request))
+                        .isInstanceOf(IllegalArgumentException.class);
+            }
+
+            // Assert: nothing was registered, so nothing was sent.
+            assertThat(transport.sent).isEmpty();
+            assertThat(ends).isEmpty();
         }
     }
 

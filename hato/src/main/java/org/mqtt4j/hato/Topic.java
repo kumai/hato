@@ -5,6 +5,9 @@ package org.mqtt4j.hato;
 /// Names are non-empty, contain neither NUL nor the wildcards `+` and `#`, and must encode
 /// as well-formed UTF-8 in at most 65535 bytes. Names are case-sensitive and preserved exactly:
 /// whitespace, empty levels separated by `/`, and a byte order mark are not removed or normalized.
+/// A name may contain control characters and noncharacters, as the name of a message that the
+/// client receives can, but the client publishes no such name; see
+/// [MqttPublisher#publish(MqttMessage)].
 ///
 /// The validation rules follow MQTT 3.1.1 Plus Errata 01:
 ///

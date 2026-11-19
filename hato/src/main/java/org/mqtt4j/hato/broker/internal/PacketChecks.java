@@ -2,6 +2,7 @@ package org.mqtt4j.hato.broker.internal;
 
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.internal.protocol.MqttString;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.PacketCodec;
 import org.mqtt4j.hato.internal.protocol.PacketDecodeException;
@@ -16,7 +17,7 @@ import org.mqtt4j.hato.internal.protocol.Property;
 // carries one as malformed, and clients do: libmosquitto, for one, drops its connection. The
 // broker passes topics and properties on to other clients, so it refuses them as Mosquitto's
 // broker does, rather than let the text of one client end the connections of others. The client
-// of this library still takes them from a broker.
+// of this library sends none, but still takes them from a broker.
 //
 // A CONNECT comes from a peer that the broker knows nothing of yet, and it carries few properties
 // in its two blocks, its own and its Will's. A decoded property holds many times its bytes on the
@@ -121,28 +122,13 @@ final class PacketChecks {
         }
     }
 
-    // Checks one string, which decoding has found well formed: every high surrogate has its low
-    // one after it.
+    // Checks one string.
     private static void text(String text) {
-        for (int index = 0; index < text.length(); index++) {
-            char unit = text.charAt(index);
-            boolean refused;
-            if (Character.isHighSurrogate(unit)) {
-                int codePoint = Character.toCodePoint(unit, text.charAt(++index));
-                // The last two code points of every plane are noncharacters.
-                refused = (codePoint & 0xFFFE) == 0xFFFE;
-            } else {
-                refused = unit < 0x20
-                        || (unit >= 0x7F && unit < 0xA0)
-                        || (unit >= 0xFDD0 && unit <= 0xFDEF)
-                        || unit >= 0xFFFE;
-            }
-            if (refused) {
-                throw new PacketDecodeException(
-                        ReasonCode.MALFORMED_PACKET,
-                        "MQTT string with a control character or a noncharacter"
-                );
-            }
+        if (MqttString.hasDisallowedCodePoint(text)) {
+            throw new PacketDecodeException(
+                    ReasonCode.MALFORMED_PACKET,
+                    "MQTT string with a control character or a noncharacter"
+            );
         }
     }
 }

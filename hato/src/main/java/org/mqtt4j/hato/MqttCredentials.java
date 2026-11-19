@@ -11,7 +11,8 @@ import org.mqtt4j.hato.internal.protocol.MqttString;
 import static java.util.Objects.requireNonNull;
 
 /// Immutable MQTT credentials: a username and an optional binary password.
-/// The username is an MQTT UTF-8 string of at most 65535 bytes and may be empty.
+/// The username is an MQTT UTF-8 string of at most 65535 bytes, without a control character or
+/// a noncharacter (see [MqttPublisher#publish(MqttMessage)]), and may be empty.
 /// A password contains at most 65535 bytes and is copied on construction and access.
 /// An absent password and an empty password are distinct values.
 /// Equality compares password contents. [#toString()] reveals neither credential.
@@ -24,6 +25,11 @@ public final class MqttCredentials {
     private MqttCredentials(String username, byte @Nullable [] password) {
         requireNonNull(username, "username");
         MqttString.validate(username);
+        if (MqttString.hasDisallowedCodePoint(username)) {
+            throw new IllegalArgumentException(
+                    "Username contains a control character or a noncharacter"
+            );
+        }
         if (password != null && password.length > 65_535) {
             throw new IllegalArgumentException("Password exceeds 65535 bytes");
         }
@@ -38,8 +44,8 @@ public final class MqttCredentials {
     /// @return
     ///   the credentials
     /// @throws IllegalArgumentException
-    ///   if the username contains U+0000, an unpaired surrogate, or exceeds 65535 bytes in
-    ///   UTF-8
+    ///   if the username contains U+0000, a control character, a noncharacter, or an unpaired
+    ///   surrogate, or exceeds 65535 bytes in UTF-8
     public static MqttCredentials of(String username) {
         return new MqttCredentials(username, null);
     }
@@ -53,8 +59,8 @@ public final class MqttCredentials {
     /// @return
     ///   the credentials
     /// @throws IllegalArgumentException
-    ///   if the username contains U+0000, an unpaired surrogate, or exceeds 65535 bytes in
-    ///   UTF-8, or the password exceeds 65535 bytes
+    ///   if the username contains U+0000, a control character, a noncharacter, or an unpaired
+    ///   surrogate, or exceeds 65535 bytes in UTF-8, or the password exceeds 65535 bytes
     public static MqttCredentials of(String username, byte[] password) {
         return new MqttCredentials(username, requireNonNull(password, "password"));
     }

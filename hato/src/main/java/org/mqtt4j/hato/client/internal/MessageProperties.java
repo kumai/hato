@@ -2,6 +2,7 @@ package org.mqtt4j.hato.client.internal;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Optional;
 
 import org.mqtt4j.hato.MqttMessage;
 import org.mqtt4j.hato.UserProperty;
@@ -98,6 +99,31 @@ public final class MessageProperties {
                     + MqttString.encodedSize(property.value());
         }
         return (int) Math.min(bytes, Integer.MAX_VALUE);
+    }
+
+    /// The part of `message` whose text holds a code point that MQTT disallows, as
+    /// [MqttString#hasDisallowedCodePoint(String)] finds them, or empty. The client sends no such
+    /// text: MQTT lets a receiver treat it as malformed and end the connection. A message that
+    /// the client received may hold some, as the client takes them from a broker.
+    public static Optional<String> disallowedText(MqttMessage message) {
+        if (MqttString.hasDisallowedCodePoint(message.topic().name())) {
+            return Optional.of("Topic name");
+        }
+        if (message.contentType().filter(MqttString::hasDisallowedCodePoint).isPresent()) {
+            return Optional.of("Content type");
+        }
+        if (message.responseTopic()
+                .filter(topic -> MqttString.hasDisallowedCodePoint(topic.name()))
+                .isPresent()) {
+            return Optional.of("Response topic");
+        }
+        for (UserProperty property : message.userProperties()) {
+            if (MqttString.hasDisallowedCodePoint(property.name())
+                    || MqttString.hasDisallowedCodePoint(property.value())) {
+                return Optional.of("User Property");
+            }
+        }
+        return Optional.empty();
     }
 
     // Rounding up never shortens the lifetime or the delay that the application asked for.

@@ -99,7 +99,10 @@ class MqttCredentialsTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"private\0user", "private\uD800user", "private\uDC00user"})
+    @ValueSource(strings = {
+            "private\0user", "private\uD800user", "private\uDC00user", "private\nuser",
+            "private\u009Fuser", "private﷐user"
+    })
     void malformed_usernames_are_rejected_without_exposing_them(String username) {
         assertThatThrownBy(() -> MqttCredentials.of(username))
                 .isInstanceOf(IllegalArgumentException.class)

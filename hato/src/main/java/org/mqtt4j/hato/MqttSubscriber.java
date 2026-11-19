@@ -86,7 +86,9 @@ public interface MqttSubscriber {
     ///
     /// Null arguments throw [NullPointerException], calls after client closure throw
     /// [IllegalStateException], and on an MQTT 3.1.1 client a request that sets a subscription
-    /// option throws [IllegalArgumentException], all synchronously and without registering.
+    /// option throws [IllegalArgumentException], as does a filter with a control character or a
+    /// noncharacter, which the client sends to no broker (see
+    /// [MqttPublisher#publish(MqttMessage)]), all synchronously and without registering.
     /// Duplicate filters, including the same filter with other subscription options,
     /// shared-filter overlap, and registration capacity are checked asynchronously: the returned
     /// handle ends, and [Subscription#established()] fails with [IllegalStateException] for

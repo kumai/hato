@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -212,7 +213,9 @@ public final class MqttClientBuilder {
         return at < 0 ? text : text.replace(part, "***" + part.substring(at));
     }
 
-    /// Uses this nonempty MQTT UTF-8 identifier of at most 65535 bytes, validated immediately.
+    /// Uses this nonempty MQTT UTF-8 identifier of at most 65535 bytes, without a control
+    /// character or a noncharacter (see [MqttPublisher#publish(MqttMessage)]), validated
+    /// immediately.
     /// Persistent sessions require an explicit value. Otherwise, omission generates 23 ASCII
     /// letters/digits. Give each running client its own identifier: a broker closes the older
     /// connection of two that share one. With a persistent session, a client that connects while
@@ -228,6 +231,11 @@ public final class MqttClientBuilder {
         MqttString.validate(value);
         if (value.isEmpty()) {
             throw new IllegalArgumentException("Client identifier must not be empty");
+        }
+        if (MqttString.hasDisallowedCodePoint(value)) {
+            throw new IllegalArgumentException(
+                    "Client identifier contains a control character or a noncharacter"
+            );
         }
         clientId = value;
         return this;
@@ -375,9 +383,11 @@ public final class MqttClientBuilder {
     /// MQTT DISCONNECT, including [MqttClient#close()] alone. No Will is configured by default.
     /// Any QoS and retention flag are accepted. With MQTT 5.0, the message's properties, such as
     /// [MqttMessage#contentType()], go to the broker as the Will Properties. A payload over 65535
-    /// bytes is rejected at once. [#build()] rejects properties that take more than 65535 bytes
-    /// in all, with the Will delay, and any properties for MQTT 3.1.1, which cannot carry them;
-    /// the immutable message already validates its topic and owns a copy of its payload.
+    /// bytes is rejected at once, as is a topic or property with a control character or a
+    /// noncharacter (see [MqttPublisher#publish(MqttMessage)]). [#build()] rejects properties that
+    /// take more than 65535 bytes in all, with the Will delay, and any properties for MQTT 3.1.1,
+    /// which cannot carry them; the immutable message already validates its topic and owns a copy
+    /// of its payload.
     /// Wait for [MqttClient#disconnect()] to complete successfully before [MqttClient#close()]
     /// so closing cannot discard the pending DISCONNECT. Completion confirms the write;
     /// the broker does not acknowledge receipt.
@@ -390,6 +400,12 @@ public final class MqttClientBuilder {
         requireNonNull(value, "will");
         if (value.payloadSize() > MAX_WILL_PAYLOAD_BYTES) {
             throw new IllegalArgumentException("Will payload exceeds 65535 bytes");
+        }
+        Optional<String> disallowed = MessageProperties.disallowedText(value);
+        if (disallowed.isPresent()) {
+            throw new IllegalArgumentException(
+                    disallowed.get() + " of the Will contains a control character or a noncharacter"
+            );
         }
         will = value;
         return this;
