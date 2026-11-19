@@ -19,7 +19,7 @@ application {
 // The examples that start their own broker run in the build, so that one that stops working, or
 // whose shutdown never ends, fails it.
 val runExamples = listOf(
-    "Hello", "HandOffToMailbox", "MailboxLanes", "MicrometerMonitoring"
+    "Hello", "HandOffToMailbox", "MailboxLanes", "MicrometerMonitoring", "RenewBrokerCertificate"
 ).map { example ->
     tasks.register<JavaExec>("run$example") {
         group = LifecycleBasePlugin.VERIFICATION_GROUP

@@ -23,3 +23,7 @@ from your IDE.
   records the client's timings and stats in Micrometer, and times the handler's own work, with
   a local registry and no monitoring server. Micrometer is a dependency of the examples, not
   of the client.
+- [RenewBrokerCertificate](src/main/java/org/mqtt4j/hato/examples/RenewBrokerCertificate.java)
+  renews the key and certificate of the broker's TLS listener while the broker runs, through a
+  key manager of the application's own: new connections get the renewed certificate, and the
+  connections already open go on. It creates its keys with the JDK's `keytool`.

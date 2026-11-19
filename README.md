@@ -1256,6 +1256,8 @@ MqttBroker broker = MqttBroker.builder()
   connection, so key and trust managers that return renewed certificates serve the connections
   that come afterwards. A key manager of your own extends `X509ExtendedKeyManager` and
   implements `chooseEngineServerAlias`, as the JDK's do; with another, every handshake fails.
+- [RenewBrokerCertificate](examples/src/main/java/org/mqtt4j/hato/examples/RenewBrokerCertificate.java)
+  renews the broker's certificate with such a key manager while its clients stay connected.
 - `sslParameters(...)` adjusts the TLS parameters. With `setNeedClientAuth(true)`, a client
   needs a certificate that the context trusts; with `setWantClientAuth(true)`, it may connect
   without one. The authenticator sees the certificates in `request.clientCertificates()`.
