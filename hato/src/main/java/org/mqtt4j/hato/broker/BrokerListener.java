@@ -95,6 +95,11 @@ public interface BrokerListener {
         /// that connected without one}
         String clientId();
 
+        /// {@return the user name of the client's CONNECT, if it had one}
+        default Optional<String> username() {
+            return Optional.empty();
+        }
+
         /// {@return the address that the connection comes from, or empty for a client in the
         /// same JVM}
         Optional<InetSocketAddress> remoteAddress();

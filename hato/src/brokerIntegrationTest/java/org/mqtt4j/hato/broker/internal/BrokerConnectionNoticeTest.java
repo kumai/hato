@@ -75,6 +75,7 @@ class BrokerConnectionNoticeTest {
                 assertThat(connected.connection().clientId()).isEqualTo("robot");
                 assertThat(connected.connection().version()).isEqualTo(version);
                 assertThat(connected.connection().remoteAddress()).isPresent();
+                assertThat(connected.connection().username()).isEmpty();
                 assertThat(disconnected.connection()).isSameAs(connected.connection());
                 assertThat(disconnected.reason()).isEqualTo(CLIENT_DISCONNECT);
             }
@@ -129,6 +130,34 @@ class BrokerConnectionNoticeTest {
                 assertThat(secondConnected.connection()).isNotSameAs(firstConnected.connection());
                 first.expectClosed();
                 second.ping();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void each_notice_carries_the_user_name_of_its_own_connection(MqttVersion version)
+            throws Exception {
+        try (BrokerServer sut = broker();
+                RawSession alice = RawSession.open(sut.port(), version)) {
+            // Arrange
+            alice.send(connectAs("robot", version, "alice"));
+            alice.expect(Packet.ConnAck.class);
+            Heard aliceConnected = next();
+
+            // Act: another user connects with the same identifier, and takes the session over.
+            try (RawSession bob = RawSession.open(sut.port(), version)) {
+                bob.send(connectAs("robot", version, "bob"));
+                bob.expect(Packet.ConnAck.class);
+                Heard aliceEnded = next();
+                Heard bobConnected = next();
+
+                // Assert
+                assertThat(aliceConnected.connection().username()).contains("alice");
+                assertThat(aliceEnded.connection()).isSameAs(aliceConnected.connection());
+                assertThat(aliceEnded.reason()).isEqualTo(TAKEN_OVER);
+                assertThat(bobConnected.connection().username()).contains("bob");
+                assertThat(bobConnected.connection().toString()).doesNotContain("bob");
             }
         }
     }
@@ -377,6 +406,21 @@ class BrokerConnectionNoticeTest {
             case V3_1_1 -> connected(port, clientId);
             case V5 -> connectedV5(port, clientId);
         };
+    }
+
+    /// A CONNECT of `version` for `clientId` with the user name `username` and no password, which
+    /// starts a session that ends with its connection.
+    private static Packet.Connect connectAs(String clientId, MqttVersion version, String username) {
+        return new Packet.Connect(
+                clientId,
+                version,
+                true,
+                0,
+                null,
+                username,
+                null,
+                Properties.EMPTY
+        );
     }
 
     private static InetSocketAddress loopback() {

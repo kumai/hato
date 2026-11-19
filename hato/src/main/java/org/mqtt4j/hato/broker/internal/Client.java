@@ -586,7 +586,7 @@ final class Client {
             settings.beforeAttach().accept(id);
             attached = actor.attach(connection, connAck);
             if (attached) {
-                tellConnected(id, request.version());
+                tellConnected(id, request);
             } else {
                 // The connection ends before its CONNACK, as when it has ended already or a
                 // shutdown has refused the client meanwhile. The broker has not accepted the
@@ -800,14 +800,16 @@ final class Client {
     }
 
     // Tells the application's listener, if there is one, that the broker has accepted this
-    // connection of the client `id`. Runs on the actor, once the session has the connection.
-    private void tellConnected(String id, MqttVersion version) {
+    // connection of the client `id`, which `request` opened. Runs on the actor, once the session
+    // has the connection.
+    private void tellConnected(String id, Packet.Connect request) {
         Notices notices = routing.notices;
         if (notices != null) {
             var connected = new ClientConnection(
                     id,
+                    request.username(),
                     connection.remoteAddress(),
-                    version,
+                    request.version(),
                     connection.overTls(),
                     clientCertificates
             );

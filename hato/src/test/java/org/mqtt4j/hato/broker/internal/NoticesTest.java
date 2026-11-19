@@ -151,10 +151,11 @@ class NoticesTest {
         }
     }
 
-    /// A connection of the client `clientId` from the same JVM.
+    /// A connection of the client `clientId` from the same JVM, without a user name.
     private static ClientConnection connection(String clientId) {
         return new ClientConnection(
                 clientId,
+                null,
                 null,
                 MqttVersion.V5,
                 false,
