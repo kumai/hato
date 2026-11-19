@@ -23,7 +23,6 @@ final class ReleaseBundle {
 
     private static final List<String> MODULES = List.of(
             "hato",
-            "hato-client",
             "hato-testkit"
     );
 
@@ -49,7 +48,7 @@ final class ReleaseBundle {
     private ReleaseBundle() {
     }
 
-    /// Fails unless `bundle` holds exactly the release files of the three modules at `version`:
+    /// Fails unless `bundle` holds exactly the release files of the published modules at `version`:
     /// each artifact with its signature and its MD5 and SHA-1 checksums, optionally its SHA-256
     /// and SHA-512 checksums, no other or duplicate file, no empty file, and only checksums that
     /// match.

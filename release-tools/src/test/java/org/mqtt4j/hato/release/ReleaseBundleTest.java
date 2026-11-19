@@ -28,7 +28,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ReleaseBundleTest {
 
-    private static final String CLIENT_JAR = "org/mqtt4j/hato-client/0.3.0/hato-client-0.3.0.jar";
+    private static final String TESTKIT_JAR =
+            "org/mqtt4j/hato-testkit/0.3.0/hato-testkit-0.3.0.jar";
 
     private static final List<String> ARTIFACT_SUFFIXES = List.of(
             ".jar",
@@ -71,10 +72,11 @@ class ReleaseBundleTest {
 
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {
-            "org/mqtt4j/hato-client/maven-metadata.xml",
-            "org/mqtt4j/hato-client/0.2.0/hato-client-0.2.0.jar",
-            "org/mqtt4j/hato-client/0.3.0/other.txt",
-            CLIENT_JAR + ".asc.md5"
+            "org/mqtt4j/hato-testkit/maven-metadata.xml",
+            "org/mqtt4j/hato-testkit/0.2.0/hato-testkit-0.2.0.jar",
+            "org/mqtt4j/hato-testkit/0.3.0/other.txt",
+            "org/mqtt4j/hato-client/0.3.0/hato-client-0.3.0.jar",
+            TESTKIT_JAR + ".asc.md5"
     })
     void other_files_and_other_versions_are_rejected(String name) {
         files.put(name, "extra".getBytes(UTF_8));
@@ -87,32 +89,32 @@ class ReleaseBundleTest {
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {".md5", ".sha1"})
     void a_checksum_that_does_not_match_its_file_is_rejected(String suffix) {
-        files.put(CLIENT_JAR + suffix, "0123456789abcdef".getBytes(UTF_8));
+        files.put(TESTKIT_JAR + suffix, "0123456789abcdef".getBytes(UTF_8));
 
         assertThatThrownBy(() -> ReleaseBundle.verify(write(zip(files)), "0.3.0"))
                 .isInstanceOf(ReleaseException.class)
-                .hasMessage("Checksum mismatch: " + CLIENT_JAR + suffix);
+                .hasMessage("Checksum mismatch: " + TESTKIT_JAR + suffix);
     }
 
     @Test
     void an_empty_signature_is_rejected() {
-        files.put(CLIENT_JAR + ".asc", new byte[0]);
+        files.put(TESTKIT_JAR + ".asc", new byte[0]);
 
         assertThatThrownBy(() -> ReleaseBundle.verify(write(zip(files)), "0.3.0"))
                 .isInstanceOf(ReleaseException.class)
-                .hasMessage("Empty release file: " + CLIENT_JAR + ".asc");
+                .hasMessage("Empty release file: " + TESTKIT_JAR + ".asc");
     }
 
     @Test
     void duplicate_entries_are_rejected() throws IOException {
         // Arrange: ZipOutputStream refuses duplicate names. Add the jar again under a placeholder
         // name of the same length, then rename it in the local header and the central directory.
-        String placeholder = CLIENT_JAR.replace("client", "CLIENT");
-        files.put(placeholder, requireNonNull(files.get(CLIENT_JAR)));
+        String placeholder = TESTKIT_JAR.replace("testkit", "TESTKIT");
+        files.put(placeholder, requireNonNull(files.get(TESTKIT_JAR)));
         byte[] bundle = replaceAll(
                 zip(files),
                 placeholder.getBytes(UTF_8),
-                CLIENT_JAR.getBytes(UTF_8)
+                TESTKIT_JAR.getBytes(UTF_8)
         );
         Path path = write(bundle);
 
@@ -128,7 +130,7 @@ class ReleaseBundleTest {
 
     private static Map<String, byte[]> completeBundle() {
         var files = new LinkedHashMap<String, byte[]>();
-        for (String module : List.of("hato", "hato-client", "hato-testkit")) {
+        for (String module : List.of("hato", "hato-testkit")) {
             for (String suffix : ARTIFACT_SUFFIXES) {
                 String name = "org/mqtt4j/%s/0.3.0/%s-0.3.0%s".formatted(module, module, suffix);
                 byte[] content = name.getBytes(UTF_8);

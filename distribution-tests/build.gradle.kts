@@ -8,12 +8,6 @@ val hatoJarDependencies = configurations.dependencyScope("hatoJarDependencies")
 val hatoJar = configurations.resolvable("hatoJar") {
     extendsFrom(hatoJarDependencies.get())
 }
-// The client's module name alone, without the hato jar that it depends on.
-val clientAliasJarDependencies = configurations.dependencyScope("clientAliasJarDependencies")
-val clientAliasJar = configurations.resolvable("clientAliasJar") {
-    extendsFrom(clientAliasJarDependencies.get())
-    isTransitive = false
-}
 val testkitJarsDependencies = configurations.dependencyScope("testkitJarsDependencies")
 val testkitJars = configurations.resolvable("testkitJars") {
     extendsFrom(testkitJarsDependencies.get())
@@ -41,12 +35,8 @@ val releaseTools = configurations.resolvable("releaseTools") {
 
 dependencies {
     add(hatoJarDependencies.name, project(path = ":hato", configuration = "runtimeElements"))
-    add(
-        clientAliasJarDependencies.name,
-        project(path = ":hato-client", configuration = "runtimeElements")
-    )
     add(testkitJarsDependencies.name, project(path = ":hato-testkit", configuration = "runtimeElements"))
-    for (module in listOf("hato", "hato-client", "hato-testkit")) {
+    for (module in listOf("hato", "hato-testkit")) {
         add(sourceJarsDependencies.name, project(path = ":$module", configuration = "sourcesElements"))
         add(javadocJarsDependencies.name, project(path = ":$module", configuration = "javadocElements"))
         add(
@@ -64,7 +54,6 @@ dependencies {
 
 val distributionArguments = objects.newInstance<DistributionTestArguments>().apply {
     hatoJar.from(configurations["hatoJar"])
-    clientAliasJar.from(configurations["clientAliasJar"])
     testkitJars.from(configurations["testkitJars"])
     sourceJars.from(configurations["sourceJars"])
     javadocJars.from(configurations["javadocJars"])
@@ -78,7 +67,7 @@ tasks.test {
 
 val releaseBundle = tasks.register<Zip>("releaseBundle") {
     group = "publishing"
-    description = "Bundles the three Maven publications for a non-SNAPSHOT release."
+    description = "Bundles the Maven publications for a non-SNAPSHOT release."
     val releaseVersion = project.version.toString()
     archiveFileName = "hato-$releaseVersion.zip"
     destinationDirectory = layout.buildDirectory.dir("distributions")

@@ -49,7 +49,6 @@ vulnerability reporting for this repository instead.
 | Project | Contents | Published |
 | --- | --- | --- |
 | `hato` | Client API/SPI, session, transport, and delivery; the in-memory, single-node broker; and the implementation they share: protocol, logging, concurrency, I/O | `org.mqtt4j:hato`, one standalone jar |
-| `hato-client` | The client's coordinates and module name from before client and broker became one jar: a module descriptor that requires `org.mqtt4j.hato`, and no class | `org.mqtt4j:hato-client`; depends on `hato` |
 | `hato-testkit` | Broker test wrapper, fake client, fault injection, manual scheduler | `org.mqtt4j:hato-testkit`; depends on `hato` |
 | `distribution-tests` | Final jar, JPMS, sources, and publication metadata checks | no |
 | `examples` | Usage examples | no |
@@ -58,8 +57,8 @@ vulnerability reporting for this repository instead.
 | `build-logic` | Convention plugins | no |
 
 The public API packages are `org.mqtt4j.hato` for the client and
-`org.mqtt4j.hato.broker` for the broker; the JPMS modules are `org.mqtt4j.hato`,
-`org.mqtt4j.hato.client`, and `org.mqtt4j.hato.testkit`. Client and broker ship
+`org.mqtt4j.hato.broker` for the broker; the JPMS modules are `org.mqtt4j.hato`
+and `org.mqtt4j.hato.testkit`. Client and broker ship
 in one jar and share one implementation of the protocol, so the broker can work
 with the client's types. An application that uses only the client still loads no
 class of the broker. There is no additional jar and no special classloader;

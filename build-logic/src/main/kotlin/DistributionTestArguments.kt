@@ -12,10 +12,6 @@ abstract class DistributionTestArguments : CommandLineArgumentProvider {
 
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.NONE)
-    abstract val clientAliasJar: ConfigurableFileCollection
-
-    @get:InputFiles
-    @get:PathSensitive(PathSensitivity.NONE)
     abstract val testkitJars: ConfigurableFileCollection
 
     @get:InputFiles
@@ -36,7 +32,6 @@ abstract class DistributionTestArguments : CommandLineArgumentProvider {
 
     override fun asArguments(): Iterable<String> = listOf(
         "-Dhato.jar=${hatoJar.singleFile.absolutePath}",
-        "-Dclient.alias.jar=${clientAliasJar.singleFile.absolutePath}",
         "-Dtestkit.jars=${testkitJars.asPath}",
         "-Dsource.jars=${sourceJars.asPath}",
         "-Djavadoc.jars=${javadocJars.asPath}",
