@@ -2,9 +2,8 @@
 
 Test the code that publishes and subscribes without a broker, and how your
 application handles interrupted connections, timeouts, and a broker that refuses,
-holds back its answers, or announces narrower limits. The test kit includes the
-[client](../hato-client/README.md) and [embedded broker](../hato-broker/README.md) as
-dependencies.
+holds back its answers, or announces narrower limits. The test kit depends on
+[Hato](../README.md), so it brings the client and the broker with it.
 
 ## Getting it
 
@@ -12,7 +11,7 @@ Gradle:
 
 ```kotlin
 dependencies {
-    testImplementation("org.mqtt4j:hato-testkit:1.0.3")
+    testImplementation("org.mqtt4j:hato-testkit:1.1.0")
 }
 ```
 
@@ -22,7 +21,7 @@ Maven:
 <dependency>
     <groupId>org.mqtt4j</groupId>
     <artifactId>hato-testkit</artifactId>
-    <version>1.0.3</version>
+    <version>1.1.0</version>
     <scope>test</scope>
 </dependency>
 ```
@@ -77,8 +76,8 @@ assertThat(delivery.failure()).isEmpty();
 ## Testing with a broker
 
 Start an embedded broker for each test and close it afterward with
-try-with-resources. See the [broker example](../hato-broker/README.md#starting-and-stopping).
-If you only need a broker, you can depend on `hato-broker` directly.
+try-with-resources. See the [broker example](../README.md#starting-and-stopping-a-broker).
+If you only need a broker, `org.mqtt4j:hato` alone is enough.
 
 ## Controlling the broker
 

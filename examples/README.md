@@ -1,9 +1,9 @@
 # Hato examples
 
-The root README's [first program](src/main/java/org/mqtt4j/hato/examples/ReadingRoundTrip.java),
-and the client guide's [publishing example](src/main/java/org/mqtt4j/hato/examples/PublishReading.java)
-and [subscribing example](src/main/java/org/mqtt4j/hato/examples/SubscribeReadings.java), are
-compiled with the public client API by `./gradlew build`. They expect a broker at
+The README's [first program](src/main/java/org/mqtt4j/hato/examples/ReadingRoundTrip.java),
+and a [publisher](src/main/java/org/mqtt4j/hato/examples/PublishReading.java) and a
+[subscriber](src/main/java/org/mqtt4j/hato/examples/SubscribeReadings.java) of the same
+readings, are compiled with the public client API by `./gradlew build`. They expect a broker at
 `mqtt://localhost:1883`. Run `ReadingRoundTrip` from your IDE on its own, or run
 `SubscribeReadings`, then `PublishReading`. Press Enter in the program that waits to stop it.
 

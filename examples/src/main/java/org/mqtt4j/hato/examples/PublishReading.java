@@ -9,7 +9,7 @@ import org.mqtt4j.hato.Topic;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
-/// Publishes the temperature reading from the client guide to a local broker.
+/// Publishes the temperature reading of the README's first program to a local broker.
 public final class PublishReading {
 
     void main() {
