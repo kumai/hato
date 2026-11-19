@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hato</title>
-<meta name="description" content="Hato is an MQTT 5.0 and 3.1.1 client for Java, with a test kit and an embedded broker for your tests.">
+<meta name="description" content="Hato is an MQTT 5.0 and 3.1.1 client and broker for Java, in one jar: connect to any MQTT broker, or run one inside your application.">
 <link rel="icon" type="image/png" href="assets/seal-hakubun.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -169,7 +169,8 @@ img { max-width: 100%; }
 /* The stance, quieter than the tagline: one short line in the body face. */
 .stance { font-size: var(--step-2); line-height: 1.35; color: var(--ink-muted); text-wrap: balance; }
 
-.install { width: 100%; max-width: 36rem; background: var(--paper-raised); border-radius: 10px; overflow: hidden; }
+/* The box fits its code, so the code sits in the middle of the hero as the lines above it do. */
+.install { width: fit-content; max-width: 100%; background: var(--paper-raised); border-radius: 10px; overflow: hidden; }
 .install-bar { display: flex; align-items: center; gap: 4px; padding: 6px 6px 0 14px; }
 .install-label { font-size: var(--step-0); color: var(--ink-muted); margin-right: 8px; }
 .tab { font: 500 var(--step-0)/1 var(--font-body); color: var(--ink-muted); background: none; border: 0; border-bottom: 2px solid transparent; padding: 12px 10px 10px; cursor: pointer; }
@@ -178,10 +179,13 @@ img { max-width: 100%; }
 .copy:hover { border-color: var(--ink-muted); }
 .install pre { margin: 0; padding: 16px 18px 18px; overflow-x: auto; text-align: left; font-size: 0.875rem; line-height: 1.6; color: var(--ink); }
 .install .coord { color: var(--shu-text); }
+/* The hidden panel still lends the box its width, without height, so the box keeps its width
+   when the tab changes. */
+.install pre[hidden] { display: block !important; height: 0; padding-block: 0; overflow: hidden; visibility: hidden; }
 
-/* Facts under the install box, one short line each and never wrapped. The top row answers
-   whether Hato fits the reader's setup, the bottom row how it is built. The two "None" values
-   come last, so they share a row in both the three-column and the two-column layout. */
+/* Facts under the install box, one short line each and never wrapped. Client and Broker lead,
+   and the two "None" values come last, so each pair shares a row in both the three-column and
+   the two-column layout. */
 .facts { display: grid; grid-template-columns: repeat(3, auto); justify-content: center; gap: 18px clamp(28px, 4vw, 56px); width: 100%; max-width: 48rem; margin: 4px 0 0; padding-top: 18px; border-top: 1px solid var(--rule); }
 .facts dt { font-family: var(--font-mono); font-size: 0.6875rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
 .facts dd { margin: 4px 0 0; font-weight: 500; white-space: nowrap; }
@@ -190,7 +194,7 @@ img { max-width: 100%; }
 .section { padding-block: clamp(44px, 6vw, 80px); border-top: 1px solid var(--rule); }
 .section h2, .band-ai h2 { font-size: var(--step-3); line-height: 1.08; letter-spacing: -0.03em; }
 
-/* Indigo band: the two sections that show code run across one strip of indigo in both themes.
+/* Indigo band: the sections that show code run across one strip of indigo in both themes.
    The page tokens are remapped inside it, so the components need no band-specific colors. */
 .band-ai {
   position: relative;
@@ -220,15 +224,6 @@ img { max-width: 100%; }
 .copy-col { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
 .copy-col p { color: var(--ink-muted); max-width: var(--measure); }
 .copy-col code { font-size: 0.875em; color: var(--ink); }
-
-/* Delivery modes, set like the facts: a name and one short line each. */
-.modes { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
-.mode-list { margin: 0; border-top: 1px solid var(--rule); }
-.mode-list div { display: grid; grid-template-columns: 10rem minmax(0, 1fr); gap: 4px 24px; align-items: baseline; padding-block: 16px; border-bottom: 1px solid var(--rule); }
-.mode-list dt { display: flex; align-items: baseline; gap: 10px; font-family: var(--font-brand); font-weight: 700; font-size: var(--step-2); letter-spacing: -0.02em; }
-.mode-list dd { margin: 0; color: var(--ink-muted); }
-.mode-default { padding: 2px 6px; border: 1px solid var(--rule); border-radius: 4px; font-family: var(--font-mono); font-size: 0.6875rem; font-weight: 400; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
-.modes-note { color: var(--ink-muted); font-size: var(--step-0); }
 
 .bullets { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
 .bullets li { display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 14px; align-items: baseline; color: var(--ink); }
@@ -279,9 +274,16 @@ img { max-width: 100%; }
 }
 @media (max-width: 760px) {
   .facts { grid-template-columns: repeat(2, auto); }
-  .mode-list div { grid-template-columns: minmax(0, 1fr); }
-  .mode-list dd { font-size: 0.9375rem; }
   .nav .nav-text { display: none; }
+}
+@media (max-width: 600px) {
+  /* The Gradle line fits a 360 px phone in smaller type with narrower padding; a longer version
+     string or a narrower screen scrolls it in the box. */
+  .install pre { font-size: 0.78125rem; padding-inline: 12px; }
+  .install-bar { padding-left: 8px; }
+  /* Client and Broker side by side, each kept on one line, fit a 360 px phone. */
+  .facts { column-gap: 16px; }
+  .facts dd { font-size: 0.9375rem; }
 }
 @media (prefers-reduced-motion: reduce) {
   .lockup-seal { animation: none; }
@@ -317,8 +319,8 @@ img { max-width: 100%; }
       <div class="hero-text">
         <div class="title-block">
           <h1 class="lockup" id="hero-title">Hato<img class="lockup-seal" src="assets/seal-hakubun.png" alt="" width="96" height="96"></h1>
-          <p class="tagline">An MQTT client for Java.</p>
-          <p class="stance">Easy on your application, from its handlers to its tests.</p>
+          <p class="tagline">MQTT, built into your application.</p>
+          <p class="stance">Connect to any MQTT broker, or be one.</p>
         </div>
         <div class="install">
           <div class="install-bar" role="tablist" aria-label="Build tool">
@@ -327,19 +329,19 @@ img { max-width: 100%; }
             <button class="tab" role="tab" id="tab-maven" type="button" aria-selected="false" aria-controls="panel-maven" tabindex="-1">Maven</button>
             <button class="copy" id="copy-install" type="button">Copy</button>
           </div>
-          <pre id="panel-gradle" role="tabpanel" aria-labelledby="tab-gradle" tabindex="0">implementation("<span class="coord">org.mqtt4j:hato-client</span>:1.0.3")</pre>
+          <pre id="panel-gradle" role="tabpanel" aria-labelledby="tab-gradle" tabindex="0">implementation("<span class="coord">org.mqtt4j:hato</span>:1.1.0")</pre>
           <pre id="panel-maven" role="tabpanel" aria-labelledby="tab-maven" tabindex="0" hidden>&lt;dependency&gt;
     &lt;groupId&gt;<span class="coord">org.mqtt4j</span>&lt;/groupId&gt;
-    &lt;artifactId&gt;<span class="coord">hato-client</span>&lt;/artifactId&gt;
-    &lt;version&gt;1.0.3&lt;/version&gt;
+    &lt;artifactId&gt;<span class="coord">hato</span>&lt;/artifactId&gt;
+    &lt;version&gt;1.1.0&lt;/version&gt;
 &lt;/dependency&gt;</pre>
         </div>
 
         <dl class="facts">
+          <div><dt>Client</dt><dd>TCP, TLS, WebSocket</dd></div>
+          <div><dt>Broker</dt><dd>TCP, TLS, In-Process</dd></div>
           <div><dt>Protocol</dt><dd>MQTT 5.0, 3.1.1</dd></div>
-          <div><dt>Transports</dt><dd>TCP, TLS, WebSocket</dd></div>
           <div><dt>Java</dt><dd>25 or later</dd></div>
-          <div><dt>Concurrency</dt><dd>Virtual threads</dd></div>
           <div><dt>Dependencies</dt><dd>None</dd></div>
           <div><dt>Reflection</dt><dd>None</dd></div>
         </dl>
@@ -350,24 +352,28 @@ img { max-width: 100%; }
   <div class="band-ai">
     <canvas class="ink-layer" id="ink-band" aria-hidden="true"></canvas>
     <div class="wrap">
-      <section class="band-section" aria-labelledby="examples-title">
+      <section class="band-section" aria-labelledby="client-title">
       <div class="split">
         <div class="copy-col">
-          <h2 id="examples-title">Write message handlers like the rest of your code.</h2>
+          <h2 id="client-title">Write message handlers like the rest of your code.</h2>
           <p>Each subscription hands its messages to your handler away from the network threads, so the handler can block, call a database, or publish and wait while the connection and other subscriptions keep going.</p>
           <ul class="bullets">
+            <li>Works with any MQTT 5.0 or 3.1.1 broker, over TCP, TLS, or WebSocket.</li>
             <li>Reconnects and subscribes again by itself.</li>
-            <li>Join a result, or chain the next step.</li>
-            <li>A client you can call from any thread.</li>
+            <li>One message at a time, or striped, parallel, or handed off when you need more.</li>
+            <li>Use only the client, and nothing of the broker runs.</li>
           </ul>
         </div>
 
-        <div class="editors">
-          <div class="editor">
-            <div class="editor-bar">
-              <span class="file">Handler</span>
-            </div>
-            <pre tabindex="0"><code class="language-java">client.subscribe(
+        <div class="editor">
+          <div class="editor-bar">
+            <span class="file">OrderService.java</span>
+          </div>
+          <pre tabindex="0"><code class="language-java">MqttClient client = MqttClient.builder()
+        .server(URI.create("mqtts://broker.example.com"))
+        .build();
+client.connect().join();
+client.subscribe(
         Subscribe.of(new TopicFilter("orders/+"), Qos.AT_LEAST_ONCE),
         delivery -&gt; {
             Order order = Order.parse(delivery.message().payload());
@@ -375,41 +381,96 @@ img { max-width: 100%; }
             client.publish(confirmation(order)).join();
         }
 );</code></pre>
-          </div>
         </div>
       </div>
       </section>
 
-      <section class="band-section" aria-labelledby="delivery-title">
+      <section class="band-section" aria-labelledby="embed-title">
       <div class="split flip">
         <div class="copy-col">
-          <h2 id="delivery-title">One message at a time, until you need more.</h2>
-          <p>The defaults suit most applications, with nothing to tune. When a subscription needs more throughput, choose how its messages reach your code instead of building thread pools.</p>
-          <p>Running your code apart from the network has a price. Hato keeps it small, under a microsecond for each QoS 0 message it receives.</p>
+          <h2 id="embed-title">Need a broker? Run it inside your application.</h2>
+          <p>IoT devices, robots, and other MQTT clients usually publish to a separate broker that your application reads from. With Hato, your application is the broker: they connect to it over TCP or TLS, and your own code joins as a client in the same process. There is no second server to install, secure, and keep running; the broker starts and stops with your application.</p>
+          <ul class="bullets">
+            <li>Inside the process, messages never touch the network.</li>
+            <li>Hear when each client connects or leaves, and disconnect any of them.</li>
+            <li>Keeps answering while your virtual threads are busy.</li>
+            <li>No process exits, shutdown hooks, or files you didn't ask for.</li>
+          </ul>
         </div>
 
-        <div class="modes">
-          <dl class="mode-list">
-            <div><dt>Serial <span class="mode-default">Default</span></dt><dd>One at a time, in arrival order.</dd></div>
-            <div><dt>Striped</dt><dd>In order per key, parallel across keys.</dd></div>
-            <div><dt>Parallel</dt><dd>As many at once as you allow.</dd></div>
-            <div><dt>Hand-off</dt><dd>Straight into your queue, in order.</dd></div>
-          </dl>
-          <p class="modes-note">Handlers can run on your own executor, too.</p>
+        <div class="editor">
+          <div class="editor-bar">
+            <span class="file">FleetController.java</span>
+          </div>
+          <pre tabindex="0"><code class="language-java">try (
+        MqttBroker broker = MqttBroker.builder()
+                .name("fleet")
+                .listen(new InetSocketAddress(1883))
+                .authenticator(robots::check)
+                .listener(fleet)
+                .start();
+        MqttClient app = MqttClient.builder()
+                .server(URI.create("inproc://fleet"))
+                .build()
+) {
+    app.connect().join();
+    app.subscribe(
+            Subscribe.of(new TopicFilter("robots/+/state"), Qos.AT_LEAST_ONCE),
+            delivery -&gt; fleet.update(delivery.message())
+    ).established().join();
+
+    fleet.runUntilStopped();
+}</code></pre>
         </div>
       </div>
       </section>
 
-      <section class="band-section" aria-labelledby="testing-title">
+      <section class="band-section" aria-labelledby="rules-title">
       <div class="split">
         <div class="copy-col">
-          <h2 id="testing-title">Rehearse the bad days in your tests.</h2>
-          <p>Test how your application handles interrupted connections and timeouts. The test kit runs on the same API you ship.</p>
+          <h2 id="rules-title">Decide who connects, and what they may do.</h2>
+          <p>Your application authenticates MQTT clients itself. Look each one up in your database, read its TLS certificate, or ask your identity service. Then let it in with the topics it may use, or turn it away. There are no password or access files on a separate broker to keep in sync.</p>
+          <ul class="bullets">
+            <li>Your check may block, and open connections keep delivering meanwhile.</li>
+            <li>Without a check, it won't listen beyond this machine.</li>
+            <li>You set the limits, and hear when it drops a QoS 1 or 2 message.</li>
+          </ul>
+        </div>
+
+        <div class="editor">
+          <div class="editor-bar">
+            <span class="file">Robots.java</span>
+          </div>
+          <pre tabindex="0"><code class="language-java">Decision check(Request request) throws SQLException {
+    // Our own code connects in process, from no address.
+    if (request.remoteAddress().isEmpty()) {
+        return Decision.accept(Scope.all());
+    }
+    // Blocking here is fine. Open connections keep delivering.
+    Optional&lt;Robot&gt; robot = registry.find(request.clientId(), request.password());
+    if (robot.isEmpty()) {
+        return Decision.refuseBadCredentials();
+    }
+    String id = robot.get().id();
+    Scope scope = Scope.of(
+            List.of(new TopicFilter("robots/" + id + "/#")),
+            List.of(new TopicFilter("orders/" + id + "/#"))
+    );
+    return Decision.accept(scope);
+}</code></pre>
+        </div>
+      </div>
+      </section>
+
+      <section class="band-section" aria-labelledby="tests-title">
+      <div class="split flip">
+        <div class="copy-col">
+          <h2 id="tests-title">Rehearse the bad days in your tests.</h2>
+          <p>Test how your application handles lost connections, refusals, and timeouts. The test kit runs on the same API you ship.</p>
           <ul class="bullets">
             <li>Unit-test handlers with fakes, without a broker.</li>
-            <li>Start an embedded broker for each test.</li>
+            <li>Make the broker refuse, hold back, or announce smaller limits.</li>
             <li>Cut the connection at any moment.</li>
-            <li>Delay incoming or outgoing traffic.</li>
             <li>Advance time instead of sleeping.</li>
           </ul>
         </div>
@@ -455,11 +516,11 @@ void showsOfflineWhenTheConnectionDrops() throws IOException {
         <h2 id="guides-title">Guides and reference</h2>
       </div>
       <ul class="guides">
-        <li><a href="https://github.com/kumai/hato/blob/main/hato-client/README.md"><span class="g-name">Client</span><span class="g-desc">Configure connections, manage subscriptions, and handle failures.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
-        <li><a href="https://github.com/kumai/hato/blob/main/hato-broker/README.md"><span class="g-name">Embedded broker</span><span class="g-desc">Run a broker inside your application for tests, device simulators, and demos.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
+        <li><a href="https://github.com/kumai/hato/blob/main/README.md#using-the-client"><span class="g-name">Client</span><span class="g-desc">Connect to any broker, manage subscriptions, and handle failures.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
+        <li><a href="https://github.com/kumai/hato/blob/main/README.md#running-a-broker-in-your-application"><span class="g-name">Broker</span><span class="g-desc">Run the broker inside your application: TLS, connection checks, limits, and notices.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
         <li><a href="https://github.com/kumai/hato/blob/main/hato-testkit/README.md"><span class="g-name">Test kit</span><span class="g-desc">Simulate connection failures and control time in your tests.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
-        <li><a href="https://github.com/kumai/hato/blob/main/examples/README.md"><span class="g-name">Examples</span><span class="g-desc">Compile and run the examples above, or try a complete round trip with the embedded broker.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
-        <li><div class="g-row"><span class="g-name">API reference</span><span class="g-desc">Javadoc for the <a href="api/hato/">client</a>, the <a href="api/testkit/">test kit</a>, and the <a href="api/hato/org.mqtt4j.hato/org/mqtt4j/hato/broker/package-summary.html">embedded broker</a>.</span></div></li>
+        <li><a href="https://github.com/kumai/hato/blob/main/examples/README.md"><span class="g-name">Examples</span><span class="g-desc">Complete programs, compiled and checked by the build.</span><span class="g-arrow" aria-hidden="true">→</span></a></li>
+        <li><div class="g-row"><span class="g-name">API reference</span><span class="g-desc">Javadoc for <a href="api/hato/">Hato</a> and the <a href="api/testkit/">test kit</a>.</span></div></li>
       </ul>
     </section>
   </div>
@@ -608,19 +669,25 @@ void showsOfflineWhenTheConnectionDrops() throws IOException {
     hills(surface(hillsCanvas, fw, fh), seeded(11), fw, fh, token('--wash'));
 
     // In the band, keep the strokes where the content leaves room: along the top right above
-    // the first code panel, and below the shorter text column of each section.
+    // the first code panel, then below each section, alternating sides, the last one at the
+    // band's bottom edge.
     const bw = band.clientWidth;
     const bh = band.clientHeight;
-    const sections = band.querySelectorAll('.band-section');
-    const firstEnd = sections[0].offsetHeight;
-    const secondEnd = firstEnd + sections[1].offsetHeight;
+    const bandTop = band.getBoundingClientRect().top;
+    const ends = [...band.querySelectorAll('.band-section')]
+        .map(section => section.getBoundingClientRect().bottom - bandTop);
     const strip = surface(bandCanvas, bw, bh);
     const bandRnd = seeded(23);
     const bandColor = token('--ai-brush');
     brush(strip, bandRnd, [bw * 0.6, -50], [bw * 0.82, 60], [bw + 50, 210], 96 * scale, bandColor);
-    brush(strip, bandRnd, [-40, firstEnd - 300], [bw * 0.1, firstEnd - 110], [bw * 0.3, firstEnd - 30], 110 * scale, bandColor);
-    brush(strip, bandRnd, [bw + 60, secondEnd - 380], [bw * 0.88, secondEnd - 130], [bw * 0.62, secondEnd + 20], 120 * scale, bandColor);
-    brush(strip, bandRnd, [-40, bh - 300], [bw * 0.1, bh - 110], [bw * 0.3, bh - 30], 100 * scale, bandColor);
+    ends.forEach((end, i) => {
+      const y = i === ends.length - 1 ? bh : end;
+      if (i % 2 === 0) {
+        brush(strip, bandRnd, [-40, y - 300], [bw * 0.1, y - 110], [bw * 0.3, y - 30], 108 * scale, bandColor);
+      } else {
+        brush(strip, bandRnd, [bw + 60, y - 380], [bw * 0.88, y - 130], [bw * 0.62, y + 20], 120 * scale, bandColor);
+      }
+    });
   };
 
   let queued = false;
