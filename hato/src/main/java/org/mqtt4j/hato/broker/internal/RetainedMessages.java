@@ -42,8 +42,8 @@ final class RetainedMessages {
     // hash codes collide, which names chosen to collide would make slow to look up otherwise.
     private final Map<String, Message> messages = new LinkedHashMap<>();
 
-    // The same messages by the levels of their topics, each with its place in the order stored.
-    private final TopicTree<Stored> byTopic = new TopicTree<>();
+    // The same messages by the levels of their topics.
+    private final TopicTree<Message> byTopic = new TopicTree<>();
 
     // The place in the order stored that the next message takes.
     private long nextPlace;
@@ -88,6 +88,7 @@ final class RetainedMessages {
             return;
         }
         var message = new Message(
+                nextPlace,
                 publication,
                 received,
                 Delivery.lifetimeOf(publication),
@@ -119,7 +120,8 @@ final class RetainedMessages {
             return;
         }
         messages.put(publication.topic().name(), message);
-        byTopic.put(publication.topic(), new Stored(nextPlace++, message));
+        byTopic.put(publication.topic(), message);
+        nextPlace++;
         bytes += size;
         noteExpiry(message);
     }
@@ -128,6 +130,12 @@ final class RetainedMessages {
     // lifetime has passed counts until the store finds it so.
     int size() {
         return messages.size();
+    }
+
+    // The place in the order stored that the next message takes: every message stored so far has
+    // an earlier one.
+    long nextPlace() {
+        return nextPlace;
     }
 
     // What a retained `publication` counts for against the byte limit, as store() counts it
@@ -193,14 +201,10 @@ final class RetainedMessages {
     // without those whose Message Expiry Interval has passed.
     List<Message> matching(TopicFilter filter) {
         discardExpired(clock.nanoTime());
-        var found = new ArrayList<Stored>();
+        var found = new ArrayList<Message>();
         byTopic.match(filter, found::add);
-        found.sort(Comparator.comparingLong(Stored::place));
-        var matched = new ArrayList<Message>(found.size());
-        for (Stored stored : found) {
-            matched.add(stored.message());
-        }
-        return matched;
+        found.sort(Comparator.comparingLong(Message::place));
+        return found;
     }
 
     // Forgets every retained message, as the broker closes.
@@ -211,17 +215,14 @@ final class RetainedMessages {
         expiring = false;
     }
 
-    // A retained message and its place in the order stored, which a later message of the same
-    // topic takes over at the end.
-    private record Stored(long place, Message message) {
-    }
-
-    // A retained message, when the broker received it, its Message Expiry Interval in seconds,
-    // which counts from then, or -1 without one, and what it holds on the heap: its share of
-    // the retained size limit, and the room that its deliveries share in the broker's memory
-    // for deliveries. The interval is read from the publication once, because a look at the
-    // lifetimes goes through every message.
+    // A retained message: its place in the order stored, which no other message has, since a
+    // later message of the same topic takes a place of its own at the end; when the broker
+    // received it; its Message Expiry Interval in seconds, which counts from then, or -1 without
+    // one; and what it holds on the heap: its share of the retained size limit, and the room
+    // that its deliveries share in the broker's memory for deliveries. The interval is read from
+    // the publication once, because a look at the lifetimes goes through every message.
     record Message(
+            long place,
             Packet.Publish publication,
             long received,
             long lifetime,

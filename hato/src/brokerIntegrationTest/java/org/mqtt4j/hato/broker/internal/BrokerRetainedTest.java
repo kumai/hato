@@ -444,32 +444,137 @@ class BrokerRetainedTest {
     }
 
     @Test
+    void overlapping_subscriptions_beyond_the_retained_limits_give_up_shared_copies_first()
+            throws Exception {
+        BrokerServer.Builder limited = BrokerServer.builder().maxInflight(1).maxRetained(4);
+        try (BrokerServer sut = limited.start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            // Arrange: the broker retains four messages, two of which a narrower filter matches
+            // as well.
+            for (String topic : List.of("b/0", "b/1", "a/0", "a/1")) {
+                publisher.publish(retained(topic, topic, AT_LEAST_ONCE));
+            }
+
+            // Act: one SUBSCRIBE with both filters, whose six retained messages would wait for a
+            // window of one.
+            subscriber.send(new Packet.Subscribe(
+                    1,
+                    List.of(
+                            RawSession.subscription("#", AT_LEAST_ONCE),
+                            RawSession.subscription("a/#", AT_LEAST_ONCE)
+                    ),
+                    EMPTY
+            ));
+            subscriber.expect(Packet.SubAck.class);
+
+            // Assert: no more wait than the broker retains, and the copies that the narrower
+            // subscription brings as well go from the first one, so the client receives each
+            // retained message.
+            var received = new ArrayList<String>();
+            for (int count = 0; count < 4; count++) {
+                Packet.Publish delivery = subscriber.expect(Packet.Publish.class);
+                received.add(delivery.topic().name());
+                subscriber.send(new Packet.PubAck(delivery.packetId(), SUCCESS, EMPTY));
+            }
+            assertThat(received).containsExactly("b/0", "b/1", "a/0", "a/1");
+            subscriber.ping();
+        }
+    }
+
+    @Test
+    void a_copy_that_no_later_subscription_brings_any_longer_stays_beyond_the_retained_limits()
+            throws Exception {
+        BrokerServer.Builder limited = BrokerServer.builder().maxInflight(1).maxRetained(6);
+        try (BrokerServer sut = limited.start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession subscriber = connected(sut.port(), "subscriber")) {
+            // Arrange: four retained messages, which `#` matches, two of them `a/#` as well,
+            // whose subscription then ends while the first message waits for its PUBACK.
+            for (String topic : List.of("a/0", "a/1", "b/0", "b/1")) {
+                publisher.publish(retained(topic, topic, AT_LEAST_ONCE));
+            }
+            subscriber.send(new Packet.Subscribe(
+                    1,
+                    List.of(
+                            RawSession.subscription("#", AT_LEAST_ONCE),
+                            RawSession.subscription("a/#", AT_LEAST_ONCE)
+                    ),
+                    EMPTY
+            ));
+            subscriber.expect(Packet.SubAck.class);
+            Packet.Publish first = subscriber.expect(Packet.Publish.class);
+            subscriber.send(new Packet.Unsubscribe(2, List.of(new TopicFilter("a/#")), EMPTY));
+            subscriber.expect(Packet.UnsubAck.class);
+
+            // Act: one SUBSCRIBE that lists `b/#` twice, whose copies make the retained messages
+            // that wait one more than the broker retains.
+            subscriber.send(new Packet.Subscribe(
+                    3,
+                    List.of(
+                            RawSession.subscription("b/#", AT_LEAST_ONCE),
+                            RawSession.subscription("b/#", AT_LEAST_ONCE)
+                    ),
+                    EMPTY
+            ));
+            subscriber.expect(Packet.SubAck.class);
+
+            // Assert: a copy of `b/0` goes rather than `a/1`, which no other subscription brings
+            // any longer, so the client receives every retained message.
+            var received = new ArrayList<String>();
+            received.add(first.topic().name());
+            subscriber.send(new Packet.PubAck(first.packetId(), SUCCESS, EMPTY));
+            for (int count = 0; count < 6; count++) {
+                Packet.Publish delivery = subscriber.expect(Packet.Publish.class);
+                received.add(delivery.topic().name());
+                subscriber.send(new Packet.PubAck(delivery.packetId(), SUCCESS, EMPTY));
+            }
+            assertThat(received).containsExactly("a/0", "a/1", "b/1", "b/0", "b/1", "b/0", "b/1");
+            subscriber.ping();
+            assertThat(sut.counts().dropped()[1]).isEqualTo(1);
+        }
+    }
+
+    @Test
     void retained_messages_that_wait_stay_within_what_the_broker_retains() throws Exception {
         BrokerServer.Builder limited = BrokerServer.builder().maxInflight(1).maxRetained(2);
         try (BrokerServer sut = limited.start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "subscriber")) {
-            // Arrange: the broker retains two messages, and the first of them takes the window.
-            publisher.publish(retained("kept/a", "a", AT_LEAST_ONCE));
-            publisher.publish(retained("kept/b", "b", AT_LEAST_ONCE));
-            subscriber.subscribe("kept/a", AT_LEAST_ONCE);
+            // Arrange: the broker retains two messages; the first of them takes the window, and
+            // the other waits.
+            publisher.publish(retained("kept/a", "a1", AT_LEAST_ONCE));
+            publisher.publish(retained("kept/b", "b1", AT_LEAST_ONCE));
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
             Packet.Publish held = subscriber.expect(Packet.Publish.class);
 
-            // Act: three more subscriptions would leave five retained messages waiting.
-            subscriber.subscribe("kept/+", AT_LEAST_ONCE);
+            // Act: the broker replaces both, which the subscription receives as publications,
+            // and the client subscribes again, which would leave three retained messages
+            // waiting.
+            publisher.publish(retained("kept/a", "a2", AT_LEAST_ONCE));
+            publisher.publish(retained("kept/b", "b2", AT_LEAST_ONCE));
             subscriber.subscribe("kept/#", AT_LEAST_ONCE);
-            subscriber.subscribe("+/b", AT_LEAST_ONCE);
 
-            // Assert: no more follow than the broker retains, and they are the newest that
-            // waited: kept/b for each of the last two subscriptions.
+            // Assert: no more retained messages follow than the broker retains, and they are the
+            // newest: the one that waited goes.
             subscriber.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
-            var received = new ArrayList<String>();
-            for (int count = 0; count < 2; count++) {
+            var received = new ArrayList<Packet.Publish>();
+            for (int count = 0; count < 4; count++) {
                 Packet.Publish delivery = subscriber.expect(Packet.Publish.class);
-                received.add(delivery.topic().name());
+                received.add(delivery);
                 subscriber.send(new Packet.PubAck(delivery.packetId(), SUCCESS, EMPTY));
             }
-            assertThat(received).containsExactly("kept/b", "kept/b");
+            assertThat(received)
+                    .extracting(
+                            publish -> new String(publish.payload(), UTF_8),
+                            Packet.Publish::retain
+                    )
+                    .containsExactly(
+                            tuple("a2", false),
+                            tuple("b2", false),
+                            tuple("a2", true),
+                            tuple("b2", true)
+                    );
             subscriber.ping();
         }
     }

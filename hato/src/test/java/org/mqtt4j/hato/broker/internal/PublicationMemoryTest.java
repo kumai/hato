@@ -138,9 +138,10 @@ class PublicationMemoryTest {
         long many = RetainedCursor.sizeOf(filter, 0, 1000, MemoryBudget.DELIVERY_BYTES);
 
         // Assert: a reference to each message, which takes eight bytes on a JVM that does not
-        // compress references. The array stays as long as it was made, so the count does not
-        // look at how many messages are left.
-        assertThat(many - none).isEqualTo(1000 * 8);
+        // compress references, and a bit for each in the notes of the messages that a later
+        // cursor holds as well, sixteen words of eight bytes. The array stays as long as it was
+        // made, so the count does not look at how many messages are left.
+        assertThat(many - none).isEqualTo(1000 * 8 + 16 * 8);
     }
 
     @Test
@@ -186,8 +187,22 @@ class PublicationMemoryTest {
         );
 
         // Act: cursors of an MQTT 5.0 subscription without and with an identifier.
-        var shared = new RetainedCursor(subscription, List.of(), matched, MqttVersion.V5, 0);
-        var identified = new RetainedCursor(subscription, List.of(7), matched, MqttVersion.V5, 0);
+        var shared = new RetainedCursor(
+                subscription,
+                List.of(),
+                matched,
+                MqttVersion.V5,
+                0,
+                1
+        );
+        var identified = new RetainedCursor(
+                subscription,
+                List.of(7),
+                matched,
+                MqttVersion.V5,
+                0,
+                1
+        );
 
         // Assert: the second counts for the delivery of the message with the properties,
         // whichever of the two is next.
@@ -209,6 +224,7 @@ class PublicationMemoryTest {
 
     private static RetainedMessages.Message retained(Packet.Publish publication) {
         return new RetainedMessages.Message(
+                0,
                 publication,
                 0,
                 Delivery.lifetimeOf(publication),

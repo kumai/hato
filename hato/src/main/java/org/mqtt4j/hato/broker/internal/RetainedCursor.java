@@ -1,5 +1,6 @@
 package org.mqtt4j.hato.broker.internal;
 
+import java.util.BitSet;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -27,10 +28,14 @@ import static java.util.Objects.requireNonNull;
 // that finds room, the session takes room for what the cursor holds besides the messages, which
 // stays as large as it was made until the cursor leaves the session: a message that has gone
 // leaves its place in the array behind.
+//
+// The messages stand in the order stored, so the cursor finds one of them by its place there.
+// It notes those that a later cursor of the session holds as well, which go first when the
+// session's cursors hold more than the broker retains.
 final class RetainedCursor implements Pending {
 
     // A cursor itself, and its place among its session's cursors.
-    private static final int CURSOR_BYTES = 104;
+    private static final int CURSOR_BYTES = 128;
 
     final TopicFilter filter;
 
@@ -47,9 +52,22 @@ final class RetainedCursor implements Pending {
     // Where the cursor stands among what its session has queued: the session's number for it.
     final long order;
 
+    // The place in the order stored that the next message took as the cursor was made: the
+    // cursor holds none stored later.
+    final long storedBefore;
+
     // The position in `matched` of the next retained message to go out, or its length once
     // none is left.
     private int next;
+
+    // The position behind the last retained message left, while one is.
+    private int end;
+
+    // The positions of the retained messages left that a later cursor of the session holds as
+    // well, as the session noted when that cursor came. The later cursor may have let go of
+    // its copy since, so the session looks again before such a message goes. Made with the
+    // first note.
+    private @Nullable BitSet shared;
 
     // The position behind the messages that have room in the broker's memory: those that are
     // left before it have room, and those from it on have none yet.
@@ -79,7 +97,8 @@ final class RetainedCursor implements Pending {
             List<Integer> identifiers,
             List<RetainedMessages.Message> matched,
             MqttVersion version,
-            long order
+            long order,
+            long storedBefore
     ) {
         filter = subscription.filter();
         granted = subscription.qos();
@@ -87,7 +106,9 @@ final class RetainedCursor implements Pending {
         this.matched = matched.toArray(new RetainedMessages.Message[0]);
         this.version = version;
         this.order = order;
+        this.storedBefore = storedBefore;
         remaining = this.matched.length;
+        end = this.matched.length;
         long delivery = MemoryBudget.DELIVERY_BYTES;
         for (RetainedMessages.Message message : matched) {
             delivery = Math.max(
@@ -101,18 +122,22 @@ final class RetainedCursor implements Pending {
     // What a cursor for `messages` retained messages holds on the heap besides those messages:
     // itself; its array, by the length that it was made with; the filter of its SUBSCRIBE,
     // which no later subscription to the same filter shares; its `identifiers` Subscription
-    // Identifiers; and the delivery of its next message, which it makes when the session first
-    // looks at that message and keeps until the message goes. `delivery` is what the largest
-    // delivery of one of its messages holds beside its publication, so the count is not below
-    // what the cursor holds whichever message is next. Like the size of a publication, it errs
-    // towards counting more than is held.
+    // Identifiers; the delivery of its next message, which it makes when the session first
+    // looks at that message and keeps until the message goes; and its notes of the messages
+    // that a later cursor holds as well, a bit for each message, which it makes with the first
+    // note. `delivery` is what the largest delivery of one of its messages holds beside its
+    // publication, so the count is not below what the cursor holds whichever message is next.
+    // Like the size of a publication, it errs towards counting more than is held.
     static long sizeOf(TopicFilter filter, int identifiers, int messages, long delivery) {
         long size = CURSOR_BYTES
                 + PublicationMemory.ARRAY_BYTES
                 + (long) PublicationMemory.REFERENCE_BYTES * messages
                 + PublicationMemory.OBJECT_BYTES
                 + PublicationMemory.sizeOf(filter.pattern())
-                + delivery;
+                + delivery
+                + PublicationMemory.OBJECT_BYTES
+                + PublicationMemory.ARRAY_BYTES
+                + Long.BYTES * ((messages + Long.SIZE - 1L) / Long.SIZE);
         if (identifiers > 0) {
             // The list, and a number for each identifier.
             size += PublicationMemory.OBJECT_BYTES * (1L + identifiers);
@@ -221,11 +246,18 @@ final class RetainedCursor implements Pending {
         }
     }
 
-    // Lets go of the message at `position`, and moves on to the next one that is left if it
-    // was the next to go out.
+    // Lets go of the message at `position`, with its note, and moves on to the next one that is
+    // left if it was the next to go out.
     private void remove(int position) {
         matched[position] = null;
         remaining--;
+        BitSet notes = shared;
+        if (notes != null) {
+            notes.clear(position);
+        }
+        while (end > 0 && matched[end - 1] == null) {
+            end--;
+        }
         if (position != next) {
             return;
         }
@@ -251,6 +283,117 @@ final class RetainedCursor implements Pending {
             }
         }
         return bytes;
+    }
+
+    // The position of the next retained message to go out, or -1 if none is left.
+    int firstLeft() {
+        return (remaining > 0) ? next : -1;
+    }
+
+    // The position of the next retained message after `position` that is left, or -1 if none
+    // is.
+    int nextLeft(int position) {
+        for (int following = position + 1; following < matched.length; following++) {
+            if (matched[following] != null) {
+                return following;
+            }
+        }
+        return -1;
+    }
+
+    // Lets go of the retained message at `position`, which is left, as another cursor of the
+    // session brings it, and returns whether it had room in the broker's memory.
+    boolean dropAt(int position) {
+        boolean hadRoom = position < roomEnd;
+        remove(position);
+        return hadRoom;
+    }
+
+    // The retained messages left, in the order they go out.
+    RetainedMessages.Message[] left() {
+        var left = new RetainedMessages.Message[remaining];
+        int index = 0;
+        for (int position = next; index < left.length; position++) {
+            RetainedMessages.Message message = matched[position];
+            if (message != null) {
+                left[index++] = message;
+            }
+        }
+        return left;
+    }
+
+    // The place in the order stored of the first retained message left. Called only while one
+    // is left.
+    long firstPlace() {
+        return requireNonNull(matched[next]).place();
+    }
+
+    // The place in the order stored of the last retained message left. Called only while one
+    // is left.
+    long lastPlace() {
+        return requireNonNull(matched[end - 1]).place();
+    }
+
+    // Whether `message` may be among the retained messages left, by its place in the order
+    // stored.
+    boolean mayHold(RetainedMessages.Message message) {
+        return remaining > 0 && message.place() >= firstPlace() && message.place() <= lastPlace();
+    }
+
+    // The position of `message` among the retained messages left, or -1 if the cursor no
+    // longer holds it: a search by its place, as the messages stand in the order stored.
+    // Ceiling: a message that has gone leaves null behind, which the search passes over one by
+    // one, so a long run of them, as the copies that another cursor brings leave, makes the
+    // search as long. Closing the gaps now and then would keep it to the halvings.
+    int positionOf(RetainedMessages.Message message) {
+        long place = message.place();
+        int low = next;
+        int high = end - 1;
+        while (low <= high) {
+            int middle = (low + high) >>> 1;
+            // The first message left from the middle on stands for the middle.
+            int probe = middle;
+            while (probe <= high && matched[probe] == null) {
+                probe++;
+            }
+            if (probe > high) {
+                high = middle - 1;
+                continue;
+            }
+            RetainedMessages.Message found = requireNonNull(matched[probe]);
+            if (found.place() == place) {
+                return (found == message) ? probe : -1;
+            }
+            if (found.place() < place) {
+                low = probe + 1;
+            } else {
+                high = middle - 1;
+            }
+        }
+        return -1;
+    }
+
+    // Notes that a later cursor of the session holds the retained message at `position`, which
+    // is left, as well.
+    void noteShared(int position) {
+        BitSet notes = shared;
+        if (notes == null) {
+            notes = new BitSet(matched.length);
+            shared = notes;
+        }
+        notes.set(position);
+    }
+
+    // Forgets the note of the retained message at `position`: no later cursor holds it now.
+    void forgetShared(int position) {
+        requireNonNull(shared).clear(position);
+    }
+
+    // The position of the first retained message left, from `position` on, that a later cursor
+    // holds as well by the notes, or -1 if there is none.
+    int nextShared(int position) {
+        BitSet notes = shared;
+        return (notes == null) ? -1 : notes.nextSetBit(position);
     }
 
     // Whether `delivery`, this cursor's current one, goes without being sent: QoS 0 belongs to

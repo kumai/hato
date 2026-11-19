@@ -994,8 +994,12 @@ class BrokerDeliveryMemoryTest {
             throws Exception {
         // Arrange: a delivery of a retained publication waits for a session that is away, and
         // a client whose window of one holds a delivery that it does not answer. The memory
-        // has room for the retained message with the cursor of a subscription to it.
-        long room = cursorSize("kept/1", 1) + PublicationMemory.sizeOf(retained("kept/1", "0001"));
+        // has room for the retained message with the cursor of a subscription to it, which
+        // does not hold two deliveries of publications of that size: the payloads make the
+        // publications larger than the cursor.
+        String kept = "0001".repeat(16);
+        String later = "0002".repeat(16);
+        long room = cursorSize("kept/1", 1) + PublicationMemory.sizeOf(retained("kept/1", kept));
         try (BrokerServer sut = settings(room).maxInflight(1).start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession behind = connected(sut.port(), "behind")) {
@@ -1003,14 +1007,14 @@ class BrokerDeliveryMemoryTest {
             behind.subscribe("held/#", AT_LEAST_ONCE);
             Packet.Publish held = behind.expect(Packet.Publish.class);
             leaveSubscribed(sut, "away", "kept/#", AT_LEAST_ONCE);
-            publisher.publish(retained("kept/1", "0001"));
+            publisher.publish(retained("kept/1", kept));
 
             // Act: a publication of the same size, for which the delivery of the retained one
             // makes room as the last holder of its publication. The session's client then
             // takes it, and the other client subscribes to the retained message.
-            publisher.publish("kept/2", "0002", AT_LEAST_ONCE, 7);
+            publisher.publish("kept/2", later, AT_LEAST_ONCE, 7);
             try (RawSession back = connected(sut.port(), "away", false, true)) {
-                assertThat(received(back, 1)).containsExactly("0002");
+                assertThat(received(back, 1)).containsExactly(later);
                 back.ping();
             }
             behind.subscribe("kept/1", AT_LEAST_ONCE);
@@ -1018,7 +1022,7 @@ class BrokerDeliveryMemoryTest {
 
             // Assert: the retained message takes its room anew and waits for that client.
             behind.send(new Packet.PubAck(held.packetId(), SUCCESS, EMPTY));
-            assertThat(received(behind, 1)).containsExactly("0001");
+            assertThat(received(behind, 1)).containsExactly(kept);
             behind.ping();
             await().untilAsserted(() -> assertThat(reported).containsExactly("away"));
         }

@@ -149,19 +149,21 @@ class BrokerDropReportTest {
         try (BrokerServer sut = limited.start(loopback());
                 RawSession publisher = connected(sut.port(), "publisher");
                 RawSession subscriber = connected(sut.port(), "behind")) {
-            // Arrange: the broker retains two messages, and the first of them takes the window.
+            // Arrange: the broker retains two messages; the first of them takes the window, and
+            // the other waits.
             publisher.publish(retained("kept/a"));
             publisher.publish(retained("kept/b"));
-            subscriber.subscribe("kept/a", AT_LEAST_ONCE);
+            subscriber.subscribe("kept/#", AT_LEAST_ONCE);
             subscriber.expect(Packet.Publish.class);
 
-            // Act: three more subscriptions would leave five retained messages waiting.
-            subscriber.subscribe("kept/+", AT_LEAST_ONCE);
+            // Act: the broker replaces both, and the client subscribes again, which would leave
+            // three retained messages waiting.
+            publisher.publish(retained("kept/a"));
+            publisher.publish(retained("kept/b"));
             subscriber.subscribe("kept/#", AT_LEAST_ONCE);
-            subscriber.subscribe("+/b", AT_LEAST_ONCE);
 
             // Assert: the session waits for no more than the broker retains.
-            await().untilAsserted(() -> assertThat(reported("behind")).isEqualTo(3));
+            await().untilAsserted(() -> assertThat(reported("behind")).isEqualTo(1));
         }
     }
 

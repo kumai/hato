@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -230,10 +231,17 @@ final class Session {
     // zero once the session is cleared; if not, one of them left without giving its room back.
     private int withRoom;
 
-    // The retained messages that the cursors still hold. Their room is as large as the retained
-    // limits, so that one subscription can take everything that the broker retains, while the
-    // cursors of a client that subscribes again and again without taking them never hold more.
+    // The retained messages that the cursors still hold, each as often as cursors hold it. Their
+    // room is as large as the retained limits, so that one subscription can take everything that
+    // the broker retains, while the cursors of a client that subscribes again and again without
+    // taking them never hold more. Overlapping subscriptions, such as `#` and `a/#`, give up the
+    // messages that they share first when the room overflows (see dropOldestRetained).
     private final Room retainedRoom;
+
+    // Whether a cursor may hold a note of a copy that a later cursor brings as well (see
+    // noteSharedRetained): set as a note is made, and cleared once every note has been through
+    // dropSharedRetained, so that the cursors are not looked through for notes that none has.
+    private boolean notedRetained;
 
     // What the cursors that have room in the broker's memory hold on the heap, themselves and
     // their retained messages with room: what they could give back at most.
@@ -1128,6 +1136,8 @@ final class Session {
         // The change whose entries have copies left for the next part, if one has.
         Change continuing = null;
         while (continuing != null || pending.hasNext()) {
+            // The session's number for the first cursor of the part.
+            long firstOrder;
             synchronized (routing.retained) {
                 var changed = new LinkedHashMap<>(subscriptions);
                 var added = new ArrayList<TopicFilter>();
@@ -1166,8 +1176,10 @@ final class Session {
                     for (TopicFilter filter : added) {
                         routing.subscribed(filter, this);
                     }
+                    firstOrder = nextOrder;
+                    long storedBefore = routing.retained.nextPlace();
                     for (Matched matched : queued) {
-                        queueRetained(matched.subscribed(), matched.messages());
+                        queueRetained(matched.subscribed(), matched.messages(), storedBefore);
                     }
                     for (int level = 0; level < skipped.length; level++) {
                         dropped(Qos.of(level), skipped[level], RETAINED_BEYOND_ROOM);
@@ -1177,7 +1189,9 @@ final class Session {
                 }
             }
             // Outside the topic lock, which the retained messages and subscriptions of every
-            // client wait for. The session's limits on what its cursors hold apply now if they
+            // client wait for. The cursors of the part note the copies that they bring again
+            // first, whether or not the room overflows now, so that the copies can go first
+            // whenever it does. The session's limits on what its cursors hold apply now if they
             // overflow, and the cursors of a part take their room in the broker's memory before
             // the next part makes more, so that what the cursors hold besides their messages
             // stays within that memory however many entries the SUBSCRIBE lists. Otherwise the
@@ -1187,6 +1201,7 @@ final class Session {
             // limits again: in this order the session gives up no older message for one that
             // the memory then refuses.
             synchronized (this) {
+                noteSharedRetained(firstOrder);
                 if (continuing != null || pending.hasNext() || retainedRoom.overflows()) {
                     takeRoomForRetained();
                     dropOldestRetained();
@@ -1305,8 +1320,13 @@ final class Session {
     // cursor that still waits for the same filter stays: replacing the subscription must lose
     // none of its messages, while Retain Handling 0 sends the retained ones again
     // [MQTT-3.8.4-3]. The session's limits on what its cursors hold apply right after, once the
-    // topic lock is free (see subscribe). Called under the topic lock and the inbox.
-    private void queueRetained(Subscribed subscribed, List<RetainedMessages.Message> matched) {
+    // topic lock is free (see subscribe). `storedBefore` is the place in the order stored that
+    // the next message takes now. Called under the topic lock and the inbox.
+    private void queueRetained(
+            Subscribed subscribed,
+            List<RetainedMessages.Message> matched,
+            long storedBefore
+    ) {
         if (matched.isEmpty()) {
             return;
         }
@@ -1318,16 +1338,30 @@ final class Session {
         List<Integer> identifiers = subscribed.identifier() == 0
                 ? List.of()
                 : List.of(subscribed.identifier());
-        cursors.addLast(
-                new RetainedCursor(subscription, identifiers, matched, version, nextOrder++)
-        );
+        cursors.addLast(new RetainedCursor(
+                subscription,
+                identifiers,
+                matched,
+                version,
+                nextOrder++,
+                storedBefore
+        ));
     }
 
-    // Drops the oldest retained messages that the cursors hold until their room holds its limits
-    // again. The newest cursor holds part of what the broker retains and fits the room alone, so
-    // only older cursors lose any, which takes SUBSCRIBEs faster than the client takes their
-    // retained messages. Called under the inbox.
+    // Drops retained messages that the cursors hold until their room holds its limits again.
+    // First go, from the oldest cursor on, those that a later cursor holds as well: the client
+    // receives each of them from the later one, so overlapping subscriptions, such as `#` and
+    // `a/#`, give up the copies that they share before any message that one of them alone
+    // holds. Then the oldest go. The newest cursor holds part of what the broker retains and
+    // fits the room alone, so only older cursors lose any, which takes SUBSCRIBEs faster than
+    // the client takes their retained messages. Called under the inbox.
     private void dropOldestRetained() {
+        if (!retainedRoom.overflows()) {
+            return;
+        }
+        if (notedRetained) {
+            dropSharedRetained();
+        }
         Iterator<RetainedCursor> oldest = cursors.iterator();
         while (retainedRoom.overflows() && oldest.hasNext()) {
             RetainedCursor cursor = oldest.next();
@@ -1341,6 +1375,206 @@ final class Session {
                 left(cursor);
             }
         }
+    }
+
+    // Drops, from the oldest cursor on, the retained messages that a later cursor holds as
+    // well, by the notes of the cursors (see noteSharedRetained), while their room overflows.
+    // A note whose later copies have all gone since, as with an UNSUBSCRIBE or for want of
+    // memory, is forgotten instead, and its copy stays. Called under the inbox.
+    private void dropSharedRetained() {
+        // The cursors in their order, for those after each to be looked through.
+        RetainedCursor[] queue = cursors.toArray(new RetainedCursor[0]);
+        Iterator<RetainedCursor> oldest = cursors.iterator();
+        for (int index = 0; index < queue.length - 1 && retainedRoom.overflows(); index++) {
+            RetainedCursor cursor = oldest.next();
+            int position = cursor.nextShared(0);
+            while (position >= 0 && retainedRoom.overflows()) {
+                RetainedMessages.Message message = cursor.at(position);
+                if (heldAfter(queue, index, message)) {
+                    Qos qos = cursor.qosOf(message);
+                    if (cursor.dropAt(position)) {
+                        giveRoom(message);
+                    }
+                    retainedRoom.remove(message.memory().bytes());
+                    dropped(qos, RETAINED_BEYOND_ROOM);
+                } else {
+                    cursor.forgetShared(position);
+                }
+                position = cursor.nextShared(position + 1);
+            }
+            if (!cursor.hasNext()) {
+                oldest.remove();
+                left(cursor);
+            }
+        }
+        // Through every cursor but the newest without room enough: no note is left before the
+        // newest, and one in the newest has no later copy.
+        if (retainedRoom.overflows()) {
+            notedRetained = false;
+        }
+    }
+
+    // Whether a cursor after the one at `index` of `queue`, the session's cursors in their
+    // order, holds `message`. The newest comes first, as the one that most often brought the
+    // message again.
+    // Ceiling: a copy whose later holder came long before the newest cursor has each cursor in
+    // between looked at by its places. A note of the holder with each note would save that.
+    private static boolean heldAfter(
+            RetainedCursor[] queue,
+            int index,
+            RetainedMessages.Message message
+    ) {
+        for (int later = queue.length - 1; later > index; later--) {
+            RetainedCursor cursor = queue[later];
+            if (cursor.mayHold(message) && cursor.positionOf(message) >= 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Notes the copies of retained messages that the cursors from `firstOrder` on, which came
+    // with one part of a SUBSCRIBE, bring again, in the cursors that hold the earlier copies:
+    // for each message that they bring, the copy of every one of them that holds it but the
+    // newest, and the copy of the newest cursor before them that held it. That copy was the
+    // newest one, and every older copy had its note already, so all copies of a message but the
+    // newest have one, and they can go first when the cursors hold more than the broker retains
+    // without a count of what waits (see dropSharedRetained). The cursors before them are
+    // looked at newest first, each by the places of the messages in the order stored, from the
+    // side that has fewer of them, until each message brought has found its last holder there,
+    // or until a cursor was made before every message left to find was stored, as with new
+    // versions of messages that the earlier cursors hold: none from there on holds those. A
+    // note goes with its copy. Called under the inbox.
+    private void noteSharedRetained(long firstOrder) {
+        // The cursors that came, newest first.
+        var arrived = new ArrayList<RetainedCursor>();
+        Iterator<RetainedCursor> newest = cursors.descendingIterator();
+        while (newest.hasNext()) {
+            RetainedCursor cursor = newest.next();
+            if (cursor.order < firstOrder) {
+                break;
+            }
+            arrived.add(cursor);
+        }
+        if (arrived.isEmpty() || (arrived.size() == 1 && cursors.size() == 1)) {
+            return;
+        }
+        RetainedMessages.Message[] brought = noteAmong(arrived);
+        Iterator<RetainedCursor> before = cursors.descendingIterator();
+        for (int skipped = 0; skipped < arrived.size(); skipped++) {
+            before.next();
+        }
+        // Which messages brought have found their last holder before them, and the first that
+        // has not.
+        var found = new boolean[brought.length];
+        int unfound = brought.length;
+        int first = 0;
+        while (unfound > 0 && before.hasNext()) {
+            RetainedCursor cursor = before.next();
+            // A cursor holds no message stored after it was made, and the cursors before it
+            // were made no later.
+            if (brought[first].place() >= cursor.storedBefore) {
+                break;
+            }
+            if (!cursor.hasNext()) {
+                continue;
+            }
+            // The messages brought whose places lie among those of the cursor's messages.
+            int from = firstFrom(brought, cursor.firstPlace());
+            int to = firstFrom(brought, cursor.lastPlace() + 1);
+            if (to - from >= cursor.remainingCount()) {
+                // Through the cursor's messages, alongside those brought.
+                int index = from;
+                int position = cursor.firstLeft();
+                while (position >= 0 && index < to) {
+                    long place = cursor.at(position).place();
+                    while (index < to && brought[index].place() < place) {
+                        index++;
+                    }
+                    if (index < to && brought[index].place() == place && !found[index]) {
+                        noteShared(cursor, position);
+                        found[index] = true;
+                        unfound--;
+                    }
+                    position = cursor.nextLeft(position);
+                }
+            } else {
+                // Each message brought, looked for among the cursor's messages.
+                for (int index = from; index < to; index++) {
+                    if (found[index]) {
+                        continue;
+                    }
+                    int position = cursor.positionOf(brought[index]);
+                    if (position >= 0) {
+                        noteShared(cursor, position);
+                        found[index] = true;
+                        unfound--;
+                    }
+                }
+            }
+            while (unfound > 0 && found[first]) {
+                first++;
+            }
+        }
+    }
+
+    // Notes that a later cursor holds the retained message at `position` of `cursor` as well.
+    // Called under the inbox.
+    private void noteShared(RetainedCursor cursor, int position) {
+        cursor.noteShared(position);
+        notedRetained = true;
+    }
+
+    // Notes, among `arrived`, the cursors that came last, newest first, the copies of each
+    // message that they hold but that of the newest of them, and returns the messages that they
+    // hold, each once, in the order stored.
+    private RetainedMessages.Message[] noteAmong(List<RetainedCursor> arrived) {
+        if (arrived.size() == 1) {
+            return arrived.getFirst().left();
+        }
+        // A copy that one of them holds: the message, the index of the cursor among them, and
+        // the position of the message in the cursor.
+        record Held(RetainedMessages.Message message, int cursor, int position) {
+        }
+        var held = new ArrayList<Held>();
+        for (int index = 0; index < arrived.size(); index++) {
+            RetainedCursor cursor = arrived.get(index);
+            int position = cursor.firstLeft();
+            while (position >= 0) {
+                held.add(new Held(cursor.at(position), index, position));
+                position = cursor.nextLeft(position);
+            }
+        }
+        // By place, and the copies of one message from the newest cursor on.
+        Comparator<Held> byPlace = Comparator.comparingLong(each -> each.message().place());
+        held.sort(byPlace.thenComparingInt(Held::cursor));
+        var brought = new ArrayList<RetainedMessages.Message>();
+        RetainedMessages.Message last = null;
+        for (Held each : held) {
+            if (each.message() == last) {
+                noteShared(arrived.get(each.cursor()), each.position());
+            } else {
+                last = each.message();
+                brought.add(last);
+            }
+        }
+        return brought.toArray(new RetainedMessages.Message[0]);
+    }
+
+    // The index of the first of `messages`, which stand in the order stored, whose place there
+    // is `place` or later, or their number if none is.
+    private static int firstFrom(RetainedMessages.Message[] messages, long place) {
+        int low = 0;
+        int high = messages.length;
+        while (low < high) {
+            int middle = (low + high) >>> 1;
+            if (messages[middle].place() < place) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
     }
 
     // Drops the retained messages that still wait for the filters whose patterns `patterns`
@@ -2181,6 +2415,7 @@ final class Session {
             }
             cursors.clear();
             retainedRoom.clear();
+            notedRetained = false;
             connection = null;
             for (Outgoing outgoing : inflight.values()) {
                 if (outgoing instanceof Delivery delivery && delivery.hasRoom) {
