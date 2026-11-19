@@ -7,20 +7,21 @@ import java.util.Optional;
 
 import org.mqtt4j.hato.MqttVersion;
 
-/// Receives the notices of a broker, apart from the broker's I/O and the handling of its
-/// clients: a listener that takes its time delays only its own later notices. The calls come
-/// one at a time, except [#onFailed(Throwable)], which waits for no other call and can run at
-/// the same time as one; a listener whose methods share state must allow for that. The default
-/// methods do nothing, so a listener overrides the ones that it needs.
+/// Receives the notifications of a broker, apart from the broker's I/O and the handling of its
+/// clients: a listener that takes its time delays only its own later notifications. The calls
+/// come one at a time, except [#onFailed(Throwable)], which waits for no other call and can run
+/// at the same time as one; a listener whose methods share state must allow for that. The
+/// default methods do nothing, so a listener overrides the ones that it needs.
 ///
-/// The notices of the connections of one client identifier come in the order in which the
-/// connections came and went: that one connected, that it disconnected, that the next one
+/// The notifications of the connections of one client identifier come in the order in which
+/// the connections came and went: that one connected, that it disconnected, that the next one
 /// connected, and so on, also when a connection takes the session over from another. So a
 /// listener can follow which clients are connected. While the listener falls behind, the broker
-/// holds these notices up to an internal limit, beyond which it drops the oldest one that the
-/// listener has yet to hear of. The broker gives no notice of the connections that its own end
-/// closes: those that [MqttBroker#close()] closes, those that a shutdown closes as it ends (see
-/// [MqttBroker#shutdown(java.time.Duration)]), and those that an internal failure ends.
+/// holds these notifications up to an internal limit, beyond which it drops the oldest one that
+/// the listener has yet to hear of. The listener hears nothing of the connections that the
+/// broker's own end closes: those that [MqttBroker#close()] closes, those that a shutdown closes
+/// as it ends (see [MqttBroker#shutdown(java.time.Duration)]), and those that an internal
+/// failure ends.
 ///
 /// Listener exceptions are logged and do not affect the broker. Interrupt status left by a call
 /// is cleared before the next call.
@@ -31,7 +32,7 @@ public interface BrokerListener {
     /// is not reported.
     ///
     /// @param connection
-    ///   the client's connection, which the notice of its end carries again
+    ///   the client's connection, which the notification of its end carries again
     default void onConnected(Connection connection) {
     }
 
@@ -71,7 +72,7 @@ public interface BrokerListener {
     ///
     /// This call waits for no other call of the listener: it can run while another one, such
     /// as a report of dropped deliveries, is still in progress or just beginning as the broker
-    /// stops. No other notice begins once the broker has ended.
+    /// stops. No other notification begins once the broker has ended.
     ///
     /// The broker goes on ending without waiting for this call, so its listening port may still
     /// be in use and its connections open while the call runs. [MqttBroker#close()], whether
@@ -85,7 +86,7 @@ public interface BrokerListener {
     }
 
     /// A connection of a client, as the broker reports it. The broker passes the same object to
-    /// both notices of a connection, and the object has no equality of its own.
+    /// both notifications of a connection, and the object has no equality of its own.
     /// [MqttBroker#disconnect(BrokerListener.Connection)] closes the connection that the object
     /// stands for. Later versions may add methods with default implementations, so that a
     /// listener's tests can implement this interface.

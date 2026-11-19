@@ -337,7 +337,7 @@ public final class MqttBrokerBuilder {
         return this;
     }
 
-    /// Registers the single listener for the broker's notices; defaults to none.
+    /// Registers the single listener for the broker's notifications; defaults to none.
     ///
     /// @param value
     ///   the listener

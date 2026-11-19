@@ -25,7 +25,7 @@ with no runtime dependencies.
   serves MQTT clients over TCP and TLS, checks them with your own code, and keeps its memory
   bounded. Hato clients in the same JVM reach it without a socket.
 - **Metrics.** The client's [stats and timings](#watching-the-client) and the broker's
-  [stats and notices](#watching-and-managing-clients) are built in, ready to feed to
+  [stats and notifications](#watching-and-managing-clients) are built in, ready to feed to
   Micrometer or another metrics library.
 - **Tests.** The [test kit](hato-testkit/README.md) tests your code without a broker,
   including lost connections and timeouts, and controls the broker in tests that run one.
@@ -1315,9 +1315,9 @@ MqttBroker broker = MqttBroker.builder().listener(listener).start();
 ```
 
 - The calls come one at a time, apart from the broker's work, so a listener that takes its time
-  delays only its own later notices. One that falls far behind loses the oldest notices, which
-  `stats()` counts. The notices of one client come in order, so a listener can follow which
-  clients are connected.
+  delays only its own later notifications. One that falls far behind loses the oldest
+  notifications, which `stats()` counts. The notifications of one client come in order, so a
+  listener can follow which clients are connected.
 - `disconnect(clientId)` closes a client's connection, as for an administrative action: its
   Will is published, and its session stays. `disconnect(connection)` closes a connection that
   the listener heard of, and never a later one of the same client.
