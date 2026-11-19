@@ -1210,11 +1210,11 @@ filters within which it may subscribe.
 Authenticator authenticator = request -> {
     // Look the client up in your application's own store; the lookup may block.
     if (!devices.matches(request.clientId(), request.password())) {
-        return Decision.refuseBadCredentials();
+        return Authenticator.Decision.refuseBadCredentials();
     }
     String device = request.clientId();
-    return Decision.accept(
-            Scope.of(
+    return Authenticator.Decision.accept(
+            Authenticator.Scope.of(
                     List.of(new TopicFilter("devices/" + device + "/#")),
                     List.of(new TopicFilter("commands/" + device + "/#"))
             )
@@ -1229,6 +1229,10 @@ Authenticator authenticator = request -> {
   publication outside the scope reaches no subscriber, and an MQTT 5.0 client learns of it
   from the acknowledgement of a QoS 1 or 2 publication; a subscription outside it is refused.
   `Scope.all()` allows everything.
+- The broker ties no client identifier to a user: a client that the authenticator accepts takes
+  over the session of its identifier, with the messages that wait there within its scope,
+  whoever used the identifier before. So check that the client may use its identifier, as the
+  example does by matching the password to the device of that identifier.
 - The request also shows the user name, the address that the client connects from, whether it
   came through TLS, and its certificates.
 - A client that you [disconnect](#watching-and-managing-clients) meets the authenticator again
