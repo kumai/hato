@@ -1289,16 +1289,21 @@ Everything lives in memory: sessions, retained messages, and the messages that w
 clients are lost when the broker stops, and an acknowledgement does not mean that a message has
 been saved to disk. Your application recreates what it needs after a restart.
 
-The broker bounds what it holds, so that no client can take your application's memory:
+The broker bounds what it holds:
 
 - A subscriber that falls too far behind, or is away, misses messages, whatever their QoS,
   while its connection and session go on. The [listener](#watching-and-managing-clients) hears
   of the QoS 1 and 2 messages that it misses.
+- A client that is connected also holds what is on its way to it, up to a bound of its own, so
+  the memory that the broker takes grows with the clients that are connected, which
+  `maxConnections(n)` limits.
 - A client that sends requests faster than it reads the answers is held back rather than
   disconnected.
 - Beyond the limit on clients or on persistent sessions, a client is refused as it connects. A
   retained publication beyond the retained limits reaches the current subscribers but is not
   kept. A client that sends a packet larger than the limit loses its connection.
+- A client that sends text with a control character, such as a newline in a user property,
+  loses its connection, as MQTT lets a receiver treat such a packet as malformed.
 
 [Broker settings](#broker-settings) lists the limits that you can change; the others are
 internal.
