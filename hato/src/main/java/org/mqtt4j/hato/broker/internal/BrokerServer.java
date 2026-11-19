@@ -430,6 +430,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private Consumer<String> beforeHandOver = _ -> { };
 
+        private Consumer<String> beforeTakeOver = _ -> { };
+
         private Consumer<String> beforeAttach = _ -> { };
 
         private Consumer<String> afterLeave = _ -> { };
@@ -653,6 +655,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder beforeTakeOver(Consumer<String> value) {
+            beforeTakeOver = requireNonNull(value, "beforeTakeOver must not be null");
+            return this;
+        }
+
         Builder beforeAttach(Consumer<String> value) {
             beforeAttach = requireNonNull(value, "beforeAttach must not be null");
             return this;
@@ -762,6 +769,7 @@ public final class BrokerServer implements AutoCloseable {
                     beforeSelect,
                     beforeAccept,
                     beforeHandOver,
+                    beforeTakeOver,
                     beforeAttach,
                     afterLeave,
                     beforeAcceptingStarts

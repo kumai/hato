@@ -55,6 +55,11 @@ final class Connection {
 
     private static final long RESERVED_BYTES = 1024 * 1024;
 
+    // How many bytes of packets a connection reads at most for a CONNECT that waits to take its
+    // session over (see readBeforeTakeOver): a client that goes on sending there holds the
+    // takeover up only while its session handles this much.
+    private static final long TAKE_OVER_INPUT = 1024 * 1024;
+
     // The largest packet that the framing format allows. The broker's own limits are at most
     // this.
     static final int MAX_PACKET_SIZE = 268_435_460;
@@ -111,6 +116,13 @@ final class Connection {
     private boolean catchingUp;
 
     private volatile boolean caughtUp;
+
+    // Whether a CONNECT waits for the connection to read the input that has arrived before it
+    // takes the session over, and the bytes of the packets that the connection has read since a
+    // CONNECT last came for that; the selector's.
+    private boolean takeOverWaits;
+
+    private long readForTakeOver;
 
     // Whether the connection waits, after its last packet, for the client to close it, which
     // only a shutdown of the broker has a connection do; guarded by this. Then whether its output
@@ -320,6 +332,9 @@ final class Connection {
         if (catchingUp && !caughtUp) {
             catchUpOrReadOn();
         }
+        if (takeOverWaits) {
+            readOnForTakeOver();
+        }
     }
 
     // Has the connection read the input that has arrived by now, as the broker begins to shut
@@ -354,6 +369,45 @@ final class Connection {
     // down; see catchUp().
     boolean caughtUp() {
         return caughtUp;
+    }
+
+    // Has the connection read the input that has arrived, as a CONNECT comes to take its session
+    // over, and then tells the session's actor, which handles that input before the CONNECT
+    // (see Session.takeOverAfterInput). Runs on the loop.
+    void readBeforeTakeOver() {
+        takeOverWaits = true;
+        readForTakeOver = 0;
+        // The loop may not have seen the input arrive yet.
+        wire.expectInput();
+        ready();
+    }
+
+    // Tells the session's actor once the connection has read the input that had arrived when a
+    // CONNECT came to take the session over, and otherwise has the loop come back to read on,
+    // unless the failed write, the acceptance, or the actor brings it back. Nothing more comes
+    // to the session once the connection ends or reads no more, and the reading stops once a
+    // read finds nothing more or the connection has read TAKE_OVER_INPUT bytes since. It stops
+    // too at a packet that waits for room for its response, which a client that does not read
+    // its responses never makes.
+    // Ceiling: a client with more requests unanswered than their responses have room for has what
+    // it sent after them come after the takeover, which leaves it unhandled with the old
+    // connection. Waiting for that room until a deadline would lift that.
+    private void readOnForTakeOver() {
+        if (!isEnded() && !readClosed && readForTakeOver < TAKE_OVER_INPUT) {
+            boolean broughtBack = writeFailure != null
+                    || connecting
+                    || (pending != null && (pendingReserved || !pendingAnswered));
+            if (broughtBack) {
+                return;
+            }
+            if (pending == null && wire.unreadInput()) {
+                loop.schedule(this);
+                return;
+            }
+        }
+        takeOverWaits = false;
+        Session owner = requireNonNull(client.session);
+        owner.post(() -> owner.takeOversGoOn(this), Session.ELSEWHERE);
     }
 
     // Whether the connection is still to take deliveries: it has not ended, is not about to,
@@ -616,6 +670,7 @@ final class Connection {
             log.debug("Broker received {} from {}",
                     pending.getClass().getSimpleName(), wire.peer());
             pendingBytes = arrival.size();
+            readForTakeOver += pendingBytes;
             pendingAnswered = answered(pending);
             pendingReceived = receivedAt;
             if (!resumePending() || isEnded()) {

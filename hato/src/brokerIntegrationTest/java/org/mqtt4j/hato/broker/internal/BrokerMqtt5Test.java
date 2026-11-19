@@ -5,8 +5,6 @@ import java.net.InetSocketAddress;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
@@ -27,7 +25,6 @@ import org.mqtt4j.hato.internal.protocol.Property;
 import org.mqtt4j.hato.internal.protocol.PropertyId;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
@@ -587,30 +584,23 @@ class BrokerMqtt5Test {
 
     @Test
     void a_taken_over_connection_leaves_held_deliveries_to_its_replacement() throws Exception {
-        var armed = new AtomicBoolean();
-        var held = new CountDownLatch(1);
-        var release = new CountDownLatch(1);
+        var writer = new HeldWrite();
         try (
                 BrokerServer sut = BrokerServer.builder()
-                        .beforeDeliveryWrite(() -> {
-                            if (armed.compareAndSet(true, false)) {
-                                held.countDown();
-                                awaitCountDown(release);
-                            }
-                        })
+                        .holdDeliveryWrite(writer)
                         .start(loopback());
                 var first = connectedV5(sut.port(), "same-id", false, 60, false);
                 var publisher = connectedV5(sut.port(), "publisher")
         ) {
             // Arrange: the first connection's writer holds a delivery.
             first.subscribe("held/#", AT_LEAST_ONCE);
-            armed.set(true);
+            writer.hold();
             publisher.publish("held/topic", "held", AT_LEAST_ONCE, 1);
-            awaitCountDown(held);
+            writer.awaitHeld();
 
             // Act
             try (var second = connectedV5(sut.port(), "same-id", false, 60, true)) {
-                release.countDown();
+                writer.release();
 
                 // Assert: the delivery goes out once, unsent before, on the new connection.
                 assertThat(first.expect(Packet.Disconnect.class))
@@ -622,7 +612,7 @@ class BrokerMqtt5Test {
                 );
             }
         } finally {
-            release.countDown();
+            writer.release();
         }
     }
 
@@ -758,14 +748,5 @@ class BrokerMqtt5Test {
 
     private static InetSocketAddress loopback() {
         return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
-    }
-
-    private static void awaitCountDown(CountDownLatch latch) {
-        try {
-            assertThat(latch.await(5, SECONDS)).isTrue();
-        } catch (InterruptedException failure) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError(failure);
-        }
     }
 }

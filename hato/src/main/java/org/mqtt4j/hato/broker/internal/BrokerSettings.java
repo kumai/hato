@@ -51,14 +51,17 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // its inbox, once it has counted which of its oldest waiting deliveries or retained messages
 // are to make room in the broker's memory for a new one and before they hand their room over,
 // so that a test can have other sessions take room or hold publications in between. A
-// session's actor calls `beforeAttach` with the client identifier when a CONNECT takes the
-// session over, once the connection that had it has stopped and the session is ready, just
-// before the new connection attaches, so that what a test throws there stands for a takeover
-// that fails on the way. A session's actor calls `afterLeave` with the client identifier once
-// the session has left the session table, so that a test can have a CONNECT for the identifier
-// reach a new actor while the old one waits there. The starting broker runs
-// `beforeAcceptingStarts` just before it starts its accepting thread, so that what a test
-// throws there stands for a thread that could not start, after others did.
+// session's actor calls `beforeTakeOver` with the client identifier each time it takes up a
+// CONNECT that is to take the session over, as the CONNECT comes and as it goes on after waiting
+// for the input of the session's connection, before it looks at that connection, so that a test
+// can have input arrive there in between. It calls `beforeAttach` with the client identifier
+// when a CONNECT takes the session over, once the connection that had it has stopped and the
+// session is ready, just before the new connection attaches, so that what a test throws there
+// stands for a takeover that fails on the way. A session's actor calls `afterLeave` with the
+// client identifier once the session has left the session table, so that a test can have a
+// CONNECT for the identifier reach a new actor while the old one waits there. The starting
+// broker runs `beforeAcceptingStarts` just before it starts its accepting thread, so that what a
+// test throws there stands for a thread that could not start, after others did.
 record BrokerSettings(
         long connectTimeout,
         int maxAwaitingConnect,
@@ -96,6 +99,7 @@ record BrokerSettings(
         Runnable beforeSelect,
         AcceptHook beforeAccept,
         Consumer<String> beforeHandOver,
+        Consumer<String> beforeTakeOver,
         Consumer<String> beforeAttach,
         Consumer<String> afterLeave,
         Runnable beforeAcceptingStarts

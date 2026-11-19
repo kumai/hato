@@ -1339,6 +1339,9 @@ final class Client {
         if (owner == null) {
             return;
         }
+        // The session has handled what the connection handed to it, and the CONNECTs that wait
+        // for that take the session over first, as they would have if they had come now.
+        owner.takeOversGoOn(connection);
         if (holdsPlace) {
             holdsPlace = false;
             routing.freeClientPlace();
@@ -1380,6 +1383,9 @@ final class Client {
 
         private @Nullable Session actor;
 
+        // The connection that had the session when this acceptance last waited for its input.
+        private @Nullable Connection awaited;
+
         Acceptance(Packet.Connect request, String id, Capabilities offered, long expiry) {
             this.request = request;
             this.id = id;
@@ -1409,6 +1415,21 @@ final class Client {
             // next actor takes the connection over.
             if (current.hasEnded()) {
                 post(Session.ALONE);
+                return;
+            }
+            settings.beforeTakeOver().accept(id);
+            if (current.takeOverBehindOthers(this)) {
+                return;
+            }
+            // A connection that still has the session hands what has arrived on it to the
+            // session first: a client that disconnected and connected again at once has sent its
+            // last packets there, the DISCONNECT that discards its Will among them, and its new
+            // connection can come to the session before them. This waits for each connection
+            // once, so a CONNECT that waited goes on even while its client still sends there.
+            Connection previous = current.connection;
+            if (previous != null && previous != awaited && !previous.isEnded()) {
+                awaited = previous;
+                current.takeOverAfterInput(previous, this);
                 return;
             }
             boolean result = false;

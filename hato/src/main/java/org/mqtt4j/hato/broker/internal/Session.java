@@ -313,6 +313,13 @@ final class Session {
     // Subscribing).
     private @Nullable Received handling;
 
+    // The acceptances of the CONNECTs that wait to take the session over, in the order that they
+    // came, while the session's connection reads the input that has arrived on it, and that
+    // connection; null while none waits (see takeOverAfterInput).
+    private final ArrayDeque<Runnable> takeOvers = new ArrayDeque<>();
+
+    private @Nullable Connection takeOversAwait;
+
     Session(Routing routing, String clientId, MqttVersion version) {
         this.routing = routing;
         settings = routing.settings;
@@ -2073,6 +2080,44 @@ final class Session {
             inflight.replace(id, new Release(id));
         } else {
             end(id, delivery);
+        }
+    }
+
+    // Has `acceptance`, of a CONNECT that comes to take the session over, wait behind the
+    // CONNECTs that wait already, if any, so that they take the session over in the order that
+    // they came. Returns whether it waits. Runs on the actor.
+    boolean takeOverBehindOthers(Runnable acceptance) {
+        if (takeOversAwait == null) {
+            return false;
+        }
+        takeOvers.addLast(acceptance);
+        return true;
+    }
+
+    // Has `acceptance`, of a CONNECT, wait ahead of those that came after it until `peer`, the
+    // session's connection, has read the input that has arrived on it, which the session then
+    // handles first: the end of a client that disconnected and connected again at once may still
+    // wait there. The CONNECTs go on once the connection's loop says that it has read that input,
+    // or once the connection's end reaches the session, whichever comes first (see takeOversGoOn).
+    // Runs on the actor.
+    void takeOverAfterInput(Connection peer, Runnable acceptance) {
+        takeOversAwait = peer;
+        takeOvers.addFirst(acceptance);
+        peer.loop.execute(peer, peer::readBeforeTakeOver);
+    }
+
+    // Has the CONNECTs that wait for the input of `peer` take the session over in the order that
+    // they came, unless none waits for it. One that finds a connection whose input it has yet to
+    // wait for, as the one that the CONNECT before it attached, waits for that in turn, and the
+    // others wait behind it again. Runs on the actor.
+    void takeOversGoOn(Connection peer) {
+        if (takeOversAwait != peer) {
+            return;
+        }
+        takeOversAwait = null;
+        Runnable next;
+        while (takeOversAwait == null && (next = takeOvers.pollFirst()) != null) {
+            perform(next);
         }
     }
 

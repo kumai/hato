@@ -13,6 +13,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.IntStream;
 
@@ -363,52 +364,75 @@ class BrokerSessionRaceTest {
 
     @ParameterizedTest
     @EnumSource(OldPacket.class)
-    void a_packet_decoded_before_takeover_cannot_change_the_replacement_session(OldPacket kind)
-            throws Exception {
-        // The hook stops the selector of the first connection between decoding the packet and
-        // handing it to the session. The other connections have selectors of their own, which
-        // take connections in turn.
-        var heldReader = new CompletableFuture<Thread>();
-        var release = new CountDownLatch(1);
+    void a_packet_that_comes_behind_the_takeover_cannot_change_the_replacement_session(
+            OldPacket kind
+    ) throws Exception {
+        // Arrange: the hook stops the actor as the replacement's CONNECT goes on, once the first
+        // connection has read what had arrived on it, until that connection's selector has read
+        // the packet that the client sends meanwhile, which comes to the session behind the
+        // takeover.
+        var armed = new AtomicBoolean();
+        var takingUp = new AtomicInteger();
+        var goingOn = new CountDownLatch(1);
+        var read = new CountDownLatch(1);
         var timer = new BrokerDeadlineTest.ManualTimer();
-        try (BrokerServer sut = start(timer, packet -> {
-            if (kind.matches(packet) && heldReader.complete(Thread.currentThread())) {
-                awaitRelease(release);
-            }
-        }); var first = connected(sut.port(), "subscriber", false, false);
-                var publisher = connected(sut.port(), "publisher")) {
+        try (BrokerServer sut = builder(timer)
+                .beforeProcess(packet -> {
+                    if (kind.matches(packet)) {
+                        read.countDown();
+                    }
+                })
+                .beforeTakeOver(_ -> {
+                    if (armed.get() && takingUp.incrementAndGet() == 2) {
+                        goingOn.countDown();
+                        awaitRelease(read);
+                    }
+                })
+                .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession first = connected(sut.port(), "subscriber", false, false);
+                RawSession publisher = connected(sut.port(), "publisher");
+                RawSession replacement = RawSession.open(sut.port())) {
             first.subscribe("kept/#", AT_LEAST_ONCE);
             publisher.publish("kept/topic", "unacknowledged", AT_LEAST_ONCE, 7);
             Packet.Publish original = first.expect(Packet.Publish.class);
+            armed.set(true);
+
+            // Act
+            replacement.send(connect("subscriber", false, 0));
+            assertThat(goingOn.await(5, SECONDS)).isTrue();
             first.send(kind.packet(original.packetId()));
-            heldReader.get(5, SECONDS);
 
-            try (var replacement = connected(sut.port(), "subscriber", false, true)) {
-                Packet.Publish replay = replacement.expect(Packet.Publish.class);
-                assertThat(replay).isEqualTo(new Packet.Publish(
-                        original.topic(), original.payload(), AT_LEAST_ONCE,
-                        false, true, original.packetId(), EMPTY
-                ));
-                release.countDown();
-                // The selector closes the old connection only after it has handed the packet
-                // over, and the session handles the packet before what the replacement sends
-                // from here on.
-                first.expectClosed();
+            // Assert
+            assertThat(replacement.expect(Packet.ConnAck.class))
+                    .isEqualTo(new Packet.ConnAck(true, SUCCESS, EMPTY));
+            Packet.Publish replay = replacement.expect(Packet.Publish.class);
+            assertThat(replay).isEqualTo(new Packet.Publish(
+                    original.topic(),
+                    original.payload(),
+                    AT_LEAST_ONCE,
+                    false,
+                    true,
+                    original.packetId(),
+                    EMPTY
+            ));
+            first.expectClosed();
 
-                publisher.publish("kept/topic", "after takeover", AT_LEAST_ONCE, 8);
-                // The old PUBACK must not release the one-message window.
-                replacement.ping();
-                replacement.send(new Packet.PubAck(replay.packetId(), SUCCESS, EMPTY));
-                Packet.Publish next = replacement.expect(Packet.Publish.class);
-                assertThat(next).isEqualTo(publication(
-                        "kept/topic", "after takeover", AT_LEAST_ONCE, next.packetId()
-                ));
-                replacement.send(new Packet.PubAck(next.packetId(), SUCCESS, EMPTY));
-                replacement.ping();
-                assertThat(timer.clock.pendingTaskCount()).isZero();
-            }
+            publisher.publish("kept/topic", "after takeover", AT_LEAST_ONCE, 8);
+            // The old PUBACK must not release the one-message window.
+            replacement.ping();
+            replacement.send(new Packet.PubAck(replay.packetId(), SUCCESS, EMPTY));
+            Packet.Publish next = replacement.expect(Packet.Publish.class);
+            assertThat(next).isEqualTo(publication(
+                    "kept/topic",
+                    "after takeover",
+                    AT_LEAST_ONCE,
+                    next.packetId()
+            ));
+            replacement.send(new Packet.PubAck(next.packetId(), SUCCESS, EMPTY));
+            replacement.ping();
+            assertThat(timer.clock.pendingTaskCount()).isZero();
         } finally {
-            release.countDown();
+            read.countDown();
         }
     }
 
