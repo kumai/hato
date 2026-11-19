@@ -88,8 +88,7 @@ public interface BrokerListener {
     /// A connection of a client, as the broker reports it. The broker passes the same object to
     /// both notifications of a connection, and the object has no equality of its own.
     /// [MqttBroker#disconnect(BrokerListener.Connection)] closes the connection that the object
-    /// stands for. Later versions may add methods with default implementations, so that a
-    /// listener's tests can implement this interface.
+    /// stands for. A listener's tests can implement this interface.
     interface Connection {
 
         /// {@return the identifier of the client, which the broker assigns to an MQTT 5.0 client
@@ -128,7 +127,7 @@ public interface BrokerListener {
         }
     }
 
-    /// Why a connection ended. Later versions may add reasons.
+    /// Why a connection ended.
     enum DisconnectReason {
 
         /// The client sent DISCONNECT, whatever its MQTT 5.0 reason code.

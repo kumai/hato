@@ -115,11 +115,10 @@ import static java.util.Objects.requireNonNull;
 /// behind misses deliveries, whatever their QoS, while its connection and session go on. The
 /// retained messages for a new subscription wait apart from them, so the subscription receives
 /// every retained message that it matches. Those still waiting go when the client unsubscribes.
-/// They take no more than the broker retains: beyond that, the copies of a message that another
-/// subscription of the client brings as well go first, so that the client receives each one,
-/// and then the oldest, which a client that keeps subscribing faster than it takes them misses.
-/// A delivery too large for the broker's internal size limits does not reach its subscriber
-/// either.
+/// They take no more than the broker retains: beyond that, a client whose subscriptions overlap
+/// still receives each message, though not for every subscription that matches it, and a client
+/// that keeps subscribing faster than it takes them misses the oldest. A delivery too large for
+/// the broker's internal size limits does not reach its subscriber either.
 /// The memory that waiting deliveries and waiting retained messages take together, for all
 /// sessions, is bounded as well. While it is used up, a session that is behind or has no
 /// connection misses some of them, whatever their QoS, before it reaches its own limits; a
