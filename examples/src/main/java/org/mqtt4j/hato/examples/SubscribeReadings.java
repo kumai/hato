@@ -10,7 +10,7 @@ import org.mqtt4j.hato.TopicFilter;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
-/// Prints the sensor readings from the client guide until Enter is pressed.
+/// Prints the sensor readings of the README's first program until Enter is pressed.
 public final class SubscribeReadings {
 
     void main() {

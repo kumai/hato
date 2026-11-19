@@ -21,6 +21,11 @@ import static java.util.Objects.requireNonNull;
 /// as for a database lookup, and decisions for different clients can run at the same time. At
 /// most a bounded number of them run at once.
 ///
+/// The broker ties no client identifier to a user. A client that a decision accepts takes over
+/// the session of its identifier, with what waits there within its [Scope], whoever connected
+/// with that identifier before. So a decision checks that the client may use its identifier, as
+/// by credentials that belong to the identifier.
+///
 /// A client is refused, and its connection closed, when the decision refuses it, in MQTT 3.1.1
 /// with return code 4 for bad credentials and 5 for a client that is not authorized, and in MQTT
 /// 5.0 with Bad user name or password and Not authorized. It is refused with Server unavailable,

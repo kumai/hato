@@ -11,9 +11,10 @@ import static org.mqtt4j.hato.ReasonCode.MALFORMED_PACKET;
 /// Reads and writes MQTT UTF-8 encoded strings, including their two-byte byte-length prefix.
 ///
 /// Empty strings are allowed. The encoded content must fit in 65535 bytes, contain no U+0000,
-/// and be well-formed UTF-8. BOM characters are preserved; control characters and Unicode
-/// noncharacters are accepted because MQTT recommends, but does not require, their rejection.
-/// Topic-specific restrictions belong to the topic value types.
+/// and be well-formed UTF-8. BOM characters are preserved. Reading and writing accept control
+/// characters and Unicode noncharacters, which MQTT advises against but does not forbid;
+/// [#hasDisallowedCodePoint(String)] finds them for the checks that refuse them. Topic-specific
+/// restrictions belong to the topic value types.
 ///
 /// Reading advances the buffer past this field only. On malformed input, its position may
 /// have advanced. No Unicode normalization is performed in either direction.
@@ -184,5 +185,32 @@ public final class MqttString {
             throw new IllegalArgumentException("MQTT string exceeds 65535 bytes in UTF-8");
         }
         return 2 + (int) bytes;
+    }
+
+    /// Whether `value` contains a code point that MQTT 5.0 calls disallowed (section 1.5.4): a
+    /// control character, from U+0001 to U+001F or from U+007F to U+009F, or a noncharacter.
+    /// MQTT advises against them and lets a receiver treat a packet that carries one as
+    /// malformed. An unpaired surrogate is not one of them; validation refuses it.
+    public static boolean hasDisallowedCodePoint(String value) {
+        for (int index = 0; index < value.length(); index++) {
+            char unit = value.charAt(index);
+            boolean disallowed;
+            if (Character.isHighSurrogate(unit)
+                    && index + 1 < value.length()
+                    && Character.isLowSurrogate(value.charAt(index + 1))) {
+                int codePoint = Character.toCodePoint(unit, value.charAt(++index));
+                // The last two code points of every plane are noncharacters.
+                disallowed = (codePoint & 0xFFFE) == 0xFFFE;
+            } else {
+                disallowed = unit < 0x20
+                        || (unit >= 0x7F && unit < 0xA0)
+                        || (unit >= 0xFDD0 && unit <= 0xFDEF)
+                        || unit >= 0xFFFE;
+            }
+            if (disallowed) {
+                return true;
+            }
+        }
+        return false;
     }
 }

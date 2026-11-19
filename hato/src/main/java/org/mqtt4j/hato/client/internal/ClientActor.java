@@ -60,6 +60,7 @@ import org.mqtt4j.hato.internal.concurrent.CarrierShare;
 import org.mqtt4j.hato.internal.concurrent.TimerService;
 import org.mqtt4j.hato.internal.io.SendQueue;
 import org.mqtt4j.hato.internal.log.Log;
+import org.mqtt4j.hato.internal.protocol.MqttString;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.PacketCodec;
 
@@ -524,6 +525,12 @@ public final class ClientActor implements MqttClient {
                     "MQTT 3.1.1 cannot carry message properties"
             ));
         }
+        Optional<String> disallowed = MessageProperties.disallowedText(message);
+        if (disallowed.isPresent()) {
+            return ClientFuture.failed(inlineHandlers, new IllegalArgumentException(
+                    disallowed.get() + " contains a control character or a noncharacter"
+            ));
+        }
         // The properties count with the payload: User Properties alone can be large.
         return submit(
                 Command.PUBLISH,
@@ -612,6 +619,12 @@ public final class ClientActor implements MqttClient {
                 || request.retainHandling() != RetainHandling.SEND;
         if (version == MqttVersion.V3_1_1 && setsOptions) {
             throw new IllegalArgumentException("MQTT 3.1.1 has no subscription options");
+        }
+        // The client sends no filter that a broker may treat as malformed (see MessageProperties).
+        if (MqttString.hasDisallowedCodePoint(request.filter().pattern())) {
+            throw new IllegalArgumentException(
+                    "Topic filter contains a control character or a noncharacter"
+            );
         }
         ClientSubscription subscription;
         MqttCapacityException rejection = null;

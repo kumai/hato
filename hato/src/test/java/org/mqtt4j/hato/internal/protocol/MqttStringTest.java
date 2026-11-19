@@ -205,4 +205,26 @@ class MqttStringTest {
         assertThat(input.get() & 0xFF).isEqualTo(0xBB);
         assertThat(input.hasRemaining()).isFalse();
     }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "\u0001", "a\nb", "\u001F", "\u007F", "\u0085", "\u009F", "﷐", "﷯",
+            "￾", "￿", "🿾", "🿿", "􏿿"
+    })
+    void finds_the_control_characters_and_noncharacters_that_mqtt_disallows(String value) {
+        // MQTT 5.0 section 1.5.4: U+0001-U+001F, U+007F-U+009F, and the noncharacters, such as
+        // U+FDD0-U+FDEF and the last two code points of every plane.
+        assertThat(MqttString.hasDisallowedCodePoint(value)).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "", " ", "~", " ", "﷏", "ﷰ", "﻿", "�", "😀",
+            "🿽", "\uD800"
+    })
+    void passes_other_text(String value) {
+        // The boundaries of each range, a byte order mark, a code point beyond the BMP, and an
+        // unpaired surrogate, which validation refuses instead.
+        assertThat(MqttString.hasDisallowedCodePoint(value)).isFalse();
+    }
 }

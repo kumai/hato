@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.function.Consumer;
 
 import org.jspecify.annotations.Nullable;
 
@@ -57,11 +58,13 @@ final class Session {
     static final int ELSEWHERE = 0;
 
     // How many events a pool thread runs before it lets the turns that wait in the pool go
-    // first, so that a session with events without end does not keep the thread.
-    // Ceiling: an event that routes a publication to many sessions counts as one, and so does a
-    // SUBSCRIBE whose filters match many retained messages, so the time of a turn has no bound.
-    // A limit on the time, on the deliveries, or on the retained messages that one SUBSCRIBE
-    // queues would give it one.
+    // first, so that a session with events without end does not keep the thread. A turn whose
+    // events have queued RETAINED_PER_HOLD deliveries of retained messages ends there too,
+    // whatever the number of its events: one SUBSCRIBE can copy retained messages for seconds,
+    // while copying that many takes about as long as a turn of other events.
+    // Ceiling: an event that routes a publication to many sessions counts as one, so the time of a
+    // turn has no bound. A limit on the deliveries of a turn would give it one, as the deliveries
+    // of retained messages have.
     private static final int TURN_EVENTS = 256;
 
     // How many deliveries of retained messages one SUBSCRIBE queues at most under one hold of the
@@ -70,7 +73,9 @@ final class Session {
     // lock is let go before the next copy. So a SUBSCRIBE of many entries, of many filters or of
     // one, holds up the retained publications and the subscriptions of other clients about as
     // long as one filter that matches every retained message does, and its subscriptions are
-    // copied once for this many deliveries at most.
+    // copied once for this many deliveries at most. The actor's turn ends there too (see
+    // TURN_EVENTS), so that the turns of other sessions come between the parts of a SUBSCRIBE
+    // (see subscribe).
     private static final int RETAINED_PER_HOLD = 1024;
 
     // The received packets that may wait in the inbox. A reader that finds no room waits until
@@ -297,6 +302,17 @@ final class Session {
     // CONNECT that comes to it goes to the table again.
     private boolean ended;
 
+    // What only the thread that holds the turn touches, from here on.
+
+    // How many deliveries of retained messages the events of the current turn have queued, which
+    // end the turn once they reach RETAINED_PER_HOLD (see run).
+    private long retainedThisTurn;
+
+    // The received packet whose event runs now, while it runs. A SUBSCRIBE that goes on in later
+    // turns takes it along, and the answer's room goes back once the last part has answered (see
+    // Subscribing).
+    private @Nullable Received handling;
+
     Session(Routing routing, String clientId, MqttVersion version) {
         this.routing = routing;
         settings = routing.settings;
@@ -473,10 +489,12 @@ final class Session {
         run(TURN_EVENTS);
     }
 
-    // Runs the events while the calling thread holds the turn: at most `budget` of them, after
-    // which it hands the rest over to the pool, and lets go of the turn once none is
-    // left.
+    // Runs the events while the calling thread holds the turn: at most `budget` of them, or fewer
+    // once they have queued RETAINED_PER_HOLD deliveries of retained messages, after which it
+    // hands the rest over to the pool, and lets go of the turn once none is left. A broker that
+    // has closed has its events run to their end here.
     private void run(int budget) {
+        retainedThisTurn = 0;
         for (int ran = 0; ran < budget || routing.closed; ran++) {
             Runnable next;
             Connection reader = null;
@@ -502,6 +520,9 @@ final class Session {
                 reader.wakeNow();
             }
             perform(next);
+            if (retainedThisTurn >= RETAINED_PER_HOLD && !routing.closed) {
+                break;
+            }
         }
         synchronized (this) {
             runner = null;
@@ -525,9 +546,12 @@ final class Session {
 
     // Handles a packet that `from` received, while `from` is still the session's connection;
     // one from a connection that the session has left goes unhandled. A packet that breaks the
-    // protocol ends the connection, as one that cannot be read does.
+    // protocol ends the connection, as one that cannot be read does. The room for the answer goes
+    // back once the packet has been handled, or, for a SUBSCRIBE that goes on in later turns,
+    // once its last part has answered.
     private void handle(Received received) {
         Connection from = received.from;
+        handling = received;
         try {
             if (connection == from && !from.isEnded()) {
                 settings.beforeHandle().accept(received.packet);
@@ -536,7 +560,9 @@ final class Session {
         } catch (Throwable failure) {
             from.failed("packet handling", failure);
         } finally {
-            if (received.answered) {
+            boolean goesOn = handling != received;
+            handling = null;
+            if (received.answered && !goesOn) {
                 from.responseSettled();
             }
         }
@@ -1079,14 +1105,14 @@ final class Session {
     }
 
     // Makes or replaces the subscriptions of one SUBSCRIBE, which `requested` lists in its order,
-    // and returns for each of them whether it subscribes: one that the subscription limits leave
-    // no room for subscribes to nothing; replacing a subscription takes no room. Retain Handling
-    // 0 queues the retained messages that a subscription matches for every SUBSCRIBE, 1 only for
-    // a new subscription, and 2, the only other value, never [MQTT-3.3.1-9] [MQTT-3.3.1-10]
-    // [MQTT-3.3.1-11]; MQTT 3.1.1 uses 0. They wait for the next drain, which follows SUBACK.
-    // Under the topic lock, a retained publication either is among them or is delivered to the
-    // subscription, and the deliveries after the subscription queue behind them. Runs on the
-    // actor.
+    // and has `done` take for each of them whether it subscribes, to answer the client: one that
+    // the subscription limits leave no room for subscribes to nothing; replacing a subscription
+    // takes no room. Retain Handling 0 queues the retained messages that a subscription matches
+    // for every SUBSCRIBE, 1 only for a new subscription, and 2, the only other value, never
+    // [MQTT-3.3.1-9] [MQTT-3.3.1-10] [MQTT-3.3.1-11]; MQTT 3.1.1 uses 0. They wait for the next
+    // drain, which follows SUBACK. Under the topic lock, a retained publication either is among
+    // them or is delivered to the subscription, and the deliveries after the subscription queue
+    // behind them. Runs on the actor, in the event of the received SUBSCRIBE.
     //
     // MQTT has a SUBSCRIBE of several filters handled as a sequence of SUBSCRIBEs, and only the
     // end of that sequence matters to anyone else. So the subscriptions change at once rather
@@ -1100,7 +1126,12 @@ final class Session {
     // is let go between copies of many retained messages, of one filter or of several (see
     // RETAINED_PER_HOLD), and the cursors of each part take their room in the broker's memory
     // before the next part makes more.
-    boolean[] subscribe(List<Subscribed> requested) {
+    //
+    // Different filters that each match many retained messages still cost the copies of each,
+    // and a part that leaves more ends the actor's turn: the next part comes as the session's next
+    // event, in a later turn (see Subscribing). The client's later packets wait for the SUBSCRIBE
+    // as before, while the turns of other sessions come between its parts.
+    void subscribe(List<Subscribed> requested, Consumer<boolean[]> done) {
         var subscribes = new boolean[requested.size()];
         Map<String, Subscribed> current = subscriptions;
         // What the SUBSCRIBE does to each filter, in the order in which it first lists them.
@@ -1139,83 +1170,83 @@ final class Session {
             }
             subscribes[index] = true;
         }
-        Iterator<Change> pending = changes.values().iterator();
-        // The change whose entries have copies left for the next part, if one has.
-        Change continuing = null;
-        while (continuing != null || pending.hasNext()) {
-            // The session's number for the first cursor of the part.
-            long firstOrder;
-            synchronized (routing.retained) {
-                var changed = new LinkedHashMap<>(subscriptions);
-                var added = new ArrayList<TopicFilter>();
-                var queued = new ArrayList<Matched>();
-                // The deliveries that copies not made would have had, by QoS level.
-                var skipped = new long[3];
-                long addedBytes = 0;
-                long matchedCount = 0;
-                while ((continuing != null || pending.hasNext())
-                        && matchedCount < RETAINED_PER_HOLD) {
-                    Change change;
-                    if (continuing != null) {
-                        change = continuing;
-                        continuing = null;
-                    } else {
-                        change = pending.next();
-                        TopicFilter filter = change.subscribed.subscription().filter();
-                        changed.put(filter.pattern(), change.subscribed);
-                        if (change.added) {
-                            added.add(filter);
-                            addedBytes += sizeOf(filter);
-                        }
-                    }
-                    if (change.copied < change.retained.size()) {
-                        TopicFilter filter = change.subscribed.subscription().filter();
-                        List<RetainedMessages.Message> matched = routing.retained.matching(filter);
-                        matchedCount += copies(change, matched, queued, skipped, matchedCount);
-                        if (change.copied < change.retained.size()) {
-                            continuing = change;
-                        }
+        new Subscribing(changes.values().iterator(), subscribes, done).next();
+    }
+
+    // Makes the next part of the SUBSCRIBE that `subscribing` makes (see subscribe), and counts
+    // the deliveries of retained messages that it queues for the actor's turn. Runs on the actor.
+    private void makePart(Subscribing subscribing) {
+        // The session's number for the first cursor of the part.
+        long firstOrder;
+        long matchedCount = 0;
+        synchronized (routing.retained) {
+            var changed = new LinkedHashMap<>(subscriptions);
+            var added = new ArrayList<TopicFilter>();
+            var queued = new ArrayList<Matched>();
+            // The deliveries that copies not made would have had, by QoS level.
+            var skipped = new long[3];
+            long addedBytes = 0;
+            while (subscribing.goesOn() && matchedCount < RETAINED_PER_HOLD) {
+                Change change = subscribing.continuing;
+                if (change != null) {
+                    subscribing.continuing = null;
+                } else {
+                    change = subscribing.pending.next();
+                    TopicFilter filter = change.subscribed.subscription().filter();
+                    changed.put(filter.pattern(), change.subscribed);
+                    if (change.added) {
+                        added.add(filter);
+                        addedBytes += sizeOf(filter);
                     }
                 }
-                synchronized (this) {
-                    // Into the index before the table: should the index fail to take them, no
-                    // subscription stays that publications cannot find.
-                    for (TopicFilter filter : added) {
-                        routing.subscribed(filter, this);
+                if (change.copied < change.retained.size()) {
+                    TopicFilter filter = change.subscribed.subscription().filter();
+                    List<RetainedMessages.Message> matched = routing.retained.matching(filter);
+                    matchedCount += copies(change, matched, queued, skipped, matchedCount);
+                    if (change.copied < change.retained.size()) {
+                        subscribing.continuing = change;
                     }
-                    firstOrder = nextOrder;
-                    long storedBefore = routing.retained.nextPlace();
-                    for (Matched matched : queued) {
-                        queueRetained(matched.subscribed(), matched.messages(), storedBefore);
-                    }
-                    for (int level = 0; level < skipped.length; level++) {
-                        dropped(Qos.of(level), skipped[level], RETAINED_BEYOND_ROOM);
-                    }
-                    subscriptions = changed;
-                    subscriptionBytes += addedBytes;
                 }
             }
-            // Outside the topic lock, which the retained messages and subscriptions of every
-            // client wait for. The cursors of the part note the copies that they bring again
-            // first, whether or not the room overflows now, so that the copies can go first
-            // whenever it does. The session's limits on what its cursors hold apply now if they
-            // overflow, and the cursors of a part take their room in the broker's memory before
-            // the next part makes more, so that what the cursors hold besides their messages
-            // stays within that memory however many entries the SUBSCRIBE lists. Otherwise the
-            // cursors take their room as the session sends what it can, after SUBACK, so that
-            // a message that goes out at once needs none. If the cursors that came find no room,
-            // a message goes alone, and only then do the oldest go until the room holds its
-            // limits again: in this order the session gives up no older message for one that
-            // the memory then refuses.
             synchronized (this) {
-                noteSharedRetained(firstOrder);
-                if (continuing != null || pending.hasNext() || retainedRoom.overflows()) {
-                    takeRoomForRetained();
-                    dropOldestRetained();
+                // Into the index before the table: should the index fail to take them, no
+                // subscription stays that publications cannot find.
+                for (TopicFilter filter : added) {
+                    routing.subscribed(filter, this);
                 }
+                firstOrder = nextOrder;
+                long storedBefore = routing.retained.nextPlace();
+                for (Matched matched : queued) {
+                    queueRetained(matched.subscribed(), matched.messages(), storedBefore);
+                }
+                for (int level = 0; level < skipped.length; level++) {
+                    dropped(Qos.of(level), skipped[level], RETAINED_BEYOND_ROOM);
+                }
+                subscriptions = changed;
+                subscriptionBytes += addedBytes;
             }
         }
-        return subscribes;
+        // A part that leaves more has queued RETAINED_PER_HOLD deliveries at least, which ends
+        // the turn after this event.
+        retainedThisTurn += matchedCount;
+        // Outside the topic lock, which the retained messages and subscriptions of every client
+        // wait for. The cursors of the part note the copies that they bring again first, whether
+        // or not the room overflows now, so that the copies can go first whenever it does. The
+        // session's limits on what its cursors hold apply now if they overflow, and the cursors of
+        // a part take their room in the broker's memory before the next part makes more, so that
+        // what the cursors hold besides their messages stays within that memory however many
+        // entries the SUBSCRIBE lists. Otherwise the cursors take their room as the session sends
+        // what it can, after SUBACK, so that a message that goes out at once needs none. If the
+        // cursors that came find no room, a message goes alone, and only then do the oldest go
+        // until the room holds its limits again: in this order the session gives up no older
+        // message for one that the memory then refuses.
+        synchronized (this) {
+            noteSharedRetained(firstOrder);
+            if (subscribing.goesOn() || retainedRoom.overflows()) {
+                takeRoomForRetained();
+                dropOldestRetained();
+            }
+        }
     }
 
     // Adds to `queued` copies of `matched`, the retained messages that the filter of `change`
@@ -2551,6 +2582,78 @@ final class Session {
         Change(Subscribed subscribed, boolean added) {
             this.subscribed = subscribed;
             this.added = added;
+        }
+    }
+
+    // One SUBSCRIBE that the session makes part by part (see subscribe): the changes that are
+    // still to come, the results of its entries, and what answers the client once the last part
+    // has been made. A part that leaves more has the next one come as the session's next event,
+    // ahead of those that wait, so that no other packet of the client and no other event of the
+    // session comes between the parts, while the turns of other sessions do: that part has
+    // queued enough retained messages to end the actor's turn.
+    private final class Subscribing implements Runnable {
+
+        // The changes that are still to come, in their order.
+        final Iterator<Change> pending;
+
+        // The change whose entries have copies left for the next part, if one has.
+        @Nullable Change continuing;
+
+        // Whether each entry of the SUBSCRIBE subscribes.
+        private final boolean[] subscribes;
+
+        // What answers the client with those results, once the last part has been made.
+        private final Consumer<boolean[]> done;
+
+        // The received SUBSCRIBE, once a part has gone on to a later event: the event of the
+        // packet leaves the room for the answer to the part that answers. Null until then.
+        private @Nullable Received packet;
+
+        Subscribing(Iterator<Change> pending, boolean[] subscribes, Consumer<boolean[]> done) {
+            this.pending = pending;
+            this.subscribes = subscribes;
+            this.done = done;
+        }
+
+        // Whether a part is still to come.
+        boolean goesOn() {
+            return continuing != null || pending.hasNext();
+        }
+
+        // Makes the next part, and answers the client once none is left; otherwise has the next
+        // part come as the session's next event. Runs on the actor.
+        void next() {
+            makePart(this);
+            if (!goesOn()) {
+                done.accept(subscribes);
+                return;
+            }
+            if (packet == null) {
+                packet = requireNonNull(handling, "the received SUBSCRIBE");
+                handling = null;
+            }
+            synchronized (Session.this) {
+                events.addFirst(this);
+            }
+        }
+
+        // The next part, as an event of its own. A failure ends the connection that the
+        // SUBSCRIBE came in, as one in the event of the packet does, and the room for the answer
+        // goes back once the SUBSCRIBE has answered or failed.
+        @Override
+        public void run() {
+            Received received = requireNonNull(packet, "the received SUBSCRIBE");
+            boolean ended = true;
+            try {
+                next();
+                ended = !goesOn();
+            } catch (Throwable failure) {
+                received.from.failed("packet handling", failure);
+            } finally {
+                if (ended && received.answered) {
+                    received.from.responseSettled();
+                }
+            }
         }
     }
 

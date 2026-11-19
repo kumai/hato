@@ -77,9 +77,9 @@ public final class BrokerStats {
         return counts.refusedPublications();
     }
 
-    /// {@return a lifetime count of the notices of connections that the broker dropped because
-    /// the [BrokerListener] fell behind}
-    public long droppedNotices() {
+    /// {@return a lifetime count of the notifications of connections that the broker dropped
+    /// because the [BrokerListener] fell behind}
+    public long droppedNotifications() {
         return counts.droppedNotices();
     }
 
@@ -93,7 +93,7 @@ public final class BrokerStats {
                 + ", delivered=" + byLevel(counts.delivered())
                 + ", dropped=" + byLevel(counts.dropped())
                 + ", refusedPublications=" + refusedPublications()
-                + ", droppedNotices=" + droppedNotices() + "]";
+                + ", droppedNotifications=" + droppedNotifications() + "]";
     }
 
     // The counts of QoS 0, 1, and 2, as text.

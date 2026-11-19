@@ -264,6 +264,10 @@ class MqttClientBuilderTest {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> sut.clientId("あ".repeat(21_846)))
                 .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> sut.clientId("robot\t1"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> sut.clientId("robot￿"))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
@@ -337,6 +341,23 @@ class MqttClientBuilderTest {
         assertThatThrownBy(() -> sut.will(will))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Will payload");
+    }
+
+    @Test
+    void a_will_with_a_control_character_is_rejected_at_once() {
+        // Arrange
+        var will = MqttMessage.of(new Topic("status"), new byte[0], Qos.AT_MOST_ONCE, false);
+        MqttClientBuilder sut = configuredBuilder();
+
+        // Act & Assert
+        assertThatThrownBy(() -> sut.will(will.withTopic(new Topic("status\r"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Topic name of the Will");
+        assertThatThrownBy(() -> sut.will(will.withUserProperties(
+                List.of(new UserProperty("last", "line 1\nline 2"))
+        )))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("User Property of the Will");
     }
 
     @Test

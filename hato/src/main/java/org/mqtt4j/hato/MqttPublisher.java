@@ -29,6 +29,13 @@ public interface MqttPublisher {
     /// the PUBLISH. An MQTT 3.1.1 client cannot carry them: a message with any of them fails
     /// with [IllegalArgumentException] without being sent.
     ///
+    /// The client sends no text that MQTT advises against: a message whose topic, Response Topic,
+    /// content type, or User Properties contain a control character, from U+0001 to U+001F or
+    /// from U+007F to U+009F, or a Unicode noncharacter fails with [IllegalArgumentException]
+    /// without being sent. MQTT lets a receiver treat such a packet as malformed and end the
+    /// connection. A message that the client received can contain them, so publishing it again
+    /// fails the same way.
+    ///
     /// A client without a connection, including one waiting to reconnect or with a requested
     /// disconnect pending, fails with [MqttNotConnectedException]. Admission capacity failures
     /// use [MqttCapacityException] and leave the connection usable.

@@ -12,6 +12,9 @@ import static java.util.Objects.requireNonNull;
 /// An MQTT 5.0 User Property of a message: a name and a value that the application chooses.
 /// Both are MQTT UTF-8 strings of at most 65535 bytes and may be empty. A message keeps its
 /// User Properties in order and may repeat a name; brokers forward them in the same order.
+/// Either string may contain control characters, such as a newline, and noncharacters, as one
+/// that the client receives can, but the client sends no such User Property; see
+/// [MqttPublisher#publish(MqttMessage)].
 /// Two User Properties are equal when their names are equal and their values are equal.
 public final class UserProperty {
 

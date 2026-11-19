@@ -1,9 +1,9 @@
 # Hato examples
 
-The root README's [first program](src/main/java/org/mqtt4j/hato/examples/ReadingRoundTrip.java),
-and the client guide's [publishing example](src/main/java/org/mqtt4j/hato/examples/PublishReading.java)
-and [subscribing example](src/main/java/org/mqtt4j/hato/examples/SubscribeReadings.java), are
-compiled with the public client API by `./gradlew build`. They expect a broker at
+The README's [first program](src/main/java/org/mqtt4j/hato/examples/ReadingRoundTrip.java),
+and a [publisher](src/main/java/org/mqtt4j/hato/examples/PublishReading.java) and a
+[subscriber](src/main/java/org/mqtt4j/hato/examples/SubscribeReadings.java) of the same
+readings, are compiled with the public client API by `./gradlew build`. They expect a broker at
 `mqtt://localhost:1883`. Run `ReadingRoundTrip` from your IDE on its own, or run
 `SubscribeReadings`, then `PublishReading`. Press Enter in the program that waits to stop it.
 
@@ -23,3 +23,7 @@ from your IDE.
   records the client's timings and stats in Micrometer, and times the handler's own work, with
   a local registry and no monitoring server. Micrometer is a dependency of the examples, not
   of the client.
+- [RenewBrokerCertificate](src/main/java/org/mqtt4j/hato/examples/RenewBrokerCertificate.java)
+  renews the key and certificate of the broker's TLS listener while the broker runs, through a
+  key manager of the application's own: new connections get the renewed certificate, and the
+  connections already open go on. It creates its keys with the JDK's `keytool`.

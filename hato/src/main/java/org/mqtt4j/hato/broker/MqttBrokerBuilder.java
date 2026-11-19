@@ -78,19 +78,20 @@ public final class MqttBrokerBuilder {
     }
 
     /// Listens with TLS at `address`, which must be resolved; port zero selects a port that the
-    /// system assigns. Every connection there takes an engine of `context`, which holds the
-    /// broker's key and the trust in client certificates, with the parameters that
-    /// [#sslParameters(Consumer)] sets. The TLS listener comes besides a plain one that
-    /// [#listen(InetSocketAddress)] sets, on another port, or alone. An address other than a
-    /// loopback one, the wildcard address included, needs an [Authenticator] or
-    /// [#allowAnonymous()], as for a plain listener: TLS authenticates the broker, and the
-    /// clients only through the certificates that the application has the broker ask for and
-    /// check.
+    /// system assigns. The TLS listener comes alone, or next to a plain one that
+    /// [#listen(InetSocketAddress)] sets on another port. `context` holds the broker's key and the
+    /// trust in client certificates, and [#sslParameters(Consumer)] adjusts the parameters of its
+    /// connections. An address other than a loopback one, the wildcard address included, needs an
+    /// [Authenticator] or [#allowAnonymous()], as for a plain listener: TLS authenticates the
+    /// broker, and the clients only through the certificates that the application has the broker
+    /// ask for and check.
     ///
     /// Initialize `context` before [#start()] and do not initialize it again while the broker
-    /// runs. The broker creates an engine of it for each connection, so key and trust managers
-    /// that change what they return, as for renewed certificates, take effect for the
-    /// connections that come afterwards.
+    /// runs. Each connection takes a new [SSLEngine] of `context`, so key and trust managers that
+    /// change what they return, as for renewed certificates, serve the connections that come
+    /// afterwards. A key manager of the application's own is then a
+    /// [javax.net.ssl.X509ExtendedKeyManager] that implements `chooseEngineServerAlias`, as the
+    /// JDK's key managers are; with another, every handshake fails.
     ///
     /// @param address
     ///   the address to listen at with TLS
@@ -152,10 +153,10 @@ public final class MqttBrokerBuilder {
     /// Limits the packets that the broker takes from a client, in bytes including the fixed
     /// header. Defaults to 1 MiB. Must be between 2 and 268435460 bytes. The broker tells MQTT
     /// 5.0 clients the limit when they connect. A client that sends a larger packet loses its
-    /// connection: an MQTT 5.0 client receives DISCONNECT with Packet too large first, and an
-    /// MQTT 3.1.1 client, which cannot learn the limit, receives nothing. Whatever this limit,
-    /// the broker takes no larger CONNECT than an internal limit allows from a peer that it
-    /// knows nothing of yet.
+    /// connection: a larger CONNECT closes it without a CONNACK, and after the CONNECT an MQTT
+    /// 5.0 client receives DISCONNECT with Packet too large first, while an MQTT 3.1.1 client,
+    /// which cannot learn the limit, receives nothing. Whatever this limit, the broker takes no
+    /// larger CONNECT than an internal limit allows from a peer that it knows nothing of yet.
     ///
     /// @param value
     ///   the largest packet in bytes, including the fixed header
@@ -337,7 +338,7 @@ public final class MqttBrokerBuilder {
         return this;
     }
 
-    /// Registers the single listener for the broker's notices; defaults to none.
+    /// Registers the single listener for the broker's notifications; defaults to none.
     ///
     /// @param value
     ///   the listener

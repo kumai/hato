@@ -586,7 +586,7 @@ final class Client {
             settings.beforeAttach().accept(id);
             attached = actor.attach(connection, connAck);
             if (attached) {
-                tellConnected(id, request.version());
+                tellConnected(id, request);
             } else {
                 // The connection ends before its CONNACK, as when it has ended already or a
                 // shutdown has refused the client meanwhile. The broker has not accepted the
@@ -800,14 +800,16 @@ final class Client {
     }
 
     // Tells the application's listener, if there is one, that the broker has accepted this
-    // connection of the client `id`. Runs on the actor, once the session has the connection.
-    private void tellConnected(String id, MqttVersion version) {
+    // connection of the client `id`, which `request` opened. Runs on the actor, once the session
+    // has the connection.
+    private void tellConnected(String id, Packet.Connect request) {
         Notices notices = routing.notices;
         if (notices != null) {
             var connected = new ClientConnection(
                     id,
+                    request.username(),
                     connection.remoteAddress(),
-                    version,
+                    request.version(),
                     connection.overTls(),
                     clientCertificates
             );
@@ -984,27 +986,30 @@ final class Client {
                 }
                 // The broker bounds the subscriptions of a session. One beyond its limits
                 // subscribes to nothing, as a refused one, and the others of the request go
-                // on.
-                boolean[] subscribed = owner.subscribe(making);
-                for (int made = 0; made < subscribed.length; made++) {
-                    if (!subscribed[made]) {
-                        grants[makingAt.get(made)] = switch (owner.version) {
-                            case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
-                            case V5 -> ReasonCode.QUOTA_EXCEEDED;
-                        };
+                // on. The session answers once it has made them, which can take later turns of
+                // its actor when they queue many retained messages.
+                Reason firstRefusal = described;
+                owner.subscribe(making, subscribed -> {
+                    for (int made = 0; made < subscribed.length; made++) {
+                        if (!subscribed[made]) {
+                            grants[makingAt.get(made)] = switch (owner.version) {
+                                case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
+                                case V5 -> ReasonCode.QUOTA_EXCEEDED;
+                            };
+                        }
                     }
-                }
-                send(acknowledgement(
-                        owner,
-                        described,
-                        properties -> new Packet.SubAck(
-                                request.packetId(),
-                                List.of(grants),
-                                properties
-                        )
-                ));
-                // The retained messages that the subscriptions queued follow SUBACK.
-                owner.drain();
+                    send(acknowledgement(
+                            owner,
+                            firstRefusal,
+                            properties -> new Packet.SubAck(
+                                    request.packetId(),
+                                    List.of(grants),
+                                    properties
+                            )
+                    ));
+                    // The retained messages that the subscriptions queued follow SUBACK.
+                    owner.drain();
+                });
             }
             case Packet.Unsubscribe request -> {
                 // So does an MQTT 5.0 UNSUBACK, and a request whose UNSUBACK the client cannot
