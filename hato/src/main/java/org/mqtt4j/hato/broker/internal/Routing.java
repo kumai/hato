@@ -3,6 +3,7 @@ package org.mqtt4j.hato.broker.internal;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -408,6 +409,64 @@ final class Routing {
         return Set.copyOf(clients);
     }
 
+    // The clients that the broker serves, for the application's list of clients: each session
+    // whose connection the broker has accepted and reported, with what the session and the
+    // connection hold now, read at `now` by the broker's clock. A connection stays in the list
+    // until its end comes to its session, as it counts among the clients until then. It takes
+    // no lock, so that the application's threads, virtual ones among them, take none that the
+    // broker's threads wait for: it reads what the broker publishes for other threads, each value
+    // as it was a moment ago.
+    //
+    // The table can show a client twice as it is read: with a session that ends meanwhile, and
+    // with the session that comes after it. The one read later stands, so that the list names
+    // each client once. That is the newer one: the table adds an entry behind those that share
+    // its place, or somewhere that the reading has passed; if the table ever did otherwise, the
+    // older one would stand, still as it was a moment ago. The map of the clients listed is made
+    // for as many as the broker serves, so that it does not grow on the way.
+    // Ceiling: it visits every session, those of absent clients included, as queuedDeliveries()
+    // does.
+    List<BrokerServer.ClientValues> clients(long now) {
+        HashMap<String, BrokerServer.ClientValues> listed = HashMap.newHashMap(clients.get());
+        for (Session session : sessions.values()) {
+            BrokerServer.ClientValues values = valuesOf(session, now);
+            if (values != null) {
+                listed.put(session.clientId, values);
+            }
+        }
+        return List.copyOf(listed.values());
+    }
+
+    // What `session` and its connection hold now, read at `now` by the broker's clock, or null if
+    // the session has no connection that the broker has reported. Another connection can take the
+    // session over while the session's values are read, which may then be that one's, as the
+    // subscriptions that it makes in a session that it started clean. A connection that takes the
+    // session over has it before it does anything there, so the values are all of the connection
+    // that the reads began with if the session still has it after them. Otherwise the reads go
+    // once more from the start, with the connection that the session has then, and a client
+    // whose connection changes again meanwhile is left out of this list: a client that connects
+    // again and again holds the list up no longer than any other.
+    private BrokerServer.@Nullable ClientValues valuesOf(Session session, long now) {
+        for (int pass = 0; pass < 2; pass++) {
+            Connection peer = session.connection;
+            ClientConnection reported = (peer == null) ? null : peer.client.reported();
+            if (peer == null || reported == null) {
+                return null;
+            }
+            settings.whileListing().accept(session.clientId);
+            List<Packet.Subscription> subscriptions = session.subscriptions();
+            long queued = session.queued();
+            if (session.connection == peer) {
+                return new BrokerServer.ClientValues(
+                        reported,
+                        Math.max(0, now - peer.client.acceptedAt()),
+                        subscriptions,
+                        queued
+                );
+            }
+        }
+        return null;
+    }
+
     // Ends the connection of the client `clientId` for the application, telling an MQTT 5.0
     // client `reason`, and returns false if the client has no connection or it was ending
     // already.
@@ -417,9 +476,10 @@ final class Routing {
         return peer != null && endForApplication(peer, reason);
     }
 
-    // Ends for the application, as above, the connection that the listener heard of as
-    // `reported`, if it is still the open connection of its client, and returns whether it did.
-    // A later connection of the same client, or a connection of another broker, is never ended.
+    // Ends for the application, as above, the connection that the broker reported as `reported`,
+    // to the listener or in the list of clients, if it is still the open connection of its
+    // client, and returns whether it did. A later connection of the same client, or a connection
+    // of another broker, is never ended.
     boolean disconnect(BrokerListener.Connection reported, Reason reason) {
         // An object of the application's own, as a listener's test makes, stands for no
         // connection of the broker's, whatever its methods return.
@@ -428,7 +488,7 @@ final class Routing {
         }
         Session session = sessions.get(reported.clientId());
         Connection peer = (session == null) ? null : session.connection;
-        return peer != null && peer.client.toldAs(reported) && endForApplication(peer, reason);
+        return peer != null && peer.client.reportedAs(reported) && endForApplication(peer, reason);
     }
 
     // Ends `peer` for the application, telling an MQTT 5.0 client `reason`, unless it was ending
@@ -654,6 +714,15 @@ final class Routing {
         var found = new HashSet<String>();
         int _ = subscribers.match(topic, session -> found.add(session.clientId));
         return found;
+    }
+
+    // Runs `whileHeld` holding the index of subscriptions, so that a session that changes its
+    // subscriptions meanwhile, as one that is cleared does, waits for it there, for tests.
+    void holdingIndex(Runnable whileHeld) {
+        FilterTree<Session> index = subscribers;
+        synchronized (index) {
+            whileHeld.run();
+        }
     }
 
     // Counts a session that the closing broker has asked to clear itself, and one that has.

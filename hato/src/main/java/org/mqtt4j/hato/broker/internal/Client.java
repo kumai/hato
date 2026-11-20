@@ -61,10 +61,11 @@ final class Client {
     private Authenticator.Scope scope = Authenticator.Scope.all();
 
     // The certificates that the client presented in its TLS handshake, its own first, or none.
-    // Taken on the selector when the CONNECT comes, since the selector alone works the TLS engine,
-    // and only for a broker with an authenticator or a listener, the two that see them. The
-    // authenticator's request gets them there, and the actor of the session reads them for the
-    // listener's notice after the acceptance has handed the client over, which publishes them.
+    // Taken on the selector when the CONNECT comes, since the selector alone works the TLS engine.
+    // The authenticator's request gets them there, and the actor of the session reads them for
+    // the report of the connection after the acceptance has handed the client over, which
+    // publishes them. The certificates are those of the connection's TLS session, which holds
+    // them anyway.
     private List<X509Certificate> clientCertificates = List.of();
 
     // The session that the CONNECT attached, written under the connection's monitor, under which
@@ -118,12 +119,20 @@ final class Client {
     // place with it. Only the session's actor uses it.
     private boolean holdsPlace;
 
-    // The connection as the application's listener heard that it connected, until the listener
-    // hears that it ended; null before and after that, and without a listener. Only the
-    // session's actor writes it, which tells the listener of all the connections of the client
-    // in their order. The application's thread reads it to find the connection that it asks to
-    // close by the object that the listener received.
-    private volatile @Nullable ClientConnection told;
+    // The connection as the broker reports it, to the application's listener and in the list of
+    // clients: made as the broker accepts the connection, and null before that. Only the
+    // session's actor writes it. The application's threads read it to list the clients and to
+    // find the connection that they ask to close by the object that the broker reported.
+    private volatile @Nullable ClientConnection reported;
+
+    // When the broker accepted the connection, by its clock: written before `reported`, which
+    // publishes it to the threads that read the list of clients.
+    private long acceptedAt;
+
+    // Whether the listener has heard that this connection connected and has yet to hear that it
+    // ended. Only the session's actor uses it, which tells the listener of all the connections
+    // of the client in their order.
+    private boolean told;
 
     // The task in the queue of the authentication pool that is to decide on the client's
     // CONNECT, or null. The connection takes it out of the queue as soon as it stops waiting for
@@ -244,10 +253,8 @@ final class Client {
                 return;
             }
         }
+        clientCertificates = connection.clientCertificates();
         Authenticator authenticator = settings.authenticator();
-        if (authenticator != null || routing.notices != null) {
-            clientCertificates = connection.clientCertificates();
-        }
         if (authenticator == null) {
             admit(request, id, offered, expiry, done);
         } else {
@@ -586,11 +593,11 @@ final class Client {
             settings.beforeAttach().accept(id);
             attached = actor.attach(connection, connAck);
             if (attached) {
-                tellConnected(id, request);
+                reportConnected(id, request);
             } else {
                 // The connection ends before its CONNACK, as when it has ended already or a
                 // shutdown has refused the client meanwhile. The broker has not accepted the
-                // client, so the listener hears of neither, and the end comes to the session now.
+                // client, so it reports neither, and the end comes to the session now.
                 actor.post(this::connectionEnded, Session.ALONE);
             }
         } catch (Throwable failure) {
@@ -799,43 +806,58 @@ final class Client {
         );
     }
 
-    // Tells the application's listener, if there is one, that the broker has accepted this
-    // connection of the client `id`, which `request` opened. Runs on the actor, once the session
-    // has the connection.
-    private void tellConnected(String id, Packet.Connect request) {
+    // Reports this connection of the client `id`, which `request` opened and the broker has just
+    // accepted: from now on the list of clients shows it, as accepted now by the broker's clock,
+    // and the application's listener, if there is one, hears that it connected. Runs on the
+    // actor, once the session has the connection.
+    private void reportConnected(String id, Packet.Connect request) {
+        Packet.Will requestedWill = request.will();
+        var connected = new ClientConnection(
+                id,
+                request.username(),
+                connection.remoteAddress(),
+                request.version(),
+                (requestedWill == null) ? null : requestedWill.topic(),
+                connection.overTls(),
+                clientCertificates
+        );
+        acceptedAt = settings.scheduler().nanoTime();
+        reported = connected;
         Notices notices = routing.notices;
         if (notices != null) {
-            Packet.Will requestedWill = request.will();
-            var connected = new ClientConnection(
-                    id,
-                    request.username(),
-                    connection.remoteAddress(),
-                    request.version(),
-                    (requestedWill == null) ? null : requestedWill.topic(),
-                    connection.overTls(),
-                    clientCertificates
-            );
-            told = connected;
+            told = true;
             notices.connected(connected);
         }
     }
 
-    // Whether the listener heard that this connection connected as `reported`, and has yet to
-    // hear that it ended. Any thread may ask.
-    boolean toldAs(BrokerListener.Connection reported) {
-        return told == reported;
+    // The connection as the broker reports it, or null until the broker has accepted it. Any
+    // thread may ask.
+    @Nullable ClientConnection reported() {
+        return reported;
+    }
+
+    // When the broker accepted the connection, by its clock. A thread that has found the
+    // connection reported finds the time as well.
+    long acceptedAt() {
+        return acceptedAt;
+    }
+
+    // Whether the broker reported this connection as `object`, to the listener or in the list of
+    // clients. Any thread may ask.
+    boolean reportedAs(BrokerListener.Connection object) {
+        return reported == object;
     }
 
     // Tells the listener that this connection has ended, once, if it heard that the connection
     // connected. A closing broker tells nothing. Runs on the actor, after the connection's end:
     // as the end reaches the session, or as another connection takes the session over.
     void tellEnded() {
-        ClientConnection connected = told;
+        ClientConnection connected = reported;
         Notices notices = routing.notices;
-        if (connected == null || notices == null) {
+        if (!told || connected == null || notices == null) {
             return;
         }
-        told = null;
+        told = false;
         if (routing.closed) {
             return;
         }

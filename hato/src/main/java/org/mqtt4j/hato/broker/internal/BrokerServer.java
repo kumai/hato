@@ -436,6 +436,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private Consumer<String> afterLeave = _ -> { };
 
+        private Consumer<String> whileListing = _ -> { };
+
         private Runnable beforeAcceptingStarts = () -> { };
 
         private Builder() {
@@ -670,6 +672,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder whileListing(Consumer<String> value) {
+            whileListing = requireNonNull(value, "whileListing must not be null");
+            return this;
+        }
+
         Builder beforeAcceptingStarts(Runnable value) {
             beforeAcceptingStarts = requireNonNull(value, "beforeAcceptingStarts must not be null");
             return this;
@@ -772,6 +779,7 @@ public final class BrokerServer implements AutoCloseable {
                     beforeTakeOver,
                     beforeAttach,
                     afterLeave,
+                    whileListing,
                     beforeAcceptingStarts
             );
             // The name first, so that a broker whose name another one holds binds no port.
@@ -1528,6 +1536,12 @@ public final class BrokerServer implements AutoCloseable {
         return routing.indexedFor(topic);
     }
 
+    // Runs `whileHeld` holding the index of subscriptions, which a session that changes its
+    // subscriptions, as one that is cleared does, waits for, for tests.
+    void holdingIndex(Runnable whileHeld) {
+        routing.holdingIndex(whileHeld);
+    }
+
     /// What the broker counts, for MqttBroker.stats(). Once the broker has ended, it holds
     /// nothing, whatever its parts have yet to let go of, and its lifetime counts stay.
     public Counts counts() {
@@ -1555,6 +1569,15 @@ public final class BrokerServer implements AutoCloseable {
                 routing.refusedPublications(),
                 (notices == null) ? 0 : notices.droppedNotices()
         );
+    }
+
+    /// The clients that the broker serves now, for MqttBroker.clients(), in no particular order.
+    /// Once the broker has ended, it serves none.
+    public List<ClientValues> clients() {
+        if (routing.closed) {
+            return List.of();
+        }
+        return routing.clients(routing.settings.scheduler().nanoTime());
     }
 
     /// Ends the open connection of `clientId` for an administrative reason, which an MQTT 5.0
@@ -1644,6 +1667,18 @@ public final class BrokerServer implements AutoCloseable {
             long[] dropped,
             long refusedPublications,
             long droppedNotices
+    ) {
+    }
+
+    /// What the broker holds of one client that it serves, for MqttBroker.clients(): its
+    /// connection as the broker reports it, how long ago the broker accepted the connection in
+    /// nanoseconds, the subscriptions of its session in the order made, and the deliveries that
+    /// wait in its session.
+    public record ClientValues(
+            BrokerListener.Connection connection,
+            long connectedNanos,
+            List<Packet.Subscription> subscriptions,
+            long queuedDeliveries
     ) {
     }
 }

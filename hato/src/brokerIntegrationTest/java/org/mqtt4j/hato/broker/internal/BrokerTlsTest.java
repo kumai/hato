@@ -328,6 +328,34 @@ class BrokerTlsTest {
     }
 
     @Test
+    void the_list_of_clients_shows_the_certificate_that_a_client_presented() throws Exception {
+        // Arrange: a TLS listener that requires a certificate, without an authenticator or a
+        // listener, which would see the certificate too.
+        try (MqttBroker broker = MqttBroker.builder()
+                .listenTls(loopback(), Tls.serverContext())
+                .sslParameters(parameters -> parameters.setNeedClientAuth(true))
+                .start();
+                MqttClient sut = tlsClient(
+                        broker.tlsPort(),
+                        Tls.clientContextWithCertificate(),
+                        MqttVersion.V5
+                )) {
+            // Act
+            sut.connect().get(5, SECONDS);
+            // Assert
+            await().until(() -> broker.clients().size() == 1);
+            BrokerListener.Connection connection = broker.clients().getFirst().connection();
+            assertThat(connection.overTls()).isTrue();
+            assertThat(connection.clientCertificates())
+                    .extracting(certificate -> certificate.getSubjectX500Principal().getName())
+                    .satisfiesExactly(
+                            client -> assertThat(client).contains("CN=Hato Test client"),
+                            authority -> assertThat(authority).contains("CN=Hato Test CA")
+                    );
+        }
+    }
+
+    @Test
     void a_required_certificate_keeps_a_client_without_one_away_from_the_authenticator()
             throws Exception {
         // Arrange

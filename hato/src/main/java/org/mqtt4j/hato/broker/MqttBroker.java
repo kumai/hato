@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import org.jspecify.annotations.Nullable;
@@ -177,9 +178,10 @@ import static java.util.Objects.requireNonNull;
 /// ## Operation
 ///
 /// The [BrokerListener] hears of each client that the broker accepts, and of the end of its
-/// connection with the reason. [#disconnect(String)] closes the connection of a client, and
-/// [#disconnect(BrokerListener.Connection)] a connection that the listener heard of. [#stats()]
-/// counts the clients, sessions, retained messages, and deliveries.
+/// connection with the reason. [#clients()] lists the clients that the broker serves, with their
+/// subscriptions. [#disconnect(String)] closes the connection of a client, and
+/// [#disconnect(BrokerListener.Connection)] a connection that the listener heard of or the list
+/// showed. [#stats()] counts the clients, sessions, retained messages, and deliveries.
 ///
 /// ## Ending
 ///
@@ -307,15 +309,16 @@ public final class MqttBroker implements AutoCloseable {
         return server.disconnect(clientId);
     }
 
-    /// Closes `connection`, which the [BrokerListener] heard of, if it is still open, as
-    /// [#disconnect(String)] closes the connection of a client. A later connection of the same
-    /// client stays open, so an application that decides about one connection, for example by
-    /// the certificate that [BrokerListener.Connection#clientCertificates()] gives, closes that
-    /// one alone, also when the client has connected again meanwhile.
+    /// Closes `connection`, which the [BrokerListener] heard of or [#clients()] showed, if it is
+    /// still open, as [#disconnect(String)] closes the connection of a client. A later
+    /// connection of the same client stays open, so an application that decides about one
+    /// connection, for example by the certificate that
+    /// [BrokerListener.Connection#clientCertificates()] gives, closes that one alone, also when
+    /// the client has connected again meanwhile.
     ///
     /// @param connection
     ///   the object that [BrokerListener#onConnected(BrokerListener.Connection)] received for
-    ///   the connection
+    ///   the connection, or that [ConnectedClient#connection()] gave
     /// @return
     ///   whether this call closes the connection; false if it has ended or was closing already,
     ///   or if this broker did not report it
@@ -333,6 +336,21 @@ public final class MqttBroker implements AutoCloseable {
     ///   the counts
     public BrokerStats stats() {
         return new BrokerStats(server.counts());
+    }
+
+    /// Reads the clients that the broker serves now, the ones that [#stats()] counts as its
+    /// connections; see [ConnectedClient]. It reads them without stopping the broker's work, so
+    /// each value is as it was a moment ago: the list can still hold a client whose connection
+    /// has just ended, and leave out one that is connecting again at that moment. It holds each
+    /// client once. A call takes time in proportion to the sessions that the broker holds and to
+    /// the subscriptions of the clients that it serves, including those that the list leaves out,
+    /// and memory in proportion to those clients and their subscriptions. Once the broker has
+    /// ended, it serves no client.
+    ///
+    /// @return
+    ///   the clients that the broker serves, in no particular order
+    public List<ConnectedClient> clients() {
+        return server.clients().stream().map(ConnectedClient::new).toList();
     }
 
     /// Observes the end of this broker without requesting it. The future completes once the

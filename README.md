@@ -1341,9 +1341,12 @@ MqttBroker broker = MqttBroker.builder().listener(listener).start();
   delays only its own later notifications. One that falls far behind loses the oldest
   notifications, which `stats()` counts. The notifications of one client come in order, so a
   listener can follow which clients are connected.
+- `clients()` lists the connected clients, each with its connection, the subscriptions of its
+  session with the QoS that the broker granted, and the messages that wait for it, for a page or
+  an API that shows what your devices are doing. It reads them without holding up the broker.
 - `disconnect(clientId)` closes a client's connection, as for an administrative action: its
   Will is published, and its session stays. `disconnect(connection)` closes a connection that
-  the listener heard of, and never a later one of the same client.
+  the listener heard of or `clients()` listed, and never a later one of the same client.
 - `stats()` counts the connected clients, persistent sessions, retained messages, waiting
   deliveries, and the messages received, delivered, and dropped at each QoS. A monitor that
   reports several values reads them from one call.

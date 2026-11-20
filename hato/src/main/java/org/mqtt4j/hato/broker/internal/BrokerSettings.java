@@ -59,9 +59,12 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // session is ready, just before the new connection attaches, so that what a test throws there
 // stands for a takeover that fails on the way. A session's actor calls `afterLeave` with the
 // client identifier once the session has left the session table, so that a test can have a
-// CONNECT for the identifier reach a new actor while the old one waits there. The starting
-// broker runs `beforeAcceptingStarts` just before it starts its accepting thread, so that what a
-// test throws there stands for a thread that could not start, after others did.
+// CONNECT for the identifier reach a new actor while the old one waits there. The list of
+// clients calls `whileListing` with the client identifier each time it has found the reported
+// connection of a session, before it reads what the session holds, so that a test can have the
+// session or the session table change in between. The starting broker runs
+// `beforeAcceptingStarts` just before it starts its accepting thread, so that what a test throws
+// there stands for a thread that could not start, after others did.
 record BrokerSettings(
         long connectTimeout,
         int maxAwaitingConnect,
@@ -102,6 +105,7 @@ record BrokerSettings(
         Consumer<String> beforeTakeOver,
         Consumer<String> beforeAttach,
         Consumer<String> afterLeave,
+        Consumer<String> whileListing,
         Runnable beforeAcceptingStarts
 ) {
 
