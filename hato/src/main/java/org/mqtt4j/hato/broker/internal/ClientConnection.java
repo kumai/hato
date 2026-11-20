@@ -9,6 +9,7 @@ import java.util.Optional;
 import org.jspecify.annotations.Nullable;
 
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.broker.BrokerListener;
 
 // A connection of a client as the application's listener hears of it. The listener gets this one
@@ -24,19 +25,23 @@ final class ClientConnection implements BrokerListener.Connection {
 
     private final MqttVersion version;
 
+    private final @Nullable Topic willTopic;
+
     private final boolean overTls;
 
     private final List<X509Certificate> clientCertificates;
 
     // `clientId` is the identifier that the broker accepted the client with, `username` the user
     // name of its CONNECT, if any, `remoteAddress` where the connection comes from, if it comes
-    // over a network, and `overTls` and `clientCertificates` whether it came to the TLS listener
-    // and the certificates, if any, that the client presented there.
+    // over a network, `willTopic` the topic of the CONNECT's Will, if any, and `overTls` and
+    // `clientCertificates` whether it came to the TLS listener and the certificates, if any, that
+    // the client presented there.
     ClientConnection(
             String clientId,
             @Nullable String username,
             @Nullable SocketAddress remoteAddress,
             MqttVersion version,
+            @Nullable Topic willTopic,
             boolean overTls,
             List<X509Certificate> clientCertificates
     ) {
@@ -44,6 +49,7 @@ final class ClientConnection implements BrokerListener.Connection {
         this.username = username;
         this.remoteAddress = (remoteAddress instanceof InetSocketAddress address) ? address : null;
         this.version = version;
+        this.willTopic = willTopic;
         this.overTls = overTls;
         this.clientCertificates = clientCertificates;
     }
@@ -66,6 +72,11 @@ final class ClientConnection implements BrokerListener.Connection {
     @Override
     public MqttVersion version() {
         return version;
+    }
+
+    @Override
+    public Optional<Topic> willTopic() {
+        return Optional.ofNullable(willTopic);
     }
 
     @Override

@@ -805,11 +805,13 @@ final class Client {
     private void tellConnected(String id, Packet.Connect request) {
         Notices notices = routing.notices;
         if (notices != null) {
+            Packet.Will requestedWill = request.will();
             var connected = new ClientConnection(
                     id,
                     request.username(),
                     connection.remoteAddress(),
                     request.version(),
+                    (requestedWill == null) ? null : requestedWill.topic(),
                     connection.overTls(),
                     clientCertificates
             );
