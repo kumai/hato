@@ -1344,6 +1344,10 @@ MqttBroker broker = MqttBroker.builder().listener(listener).start();
 - `clients()` lists the connected clients, each with its connection, the subscriptions of its
   session with the QoS that the broker granted, and the messages that wait for it, for a page or
   an API that shows what your devices are doing. It reads them without holding up the broker.
+  With `recordClientActivity()`, each client also shows what it has done on its connection: the
+  messages that it published, with the topic of the last one and how long ago it came, the
+  messages that it received, and what its scope refused. Without it, the broker records none
+  of this.
 - `disconnect(clientId)` closes a client's connection, as for an administrative action: its
   Will is published, and its session stays. `disconnect(connection)` closes a connection that
   the listener heard of or `clients()` listed, and never a later one of the same client.
@@ -1376,6 +1380,7 @@ which the listener's `onFailed` hears of.
 | `authenticator(...)` | None: every client is accepted | Check clients and their topics; see [Checking clients and their topics](#checking-clients-and-their-topics). |
 | `authenticationTimeout(...)` | 10 seconds | Give the authenticator more or less time for a decision. |
 | `listener(...)` | None | Hear of clients and failures; see [Watching and managing clients](#watching-and-managing-clients). |
+| `recordClientActivity()` | Off | Show what each client published and received in `clients()`; see [Watching and managing clients](#watching-and-managing-clients). |
 | `maxConnections(n)` | 10,000 clients | Serve more clients at once, or fewer. |
 | `maxPersistentSessions(n)` | 10,000 | Keep more sessions that outlive their connections, or fewer. |
 | `maxSessionExpiry(...)` | 24 hours | Keep the sessions of absent clients longer, or not as long. |

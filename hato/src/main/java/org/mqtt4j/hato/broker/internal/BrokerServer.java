@@ -410,6 +410,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private @Nullable BrokerListener listener;
 
+        private boolean recordActivity;
+
         private @Nullable Authenticator authenticator;
 
         private Duration authenticationTimeout = AUTHENTICATION_TIMEOUT;
@@ -609,6 +611,12 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        /// Has the connections record what their clients do, for the list of clients.
+        public Builder recordActivity() {
+            recordActivity = true;
+            return this;
+        }
+
         Builder scheduler(Timer value) {
             scheduler = requireNonNull(value, "scheduler must not be null");
             return this;
@@ -765,6 +773,7 @@ public final class BrokerServer implements AutoCloseable {
                     actors,
                     capabilities,
                     listener,
+                    recordActivity,
                     authenticator,
                     authenticationTimeout.toNanos(),
                     maxAuthentications,
@@ -1672,13 +1681,36 @@ public final class BrokerServer implements AutoCloseable {
 
     /// What the broker holds of one client that it serves, for MqttBroker.clients(): its
     /// connection as the broker reports it, how long ago the broker accepted the connection in
-    /// nanoseconds, the subscriptions of its session in the order made, and the deliveries that
-    /// wait in its session.
+    /// nanoseconds, the subscriptions of its session in the order made, the deliveries that wait
+    /// in its session, and what it has done on the connection, or null for a broker that does not
+    /// record the activity of its clients.
     public record ClientValues(
             BrokerListener.Connection connection,
             long connectedNanos,
             List<Packet.Subscription> subscriptions,
-            long queuedDeliveries
+            long queuedDeliveries,
+            @Nullable ActivityValues activity
+    ) {
+    }
+
+    /// What the client of one connection has done there: the PUBLISH packets that the broker
+    /// took from it and the topic of the last one, which is null before the first, and how long
+    /// ago that came in nanoseconds, which means nothing before the first; the PUBLISH packets
+    /// that the broker wrote to it; and the publications and subscriptions that its scope
+    /// refused, with the topic and the filter of the last ones. Each topic or filter is followed
+    /// by whether ClientActivity cut it, in which case it is the beginning of a longer one.
+    public record ActivityValues(
+            long received,
+            @Nullable String lastTopic,
+            boolean lastTopicTruncated,
+            long sinceLastReceivedNanos,
+            long delivered,
+            long refusedPublications,
+            @Nullable String lastRefusedTopic,
+            boolean lastRefusedTopicTruncated,
+            long refusedSubscriptions,
+            @Nullable String lastRefusedFilter,
+            boolean lastRefusedFilterTruncated
     ) {
     }
 }

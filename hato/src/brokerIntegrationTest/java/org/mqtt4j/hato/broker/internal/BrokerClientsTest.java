@@ -19,9 +19,13 @@ import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.ConnectedClient;
 import org.mqtt4j.hato.broker.MqttBroker;
 import org.mqtt4j.hato.internal.protocol.Packet;
+import org.mqtt4j.hato.internal.protocol.Properties;
+import org.mqtt4j.hato.internal.protocol.Property;
+import org.mqtt4j.hato.internal.protocol.PropertyId;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -33,12 +37,14 @@ import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.Qos.EXACTLY_ONCE;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
+import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.internal.protocol.Properties.EMPTY;
 
 /// What the application reads of the clients that a broker serves: each connection that the
-/// broker accepted, the subscriptions of its session, and the deliveries that wait there, read
-/// without holding up the broker.
+/// broker accepted, the subscriptions of its session, the deliveries that wait there, and, on a
+/// broker that records it, what the client has done on its connection, read without holding up
+/// the broker.
 class BrokerClientsTest {
 
     @Test
@@ -99,6 +105,7 @@ class BrokerClientsTest {
                     )
                     .containsExactly(tuple(new TopicFilter("orders/robot"), AT_LEAST_ONCE));
             assertThat(listedRobot.queuedDeliveries()).isZero();
+            assertThat(listedRobot.activity()).isEmpty();
             ConnectedClient listedVehicle = listed(sut, "vehicle");
             assertThat(listedVehicle.connection().version()).isEqualTo(MqttVersion.V5);
             assertThat(listedVehicle.connection().willTopic())
@@ -403,6 +410,189 @@ class BrokerClientsTest {
     }
 
     @Test
+    void a_broker_that_records_activity_shows_what_each_client_published() throws Exception {
+        var alias = new Properties(List.of(new Property.TwoByteValue(PropertyId.TOPIC_ALIAS, 1)));
+        try (MqttBroker sut = MqttBroker.builder().recordClientActivity().start();
+                RawSession robot = connected(sut.port(), "robot");
+                RawSession vehicle = connectedV5(sut.port(), "vehicle")) {
+            // Act: one publication at each QoS, and two through a Topic Alias, the second of
+            // which comes without its topic.
+            robot.publish("fleet/robot/state", "1", AT_MOST_ONCE, 0);
+            robot.publish("fleet/robot/visualization", "2", AT_LEAST_ONCE, 1);
+            robot.publish("fleet/robot/connection", "3", EXACTLY_ONCE, 2);
+            vehicle.send(new Packet.Publish(
+                    new Topic("fleet/vehicle/state"),
+                    "4".getBytes(UTF_8),
+                    AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    alias
+            ));
+            vehicle.send(new Packet.AliasPublish(
+                    "5".getBytes(UTF_8),
+                    AT_MOST_ONCE,
+                    false,
+                    false,
+                    0,
+                    alias
+            ));
+            vehicle.ping();
+
+            // Assert
+            await().untilAsserted(() -> {
+                ConnectedClient.Activity robotDid = activityOf(sut, "robot");
+                assertThat(robotDid.received()).isEqualTo(3);
+                assertThat(robotDid.lastTopic()).contains("fleet/robot/connection");
+                assertThat(robotDid.sinceLastReceived()).isPresent();
+                ConnectedClient.Activity vehicleDid = activityOf(sut, "vehicle");
+                assertThat(vehicleDid.received()).isEqualTo(2);
+                assertThat(vehicleDid.lastTopic()).contains("fleet/vehicle/state");
+            });
+        }
+    }
+
+    @Test
+    void the_activity_tells_how_long_ago_the_last_publication_came() throws Exception {
+        var timer = new BrokerDeadlineTest.ManualTimer();
+        try (BrokerServer sut = BrokerServer.builder()
+                .scheduler(timer)
+                .recordActivity()
+                .start(loopback());
+                RawSession robot = connected(sut.port(), "robot")) {
+            // Arrange
+            robot.publish("fleet/robot/state", "1", AT_LEAST_ONCE, 1);
+
+            // Act
+            timer.clock.advance(Duration.ofSeconds(7));
+
+            // Assert
+            await().untilAsserted(() -> assertThat(activityValuesOf(sut, "robot"))
+                    .extracting(BrokerServer.ActivityValues::sinceLastReceivedNanos)
+                    .isEqualTo(Duration.ofSeconds(7).toNanos()));
+        }
+    }
+
+    @Test
+    void the_activity_starts_again_with_each_connection_of_a_client() throws Exception {
+        try (MqttBroker sut = MqttBroker.builder().recordClientActivity().start()) {
+            // Arrange: the client publishes on a connection whose session outlives it.
+            try (RawSession first = connected(sut.port(), "robot", false, false)) {
+                first.publish("fleet/robot/state", "1", AT_LEAST_ONCE, 1);
+                await().until(() -> activityOf(sut, "robot").received() == 1);
+                first.disconnect();
+            }
+
+            // Act
+            try (RawSession _ = connected(sut.port(), "robot", false, true)) {
+                // Assert: the list shows the new connection once the broker has accepted it.
+                await().until(() -> clientIds(sut).contains("robot"));
+                ConnectedClient.Activity again = activityOf(sut, "robot");
+                assertThat(again.received()).isZero();
+                assertThat(again.lastTopic()).isEmpty();
+                assertThat(again.sinceLastReceived()).isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void the_activity_shows_the_publications_that_the_broker_sent_a_client() throws Exception {
+        try (MqttBroker sut = MqttBroker.builder().recordClientActivity().start();
+                RawSession subscriber = connected(sut.port(), "subscriber");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange
+            subscriber.subscribe("orders", AT_LEAST_ONCE);
+
+            // Act
+            for (int sent = 0; sent < 3; sent++) {
+                publisher.publish("orders", "order", AT_MOST_ONCE, 0);
+                subscriber.expect(Packet.Publish.class);
+            }
+
+            // Assert
+            await().untilAsserted(() -> {
+                assertThat(activityOf(sut, "subscriber").delivered()).isEqualTo(3);
+                assertThat(activityOf(sut, "publisher").delivered()).isZero();
+            });
+        }
+    }
+
+    @Test
+    void the_activity_shows_what_the_scope_of_a_client_refused() throws Exception {
+        // Arrange: a client that may publish to its own topics and subscribe to its own orders.
+        Authenticator scoped = _ -> Authenticator.Decision.accept(Authenticator.Scope.of(
+                List.of(new TopicFilter("fleet/robot/#")),
+                List.of(new TopicFilter("orders/robot/#"))
+        ));
+        try (MqttBroker sut = MqttBroker.builder()
+                .authenticator(scoped)
+                .recordClientActivity()
+                .start();
+                RawSession robot = connected(sut.port(), "robot")) {
+            // Act
+            robot.publish("fleet/robot/state", "fine", AT_LEAST_ONCE, 1);
+            robot.publish("fleet/other/state", "astray", AT_LEAST_ONCE, 2);
+            robot.send(new Packet.Subscribe(
+                    3,
+                    List.of(subscription("orders/other/#", AT_LEAST_ONCE)),
+                    EMPTY
+            ));
+            robot.expect(Packet.SubAck.class);
+
+            // Assert: the refused publication counts among those received, too.
+            await().untilAsserted(() -> {
+                ConnectedClient.Activity did = activityOf(sut, "robot");
+                assertThat(did.received()).isEqualTo(2);
+                assertThat(did.lastTopic()).contains("fleet/other/state");
+                assertThat(did.refusedPublications()).isEqualTo(1);
+                assertThat(did.lastRefusedTopic()).contains("fleet/other/state");
+                assertThat(did.refusedSubscriptions()).isEqualTo(1);
+                assertThat(did.lastRefusedFilter()).contains("orders/other/#");
+            });
+        }
+    }
+
+    @Test
+    void the_activity_marks_a_long_topic_or_filter_that_it_keeps_as_its_beginning()
+            throws Exception {
+        // Arrange: a client that may publish to its own topics and subscribe to its own orders.
+        Authenticator scoped = _ -> Authenticator.Decision.accept(Authenticator.Scope.of(
+                List.of(new TopicFilter("fleet/robot/#")),
+                List.of(new TopicFilter("orders/robot/#"))
+        ));
+        String topic = "fleet/" + "x".repeat(ClientActivity.MAX_TEXT);
+        String filter = "orders/" + "y".repeat(ClientActivity.MAX_TEXT);
+        try (MqttBroker sut = MqttBroker.builder()
+                .authenticator(scoped)
+                .recordClientActivity()
+                .start();
+                RawSession robot = connected(sut.port(), "robot")) {
+            // Act: a long topic and a long filter outside the scope, and a topic within it.
+            robot.publish(topic, "astray", AT_LEAST_ONCE, 1);
+            robot.publish("fleet/robot/state", "fine", AT_LEAST_ONCE, 2);
+            robot.send(new Packet.Subscribe(
+                    3,
+                    List.of(subscription(filter, AT_LEAST_ONCE)),
+                    EMPTY
+            ));
+            robot.expect(Packet.SubAck.class);
+
+            // Assert
+            await().untilAsserted(() -> {
+                ConnectedClient.Activity did = activityOf(sut, "robot");
+                assertThat(did.lastTopic()).contains("fleet/robot/state");
+                assertThat(did.lastTopicTruncated()).isFalse();
+                assertThat(did.lastRefusedTopic())
+                        .contains(topic.substring(0, ClientActivity.MAX_TEXT));
+                assertThat(did.lastRefusedTopicTruncated()).isTrue();
+                assertThat(did.lastRefusedFilter())
+                        .contains(filter.substring(0, ClientActivity.MAX_TEXT));
+                assertThat(did.lastRefusedFilterTruncated()).isTrue();
+            });
+        }
+    }
+
+    @Test
     @SuppressWarnings("try") // The test closes the broker itself; closing it again does nothing.
     void a_broker_that_has_ended_serves_no_client() throws Exception {
         try (MqttBroker sut = MqttBroker.start(); RawSession _ = connected(sut.port(), "robot")) {
@@ -432,12 +622,30 @@ class BrokerClientsTest {
                 .orElseThrow(() -> new AssertionError(clientId + " is not in the list"));
     }
 
+    /// What the client `clientId` in the list of `broker` has done, which the broker records.
+    private static ConnectedClient.Activity activityOf(MqttBroker broker, String clientId) {
+        return listed(broker, clientId).activity()
+                .orElseThrow(() -> new AssertionError("no activity of " + clientId));
+    }
+
     /// What the server holds of the client `clientId`, which its list must show.
     private static BrokerServer.ClientValues listedValues(BrokerServer server, String clientId) {
         return server.clients().stream()
                 .filter(client -> client.connection().clientId().equals(clientId))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError(clientId + " is not in the list"));
+    }
+
+    /// What the client `clientId` in the list of `server` has done, which the server records.
+    private static BrokerServer.ActivityValues activityValuesOf(
+            BrokerServer server,
+            String clientId
+    ) {
+        BrokerServer.ActivityValues activity = listedValues(server, clientId).activity();
+        if (activity == null) {
+            throw new AssertionError("no activity of " + clientId);
+        }
+        return activity;
     }
 
     /// A builder of a broker that runs the step that `step` holds each time its list is about to

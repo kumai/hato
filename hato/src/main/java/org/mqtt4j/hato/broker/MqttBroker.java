@@ -179,9 +179,11 @@ import static java.util.Objects.requireNonNull;
 ///
 /// The [BrokerListener] hears of each client that the broker accepts, and of the end of its
 /// connection with the reason. [#clients()] lists the clients that the broker serves, with their
-/// subscriptions. [#disconnect(String)] closes the connection of a client, and
-/// [#disconnect(BrokerListener.Connection)] a connection that the listener heard of or the list
-/// showed. [#stats()] counts the clients, sessions, retained messages, and deliveries.
+/// subscriptions, and with what each has done on its connection if
+/// [MqttBrokerBuilder#recordClientActivity()] has the broker record it. [#disconnect(String)]
+/// closes the connection of a client, and [#disconnect(BrokerListener.Connection)] a connection
+/// that the listener heard of or the list showed. [#stats()] counts the clients, sessions,
+/// retained messages, and deliveries.
 ///
 /// ## Ending
 ///
@@ -339,13 +341,15 @@ public final class MqttBroker implements AutoCloseable {
     }
 
     /// Reads the clients that the broker serves now, the ones that [#stats()] counts as its
-    /// connections; see [ConnectedClient]. It reads them without stopping the broker's work, so
-    /// each value is as it was a moment ago: the list can still hold a client whose connection
-    /// has just ended, and leave out one that is connecting again at that moment. It holds each
-    /// client once. A call takes time in proportion to the sessions that the broker holds and to
-    /// the subscriptions of the clients that it serves, including those that the list leaves out,
-    /// and memory in proportion to those clients and their subscriptions. Once the broker has
-    /// ended, it serves no client.
+    /// connections; see [ConnectedClient]. A broker that
+    /// [records the activity of its clients][MqttBrokerBuilder#recordClientActivity()] shows what
+    /// each has done on its connection as well. It reads them without stopping the broker's work,
+    /// so each value is as it was a moment ago: the list can still hold a client whose
+    /// connection has just ended, and leave out one that is connecting again at that moment. It
+    /// holds each client once. A call takes time in proportion to the sessions that the broker
+    /// holds and to the subscriptions of the clients that it serves, including those that the
+    /// list leaves out, and memory in proportion to those clients and their subscriptions.
+    /// Once the broker has ended, it serves no client.
     ///
     /// @return
     ///   the clients that the broker serves, in no particular order

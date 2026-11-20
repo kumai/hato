@@ -10,6 +10,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.jspecify.annotations.Nullable;
 
@@ -160,6 +161,12 @@ final class Connection {
     // Where the loop counts the PUBLISH packets that it reads and writes.
     private final Traffic traffic;
 
+    // The PUBLISH packets that the loop has written to this connection, for the list of clients,
+    // on a broker that records the activity of its clients; null on one that does not. Only the
+    // loop's thread counts, as for Traffic. The count is apart from what the session's actor
+    // records of the client, so that the two threads do not write to the same object.
+    private final @Nullable AtomicLong deliveriesWritten;
+
     private boolean writingLast;
 
     // Remaining state is guarded by this connection's monitor.
@@ -235,6 +242,7 @@ final class Connection {
         );
         lastReceived = scheduler.nanoTime();
         receiveTimeout = settings.connectTimeout();
+        deliveriesWritten = settings.recordsActivity() ? new AtomicLong() : null;
         client = new Client(this, routing);
         loop = wire.loop();
         traffic = loop.traffic();
@@ -258,6 +266,12 @@ final class Connection {
     // Called on the selector once the client has sent its CONNECT.
     List<X509Certificate> clientCertificates() {
         return wire.clientCertificates();
+    }
+
+    // How many PUBLISH packets the loop has written to this connection, as it was a moment ago,
+    // on a broker that records the activity of its clients; 0 on one that does not. Any thread.
+    long deliveriesWritten() {
+        return (deliveriesWritten == null) ? 0 : deliveriesWritten.getAcquire();
     }
 
     // Refuses the packets after this point that are larger than `maximumPacketSize`: the
@@ -963,6 +977,10 @@ final class Connection {
         }
         if (!writingSkips) {
             traffic.delivered(writingDeliveries);
+            if (deliveriesWritten != null) {
+                long written = writingDeliveries[0] + writingDeliveries[1] + writingDeliveries[2];
+                deliveriesWritten.setRelease(deliveriesWritten.getPlain() + written);
+            }
         }
         Arrays.fill(writingDeliveries, 0);
         boolean resume;

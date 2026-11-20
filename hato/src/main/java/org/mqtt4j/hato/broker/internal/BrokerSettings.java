@@ -33,7 +33,9 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // pool. The capabilities are what the broker announces to MQTT 5.0 clients until a test
 // changes them, within its own limits. The application's listener, if there is one, hears of
 // the clients that connect and disconnect and of the QoS 1 and 2 deliveries that the limits keep
-// from a session (see Notices). The application's authenticator, if there is one, decides on
+// from a session (see Notices). `recordsActivity` has each connection record what its client
+// does there, for the application's list of clients (see ClientActivity); without it, the
+// connections record nothing for it. The application's authenticator, if there is one, decides on
 // every CONNECT; a decision may take `authenticationTimeout` nanoseconds, and at most
 // `maxAuthentications` run at once, while further CONNECTs wait for one of them to end. At most
 // `maxTlsTasks` threads run the delegated tasks of the TLS handshakes, if the broker has a TLS
@@ -91,6 +93,7 @@ record BrokerSettings(
         int actors,
         Capabilities capabilities,
         @Nullable BrokerListener listener,
+        boolean recordsActivity,
         @Nullable Authenticator authenticator,
         long authenticationTimeout,
         int maxAuthentications,

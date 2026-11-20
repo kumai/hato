@@ -456,11 +456,13 @@ final class Routing {
             List<Packet.Subscription> subscriptions = session.subscriptions();
             long queued = session.queued();
             if (session.connection == peer) {
+                ClientActivity activity = peer.client.activity();
                 return new BrokerServer.ClientValues(
                         reported,
                         Math.max(0, now - peer.client.acceptedAt()),
                         subscriptions,
-                        queued
+                        queued,
+                        (activity == null) ? null : activity.values(now, peer.deliveriesWritten())
                 );
             }
         }

@@ -631,6 +631,7 @@ class DistributionTest {
                 "org.mqtt4j.hato.broker.BrokerListener$DisconnectReason",
                 "org.mqtt4j.hato.broker.BrokerStats",
                 "org.mqtt4j.hato.broker.ConnectedClient",
+                "org.mqtt4j.hato.broker.ConnectedClient$Activity",
                 "org.mqtt4j.hato.broker.ConnectedClient$Subscription",
                 "org.mqtt4j.hato.broker.MqttBroker",
                 "org.mqtt4j.hato.broker.MqttBrokerBuilder"

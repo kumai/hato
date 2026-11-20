@@ -134,6 +134,11 @@ final class Client {
     // of the client in their order.
     private boolean told;
 
+    // What the client sends on this connection, for the list of clients, on a broker that records
+    // the activity of its clients; null on one that does not, so that such a broker does no work
+    // for it as it handles a publication. The session's actor writes it.
+    private final @Nullable ClientActivity activity;
+
     // The task in the queue of the authentication pool that is to decide on the client's
     // CONNECT, or null. The connection takes it out of the queue as soon as it stops waiting for
     // the decision, at its deadline or its end, so that the queue holds the CONNECTs that still
@@ -145,6 +150,7 @@ final class Client {
         this.connection = connection;
         this.routing = routing;
         settings = routing.settings;
+        activity = settings.recordsActivity() ? new ClientActivity() : null;
     }
 
     // Checks CONNECT on the selector and reports through `done` whether the session attached.
@@ -848,6 +854,11 @@ final class Client {
         return reported == object;
     }
 
+    // What the client has sent on this connection, or null on a broker that does not record it.
+    @Nullable ClientActivity activity() {
+        return activity;
+    }
+
     // Tells the listener that this connection has ended, once, if it heard that the connection
     // connected. A closing broker tells nothing. Runs on the actor, after the connection's end:
     // as the end reaches the session, or as another connection takes the session over.
@@ -965,6 +976,9 @@ final class Client {
                             case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
                             case V5 -> ReasonCode.NOT_AUTHORIZED;
                         };
+                        if (activity != null) {
+                            activity.refusedSubscription(requested.filter());
+                        }
                         continue;
                     }
                     // A test rule can refuse the filter, which then subscribes to nothing
@@ -1144,9 +1158,13 @@ final class Client {
     }
 
     // Forwards a publication from the client, which the broker received at `received` by its
-    // clock, and acknowledges it. Only a server sets Subscription Identifiers. MQTT 3.1.1 has no
-    // properties.
+    // clock, and acknowledges it. The record of the client's activity, if the broker keeps one,
+    // notes the publication first, whatever becomes of it. Only a server sets Subscription
+    // Identifiers. MQTT 3.1.1 has no properties.
     private void receive(Session owner, Packet.Publish publish, long received) {
+        if (activity != null) {
+            activity.received(publish.topic(), received);
+        }
         if (publish.properties().find(PropertyId.SUBSCRIPTION_IDENTIFIER).isPresent()) {
             throw new PacketDecodeException(
                     ReasonCode.PROTOCOL_ERROR,
@@ -1204,6 +1222,9 @@ final class Client {
         // QoS 2 publication, whose exchange ends with the refusal [MQTT-4.3.3-9].
         if (!scope.permitsPublish(publish.topic())) {
             routing.refusedPublication();
+            if (activity != null) {
+                activity.refusedPublication(publish.topic());
+            }
             refuse(owner, publish, OUTSIDE_SCOPE);
             return;
         }
