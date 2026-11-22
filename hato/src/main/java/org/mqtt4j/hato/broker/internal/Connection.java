@@ -244,6 +244,12 @@ final class Connection {
         return wire.remoteAddress();
     }
 
+    // The peer, as logs name it: the address that it connects from, or that it is a client in
+    // the same JVM, which has no address.
+    Object peer() {
+        return wire.peer();
+    }
+
     // Whether the client runs in the same JVM.
     boolean inProcess() {
         return wire.inProcess();

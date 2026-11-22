@@ -346,7 +346,7 @@ final class Client {
                             routing.port, task.asked.clientId(), failure);
                 } else {
                     log.warn("Broker on port {} could not decide on client {} from {}",
-                            routing.port, task.asked.clientId(), connection.remoteAddress(),
+                            routing.port, task.asked.clientId(), connection.peer(),
                             failure);
                 }
             } finally {
@@ -453,7 +453,7 @@ final class Client {
                     (announced == null) ? settings.maxPacketSize() : announced
             );
             log.info("Broker accepted client {} from {} on port {}",
-                    acceptance.id, connection.remoteAddress(), routing.port);
+                    acceptance.id, connection.peer(), routing.port);
             done.accept(true);
         });
     }
@@ -536,7 +536,7 @@ final class Client {
                 // delivery and whether the resend carries the DUP flag.
                 previous.disconnect(
                         ReasonCode.SESSION_TAKEN_OVER,
-                        "taken over by " + connection.remoteAddress(),
+                        "taken over by " + connection.peer(),
                         DisconnectReason.TAKEN_OVER
                 );
                 previous.client.holdsPlace = false;
