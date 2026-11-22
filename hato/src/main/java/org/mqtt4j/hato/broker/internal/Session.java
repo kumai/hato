@@ -381,6 +381,18 @@ final class Session {
         return atMostOnceQueue.count + acknowledgedQueue.count + retainedRoom.count;
     }
 
+    // The subscriptions of the session, each with the QoS that the broker granted, in the order
+    // that the client made them. Read without the inbox, as queued() is: a change replaces the
+    // map of subscriptions as a whole, which is never changed once set.
+    List<Packet.Subscription> subscriptions() {
+        Map<String, Subscribed> current = subscriptions;
+        var made = new ArrayList<Packet.Subscription>(current.size());
+        for (Subscribed subscribed : current.values()) {
+            made.add(subscribed.subscription());
+        }
+        return made;
+    }
+
     // Posts `event`, which the actor runs after those posted before. If the turn is free, the
     // calling thread takes it and runs up to `inPlace` events here, and a pool thread runs the
     // rest, or all of them for ELSEWHERE. While the turn is taken, also by the calling thread,
@@ -2485,6 +2497,10 @@ final class Session {
     void clear() {
         int unaccounted;
         synchronized (this) {
+            // The connection goes first, so that a thread that reads the session without the
+            // inbox, as the list of clients does, never finds it with the subscriptions that the
+            // clearing drops below, as if its client had dropped them.
+            connection = null;
             Map<String, Subscribed> ended = subscriptions;
             subscriptions = Map.of();
             for (Subscribed subscribed : ended.values()) {
@@ -2499,7 +2515,6 @@ final class Session {
             cursors.clear();
             retainedRoom.clear();
             notedRetained = false;
-            connection = null;
             for (Outgoing outgoing : inflight.values()) {
                 if (outgoing instanceof Delivery delivery && delivery.hasRoom) {
                     giveRoom(delivery);

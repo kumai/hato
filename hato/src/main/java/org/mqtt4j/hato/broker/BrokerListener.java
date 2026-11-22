@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Optional;
 
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Topic;
 
 /// Receives the notifications of a broker, apart from the broker's I/O and the handling of its
 /// clients: a listener that takes its time delays only its own later notifications. The calls
@@ -86,9 +87,9 @@ public interface BrokerListener {
     }
 
     /// A connection of a client, as the broker reports it. The broker passes the same object to
-    /// both notifications of a connection, and the object has no equality of its own.
-    /// [MqttBroker#disconnect(BrokerListener.Connection)] closes the connection that the object
-    /// stands for. A listener's tests can implement this interface.
+    /// both notifications of a connection and shows it in [MqttBroker#clients()], and the object
+    /// has no equality of its own. [MqttBroker#disconnect(BrokerListener.Connection)] closes the
+    /// connection that the object stands for. A listener's tests can implement this interface.
     interface Connection {
 
         /// {@return the identifier of the client, which the broker assigns to an MQTT 5.0 client
@@ -106,6 +107,12 @@ public interface BrokerListener {
 
         /// {@return the MQTT version of the connection}
         MqttVersion version();
+
+        /// {@return the topic of the Will in the client's CONNECT, if the CONNECT had a Will}
+        /// The topic stays with the connection whether the Will goes out or not.
+        default Optional<Topic> willTopic() {
+            return Optional.empty();
+        }
 
         /// {@return whether the client connected to the broker's TLS listener}
         default boolean overTls() {

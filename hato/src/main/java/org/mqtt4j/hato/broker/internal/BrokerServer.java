@@ -410,6 +410,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private @Nullable BrokerListener listener;
 
+        private boolean recordActivity;
+
         private @Nullable Authenticator authenticator;
 
         private Duration authenticationTimeout = AUTHENTICATION_TIMEOUT;
@@ -435,6 +437,8 @@ public final class BrokerServer implements AutoCloseable {
         private Consumer<String> beforeAttach = _ -> { };
 
         private Consumer<String> afterLeave = _ -> { };
+
+        private Consumer<String> whileListing = _ -> { };
 
         private Runnable beforeAcceptingStarts = () -> { };
 
@@ -607,6 +611,12 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        /// Has the connections record what their clients do, for the list of clients.
+        public Builder recordActivity() {
+            recordActivity = true;
+            return this;
+        }
+
         Builder scheduler(Timer value) {
             scheduler = requireNonNull(value, "scheduler must not be null");
             return this;
@@ -667,6 +677,11 @@ public final class BrokerServer implements AutoCloseable {
 
         Builder afterLeave(Consumer<String> value) {
             afterLeave = requireNonNull(value, "afterLeave must not be null");
+            return this;
+        }
+
+        Builder whileListing(Consumer<String> value) {
+            whileListing = requireNonNull(value, "whileListing must not be null");
             return this;
         }
 
@@ -758,6 +773,7 @@ public final class BrokerServer implements AutoCloseable {
                     actors,
                     capabilities,
                     listener,
+                    recordActivity,
                     authenticator,
                     authenticationTimeout.toNanos(),
                     maxAuthentications,
@@ -772,6 +788,7 @@ public final class BrokerServer implements AutoCloseable {
                     beforeTakeOver,
                     beforeAttach,
                     afterLeave,
+                    whileListing,
                     beforeAcceptingStarts
             );
             // The name first, so that a broker whose name another one holds binds no port.
@@ -1528,6 +1545,12 @@ public final class BrokerServer implements AutoCloseable {
         return routing.indexedFor(topic);
     }
 
+    // Runs `whileHeld` holding the index of subscriptions, which a session that changes its
+    // subscriptions, as one that is cleared does, waits for, for tests.
+    void holdingIndex(Runnable whileHeld) {
+        routing.holdingIndex(whileHeld);
+    }
+
     /// What the broker counts, for MqttBroker.stats(). Once the broker has ended, it holds
     /// nothing, whatever its parts have yet to let go of, and its lifetime counts stay.
     public Counts counts() {
@@ -1555,6 +1578,15 @@ public final class BrokerServer implements AutoCloseable {
                 routing.refusedPublications(),
                 (notices == null) ? 0 : notices.droppedNotices()
         );
+    }
+
+    /// The clients that the broker serves now, for MqttBroker.clients(), in no particular order.
+    /// Once the broker has ended, it serves none.
+    public List<ClientValues> clients() {
+        if (routing.closed) {
+            return List.of();
+        }
+        return routing.clients(routing.settings.scheduler().nanoTime());
     }
 
     /// Ends the open connection of `clientId` for an administrative reason, which an MQTT 5.0
@@ -1644,6 +1676,41 @@ public final class BrokerServer implements AutoCloseable {
             long[] dropped,
             long refusedPublications,
             long droppedNotices
+    ) {
+    }
+
+    /// What the broker holds of one client that it serves, for MqttBroker.clients(): its
+    /// connection as the broker reports it, how long ago the broker accepted the connection in
+    /// nanoseconds, the subscriptions of its session in the order made, the deliveries that wait
+    /// in its session, and what it has done on the connection, or null for a broker that does not
+    /// record the activity of its clients.
+    public record ClientValues(
+            BrokerListener.Connection connection,
+            long connectedNanos,
+            List<Packet.Subscription> subscriptions,
+            long queuedDeliveries,
+            @Nullable ActivityValues activity
+    ) {
+    }
+
+    /// What the client of one connection has done there: the PUBLISH packets that the broker
+    /// took from it and the topic of the last one, which is null before the first, and how long
+    /// ago that came in nanoseconds, which means nothing before the first; the PUBLISH packets
+    /// that the broker wrote to it; and the publications and subscriptions that its scope
+    /// refused, with the topic and the filter of the last ones. Each topic or filter is followed
+    /// by whether ClientActivity cut it, in which case it is the beginning of a longer one.
+    public record ActivityValues(
+            long received,
+            @Nullable String lastTopic,
+            boolean lastTopicTruncated,
+            long sinceLastReceivedNanos,
+            long delivered,
+            long refusedPublications,
+            @Nullable String lastRefusedTopic,
+            boolean lastRefusedTopicTruncated,
+            long refusedSubscriptions,
+            @Nullable String lastRefusedFilter,
+            boolean lastRefusedFilterTruncated
     ) {
     }
 }

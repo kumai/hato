@@ -17,12 +17,13 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
 
 /// How the application closes the connection of a client, by its identifier or as the listener
-/// heard of it, and what the client keeps of its session.
+/// or the list of clients reported it, and what the client keeps of its session.
 class BrokerDisconnectTest {
 
     // The connections that the listener heard of, in the order of its calls.
@@ -101,6 +102,25 @@ class BrokerDisconnectTest {
                 RawSession client = connectedV5(sut.port(), "robot")) {
             // Arrange
             BrokerListener.Connection connection = nextConnection();
+
+            // Act
+            boolean disconnected = sut.disconnect(connection);
+
+            // Assert
+            assertThat(disconnected).isTrue();
+            assertThat(client.expect(Packet.Disconnect.class).reasonCode())
+                    .isEqualTo(ReasonCode.ADMINISTRATIVE_ACTION);
+            client.expectClosed();
+        }
+    }
+
+    @Test
+    void the_application_closes_a_connection_that_the_list_of_clients_showed() throws Exception {
+        try (MqttBroker sut = MqttBroker.start();
+                RawSession client = connectedV5(sut.port(), "robot")) {
+            // Arrange: a broker without a listener, whose list shows the connection.
+            await().until(() -> sut.clients().size() == 1);
+            BrokerListener.Connection connection = sut.clients().getFirst().connection();
 
             // Act
             boolean disconnected = sut.disconnect(connection);

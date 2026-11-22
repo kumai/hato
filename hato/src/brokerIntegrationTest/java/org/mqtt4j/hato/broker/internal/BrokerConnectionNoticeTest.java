@@ -16,13 +16,16 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import org.mqtt4j.hato.MqttClient;
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
+import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.broker.Authenticator;
 import org.mqtt4j.hato.broker.BrokerListener;
 import org.mqtt4j.hato.broker.BrokerListener.DisconnectReason;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mqtt4j.hato.broker.BrokerListener.DisconnectReason.APPLICATION;
@@ -158,6 +161,41 @@ class BrokerConnectionNoticeTest {
                 assertThat(aliceEnded.reason()).isEqualTo(TAKEN_OVER);
                 assertThat(bobConnected.connection().username()).contains("bob");
                 assertThat(bobConnected.connection().toString()).doesNotContain("bob");
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void the_notice_of_a_connection_carries_the_topic_of_its_will(MqttVersion version)
+            throws Exception {
+        try (BrokerServer sut = broker(); RawSession robot = RawSession.open(sut.port(), version)) {
+            // Act: a client with a Will, and then one without.
+            robot.send(new Packet.Connect(
+                    "robot",
+                    version,
+                    true,
+                    0,
+                    new Packet.Will(
+                            new Topic("fleet/robot/connection"),
+                            "lost".getBytes(UTF_8),
+                            Qos.AT_LEAST_ONCE,
+                            false,
+                            Properties.EMPTY
+                    ),
+                    null,
+                    null,
+                    Properties.EMPTY
+            ));
+            robot.expect(Packet.ConnAck.class);
+            Heard withWill = next();
+            try (RawSession _ = connectedOf(sut.port(), "other", version)) {
+                Heard withoutWill = next();
+
+                // Assert
+                assertThat(withWill.connection().willTopic())
+                        .contains(new Topic("fleet/robot/connection"));
+                assertThat(withoutWill.connection().willTopic()).isEmpty();
             }
         }
     }

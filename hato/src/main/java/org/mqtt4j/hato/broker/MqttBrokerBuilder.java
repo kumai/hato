@@ -349,6 +349,22 @@ public final class MqttBrokerBuilder {
         return this;
     }
 
+    /// Has the broker record what each client does on its connection, which
+    /// [MqttBroker#clients()] then shows in [ConnectedClient#activity()]: the PUBLISH packets that
+    /// the client sends and those that the broker sends it, and the publications and
+    /// subscriptions that the client's scope refuses, with the topic and the filter of the last
+    /// ones. Without this, which is the default, the broker records none of it. Recording takes
+    /// a little time for each publication, and some memory for each connection: the broker keeps
+    /// no payload, and keeps a long topic or filter as its beginning, which the activity marks as
+    /// truncated.
+    ///
+    /// @return
+    ///   this builder
+    public MqttBrokerBuilder recordClientActivity() {
+        settings.recordActivity();
+        return this;
+    }
+
     /// Starts a broker with these settings. Each call starts another broker, independent of the
     /// others, with the settings at that time.
     ///
