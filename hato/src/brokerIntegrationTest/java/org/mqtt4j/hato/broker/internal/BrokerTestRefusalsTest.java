@@ -226,7 +226,7 @@ class BrokerTestRefusalsTest {
         try (BrokerServer sut = BrokerServer.start(loopback());
                 RawSession client = RawSession.open(sut.port(), MqttVersion.V5)) {
             // Arrange: one unanswered publication at a time, and a refusal that waits.
-            sut.announce(2, true, true, true, 1, 268_435_460, 16);
+            sut.announce(2, true, true, true, true, 1, 268_435_460, 16);
             client.send(connect("holding", EMPTY));
             client.expect(Packet.ConnAck.class);
             sut.holdResponses(Packet.PubRec.class, "holding");

@@ -15,9 +15,9 @@ import static java.util.Objects.requireNonNull;
 /// The broker refuses an MQTT 5.0 connection whose Will the capabilities forbid, and ends a
 /// connection that sends what they forbid, with the reason code that MQTT 5.0 defines for it.
 /// CONNACK leaves out each capability whose value is what MQTT 5.0 assumes without it: QoS 2,
-/// retained messages, wildcard subscriptions, and Subscription Identifiers available, a Receive
-/// Maximum of 65,535, the largest packet that MQTT allows, and no Topic Aliases. Whatever the
-/// value, the broker announces that it does not support shared subscriptions.
+/// retained messages, wildcard subscriptions, Subscription Identifiers, and shared subscriptions
+/// available, a Receive Maximum of 65,535, the largest packet that MQTT allows, and no Topic
+/// Aliases. An MQTT 3.1.1 client learns of no capability and is held to none.
 ///
 /// Experimental, like [BrokerControls].
 public final class BrokerCapabilities {
@@ -28,6 +28,7 @@ public final class BrokerCapabilities {
 
     private static final BrokerCapabilities DEFAULTS = new BrokerCapabilities(
             Qos.EXACTLY_ONCE,
+            true,
             true,
             true,
             true,
@@ -44,6 +45,8 @@ public final class BrokerCapabilities {
 
     private final boolean subscriptionIdentifiersAvailable;
 
+    private final boolean sharedSubscriptionAvailable;
+
     private final int receiveMaximum;
 
     private final int maximumPacketSize;
@@ -55,6 +58,7 @@ public final class BrokerCapabilities {
             boolean retainAvailable,
             boolean wildcardSubscriptionAvailable,
             boolean subscriptionIdentifiersAvailable,
+            boolean sharedSubscriptionAvailable,
             int receiveMaximum,
             int maximumPacketSize,
             int topicAliasMaximum
@@ -63,6 +67,7 @@ public final class BrokerCapabilities {
         this.retainAvailable = retainAvailable;
         this.wildcardSubscriptionAvailable = wildcardSubscriptionAvailable;
         this.subscriptionIdentifiersAvailable = subscriptionIdentifiersAvailable;
+        this.sharedSubscriptionAvailable = sharedSubscriptionAvailable;
         this.receiveMaximum = receiveMaximum;
         this.maximumPacketSize = maximumPacketSize;
         this.topicAliasMaximum = topicAliasMaximum;
@@ -89,6 +94,7 @@ public final class BrokerCapabilities {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -106,6 +112,7 @@ public final class BrokerCapabilities {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -125,6 +132,7 @@ public final class BrokerCapabilities {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -145,6 +153,28 @@ public final class BrokerCapabilities {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
+                receiveMaximum,
+                maximumPacketSize,
+                topicAliasMaximum
+        );
+    }
+
+    /// {@return a copy in which a client may make shared subscriptions, `$share/{group}/{filter}`,
+    /// if `sharedSubscriptionAvailable` is `true`, or may not if it is `false`} Like every
+    /// capability, it holds only for MQTT 5.0 clients: an MQTT 3.1.1 client may still make shared
+    /// subscriptions, and [BrokerControls#refuseSubscriptions(org.mqtt4j.hato.TopicFilter)]
+    /// refuses a filter for it instead.
+    ///
+    /// @param sharedSubscriptionAvailable
+    ///   whether a client may make shared subscriptions
+    public BrokerCapabilities withSharedSubscriptionAvailable(boolean sharedSubscriptionAvailable) {
+        return new BrokerCapabilities(
+                maximumQos,
+                retainAvailable,
+                wildcardSubscriptionAvailable,
+                subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -168,6 +198,7 @@ public final class BrokerCapabilities {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -193,6 +224,7 @@ public final class BrokerCapabilities {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -215,6 +247,7 @@ public final class BrokerCapabilities {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -241,6 +274,11 @@ public final class BrokerCapabilities {
         return subscriptionIdentifiersAvailable;
     }
 
+    /// {@return `true` if a client may make shared subscriptions}
+    public boolean sharedSubscriptionAvailable() {
+        return sharedSubscriptionAvailable;
+    }
+
     /// {@return the number of QoS 1 and QoS 2 publications that a client may have unanswered at
     /// once}
     public int receiveMaximum() {
@@ -265,6 +303,7 @@ public final class BrokerCapabilities {
                 && retainAvailable == that.retainAvailable
                 && wildcardSubscriptionAvailable == that.wildcardSubscriptionAvailable
                 && subscriptionIdentifiersAvailable == that.subscriptionIdentifiersAvailable
+                && sharedSubscriptionAvailable == that.sharedSubscriptionAvailable
                 && receiveMaximum == that.receiveMaximum
                 && maximumPacketSize == that.maximumPacketSize
                 && topicAliasMaximum == that.topicAliasMaximum;
@@ -277,6 +316,7 @@ public final class BrokerCapabilities {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum
@@ -289,6 +329,7 @@ public final class BrokerCapabilities {
                 + ", retainAvailable=" + retainAvailable
                 + ", wildcardSubscriptionAvailable=" + wildcardSubscriptionAvailable
                 + ", subscriptionIdentifiersAvailable=" + subscriptionIdentifiersAvailable
+                + ", sharedSubscriptionAvailable=" + sharedSubscriptionAvailable
                 + ", receiveMaximum=" + receiveMaximum
                 + ", maximumPacketSize=" + maximumPacketSize
                 + ", topicAliasMaximum=" + topicAliasMaximum + "]";

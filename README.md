@@ -1234,6 +1234,10 @@ Authenticator authenticator = request -> {
   publication outside the scope reaches no subscriber, and an MQTT 5.0 client learns of it
   from the acknowledgement of a QoS 1 or 2 publication; a subscription outside it is refused.
   `Scope.all()` allows everything.
+- A shared subscription takes part of the messages that its group receives, so a scope allows
+  none unless you pass the ones that the client may join as a third list:
+  `Scope.of(publish, subscribe, List.of(new TopicFilter("$share/+/jobs/#")))` lets it join any
+  group's shared subscription within `jobs/#`.
 - The broker ties no client identifier to a user: a client that the authenticator accepts takes
   over the session of its identifier, with the messages that wait there within its scope,
   whoever used the identifier before. So check that the client may use its identifier, as the
@@ -1286,11 +1290,9 @@ The broker supports MQTT 3.1.1 and 5.0 with:
 - Retained messages and Wills
 - Sessions that outlive their connections
 - The MQTT 5.0 subscription options, message expiry, and Will delay
+- Shared subscriptions, `$share/{group}/{filter}`, also from MQTT 3.1.1 clients
 
-It does not support:
-
-- Shared subscriptions, which it tells MQTT 5.0 clients as they connect
-- MQTT 5.0 enhanced authentication
+It does not support MQTT 5.0 enhanced authentication.
 
 Everything lives in memory: sessions, retained messages, and the messages that wait for
 clients are lost when the broker stops, and an acknowledgement does not mean that a message has

@@ -6,9 +6,13 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
+import org.mqtt4j.hato.broker.internal.ScopeChecks;
+import org.mqtt4j.hato.internal.protocol.SharedTopicFilter;
 
 import static java.util.Objects.requireNonNull;
 
@@ -154,14 +158,30 @@ public interface Authenticator {
     /// - A subscription is made only if every topic that its filter matches is one that a filter
     ///   of the scope matches; a filter that only overlaps the scope subscribes to nothing.
     ///   SUBACK refuses it, in MQTT 5.0 with Not authorized and in MQTT 3.1.1 with failure 0x80.
+    /// - A shared subscription, `$share/{group}/{filter}`, is made only if a shared subscription
+    ///   that the scope allows names its group, or any group, and holds its filter in the same
+    ///   way. The subscribe filters of a scope allow no shared subscription, `$share/` ones
+    ///   included; [#of(Collection, Collection, Collection)] allows shared subscriptions, and
+    ///   [#all()] allows every one.
     /// - A CONNECT whose Will goes to a topic outside the scope is refused as not authorized.
     /// - When a client resumes a persistent session, the broker holds the session to the
     ///   client's scope as well: the session's subscriptions outside the scope end, and the
     ///   messages that wait for the client, those that it has not acknowledged included, go
-    ///   unless the scope would let it subscribe to their topics.
+    ///   unless the scope would let it subscribe to their topics, or, for a message of a shared
+    ///   subscription, make that group's shared subscription to its topic.
     final class Scope {
 
-        private static final Scope ALL = new Scope(true, List.of(), List.of());
+        private static final Scope ALL = new Scope(true, List.of(), List.of(), List.of());
+
+        private static final String SHARE_PREFIX = "$share/";
+
+        // The broker holds a session that a client resumes to its scope, and keeps a message of a
+        // shared subscription that waits there if the scope lets the client make a shared
+        // subscription of that group to its topic. No filter can hold both a long group and a
+        // long topic, so the broker asks with them apart, which no public check does.
+        static {
+            ScopeChecks.register(Scope::permitsShare);
+        }
 
         // Whether the scope has no limits, which its filters cannot say: a filter that starts
         // with a wildcard matches no topic that starts with '$'.
@@ -171,28 +191,72 @@ public interface Authenticator {
 
         private final List<TopicFilter> subscribe;
 
-        private Scope(boolean all, List<TopicFilter> publish, List<TopicFilter> subscribe) {
+        // The shared subscriptions that the scope allows, as the application wrote them and as
+        // the group and the filter that each one allows.
+        private final List<TopicFilter> share;
+
+        private final List<SharePermission> permissions;
+
+        private Scope(
+                boolean all,
+                List<TopicFilter> publish,
+                List<TopicFilter> subscribe,
+                List<TopicFilter> share
+        ) {
             this.all = all;
             this.publish = publish;
             this.subscribe = subscribe;
+            this.share = share;
+            permissions = share.stream().map(Scope::permission).toList();
         }
 
-        /// {@return a scope that lets the client publish to every topic and subscribe to every
-        /// filter, as a broker without an authenticator lets every client}
+        /// {@return a scope that lets the client publish to every topic, subscribe to every
+        /// filter, and make every shared subscription, as a broker without an authenticator lets
+        /// every client}
         public static Scope all() {
             return ALL;
         }
 
         /// {@return a scope that lets the client publish to the topics that a filter of `publish`
         /// matches, and subscribe to the filters that lie within a filter of `subscribe`} Either
-        /// may be empty, which allows no publication or no subscription.
+        /// may be empty, which allows no publication or no subscription. The scope allows no
+        /// shared subscription, whatever `subscribe` holds; [#of(Collection, Collection,
+        /// Collection)] allows those.
         ///
         /// @param publish
         ///   the filters of the topics that the client may publish to
         /// @param subscribe
         ///   the filters within which the client may subscribe
         public static Scope of(Collection<TopicFilter> publish, Collection<TopicFilter> subscribe) {
-            return new Scope(false, List.copyOf(publish), List.copyOf(subscribe));
+            return new Scope(false, List.copyOf(publish), List.copyOf(subscribe), List.of());
+        }
+
+        /// {@return a scope as [#of(Collection, Collection)] makes it that also lets the client
+        /// make the shared subscriptions that `share` allows} Each filter of `share` has the form
+        /// `$share/{group}/{filter}`, where `{group}` is a group name or `+` for any group. The
+        /// client may then make a shared subscription to that group whose filter lies within
+        /// `{filter}`, compared as for an ordinary subscription: `$share/+/#` allows no shared
+        /// subscription to topics that start with `$`, as `#` allows no such subscription.
+        ///
+        /// @param publish
+        ///   the filters of the topics that the client may publish to
+        /// @param subscribe
+        ///   the filters within which the client may subscribe
+        /// @param share
+        ///   the shared subscriptions within which the client may make shared subscriptions
+        /// @throws IllegalArgumentException
+        ///   if a filter of `share` is not of the form `$share/{group}/{filter}`
+        public static Scope of(
+                Collection<TopicFilter> publish,
+                Collection<TopicFilter> subscribe,
+                Collection<TopicFilter> share
+        ) {
+            return new Scope(
+                    false,
+                    List.copyOf(publish),
+                    List.copyOf(subscribe),
+                    List.copyOf(share)
+            );
         }
 
         /// {@return whether the scope lets the client publish to `topic`}
@@ -215,8 +279,12 @@ public interface Authenticator {
             return false;
         }
 
-        /// {@return whether the scope lets the client subscribe to `filter`: whether every topic
-        /// that `filter` matches is one that a filter of the scope matches}
+        /// {@return whether the scope lets the client subscribe to `filter`} For an ordinary
+        /// filter: whether every topic that it matches is one that a filter of the scope
+        /// matches. For a shared subscription, `$share/{group}/{filter}`: whether a shared
+        /// subscription that the scope allows names that group, or any group, and holds
+        /// `{filter}` in the same way; a filter that starts with `$share/` but is no valid shared
+        /// subscription is allowed by no scope but `all()`, which allows every filter.
         ///
         /// @param filter
         ///   the filter of a subscription
@@ -225,12 +293,64 @@ public interface Authenticator {
             if (all) {
                 return true;
             }
+            if (SharedTopicFilter.isShared(filter)) {
+                SharedTopicFilter requested;
+                try {
+                    requested = SharedTopicFilter.parse(filter).orElseThrow();
+                } catch (IllegalArgumentException _) {
+                    return false;
+                }
+                for (SharePermission permission : permissions) {
+                    if (permission.names(requested.shareName())
+                            && contains(permission.filter(), requested.filter())) {
+                        return true;
+                    }
+                }
+                return false;
+            }
             for (TopicFilter outer : subscribe) {
                 if (contains(outer, filter)) {
                     return true;
                 }
             }
             return false;
+        }
+
+        // Whether the scope lets the client make a shared subscription of `group` to the filter
+        // that matches `topic` alone, as permitsSubscribe() would answer for one that a filter
+        // could hold.
+        private boolean permitsShare(String group, Topic topic) {
+            if (all) {
+                return true;
+            }
+            for (SharePermission permission : permissions) {
+                if (permission.names(group) && permission.filter().matches(topic)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // What `written`, one of the shared subscriptions that a scope allows, allows: its
+        // group, or any group for '+', and its filter. TopicFilter keeps a wildcard to a whole
+        // level and a '#' to the last one, so a group level with a wildcard is '+'.
+        private static SharePermission permission(TopicFilter written) {
+            String pattern = written.pattern();
+            int start = SHARE_PREFIX.length();
+            int separator = pattern.indexOf('/', start);
+            if (!pattern.startsWith(SHARE_PREFIX)
+                    || separator <= start
+                    || separator == pattern.length() - 1) {
+                throw new IllegalArgumentException(
+                        "A shared subscription that a scope allows must be"
+                                + " $share/{group}/{filter}, not " + pattern
+                );
+            }
+            String group = pattern.substring(start, separator);
+            return new SharePermission(
+                    group.equals("+") ? null : group,
+                    new TopicFilter(pattern.substring(separator + 1))
+            );
         }
 
         // Whether every topic that `inner` matches is one that `outer` matches. The levels are
@@ -280,7 +400,17 @@ public interface Authenticator {
             if (all) {
                 return "Scope[all]";
             }
-            return "Scope[publish=" + publish + ", subscribe=" + subscribe + "]";
+            return "Scope[publish=" + publish + ", subscribe=" + subscribe + ", share=" + share
+                    + "]";
+        }
+
+        // A shared subscription that a scope allows: to the group, or to any group while it is
+        // null, and within the filter.
+        private record SharePermission(@Nullable String group, TopicFilter filter) {
+
+            boolean names(String requested) {
+                return group == null || group.equals(requested);
+            }
         }
     }
 }

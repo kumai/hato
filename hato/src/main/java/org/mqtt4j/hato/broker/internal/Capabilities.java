@@ -8,13 +8,14 @@ import static java.util.Objects.requireNonNull;
 
 // What the broker announces to an MQTT 5.0 client in CONNACK and then holds the client to: the
 // capabilities that a test can narrow. A null value is not announced, which MQTT 5.0 reads as no
-// limit, and so is a maximum QoS of 2, retained messages, wildcards, and Subscription
-// Identifiers. A connection keeps what it was accepted with.
+// limit, and so is a maximum QoS of 2, retained messages, wildcards, Subscription Identifiers,
+// and shared subscriptions. A connection keeps what it was accepted with.
 record Capabilities(
         Qos maximumQos,
         boolean retainAvailable,
         boolean wildcardSubscriptionAvailable,
         boolean subscriptionIdentifiersAvailable,
+        boolean sharedSubscriptionAvailable,
         @Nullable Integer receiveMaximum,
         @Nullable Integer maximumPacketSize,
         int topicAliasMaximum,
@@ -28,6 +29,7 @@ record Capabilities(
             true,
             true,
             true,
+            true,
             null,
             null,
             16,
@@ -35,9 +37,11 @@ record Capabilities(
     );
 
     // What an MQTT 3.1.1 connection works by: it learns of no limit, so none applies, and it has
-    // no Topic Aliases.
+    // no Topic Aliases. Shared subscriptions, which MQTT 3.1.1 does not define, stay available, as
+    // a test narrows only what MQTT 5.0 connections are told.
     static final Capabilities UNANNOUNCED = new Capabilities(
             Qos.EXACTLY_ONCE,
+            true,
             true,
             true,
             true,
@@ -67,6 +71,7 @@ record Capabilities(
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 (size == Connection.MAX_PACKET_SIZE) ? null : size,
                 topicAliasMaximum,
@@ -82,6 +87,7 @@ record Capabilities(
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 0,

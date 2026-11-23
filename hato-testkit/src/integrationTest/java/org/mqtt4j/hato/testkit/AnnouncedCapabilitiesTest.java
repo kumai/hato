@@ -37,6 +37,7 @@ class AnnouncedCapabilitiesTest {
                     .withRetainAvailable(false)
                     .withWildcardSubscriptionAvailable(false)
                     .withSubscriptionIdentifiersAvailable(false)
+                    .withSharedSubscriptionAvailable(false)
                     .withReceiveMaximum(7)
                     .withMaximumPacketSize(1_024)
                     .withTopicAliasMaximum(3);

@@ -29,6 +29,7 @@ class InprocBroker5RestrictedTest extends Mqtt5RestrictedSubscriptionsTest {
                 .withMaximumQos(Qos.AT_LEAST_ONCE)
                 .withRetainAvailable(false)
                 .withWildcardSubscriptionAvailable(false)
+                .withSharedSubscriptionAvailable(false)
                 .withReceiveMaximum(2)
                 .withMaximumPacketSize(512)
                 .withTopicAliasMaximum(0);

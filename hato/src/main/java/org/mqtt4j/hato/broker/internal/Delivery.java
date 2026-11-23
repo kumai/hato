@@ -3,6 +3,8 @@ package org.mqtt4j.hato.broker.internal;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.jspecify.annotations.Nullable;
+
 import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.Topic;
@@ -11,6 +13,8 @@ import org.mqtt4j.hato.internal.protocol.PacketCodec;
 import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.Property;
 import org.mqtt4j.hato.internal.protocol.PropertyId;
+
+import static java.util.Objects.requireNonNull;
 
 // One publication on its way to one session, sized for the session's protocol version. The
 // packet identifier belongs to the session's actor. Whether it was sent is set by the writer of
@@ -51,21 +55,33 @@ final class Delivery implements Outgoing, Pending {
     final int byteCount;
 
     // What the delivery holds on the heap beside its publication: itself, its places in its
-    // session's queue and window, and a sequence of properties of its own if it adds
-    // Subscription Identifiers to the publication's.
+    // session's queue and window, a sequence of properties of its own if it adds Subscription
+    // Identifiers to the publication's, and its shared subscription, if any, which may end while
+    // the delivery waits, and then no subscription of a session counts it any more. Each
+    // delivery of a shared subscription counts it whole, which errs towards counting more than
+    // the deliveries hold.
     final long ownBytes;
 
     // What the limits that bound memory count for the delivery: its publication, which it
     // shares with the publication's other deliveries, and what it holds beside.
     final long memoryBytes;
 
+    // The shared subscription that the delivery is for, or null for one that its session's own
+    // subscriptions call for. A session that resumes with a narrower scope keeps such a delivery
+    // if its scope lets it make that group's shared subscription to the topic, and a session
+    // that ends, or that its scope keeps from the delivery, passes it on to another member (see
+    // passOn and Session.passesOn). A publication that waits for a later turn to reach a member
+    // of a shared subscription waits as such a delivery as well (see Session.share).
+    final @Nullable SharedSubscription shared;
+
     // Where the delivery stands among what its session has queued: the session's number for
     // it, set under the session's inbox as the delivery comes to wait.
     long order;
 
     // Whether the delivery has room in the broker's memory for deliveries, which its session
-    // takes for it once it waits and gives back as it leaves the session. The session's, under
-    // its inbox.
+    // takes for it once it waits and gives back as it leaves the session, unless the delivery
+    // takes the room on with it to another member of its shared subscription (see
+    // Session.handOff). The session's, under its inbox.
     boolean hasRoom;
 
     // Whether the delivery took its room whatever the memory had left, rather than within the
@@ -73,6 +89,14 @@ final class Delivery implements Outgoing, Pending {
     // the memory has no room for it there. Such room goes back to the memory's shared count (see
     // Session.giveRoom). The session's, under its inbox.
     boolean roomTakenAnyway;
+
+    // The room that the delivery had within the memory's limit and takes on with it as it goes
+    // on to another member of its shared subscription, for the member's delivery to take over
+    // (see Session.handOff): what it holds itself, and its hold on its publication, which the
+    // publication's other deliveries share. The actor's that hands the delivery on.
+    boolean carriesOwnRoom;
+
+    boolean carriesPublication;
 
     int packetId;
 
@@ -85,11 +109,13 @@ final class Delivery implements Outgoing, Pending {
             Qos qos,
             boolean retain,
             List<Integer> identifiers,
-            MqttVersion version
+            MqttVersion version,
+            @Nullable SharedSubscription shared
     ) {
         this.publication = publication;
         this.memory = memory;
         this.received = received;
+        this.shared = shared;
         lifetime = lifetimeOf(publication);
         this.qos = qos;
         this.retain = retain;
@@ -104,7 +130,8 @@ final class Delivery implements Outgoing, Pending {
                 properties,
                 publication.payload().length
         );
-        ownBytes = ownSize(publication, identifiers, version);
+        ownBytes = ownSize(publication, identifiers, version)
+                + ((shared == null) ? 0 : shared.bytes);
         memoryBytes = memory.bytes() + ownBytes;
     }
 
@@ -138,6 +165,18 @@ final class Delivery implements Outgoing, Pending {
             );
         }
         return new Properties(entries);
+    }
+
+    // Hands the publication on to a member of the delivery's shared subscription, and returns
+    // what became of it (see SharedSubscription.deliver). The member makes a delivery of its own,
+    // at the QoS granted to it and with its own Subscription Identifier, while the publication
+    // keeps the time at which the broker received it, from which its Message Expiry Interval
+    // counts, and a member whose session has expired by `now`, the clock as the delivery goes on,
+    // takes none. A shared subscription that has ended has no member to take it, also when a later
+    // one of the same name has members.
+    SharedSubscription.Outcome passOn(long now) {
+        return requireNonNull(shared, "the shared subscription of the delivery")
+                .deliver(publication, memory, received, now);
     }
 
     // Whether the delivery waited its whole lifetime, after which it must not start

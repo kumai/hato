@@ -67,6 +67,11 @@ import org.mqtt4j.hato.internal.protocol.Packet;
 // session or the session table change in between. The starting broker runs
 // `beforeAcceptingStarts` just before it starts its accepting thread, so that what a test throws
 // there stands for a thread that could not start, after others did.
+//
+// A shared subscription calls `beforeLastShareStep` with its name before the last step of each
+// round in which it looks for a member to take a QoS 1 or QoS 2 publication, when it asks the
+// members that it has not asked yet whatever their connections, so that a test can have sessions
+// connect, join, or leave in between.
 record BrokerSettings(
         long connectTimeout,
         int maxAwaitingConnect,
@@ -105,6 +110,7 @@ record BrokerSettings(
         Runnable beforeSelect,
         AcceptHook beforeAccept,
         Consumer<String> beforeHandOver,
+        Consumer<String> beforeLastShareStep,
         Consumer<String> beforeTakeOver,
         Consumer<String> beforeAttach,
         Consumer<String> afterLeave,

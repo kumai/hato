@@ -104,7 +104,7 @@ class BrokerPacketSizeTest {
         try (BrokerServer sut = broker(64, 64);
                 RawSession client = RawSession.open(sut.port(), MqttVersion.V5)) {
             // Act: the test control announces 128 bytes to the clients from now on.
-            sut.announce(2, true, true, true, 65_535, 128, 16);
+            sut.announce(2, true, true, true, true, 65_535, 128, 16);
             client.send(connectV5("sized", true, 0, 0));
 
             // Assert
@@ -230,6 +230,7 @@ class BrokerPacketSizeTest {
     private static BrokerServer announcing(int maxPacketSize, int announced) throws IOException {
         var capabilities = new Capabilities(
                 EXACTLY_ONCE,
+                true,
                 true,
                 true,
                 true,

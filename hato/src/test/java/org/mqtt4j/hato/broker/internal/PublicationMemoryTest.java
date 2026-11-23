@@ -109,7 +109,8 @@ class PublicationMemoryTest {
                 Qos.AT_LEAST_ONCE,
                 false,
                 List.of(),
-                MqttVersion.V5
+                MqttVersion.V5,
+                null
         );
         var identified = new Delivery(
                 publication,
@@ -118,7 +119,8 @@ class PublicationMemoryTest {
                 Qos.AT_LEAST_ONCE,
                 false,
                 List.of(7),
-                MqttVersion.V5
+                MqttVersion.V5,
+                null
         );
 
         // Assert: the second holds a sequence of its own with a reference to each property,
@@ -126,6 +128,44 @@ class PublicationMemoryTest {
         assertThat(shared.ownBytes).isEqualTo(MemoryBudget.DELIVERY_BYTES);
         assertThat(identified.ownBytes - shared.ownBytes).isGreaterThanOrEqualTo(1001 * 4);
         assertThat(identified.memoryBytes).isEqualTo(memory.bytes() + identified.ownBytes);
+    }
+
+    @Test
+    void a_delivery_of_a_shared_subscription_counts_for_the_name_that_it_keeps() {
+        // Arrange: a shared subscription of a long name, which its deliveries keep after the
+        // subscriptions of the sessions that counted it have ended.
+        Packet.Publish publication = publication("jobs/1", 8, Properties.EMPTY);
+        var memory = new PublicationMemory(publication);
+        var subscription = new SharedSubscription(
+                "$share/" + "g".repeat(1000) + "/jobs/#",
+                _ -> { }
+        );
+
+        // Act
+        var ordinary = new Delivery(
+                publication,
+                memory,
+                0,
+                Qos.AT_LEAST_ONCE,
+                false,
+                List.of(),
+                MqttVersion.V5,
+                null
+        );
+        var shared = new Delivery(
+                publication,
+                memory,
+                0,
+                Qos.AT_LEAST_ONCE,
+                false,
+                List.of(),
+                MqttVersion.V5,
+                subscription
+        );
+
+        // Assert: two bytes for each character of the name at least.
+        assertThat(shared.ownBytes - ordinary.ownBytes).isGreaterThanOrEqualTo(2 * 1014);
+        assertThat(shared.memoryBytes).isEqualTo(memory.bytes() + shared.ownBytes);
     }
 
     @Test

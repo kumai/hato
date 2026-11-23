@@ -304,10 +304,145 @@ class BrokerAuthorizationTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_shared_subscription_needs_a_shared_one_of_the_scope_to_hold_it(MqttVersion version)
+            throws Exception {
+        // Arrange: subscribe filters, the shared subscription written as one of them included,
+        // allow no shared subscription.
+        var robotScope = new AtomicReference<>(Authenticator.Scope.of(
+                List.of(),
+                List.of(new TopicFilter("jobs/#"), new TopicFilter("$share/workers/jobs/#"))
+        ));
+        try (BrokerServer sut = broker(robotScope)) {
+            try (RawSession robot = robot(sut.port(), version)) {
+                // Act
+                robot.send(new Packet.Subscribe(
+                        1,
+                        List.of(subscription("$share/workers/jobs/#", AT_MOST_ONCE)),
+                        EMPTY
+                ));
+
+                // Assert
+                ReasonCode refused = switch (version) {
+                    case V3_1_1 -> ReasonCode.UNSPECIFIED_ERROR;
+                    case V5 -> ReasonCode.NOT_AUTHORIZED;
+                };
+                assertThat(robot.expect(Packet.SubAck.class).reasonCodes())
+                        .containsExactly(refused);
+            }
+            // Act & Assert: a shared subscription of any group within `jobs/#` allows it.
+            robotScope.set(sharing("$share/+/jobs/#"));
+            try (RawSession robot = robot(sut.port(), version)) {
+                robot.subscribe("$share/workers/jobs/#", AT_MOST_ONCE);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MqttVersion.class)
+    void a_resumed_session_keeps_the_waiting_messages_of_a_shared_subscription_within_the_scope(
+            MqttVersion version
+    ) throws Exception {
+        // Arrange: two messages that wait for the robot's shared subscription, which the robot
+        // resumes with a scope that allows the shared subscription to the topic of one of them.
+        var robotScope = new AtomicReference<>(sharing("$share/+/orders/#"));
+        try (BrokerServer sut = broker(robotScope)) {
+            try (RawSession robot = persistent(sut.port(), version, false)) {
+                robot.subscribe("$share/fleet/orders/#", AT_LEAST_ONCE);
+                robot.disconnect();
+            }
+            try (RawSession fleet = connected(sut.port(), "fleet")) {
+                fleet.publish("orders/2/a", "outside", AT_LEAST_ONCE, 1);
+                fleet.publish("orders/1/a", "within", AT_LEAST_ONCE, 2);
+            }
+            robotScope.set(sharing("$share/+/orders/1/#"));
+            // Act
+            try (RawSession robot = persistent(sut.port(), version, true)) {
+                // Assert: the one that the scope allows still comes, as messages that wait for an
+                // ordinary subscription that ends do, though its shared subscription has ended.
+                assertThat(robot.expect(Packet.Publish.class).topic().name())
+                        .isEqualTo("orders/1/a");
+                robot.ping();
+            }
+        }
+    }
+
+    @Test
+    void a_waiting_message_of_a_long_group_and_a_long_topic_stays_within_the_scope()
+            throws Exception {
+        // Arrange: a message to a long topic that waits for the robot's shared subscription of a
+        // long group, which the robot resumes with a scope that allows the shared subscription
+        // to that topic but not the one that it had. No filter could hold both the group and
+        // the topic.
+        String group = "g".repeat(40_000);
+        String topic = "orders/" + "1".repeat(30_000);
+        var robotScope = new AtomicReference<>(sharing("$share/+/orders/#"));
+        try (BrokerServer sut = broker(robotScope)) {
+            try (RawSession robot = persistent(sut.port(), MqttVersion.V5, false)) {
+                robot.subscribe("$share/" + group + "/orders/#", AT_LEAST_ONCE);
+                robot.disconnect();
+            }
+            try (RawSession fleet = connected(sut.port(), "fleet")) {
+                fleet.publish(topic, "within", AT_LEAST_ONCE, 1);
+            }
+            robotScope.set(sharing("$share/+/orders/+"));
+
+            // Act
+            try (RawSession robot = persistent(sut.port(), MqttVersion.V5, true)) {
+                // Assert
+                assertThat(robot.expect(Packet.Publish.class).topic().name()).isEqualTo(topic);
+                robot.ping();
+            }
+        }
+    }
+
+    @Test
+    void a_message_that_a_narrower_scope_keeps_from_a_member_goes_to_another_member()
+            throws Exception {
+        // Arrange: a message that waits for the robot, the only member while it was away.
+        var robotScope = new AtomicReference<>(sharing("$share/+/orders/#"));
+        try (BrokerServer sut = broker(robotScope);
+                RawSession member = connected(sut.port(), "member")) {
+            try (RawSession robot = persistent(sut.port(), MqttVersion.V5, false)) {
+                robot.subscribe("$share/fleet/orders/#", AT_LEAST_ONCE);
+                robot.disconnect();
+            }
+            try (RawSession fleet = connected(sut.port(), "fleet")) {
+                fleet.publish("orders/2/a", "kept away", AT_LEAST_ONCE, 1);
+            }
+            member.subscribe("$share/fleet/orders/#", AT_LEAST_ONCE);
+            robotScope.set(sharing("$share/+/orders/1/#"));
+
+            // Act
+            try (RawSession robot = persistent(sut.port(), MqttVersion.V5, true)) {
+                // Assert: the scope keeps the message from the robot, and the other member of the
+                // shared subscription gets it instead.
+                assertThat(member.expect(Packet.Publish.class).topic().name())
+                        .isEqualTo("orders/2/a");
+                robot.ping();
+            }
+        }
+    }
+
     private static BrokerServer broker() throws Exception {
         return BrokerServer.builder()
                 .authenticator(authenticator)
                 .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+    }
+
+    // A scope that lets the client make shared subscriptions within `filter`, a shared
+    // subscription, and nothing else.
+    private static Authenticator.Scope sharing(String filter) {
+        return Authenticator.Scope.of(List.of(), List.of(), List.of(new TopicFilter(filter)));
+    }
+
+    // The robot's connection with a session that ends with it.
+    private static RawSession robot(int port, MqttVersion version) throws Exception {
+        return switch (version) {
+            case V3_1_1 -> connected(port, "robot");
+            case V5 -> connectedV5(port, "robot");
+        };
     }
 
     // A broker whose authenticator gives the robot the scope that `robotScope` holds as it

@@ -38,11 +38,6 @@ class InprocBrokerMessagingTest extends MessagingTest {
         return requireNonNull(broker).uri();
     }
 
-    @Override
-    boolean sharedSubscriptionAvailable() {
-        return false;
-    }
-
     // Left out: the test breaks the connection through a TCP transport that it wraps.
     @Override
     void an_established_subscription_resumes_after_explicit_reconnect(

@@ -269,7 +269,6 @@ class BrokerControlsTest {
                     .withMaximumQos(Qos.AT_LEAST_ONCE)
                     .withRetainAvailable(false)
                     .withWildcardSubscriptionAvailable(false)
-                    .withSharedSubscriptionAvailable(false)
                     .withMaximumPacketSize(512);
             assertThat(ack).isEqualTo(expected);
             MqttMessage retained = MqttMessage.of(
@@ -290,7 +289,8 @@ class BrokerControlsTest {
             var sut = BrokerControls.of(broker);
             BrokerCapabilities narrowed = BrokerCapabilities.defaults()
                     .withMaximumQos(Qos.AT_MOST_ONCE)
-                    .withRetainAvailable(false);
+                    .withRetainAvailable(false)
+                    .withSharedSubscriptionAvailable(false);
             sut.announce(narrowed);
             MqttMessage retained = MqttMessage.of(
                     new Topic("announced/v311"),
@@ -302,10 +302,15 @@ class BrokerControlsTest {
             // Act
             ConnAck ack = client.connect().get(5, SECONDS);
             CompletableFuture<PublishResult> publication = client.publish(retained);
+            Subscription shared = client.subscribe(
+                    Subscribe.of(new TopicFilter("$share/v311/announced/#"), Qos.AT_MOST_ONCE),
+                    _ -> { }
+            );
 
             // Assert
             assertThat(ack).isEqualTo(ConnAck.of(false, 1));
             assertThat(publication).succeedsWithin(Duration.ofSeconds(5));
+            assertThat(shared.established()).succeedsWithin(Duration.ofSeconds(5));
         }
     }
 

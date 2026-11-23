@@ -63,10 +63,8 @@ class BrokerMqtt5Test {
             client.send(connectV5("accepted", true, 0, 0));
 
             // Assert: only the MQTT 5.0 form, which has a reason code, decodes here. It announces
-            // only that shared subscriptions are not supported, the Topic Alias Maximum, and
-            // the largest packet that the broker takes.
+            // only the Topic Alias Maximum and the largest packet that the broker takes.
             var announcements = new Properties(List.of(
-                    new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0),
                     new Property.TwoByteValue(PropertyId.TOPIC_ALIAS_MAXIMUM, 16),
                     new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 1024 * 1024)
             ));
@@ -183,36 +181,6 @@ class BrokerMqtt5Test {
                 publisher.expectClosed();
             }
             subscriber.ping();
-        }
-    }
-
-    @Test
-    void a_subscribe_with_a_shared_subscription_ends_the_connection_and_subscribes_to_nothing()
-            throws Exception {
-        try (var sut = MqttBroker.start(); var publisher = connectedV5(sut.port(), "publisher")) {
-            // Arrange: a session that outlives the connection.
-            try (var first = connectedV5(sut.port(), "sharing", false, 60, false)) {
-                // Act
-                first.send(new Packet.Subscribe(
-                        1,
-                        List.of(
-                                subscription("ordinary/#", AT_MOST_ONCE),
-                                subscription("$share/group/ordinary/#", AT_MOST_ONCE)
-                        ),
-                        EMPTY
-                ));
-
-                // Assert: the ordinary filter of the same SUBSCRIBE does not subscribe either.
-                assertThat(first.expect(Packet.Disconnect.class)).isEqualTo(new Packet.Disconnect(
-                        ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED,
-                        EMPTY
-                ));
-                first.expectClosed();
-            }
-            try (var resumed = connectedV5(sut.port(), "sharing", false, 60, true)) {
-                publisher.publish("ordinary/topic", "unsubscribed", AT_LEAST_ONCE, 1);
-                resumed.ping();
-            }
         }
     }
 
@@ -487,15 +455,6 @@ class BrokerMqtt5Test {
                                 identifier
                         ),
                         ReasonCode.PROTOCOL_ERROR
-                ),
-                new Violation(
-                        "a SUBSCRIBE with a shared subscription",
-                        new Packet.Subscribe(
-                                1,
-                                List.of(subscription("$share/group/violation/#", AT_MOST_ONCE)),
-                                EMPTY
-                        ),
-                        ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED
                 ),
                 new Violation("AUTH", new Packet.Auth(SUCCESS, EMPTY), ReasonCode.PROTOCOL_ERROR),
                 new Violation(
