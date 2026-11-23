@@ -315,9 +315,10 @@ final class Session implements Subscriber {
     private long retainedThisTurn;
 
     // The deliveries of shared subscriptions that the actor hands on to members, in their order:
-    // publications of the session's client that found the members of their shared subscription
-    // changing in every round (see share). Each leaves as it goes on or goes, so that nothing
-    // holds it on the heap once it has (see passOnShared).
+    // those that the session lets go of (see handOff), and publications of its client that found
+    // the members of their shared subscription changing in every round (see share). One that had
+    // room within the memory's limit keeps it until it goes on, and each leaves as it goes on or
+    // goes, so that nothing holds it on the heap beyond its room (see passOnShared).
     private final ArrayDeque<Delivery> passing = new ArrayDeque<>();
 
     // Whether the event that hands the deliveries in `passing` on waits among the events, ahead
@@ -894,8 +895,8 @@ final class Session implements Subscriber {
     // left meanwhile, by an UNSUBSCRIBE or as it ended, so that none goes to a subscription once
     // the client has learned that it ended [MQTT-3.10.4-2] while the shared subscription hands it
     // to another member; and a delivery that admit() turns away before the queue, as at QoS 0
-    // without a connection or once the session's expiry has passed, or one larger than the
-    // client takes, which another member may take (MQTT 5.0 section 3.1.2.11.4). Once the
+    // without a connection or once the session's expiry has passed by `now`, or one larger than
+    // the client takes, which another member may take (MQTT 5.0 section 3.1.2.11.4). Once the
     // delivery has come to the queue, where it waits, also for the session's next connection, or
     // where the session's limits or the delivery's lifetime have it go, the session has taken it,
     // and no other member gets it. So has one that could never fit through the session's send
@@ -907,6 +908,7 @@ final class Session implements Subscriber {
             Packet.Publish publication,
             PublicationMemory room,
             long received,
+            long now,
             SharedSubscription shared
     ) {
         boolean claimed = false;
@@ -917,7 +919,7 @@ final class Session implements Subscriber {
             }
             Delivery delivery = sharedDelivery(publication, room, received, subscribed, version);
             boolean here = turnFree() || runner == Thread.currentThread();
-            Admission admission = admit(delivery, received, here);
+            Admission admission = admit(delivery, now, here);
             if (admission == Admission.DECLINED) {
                 return false;
             }
@@ -971,12 +973,20 @@ final class Session implements Subscriber {
     // became of it. The queue's limits and the memory's apply to what still waits once the drain
     // that `drainsNext` promises has sent what it can; without that promise they apply at once
     // if the session has no connection or the queue is full. Called under the inbox.
-    private Admission admit(Delivery delivery, long received, boolean drainsNext) {
+    private Admission admit(Delivery delivery, long now, boolean drainsNext) {
         Connection peer = connection;
         boolean online = peer != null && !peer.isEnded();
         // Only acknowledged deliveries wait for a session's next connection, and only while the
-        // session lasts.
-        if (!online && (!kept() || delivery.qos == Qos.AT_MOST_ONCE || expired(received))) {
+        // session lasts by `now`: the time at which the broker received a publication that the
+        // publisher's actor hands over as it routes it, and the clock for one that goes on later
+        // (see passOnShared), as one that another member hands on or one that waited for a later
+        // turn, which may have come to the broker before this session's expiry passed while its
+        // timer has not come yet. A publication that the publisher's actor hands over reads no
+        // clock here: that costs a delivery that waits for a session without a connection a
+        // noticeable part of its time.
+        if (!online && (!kept()
+                || delivery.qos == Qos.AT_MOST_ONCE
+                || expired(now))) {
             return Admission.DECLINED;
         }
         // A connected client that takes no packet this large loses this delivery before it
@@ -1066,16 +1076,16 @@ final class Session implements Subscriber {
     // order they came and are the ones without room in the broker's memory. One whose lifetime
     // has passed by now goes at once, as it would go without being sent [MQTT-3.3.2-5], before
     // it takes room or has any other go for it: such a delivery has a Message Expiry Interval
-    // of 0, or comes from a publisher whose actor was slow to route it. Each other one takes its
-    // room there first. Without room, the session's oldest deliveries of the kind make room
-    // for the new one; they stay if they could not make enough, and the session then goes
-    // without the new one alone, as it does when none waits. Only then do the queue's own
-    // limits apply to a delivery that has its room: the oldest go until the queue holds its
-    // limits again, so that a client that falls behind gets the newest ones. In this order
-    // the queue gives up nothing for a delivery that the memory then refuses. One larger
-    // than the whole queue would never fit, so it goes alone rather than with the older ones.
-    // Deliveries in the connection's send queue or in flight are on their way and stay.
-    // Called under the inbox.
+    // of 0, comes from a publisher whose actor was slow to route it, or expired on its way from
+    // another member of a shared subscription (see passOnShared). Each other one takes its room
+    // there first. Without room, the session's oldest deliveries of the kind make room for the new
+    // one; they stay if they could not make enough, and the session then goes without the new
+    // one alone, as it does when none waits. Only then do the queue's own limits apply to a
+    // delivery that has its room: the oldest go until the queue holds its limits again, so
+    // that a client that falls behind gets the newest ones. In this order the queue gives up
+    // nothing for a delivery that the memory then refuses. One larger than the whole queue
+    // would never fit, so it goes alone rather than with the older ones. Deliveries in the
+    // connection's send queue or in flight are on their way and stay. Called under the inbox.
     private void trim(DeliveryQueue queue) {
         int arrived = queue.deliveries.size() - queue.withRoom;
         if (arrived == 0) {
@@ -2189,18 +2199,23 @@ final class Session implements Subscriber {
     // deliveries that wait, and those in the window that await their answer, go unless the
     // scope lets the client receive their topics; otherwise a message that waits for a
     // subscription that ends stays, as after an UNSUBSCRIBE. One in the window is withdrawn,
-    // as withdraw() describes. A PUBREL that awaits its PUBCOMP stays, as the client has that
-    // message already, and QoS 0 deliveries ended with the connection that they waited for. A
-    // scope without limits, which every client of a broker without an authenticator has,
-    // leaves the session as it is. Runs on the actor before the connection attaches, once the
-    // connection that had the session can send no more, so that whether a delivery went out
-    // stays as read.
+    // as withdraw() describes. One of a shared subscription that goes passes on to another
+    // member, as when the session ends (see passesOn). A PUBREL that awaits its PUBCOMP stays,
+    // as the client has that message already, and QoS 0 deliveries ended with the connection
+    // that they waited for. A scope without limits, which every client of a broker without an
+    // authenticator has, leaves the session as it is. Runs on the actor before the connection
+    // attaches, once the connection that had the session can send no more, so that whether a
+    // delivery went out stays as read.
     void limitTo(Authenticator.Scope scope) {
         if (scope == Authenticator.Scope.all()) {
             return;
         }
-        int withheld = 0;
+        int dropped = 0;
+        int passedOn = 0;
         var ended = new ArrayList<Subscribed>();
+        // The waiting deliveries of shared subscriptions that the scope keeps from the client,
+        // which go on to other members behind those in the window (see passesOn).
+        var fromQueue = new ArrayList<Delivery>();
         synchronized (this) {
             var kept = new LinkedHashMap<String, Subscribed>();
             var gone = new HashSet<String>();
@@ -2227,23 +2242,40 @@ final class Session implements Subscriber {
                 if (!receives(scope, delivery)) {
                     waiting.remove();
                     acknowledgedQueue.left(delivery);
-                    if (delivery.hasRoom) {
-                        giveRoom(delivery);
+                    if (passesOn(delivery)) {
+                        fromQueue.add(handOff(delivery));
+                        passedOn++;
+                    } else {
+                        if (delivery.hasRoom) {
+                            giveRoom(delivery);
+                        }
+                        dropped++;
                     }
-                    withheld++;
                 }
             }
         }
         for (Map.Entry<Integer, Outgoing> entry : new LinkedHashMap<>(inflight).entrySet()) {
             if (entry.getValue() instanceof Delivery delivery && !receives(scope, delivery)) {
+                if (passesOn(delivery)) {
+                    synchronized (this) {
+                        passing.addLast(handOff(delivery));
+                    }
+                    passedOn++;
+                } else {
+                    dropped++;
+                }
                 withdraw(entry.getKey(), delivery);
-                withheld++;
             }
         }
-        if (!ended.isEmpty() || withheld > 0) {
+        passing.addAll(fromQueue);
+        // Only `passing` holds them as they go on, so that each leaves the heap as it goes.
+        fromQueue.clear();
+        passOnShared();
+        if (!ended.isEmpty() || dropped > 0 || passedOn > 0) {
             log.info("Broker on port {} ended {} subscriptions and dropped {} deliveries of"
-                    + " client {} outside the scope of its new connection",
-                    routing.port, ended.size(), withheld, clientId);
+                    + " client {} outside the scope of its new connection, and offered {} to"
+                    + " other members of their shared subscriptions",
+                    routing.port, ended.size(), dropped, clientId, passedOn);
         }
     }
 
@@ -2705,6 +2737,19 @@ final class Session implements Subscriber {
             for (Subscribed subscribed : ended.values()) {
                 unindex(subscribed);
             }
+            // The deliveries of shared subscriptions go on to other members once the session has
+            // left the shared subscriptions, in the order that they would have gone out: those in
+            // the window first (see passesOn).
+            for (Outgoing outgoing : inflight.values()) {
+                if (outgoing instanceof Delivery delivery && passesOn(delivery)) {
+                    passing.addLast(handOff(delivery));
+                }
+            }
+            for (Delivery delivery : acknowledgedQueue.deliveries) {
+                if (passesOn(delivery)) {
+                    passing.addLast(handOff(delivery));
+                }
+            }
             empty(atMostOnceQueue);
             empty(acknowledgedQueue);
             for (RetainedCursor cursor : cursors) {
@@ -2737,6 +2782,44 @@ final class Session implements Subscriber {
         inflightBytes = 0;
         cancelWill();
         cancelTimer();
+        passOnShared();
+    }
+
+    // Whether `delivery`, which the session lets go of before its client has acknowledged it,
+    // goes on to another member of its shared subscription: one that has not started to go out,
+    // which the client has not seen, and one at QoS 1, which the specification has go to another
+    // member as the session ends, though the client may have taken it already (MQTT 5.0 section
+    // 4.8.2). A QoS 2 delivery that has started to go out stays with the client, which may hold
+    // its identifier [MQTT-4.8.2-5], and a QoS 0 one goes as without a shared subscription. Read
+    // once the connections that had the delivery can send no more, so that whether it started
+    // stays as read.
+    private static boolean passesOn(Delivery delivery) {
+        return delivery.shared != null
+                && (delivery.qos == Qos.AT_LEAST_ONCE
+                        || (delivery.qos == Qos.EXACTLY_ONCE && !delivery.sent));
+    }
+
+    // `delivery`, which leaves the session to go on to another member (see passesOn), as one
+    // that the session counts no more. Room that it had within the memory's limit goes on with
+    // it, for the member's delivery to take over (see passOnShared): what it holds itself, and
+    // its hold on its publication, which the publication's other deliveries share, so that the
+    // publication counts once however many of its deliveries go on. Room that it took whatever
+    // the memory had left goes back at once, as the session gives such room back (see
+    // giveRoom), and the member's delivery takes room as any delivery does, as it does for one
+    // that had none, such as one on its way through a connection. Called under the inbox.
+    private Delivery handOff(Delivery delivery) {
+        if (!delivery.hasRoom) {
+            return delivery;
+        }
+        if (delivery.roomTakenAnyway) {
+            giveRoom(delivery);
+        } else {
+            delivery.hasRoom = false;
+            withRoom--;
+            delivery.carriesOwnRoom = true;
+            delivery.carriesPublication = true;
+        }
+        return delivery;
     }
 
     // Hands `publication`, which this session's client published and the broker received at
@@ -2752,7 +2835,8 @@ final class Session implements Subscriber {
             PublicationMemory room,
             long received
     ) {
-        if (shared.deliver(publication, room, received) != SharedSubscription.Outcome.LATER) {
+        if (shared.deliver(publication, room, received, received)
+                != SharedSubscription.Outcome.LATER) {
             return;
         }
         var waiting = new Delivery(
@@ -2772,33 +2856,60 @@ final class Session implements Subscriber {
     // Passes the deliveries in `passing` on to members of their shared subscriptions, in their
     // order, unless the broker closes. One that has waited its whole lifetime by now goes to
     // none, rather than to a member that would only drop it (see trim), and so does one that no
-    // member takes. One whose shared subscription finds its members changing in every round
-    // stops the passing: it waits with those behind it for a later turn (see passLater), and
-    // deliveries that come meanwhile wait behind them. Each leaves `passing` as it goes on or
-    // goes, so that nothing holds it on the heap once it has. Runs on the actor, outside the
-    // inbox, as a publisher's actor delivers.
+    // member takes, as it would with the session. One whose shared subscription finds its
+    // members changing in every round stops the passing: it waits with those behind it for a
+    // later turn (see passLater), and deliveries that come meanwhile wait behind them.
+    //
+    // A delivery that carries the room that it had within the memory's limit (see handOff)
+    // keeps it until it goes on, rather than giving it back as the session lets go of it, so
+    // that other sessions cannot take it meanwhile. As it goes on, what it holds itself goes to
+    // this thread alone (see MemoryBudget.keep), and it holds its publication until the member
+    // has its delivery: if that delivery waits and takes its room on this thread, as for a
+    // member without a connection, it takes the room from there and joins the holders of the
+    // publication, so that the room passes from one delivery to the other. Each delivery leaves
+    // `passing` as it goes on or goes, so that nothing holds it on the heap once its room is
+    // back. Runs on the actor, outside the inbox, as a publisher's actor delivers.
+    // Ceiling: a session that ends hands all that it held on in one event, as it gives the room
+    // of the rest back in one, which takes time in its queue limits; the event could end the
+    // turn after a number of deliveries as well, as it does when the members keep changing.
     private void passOnShared() {
+        MemoryBudget memory = routing.memory;
         Delivery delivery;
         while ((delivery = passing.peekFirst()) != null) {
+            if (delivery.carriesOwnRoom) {
+                memory.keep(delivery.ownBytes);
+            }
             SharedSubscription.Outcome outcome = tryPassOn(delivery);
             if (outcome == SharedSubscription.Outcome.LATER) {
+                // No member has taken the room that the delivery left with this thread. It takes
+                // that room back to wait with if the memory still has it, and else waits without
+                // it, as one that had none does, rather than past the limit.
+                if (delivery.carriesOwnRoom && !memory.take(delivery.ownBytes)) {
+                    delivery.carriesOwnRoom = false;
+                }
+                memory.settle();
                 passLater();
                 return;
             }
             passing.pollFirst();
+            if (delivery.carriesPublication) {
+                delivery.memory.release(memory);
+            }
+            memory.settle();
         }
     }
 
     // Hands `delivery` on to a member of its shared subscription (see Delivery.passOn), unless the
     // broker closes or the delivery has waited its whole lifetime by now, and returns what became
     // of it. A failure on the way, as an OutOfMemoryError, loses this delivery alone, which goes
-    // to none, so that those behind it still go on.
+    // to none, so that the room that it holds still goes back and those behind it still go on.
     private SharedSubscription.Outcome tryPassOn(Delivery delivery) {
         try {
-            if (routing.closed || delivery.expired(settings.scheduler().nanoTime())) {
+            long now = settings.scheduler().nanoTime();
+            if (routing.closed || delivery.expired(now)) {
                 return SharedSubscription.Outcome.NONE;
             }
-            return delivery.passOn();
+            return delivery.passOn(now);
         } catch (Throwable failure) {
             log.warn("Broker on port {} failed to pass a delivery of a shared subscription on for"
                     + " client {}", routing.port, clientId, failure);

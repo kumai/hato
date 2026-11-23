@@ -11,7 +11,9 @@ import org.mqtt4j.hato.internal.log.Log;
 // to a queue that is full already, and when its session loses its connection while the
 // delivery is unanswered in the window. It keeps the room until it leaves the session: what it
 // holds on the heap itself, and what its publication holds, once for all the deliveries of
-// that publication that have room (see PublicationMemory). The retained messages that wait
+// that publication that have room (see PublicationMemory). One that goes on to another member
+// of a shared subscription takes room that it had within the limit on with it, for the
+// member's delivery to take over (see Session.handOff). The retained messages that wait
 // for a new subscription take room in the same way, for as long as their cursor holds them,
 // and so does the cursor for what it holds itself. A session that finds no room drops what
 // waits for it as it does for its own limits, but only what gives enough room back as it goes.
@@ -31,7 +33,8 @@ import org.mqtt4j.hato.internal.log.Log;
 // of the actor pool. So such a thread keeps some room of its own, takes from it, and gives
 // back to it, and touches the shared count only to fetch a unit more or, once it holds more
 // than two units, to return all but one. What the threads keep is room that no other thread
-// can use: at most two units for each thread.
+// can use: at most two units for each thread, and for a moment the room of a delivery that
+// goes on to another session (see keep).
 //
 // Ceiling: what is on its way through a connection takes no room: the unanswered deliveries
 // in the window of a session that has a connection, and what waits in a connection's send
@@ -40,10 +43,12 @@ import org.mqtt4j.hato.internal.log.Log;
 // budget, and all the clients together as many times as much. Having a connection that falls
 // behind take room for them would close that.
 //
-// Ceiling: a publication that waits for a later turn to reach a member of a shared subscription
-// takes none either until the member's delivery takes its own (see Session.share): the
-// deliveries of one publication for each publisher whose shared subscriptions find their members
-// changing.
+// Ceiling: a delivery that goes on to another member of a shared subscription without room
+// that it had within the limit, and a publication that waits for a later turn to reach a
+// member, take none either until the member's delivery takes its own (see Session.handOff and
+// Session.share): up to the window and queue limits of the session that lets go of them, and
+// the deliveries of one publication for each publisher whose shared subscriptions find their
+// members changing.
 final class MemoryBudget {
 
     // What a delivery holds on the heap besides its publication and a sequence of properties
@@ -116,12 +121,36 @@ final class MemoryBudget {
         worker.memory = kept;
     }
 
+    // Gives `bytes` of room back to the calling thread alone, whatever it keeps already, so that
+    // its next take finds the room there before any other thread can take it: the room of a
+    // delivery that goes on to another session, whose delivery there takes its room on this
+    // thread if it waits (see Session.passOnShared). settle() follows, once that delivery has
+    // taken the room or will not. A thread outside the pool gives the room back as give() does.
+    // Ceiling: the other session may send what it can on this thread before its delivery takes
+    // room, and a give() there returns all but a unit of what the thread keeps once it keeps
+    // more than two units, so a delivery that holds more than a unit itself, as one of a
+    // publication with tens of thousands of properties does, can lose its room to another
+    // thread meanwhile.
+    void keep(long bytes) {
+        if (!(Thread.currentThread() instanceof Worker worker)) {
+            lent.addAndGet(-bytes);
+            return;
+        }
+        worker.memory += bytes;
+    }
+
     // Gives `bytes` of room back to the shared count, whatever the calling thread keeps, so that
     // no take of this thread finds it among the thread's own room: room that was taken whatever
     // the budget had left, for what could not go without it, which must not let anything else
     // past the limit once that has let go of it (see Session.giveRoom).
     void giveShared(long bytes) {
         lent.addAndGet(-bytes);
+    }
+
+    // Returns all but a unit of what the calling thread keeps after keep(), if that is more than
+    // two units, as give() does.
+    void settle() {
+        give(0);
     }
 
     // How many bytes more would have to come back before `bytes` found room, which is none if

@@ -54,6 +54,15 @@ import static java.util.Objects.requireNonNull;
 /// filter that starts with `$share/` but is no valid shared subscription is refused, in MQTT
 /// 3.1.1 with failure 0x80.
 ///
+/// While a member's session waits for its client to come back, its deliveries wait with it.
+/// When the session ends, or a resumed session's narrower scope keeps a delivery from it, the
+/// QoS 1 and QoS 2 deliveries that it had not started to send, and the QoS 1 deliveries that its
+/// client had not acknowledged, go to another member of the shared subscription that takes
+/// them, at that member's QoS. A QoS 1 message can so reach two sessions, and a delivery that
+/// goes to another member arrives after that member's other deliveries. A QoS 2 delivery that
+/// has started to go out stays with its session, and QoS 0 deliveries end with it, as they do
+/// without a shared subscription.
+///
 /// ## Retained messages and Wills
 ///
 /// A retained publication becomes the retained message of its topic in place of the previous

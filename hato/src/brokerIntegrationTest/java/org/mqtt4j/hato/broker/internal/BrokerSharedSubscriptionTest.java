@@ -14,8 +14,11 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.mqtt4j.hato.MqttVersion;
+import org.mqtt4j.hato.Qos;
+import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.Topic;
 import org.mqtt4j.hato.TopicFilter;
 import org.mqtt4j.hato.broker.MqttBroker;
@@ -36,6 +39,7 @@ import static org.mqtt4j.hato.ReasonCode.UNSPECIFIED_ERROR;
 import static org.mqtt4j.hato.broker.internal.BrokerSessionRaceTest.awaitRelease;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
+import static org.mqtt4j.hato.broker.internal.RawSession.deliverySize;
 import static org.mqtt4j.hato.broker.internal.RawSession.publication;
 import static org.mqtt4j.hato.broker.internal.RawSession.subscription;
 import static org.mqtt4j.hato.internal.protocol.Properties.EMPTY;
@@ -198,8 +202,8 @@ class BrokerSharedSubscriptionTest {
         try (var sut = MqttBroker.start();
                 RawSession member = connectedV5(sut.port(), "member");
                 RawSession publisher = connected(sut.port(), "publisher")) {
-            subscribeWithIdentifier(member, "$share/workers/jobs/#", 5);
-            subscribeWithIdentifier(member, "jobs/+", 7);
+            subscribeWithIdentifier(member, "$share/workers/jobs/#", 5, AT_MOST_ONCE);
+            subscribeWithIdentifier(member, "jobs/+", 7, AT_MOST_ONCE);
 
             // Act
             publisher.publish("jobs/1", "job", AT_MOST_ONCE, 0);
@@ -613,6 +617,597 @@ class BrokerSharedSubscriptionTest {
     }
 
     @Test
+    void the_unacknowledged_deliveries_of_a_member_whose_session_ends_go_to_another_member()
+            throws Exception {
+        try (var sut = MqttBroker.start();
+                RawSession other = connected(sut.port(), "other");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a member that takes the first publication, which it does not answer, and
+            // the third, which waits behind it.
+            try (RawSession slow = oneAtATime(sut.port(), "slow")) {
+                slow.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                other.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                for (int i = 0; i < 4; i++) {
+                    publisher.publish("jobs/" + i, Integer.toString(i), AT_LEAST_ONCE, i + 1);
+                }
+                slow.expect(Packet.Publish.class);
+                assertThat(receivedBeforePong(other)).containsExactly("1", "3");
+            }
+
+            // Act: the session of the member ends with its connection.
+
+            // Assert: the one that went out, which its client may have taken, and the one that
+            // waited both go to the other member, in their order.
+            assertThat(receivedUntil(other, 2)).containsExactly("0", "2");
+        }
+    }
+
+    @Test
+    void a_qos_2_delivery_that_went_out_stays_with_its_member_as_its_session_ends()
+            throws Exception {
+        try (var sut = MqttBroker.start();
+                RawSession other = connected(sut.port(), "other");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: as above, at QoS 2.
+            try (RawSession slow = oneAtATime(sut.port(), "slow")) {
+                slow.subscribe("$share/workers/jobs/#", EXACTLY_ONCE);
+                other.subscribe("$share/workers/jobs/#", EXACTLY_ONCE);
+                for (int i = 0; i < 4; i++) {
+                    publisher.publish("jobs/" + i, Integer.toString(i), EXACTLY_ONCE, i + 1);
+                }
+                slow.expect(Packet.Publish.class);
+                assertThat(receivedBeforePong(other)).containsExactly("1", "3");
+            }
+
+            // Act: the session of the member ends with its connection.
+
+            // Assert: only the one that waited goes to the other member [MQTT-4.8.2-5].
+            assertThat(receivedUntil(other, 1)).containsExactly("2");
+            assertThat(receivedBeforePong(other)).isEmpty();
+        }
+    }
+
+    @Test
+    void the_deliveries_of_a_member_whose_session_outlives_its_connection_wait_until_it_ends()
+            throws Exception {
+        try (var sut = MqttBroker.start();
+                RawSession present = connected(sut.port(), "present");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a member whose session outlives its connection by one second takes the
+            // publication and does not answer it.
+            try (RawSession away = connectedV5(sut.port(), "away", true, 1, false)) {
+                away.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                present.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                publisher.publish("jobs/1", "waits", AT_LEAST_ONCE, 1);
+                away.expect(Packet.Publish.class);
+            }
+
+            // Act & Assert: while the session lasts, the publication waits with it for its
+            // client to come back; once the session expires, it goes to the other member.
+            assertThat(receivedBeforePong(present)).isEmpty();
+            assertThat(receivedUntil(present, 1)).containsExactly("waits");
+        }
+    }
+
+    @Test
+    void a_delivery_that_goes_to_another_member_takes_that_members_qos_and_identifier()
+            throws Exception {
+        try (var sut = MqttBroker.start();
+                RawSession second = connectedV5(sut.port(), "second");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            try (RawSession first = connectedV5(sut.port(), "first")) {
+                subscribeWithIdentifier(first, "$share/workers/jobs/#", 5, AT_LEAST_ONCE);
+                subscribeWithIdentifier(second, "$share/workers/jobs/#", 9, AT_MOST_ONCE);
+                publisher.publish("jobs/1", "job", AT_LEAST_ONCE, 1);
+                first.expect(Packet.Publish.class);
+            }
+
+            // Act: the session of the first member ends with its connection.
+
+            // Assert
+            Packet.Publish delivered = second.expect(Packet.Publish.class);
+            assertThat(delivered.qos()).isEqualTo(AT_MOST_ONCE);
+            assertThat(delivered.properties().entries()).containsExactly(
+                    new Property.VariableByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER, 9)
+            );
+        }
+    }
+
+    @Test
+    void a_message_that_expired_with_its_member_goes_to_no_other_member() throws Exception {
+        var timer = new BrokerDeadlineTest.ManualTimer();
+        String unanswered = "1".repeat(100);
+        String waiting = "2".repeat(100);
+        try (BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(Duration.ofSeconds(5))
+                        .scheduler(timer)
+                        .maxQueued(1)
+                        .start(loopback());
+                RawSession ending = oneAtATime(
+                        sut.port(),
+                        "ending",
+                        new Property.FourByteValue(PropertyId.MAXIMUM_PACKET_SIZE, 64)
+                );
+                RawSession other = oneAtATime(sut.port(), "other");
+                RawSession publisher = connectedV5(sut.port(), "publisher")) {
+            // Arrange: a member that takes no packet over 64 bytes holds a message with a
+            // lifetime of a second unanswered. The other member, which takes one unanswered
+            // message at a time, has the next one unanswered and the one after waiting, as many
+            // as its queue takes. Then the lifetime passes.
+            ending.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            other.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            publisher.publish(expiring("jobs/0", "expires", 1, 1));
+            ending.expect(Packet.Publish.class);
+            publisher.publish("jobs/1", unanswered, AT_LEAST_ONCE, 2);
+            publisher.publish("jobs/2", waiting, AT_LEAST_ONCE, 3);
+            Packet.Publish first = other.expect(Packet.Publish.class);
+            timer.clock.advance(Duration.ofSeconds(2));
+
+            // Act: a new session of the first member's client takes the place of its session,
+            // whose unanswered message goes on to another member before the CONNACK.
+            try (RawSession _ = connectedV5(sut.port(), "ending")) {
+                other.send(new Packet.PubAck(first.packetId(), SUCCESS, EMPTY));
+
+                // Assert: the message that expired went to no member, so it pushed none out of
+                // the other member's full queue.
+                assertThat(receivedUntil(other, 1)).containsExactly(waiting);
+            }
+        }
+    }
+
+    @Test
+    void a_message_whose_lifetime_passes_while_it_looks_for_a_member_pushes_out_no_waiting_one()
+            throws Exception {
+        var timer = new BrokerDeadlineTest.ManualTimer();
+        var passing = new AtomicBoolean();
+        try (BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(Duration.ofSeconds(5))
+                        .scheduler(timer)
+                        .maxQueued(1)
+                        .beforeLastShareStep(_ -> {
+                            if (passing.compareAndSet(true, false)) {
+                                timer.clock.advance(Duration.ofSeconds(2));
+                            }
+                        })
+                        .start(loopback());
+                RawSession publisher = connectedV5(sut.port(), "publisher")) {
+            // Arrange: a member whose session waits for its next connection with a message, as
+            // many as its queue takes, and a member that holds a message with a lifetime of a
+            // second unanswered.
+            try (RawSession away = connected(sut.port(), "away", false, false)) {
+                away.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "away");
+            publisher.publish("jobs/0", "waiting", AT_LEAST_ONCE, 1);
+            try (RawSession ending = oneAtATime(sut.port(), "ending")) {
+                ending.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                publisher.publish(expiring("jobs/1", "expires", 2, 1));
+                ending.expect(Packet.Publish.class);
+                passing.set(true);
+
+                // Act: a new session of the second member's client takes the place of its
+                // session, whose unanswered message goes on to the other member, and the
+                // lifetime passes while the shared subscription looks for one.
+                try (RawSession _ = connectedV5(sut.port(), "ending");
+                        RawSession back = connected(sut.port(), "away", false, true)) {
+                    // Assert: the message that expired on its way pushed out none that waited.
+                    assertThat(receivedUntil(back, 1)).containsExactly("waiting");
+                }
+            }
+        }
+    }
+
+    @Test
+    void a_member_whose_session_has_expired_takes_none_from_another_before_its_timer_comes()
+            throws Exception {
+        var timer = new BrokerDeadlineTest.ManualTimer();
+        try (BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(Duration.ofSeconds(5))
+                        .scheduler(timer)
+                        .maxQueued(1)
+                        .start(loopback());
+                RawSession publisher = connectedV5(sut.port(), "publisher")) {
+            // Arrange: a member whose session outlives its connection by a second, on a timer
+            // that comes ten seconds late, waits with a message, as many as its queue takes. A
+            // member that holds a message unanswered, and one whose session lasts, join, and
+            // then the first session's second passes.
+            timer.lateness = Duration.ofSeconds(10);
+            try (RawSession expiring = connectedV5(sut.port(), "expiring", true, 1, false)) {
+                expiring.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "expiring");
+            publisher.publish("jobs/0", "from expiring", AT_LEAST_ONCE, 1);
+            try (RawSession ending = oneAtATime(sut.port(), "ending")) {
+                ending.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                publisher.publish("jobs/1", "from ending", AT_LEAST_ONCE, 2);
+                ending.expect(Packet.Publish.class);
+                try (RawSession lasting = connected(sut.port(), "lasting", false, false)) {
+                    lasting.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                }
+                awaitAway(sut, "lasting");
+                timer.clock.advance(Duration.ofSeconds(2));
+
+                // Act: a new session of the second member's client takes the place of its
+                // session, whose unanswered message goes on to another member.
+                try (RawSession _ = connectedV5(sut.port(), "ending");
+                        RawSession back = connected(sut.port(), "lasting", false, true)) {
+                    // Assert: the message went to the member whose session lasts, and the one
+                    // that waited with the expired session follows it as the timer comes.
+                    assertThat(receivedUntil(back, 1)).containsExactly("from ending");
+                    timer.clock.advance(Duration.ofSeconds(10));
+                    assertThat(receivedUntil(back, 1)).containsExactly("from expiring");
+                }
+            }
+        }
+    }
+
+    @Test
+    void deliveries_that_go_to_another_member_keep_their_room_from_other_sessions_meanwhile()
+            throws Exception {
+        String payload = "x".repeat(10_000);
+        var shared = new SharedSubscription("$share/workers/jobs/#", _ -> { });
+        long room = deliverySize(publication("jobs/0", payload, AT_LEAST_ONCE, 1)) + shared.bytes;
+        var holding = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var timer = new BrokerDeadlineTest.ManualTimer();
+        try (BrokerServer sut = holdingBeforeLastStep(holding, held, release)
+                        .connectTimeout(Duration.ofSeconds(5))
+                        .scheduler(timer)
+                        .maxDeliveryMemory(3 * room + room / 2)
+                        .deliveryMemoryUnit(0)
+                        .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a broker whose waiting deliveries have room for three of a shared
+            // subscription and half of one more, which all three take, waiting with a member
+            // whose session outlives its connection by a second. Another member, and a session
+            // with an ordinary subscription, wait for their next connections.
+            try (RawSession ending = connectedV5(sut.port(), "ending", true, 1, false)) {
+                ending.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "ending");
+            for (int i = 0; i < 3; i++) {
+                publisher.publish("jobs/" + i, payload, AT_LEAST_ONCE, i + 1);
+            }
+            try (RawSession away = connected(sut.port(), "away", false, false)) {
+                away.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            }
+            try (RawSession other = connected(sut.port(), "other", false, false)) {
+                other.subscribe("other/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "away");
+            awaitAway(sut, "other");
+
+            // Act: the first member's session expires, and while its first delivery goes on to
+            // the other member, publications for the other session come.
+            holding.set(true);
+            timer.clock.advance(Duration.ofSeconds(1));
+            assertThat(held.await(5, SECONDS)).isTrue();
+            for (int i = 0; i < 3; i++) {
+                publisher.publish("other/" + i, payload, AT_LEAST_ONCE, i + 4);
+            }
+            release.countDown();
+
+            // Assert: the deliveries that go on kept their room, which the other session's
+            // publications found taken, and all three wait with the other member.
+            try (RawSession back = connected(sut.port(), "away", false, true)) {
+                assertThat(receivedUntil(back, 3)).containsExactly(payload, payload, payload);
+            }
+        } finally {
+            release.countDown();
+        }
+    }
+
+    // Whether the connection of the member that holds the delivery unanswered ends before its
+    // session does, so that the session, which outlives the connection, takes room for that
+    // delivery whatever the memory has left, as it cannot go without it.
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void a_delivery_that_a_member_leaves_unanswered_goes_on_within_the_memory_limit(
+            boolean connectionEndsFirst
+    ) throws Exception {
+        String payload = "x".repeat(1_000);
+        var shared = new SharedSubscription("$share/workers/jobs/#", _ -> { });
+        long room = deliverySize(publication("jobs/0", payload, AT_LEAST_ONCE, 1)) + shared.bytes;
+        long control = deliverySize(publication("control/0", "control", AT_LEAST_ONCE, 1));
+        var expiry = new Property.FourByteValue(
+                PropertyId.SESSION_EXPIRY_INTERVAL,
+                connectionEndsFirst ? 60 : 0
+        );
+        // One actor thread, so that the room that it keeps to itself is the room that the
+        // test gives back to it.
+        try (BrokerServer sut = BrokerServer.builder()
+                        .actors(1)
+                        .maxDeliveryMemory(room + room / 2 + control)
+                        .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a broker whose waiting deliveries have room for one delivery of a shared
+            // subscription and half of another, besides one for an ordinary subscription. A
+            // member and a session with that ordinary subscription wait for their next
+            // connections, the member with a delivery, and a delivery that waited and went out
+            // has left its room with the actor thread. Another member holds a delivery
+            // unanswered.
+            try (RawSession away = connected(sut.port(), "away", false, false)) {
+                away.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            }
+            try (RawSession other = connected(sut.port(), "other", false, false)) {
+                other.subscribe("control/#", AT_LEAST_ONCE);
+            }
+            try (RawSession filling = connected(sut.port(), "filling", false, false)) {
+                filling.subscribe("filling/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "away");
+            awaitAway(sut, "other");
+            awaitAway(sut, "filling");
+            publisher.publish("jobs/0", payload, AT_LEAST_ONCE, 1);
+            publisher.publish("filling/0", "y".repeat(400), AT_LEAST_ONCE, 2);
+            try (RawSession back = connected(sut.port(), "filling", false, true)) {
+                assertThat(receivedBeforePong(back)).hasSize(1);
+            }
+            awaitAway(sut, "filling");
+            try (RawSession ending = oneAtATime(sut.port(), "ending", expiry)) {
+                ending.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                publisher.publish("jobs/1", payload, AT_LEAST_ONCE, 3);
+                ending.expect(Packet.Publish.class);
+                if (connectionEndsFirst) {
+                    ending.disconnect();
+                    awaitAway(sut, "ending");
+                }
+
+                // Act: a new session of the member's client takes the place of its session,
+                // whose unanswered delivery goes on to the member that waits, and then a
+                // publication comes for the ordinary subscription.
+                try (RawSession _ = connectedV5(sut.port(), "ending")) {
+                    publisher.publish("control/0", "control", AT_LEAST_ONCE, 4);
+                }
+            }
+
+            // Assert: the member that waits took the delivery only as the memory's limit allows,
+            // so it holds one of the two, and the publication for the ordinary subscription
+            // found its room.
+            try (RawSession back = connected(sut.port(), "other", false, true)) {
+                assertThat(receivedBeforePong(back)).containsExactly("control");
+            }
+            try (RawSession back = connected(sut.port(), "away", false, true)) {
+                assertThat(receivedBeforePong(back)).containsExactly(payload);
+            }
+        }
+    }
+
+    @Test
+    void a_message_that_waits_for_a_member_of_two_shared_subscriptions_goes_on_to_both()
+            throws Exception {
+        String payload = "x".repeat(1_000);
+        Packet.Publish message = publication("jobs/0", payload, AT_LEAST_ONCE, 1);
+        var shared = new SharedSubscription("$share/first/jobs/#", _ -> { });
+        // What the message holds, which its deliveries share, and what a delivery of either
+        // shared subscription holds beside it.
+        long publicationRoom = PublicationMemory.sizeOf(message);
+        long deliveryRoom = MemoryBudget.DELIVERY_BYTES + shared.bytes;
+        try (BrokerServer sut = BrokerServer.builder()
+                        .maxDeliveryMemory(publicationRoom * 3 / 2 + 2 * deliveryRoom)
+                        .deliveryMemoryUnit(0)
+                        .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a broker whose waiting deliveries have room for the message and two
+            // deliveries of it, with half the message to spare. A member of two shared
+            // subscriptions waits for its next connection with a delivery of the message for
+            // each, and each shared subscription has another member that waits as well.
+            try (RawSession ending = connected(sut.port(), "ending", false, false)) {
+                ending.subscribe("$share/first/jobs/#", AT_LEAST_ONCE);
+                ending.subscribe("$share/other/jobs/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "ending");
+            publisher.publish(message);
+            try (RawSession first = connected(sut.port(), "first", false, false)) {
+                first.subscribe("$share/first/jobs/#", AT_LEAST_ONCE);
+            }
+            try (RawSession other = connected(sut.port(), "other", false, false)) {
+                other.subscribe("$share/other/jobs/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "first");
+            awaitAway(sut, "other");
+
+            // Act: a new session of the first member's client takes the place of its session.
+            try (RawSession _ = connected(sut.port(), "ending", true, false)) {
+                // Assert: both deliveries went on, as the message still counted once.
+                try (RawSession back = connected(sut.port(), "first", false, true)) {
+                    assertThat(receivedBeforePong(back)).containsExactly(payload);
+                }
+                try (RawSession back = connected(sut.port(), "other", false, true)) {
+                    assertThat(receivedBeforePong(back)).containsExactly(payload);
+                }
+            }
+        }
+    }
+
+    // Whether an ordinary subscriber of the message leaves it unanswered as its connection ends,
+    // so that its session holds the message with room taken whatever the memory had left, or
+    // answers it at once.
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void a_member_does_not_hold_a_message_on_room_that_another_session_took_past_the_limit(
+            boolean leftUnanswered
+    ) throws Exception {
+        String payload = "x".repeat(2_000);
+        Packet.Publish message = publication("jobs/1", payload, AT_LEAST_ONCE, 1);
+        var shared = new SharedSubscription("$share/workers/jobs/#", _ -> { });
+        // What a delivery of the shared subscription holds beside the message, and half of the
+        // message: the room that the actor thread keeps to itself below.
+        long threadRoom = MemoryBudget.DELIVERY_BYTES
+                + shared.bytes
+                + PublicationMemory.sizeOf(message) / 2;
+        long emptyFilling = deliverySize(publication("filling/0", "", AT_LEAST_ONCE, 2));
+        String filler = "y".repeat((int) (threadRoom - emptyFilling));
+        // One actor thread, so that the room that it keeps to itself is the room that the
+        // test gives back to it.
+        try (BrokerServer sut = BrokerServer.builder()
+                        .actors(1)
+                        .maxDeliveryMemory(threadRoom)
+                        .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a delivery took up the memory as it waited and gave the room back to the
+            // actor thread as it went out. A member waits for its next connection. An ordinary
+            // subscriber and another member, whose session ends with its connection, take the
+            // message.
+            try (RawSession away = connected(sut.port(), "away", false, false)) {
+                away.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            }
+            try (RawSession filling = connected(sut.port(), "filling", false, false)) {
+                filling.subscribe("filling/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "away");
+            awaitAway(sut, "filling");
+            publisher.publish("filling/0", filler, AT_LEAST_ONCE, 2);
+            try (RawSession back = connected(sut.port(), "filling", false, true)) {
+                assertThat(receivedBeforePong(back)).containsExactly(filler);
+            }
+            try (RawSession ordinary = connected(sut.port(), "ordinary", false, false);
+                    RawSession ending = connected(sut.port(), "ending")) {
+                ordinary.subscribe("jobs/#", AT_LEAST_ONCE);
+                ending.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                publisher.publish(message);
+                ending.expect(Packet.Publish.class);
+                if (leftUnanswered) {
+                    ordinary.expect(Packet.Publish.class);
+                    ordinary.disconnect();
+                    awaitAway(sut, "ordinary");
+                } else {
+                    assertThat(receivedBeforePong(ordinary)).containsExactly(payload);
+                }
+
+                // Act: a new session of the member's client takes the place of its session,
+                // whose unanswered delivery goes on to the member that waits, and then the
+                // ordinary subscriber answers the message if it has not.
+                connected(sut.port(), "ending").close();
+            }
+            if (leftUnanswered) {
+                try (RawSession back = connected(sut.port(), "ordinary", false, true)) {
+                    assertThat(receivedBeforePong(back)).containsExactly(payload);
+                }
+            }
+
+            // Assert: the member that waits found room for its delivery but not for the
+            // message, whatever room the ordinary subscriber's session took for it.
+            try (RawSession back = connected(sut.port(), "away", false, true)) {
+                assertThat(receivedBeforePong(back)).isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void a_delivery_that_goes_on_pushes_out_older_ones_though_one_of_them_holds_its_message()
+            throws Exception {
+        String job = "j".repeat(1_000);
+        String other = "o".repeat(500);
+        // Room for the two deliveries that the member below holds, and no more.
+        long memory = deliverySize(publication("jobs/1", job, AT_LEAST_ONCE, 1))
+                + deliverySize(publication("other/1", other, AT_LEAST_ONCE, 2));
+        try (BrokerServer sut = BrokerServer.builder()
+                        .maxDeliveryMemory(memory)
+                        .deliveryMemoryUnit(0)
+                        .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a member waits for its next connection with a delivery of a message for
+            // an ordinary subscription and, behind it, one of another message, which fill the
+            // memory. Another member, whose session ends with its connection, takes the message
+            // for the shared subscription, which the member that waits made with a Subscription
+            // Identifier.
+            try (RawSession away = connectedV5(sut.port(), "away", true, 60, false)) {
+                away.subscribe("jobs/#", AT_LEAST_ONCE);
+                away.subscribe("other/#", AT_LEAST_ONCE);
+                subscribeWithIdentifier(away, "$share/workers/jobs/#", 7, AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "away");
+            try (RawSession ending = connected(sut.port(), "ending")) {
+                ending.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                publisher.publish("jobs/1", job, AT_LEAST_ONCE, 1);
+                ending.expect(Packet.Publish.class);
+                publisher.publish("other/1", other, AT_LEAST_ONCE, 2);
+
+                // Act: a new session of the member's client takes the place of its session,
+                // whose unanswered delivery goes on to the member that waits.
+                connected(sut.port(), "ending").close();
+            }
+
+            // Assert: the delivery that went on took the place of both older deliveries, as
+            // the first of them gave back what it held itself alone: the message stays with the
+            // delivery that went on.
+            try (RawSession back = connectedV5(sut.port(), "away", false, 60, true)) {
+                back.send(new Packet.PingReq());
+                Packet.Publish delivered = back.expect(Packet.Publish.class);
+                Packet next = back.expect(Packet.class);
+                assertThat(delivered.properties().entries()).containsExactly(
+                        new Property.VariableByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER, 7)
+                );
+                assertThat(new String(delivered.payload(), UTF_8)).isEqualTo(job);
+                assertThat(next).isInstanceOf(Packet.PingResp.class);
+            }
+        }
+    }
+
+    @Test
+    void a_failure_while_a_delivery_goes_on_loses_that_delivery_alone() throws Exception {
+        var failing = new AtomicBoolean();
+        try (BrokerServer sut = BrokerServer.builder()
+                        .beforeLastShareStep(_ -> {
+                            if (failing.compareAndSet(true, false)) {
+                                throw new IllegalStateException("Injected failure");
+                            }
+                        })
+                        .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            // Arrange: a member waits for its next connection with two messages of a shared
+            // subscription, which has another member that waits as well.
+            try (RawSession ending = connected(sut.port(), "ending", false, false)) {
+                ending.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "ending");
+            publisher.publish("jobs/1", "first", AT_LEAST_ONCE, 1);
+            publisher.publish("jobs/2", "second", AT_LEAST_ONCE, 2);
+            try (RawSession away = connected(sut.port(), "away", false, false)) {
+                away.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+            }
+            awaitAway(sut, "away");
+
+            // Act: a new session of the first member's client takes the place of its session,
+            // and handing the first message on to the other member fails.
+            failing.set(true);
+            try (RawSession _ = connected(sut.port(), "ending", true, false)) {
+                // Assert: the new session started, and the second message went on. Closing the
+                // broker then finds every room in its memory given back.
+                try (RawSession back = connected(sut.port(), "away", false, true)) {
+                    assertThat(receivedBeforePong(back)).containsExactly("second");
+                }
+            }
+        }
+    }
+
+    @Test
+    void a_shared_subscription_that_ended_hands_its_deliveries_to_no_later_one_of_its_name()
+            throws Exception {
+        try (BrokerServer sut = BrokerServer.builder().start(loopback());
+                RawSession later = connected(sut.port(), "later");
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            var topic = new Topic("jobs/1");
+            try (RawSession only = oneAtATime(sut.port(), "only")) {
+                only.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+                publisher.publish("jobs/1", "first", AT_LEAST_ONCE, 1);
+                publisher.publish("jobs/2", "second", AT_LEAST_ONCE, 2);
+                only.expect(Packet.Publish.class);
+            }
+            // Arrange: the last member's session has ended, and with it the shared subscription.
+            await().atMost(Duration.ofSeconds(5)).until(() -> sut.indexedFor(topic).isEmpty());
+
+            // Act: a new shared subscription of the same name.
+            later.subscribe("$share/workers/jobs/#", AT_LEAST_ONCE);
+
+            // Assert: the messages of the one that ended were lost with it.
+            assertThat(receivedBeforePong(later)).isEmpty();
+        }
+    }
+
+    @Test
     void a_malformed_shared_filter_of_mqtt_3_1_1_is_refused_while_the_others_subscribe()
             throws Exception {
         try (var sut = MqttBroker.start();
@@ -667,10 +1262,16 @@ class BrokerSharedSubscriptionTest {
                 }
                 case Packet.Publish delivered -> {
                     payloads.add(new String(delivered.payload(), UTF_8));
-                    if (delivered.qos() == AT_LEAST_ONCE) {
-                        member.send(new Packet.PubAck(delivered.packetId(), SUCCESS, EMPTY));
+                    int id = delivered.packetId();
+                    switch (delivered.qos()) {
+                        case AT_MOST_ONCE -> { }
+                        case AT_LEAST_ONCE -> member.send(new Packet.PubAck(id, SUCCESS, EMPTY));
+                        case EXACTLY_ONCE -> member.send(new Packet.PubRec(id, SUCCESS, EMPTY));
                     }
                 }
+                case Packet.PubRel release -> member.send(
+                        new Packet.PubComp(release.packetId(), SUCCESS, EMPTY)
+                );
                 default -> throw new AssertionError("Unexpected " + packet);
             }
         }
@@ -745,18 +1346,46 @@ class BrokerSharedSubscriptionTest {
                 .noneMatch(client -> client.connection().clientId().equals(clientId)));
     }
 
-    private static void subscribeWithIdentifier(RawSession member, String filter, int identifier)
-            throws Exception {
+    // A QoS 1 publication of `payload` to `topic` with a lifetime of `lifetime` seconds.
+    private static Packet.Publish expiring(
+            String topic,
+            String payload,
+            int packetId,
+            long lifetime
+    ) {
+        return new Packet.Publish(
+                new Topic(topic),
+                payload.getBytes(UTF_8),
+                AT_LEAST_ONCE,
+                false,
+                false,
+                packetId,
+                new Properties(List.of(
+                        new Property.FourByteValue(PropertyId.MESSAGE_EXPIRY_INTERVAL, lifetime)
+                ))
+        );
+    }
+
+    private static void subscribeWithIdentifier(
+            RawSession member,
+            String filter,
+            int identifier,
+            Qos qos
+    ) throws Exception {
         member.send(new Packet.Subscribe(
                 identifier,
-                List.of(subscription(filter, AT_MOST_ONCE)),
+                List.of(subscription(filter, qos)),
                 new Properties(List.of(new Property.VariableByteValue(
                         PropertyId.SUBSCRIPTION_IDENTIFIER,
                         identifier
                 )))
         ));
-        assertThat(member.expect(Packet.SubAck.class).reasonCodes())
-                .containsExactly(SUCCESS);
+        ReasonCode granted = switch (qos) {
+            case AT_MOST_ONCE -> SUCCESS;
+            case AT_LEAST_ONCE -> ReasonCode.GRANTED_QOS_1;
+            case EXACTLY_ONCE -> ReasonCode.GRANTED_QOS_2;
+        };
+        assertThat(member.expect(Packet.SubAck.class).reasonCodes()).containsExactly(granted);
     }
 
     private static void unsubscribe(RawSession member, String filter) throws Exception {

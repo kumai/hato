@@ -397,6 +397,34 @@ class BrokerAuthorizationTest {
         }
     }
 
+    @Test
+    void a_message_that_a_narrower_scope_keeps_from_a_member_goes_to_another_member()
+            throws Exception {
+        // Arrange: a message that waits for the robot, the only member while it was away.
+        var robotScope = new AtomicReference<>(sharing("$share/+/orders/#"));
+        try (BrokerServer sut = broker(robotScope);
+                RawSession member = connected(sut.port(), "member")) {
+            try (RawSession robot = persistent(sut.port(), MqttVersion.V5, false)) {
+                robot.subscribe("$share/fleet/orders/#", AT_LEAST_ONCE);
+                robot.disconnect();
+            }
+            try (RawSession fleet = connected(sut.port(), "fleet")) {
+                fleet.publish("orders/2/a", "kept away", AT_LEAST_ONCE, 1);
+            }
+            member.subscribe("$share/fleet/orders/#", AT_LEAST_ONCE);
+            robotScope.set(sharing("$share/+/orders/1/#"));
+
+            // Act
+            try (RawSession robot = persistent(sut.port(), MqttVersion.V5, true)) {
+                // Assert: the scope keeps the message from the robot, and the other member of the
+                // shared subscription gets it instead.
+                assertThat(member.expect(Packet.Publish.class).topic().name())
+                        .isEqualTo("orders/2/a");
+                robot.ping();
+            }
+        }
+    }
+
     private static BrokerServer broker() throws Exception {
         return BrokerServer.builder()
                 .authenticator(authenticator)

@@ -123,6 +123,30 @@ class MemoryBudgetTest {
     }
 
     @Test
+    void room_that_a_pool_thread_keeps_for_its_next_take_is_not_there_for_others_until_it_settles()
+            throws Exception {
+        // Arrange: a budget whose threads keep nothing otherwise.
+        var sut = new MemoryBudget(100, 0, 0);
+        var taken = new ArrayList<Boolean>();
+
+        // Act: a delivery that took all the room gives it to its thread alone, which takes
+        // part of it for the next delivery and then settles.
+        onPoolThread(() -> {
+            sut.take(100);
+            sut.keep(100);
+            taken.add(takenElsewhere(sut, 1));
+            taken.add(sut.take(60));
+            taken.add(takenElsewhere(sut, 1));
+            sut.settle();
+            taken.add(takenElsewhere(sut, 40));
+        });
+
+        // Assert: another thread finds room only once the thread has settled.
+        assertThat(taken).containsExactly(false, true, false, true);
+        assertThat(sut.lent()).isEqualTo(100);
+    }
+
+    @Test
     void room_that_a_pool_thread_gives_to_the_shared_count_is_not_its_own_to_take()
             throws Exception {
         // Arrange: a budget of 100 bytes whose threads keep up to two units of 50, which has
@@ -380,6 +404,19 @@ class MemoryBudgetTest {
         assertThat(List.of(held, letGo, other)).containsExactly(true, true, true);
         assertThat(List.of(withBoth, budget.lent())).containsExactly(120L, 60L);
         assertThat(sut.heldOnce()).isFalse();
+    }
+
+    /// Whether another thread, outside the actor pool, takes `bytes` of room from `budget`.
+    private static boolean takenElsewhere(MemoryBudget budget, long bytes) {
+        var taken = new ArrayList<Boolean>();
+        Thread other = Thread.ofPlatform().start(() -> taken.add(budget.take(bytes)));
+        try {
+            other.join();
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(failure);
+        }
+        return taken.getFirst();
     }
 
     /// Runs `body` on a thread of the kind that the actor pool has, and waits for it.

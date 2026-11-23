@@ -114,8 +114,12 @@ final class SharedSubscription implements Subscriber {
     // Hands `publication`, which the broker received at `received` by its clock, to one member
     // that takes it, and returns what became of it. A member takes it once the delivery waits in
     // its queues, also for a connection to come, and declines it before that, as it does when it
-    // has left the shared subscription meanwhile (see Session.deliverShared). The members are
-    // asked in turn from after the one that took the last publication, in this order:
+    // has left the shared subscription meanwhile (see Session.deliverShared), or when its session
+    // has expired by `now`: `received` for a publication that its publisher's actor hands over
+    // as it routes it, as for an ordinary subscription, and the clock for one that goes on later
+    // (see Session.passOnShared), as one that a member hands on, which may have come to the
+    // broker long before, or one that waited for a later turn. The members are asked in turn
+    // from after the one that took the last publication, in this order:
     //
     // 1. A member with a connection that has not ended and nothing waiting, which has sent
     //    everything so far (see connected). That nothing waits is an observation that a moment
@@ -140,20 +144,20 @@ final class SharedSubscription implements Subscriber {
     // A publication that no member takes, as at QoS 0 while no member has a connection, goes to
     // none, as for an ordinary subscription whose session has no connection. Called by the actor
     // that hands the publication over, as a publisher's actor calls Session.deliverMatching.
-    Outcome deliver(Packet.Publish publication, PublicationMemory room, long received) {
+    Outcome deliver(Packet.Publish publication, PublicationMemory room, long received, long now) {
         Session[] current = members;
         for (int round = 1; current.length > 0; round++) {
-            if (deliverAmong(current, publication, room, received)) {
+            if (deliverAmong(current, publication, room, received, now)) {
                 return Outcome.TAKEN;
             }
-            Session[] now = members;
-            if (now == current) {
+            Session[] latest = members;
+            if (latest == current) {
                 return Outcome.NONE;
             }
-            if (round == ROUNDS && now.length > 0) {
+            if (round == ROUNDS && latest.length > 0) {
                 return Outcome.LATER;
             }
-            current = now;
+            current = latest;
         }
         return Outcome.NONE;
     }
@@ -167,7 +171,8 @@ final class SharedSubscription implements Subscriber {
             Session[] current,
             Packet.Publish publication,
             PublicationMemory room,
-            long received
+            long received,
+            long now
     ) {
         int count = current.length;
         int start = Math.floorMod(next, count);
@@ -179,7 +184,7 @@ final class SharedSubscription implements Subscriber {
             if (!connected(member) || member.queued() != 0) {
                 continue;
             }
-            if (member.deliverShared(publication, room, received, this)) {
+            if (member.deliverShared(publication, room, received, now, this)) {
                 next = place + 1;
                 return true;
             }
@@ -203,7 +208,7 @@ final class SharedSubscription implements Subscriber {
             if (fewest < 0) {
                 break;
             }
-            if (current[fewest].deliverShared(publication, room, received, this)) {
+            if (current[fewest].deliverShared(publication, room, received, now, this)) {
                 next = fewest + 1;
                 return true;
             }
@@ -218,7 +223,7 @@ final class SharedSubscription implements Subscriber {
             if (declined != null && declined[place]) {
                 continue;
             }
-            if (current[place].deliverShared(publication, room, received, this)) {
+            if (current[place].deliverShared(publication, room, received, now, this)) {
                 next = place + 1;
                 return true;
             }
