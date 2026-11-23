@@ -10,7 +10,14 @@ import org.mqtt4j.hato.internal.protocol.Property;
 // that size, once, while at least one of its deliveries has room there. The deliveries of a
 // publication to many sessions share it, so counting it for each of them would refuse
 // deliveries for memory that nobody uses. The sessions that hold them run on different
-// threads, so the number of holders is the one count here that they share.
+// threads, so the numbers of holders are the counts here that they share.
+//
+// Deliveries that took their room whatever the memory had left hold the publication apart from
+// those that took theirs within the limit, and count it once more among themselves (see
+// holdAnyway): their room must never stand in for room that another delivery has to find within
+// the limit, which would keep the memory past its limit once they have gone. So a publication
+// that deliveries of both kinds hold counts twice. Every method here but holdAnyway() and
+// releaseAnyway() concerns the holders within the limit.
 //
 // The size is an estimate of the decoded publication, not the bytes of the packet that brought
 // it. A property is an object of its own, with objects for its strings, so a packet of many
@@ -42,6 +49,8 @@ final class PublicationMemory {
     private final long bytes;
 
     private final AtomicInteger holders = new AtomicInteger();
+
+    private final AtomicInteger anywayHolders = new AtomicInteger();
 
     PublicationMemory(Packet.Publish publication) {
         this(sizeOf(publication));
@@ -104,20 +113,20 @@ final class PublicationMemory {
     // Adds a holder, which takes the publication's room from `budget` if it is the only one.
     // Returns false, without adding it, when the budget has no room for the publication.
     boolean hold(MemoryBudget budget) {
-        return hold(budget, false);
+        return hold(holders, budget, false);
     }
 
-    // Adds a holder as hold() does, but takes the publication's room whatever the budget has
-    // left.
+    // Adds a holder that takes the publication's room whatever the budget has left, if it is
+    // the first such holder, apart from the room of the holders within the limit.
     void holdAnyway(MemoryBudget budget) {
-        boolean _ = hold(budget, true);
+        boolean _ = hold(anywayHolders, budget, true);
     }
 
-    private boolean hold(MemoryBudget budget, boolean anyway) {
+    private boolean hold(AtomicInteger count, MemoryBudget budget, boolean anyway) {
         while (true) {
-            int held = holders.get();
+            int held = count.get();
             if (held > 0) {
-                if (holders.compareAndSet(held, held + 1)) {
+                if (count.compareAndSet(held, held + 1)) {
                     return true;
                 }
                 continue;
@@ -129,10 +138,14 @@ final class PublicationMemory {
             } else if (!budget.take(bytes)) {
                 return false;
             }
-            if (holders.compareAndSet(0, 1)) {
+            if (count.compareAndSet(0, 1)) {
                 return true;
             }
-            budget.give(bytes);
+            if (anyway) {
+                budget.giveShared(bytes);
+            } else {
+                budget.give(bytes);
+            }
         }
     }
 
@@ -172,6 +185,15 @@ final class PublicationMemory {
     void release(MemoryBudget budget) {
         if (holders.decrementAndGet() == 0) {
             budget.give(bytes);
+        }
+    }
+
+    // Removes a holder that took the publication's room whatever the budget had left, which
+    // gives that room back to the budget's shared count if it was the last such holder, past the
+    // room that the calling thread keeps (see MemoryBudget.giveShared).
+    void releaseAnyway(MemoryBudget budget) {
+        if (anywayHolders.decrementAndGet() == 0) {
+            budget.giveShared(bytes);
         }
     }
 

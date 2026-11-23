@@ -3,6 +3,7 @@ package org.mqtt4j.hato.broker.internal;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -48,7 +49,7 @@ import static org.mqtt4j.hato.internal.protocol.Properties.EMPTY;
 
 /// The memory that the deliveries that wait for the sessions of a broker may take together. In
 /// these tests the broker's threads keep none of it to themselves, so each test knows to the byte
-/// what fits.
+/// what fits, unless a test says otherwise.
 class BrokerDeliveryMemoryTest {
 
     // The sessions whose dropped QoS 1 and 2 deliveries the application has heard of, one
@@ -719,6 +720,85 @@ class BrokerDeliveryMemoryTest {
                 assertThat(received(back, 1)).containsExactly("0004");
             }
             assertThat(reported).containsExactly("second");
+        }
+    }
+
+    @Test
+    void room_that_unanswered_deliveries_took_past_the_limit_lets_nothing_past_it_once_answered()
+            throws Exception {
+        // Arrange: memory for one delivery, which waits for a session that is away, on a broker
+        // with one actor thread that keeps room to itself, so that room given back on it would
+        // be the room that its next delivery takes. A client takes three publications and
+        // leaves them unanswered as its connection ends, so that its session takes room for
+        // them past the limit, and answers them on its next connection. Three, so that what
+        // the deliveries hold themselves, beside their publications, is room for one more.
+        try (BrokerServer sut = settings(roomOf("kept", "0001"))
+                        .actors(1)
+                        .deliveryMemoryUnit(256 * 1024)
+                        .start(loopback());
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            leaveSubscribed(sut, "first", "kept", AT_LEAST_ONCE);
+            leaveSubscribed(sut, "second", "two", AT_LEAST_ONCE);
+            publisher.publish("kept", "0001", AT_LEAST_ONCE, 7);
+            try (RawSession leaving = connected(sut.port(), "leaving", false, false)) {
+                leaving.subscribe("one", AT_LEAST_ONCE);
+                for (String payload : List.of("1001", "1002", "1003")) {
+                    publisher.publish("one", payload, AT_LEAST_ONCE, 7);
+                    leaving.expect(Packet.Publish.class);
+                }
+            }
+            awaitAway(sut, "leaving");
+            try (RawSession back = connected(sut.port(), "leaving", false, true)) {
+                assertThat(received(back, 3)).containsExactly("1001", "1002", "1003");
+                back.ping();
+            }
+
+            // Act: a delivery comes to wait for the other session.
+            publisher.publish("two", "0002", AT_LEAST_ONCE, 7);
+
+            // Assert: the memory has no room for it, as the room that the answer gave back was
+            // past the limit, and the delivery that waited first stays.
+            await().untilAsserted(() -> assertThat(reported).containsExactly("second"));
+            try (RawSession back = connected(sut.port(), "first", false, true)) {
+                assertThat(received(back, 1)).containsExactly("0001");
+            }
+        }
+    }
+
+    @Test
+    void a_session_that_loses_its_connection_counts_a_publication_held_elsewhere_once()
+            throws Exception {
+        // Arrange: memory for a delivery that waits for a session that is away, for what a
+        // second delivery of the same publication holds beside the publication, and for one
+        // more delivery. A client takes the publication too, and leaves it unanswered as its
+        // connection ends.
+        long memory = roomOf("kept", "0001")
+                + MemoryBudget.DELIVERY_BYTES
+                + roomOf("two", "0002");
+        try (BrokerServer sut = broker(memory);
+                RawSession publisher = connected(sut.port(), "publisher")) {
+            leaveSubscribed(sut, "first", "kept", AT_LEAST_ONCE);
+            leaveSubscribed(sut, "second", "two", AT_LEAST_ONCE);
+            try (RawSession leaving = connected(sut.port(), "leaving", false, false)) {
+                leaving.subscribe("kept", AT_LEAST_ONCE);
+                publisher.publish("kept", "0001", AT_LEAST_ONCE, 7);
+                leaving.expect(Packet.Publish.class);
+            }
+            awaitAway(sut, "leaving");
+
+            // Act: a delivery comes to wait for the other session.
+            publisher.publish("two", "0002", AT_LEAST_ONCE, 7);
+
+            // Assert: it found room, as the unanswered delivery took room within the limit for
+            // itself alone and joined the room of its publication rather than counting the
+            // publication again.
+            try (RawSession back = connected(sut.port(), "second", false, true)) {
+                assertThat(received(back, 1)).containsExactly("0002");
+            }
+            try (RawSession back = connected(sut.port(), "leaving", false, true)) {
+                assertThat(received(back, 1)).containsExactly("0001");
+            }
+            assertThat(reported).isEmpty();
         }
     }
 
@@ -1662,6 +1742,12 @@ class BrokerDeliveryMemoryTest {
             client.subscribe(filter, qos);
             client.disconnect();
         }
+    }
+
+    /// Waits until the session of `clientId`, whose connection has ended, waits without one.
+    private static void awaitAway(BrokerServer broker, String clientId) {
+        await().atMost(Duration.ofSeconds(5)).until(() -> broker.clients().stream()
+                .noneMatch(client -> client.connection().clientId().equals(clientId)));
     }
 
     /// The room that a delivery of a publication to `topic` with `payload` takes while no other

@@ -68,6 +68,12 @@ final class Delivery implements Outgoing, Pending {
     // its inbox.
     boolean hasRoom;
 
+    // Whether the delivery took its room whatever the memory had left, rather than within the
+    // memory's limit, as an unanswered delivery of a session that lost its connection does when
+    // the memory has no room for it there. Such room goes back to the memory's shared count (see
+    // Session.giveRoom). The session's, under its inbox.
+    boolean roomTakenAnyway;
+
     int packetId;
 
     volatile boolean sent;
