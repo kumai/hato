@@ -140,6 +140,12 @@ final class Delivery implements Outgoing, Pending {
         return expired(lifetime, received, now);
     }
 
+    // Whether the publication has a lifetime at all, without which expired() never holds: a
+    // caller that would read the clock for expired() reads it only then.
+    boolean hasLifetime() {
+        return lifetime >= 0;
+    }
+
     // The Message Expiry Interval of `publication`, in seconds, or -1 without one.
     static long lifetimeOf(Packet.Publish publication) {
         Property expiry = publication.properties()
