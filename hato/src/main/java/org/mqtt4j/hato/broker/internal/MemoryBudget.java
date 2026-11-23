@@ -16,6 +16,12 @@ import org.mqtt4j.hato.internal.log.Log;
 // and so does the cursor for what it holds itself. A session that finds no room drops what
 // waits for it as it does for its own limits, but only what gives enough room back as it goes.
 //
+// An unanswered delivery is one that its session cannot go without, so it takes its room
+// whatever the budget has left if it finds none within the limit. Such room goes back to the
+// shared count rather than to a thread's own room (see giveShared), and its publication counts
+// apart for it (see PublicationMemory), so that it never stands in for room that another
+// delivery has to find within the limit.
+//
 // A delivery that goes straight out takes no room and costs nothing here. That is what keeps
 // the count off the path of a client that keeps up: counting every delivery from the moment
 // its session accepts it cost a publication to 200 subscribers about a tenth more of the
@@ -23,9 +29,9 @@ import org.mqtt4j.hato.internal.log.Log;
 //
 // A session that is behind takes and gives room for delivery after delivery, each on a thread
 // of the actor pool. So such a thread keeps some room of its own, takes from it, and gives
-// back to it, and touches the shared count only to fetch a unit more or to return what it
-// holds beyond two units. What the threads keep is room that no other thread can use: at
-// most two units for each thread.
+// back to it, and touches the shared count only to fetch a unit more or, once it holds more
+// than two units, to return all but one. What the threads keep is room that no other thread
+// can use: at most two units for each thread.
 //
 // Ceiling: what is on its way through a connection takes no room: the unanswered deliveries
 // in the window of a session that has a connection, and what waits in a connection's send
@@ -86,7 +92,7 @@ final class MemoryBudget {
     }
 
     // Takes `bytes` of room whatever the budget has left, for what a session cannot go without.
-    // The budget then has less than no room until as much has come back.
+    // The budget then has less than no room until as much has come back, through giveShared().
     void takeAnyway(long bytes) {
         lent.addAndGet(bytes);
     }
@@ -103,6 +109,14 @@ final class MemoryBudget {
             kept = unit;
         }
         worker.memory = kept;
+    }
+
+    // Gives `bytes` of room back to the shared count, whatever the calling thread keeps, so that
+    // no take of this thread finds it among the thread's own room: room that was taken whatever
+    // the budget had left, for what could not go without it, which must not let anything else
+    // past the limit once that has let go of it (see Session.giveRoom).
+    void giveShared(long bytes) {
+        lent.addAndGet(-bytes);
     }
 
     // How many bytes more would have to come back before `bytes` found room, which is none if

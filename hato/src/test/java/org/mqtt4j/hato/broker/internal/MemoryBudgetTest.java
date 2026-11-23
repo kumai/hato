@@ -123,6 +123,29 @@ class MemoryBudgetTest {
     }
 
     @Test
+    void room_that_a_pool_thread_gives_to_the_shared_count_is_not_its_own_to_take()
+            throws Exception {
+        // Arrange: a budget of 100 bytes whose threads keep up to two units of 50, which has
+        // handed out 80.
+        var sut = new MemoryBudget(100, 50, 0);
+        sut.take(80);
+        var taken = new ArrayList<Boolean>();
+
+        // Act: a pool thread takes 50 bytes whatever the budget has left, for what cannot go
+        // without them, gives them back to the shared count, and then asks for some of them.
+        onPoolThread(() -> {
+            sut.takeAnyway(50);
+            sut.giveShared(50);
+            taken.add(sut.take(21));
+            taken.add(sut.take(20));
+        });
+
+        // Assert: the thread kept none of the 50 bytes, and took only what the limit allows.
+        assertThat(taken).containsExactly(false, true);
+        assertThat(sut.lent()).isEqualTo(100);
+    }
+
+    @Test
     void what_is_missing_for_room_is_what_has_to_come_back_first() {
         // Arrange: 40 of 100 bytes are left.
         var sut = new MemoryBudget(100, 0, 0);
@@ -197,6 +220,47 @@ class MemoryBudgetTest {
         // Assert
         assertThat(List.of(first, second)).containsExactly(true, true);
         assertThat(List.of(held, stillHeld, budget.lent())).containsExactly(60L, 60L, 0L);
+    }
+
+    @Test
+    void a_publication_counts_once_for_its_holders_within_the_limit_and_once_for_the_others() {
+        // Arrange
+        var budget = new MemoryBudget(100, 0, 0);
+        var sut = new PublicationMemory(60);
+
+        // Act: a holder within the limit comes, then two that take the room whatever the
+        // budget has left, and they go in the same order.
+        boolean within = sut.hold(budget);
+        sut.holdAnyway(budget);
+        sut.holdAnyway(budget);
+        long heldByAll = budget.lent();
+        sut.releaseAnyway(budget);
+        long heldByTwo = budget.lent();
+        sut.releaseAnyway(budget);
+        long heldWithin = budget.lent();
+        sut.release(budget);
+
+        // Assert
+        assertThat(within).isTrue();
+        assertThat(List.of(heldByAll, heldByTwo, heldWithin, budget.lent()))
+                .containsExactly(120L, 120L, 60L, 0L);
+    }
+
+    @Test
+    void a_holder_within_the_limit_finds_no_room_in_what_another_took_past_it() {
+        // Arrange: a budget that has handed out 50 of its 100 bytes, and a publication of 60
+        // bytes that a holder holds with room taken whatever the budget had left.
+        var budget = new MemoryBudget(100, 0, 0);
+        var sut = new PublicationMemory(60);
+        budget.take(50);
+        sut.holdAnyway(budget);
+
+        // Act
+        boolean held = sut.hold(budget);
+
+        // Assert: the holder would need room of its own, which the limit does not allow.
+        assertThat(held).isFalse();
+        assertThat(budget.lent()).isEqualTo(110);
     }
 
     @Test

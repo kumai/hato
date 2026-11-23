@@ -899,9 +899,9 @@ final class Session {
         return online;
     }
 
-    // Takes room in the broker's memory for `delivery`: for itself, and for its publication
-    // unless another delivery of it has that already. Returns false when the memory has none.
-    // Called under the inbox.
+    // Takes room in the broker's memory for `delivery` within its limit: for itself, and for its
+    // publication unless deliveries of it hold that within the limit already. Returns false when
+    // the memory has none. Called under the inbox.
     private boolean takeRoom(Delivery delivery) {
         MemoryBudget memory = routing.memory;
         if (!memory.take(delivery.ownBytes)) {
@@ -916,23 +916,34 @@ final class Session {
         return true;
     }
 
-    // Takes room in the broker's memory for `delivery` whatever the memory has left. Called
-    // under the inbox.
+    // Takes room in the broker's memory for `delivery` whatever the memory has left, which the
+    // delivery then has as room taken so (see giveRoom). Called under the inbox.
     private void takeRoomAnyway(Delivery delivery) {
         MemoryBudget memory = routing.memory;
         memory.takeAnyway(delivery.ownBytes);
         delivery.memory.holdAnyway(memory);
         delivery.hasRoom = true;
+        delivery.roomTakenAnyway = true;
         withRoom++;
     }
 
-    // Gives the room of `delivery` in the broker's memory back. Called under the inbox.
+    // Gives the room of `delivery` in the broker's memory back. Room that it took whatever the
+    // memory had left goes back to the memory's shared count, past the room that this thread
+    // keeps, both its own and its publication's, which it held apart from the deliveries that
+    // hold that publication within the limit (see PublicationMemory): it lets nothing else past
+    // the limit once the delivery has let go of it. Called under the inbox.
     private void giveRoom(Delivery delivery) {
         MemoryBudget memory = routing.memory;
         delivery.hasRoom = false;
         withRoom--;
-        delivery.memory.release(memory);
-        memory.give(delivery.ownBytes);
+        if (delivery.roomTakenAnyway) {
+            delivery.roomTakenAnyway = false;
+            delivery.memory.releaseAnyway(memory);
+            memory.giveShared(delivery.ownBytes);
+        } else {
+            delivery.memory.release(memory);
+            memory.give(delivery.ownBytes);
+        }
     }
 
     // Drops `delivery`, which has just left its queue, for `cause`. Called under the inbox.
@@ -2438,9 +2449,14 @@ final class Session {
                 }
                 // From here on the session waits for a connection with everything that it
                 // holds, so all of it takes room in the broker's memory: the unanswered
-                // deliveries too, which the session cannot go without, whatever room is left.
+                // deliveries too, which the session cannot go without. Each takes room within
+                // the limit if the memory has it, joining the deliveries that hold its
+                // publication there already, and whatever room is left only if the memory has
+                // none, rather than pushing out what waits to make room.
                 for (Outgoing outgoing : inflight.values()) {
-                    if (outgoing instanceof Delivery delivery && !delivery.hasRoom) {
+                    if (outgoing instanceof Delivery delivery
+                            && !delivery.hasRoom
+                            && !takeRoom(delivery)) {
                         takeRoomAnyway(delivery);
                     }
                 }
