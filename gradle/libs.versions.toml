@@ -12,7 +12,7 @@ errorprone = "2.52.0"
 nullaway = "0.14.3"
 errorprone-plugin = "5.2.0"
 checkstyle = "14.4.0"
-micrometer = "1.17.2"
+micrometer = "1.18.0"
 
 [libraries]
 # Nullness annotations. Build-time only: never a runtime or POM dependency of the published jars.
