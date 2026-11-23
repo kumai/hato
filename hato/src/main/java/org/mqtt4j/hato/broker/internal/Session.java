@@ -956,7 +956,10 @@ final class Session {
 
     // Sees to the deliveries of `queue` that have come to wait since the last time: those
     // that are still there once what could go out has gone, which stand at its end in the
-    // order they came and are the ones without room in the broker's memory. Each takes its
+    // order they came and are the ones without room in the broker's memory. One whose lifetime
+    // has passed by now goes at once, as it would go without being sent [MQTT-3.3.2-5], before
+    // it takes room or has any other go for it: such a delivery has a Message Expiry Interval
+    // of 0, or comes from a publisher whose actor was slow to route it. Each other one takes its
     // room there first. Without room, the session's oldest deliveries of the kind make room
     // for the new one; they stay if they could not make enough, and the session then goes
     // without the new one alone, as it does when none waits. Only then do the queue's own
@@ -978,7 +981,20 @@ final class Session {
             waiting[index] = queue.deliveries.removeLast();
             queue.left(waiting[index]);
         }
+        // The clock now, which only a delivery with a lifetime needs: most publications have none,
+        // and reading the clock is a noticeable part of what a delivery that comes to wait for a
+        // session without a connection costs.
+        long now = 0;
         for (Delivery delivery : waiting) {
+            if (delivery.hasLifetime()) {
+                now = settings.scheduler().nanoTime();
+                break;
+            }
+        }
+        for (Delivery delivery : waiting) {
+            if (delivery.expired(now)) {
+                continue;
+            }
             if (delivery.memoryBytes > queue.maxBytes) {
                 dropped(delivery.qos, "it is larger than the delivery queue");
                 continue;

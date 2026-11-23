@@ -21,6 +21,7 @@ import org.mqtt4j.hato.internal.protocol.PropertyId;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mqtt4j.hato.Qos.AT_LEAST_ONCE;
 import static org.mqtt4j.hato.Qos.AT_MOST_ONCE;
 import static org.mqtt4j.hato.ReasonCode.SUCCESS;
@@ -169,6 +170,37 @@ class BrokerMessageExpiryTest {
 
             // Assert
             subscriber.ping();
+        }
+    }
+
+    @Test
+    void a_message_without_any_lifetime_pushes_no_waiting_one_out_of_a_full_queue()
+            throws Exception {
+        try (BrokerServer sut = BrokerServer.builder()
+                        .connectTimeout(Duration.ofSeconds(5))
+                        .scheduler(timer)
+                        .maxQueued(1)
+                        .start(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+                RawSession publisher = connectedV5(sut.port(), "publisher")) {
+            // Arrange: a session that waits for its next connection with a message, as many as
+            // its queue takes, while the broker's clock has run on from where it started.
+            try (RawSession away = connectedV5(sut.port(), "away", true, 60, false)) {
+                away.subscribe("expiring/#", AT_LEAST_ONCE);
+            }
+            await().atMost(Duration.ofSeconds(5))
+                    .until(() -> !sut.connectedClients().contains("away"));
+            publisher.publish("expiring/waiting", "waiting", AT_LEAST_ONCE, 1);
+            timer.clock.advance(Duration.ofSeconds(1));
+
+            // Act
+            publisher.publish(expiring("expiring/none", AT_LEAST_ONCE, 2, 0));
+
+            // Assert: the message without any lifetime went at once, rather than after it took
+            // the place of the one that waited.
+            try (RawSession back = connectedV5(sut.port(), "away", false, 60, true)) {
+                assertThat(back.expect(Packet.Publish.class).topic())
+                        .isEqualTo(new Topic("expiring/waiting"));
+            }
         }
     }
 
