@@ -38,8 +38,21 @@ import static java.util.Objects.requireNonNull;
 /// reuses such an identifier ends that wait, as a client that lost its session state does.
 /// Offline QoS 0 deliveries are discarded. An empty identifier with Clean Session false is
 /// refused with Identifier rejected. Overlapping subscriptions of a session receive one copy at
-/// their highest QoS. Shared subscriptions are not supported: a `$share/` filter is refused, in
-/// MQTT 3.1.1 with failure 0x80.
+/// their highest QoS.
+///
+/// ## Shared subscriptions
+///
+/// A shared subscription, `$share/{group}/{filter}`, belongs to the broker rather than to a
+/// session, and MQTT 3.1.1 clients may make one as well. Each session that subscribes to it
+/// becomes one of its members, and each publication that its filter matches goes to one member,
+/// at the QoS granted to that member, apart from the session's other subscriptions and from
+/// other shared subscriptions, so that a session can receive more than one copy. Which member
+/// gets a publication is not specified, and publications that go to different members keep no
+/// order between them. A member receives no retained messages as it subscribes. A member that
+/// subscribes again changes its options and stays one member, and its first UNSUBSCRIBE lets it
+/// go; so does the end of its session. The shared subscription ends with its last member. A
+/// filter that starts with `$share/` but is no valid shared subscription is refused, in MQTT
+/// 3.1.1 with failure 0x80.
 ///
 /// ## Retained messages and Wills
 ///
@@ -57,7 +70,7 @@ import static java.util.Objects.requireNonNull;
 ///
 /// ## MQTT 5.0
 ///
-/// MQTT 5.0 support leaves out shared subscriptions and enhanced authentication. A positive
+/// MQTT 5.0 support leaves out enhanced authentication. A positive
 /// Session Expiry Interval makes a session persistent, as Clean Session false does, and Clean
 /// Start false resumes it. The session ends once that many seconds have passed since its last
 /// connection ended; the client's DISCONNECT can change the interval, though not from 0. The
@@ -89,22 +102,21 @@ import static java.util.Objects.requireNonNull;
 /// cancels the Will. The properties of a Will, except the delay, reach MQTT 5.0 subscribers as
 /// publication properties, and its Message Expiry Interval counts from its publication.
 ///
-/// By default, CONNACK announces only that shared subscriptions are not supported, the largest
-/// packet that the broker takes, and a Topic Alias Maximum: the aliases that a client sets last
-/// for its connection. In turn, the broker keeps to the client's Receive Maximum on each
-/// connection, resending on a resumed session no more than the new connection allows, and
-/// discards a publication larger than the client's Maximum Packet Size as if the client had
-/// received and acknowledged it. No other packet exceeds that size either: a client whose
-/// Maximum Packet Size takes no CONNACK is refused before its session changes, with
-/// Implementation specific error where that fits, and a SUBSCRIBE or UNSUBSCRIBE whose answer
-/// does not fit ends the connection with Packet too large before it is carried out. A refusal
-/// or DISCONNECT that does not fit is left out. An Authentication Method is refused with Bad
-/// authentication method. AUTH, a PUBLISH with a Subscription Identifier or an invalid Topic
-/// Alias, or a SUBSCRIBE with a `$share/` filter closes the connection. A PUBREC with a failure
-/// reason code ends the QoS 2 delivery without PUBREL. Before it closes an MQTT 5.0 connection
-/// for a malformed or forbidden packet, an expired keep-alive, or another connection with the
-/// same client identifier, the broker sends DISCONNECT with the reason code; a peer that stops
-/// reading may not receive it.
+/// By default, CONNACK announces only the largest packet that the broker takes and a Topic Alias
+/// Maximum: the aliases that a client sets last for its connection. In turn, the broker keeps to
+/// the client's Receive Maximum on each connection, resending on a resumed session no more than
+/// the new connection allows, and discards a publication larger than the client's Maximum
+/// Packet Size as if the client had received and acknowledged it. No other packet exceeds that
+/// size either: a client whose Maximum Packet Size takes no CONNACK is refused before its
+/// session changes, with Implementation specific error where that fits, and a SUBSCRIBE or
+/// UNSUBSCRIBE whose answer does not fit ends the connection with Packet too large before it is
+/// carried out. A refusal or DISCONNECT that does not fit is left out. An Authentication Method
+/// is refused with Bad authentication method. AUTH, or a PUBLISH with a Subscription Identifier
+/// or an invalid Topic Alias, closes the connection. A PUBREC with a failure reason code ends
+/// the QoS 2 delivery without PUBREL. Before it closes an MQTT 5.0 connection for a malformed or
+/// forbidden packet, an expired keep-alive, or another connection with the same client
+/// identifier, the broker sends DISCONNECT with the reason code; a peer that stops reading may
+/// not receive it.
 ///
 /// ## Flow control and limits
 ///

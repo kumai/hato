@@ -39,6 +39,11 @@ import org.mqtt4j.hato.internal.log.Log;
 // that stays connected and neither answers nor reads holds up to those limits outside this
 // budget, and all the clients together as many times as much. Having a connection that falls
 // behind take room for them would close that.
+//
+// Ceiling: a publication that waits for a later turn to reach a member of a shared subscription
+// takes none either until the member's delivery takes its own (see Session.share): the
+// deliveries of one publication for each publisher whose shared subscriptions find their members
+// changing.
 final class MemoryBudget {
 
     // What a delivery holds on the heap besides its publication and a sequence of properties

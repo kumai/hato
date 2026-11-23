@@ -19,9 +19,10 @@ import static java.util.Objects.requireNonNull;
 ///
 /// - The client interprets `$share/` in MQTT 3.1.1 and 5.0 alike. When subscribing, it rejects
 ///   a filter that [#parse] rejects, and it routes deliveries by [#filter()].
-/// - The broker has no shared subscriptions and refuses every filter that [#isShared]
-///   recognizes, in MQTT 3.1.1 too. [TopicFilter] and the MQTT 3.1.1 codec keep the filter
-///   exactly as written, so there it may be any filter that starts with `$share/`.
+/// - The broker takes a filter that [#parse] accepts as a shared subscription, in MQTT 3.1.1
+///   too, and matches publications by [#filter()]. [TopicFilter] and the MQTT 3.1.1 codec keep
+///   the filter exactly as written, so there it may be any filter that starts with `$share/`:
+///   the broker refuses one that [#isShared] recognizes and [#parse] rejects.
 /// - The MQTT 5.0 codec uses this type to reject No Local on a shared subscription
 ///   (`MQTT-3.8.3-4`).
 ///

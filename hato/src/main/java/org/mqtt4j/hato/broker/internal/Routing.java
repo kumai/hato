@@ -35,16 +35,17 @@ import org.mqtt4j.hato.internal.protocol.FilterTree;
 import org.mqtt4j.hato.internal.protocol.Packet;
 import org.mqtt4j.hato.internal.protocol.Properties;
 import org.mqtt4j.hato.internal.protocol.PropertyId;
+import org.mqtt4j.hato.internal.protocol.SharedTopicFilter;
 
 // What the connections of one broker share: its sessions and connections, its retained
 // messages, and the rules that tests set. Each session's actor handles the packets of its
 // connections (see Session), and what they share here is concurrent or replaced as a whole;
 // the retained messages have a lock of their own, the topic lock.
 //
-// Routing a publication looks up the sessions whose subscriptions select its topic in an index of
-// the filters, so that its time does not grow with the sessions that it does not reach. Lock
-// order is topic lock -> session inbox -> Connection; the index's monitor is taken last, with
-// nothing under it.
+// Routing a publication looks up the sessions whose subscriptions select its topic, and the
+// shared subscriptions that do, in an index of the filters, so that its time does not grow with
+// the sessions that it does not reach. Lock order is topic lock -> session inbox -> Connection;
+// the index's monitor is taken last, with nothing under it.
 final class Routing {
 
     private static final Log log = Log.of(Routing.class);
@@ -118,8 +119,14 @@ final class Routing {
     // subscriptions under the inbox, after the session's own table has changed, so that a
     // publisher that still finds one checks the table under the inbox and passes it by. The
     // closing broker replaces it with an empty one (see clear()), so that a closed broker that
-    // the application still holds keeps no session through it.
-    private volatile FilterTree<Session> subscribers = FilterTree.concurrent();
+    // the application still holds keeps no session through it. A shared subscription stands in
+    // the index under the filter after its group, for all its members at once (see joined()).
+    private volatile FilterTree<Subscriber> subscribers = FilterTree.concurrent();
+
+    // The shared subscriptions by the names that clients subscribe with, which the index's
+    // monitor guards: a shared subscription enters with its first member and leaves with its
+    // last, together with its place in the index. The closing broker replaces it with the index.
+    private volatile Map<String, SharedSubscription> shared = new HashMap<>();
 
     // The memory that the deliveries of all the sessions may take together.
     final MemoryBudget memory;
@@ -673,12 +680,27 @@ final class Routing {
     ) {
         // A session whose overlapping filters select the topic comes once from each, and must
         // match the publication once, which sends one copy to it. A session that has ended since
-        // the look-up passes it by.
-        var targets = new ArrayList<Session>();
+        // the look-up passes it by. A shared subscription stands under one filter alone, and
+        // hands its own copy to one of its members, whatever their other subscriptions, from the
+        // publisher's actor (see Session.share).
+        var targets = new ArrayList<Subscriber>();
         int filters = subscribers.match(publication.topic(), targets::add);
-        Collection<Session> distinct = (filters > 1) ? new LinkedHashSet<>(targets) : targets;
-        for (Session target : distinct) {
-            target.deliverMatching(publication, room, publisher, received);
+        Collection<Subscriber> distinct = (filters > 1) ? new LinkedHashSet<>(targets) : targets;
+        for (Subscriber target : distinct) {
+            switch (target) {
+                case Session session -> session.deliverMatching(
+                        publication,
+                        room,
+                        publisher,
+                        received
+                );
+                case SharedSubscription subscription -> publisher.share(
+                        subscription,
+                        publication,
+                        room,
+                        received
+                );
+            }
         }
     }
 
@@ -690,7 +712,7 @@ final class Routing {
     // that finds the replacement finds `closed` as well, and one that finds the former index
     // changes only what nothing holds any more.
     void subscribed(TopicFilter filter, Session session) {
-        FilterTree<Session> index = subscribers;
+        FilterTree<Subscriber> index = subscribers;
         if (closed) {
             return;
         }
@@ -701,7 +723,7 @@ final class Routing {
 
     // Takes `filter` of `session` out of the index of subscriptions, as subscribed() takes it in.
     void unsubscribed(TopicFilter filter, Session session) {
-        FilterTree<Session> index = subscribers;
+        FilterTree<Subscriber> index = subscribers;
         if (closed) {
             return;
         }
@@ -710,18 +732,63 @@ final class Routing {
         }
     }
 
-    // The identifiers of the sessions that the index of subscriptions finds for `topic`, for
-    // tests.
+    // Takes `session` in as a member of the shared subscription `name`, which `parsed` takes
+    // apart, and returns the shared subscription: the one of that name, or a new one that enters
+    // the index, as with the first member, also after an earlier one of the name has ended. A
+    // closing broker changes nothing, as subscribed() describes, and the session gets a shared
+    // subscription that no index holds.
+    SharedSubscription joined(String name, SharedTopicFilter parsed, Session session) {
+        FilterTree<Subscriber> index = subscribers;
+        Map<String, SharedSubscription> table = shared;
+        if (closed) {
+            return new SharedSubscription(name, settings.beforeLastShareStep());
+        }
+        synchronized (index) {
+            SharedSubscription subscription = table.get(name);
+            if (subscription == null) {
+                subscription = new SharedSubscription(name, settings.beforeLastShareStep());
+                subscription.join(session);
+                table.put(name, subscription);
+                index.add(parsed.filter(), subscription);
+            } else {
+                subscription.join(session);
+            }
+            return subscription;
+        }
+    }
+
+    // Lets `session` go as a member of `subscription`, which ends with its last member: it leaves
+    // the index and the table, and a later SUBSCRIBE to its name makes a new one. A closing
+    // broker changes nothing, as subscribed() describes.
+    void left(SharedSubscription subscription, Session session) {
+        FilterTree<Subscriber> index = subscribers;
+        Map<String, SharedSubscription> table = shared;
+        if (closed) {
+            return;
+        }
+        synchronized (index) {
+            if (subscription.leave(session)) {
+                table.remove(subscription.name, subscription);
+                index.remove(subscription.filter(), subscription);
+            }
+        }
+    }
+
+    // The identifiers of the sessions, and the names of the shared subscriptions, that the index
+    // of subscriptions finds for `topic`, for tests.
     Set<String> indexedFor(Topic topic) {
         var found = new HashSet<String>();
-        int _ = subscribers.match(topic, session -> found.add(session.clientId));
+        int _ = subscribers.match(topic, subscriber -> found.add(switch (subscriber) {
+            case Session session -> session.clientId;
+            case SharedSubscription subscription -> subscription.name;
+        }));
         return found;
     }
 
     // Runs `whileHeld` holding the index of subscriptions, so that a session that changes its
     // subscriptions meanwhile, as one that is cleared does, waits for it there, for tests.
     void holdingIndex(Runnable whileHeld) {
-        FilterTree<Session> index = subscribers;
+        FilterTree<Subscriber> index = subscribers;
         synchronized (index) {
             whileHeld.run();
         }
@@ -784,6 +851,7 @@ final class Routing {
         sessions.values().forEach(Session::close);
         sessions.clear();
         subscribers = FilterTree.concurrent();
+        shared = new HashMap<>();
         persistentSessions.set(0);
         synchronized (retained) {
             retained.clear();

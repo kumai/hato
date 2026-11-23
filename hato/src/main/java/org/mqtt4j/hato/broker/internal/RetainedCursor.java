@@ -162,7 +162,8 @@ final class RetainedCursor implements Pending {
                     qosOf(entry),
                     true,
                     identifiers,
-                    version
+                    version,
+                    null
             );
             current = delivery;
         }

@@ -29,7 +29,6 @@ import static org.mqtt4j.hato.Qos.EXACTLY_ONCE;
 import static org.mqtt4j.hato.ReasonCode.GRANTED_QOS_1;
 import static org.mqtt4j.hato.ReasonCode.GRANTED_QOS_2;
 import static org.mqtt4j.hato.ReasonCode.SUCCESS;
-import static org.mqtt4j.hato.ReasonCode.UNSPECIFIED_ERROR;
 import static org.mqtt4j.hato.broker.internal.BrokerQos2Test.acknowledge;
 import static org.mqtt4j.hato.broker.internal.RawSession.connected;
 import static org.mqtt4j.hato.broker.internal.RawSession.connectedV5;
@@ -153,36 +152,6 @@ class BrokerRoutingTest {
             // [MQTT-3.10.4-3]: an already-started QoS 1 delivery can still complete.
             subscriber.send(new Packet.PubAck(pending.packetId(), SUCCESS, EMPTY));
             publisher.publish("sensors/temperature", "after", AT_LEAST_ONCE, 9);
-            subscriber.ping();
-        }
-    }
-
-    @Test
-    void a_shared_subscription_is_refused_while_the_other_filters_subscribe() throws Exception {
-        try (var sut = MqttBroker.start();
-                var subscriber = connected(sut.port(), "subscriber");
-                var publisher = connected(sut.port(), "publisher")) {
-            // Act: a malformed shared filter is refused like a well-formed one.
-            subscriber.send(new Packet.Subscribe(
-                    1,
-                    List.of(
-                            subscription("$share/team/sensors/#", AT_MOST_ONCE),
-                            subscription("$share/team", AT_MOST_ONCE),
-                            subscription("sensors/#", AT_MOST_ONCE)
-                    ),
-                    EMPTY
-            ));
-
-            // Assert: MQTT 3.1.1 can refuse any filter, with 0x80.
-            assertThat(subscriber.expect(Packet.SubAck.class)).isEqualTo(new Packet.SubAck(
-                    1,
-                    List.of(UNSPECIFIED_ERROR, UNSPECIFIED_ERROR, SUCCESS),
-                    EMPTY
-            ));
-            publisher.publish("sensors/temperature", "matched", AT_LEAST_ONCE, 1);
-            assertThat(subscriber.expect(Packet.Publish.class))
-                    .isEqualTo(publication("sensors/temperature", "matched", AT_MOST_ONCE, 0));
-            publisher.publish("$share/team/sensors/temperature", "unmatched", AT_LEAST_ONCE, 2);
             subscriber.ping();
         }
     }

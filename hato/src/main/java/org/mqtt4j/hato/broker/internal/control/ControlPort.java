@@ -123,12 +123,13 @@ public final class ControlPort {
         server.disconnect(clientId, reasonCode, reasonString, serverReference);
     }
 
-    /// See [BrokerServer#announce(int, boolean, boolean, boolean, int, int, int)].
+    /// See [BrokerServer#announce(int, boolean, boolean, boolean, boolean, int, int, int)].
     public void announce(
             int maximumQosLevel,
             boolean retainAvailable,
             boolean wildcardSubscriptionAvailable,
             boolean subscriptionIdentifiersAvailable,
+            boolean sharedSubscriptionAvailable,
             int receiveMaximum,
             int maximumPacketSize,
             int topicAliasMaximum
@@ -138,6 +139,7 @@ public final class ControlPort {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 receiveMaximum,
                 maximumPacketSize,
                 topicAliasMaximum

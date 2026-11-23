@@ -432,6 +432,8 @@ public final class BrokerServer implements AutoCloseable {
 
         private Consumer<String> beforeHandOver = _ -> { };
 
+        private Consumer<String> beforeLastShareStep = _ -> { };
+
         private Consumer<String> beforeTakeOver = _ -> { };
 
         private Consumer<String> beforeAttach = _ -> { };
@@ -665,6 +667,11 @@ public final class BrokerServer implements AutoCloseable {
             return this;
         }
 
+        Builder beforeLastShareStep(Consumer<String> value) {
+            beforeLastShareStep = requireNonNull(value, "beforeLastShareStep must not be null");
+            return this;
+        }
+
         Builder beforeTakeOver(Consumer<String> value) {
             beforeTakeOver = requireNonNull(value, "beforeTakeOver must not be null");
             return this;
@@ -785,6 +792,7 @@ public final class BrokerServer implements AutoCloseable {
                     beforeSelect,
                     beforeAccept,
                     beforeHandOver,
+                    beforeLastShareStep,
                     beforeTakeOver,
                     beforeAttach,
                     afterLeave,
@@ -1631,10 +1639,11 @@ public final class BrokerServer implements AutoCloseable {
     }
 
     /// Makes the broker announce these capabilities to the MQTT 5.0 connections that it accepts
-    /// from now on, and hold those connections to them; connections accepted before keep theirs.
-    /// The maximum QoS is a level. A Receive Maximum of 65,535 and a Maximum Packet Size of
-    /// 268,435,460 bytes are what a client assumes when CONNACK leaves them out, so the broker
-    /// leaves them out. The Server Keep Alive stays as the broker was built with.
+    /// from now on, and hold those connections to them; connections accepted before keep theirs,
+    /// and MQTT 3.1.1 connections, which learn of none, are held to none. The maximum QoS is a
+    /// level. A Receive Maximum of 65,535 and a Maximum Packet Size of 268,435,460 bytes are what
+    /// a client assumes when CONNACK leaves them out, so the broker leaves them out. The Server
+    /// Keep Alive stays as the broker was built with.
     ///
     /// @throws IllegalArgumentException if the level is not 0, 1, or 2, or a value is outside
     ///         what MQTT 5.0 can announce
@@ -1643,6 +1652,7 @@ public final class BrokerServer implements AutoCloseable {
             boolean retainAvailable,
             boolean wildcardSubscriptionAvailable,
             boolean subscriptionIdentifiersAvailable,
+            boolean sharedSubscriptionAvailable,
             int receiveMaximum,
             int maximumPacketSize,
             int topicAliasMaximum
@@ -1652,6 +1662,7 @@ public final class BrokerServer implements AutoCloseable {
                 retainAvailable,
                 wildcardSubscriptionAvailable,
                 subscriptionIdentifiersAvailable,
+                sharedSubscriptionAvailable,
                 (receiveMaximum == 65_535) ? null : receiveMaximum,
                 (maximumPacketSize == Connection.MAX_PACKET_SIZE) ? null : maximumPacketSize,
                 topicAliasMaximum,

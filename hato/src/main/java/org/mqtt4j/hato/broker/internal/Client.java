@@ -7,6 +7,7 @@ import java.util.BitSet;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -648,10 +649,9 @@ final class Client {
 
     // The properties of an MQTT 5.0 CONNACK that accepts `request` for the client `id` with a
     // session that outlives its connection by `expiry` seconds. A client that asked for longer
-    // learns the interval that the broker uses instead (MQTT 5.0 section 3.2.2.3.2). The broker
-    // has no shared subscriptions, so it tells clients to send none. It announces the
-    // capabilities that differ from what a client assumes without them, and only MQTT 5.0 can
-    // tell a client the identifier assigned to it.
+    // learns the interval that the broker uses instead (MQTT 5.0 section 3.2.2.3.2). It announces
+    // the capabilities that differ from what a client assumes without them, and only MQTT 5.0
+    // can tell a client the identifier assigned to it.
     private static Properties acceptanceV5(
             Packet.Connect request,
             String id,
@@ -665,7 +665,9 @@ final class Client {
         if (!offered.subscriptionIdentifiersAvailable()) {
             entries.add(new Property.ByteValue(PropertyId.SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0));
         }
-        entries.add(new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0));
+        if (!offered.sharedSubscriptionAvailable()) {
+            entries.add(new Property.ByteValue(PropertyId.SHARED_SUBSCRIPTION_AVAILABLE, 0));
+        }
         int topicAliasMaximum = offered.topicAliasMaximum();
         if (topicAliasMaximum > 0) {
             entries.add(new Property.TwoByteValue(
@@ -918,10 +920,11 @@ final class Client {
                     );
                     return;
                 }
-                // The broker has no shared subscriptions, which CONNACK announced in MQTT 5.0,
-                // so a shared filter there is a Protocol Error that subscribes to nothing
-                // (MQTT 5.0 section 3.2.2.3.13) and ends the connection [MQTT-4.13.1-1].
-                if (owner.version == MqttVersion.V5 && request.subscriptions().stream()
+                // So is a shared filter when CONNACK announced that shared subscriptions are not
+                // supported (MQTT 5.0 section 3.2.2.3.13), which ends the connection
+                // [MQTT-4.13.1-1]. An MQTT 3.1.1 connection learns of no capability and is held
+                // to none.
+                if (!limits.sharedSubscriptionAvailable() && request.subscriptions().stream()
                         .anyMatch(requested -> SharedTopicFilter.isShared(requested.filter()))) {
                     connection.disconnect(
                             ReasonCode.SHARED_SUBSCRIPTIONS_NOT_SUPPORTED,
@@ -962,10 +965,12 @@ final class Client {
                 Reason described = null;
                 for (int index = 0; index < count; index++) {
                     Packet.Subscription requested = request.subscriptions().get(index);
-                    // An MQTT 3.1.1 client cannot learn that shared subscriptions are missing,
-                    // so the broker refuses the filter rather than match it as written: a
-                    // client that means a shared subscription would wait for nothing.
-                    if (SharedTopicFilter.isShared(requested.filter())) {
+                    // MQTT 3.1.1 gives `$share/` no meaning, but the broker takes it as a shared
+                    // subscription, as widely used brokers do (see SharedTopicFilter). A filter
+                    // with the prefix that is no valid shared subscription subscribes to nothing
+                    // rather than match as written, as a client that means a shared subscription
+                    // would wait for nothing; the MQTT 5.0 decoder refuses such a filter already.
+                    if (malformedShare(requested.filter())) {
                         grants[index] = ReasonCode.UNSPECIFIED_ERROR;
                         continue;
                     }
@@ -1372,6 +1377,20 @@ final class Client {
 
     private static boolean hasWildcard(TopicFilter filter) {
         return filter.pattern().contains("+") || filter.pattern().contains("#");
+    }
+
+    // Whether `filter` starts with `$share/` but is no valid shared subscription, as MQTT 3.1.1
+    // lets a client send.
+    private static boolean malformedShare(TopicFilter filter) {
+        if (!SharedTopicFilter.isShared(filter)) {
+            return false;
+        }
+        try {
+            Optional<SharedTopicFilter> _ = SharedTopicFilter.parse(filter);
+            return false;
+        } catch (IllegalArgumentException _) {
+            return true;
+        }
     }
 
     // Tells the listener of the end, detaches the session from the connection, which has ended,

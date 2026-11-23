@@ -7,14 +7,15 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 
+import org.mqtt4j.hato.MqttVersion;
 import org.mqtt4j.hato.Qos;
 import org.mqtt4j.hato.ReasonCode;
 import org.mqtt4j.hato.broker.MqttBroker;
 
 import static java.util.Objects.requireNonNull;
 
-/// [Mqtt5RoundTripTest] over an in-process connection to the embedded broker.
-class InprocBroker5RoundTripTest extends Mqtt5RoundTripTest {
+/// [Mqtt5ProductRoundTripTest] over an in-process connection to the embedded broker.
+class InprocBroker5RoundTripTest extends Mqtt5ProductRoundTripTest {
 
     private static @Nullable MqttBroker broker;
 
@@ -34,6 +35,11 @@ class InprocBroker5RoundTripTest extends Mqtt5RoundTripTest {
     @Override
     ReasonCode unmatchedPublicationReason(Qos qos) {
         return ReasonCode.SUCCESS;
+    }
+
+    @Override
+    boolean takesTurns(MqttVersion version) {
+        return true;
     }
 
     @Override
